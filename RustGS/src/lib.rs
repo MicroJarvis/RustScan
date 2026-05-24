@@ -14,14 +14,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use rustgs::{train_splats, TrainingConfig, TrainingDataset, TrainingOptions};
+//! use rustgs::{load_colmap_training_dataset, train_splats, ColmapConfig, TrainingConfig, TrainingOptions};
 //! use std::path::PathBuf;
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let path = PathBuf::from("dataset.json");
+//! let path = PathBuf::from("colmap_dataset");
 //!
-//! // Load a prepared training dataset artifact.
-//! let dataset = TrainingDataset::load(&path)?;
+//! // Load a COLMAP reconstruction with sparse points.
+//! let dataset = load_colmap_training_dataset(&path, &ColmapConfig::default())?;
 //!
 //! // Train 3DGS splats.
 //! let config = TrainingConfig::default();
@@ -92,14 +92,12 @@ pub use crate::training::{TrainingBackend, TrainingConfig, TrainingResult};
 
 // Re-export IO types
 pub use crate::io::colmap_dataset::{load_colmap_dataset, ColmapConfig};
-pub use crate::io::nerfstudio_dataset::{load_nerfstudio_dataset, NerfstudioConfig};
 #[cfg(feature = "gpu")]
 pub use crate::io::scene_io::{
     load_splats, load_splats_ply, load_splats_splat, save_splats, save_splats_ply,
     save_splats_splat,
 };
 pub use crate::io::scene_io::{SceneIoError, SplatMetadata};
-pub use crate::io::tum_dataset::{load_tum_rgbd_dataset, TumRgbdConfig};
 #[cfg(feature = "gpu")]
 pub use crate::io::TrainingCheckpoint;
 
@@ -118,78 +116,41 @@ pub fn gpu_available() -> bool {
     true
 }
 
-/// Load a training dataset from a TUM RGB-D directory, a COLMAP directory,
-/// a Nerfstudio transforms directory, or a serialized `TrainingDataset` JSON file.
+/// Supported training input format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrainingInputKind {
-    TumRgbd,
     Colmap,
-    Nerfstudio,
-    TrainingDatasetJson,
 }
 
 impl std::fmt::Display for TrainingInputKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TumRgbd => write!(f, "TUM RGB-D dataset"),
             Self::Colmap => write!(f, "COLMAP dataset"),
-            Self::Nerfstudio => write!(f, "Nerfstudio dataset"),
-            Self::TrainingDatasetJson => write!(f, "TrainingDataset JSON"),
         }
     }
 }
 
-/// Load a training dataset and report which input type was resolved.
-pub fn load_training_dataset_with_source(
+/// Load a COLMAP training dataset and report the resolved input kind.
+pub fn load_colmap_training_dataset_with_source(
     input: &Path,
-    tum_config: &TumRgbdConfig,
     colmap_config: &ColmapConfig,
 ) -> Result<(TrainingDataset, TrainingInputKind), TrainingError> {
-    if input.is_dir() {
-        if io::colmap_dataset::resolve_colmap_sparse_dir(input).is_ok() {
-            return load_colmap_dataset(input, colmap_config)
-                .map(|dataset| (dataset, TrainingInputKind::Colmap));
-        }
-
-        if io::nerfstudio_dataset::looks_like_nerfstudio_dataset(input) {
-            return load_nerfstudio_dataset(
-                input,
-                &NerfstudioConfig {
-                    max_frames: colmap_config.max_frames,
-                    frame_stride: colmap_config.frame_stride,
-                },
-            )
-            .map(|dataset| (dataset, TrainingInputKind::Nerfstudio));
-        }
-
-        return load_tum_rgbd_dataset(input, tum_config)
-            .map(|dataset| (dataset, TrainingInputKind::TumRgbd));
+    if !input.is_dir() {
+        return Err(TrainingError::InvalidInput(format!(
+            "{} is not a COLMAP dataset directory",
+            input.display()
+        )));
     }
 
-    let input_buf = input.to_path_buf();
-    TrainingDataset::load(&input_buf)
-        .map(|dataset| (dataset, TrainingInputKind::TrainingDatasetJson))
-        .map_err(|err| {
-            TrainingError::InvalidInput(format!(
-                "failed to load {} as TrainingDataset JSON: {}",
-                input.display(),
-                err,
-            ))
-        })
+    load_colmap_dataset(input, colmap_config).map(|dataset| (dataset, TrainingInputKind::Colmap))
 }
 
-/// Load a training dataset from a TUM RGB-D directory, a COLMAP directory,
-/// a Nerfstudio transforms directory, or a serialized `TrainingDataset` JSON file.
-pub fn load_training_dataset(
+/// Load a COLMAP training dataset.
+pub fn load_colmap_training_dataset(
     input: &Path,
-    tum_config: &TumRgbdConfig,
+    colmap_config: &ColmapConfig,
 ) -> Result<TrainingDataset, TrainingError> {
-    let colmap_config = ColmapConfig {
-        max_frames: tum_config.max_frames,
-        frame_stride: tum_config.frame_stride,
-        depth_scale: 1.0,
-    };
-    load_training_dataset_with_source(input, tum_config, &colmap_config).map(|(dataset, _)| dataset)
+    load_colmap_training_dataset_with_source(input, colmap_config).map(|(dataset, _)| dataset)
 }
 
 /// Train 3DGS splats from a prepared training dataset.
@@ -202,8 +163,6 @@ pub fn train_splats(
     training::train_splats(dataset, config, options)
 }
 
-#[cfg(test)]
-mod tests;
 /// Training error type.
 #[derive(Debug, thiserror::Error)]
 pub enum TrainingError {
@@ -219,3 +178,6 @@ pub enum TrainingError {
     #[error("Training failed: {0}")]
     TrainingFailed(String),
 }
+
+#[cfg(test)]
+mod tests;

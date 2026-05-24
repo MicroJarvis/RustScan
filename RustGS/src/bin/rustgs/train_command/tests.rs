@@ -11,6 +11,7 @@ fn run_train_command_surfaces_missing_input_cleanly() {
     let args = TrainArgs {
         input: PathBuf::from("missing-dataset"),
         output: PathBuf::from("scene.ply"),
+        train_config: None,
         train_preset: None,
         iterations: 1,
         max_initial_gaussians: 16,
@@ -101,7 +102,7 @@ fn run_train_command_surfaces_missing_input_cleanly() {
 
     let err = run_train_command(args, super::TrainArgSources::default())
         .expect_err("missing input should fail");
-    assert!(err.to_string().contains("failed to load"));
+    assert!(err.to_string().contains("COLMAP dataset directory"));
 }
 
 #[test]
@@ -110,8 +111,8 @@ fn training_requires_sparse_initialization_points() {
         rustscan_types::TrainingDataset::new(rustgs::Intrinsics::new(1.0, 1.0, 0.0, 0.0, 1, 1));
     let err = ensure_sparse_initialization_points(
         &dataset,
-        rustgs::TrainingInputKind::TumRgbd,
-        PathBuf::from("test_data/tum").as_path(),
+        rustgs::TrainingInputKind::Colmap,
+        PathBuf::from("test_data/colmap").as_path(),
     )
     .expect_err("dataset without sparse points should fail");
 

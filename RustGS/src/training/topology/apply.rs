@@ -83,7 +83,7 @@ fn rebuild_host_snapshot(snapshot: &HostSplats, plan: &TopologyMutationPlan) -> 
         sh_coeffs.extend_from_slice(snapshot.sh_coeffs_row(source_idx));
     }
 
-    HostSplats::from_raw_parts(
+    HostSplats::from_components(
         positions,
         log_scales,
         rotations,

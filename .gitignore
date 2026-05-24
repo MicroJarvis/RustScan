@@ -21,6 +21,9 @@ Thumbs.db
 
 # Large test data (optional - keep small test files)
 test_data/*
+!test_data/tum_freiburg1_xyz_colmap/
+test_data/tum_freiburg1_xyz_colmap/*
+!test_data/tum_freiburg1_xyz_colmap/rustgs-train.json
 !test_data/large/
 test_data/large/*
 !test_data/large/*.obj

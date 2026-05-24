@@ -5,7 +5,7 @@ use crate::{
         maybe_write_litegs_parity_report, maybe_write_litegs_parity_report_with_manifest_dir,
         TrainArgSources,
     },
-    Cli, Commands, PruneSceneArgs, TrainArgs, TrainPreset,
+    Cli, Commands, PruneSceneArgs, TrainArgs,
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -45,6 +45,12 @@ fn parse_prune_scene_args(args: &[&str]) -> PruneSceneArgs {
     args
 }
 
+fn write_train_config(dir: &std::path::Path, contents: &str) -> PathBuf {
+    let path = dir.join("rustgs-train.json");
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
 #[cfg(feature = "gpu")]
 fn rgb_to_sh0_value(rgb: f32) -> f32 {
     (rgb - 0.5) / 0.282_094_8
@@ -58,7 +64,7 @@ fn opacity_to_logit(opacity: f32) -> f32 {
 
 #[cfg(feature = "gpu")]
 fn test_splats() -> rustgs::HostSplats {
-    rustgs::HostSplats::from_raw_parts(
+    rustgs::HostSplats::from_components(
         vec![0.0, 0.0, 0.0],
         vec![0.01f32.ln(), 0.01f32.ln(), 0.01f32.ln()],
         vec![1.0, 0.0, 0.0, 0.0],
@@ -114,6 +120,7 @@ fn train_command_parses_training_defaults() {
     ]);
 
     assert_eq!(args.render_scale, 0.5);
+    assert_eq!(args.train_config, None);
     assert_eq!(args.train_preset, None);
     assert_eq!(args.include_frame_ranges, None);
     assert_eq!(args.exclude_frame_ranges, None);
@@ -189,7 +196,32 @@ fn train_command_parses_visibility_weight_prune_mode() {
 }
 
 #[test]
-fn train_command_applies_tum_prefix_compact_preset() {
+fn train_command_applies_dataset_train_preset() {
+    let dir = tempdir().unwrap();
+    let config_path = write_train_config(
+        dir.path(),
+        r#"{
+  "presets": {
+    "tum-prefix-compact": {
+      "iterations": 8000,
+      "lr_decay_iterations": 8000,
+      "lr_scale_final": 0.0005,
+      "lr_rotation_final": 0.0001,
+      "lr_opacity_final": 0.005,
+      "lr_color_final": 0.00025,
+      "max_frames": 180,
+      "frame_stride": 1,
+      "eval_after_train": true,
+      "eval_raster_cov_blur": 0.2,
+      "raster_cov_blur": 0.3,
+      "litegs_topology_freeze_after_epoch": 18,
+      "litegs_growth_select_fraction": 0.14,
+      "loss_l1_weight": 0.8,
+      "loss_ssim_weight": 0.2
+    }
+  }
+}"#,
+    );
     let args = parse_train_args(&[
         "rustgs",
         "train",
@@ -197,13 +229,16 @@ fn train_command_applies_tum_prefix_compact_preset() {
         "scene.json",
         "--output",
         "scene.ply",
+        "--train-config",
+        config_path.to_str().unwrap(),
         "--train-preset",
         "tum-prefix-compact",
     ]);
     let args = effective_train_args(args);
     let config = build_training_config(&args).unwrap();
 
-    assert_eq!(args.train_preset, Some(TrainPreset::TumPrefixCompact));
+    assert_eq!(args.train_config, Some(config_path));
+    assert_eq!(args.train_preset.as_deref(), Some("tum-prefix-compact"));
     assert_eq!(args.iterations, 8_000);
     assert_eq!(args.lr_decay_iterations, 8_000);
     assert_eq!(args.lr_scale_final, 0.0005);
@@ -222,27 +257,60 @@ fn train_command_applies_tum_prefix_compact_preset() {
 }
 
 #[test]
-fn train_command_applies_tum_prefix_efficient_loss_preset() {
+fn train_command_auto_loads_dataset_train_config_default_preset() {
+    let dir = tempdir().unwrap();
+    let config_path = write_train_config(
+        dir.path(),
+        r#"{
+  "defaults": {
+    "render_scale": 0.75
+  },
+  "default_preset": "efficient",
+  "presets": {
+    "efficient": {
+      "iterations": 7000,
+      "litegs_growth_select_fraction": 0.14,
+      "loss_l1_weight": 0.9,
+      "loss_ssim_weight": 0.1
+    }
+  }
+}"#,
+    );
     let args = parse_train_args(&[
         "rustgs",
         "train",
         "--input",
-        "scene.json",
+        dir.path().to_str().unwrap(),
         "--output",
         "scene.ply",
-        "--train-preset",
-        "tum-prefix-efficient",
     ]);
     let args = effective_train_args(args);
     let config = build_training_config(&args).unwrap();
 
+    assert_eq!(args.train_config, Some(config_path));
+    assert_eq!(args.train_preset.as_deref(), Some("efficient"));
+    assert_eq!(args.iterations, 7_000);
+    assert_eq!(args.render_scale, 0.75);
     assert_eq!(config.litegs.growth.growth_select_fraction, 0.14);
     assert_eq!(config.loss.loss_l1_weight, 0.9);
     assert_eq!(config.loss.loss_ssim_weight, 0.1);
 }
 
 #[test]
-fn train_command_applies_tum_prefix_quality_abs_pixel_preset() {
+fn train_command_applies_named_dataset_train_preset() {
+    let dir = tempdir().unwrap();
+    let config_path = write_train_config(
+        dir.path(),
+        r#"{
+  "presets": {
+    "quality": {
+      "max_frames": 180,
+      "litegs_profile": "abs_pixel",
+      "litegs_growth_select_fraction": 0.25
+    }
+  }
+}"#,
+    );
     let args = parse_train_args(&[
         "rustgs",
         "train",
@@ -250,8 +318,10 @@ fn train_command_applies_tum_prefix_quality_abs_pixel_preset() {
         "scene.json",
         "--output",
         "scene.ply",
+        "--train-config",
+        config_path.to_str().unwrap(),
         "--train-preset",
-        "tum-prefix-quality",
+        "quality",
     ]);
     let args = effective_train_args(args);
     let config = build_training_config(&args).unwrap();
@@ -270,7 +340,23 @@ fn train_command_applies_tum_prefix_quality_abs_pixel_preset() {
 }
 
 #[test]
-fn train_command_applies_tum_full_798_baseline_preset() {
+fn train_command_applies_dataset_full_baseline_preset() {
+    let dir = tempdir().unwrap();
+    let config_path = write_train_config(
+        dir.path(),
+        r#"{
+  "presets": {
+    "full-baseline": {
+      "max_frames": 0,
+      "frame_stride": 1,
+      "litegs_topology_freeze_after_epoch": 4,
+      "litegs_growth_select_fraction": 0.25,
+      "loss_l1_weight": 0.8,
+      "loss_ssim_weight": 0.2
+    }
+  }
+}"#,
+    );
     let args = parse_train_args(&[
         "rustgs",
         "train",
@@ -278,8 +364,10 @@ fn train_command_applies_tum_full_798_baseline_preset() {
         "scene.json",
         "--output",
         "scene.ply",
+        "--train-config",
+        config_path.to_str().unwrap(),
         "--train-preset",
-        "tum-full-798-baseline",
+        "full-baseline",
     ]);
     let args = effective_train_args(args);
     let config = build_training_config(&args).unwrap();
@@ -293,7 +381,23 @@ fn train_command_applies_tum_full_798_baseline_preset() {
 }
 
 #[test]
-fn train_command_applies_tum_full_798_quality_preset() {
+fn train_command_applies_dataset_full_quality_preset() {
+    let dir = tempdir().unwrap();
+    let config_path = write_train_config(
+        dir.path(),
+        r#"{
+  "presets": {
+    "full-quality": {
+      "max_frames": 0,
+      "frame_stride": 1,
+      "litegs_topology_freeze_after_epoch": 4,
+      "litegs_profile": "abs-pixel",
+      "loss_l1_weight": 0.8,
+      "loss_ssim_weight": 0.2
+    }
+  }
+}"#,
+    );
     let args = parse_train_args(&[
         "rustgs",
         "train",
@@ -301,8 +405,10 @@ fn train_command_applies_tum_full_798_quality_preset() {
         "scene.json",
         "--output",
         "scene.ply",
+        "--train-config",
+        config_path.to_str().unwrap(),
         "--train-preset",
-        "tum-full-798-quality",
+        "full-quality",
     ]);
     let args = effective_train_args(args);
     let config = build_training_config(&args).unwrap();
@@ -325,6 +431,20 @@ fn train_command_applies_tum_full_798_quality_preset() {
 
 #[test]
 fn train_preset_keeps_explicit_cli_overrides() {
+    let dir = tempdir().unwrap();
+    let config_path = write_train_config(
+        dir.path(),
+        r#"{
+  "presets": {
+    "full-quality": {
+      "iterations": 8000,
+      "eval_raster_cov_blur": 0.2,
+      "litegs_profile": "abs-pixel",
+      "litegs_topology_freeze_after_epoch": 4
+    }
+  }
+}"#,
+    );
     let (args, sources) = parse_train_args_with_sources(&[
         "rustgs",
         "train",
@@ -332,8 +452,10 @@ fn train_preset_keeps_explicit_cli_overrides() {
         "scene.json",
         "--output",
         "scene.ply",
+        "--train-config",
+        config_path.to_str().unwrap(),
         "--train-preset",
-        "tum-full-798-quality",
+        "full-quality",
         "--iterations",
         "1000",
         "--litegs-profile",
@@ -341,7 +463,7 @@ fn train_preset_keeps_explicit_cli_overrides() {
         "--eval-raster-cov-blur",
         "0.3",
     ]);
-    let args = effective_train_args_with_sources(args, &sources);
+    let args = effective_train_args_with_sources(args, &sources).unwrap();
     let config = build_training_config(&args).unwrap();
 
     assert_eq!(args.iterations, 1000);
@@ -416,7 +538,7 @@ fn prune_scene_command_parses_cleanup_flags() {
 #[cfg(feature = "gpu")]
 #[test]
 fn prune_splats_filters_low_opacity_and_far_outliers() {
-    let splats = rustgs::HostSplats::from_raw_parts(
+    let splats = rustgs::HostSplats::from_components(
         vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 20.0, 0.0, 0.0],
         vec![0.01f32.ln(); 9],
         vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
@@ -824,6 +946,21 @@ fn train_command_builds_dynamic_mask_config() {
 
 #[test]
 fn train_preset_preserves_dynamic_mask_override() {
+    let dir = tempdir().unwrap();
+    let config_path = write_train_config(
+        dir.path(),
+        r#"{
+  "presets": {
+    "compact": {
+      "max_frames": 180,
+      "litegs_growth_select_fraction": 0.14,
+      "loss_dynamic_mask_threshold_low": 0.0,
+      "loss_dynamic_mask_threshold_high": 0.0,
+      "loss_dynamic_mask_min_weight": 1.0
+    }
+  }
+}"#,
+    );
     let (args, sources) = parse_train_args_with_sources(&[
         "rustgs",
         "train",
@@ -831,8 +968,10 @@ fn train_preset_preserves_dynamic_mask_override() {
         "scene.json",
         "--output",
         "scene.ply",
+        "--train-config",
+        config_path.to_str().unwrap(),
         "--train-preset",
-        "tum-prefix-compact",
+        "compact",
         "--loss-dynamic-mask-threshold-low",
         "0.12",
         "--loss-dynamic-mask-threshold-high",
@@ -840,7 +979,7 @@ fn train_preset_preserves_dynamic_mask_override() {
         "--loss-dynamic-mask-min-weight",
         "0.35",
     ]);
-    let args = effective_train_args_with_sources(args, &sources);
+    let args = effective_train_args_with_sources(args, &sources).unwrap();
     let config = build_training_config(&args).unwrap();
 
     assert_eq!(args.max_frames, 180);
@@ -1240,11 +1379,8 @@ fn litegs_fixture_parity_regression_writes_report_from_real_training_run() {
         return;
     }
 
-    let tum_config = rustgs::TumRgbdConfig {
-        max_frames: 90,
-        frame_stride: 30,
-        ..Default::default()
-    };
+    let max_frames = 90;
+    let frame_stride = 30;
     let config = rustgs::TrainingConfig {
         iterations: 1,
         initialization: rustgs::TrainingInitializationConfig {
@@ -1268,7 +1404,7 @@ fn litegs_fixture_parity_regression_writes_report_from_real_training_run() {
     let output_dir = tempdir().unwrap();
     let output = output_dir.path().join("fixture-scene.ply");
     let Ok((dataset, source)) =
-        load_training_dataset_for_training(&input, tum_config.max_frames, tum_config.frame_stride)
+        load_training_dataset_for_training(&input, max_frames, frame_stride)
     else {
         eprintln!(
             "skipping test: could not load LiteGS convergence fixture at {:?}",

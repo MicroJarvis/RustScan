@@ -242,7 +242,7 @@ mod tests {
         let opacity_logits = vec![2.0]; // high opacity
         let sh_coeffs = vec![0.5, 0.5, 0.5]; // gray
         
-        let host_splats = HostSplats::from_raw_parts(
+        let host_splats = HostSplats::from_components(
             positions, log_scales, rotations, opacity_logits, sh_coeffs, 0
         ).unwrap();
         
@@ -298,7 +298,7 @@ mod tests {
         let opacity_logits = vec![2.0];
         let sh_coeffs = vec![0.5, 0.5, 0.5];
         
-        let host_splats = HostSplats::from_raw_parts(
+        let host_splats = HostSplats::from_components(
             positions, log_scales, rotations, opacity_logits, sh_coeffs, 0
         ).unwrap();
         

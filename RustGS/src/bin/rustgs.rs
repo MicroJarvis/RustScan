@@ -1,7 +1,7 @@
 //! RustGS CLI - 3D Gaussian Splatting Training
 //!
 //! Usage:
-//!   rustgs train --input <training_dataset_with_initial_points.json|colmap_dir|nerfstudio_dir> --output <scene.splat>
+//!   rustgs train --input <colmap_dir> --output <scene.splat>
 //!   rustgs render --input <scene.splat|scene.ply> --camera <pose.json> --output <image.png>
 
 use anyhow::{bail, Context};
@@ -9,7 +9,6 @@ use clap::{CommandFactory, FromArgMatches};
 #[cfg(feature = "gpu")]
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::str::FromStr;
 
 #[path = "rustgs/train_command.rs"]
 mod train_command;
@@ -24,7 +23,7 @@ struct Cli {
 
 #[derive(Debug, Clone, clap::Args)]
 struct TrainArgs {
-    /// Path to a COLMAP, Nerfstudio, TUM RGB-D directory, or a TrainingDataset JSON that already contains initial_points
+    /// Path to a COLMAP dataset directory with sparse reconstruction points
     #[arg(short, long)]
     input: PathBuf,
 
@@ -32,9 +31,13 @@ struct TrainArgs {
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Reproducible RustGS training preset, e.g. tum-prefix-quality or tum-full-798-quality
+    /// Path to a JSON training config file. Defaults to <input>/rustgs-train.json when present.
     #[arg(long)]
-    train_preset: Option<TrainPreset>,
+    train_config: Option<PathBuf>,
+
+    /// Training preset name loaded from the dataset training config file
+    #[arg(long)]
+    train_preset: Option<String>,
 
     /// Number of training iterations
     #[arg(long, default_value = "30000")]
@@ -377,288 +380,6 @@ struct TrainArgs {
     eval_crop_rect: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrainPreset {
-    TumPrefixQuality,
-    TumPrefixCompact,
-    TumPrefixEfficient,
-    TumFull798Baseline,
-    TumFull798Quality,
-}
-
-impl TrainPreset {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::TumPrefixQuality => "tum-prefix-quality",
-            Self::TumPrefixCompact => "tum-prefix-compact",
-            Self::TumPrefixEfficient => "tum-prefix-efficient",
-            Self::TumFull798Baseline => "tum-full-798-baseline",
-            Self::TumFull798Quality => "tum-full-798-quality",
-        }
-    }
-
-    fn apply_to_with_sources(self, args: &mut TrainArgs, sources: &train_command::TrainArgSources) {
-        set_if_default(sources, "iterations", &mut args.iterations, 8_000);
-        set_if_default(sources, "frame_stride", &mut args.frame_stride, 1);
-        set_if_default(
-            sources,
-            "include_frame_ranges",
-            &mut args.include_frame_ranges,
-            None,
-        );
-        set_if_default(
-            sources,
-            "exclude_frame_ranges",
-            &mut args.exclude_frame_ranges,
-            None,
-        );
-        set_if_default(
-            sources,
-            "oversample_frame_ranges",
-            &mut args.oversample_frame_ranges,
-            None,
-        );
-        set_if_default(
-            sources,
-            "oversample_frame_repeat",
-            &mut args.oversample_frame_repeat,
-            1,
-        );
-        set_if_default(
-            sources,
-            "frame_shuffle_seed",
-            &mut args.frame_shuffle_seed,
-            0,
-        );
-        set_if_default(sources, "render_scale", &mut args.render_scale, 0.5);
-        set_if_default(
-            sources,
-            "lr_decay_iterations",
-            &mut args.lr_decay_iterations,
-            8_000,
-        );
-        set_if_default(sources, "lr_scale_final", &mut args.lr_scale_final, 0.0005);
-        set_if_default(
-            sources,
-            "lr_rotation_final",
-            &mut args.lr_rotation_final,
-            0.0001,
-        );
-        set_if_default(
-            sources,
-            "lr_opacity_final",
-            &mut args.lr_opacity_final,
-            0.005,
-        );
-        set_if_default(sources, "lr_color_final", &mut args.lr_color_final, 0.00025);
-        set_if_default(sources, "raster_cov_blur", &mut args.raster_cov_blur, 0.3);
-        set_if_default(
-            sources,
-            "raster_cov_blur_final",
-            &mut args.raster_cov_blur_final,
-            None,
-        );
-        set_if_default(
-            sources,
-            "raster_cov_blur_final_after_epoch",
-            &mut args.raster_cov_blur_final_after_epoch,
-            None,
-        );
-        let litegs_profile = match self {
-            Self::TumPrefixQuality | Self::TumFull798Quality => {
-                rustgs::LiteGsTrainingProfile::AbsPixel
-            }
-            Self::TumPrefixCompact | Self::TumPrefixEfficient | Self::TumFull798Baseline => {
-                rustgs::LiteGsTrainingProfile::Baseline
-            }
-        };
-        set_if_default(
-            sources,
-            "litegs_profile",
-            &mut args.litegs_profile,
-            litegs_profile,
-        );
-        let topology_freeze_after_epoch = Some(match self {
-            Self::TumFull798Baseline | Self::TumFull798Quality => 4,
-            Self::TumPrefixQuality | Self::TumPrefixCompact | Self::TumPrefixEfficient => 18,
-        });
-        set_if_default(
-            sources,
-            "litegs_topology_freeze_after_epoch",
-            &mut args.litegs_topology_freeze_after_epoch,
-            topology_freeze_after_epoch,
-        );
-        set_if_default(
-            sources,
-            "litegs_growth_freeze_after_epoch",
-            &mut args.litegs_growth_freeze_after_epoch,
-            None,
-        );
-        let growth_select_fraction = match self {
-            Self::TumPrefixQuality | Self::TumFull798Baseline | Self::TumFull798Quality => 0.25,
-            Self::TumPrefixCompact | Self::TumPrefixEfficient => 0.14,
-        };
-        set_if_default(
-            sources,
-            "litegs_growth_select_fraction",
-            &mut args.litegs_growth_select_fraction,
-            growth_select_fraction,
-        );
-        let loss_l1_weight = match self {
-            Self::TumPrefixEfficient => 0.9,
-            Self::TumPrefixQuality
-            | Self::TumPrefixCompact
-            | Self::TumFull798Baseline
-            | Self::TumFull798Quality => 0.8,
-        };
-        set_if_default(
-            sources,
-            "loss_l1_weight",
-            &mut args.loss_l1_weight,
-            loss_l1_weight,
-        );
-        let loss_ssim_weight = match self {
-            Self::TumPrefixEfficient => 0.1,
-            Self::TumPrefixQuality
-            | Self::TumPrefixCompact
-            | Self::TumFull798Baseline
-            | Self::TumFull798Quality => 0.2,
-        };
-        set_if_default(
-            sources,
-            "loss_ssim_weight",
-            &mut args.loss_ssim_weight,
-            loss_ssim_weight,
-        );
-        set_if_default(
-            sources,
-            "loss_gradient_weight",
-            &mut args.loss_gradient_weight,
-            0.0,
-        );
-        set_if_default(
-            sources,
-            "loss_robust_delta",
-            &mut args.loss_robust_delta,
-            0.0,
-        );
-        set_if_default(
-            sources,
-            "loss_outlier_threshold",
-            &mut args.loss_outlier_threshold,
-            0.0,
-        );
-        set_if_default(
-            sources,
-            "loss_outlier_weight",
-            &mut args.loss_outlier_weight,
-            1.0,
-        );
-        set_if_default(
-            sources,
-            "loss_dynamic_mask_threshold_low",
-            &mut args.loss_dynamic_mask_threshold_low,
-            0.0,
-        );
-        set_if_default(
-            sources,
-            "loss_dynamic_mask_threshold_high",
-            &mut args.loss_dynamic_mask_threshold_high,
-            0.0,
-        );
-        set_if_default(
-            sources,
-            "loss_dynamic_mask_min_weight",
-            &mut args.loss_dynamic_mask_min_weight,
-            1.0,
-        );
-        set_if_default(
-            sources,
-            "loss_dynamic_mask_start_epoch",
-            &mut args.loss_dynamic_mask_start_epoch,
-            None,
-        );
-        let max_frames = match self {
-            Self::TumFull798Baseline | Self::TumFull798Quality => 0,
-            Self::TumPrefixQuality | Self::TumPrefixCompact | Self::TumPrefixEfficient => 180,
-        };
-        set_if_default(sources, "max_frames", &mut args.max_frames, max_frames);
-        set_if_default(
-            sources,
-            "eval_after_train",
-            &mut args.eval_after_train,
-            true,
-        );
-        set_if_default(
-            sources,
-            "eval_render_scale",
-            &mut args.eval_render_scale,
-            0.25,
-        );
-        set_if_default(
-            sources,
-            "eval_raster_cov_blur",
-            &mut args.eval_raster_cov_blur,
-            Some(0.2),
-        );
-        set_if_default(sources, "eval_max_frames", &mut args.eval_max_frames, 180);
-        set_if_default(
-            sources,
-            "eval_frame_stride",
-            &mut args.eval_frame_stride,
-            30,
-        );
-        set_if_default(
-            sources,
-            "eval_include_frame_ranges",
-            &mut args.eval_include_frame_ranges,
-            None,
-        );
-        set_if_default(
-            sources,
-            "eval_exclude_frame_ranges",
-            &mut args.eval_exclude_frame_ranges,
-            None,
-        );
-        set_if_default(sources, "eval_worst_frames", &mut args.eval_worst_frames, 5);
-        set_if_default(
-            sources,
-            "eval_device",
-            &mut args.eval_device,
-            "cpu".to_string(),
-        );
-    }
-}
-
-fn set_if_default<T>(sources: &train_command::TrainArgSources, id: &str, target: &mut T, value: T) {
-    if !sources.is_command_line(id) {
-        *target = value;
-    }
-}
-
-impl std::fmt::Display for TrainPreset {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for TrainPreset {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "tum-prefix-quality" => Ok(Self::TumPrefixQuality),
-            "tum-prefix-compact" => Ok(Self::TumPrefixCompact),
-            "tum-prefix-efficient" => Ok(Self::TumPrefixEfficient),
-            "tum-full-798-baseline" | "tum-full-baseline" => Ok(Self::TumFull798Baseline),
-            "tum-full-798-quality" | "tum-full-quality" => Ok(Self::TumFull798Quality),
-            other => Err(format!(
-                "unsupported RustGS train preset '{other}'. Expected one of: tum-prefix-quality, tum-prefix-compact, tum-prefix-efficient, tum-full-798-baseline, tum-full-798-quality"
-            )),
-        }
-    }
-}
-
 #[derive(Debug, Clone, clap::Args)]
 struct RenderArgs {
     /// Path to scene .splat or PLY file
@@ -724,7 +445,7 @@ struct PruneSceneArgs {
 #[derive(Debug, clap::Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Train a 3DGS scene from JSON input, a TUM RGB-D, Nerfstudio, or COLMAP directory
+    /// Train a 3DGS scene from a COLMAP dataset directory
     Train(TrainArgs),
 
     /// Render a scene from a given viewpoint
@@ -902,7 +623,7 @@ fn prune_splats(
         kept_sh_coeffs.extend_from_slice(&view.sh_coeffs[sh_base..sh_base + sh_row_width]);
     }
 
-    let pruned = rustgs::HostSplats::from_raw_parts(
+    let pruned = rustgs::HostSplats::from_components(
         kept_positions,
         kept_log_scales,
         kept_rotations,

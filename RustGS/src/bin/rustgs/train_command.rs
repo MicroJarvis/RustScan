@@ -3,14 +3,16 @@
 use crate::TrainArgs;
 use anyhow::{bail, Context};
 use clap::parser::ValueSource;
-use std::collections::BTreeSet;
+use serde::{de, Deserialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 #[cfg(feature = "gpu")]
 pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> anyhow::Result<()> {
-    let args = effective_train_args_with_sources(args, &sources);
+    let args = effective_train_args_with_sources(args, &sources)?;
     env_logger::Builder::new()
         .parse_filters(&args.log_level)
         .init();
@@ -25,7 +27,10 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
             args.sampling_step
         );
     }
-    if let Some(preset) = args.train_preset {
+    if let Some(config_path) = &args.train_config {
+        log::info!("Loaded RustGS train config: {}", config_path.display());
+    }
+    if let Some(preset) = &args.train_preset {
         log::info!("Applied RustGS train preset: {}", preset);
     }
 
@@ -104,7 +109,7 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
 
 #[cfg(not(feature = "gpu"))]
 pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> anyhow::Result<()> {
-    let args = effective_train_args_with_sources(args, &sources);
+    let args = effective_train_args_with_sources(args, &sources)?;
     env_logger::Builder::new()
         .parse_filters(&args.log_level)
         .init();
@@ -115,16 +120,751 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
 #[cfg(test)]
 pub(super) fn effective_train_args(args: TrainArgs) -> TrainArgs {
     effective_train_args_with_sources(args, &TrainArgSources::default())
+        .expect("training config should apply")
 }
 
 pub(super) fn effective_train_args_with_sources(
     mut args: TrainArgs,
     sources: &TrainArgSources,
-) -> TrainArgs {
-    if let Some(preset) = args.train_preset {
-        preset.apply_to_with_sources(&mut args, sources);
+) -> anyhow::Result<TrainArgs> {
+    let config_path = resolve_train_config_path(&args);
+    if let Some(config_path) = config_path {
+        let config = TrainConfigFile::load(&config_path)?;
+        config.apply_to_with_sources(&mut args, sources, &config_path)?;
+        args.train_config = Some(config_path);
+    } else if let Some(preset) = &args.train_preset {
+        bail!(
+            "RustGS train preset '{preset}' requires a training config file. Pass --train-config or create {}/{}",
+            args.input.display(),
+            DEFAULT_TRAIN_CONFIG_FILE
+        );
     }
-    args
+    Ok(args)
+}
+
+const DEFAULT_TRAIN_CONFIG_FILE: &str = "rustgs-train.json";
+
+fn resolve_train_config_path(args: &TrainArgs) -> Option<PathBuf> {
+    if let Some(path) = &args.train_config {
+        return Some(path.clone());
+    }
+    if !args.input.is_dir() {
+        return None;
+    }
+
+    let default_path = args.input.join(DEFAULT_TRAIN_CONFIG_FILE);
+    if default_path.exists() {
+        Some(default_path)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TrainConfigFile {
+    #[serde(default)]
+    default_preset: Option<String>,
+    #[serde(default)]
+    defaults: TrainConfigOverrides,
+    #[serde(default)]
+    presets: BTreeMap<String, TrainConfigOverrides>,
+}
+
+impl TrainConfigFile {
+    fn load(path: &Path) -> anyhow::Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read RustGS train config {}", path.display()))?;
+        serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse RustGS train config {}", path.display()))
+    }
+
+    fn apply_to_with_sources(
+        &self,
+        args: &mut TrainArgs,
+        sources: &TrainArgSources,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        self.defaults.apply_to_with_sources(args, sources);
+
+        let selected_preset = args
+            .train_preset
+            .clone()
+            .or_else(|| self.default_preset.clone());
+        if let Some(preset) = selected_preset {
+            let overrides = self.presets.get(&preset).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "RustGS train config {} does not define preset '{}'",
+                    path.display(),
+                    preset
+                )
+            })?;
+            overrides.apply_to_with_sources(args, sources);
+            args.train_preset = Some(preset);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct TrainConfigOverrides {
+    iterations: Option<usize>,
+    max_initial_gaussians: Option<usize>,
+    sampling_step: Option<usize>,
+    max_frames: Option<usize>,
+    frame_stride: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    include_frame_ranges: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    exclude_frame_ranges: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    oversample_frame_ranges: Option<Option<String>>,
+    oversample_frame_repeat: Option<usize>,
+    frame_shuffle_seed: Option<u64>,
+    render_scale: Option<f32>,
+    raster_cov_blur: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    raster_cov_blur_final: Option<Option<f32>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    raster_cov_blur_final_after_epoch: Option<Option<usize>>,
+    litegs_sh_degree: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_from_str")]
+    litegs_profile: Option<rustgs::LiteGsTrainingProfile>,
+    #[serde(default, deserialize_with = "deserialize_optional_litegs_tile_size")]
+    litegs_tile_size: Option<rustgs::LiteGsTileSize>,
+    litegs_sparse_grad: Option<bool>,
+    litegs_reg_weight: Option<f32>,
+    litegs_enable_transmittance: Option<bool>,
+    litegs_enable_depth: Option<bool>,
+    litegs_densify_from: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    litegs_densify_until: Option<Option<usize>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    litegs_topology_freeze_after_epoch: Option<Option<usize>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    litegs_growth_freeze_after_epoch: Option<Option<usize>>,
+    litegs_densification_interval: Option<usize>,
+    litegs_refine_every: Option<usize>,
+    litegs_growth_grad_threshold: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_optional_from_str")]
+    litegs_split_score: Option<rustgs::LiteGsSplitScoreMode>,
+    litegs_split_grad_threshold: Option<f32>,
+    litegs_depth_scale_gamma: Option<f32>,
+    litegs_growth_select_fraction: Option<f32>,
+    litegs_growth_stop_iter: Option<usize>,
+    litegs_opacity_decay: Option<f32>,
+    litegs_scale_decay: Option<f32>,
+    litegs_opacity_reset_interval: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_from_str")]
+    litegs_opacity_reset_mode: Option<rustgs::LiteGsOpacityResetMode>,
+    #[serde(default, deserialize_with = "deserialize_optional_from_str")]
+    litegs_prune_mode: Option<rustgs::LiteGsPruneMode>,
+    litegs_prune_offset_epochs: Option<usize>,
+    litegs_prune_min_age: Option<usize>,
+    litegs_prune_invisible_epochs: Option<usize>,
+    litegs_prune_opacity_threshold: Option<f32>,
+    litegs_prune_visibility_dry_run: Option<bool>,
+    litegs_prune_visibility_threshold: Option<f32>,
+    litegs_prune_high_opacity_threshold: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    litegs_prune_until_epoch: Option<Option<usize>>,
+    litegs_target_primitives: Option<usize>,
+    litegs_learnable_viewproj: Option<bool>,
+    litegs_lr_pose: Option<f32>,
+    litegs_prune_scale_threshold: Option<f32>,
+    lr_position: Option<f32>,
+    lr_position_final: Option<f32>,
+    lr_decay_iterations: Option<usize>,
+    lr_scale: Option<f32>,
+    lr_scale_final: Option<f32>,
+    lr_rotation: Option<f32>,
+    lr_rotation_final: Option<f32>,
+    lr_opacity: Option<f32>,
+    lr_opacity_final: Option<f32>,
+    lr_color: Option<f32>,
+    lr_color_final: Option<f32>,
+    loss_l1_weight: Option<f32>,
+    loss_ssim_weight: Option<f32>,
+    loss_gradient_weight: Option<f32>,
+    loss_robust_delta: Option<f32>,
+    loss_outlier_threshold: Option<f32>,
+    loss_outlier_weight: Option<f32>,
+    loss_dynamic_mask_threshold_low: Option<f32>,
+    loss_dynamic_mask_threshold_high: Option<f32>,
+    loss_dynamic_mask_min_weight: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    loss_dynamic_mask_start_epoch: Option<Option<usize>>,
+    log_level: Option<String>,
+    eval_after_train: Option<bool>,
+    eval_render_scale: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    eval_raster_cov_blur: Option<Option<f32>>,
+    eval_max_frames: Option<usize>,
+    eval_frame_stride: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    eval_include_frame_ranges: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    eval_exclude_frame_ranges: Option<Option<String>>,
+    eval_worst_frames: Option<usize>,
+    eval_device: Option<String>,
+    eval_json: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    eval_crop_output_dir: Option<Option<PathBuf>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    eval_crop_frames: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    eval_crop_rect: Option<Option<String>>,
+}
+
+impl TrainConfigOverrides {
+    fn apply_to_with_sources(&self, args: &mut TrainArgs, sources: &TrainArgSources) {
+        apply_override(sources, "iterations", &mut args.iterations, self.iterations);
+        apply_override(
+            sources,
+            "max_initial_gaussians",
+            &mut args.max_initial_gaussians,
+            self.max_initial_gaussians,
+        );
+        apply_override(
+            sources,
+            "sampling_step",
+            &mut args.sampling_step,
+            self.sampling_step,
+        );
+        apply_override(sources, "max_frames", &mut args.max_frames, self.max_frames);
+        apply_override(
+            sources,
+            "frame_stride",
+            &mut args.frame_stride,
+            self.frame_stride,
+        );
+        apply_override(
+            sources,
+            "include_frame_ranges",
+            &mut args.include_frame_ranges,
+            self.include_frame_ranges.clone(),
+        );
+        apply_override(
+            sources,
+            "exclude_frame_ranges",
+            &mut args.exclude_frame_ranges,
+            self.exclude_frame_ranges.clone(),
+        );
+        apply_override(
+            sources,
+            "oversample_frame_ranges",
+            &mut args.oversample_frame_ranges,
+            self.oversample_frame_ranges.clone(),
+        );
+        apply_override(
+            sources,
+            "oversample_frame_repeat",
+            &mut args.oversample_frame_repeat,
+            self.oversample_frame_repeat,
+        );
+        apply_override(
+            sources,
+            "frame_shuffle_seed",
+            &mut args.frame_shuffle_seed,
+            self.frame_shuffle_seed,
+        );
+        apply_override(
+            sources,
+            "render_scale",
+            &mut args.render_scale,
+            self.render_scale,
+        );
+        apply_override(
+            sources,
+            "raster_cov_blur",
+            &mut args.raster_cov_blur,
+            self.raster_cov_blur,
+        );
+        apply_override(
+            sources,
+            "raster_cov_blur_final",
+            &mut args.raster_cov_blur_final,
+            self.raster_cov_blur_final,
+        );
+        apply_override(
+            sources,
+            "raster_cov_blur_final_after_epoch",
+            &mut args.raster_cov_blur_final_after_epoch,
+            self.raster_cov_blur_final_after_epoch,
+        );
+        apply_override(
+            sources,
+            "litegs_sh_degree",
+            &mut args.litegs_sh_degree,
+            self.litegs_sh_degree,
+        );
+        apply_override(
+            sources,
+            "litegs_profile",
+            &mut args.litegs_profile,
+            self.litegs_profile,
+        );
+        apply_override(
+            sources,
+            "litegs_tile_size",
+            &mut args.litegs_tile_size,
+            self.litegs_tile_size,
+        );
+        apply_override(
+            sources,
+            "litegs_sparse_grad",
+            &mut args.litegs_sparse_grad,
+            self.litegs_sparse_grad,
+        );
+        apply_override(
+            sources,
+            "litegs_reg_weight",
+            &mut args.litegs_reg_weight,
+            self.litegs_reg_weight,
+        );
+        apply_override(
+            sources,
+            "litegs_enable_transmittance",
+            &mut args.litegs_enable_transmittance,
+            self.litegs_enable_transmittance,
+        );
+        apply_override(
+            sources,
+            "litegs_enable_depth",
+            &mut args.litegs_enable_depth,
+            self.litegs_enable_depth,
+        );
+        apply_override(
+            sources,
+            "litegs_densify_from",
+            &mut args.litegs_densify_from,
+            self.litegs_densify_from,
+        );
+        apply_override(
+            sources,
+            "litegs_densify_until",
+            &mut args.litegs_densify_until,
+            self.litegs_densify_until,
+        );
+        apply_override(
+            sources,
+            "litegs_topology_freeze_after_epoch",
+            &mut args.litegs_topology_freeze_after_epoch,
+            self.litegs_topology_freeze_after_epoch,
+        );
+        apply_override(
+            sources,
+            "litegs_growth_freeze_after_epoch",
+            &mut args.litegs_growth_freeze_after_epoch,
+            self.litegs_growth_freeze_after_epoch,
+        );
+        apply_override(
+            sources,
+            "litegs_densification_interval",
+            &mut args.litegs_densification_interval,
+            self.litegs_densification_interval,
+        );
+        apply_override(
+            sources,
+            "litegs_refine_every",
+            &mut args.litegs_refine_every,
+            self.litegs_refine_every,
+        );
+        apply_override(
+            sources,
+            "litegs_growth_grad_threshold",
+            &mut args.litegs_growth_grad_threshold,
+            self.litegs_growth_grad_threshold,
+        );
+        apply_override(
+            sources,
+            "litegs_split_score",
+            &mut args.litegs_split_score,
+            self.litegs_split_score,
+        );
+        apply_override(
+            sources,
+            "litegs_split_grad_threshold",
+            &mut args.litegs_split_grad_threshold,
+            self.litegs_split_grad_threshold,
+        );
+        apply_override(
+            sources,
+            "litegs_depth_scale_gamma",
+            &mut args.litegs_depth_scale_gamma,
+            self.litegs_depth_scale_gamma,
+        );
+        apply_override(
+            sources,
+            "litegs_growth_select_fraction",
+            &mut args.litegs_growth_select_fraction,
+            self.litegs_growth_select_fraction,
+        );
+        apply_override(
+            sources,
+            "litegs_growth_stop_iter",
+            &mut args.litegs_growth_stop_iter,
+            self.litegs_growth_stop_iter,
+        );
+        apply_override(
+            sources,
+            "litegs_opacity_decay",
+            &mut args.litegs_opacity_decay,
+            self.litegs_opacity_decay,
+        );
+        apply_override(
+            sources,
+            "litegs_scale_decay",
+            &mut args.litegs_scale_decay,
+            self.litegs_scale_decay,
+        );
+        apply_override(
+            sources,
+            "litegs_opacity_reset_interval",
+            &mut args.litegs_opacity_reset_interval,
+            self.litegs_opacity_reset_interval,
+        );
+        apply_override(
+            sources,
+            "litegs_opacity_reset_mode",
+            &mut args.litegs_opacity_reset_mode,
+            self.litegs_opacity_reset_mode,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_mode",
+            &mut args.litegs_prune_mode,
+            self.litegs_prune_mode,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_offset_epochs",
+            &mut args.litegs_prune_offset_epochs,
+            self.litegs_prune_offset_epochs,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_min_age",
+            &mut args.litegs_prune_min_age,
+            self.litegs_prune_min_age,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_invisible_epochs",
+            &mut args.litegs_prune_invisible_epochs,
+            self.litegs_prune_invisible_epochs,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_opacity_threshold",
+            &mut args.litegs_prune_opacity_threshold,
+            self.litegs_prune_opacity_threshold,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_visibility_dry_run",
+            &mut args.litegs_prune_visibility_dry_run,
+            self.litegs_prune_visibility_dry_run,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_visibility_threshold",
+            &mut args.litegs_prune_visibility_threshold,
+            self.litegs_prune_visibility_threshold,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_high_opacity_threshold",
+            &mut args.litegs_prune_high_opacity_threshold,
+            self.litegs_prune_high_opacity_threshold,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_until_epoch",
+            &mut args.litegs_prune_until_epoch,
+            self.litegs_prune_until_epoch,
+        );
+        apply_override(
+            sources,
+            "litegs_target_primitives",
+            &mut args.litegs_target_primitives,
+            self.litegs_target_primitives,
+        );
+        apply_override(
+            sources,
+            "litegs_learnable_viewproj",
+            &mut args.litegs_learnable_viewproj,
+            self.litegs_learnable_viewproj,
+        );
+        apply_override(
+            sources,
+            "litegs_lr_pose",
+            &mut args.litegs_lr_pose,
+            self.litegs_lr_pose,
+        );
+        apply_override(
+            sources,
+            "litegs_prune_scale_threshold",
+            &mut args.litegs_prune_scale_threshold,
+            self.litegs_prune_scale_threshold,
+        );
+        apply_override(
+            sources,
+            "lr_position",
+            &mut args.lr_position,
+            self.lr_position,
+        );
+        apply_override(
+            sources,
+            "lr_position_final",
+            &mut args.lr_position_final,
+            self.lr_position_final,
+        );
+        apply_override(
+            sources,
+            "lr_decay_iterations",
+            &mut args.lr_decay_iterations,
+            self.lr_decay_iterations,
+        );
+        apply_override(sources, "lr_scale", &mut args.lr_scale, self.lr_scale);
+        apply_override(
+            sources,
+            "lr_scale_final",
+            &mut args.lr_scale_final,
+            self.lr_scale_final,
+        );
+        apply_override(
+            sources,
+            "lr_rotation",
+            &mut args.lr_rotation,
+            self.lr_rotation,
+        );
+        apply_override(
+            sources,
+            "lr_rotation_final",
+            &mut args.lr_rotation_final,
+            self.lr_rotation_final,
+        );
+        apply_override(sources, "lr_opacity", &mut args.lr_opacity, self.lr_opacity);
+        apply_override(
+            sources,
+            "lr_opacity_final",
+            &mut args.lr_opacity_final,
+            self.lr_opacity_final,
+        );
+        apply_override(sources, "lr_color", &mut args.lr_color, self.lr_color);
+        apply_override(
+            sources,
+            "lr_color_final",
+            &mut args.lr_color_final,
+            self.lr_color_final,
+        );
+        apply_override(
+            sources,
+            "loss_l1_weight",
+            &mut args.loss_l1_weight,
+            self.loss_l1_weight,
+        );
+        apply_override(
+            sources,
+            "loss_ssim_weight",
+            &mut args.loss_ssim_weight,
+            self.loss_ssim_weight,
+        );
+        apply_override(
+            sources,
+            "loss_gradient_weight",
+            &mut args.loss_gradient_weight,
+            self.loss_gradient_weight,
+        );
+        apply_override(
+            sources,
+            "loss_robust_delta",
+            &mut args.loss_robust_delta,
+            self.loss_robust_delta,
+        );
+        apply_override(
+            sources,
+            "loss_outlier_threshold",
+            &mut args.loss_outlier_threshold,
+            self.loss_outlier_threshold,
+        );
+        apply_override(
+            sources,
+            "loss_outlier_weight",
+            &mut args.loss_outlier_weight,
+            self.loss_outlier_weight,
+        );
+        apply_override(
+            sources,
+            "loss_dynamic_mask_threshold_low",
+            &mut args.loss_dynamic_mask_threshold_low,
+            self.loss_dynamic_mask_threshold_low,
+        );
+        apply_override(
+            sources,
+            "loss_dynamic_mask_threshold_high",
+            &mut args.loss_dynamic_mask_threshold_high,
+            self.loss_dynamic_mask_threshold_high,
+        );
+        apply_override(
+            sources,
+            "loss_dynamic_mask_min_weight",
+            &mut args.loss_dynamic_mask_min_weight,
+            self.loss_dynamic_mask_min_weight,
+        );
+        apply_override(
+            sources,
+            "loss_dynamic_mask_start_epoch",
+            &mut args.loss_dynamic_mask_start_epoch,
+            self.loss_dynamic_mask_start_epoch,
+        );
+        apply_override(
+            sources,
+            "log_level",
+            &mut args.log_level,
+            self.log_level.clone(),
+        );
+        apply_override(
+            sources,
+            "eval_after_train",
+            &mut args.eval_after_train,
+            self.eval_after_train,
+        );
+        apply_override(
+            sources,
+            "eval_render_scale",
+            &mut args.eval_render_scale,
+            self.eval_render_scale,
+        );
+        apply_override(
+            sources,
+            "eval_raster_cov_blur",
+            &mut args.eval_raster_cov_blur,
+            self.eval_raster_cov_blur,
+        );
+        apply_override(
+            sources,
+            "eval_max_frames",
+            &mut args.eval_max_frames,
+            self.eval_max_frames,
+        );
+        apply_override(
+            sources,
+            "eval_frame_stride",
+            &mut args.eval_frame_stride,
+            self.eval_frame_stride,
+        );
+        apply_override(
+            sources,
+            "eval_include_frame_ranges",
+            &mut args.eval_include_frame_ranges,
+            self.eval_include_frame_ranges.clone(),
+        );
+        apply_override(
+            sources,
+            "eval_exclude_frame_ranges",
+            &mut args.eval_exclude_frame_ranges,
+            self.eval_exclude_frame_ranges.clone(),
+        );
+        apply_override(
+            sources,
+            "eval_worst_frames",
+            &mut args.eval_worst_frames,
+            self.eval_worst_frames,
+        );
+        apply_override(
+            sources,
+            "eval_device",
+            &mut args.eval_device,
+            self.eval_device.clone(),
+        );
+        apply_override(sources, "eval_json", &mut args.eval_json, self.eval_json);
+        apply_override(
+            sources,
+            "eval_crop_output_dir",
+            &mut args.eval_crop_output_dir,
+            self.eval_crop_output_dir.clone(),
+        );
+        apply_override(
+            sources,
+            "eval_crop_frames",
+            &mut args.eval_crop_frames,
+            self.eval_crop_frames.clone(),
+        );
+        apply_override(
+            sources,
+            "eval_crop_rect",
+            &mut args.eval_crop_rect,
+            self.eval_crop_rect.clone(),
+        );
+    }
+}
+
+fn apply_override<T>(sources: &TrainArgSources, id: &str, target: &mut T, value: Option<T>) {
+    if !sources.is_command_line(id) {
+        if let Some(value) = value {
+            *target = value;
+        }
+    }
+}
+
+fn deserialize_optional_litegs_tile_size<'de, D>(
+    deserializer: D,
+) -> Result<Option<rustgs::LiteGsTileSize>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let value = Option::<LiteGsTileSizeConfig>::deserialize(deserializer)?;
+    value
+        .map(|value| value.into_tile_size())
+        .transpose()
+        .map_err(de::Error::custom)
+}
+
+fn deserialize_optional_from_str<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: de::Deserializer<'de>,
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|value| T::from_str(&value))
+        .transpose()
+        .map_err(de::Error::custom)
+}
+
+fn deserialize_nullable_override<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: de::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum LiteGsTileSizeConfig {
+    String(String),
+    Object { width: usize, height: usize },
+}
+
+impl LiteGsTileSizeConfig {
+    fn into_tile_size(self) -> Result<rustgs::LiteGsTileSize, String> {
+        match self {
+            Self::String(value) => rustgs::LiteGsTileSize::from_str(&value),
+            Self::Object { width, height } => {
+                if width == 0 || height == 0 {
+                    Err("litegs_tile_size width and height must both be > 0".to_string())
+                } else {
+                    Ok(rustgs::LiteGsTileSize::new(width, height))
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -166,13 +906,8 @@ pub(super) fn load_training_dataset_for_training(
         );
     }
 
-    let (dataset, source) = rustgs::load_training_dataset_with_source(
+    let (dataset, source) = rustgs::load_colmap_training_dataset_with_source(
         input,
-        &rustgs::TumRgbdConfig {
-            max_frames,
-            frame_stride,
-            ..Default::default()
-        },
         &rustgs::ColmapConfig {
             max_frames,
             frame_stride,
@@ -196,13 +931,8 @@ fn load_evaluation_dataset(
     max_frames: usize,
     frame_stride: usize,
 ) -> anyhow::Result<rustscan_types::TrainingDataset> {
-    let (dataset, source) = rustgs::load_training_dataset_with_source(
+    let (dataset, source) = rustgs::load_colmap_training_dataset_with_source(
         input,
-        &rustgs::TumRgbdConfig {
-            max_frames,
-            frame_stride,
-            ..Default::default()
-        },
         &rustgs::ColmapConfig {
             max_frames,
             frame_stride,
@@ -970,20 +1700,8 @@ fn ensure_sparse_initialization_points(
         return Ok(());
     }
 
-    let source_hint = match source {
-        rustgs::TrainingInputKind::TumRgbd => {
-            "raw TUM RGB-D input does not carry COLMAP sparse points; convert it to a COLMAP reconstruction first"
-        }
-        rustgs::TrainingInputKind::Colmap => {
-            "the COLMAP input is missing sparse points3D output; make sure points3D.bin or points3D.txt exists"
-        }
-        rustgs::TrainingInputKind::Nerfstudio => {
-            "the Nerfstudio input is missing an initialization point cloud; add ply_file_path or sparse_pc.ply with xyz/rgb vertices"
-        }
-        rustgs::TrainingInputKind::TrainingDatasetJson => {
-            "the TrainingDataset JSON did not contain any initial_points; export it from a COLMAP sparse reconstruction first"
-        }
-    };
+    let source_hint =
+        "the COLMAP input is missing sparse points3D output; make sure points3D.bin or points3D.txt exists";
 
     bail!(
         "training initialization now requires COLMAP sparse points, but {:?} ({}) provided none: {}",

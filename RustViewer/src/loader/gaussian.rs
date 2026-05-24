@@ -137,7 +137,7 @@ mod tests {
         let rgb = [0.25, 0.5, 0.75];
         let sh0 = rgb.map(|channel| (channel - 0.5) / SH_C0);
         let tmp = tempfile::NamedTempFile::with_suffix(".ply").unwrap();
-        let splats = rustgs::HostSplats::from_raw_parts(
+        let splats = rustgs::HostSplats::from_components(
             vec![1.0, 2.0, 3.0],
             vec![0.1f32.ln(), 0.2f32.ln(), 0.3f32.ln()],
             vec![0.707, 0.0, 0.707, 0.0],
@@ -179,7 +179,7 @@ mod tests {
         let rgb = [0.25, 0.5, 0.75];
         let sh0 = rgb.map(|channel| (channel - 0.5) / SH_C0);
         let tmp = tempfile::NamedTempFile::with_suffix(".splat").unwrap();
-        let splats = rustgs::HostSplats::from_raw_parts(
+        let splats = rustgs::HostSplats::from_components(
             vec![1.0, 2.0, 3.0],
             vec![0.1f32.ln(), 0.2f32.ln(), 0.3f32.ln()],
             vec![1.0, 0.0, 0.0, 0.0],

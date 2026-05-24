@@ -780,7 +780,7 @@ pub fn load_splats_ply(
         metadata.gaussian_count = parsed_vertices;
     }
 
-    let splats = crate::core::HostSplats::from_raw_parts(
+    let splats = crate::core::HostSplats::from_components(
         positions,
         log_scales,
         rotations,
@@ -853,7 +853,7 @@ pub fn load_splats_splat(
         gaussian_count: row_count,
         sh_degree: 0,
     };
-    let splats = crate::core::HostSplats::from_raw_parts(
+    let splats = crate::core::HostSplats::from_components(
         positions,
         log_scales,
         rotations,

@@ -96,7 +96,7 @@ pub async fn device_splats_to_host<B: Backend>(splats: &DeviceSplats<B>) -> Host
         log_scales.extend_from_slice(&transforms[base + 7..base + 10]);
     }
 
-    HostSplats::from_raw_parts(
+    HostSplats::from_components(
         positions,
         log_scales,
         rotations,

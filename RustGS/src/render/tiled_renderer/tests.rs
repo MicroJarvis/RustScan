@@ -17,7 +17,7 @@ fn single_rgb_splats(
     opacity: f32,
     color: [f32; 3],
 ) -> crate::core::HostSplats {
-    crate::core::HostSplats::from_raw_parts(
+    crate::core::HostSplats::from_components(
         position.into(),
         scale.map(f32::ln).into(),
         rotation.into(),

@@ -276,7 +276,7 @@ mod tests {
         let arcball =
             ArcballCamera::from_angles(Vec3::ZERO, 5.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_4);
         let intrinsics = Intrinsics::from_focal(300.0, 128, 128);
-        let splats = HostSplats::from_raw_parts(
+        let splats = HostSplats::from_components(
             vec![0.0, 0.0, 0.0],
             vec![0.01f32.ln(), 0.01f32.ln(), 0.01f32.ln()],
             vec![1.0, 0.0, 0.0, 0.0],

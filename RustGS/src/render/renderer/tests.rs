@@ -6,7 +6,7 @@ use crate::{Intrinsics, SE3};
 
 #[cfg(feature = "gpu")]
 fn single_rgb_splats(position: [f32; 3], scale: [f32; 3], color: [f32; 3]) -> HostSplats {
-    HostSplats::from_raw_parts(
+    HostSplats::from_components(
         position.into(),
         scale.map(f32::ln).into(),
         vec![1.0, 0.0, 0.0, 0.0],

@@ -6,7 +6,7 @@ use tempfile::tempdir;
 fn checkpoint_round_trips_host_splats() {
     let tempdir = tempdir().unwrap();
     let path = tempdir.path().join("checkpoint.json");
-    let splats = crate::core::HostSplats::from_raw_parts(
+    let splats = crate::core::HostSplats::from_components(
         vec![0.0, 0.0, 1.0],
         vec![0.1f32.ln(), 0.1f32.ln(), 0.1f32.ln()],
         vec![1.0, 0.0, 0.0, 0.0],

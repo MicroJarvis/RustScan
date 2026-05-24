@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::sh::{rgb_to_sh0_value, sh0_to_rgb_value, sh_coeff_count_for_degree};
+use crate::sh::{sh0_to_rgb_value, sh_coeff_count_for_degree};
 use crate::TrainingError;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -24,18 +24,8 @@ pub struct SplatView<'a> {
 }
 
 impl HostSplats {
-    pub(crate) fn with_sh_degree_capacity(sh_degree: usize, row_count: usize) -> Self {
-        Self {
-            positions: Vec::with_capacity(row_count * 3),
-            log_scales: Vec::with_capacity(row_count * 3),
-            rotations: Vec::with_capacity(row_count * 4),
-            opacity_logits: Vec::with_capacity(row_count),
-            sh_coeffs: Vec::with_capacity(row_count * sh_coeff_count_for_degree(sh_degree) * 3),
-            sh_degree,
-        }
-    }
-
-    pub fn from_raw_parts(
+    /// Build a host-side splat set from its packed component arrays.
+    pub fn from_components(
         positions: Vec<f32>,
         log_scales: Vec<f32>,
         rotations: Vec<f32>,
@@ -137,10 +127,6 @@ impl HostSplats {
         sh_coeff_count_for_degree(self.sh_degree) * 3
     }
 
-    pub(crate) fn sh_rest_row_width(&self) -> usize {
-        self.sh_coeffs_row_width().saturating_sub(3)
-    }
-
     pub fn sh_coeffs_row(&self, idx: usize) -> &[f32] {
         row_slice(&self.sh_coeffs, self.sh_coeffs_row_width(), idx)
     }
@@ -176,23 +162,6 @@ impl HostSplats {
         self.rotations.extend_from_slice(&rotation);
         self.opacity_logits.push(opacity_logit);
         self.push_sh_coeffs_row(sh_coeffs);
-    }
-
-    pub(crate) fn push_rgb(
-        &mut self,
-        position: [f32; 3],
-        log_scale: [f32; 3],
-        rotation: [f32; 4],
-        opacity_logit: f32,
-        rgb: [f32; 3],
-    ) {
-        self.positions.extend_from_slice(&position);
-        self.log_scales.extend_from_slice(&log_scale);
-        self.rotations.extend_from_slice(&rotation);
-        self.opacity_logits.push(opacity_logit);
-        self.sh_coeffs.extend(rgb.map(rgb_to_sh0_value));
-        self.sh_coeffs
-            .resize(self.sh_coeffs.len() + self.sh_rest_row_width(), 0.0);
     }
 
     pub(crate) fn truncate_rows(&mut self, row_count: usize) {

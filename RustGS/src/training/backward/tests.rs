@@ -10,7 +10,7 @@ fn test_camera() -> GaussianCamera {
 }
 
 fn test_splats() -> HostSplats {
-    HostSplats::from_raw_parts(
+    HostSplats::from_components(
         vec![0.0, 0.0, 2.0],
         vec![0.2f32.ln(), 0.2f32.ln(), 0.2f32.ln()],
         vec![1.0, 0.0, 0.0, 0.0],

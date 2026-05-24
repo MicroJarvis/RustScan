@@ -13,7 +13,7 @@ fn test_save_splats_ply_roundtrip() {
         gaussian_count: 1,
         sh_degree: 0,
     };
-    let splats = crate::core::HostSplats::from_raw_parts(
+    let splats = crate::core::HostSplats::from_components(
         vec![0.0, 0.0, 1.0],
         vec![0.1f32.ln(), 0.1f32.ln(), 0.1f32.ln()],
         vec![1.0, 0.0, 0.0, 0.0],
@@ -45,7 +45,7 @@ fn test_save_splats_ply_roundtrip_with_sh_coeffs() {
     };
     let mut sh_coeffs = vec![rgb_to_sh_dc(0.2), rgb_to_sh_dc(0.3), rgb_to_sh_dc(0.4)];
     sh_coeffs.extend((0..45).map(|idx| idx as f32 * 0.01));
-    let splats = crate::core::HostSplats::from_raw_parts(
+    let splats = crate::core::HostSplats::from_components(
         vec![1.0, 2.0, 3.0],
         vec![0.2f32.ln(), 0.3f32.ln(), 0.4f32.ln()],
         vec![1.0, 0.0, 0.0, 0.0],
@@ -77,7 +77,7 @@ fn test_save_splats_splat_roundtrip() {
         gaussian_count: 2,
         sh_degree: 0,
     };
-    let splats = crate::core::HostSplats::from_raw_parts(
+    let splats = crate::core::HostSplats::from_components(
         vec![0.0, 0.0, 1.0, 1.0, 2.0, 3.0],
         vec![
             0.1f32.ln(),
@@ -129,7 +129,7 @@ fn test_save_splats_dispatches_ply_by_extension() {
         gaussian_count: 1,
         sh_degree: 0,
     };
-    let splats = crate::core::HostSplats::from_raw_parts(
+    let splats = crate::core::HostSplats::from_components(
         vec![0.0, 0.0, 1.0],
         vec![0.1f32.ln(), 0.1f32.ln(), 0.1f32.ln()],
         vec![1.0, 0.0, 0.0, 0.0],

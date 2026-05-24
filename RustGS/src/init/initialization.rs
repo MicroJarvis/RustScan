@@ -9,6 +9,8 @@ use kiddo::{KdTree, SquaredEuclidean};
 
 #[cfg(feature = "gpu")]
 use crate::core::HostSplats;
+#[cfg(feature = "gpu")]
+use crate::sh::{rgb_to_sh0_value, sh_coeff_count_for_degree};
 use crate::TrainingError;
 
 /// Configuration for Gaussian initialization from point clouds.
@@ -47,7 +49,7 @@ pub fn initialize_host_splats_from_points(
     sh_degree: usize,
 ) -> Result<HostSplats, TrainingError> {
     if points.is_empty() {
-        return HostSplats::from_raw_parts(
+        return HostSplats::from_components(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -63,20 +65,33 @@ pub fn initialize_host_splats_from_points(
         .collect();
     let scales = compute_scales(&positions_vec3, config);
 
-    let mut splats = HostSplats::with_sh_degree_capacity(sh_degree, points.len());
-    for ((position, color), scale) in points.iter().zip(scales.iter()) {
+    let row_count = points.len();
+    let sh_row_width = sh_coeff_count_for_degree(sh_degree) * 3;
+    let mut positions = Vec::with_capacity(row_count * 3);
+    let mut log_scales = Vec::with_capacity(row_count * 3);
+    let mut rotations = Vec::with_capacity(row_count * 4);
+    let mut opacity_logits = Vec::with_capacity(row_count);
+    let mut sh_coeffs = vec![0.0; row_count * sh_row_width];
+
+    for (idx, ((position, color), scale)) in points.iter().zip(scales.iter()).enumerate() {
         let rgb = color.unwrap_or(config.default_color);
-        splats.push_rgb(
-            *position,
-            [scale.ln(), scale.ln(), scale.ln()],
-            [1.0, 0.0, 0.0, 0.0],
-            opacity_to_logit(config.opacity),
-            rgb,
-        );
+        positions.extend_from_slice(position);
+        log_scales.extend_from_slice(&[scale.ln(), scale.ln(), scale.ln()]);
+        rotations.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+        opacity_logits.push(opacity_to_logit(config.opacity));
+
+        let sh_base = idx * sh_row_width;
+        sh_coeffs[sh_base..sh_base + 3].copy_from_slice(&rgb.map(rgb_to_sh0_value));
     }
 
-    splats.validate()?;
-    Ok(splats)
+    HostSplats::from_components(
+        positions,
+        log_scales,
+        rotations,
+        opacity_logits,
+        sh_coeffs,
+        sh_degree,
+    )
 }
 
 fn compute_scales(points: &[Vec3], config: &GaussianInitConfig) -> Vec<f32> {
