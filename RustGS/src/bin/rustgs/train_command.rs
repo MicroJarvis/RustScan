@@ -1867,13 +1867,13 @@ fn resolve_parity_reference_report_path_from_manifest_dir(
 
 fn inferred_initialization_gaussian_count(
     dataset: &rustscan_types::TrainingDataset,
-    config: &rustgs::TrainingConfig,
+    _config: &rustgs::TrainingConfig,
 ) -> Option<usize> {
     let sparse_points = dataset.initial_points.len();
     if sparse_points == 0 {
         None
     } else {
-        Some(sparse_points.min(config.initialization.max_initial_gaussians.max(1)))
+        Some(sparse_points)
     }
 }
 

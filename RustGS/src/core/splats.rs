@@ -148,69 +148,6 @@ impl HostSplats {
         sigmoid_scalar(self.opacity_logit(idx)).clamp(0.0, 1.0)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn push(
-        &mut self,
-        position: [f32; 3],
-        log_scale: [f32; 3],
-        rotation: [f32; 4],
-        opacity_logit: f32,
-        sh_coeffs: &[f32],
-    ) {
-        self.positions.extend_from_slice(&position);
-        self.log_scales.extend_from_slice(&log_scale);
-        self.rotations.extend_from_slice(&rotation);
-        self.opacity_logits.push(opacity_logit);
-        self.push_sh_coeffs_row(sh_coeffs);
-    }
-
-    pub(crate) fn truncate_rows(&mut self, row_count: usize) {
-        if row_count >= self.len() {
-            return;
-        }
-
-        self.positions.truncate(row_count * 3);
-        self.log_scales.truncate(row_count * 3);
-        self.rotations.truncate(row_count * 4);
-        self.opacity_logits.truncate(row_count);
-        self.sh_coeffs
-            .truncate(row_count * self.sh_coeffs_row_width());
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn retained_view(&self, row_count: usize) -> Self {
-        Self {
-            positions: Vec::with_capacity(row_count * 3),
-            log_scales: Vec::with_capacity(row_count * 3),
-            rotations: Vec::with_capacity(row_count * 4),
-            opacity_logits: Vec::with_capacity(row_count),
-            sh_coeffs: Vec::with_capacity(row_count * self.sh_coeffs_row_width()),
-            sh_degree: self.sh_degree,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn downsample_evenly(&mut self, target_count: usize) {
-        if target_count == 0 || self.len() <= target_count {
-            return;
-        }
-
-        let len = self.len();
-        let mut sampled = self.retained_view(target_count);
-        for out_idx in 0..target_count {
-            let src_idx = out_idx.saturating_mul(len) / target_count;
-            let src_idx = src_idx.min(len.saturating_sub(1));
-            sampled.push(
-                self.position(src_idx),
-                self.log_scale(src_idx),
-                self.rotation(src_idx),
-                self.opacity_logits[src_idx],
-                self.sh_coeffs_row(src_idx),
-            );
-        }
-        *self = sampled;
-    }
-
     pub fn positions_vec3(&self) -> Vec<[f32; 3]> {
         (0..self.len()).map(|idx| self.position(idx)).collect()
     }
@@ -250,20 +187,6 @@ impl HostSplats {
             max_dist = max_dist.max((dx * dx + dy * dy + dz * dz).sqrt());
         }
         max_dist.max(1e-3)
-    }
-
-    #[allow(dead_code)]
-    fn push_sh_coeffs_row(&mut self, sh_coeffs: &[f32]) {
-        let row_width = self.sh_coeffs_row_width();
-        if row_width == 0 {
-            return;
-        }
-        let copied = sh_coeffs.len().min(row_width);
-        self.sh_coeffs.extend_from_slice(&sh_coeffs[..copied]);
-        if copied < row_width {
-            self.sh_coeffs
-                .resize(self.sh_coeffs.len() + (row_width - copied), 0.0);
-        }
     }
 }
 

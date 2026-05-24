@@ -137,9 +137,7 @@ impl CameraModel {
 
 /// COLMAP camera entry.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ColmapCamera {
-    camera_id: u32,
     model: CameraModel,
     width: u32,
     height: u32,
@@ -148,7 +146,6 @@ struct ColmapCamera {
 
 /// COLMAP image entry.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ColmapImage {
     image_id: u32,
     qw: f64,
@@ -158,15 +155,12 @@ struct ColmapImage {
     tx: f64,
     ty: f64,
     tz: f64,
-    camera_id: u32,
     name: String,
 }
 
 /// COLMAP 3D point entry.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ColmapPoint3D {
-    point_id: u64,
     x: f64,
     y: f64,
     z: f64,
@@ -436,7 +430,7 @@ fn parse_cameras_binary(path: &Path) -> Result<Vec<ColmapCamera>, TrainingError>
 
     let mut cameras = Vec::with_capacity(num_cameras);
     for _ in 0..num_cameras {
-        let camera_id = read_u32(&mut file)?;
+        read_u32(&mut file)?;
         let model_id = read_u32(&mut file)?;
         let width = read_u64(&mut file)? as u32;
         let height = read_u64(&mut file)? as u32;
@@ -451,7 +445,6 @@ fn parse_cameras_binary(path: &Path) -> Result<Vec<ColmapCamera>, TrainingError>
             .collect::<std::io::Result<Vec<_>>>()?;
 
         cameras.push(ColmapCamera {
-            camera_id,
             model,
             width,
             height,
@@ -478,7 +471,7 @@ fn parse_cameras_text(path: &Path) -> Result<Vec<ColmapCamera>, TrainingError> {
             continue;
         }
 
-        let camera_id = parse_u32(path, line_num, "camera_id", parts[0])?;
+        parse_u32(path, line_num, "camera_id", parts[0])?;
         let model_name = parts[1];
         let width = parse_u32(path, line_num, "width", parts[2])?;
         let height = parse_u32(path, line_num, "height", parts[3])?;
@@ -491,7 +484,6 @@ fn parse_cameras_text(path: &Path) -> Result<Vec<ColmapCamera>, TrainingError> {
             .collect::<Result<Vec<_>, _>>()?;
 
         cameras.push(ColmapCamera {
-            camera_id,
             model,
             width,
             height,
@@ -574,7 +566,7 @@ fn parse_images_binary(path: &Path) -> Result<Vec<ColmapImage>, TrainingError> {
         let tx = read_f64(&mut file)?;
         let ty = read_f64(&mut file)?;
         let tz = read_f64(&mut file)?;
-        let camera_id = read_u32(&mut file)?;
+        read_u32(&mut file)?;
         let name = read_string(&mut file)?;
 
         // Skip 2D point observations (we don't need them for dataset loading)
@@ -595,7 +587,6 @@ fn parse_images_binary(path: &Path) -> Result<Vec<ColmapImage>, TrainingError> {
             tx,
             ty,
             tz,
-            camera_id,
             name,
         });
     }
@@ -634,7 +625,7 @@ fn parse_images_text(path: &Path) -> Result<Vec<ColmapImage>, TrainingError> {
         let tx = parse_f64(path, line_num, "tx", parts[5])?;
         let ty = parse_f64(path, line_num, "ty", parts[6])?;
         let tz = parse_f64(path, line_num, "tz", parts[7])?;
-        let camera_id = parse_u32(path, line_num, "camera_id", parts[8])?;
+        parse_u32(path, line_num, "camera_id", parts[8])?;
         let name = parts[9].to_string();
 
         images.push(ColmapImage {
@@ -646,7 +637,6 @@ fn parse_images_text(path: &Path) -> Result<Vec<ColmapImage>, TrainingError> {
             tx,
             ty,
             tz,
-            camera_id,
             name,
         });
     }
@@ -676,7 +666,7 @@ fn parse_points3d_binary(path: &Path) -> Result<Vec<ColmapPoint3D>, TrainingErro
 
     let mut points = Vec::with_capacity(num_points);
     for _ in 0..num_points {
-        let point_id = read_u64(&mut file)?;
+        read_u64(&mut file)?;
         let x = read_f64(&mut file)?;
         let y = read_f64(&mut file)?;
         let z = read_f64(&mut file)?;
@@ -692,15 +682,7 @@ fn parse_points3d_binary(path: &Path) -> Result<Vec<ColmapPoint3D>, TrainingErro
             read_u32(&mut file)?; // point2d_idx
         }
 
-        points.push(ColmapPoint3D {
-            point_id,
-            x,
-            y,
-            z,
-            r,
-            g,
-            b,
-        });
+        points.push(ColmapPoint3D { x, y, z, r, g, b });
     }
 
     Ok(points)
@@ -723,7 +705,7 @@ fn parse_points3d_text(path: &Path) -> Result<Vec<ColmapPoint3D>, TrainingError>
             continue;
         }
 
-        let point_id = parse_u64(path, line_num, "point_id", parts[0])?;
+        parse_u64(path, line_num, "point_id", parts[0])?;
         let x = parse_f64(path, line_num, "x", parts[1])?;
         let y = parse_f64(path, line_num, "y", parts[2])?;
         let z = parse_f64(path, line_num, "z", parts[3])?;
@@ -731,15 +713,7 @@ fn parse_points3d_text(path: &Path) -> Result<Vec<ColmapPoint3D>, TrainingError>
         let g = parse_u8(path, line_num, "g", parts[5])?;
         let b = parse_u8(path, line_num, "b", parts[6])?;
 
-        points.push(ColmapPoint3D {
-            point_id,
-            x,
-            y,
-            z,
-            r,
-            g,
-            b,
-        });
+        points.push(ColmapPoint3D { x, y, z, r, g, b });
     }
 
     Ok(points)

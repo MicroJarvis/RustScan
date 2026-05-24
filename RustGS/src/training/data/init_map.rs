@@ -14,17 +14,7 @@ pub(crate) fn build_initial_splats(
 
     let sh_degree = config.litegs.rendering.sh_degree;
     let init_config = gaussian_init_config_for_training();
-    let mut splats =
-        initialize_host_splats_from_points(&dataset.initial_points, &init_config, sh_degree)?;
-    let max_initial = config.initialization.max_initial_gaussians.max(1);
-    if splats.len() > max_initial {
-        log::warn!(
-            "Truncating point-initialized chunk from {} to {} gaussians to respect max_initial_gaussians",
-            splats.len(),
-            max_initial,
-        );
-        splats.truncate_rows(max_initial);
-    }
+    let splats = initialize_host_splats_from_points(&dataset.initial_points, &init_config, sh_degree)?;
 
     splats
         .validate()
@@ -35,7 +25,3 @@ pub(crate) fn build_initial_splats(
 pub(super) fn gaussian_init_config_for_training() -> GaussianInitConfig {
     GaussianInitConfig::default()
 }
-
-#[cfg(test)]
-mod tests;
-

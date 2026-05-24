@@ -141,7 +141,6 @@ async fn read_projection_counts_async<B: Backend>(
     )
 }
 
-#[allow(dead_code)]
 pub(crate) struct RenderOutput<B: Backend> {
     pub out_img: Tensor<B, 3>,
     pub visible: Tensor<B, 1>,
@@ -150,7 +149,6 @@ pub(crate) struct RenderOutput<B: Backend> {
     pub compact_gid_from_isect: Tensor<B, 1, Int>,
     pub tile_offsets: Tensor<B, 1, Int>,
     pub num_visible: usize,
-    pub num_intersections: usize,
 }
 
 pub(crate) async fn render_forward<B>(
@@ -207,7 +205,6 @@ where
             compact_gid_from_isect: empty_indices,
             tile_offsets,
             num_visible,
-            num_intersections,
         };
     }
 
@@ -249,7 +246,6 @@ where
             compact_gid_from_isect,
             tile_offsets,
             num_visible,
-            num_intersections,
         };
     }
 
@@ -289,7 +285,6 @@ where
         compact_gid_from_isect: tile_out.compact_gid_from_isect,
         tile_offsets,
         num_visible,
-        num_intersections,
     }
 }
 

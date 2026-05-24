@@ -37,22 +37,6 @@ pub(super) struct RunningMoments {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-impl RunningMoments {
-    #[allow(dead_code)]
-    pub(super) fn update(&mut self, value: f32) {
-        if !value.is_finite() {
-            return;
-        }
-        self.count = self.count.saturating_add(1);
-        let count = self.count as f32;
-        let delta = value - self.mean;
-        self.mean += delta / count;
-        let delta2 = value - self.mean;
-        self.m2 += delta * delta2;
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct MetalGaussianStats {
     pub(super) mean2d_grad: RunningMoments,
@@ -67,9 +51,7 @@ pub(super) struct MetalGaussianStats {
     pub(super) visible_count: usize,
     pub(super) actual_visible_count: usize,
     pub(super) actual_visibility_ratio: f32,
-    #[allow(dead_code)]
     pub(super) age: usize,
-    #[allow(dead_code)]
     pub(super) consecutive_invisible_epochs: usize,
 }
 

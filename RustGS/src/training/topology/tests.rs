@@ -66,7 +66,7 @@ pub(super) fn densify_snapshot_litegs(
         position[max_axis] += max_axis_scale * 0.5;
         log_scale[max_axis] = (max_axis_scale / 1.6f32).max(1e-6f32).ln();
 
-        snapshot.push(position, log_scale, rotation, opacity_logit, &sh_coeffs);
+        append_splat(snapshot, position, log_scale, rotation, opacity_logit, &sh_coeffs);
         stats.push(MetalGaussianStats::default());
         origins.push(None);
         added = added.saturating_add(1);
@@ -82,7 +82,7 @@ pub(super) fn densify_snapshot_litegs(
         let rotation = snapshot.rotation(*idx);
         let opacity_logit = snapshot.opacity_logits[*idx];
         let sh_coeffs = snapshot.sh_coeffs_row(*idx).to_vec();
-        snapshot.push(position, log_scale, rotation, opacity_logit, &sh_coeffs);
+        append_splat(snapshot, position, log_scale, rotation, opacity_logit, &sh_coeffs);
         stats.push(MetalGaussianStats::default());
         origins.push(None);
         added = added.saturating_add(1);
@@ -222,7 +222,7 @@ fn rebuild_snapshot_from_plan(
     metrics: &TopologySplatMetrics,
     plan: &TopologyMutationPlan,
 ) -> Splats {
-    let mut rebuilt = snapshot.retained_view(plan.rows.len());
+    let mut rebuilt = empty_splats_like(snapshot, plan.rows.len());
     for row in &plan.rows {
         let source_idx = row.source_idx();
         let position = row.position(metrics);
@@ -237,7 +237,8 @@ fn rebuild_snapshot_from_plan(
         let log_scale = scale.map(|value| value.max(1e-6).ln());
         let rotation = snapshot.rotation(source_idx);
         let opacity_logit = (opacity / (1.0 - opacity)).ln();
-        rebuilt.push(
+        append_splat(
+            &mut rebuilt,
             position,
             log_scale,
             rotation,
@@ -246,6 +247,43 @@ fn rebuild_snapshot_from_plan(
         );
     }
     rebuilt
+}
+
+fn empty_splats_like(snapshot: &Splats, row_count: usize) -> Splats {
+    let sh_degree = snapshot.sh_degree();
+    let sh_row_width = sh_coeff_count_for_degree(sh_degree) * 3;
+    Splats::from_components(
+        Vec::with_capacity(row_count * 3),
+        Vec::with_capacity(row_count * 3),
+        Vec::with_capacity(row_count * 4),
+        Vec::with_capacity(row_count),
+        Vec::with_capacity(row_count * sh_row_width),
+        sh_degree,
+    )
+    .expect("empty topology test snapshot")
+}
+
+fn append_splat(
+    splats: &mut Splats,
+    position: [f32; 3],
+    log_scale: [f32; 3],
+    rotation: [f32; 4],
+    opacity_logit: f32,
+    sh_coeffs: &[f32],
+) {
+    let row_width = sh_coeff_count_for_degree(splats.sh_degree()) * 3;
+    let copied = sh_coeffs.len().min(row_width);
+
+    splats.positions.extend_from_slice(&position);
+    splats.log_scales.extend_from_slice(&log_scale);
+    splats.rotations.extend_from_slice(&rotation);
+    splats.opacity_logits.push(opacity_logit);
+    splats.sh_coeffs.extend_from_slice(&sh_coeffs[..copied]);
+    if copied < row_width {
+        splats
+            .sh_coeffs
+            .resize(splats.sh_coeffs.len() + (row_width - copied), 0.0);
+    }
 }
 
 fn apply_refine_decay_for_test(
