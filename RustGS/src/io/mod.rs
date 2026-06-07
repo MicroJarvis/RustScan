@@ -1,14 +1,10 @@
 //! IO module for scene files and checkpoints.
 //!
 //! - `scene_io`: PLY scene export/import
-//! - `tum_dataset`: TUM RGB-D dataset loading for direct RustGS training
 //! - `colmap_dataset`: COLMAP dataset loading
-//! - `nerfstudio_dataset`: Nerfstudio-style `transforms.json` loading
 
 pub mod colmap_dataset;
-pub mod nerfstudio_dataset;
 pub mod scene_io;
-pub mod tum_dataset;
 
 #[cfg(feature = "gpu")]
 use crate::core::HostSplats;

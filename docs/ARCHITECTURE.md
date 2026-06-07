@@ -18,7 +18,7 @@ RustScan 是一个多 crate 的 3D 重建工作区，但当前主线已经明确
 ## Cross-Crate Flow
 
 1. 外部数据源或 `RustSLAM` 提供图像、位姿和可选稀疏点。
-2. `RustGS` 将 TUM、COLMAP 或 `TrainingDataset` JSON 解析为 `TrainingDataset`。
+2. `RustGS` 将 COLMAP sparse reconstruction 解析为 `TrainingDataset`。
 3. `RustGS` 初始化并训练 splats，导出 splat PLY、checkpoint 与评估摘要。
 4. `RustViewer` 或其他工具消费导出的 splat/checkpoint 产物。
 5. `RustMesh` 只在需要网格后处理时介入，不参与 RustGS 核心训练状态设计。
@@ -29,8 +29,8 @@ RustScan 是一个多 crate 的 3D 重建工作区，但当前主线已经明确
 
 当前 RustGS 保留的训练主入口是 splat-first 的：
 
-- `rustgs::load_training_dataset_with_source`
-- `rustgs::load_training_dataset`
+- `rustgs::load_colmap_training_dataset_with_source`
+- `rustgs::load_colmap_training_dataset`
 - `rustgs::train_splats`
 - `rustgs::evaluate_splats`
 - `rustgs::runtime_from_splats`

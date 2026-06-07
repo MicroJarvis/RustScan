@@ -1,32 +1,32 @@
 use std::path::PathBuf;
 
 use rustgs::{
-    evaluate_splats, evaluation_device, load_training_dataset, select_evaluation_frames,
-    EvaluationDevice, SplatEvaluationConfig, SplatMetadata, TrainingConfig, TrainingOptions,
-    TumRgbdConfig,
+    evaluate_splats, evaluation_device, load_colmap_training_dataset, select_evaluation_frames,
+    ColmapConfig, EvaluationDevice, SplatEvaluationConfig, SplatMetadata, TrainingConfig,
+    TrainingOptions,
 };
 
-fn tum_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test_data/tum")
+fn colmap_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test_data/tum_freiburg1_xyz_colmap")
 }
 
-fn tum_root_if_available() -> Option<PathBuf> {
-    let root = tum_root();
+fn colmap_root_if_available() -> Option<PathBuf> {
+    let root = colmap_root();
     root.exists().then_some(root)
 }
 
 #[test]
-fn loads_workspace_tum_directory_as_training_dataset() {
-    let Some(root) = tum_root_if_available() else {
+fn loads_workspace_colmap_directory_as_training_dataset() {
+    let Some(root) = colmap_root_if_available() else {
         eprintln!(
-            "skipping test: missing TUM fixture at {}",
-            tum_root().display()
+            "skipping test: missing COLMAP fixture at {}",
+            colmap_root().display()
         );
         return;
     };
-    let dataset = load_training_dataset(
+    let dataset = load_colmap_training_dataset(
         &root,
-        &TumRgbdConfig {
+        &ColmapConfig {
             max_frames: 90,
             frame_stride: 30,
             ..Default::default()
@@ -35,22 +35,21 @@ fn loads_workspace_tum_directory_as_training_dataset() {
     .unwrap();
 
     assert!(dataset.poses.len() >= 3);
-    assert_eq!(dataset.depth_scale, 5000.0);
-    assert!(dataset.poses.iter().all(|pose| pose.depth_path.is_some()));
+    assert!(!dataset.initial_points.is_empty());
 }
 
 #[test]
-fn selects_stable_tum_eval_subset_with_stride() {
-    let Some(root) = tum_root_if_available() else {
+fn selects_stable_colmap_eval_subset_with_stride() {
+    let Some(root) = colmap_root_if_available() else {
         eprintln!(
-            "skipping test: missing TUM fixture at {}",
-            tum_root().display()
+            "skipping test: missing COLMAP fixture at {}",
+            colmap_root().display()
         );
         return;
     };
-    let dataset = load_training_dataset(
+    let dataset = load_colmap_training_dataset(
         &root,
-        &TumRgbdConfig {
+        &ColmapConfig {
             max_frames: 180,
             frame_stride: 1,
             ..Default::default()
@@ -65,11 +64,11 @@ fn selects_stable_tum_eval_subset_with_stride() {
 
 #[cfg(feature = "gpu")]
 #[test]
-fn trains_directly_from_workspace_tum_directory() {
-    let Some(root) = tum_root_if_available() else {
+fn trains_directly_from_workspace_colmap_directory() {
+    let Some(root) = colmap_root_if_available() else {
         eprintln!(
-            "skipping test: missing TUM fixture at {}",
-            tum_root().display()
+            "skipping test: missing COLMAP fixture at {}",
+            colmap_root().display()
         );
         return;
     };
@@ -85,19 +84,15 @@ fn trains_directly_from_workspace_tum_directory() {
         },
         ..TrainingConfig::default()
     };
-    let dataset = load_training_dataset(
+    let dataset = load_colmap_training_dataset(
         &root,
-        &TumRgbdConfig {
+        &ColmapConfig {
             max_frames: 90,
             frame_stride: 30,
             ..Default::default()
         },
     )
     .unwrap();
-    if dataset.initial_points.is_empty() {
-        eprintln!("skipping test: TUM fixture does not include sparse initialization points");
-        return;
-    }
 
     let run = rustgs::train_splats(&dataset, &config, TrainingOptions::default()).unwrap();
 
@@ -106,11 +101,11 @@ fn trains_directly_from_workspace_tum_directory() {
 
 #[cfg(feature = "gpu")]
 #[test]
-fn tum_training_smoke_produces_post_train_evaluation_summary() {
-    let Some(root) = tum_root_if_available() else {
+fn colmap_training_smoke_produces_post_train_evaluation_summary() {
+    let Some(root) = colmap_root_if_available() else {
         eprintln!(
-            "skipping test: missing TUM fixture at {}",
-            tum_root().display()
+            "skipping test: missing COLMAP fixture at {}",
+            colmap_root().display()
         );
         return;
     };
@@ -119,12 +114,12 @@ fn tum_training_smoke_produces_post_train_evaluation_summary() {
         return;
     }
 
-    let tum_config = TumRgbdConfig {
+    let colmap_config = ColmapConfig {
         max_frames: 90,
         frame_stride: 30,
         ..Default::default()
     };
-    let dataset = load_training_dataset(&root, &tum_config).unwrap();
+    let dataset = load_colmap_training_dataset(&root, &colmap_config).unwrap();
 
     let config = TrainingConfig {
         iterations: 1,
@@ -134,11 +129,6 @@ fn tum_training_smoke_produces_post_train_evaluation_summary() {
         },
         ..TrainingConfig::default()
     };
-    if dataset.initial_points.is_empty() {
-        eprintln!("skipping test: TUM fixture does not include sparse initialization points");
-        return;
-    }
-
     let run = rustgs::train_splats(&dataset, &config, TrainingOptions::default()).unwrap();
     let metadata = SplatMetadata {
         iterations: config.iterations,

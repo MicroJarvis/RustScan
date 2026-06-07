@@ -77,5 +77,5 @@ name = "rustgs_residual_heatmap"
 required-features = ["gpu", "cli"]
 
 [[test]]
-name = "tum_training"
+name = "colmap_training"
 required-features = ["gpu"]

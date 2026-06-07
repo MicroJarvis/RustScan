@@ -17,7 +17,6 @@ pub const DEFAULT_CONVERGENCE_FIXTURE_ID: &str = "litegs-apple-silicon-convergen
 #[serde(rename_all = "snake_case")]
 pub enum ParityFixtureKind {
     SyntheticTrainingDataset,
-    TumRgbdDirectory,
     ColmapDirectory,
 }
 
@@ -93,16 +92,15 @@ pub fn default_litegs_parity_fixtures() -> Vec<ParityFixtureSpec> {
             id: DEFAULT_CONVERGENCE_FIXTURE_ID.to_string(),
             kind: ParityFixtureKind::ColmapDirectory,
             description: "Apple Silicon convergence fixture reserved for LiteGS parity tracking.".to_string(),
-            input_path: Some(PathBuf::from("test_data/fixtures/litegs/colmap-small")),
-            bootstrap_input_path: Some(PathBuf::from("test_data/tum/rgbd_dataset_freiburg1_xyz")),
+            input_path: Some(PathBuf::from("test_data/tum_freiburg1_xyz_colmap")),
+            bootstrap_input_path: None,
             reference_report_path: Some(PathBuf::from(
                 "test_data/fixtures/litegs/colmap-small/parity-reference.json",
             )),
             max_frames: Some(90),
             frame_stride: Some(30),
             notes: vec![
-                "The canonical parity target is a small COLMAP scene.".to_string(),
-                "Until that fixture is checked into the workspace, the harness boots from the existing Freiburg1 XYZ TUM subset to keep Apple Silicon smoke coverage live.".to_string(),
+                "The canonical parity target is a COLMAP reconstruction.".to_string(),
             ],
         },
     ]

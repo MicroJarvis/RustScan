@@ -17,13 +17,10 @@ fn default_fixture_registry_contains_tiny_and_convergence_targets() {
     assert_eq!(fixtures[0].id, DEFAULT_TINY_FIXTURE_ID);
     assert_eq!(fixtures[1].id, DEFAULT_CONVERGENCE_FIXTURE_ID);
     assert_eq!(
-        fixtures[1]
-            .bootstrap_input_path
-            .as_ref()
-            .unwrap()
-            .to_string_lossy(),
-        "test_data/tum/rgbd_dataset_freiburg1_xyz"
+        fixtures[1].input_path.as_ref().unwrap().to_string_lossy(),
+        "test_data/tum_freiburg1_xyz_colmap"
     );
+    assert!(fixtures[1].bootstrap_input_path.is_none());
 }
 
 #[test]
@@ -66,7 +63,7 @@ fn parity_report_round_trips_through_json() {
 #[test]
 fn parity_fixture_id_matches_known_bootstrap_fixture_and_external_fallback() {
     assert_eq!(
-        parity_fixture_id_for_input_path(Path::new("test_data/tum/rgbd_dataset_freiburg1_xyz")),
+        parity_fixture_id_for_input_path(Path::new("test_data/tum_freiburg1_xyz_colmap")),
         DEFAULT_CONVERGENCE_FIXTURE_ID
     );
     assert_eq!(
@@ -85,15 +82,13 @@ fn default_parity_report_path_uses_output_stem() {
 fn resolve_litegs_fixture_input_prefers_canonical_fixture_and_falls_back_to_bootstrap() {
     let tempdir = tempdir().unwrap();
     let workspace_root = tempdir.path();
-    let bootstrap = workspace_root.join("test_data/tum/rgbd_dataset_freiburg1_xyz");
-    std::fs::create_dir_all(&bootstrap).unwrap();
+    assert!(resolve_litegs_parity_fixture_input_path(
+        DEFAULT_CONVERGENCE_FIXTURE_ID,
+        workspace_root
+    )
+    .is_none());
 
-    let resolved_bootstrap =
-        resolve_litegs_parity_fixture_input_path(DEFAULT_CONVERGENCE_FIXTURE_ID, workspace_root)
-            .unwrap();
-    assert_eq!(resolved_bootstrap, bootstrap);
-
-    let canonical = workspace_root.join("test_data/fixtures/litegs/colmap-small");
+    let canonical = workspace_root.join("test_data/tum_freiburg1_xyz_colmap");
     std::fs::create_dir_all(&canonical).unwrap();
 
     let resolved_canonical =

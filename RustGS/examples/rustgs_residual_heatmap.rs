@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use image::{ImageBuffer, RgbImage};
 use rustgs::{
-    evaluation_device, load_splats_ply, load_training_dataset, render_evaluation_frame,
-    runtime_from_splats, EvaluationDevice, SplatEvaluationRenderer, TrainingDataset, TumRgbdConfig,
+    evaluation_device, load_colmap_training_dataset, load_splats_ply, render_evaluation_frame,
+    runtime_from_splats, ColmapConfig, EvaluationDevice, SplatEvaluationRenderer, TrainingDataset,
 };
 use serde::Serialize;
 
@@ -19,7 +19,7 @@ struct Args {
     #[arg(long)]
     scene: PathBuf,
 
-    /// Path to the source TUM/COLMAP dataset.
+    /// Path to the source COLMAP dataset.
     #[arg(long)]
     dataset: PathBuf,
 
@@ -100,12 +100,12 @@ fn main() -> anyhow::Result<()> {
         .parse::<EvaluationDevice>()
         .map_err(anyhow::Error::msg)?;
     let device = evaluation_device(eval_device)?;
-    let mut dataset = load_training_dataset(
+    let mut dataset = load_colmap_training_dataset(
         &args.dataset,
-        &TumRgbdConfig {
+        &ColmapConfig {
             max_frames: 0,
             frame_stride: 1,
-            ..TumRgbdConfig::default()
+            ..ColmapConfig::default()
         },
     )?;
     dataset = filter_dataset_to_frame_ranges(dataset, &frame_ranges)?;

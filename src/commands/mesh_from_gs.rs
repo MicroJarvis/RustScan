@@ -13,7 +13,7 @@ pub struct MeshFromGsArgs {
     #[arg(long)]
     scene: PathBuf,
 
-    /// Original training input directory or TrainingDataset JSON used for the scene.
+    /// Original COLMAP training input directory used for the scene.
     #[arg(short, long)]
     input: PathBuf,
 
@@ -86,13 +86,8 @@ pub fn run_mesh_from_gs(args: MeshFromGsArgs) -> anyhow::Result<()> {
         bail!("scene {} contains no Gaussians", args.scene.display());
     }
 
-    let (dataset, source) = rustgs::load_training_dataset_with_source(
+    let (dataset, source) = rustgs::load_colmap_training_dataset_with_source(
         &args.input,
-        &rustgs::TumRgbdConfig {
-            max_frames: 0,
-            frame_stride: 1,
-            ..Default::default()
-        },
         &rustgs::ColmapConfig {
             max_frames: 0,
             frame_stride: 1,

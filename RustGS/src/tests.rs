@@ -26,16 +26,12 @@ fn write_colmap_test_dataset(root: &Path) {
 }
 
 #[test]
-fn test_load_training_dataset_with_source_detects_colmap_directory() {
+fn test_load_colmap_training_dataset_with_source_detects_colmap_directory() {
     let temp = tempdir().unwrap();
     write_colmap_test_dataset(temp.path());
 
-    let (dataset, source) = load_training_dataset_with_source(
-        temp.path(),
-        &TumRgbdConfig::default(),
-        &ColmapConfig::default(),
-    )
-    .unwrap();
+    let (dataset, source) =
+        load_colmap_training_dataset_with_source(temp.path(), &ColmapConfig::default()).unwrap();
 
     assert_eq!(source, TrainingInputKind::Colmap);
     assert_eq!(dataset.poses.len(), 1);
@@ -43,7 +39,7 @@ fn test_load_training_dataset_with_source_detects_colmap_directory() {
 }
 
 #[test]
-fn test_load_training_dataset_with_source_detects_nerfstudio_directory() {
+fn test_load_colmap_training_dataset_rejects_non_colmap_directory() {
     let temp = tempdir().unwrap();
     std::fs::write(temp.path().join("frame.png"), []).unwrap();
     std::fs::write(
@@ -85,16 +81,11 @@ end_header\n\
     )
     .unwrap();
 
-    let (dataset, source) = load_training_dataset_with_source(
-        temp.path(),
-        &TumRgbdConfig::default(),
-        &ColmapConfig::default(),
-    )
-    .unwrap();
+    let err = load_colmap_training_dataset_with_source(temp.path(), &ColmapConfig::default())
+        .unwrap_err();
 
-    assert_eq!(source, TrainingInputKind::Nerfstudio);
-    assert_eq!(dataset.poses.len(), 1);
-    assert_eq!(dataset.initial_points.len(), 1);
-    assert_eq!(dataset.initial_points[0].0, [0.0, 0.0, 1.0]);
-    assert_eq!(dataset.initial_points[0].1, Some([1.0, 128.0 / 255.0, 0.0]));
+    assert!(
+        err.to_string().contains("COLMAP"),
+        "unexpected error: {err}"
+    );
 }

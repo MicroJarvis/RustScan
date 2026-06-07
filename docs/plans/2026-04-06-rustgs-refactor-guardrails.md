@@ -32,8 +32,8 @@ Last verified: 2026-04-10
 
 当前保留的 RustGS public contract：
 
-- `rustgs::load_training_dataset_with_source`
-- `rustgs::load_training_dataset`
+- `rustgs::load_colmap_training_dataset_with_source`
+- `rustgs::load_colmap_training_dataset`
 - `rustgs::train_splats`
 - `rustgs::evaluate_splats`
 - `rustgs::runtime_from_splats`

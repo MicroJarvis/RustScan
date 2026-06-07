@@ -2,21 +2,21 @@ use std::path::PathBuf;
 
 use image::{ImageBuffer, RgbImage};
 use rustgs::{
-    evaluate_splats, evaluation_device, load_splats_ply, load_training_dataset,
-    render_evaluation_frame, runtime_from_splats, select_evaluation_frames, EvaluationDevice,
-    EvaluationFrameMetric, HostSplats, SplatEvaluationConfig, SplatEvaluationRenderer,
-    SplatEvaluationSummary, TrainingDataset, TumRgbdConfig,
+    evaluate_splats, evaluation_device, load_colmap_training_dataset, load_splats_ply,
+    render_evaluation_frame, runtime_from_splats, select_evaluation_frames, ColmapConfig,
+    EvaluationDevice, EvaluationFrameMetric, HostSplats, SplatEvaluationConfig,
+    SplatEvaluationRenderer, SplatEvaluationSummary, TrainingDataset,
 };
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
 
-    let dataset = load_training_dataset(
+    let dataset = load_colmap_training_dataset(
         &args.dataset,
-        &TumRgbdConfig {
+        &ColmapConfig {
             max_frames: args.max_frames,
             frame_stride: 1,
-            ..TumRgbdConfig::default()
+            ..ColmapConfig::default()
         },
     )?;
     let included_ranges = parse_frame_ranges(args.include_frame_ranges.as_deref())?;

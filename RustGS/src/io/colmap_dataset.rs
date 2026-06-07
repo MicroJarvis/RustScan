@@ -395,16 +395,27 @@ fn read_u32<T: Read>(reader: &mut T) -> std::io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
+fn read_u8<T: Read>(reader: &mut T) -> std::io::Result<u8> {
+    let mut buf = [0u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
 fn read_f64<T: Read>(reader: &mut T) -> std::io::Result<f64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(f64::from_le_bytes(buf))
 }
 
-fn read_string<T: Read>(reader: &mut T) -> std::io::Result<String> {
-    let len = read_u64(reader)? as usize;
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf)?;
+fn read_null_terminated_string<T: Read>(reader: &mut T) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    loop {
+        let byte = read_u8(reader)?;
+        if byte == 0 {
+            break;
+        }
+        buf.push(byte);
+    }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -567,7 +578,7 @@ fn parse_images_binary(path: &Path) -> Result<Vec<ColmapImage>, TrainingError> {
         let ty = read_f64(&mut file)?;
         let tz = read_f64(&mut file)?;
         read_u32(&mut file)?;
-        let name = read_string(&mut file)?;
+        let name = read_null_terminated_string(&mut file)?;
 
         // Skip 2D point observations (we don't need them for dataset loading)
         let num_points2d = read_u64(&mut file)?;
@@ -670,9 +681,9 @@ fn parse_points3d_binary(path: &Path) -> Result<Vec<ColmapPoint3D>, TrainingErro
         let x = read_f64(&mut file)?;
         let y = read_f64(&mut file)?;
         let z = read_f64(&mut file)?;
-        let r = read_u32(&mut file)? as u8;
-        let g = read_u32(&mut file)? as u8;
-        let b = read_u32(&mut file)? as u8;
+        let r = read_u8(&mut file)?;
+        let g = read_u8(&mut file)?;
+        let b = read_u8(&mut file)?;
 
         // Skip error and track
         read_f64(&mut file)?; // error

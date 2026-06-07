@@ -5,10 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use image::{ImageBuffer, RgbImage};
 use rustgs::{
-    evaluate_splats, evaluation_device, load_splats_ply, load_training_dataset,
-    render_evaluation_frame, runtime_from_splats, select_evaluation_frames, EvaluationDevice,
-    EvaluationFrameMetric, HostSplats, SplatEvaluationConfig, SplatEvaluationRenderer,
-    SplatEvaluationSummary, TrainingDataset, TumRgbdConfig,
+    evaluate_splats, evaluation_device, load_colmap_training_dataset, load_splats_ply,
+    render_evaluation_frame, runtime_from_splats, select_evaluation_frames, ColmapConfig,
+    EvaluationDevice, EvaluationFrameMetric, HostSplats, SplatEvaluationConfig,
+    SplatEvaluationRenderer, SplatEvaluationSummary, TrainingDataset,
 };
 use serde::Serialize;
 
@@ -185,12 +185,12 @@ fn main() -> anyhow::Result<()> {
     let mut reports = Vec::new();
     for case in eval_cases() {
         println!("running case {}", case.name);
-        let mut dataset = load_training_dataset(
+        let mut dataset = load_colmap_training_dataset(
             &args.dataset,
-            &TumRgbdConfig {
+            &ColmapConfig {
                 max_frames: case.dataset_max_frames,
                 frame_stride: 1,
-                ..TumRgbdConfig::default()
+                ..ColmapConfig::default()
             },
         )?;
         let include_ranges = parse_frame_ranges(case.include_frame_ranges)?;
