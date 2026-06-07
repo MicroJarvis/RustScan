@@ -134,10 +134,23 @@ impl SceneRenderer {
         camera: &ArcballCamera,
         viewport_size: [f32; 2],
     ) {
+        self.update_buffers_with_options(device, queue, scene, camera, viewport_size, false);
+    }
+
+    /// Upload scene data to GPU buffers with optional layer overrides.
+    pub fn update_buffers_with_options(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &Scene,
+        camera: &ArcballCamera,
+        viewport_size: [f32; 2],
+        suppress_gaussians: bool,
+    ) {
         // Cache layer flags for use in paint()
         self.layer_trajectory = scene.layers.trajectory;
         self.layer_map_points = scene.layers.map_points;
-        self.layer_gaussians = scene.layers.gaussians;
+        self.layer_gaussians = scene.layers.gaussians && !suppress_gaussians;
         self.layer_mesh_solid = scene.layers.mesh_solid;
         self.layer_mesh_wireframe = scene.layers.mesh_wireframe;
 
@@ -165,7 +178,7 @@ impl SceneRenderer {
         }
 
         // Gaussians
-        if scene.layers.gaussians && !scene.gaussians.is_empty() {
+        if self.layer_gaussians && !scene.gaussians.is_empty() {
             let instances = project_gaussians_to_splats(&scene.gaussians, camera, viewport_size);
             self.gauss_instance_count = instances.len() as u32;
             self.gauss_instance_vbuf = (!instances.is_empty())
@@ -317,6 +330,7 @@ pub struct ViewerCallback {
     pub scene: std::sync::Arc<std::sync::Mutex<Scene>>,
     pub camera: ArcballCamera,
     pub viewport_size: [f32; 2],
+    pub suppress_gaussians: bool,
     /// Surface format read from eframe at startup — used for lazy pipeline init.
     pub surface_format: wgpu::TextureFormat,
 }
@@ -339,7 +353,14 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
 
         if let Some(renderer) = resources.get_mut::<SceneRenderer>() {
             if let Ok(scene) = self.scene.lock() {
-                renderer.update_buffers(device, queue, &scene, &self.camera, self.viewport_size);
+                renderer.update_buffers_with_options(
+                    device,
+                    queue,
+                    &scene,
+                    &self.camera,
+                    self.viewport_size,
+                    self.suppress_gaussians,
+                );
             }
         }
 

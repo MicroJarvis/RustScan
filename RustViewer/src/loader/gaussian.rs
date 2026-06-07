@@ -18,10 +18,20 @@ use crate::renderer::scene::{GaussianSplat, Scene};
 /// println!("Loaded {} gaussians", scene.gaussians.len());
 /// ```
 pub fn load_gaussians(path: &Path, scene: &mut Scene) -> Result<(), LoadError> {
+    load_gaussians_with_splats(path, scene).map(|_| ())
+}
+
+/// Load a 3DGS scene and return the original RustGS splats when the file uses
+/// RustGS's native layout. Legacy RustSLAM PLY files still load into `scene`,
+/// but return `None` because they do not preserve the full RustGS SH layout.
+pub fn load_gaussians_with_splats(
+    path: &Path,
+    scene: &mut Scene,
+) -> Result<Option<rustgs::HostSplats>, LoadError> {
     match rustgs::load_splats(path) {
         Ok((splats, _meta)) => {
             append_rustgs_splats(&splats, scene);
-            return Ok(());
+            return Ok(Some(splats));
         }
         Err(err) if should_try_legacy_rustslam_loader(path, &err) => {}
         Err(err) => {
@@ -43,7 +53,7 @@ pub fn load_gaussians(path: &Path, scene: &mut Scene) -> Result<(), LoadError> {
         scene.bounds.extend(g.position);
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn append_rustgs_splats(splats: &rustgs::HostSplats, scene: &mut Scene) {

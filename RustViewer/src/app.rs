@@ -15,7 +15,10 @@ use crate::loader::{
 use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
-use crate::training::preview::{LivePreviewBridge, PreviewRenderStatus};
+use crate::training::preview::{
+    gaussian_camera_from_arcball_viewport, LivePreviewBridge, PreviewRenderStatus,
+    PreviewResolution,
+};
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{draw_side_panel, DatasetUiSummary, PanelAction, UiState};
 use crate::ui::theme::{
@@ -44,10 +47,16 @@ pub struct ViewerApp {
     command_rx: mpsc::Receiver<AppCommand>,
     command_tx: mpsc::Sender<AppCommand>,
     training_manager: TrainingManager,
+    loaded_splats: Option<Arc<HostSplats>>,
     preview_bridge: LivePreviewBridge,
     preview_texture: Option<TextureHandle>,
     preview_texture_size: Option<[usize; 2]>,
     preview_dirty: bool,
+    viewport_bridge: LivePreviewBridge,
+    viewport_texture: Option<TextureHandle>,
+    viewport_texture_size: Option<[usize; 2]>,
+    viewport_dirty: bool,
+    viewport_render_error: Option<String>,
     /// Actual wgpu surface format read from eframe at startup.
     surface_format: wgpu::TextureFormat,
 }
@@ -76,10 +85,16 @@ impl ViewerApp {
             command_rx,
             command_tx,
             training_manager: TrainingManager::new(),
+            loaded_splats: None,
             preview_bridge: LivePreviewBridge::default(),
             preview_texture: None,
             preview_texture_size: None,
             preview_dirty: true,
+            viewport_bridge: LivePreviewBridge::default(),
+            viewport_texture: None,
+            viewport_texture_size: None,
+            viewport_dirty: true,
+            viewport_render_error: None,
             surface_format,
         };
 
@@ -103,6 +118,9 @@ impl ViewerApp {
     }
 
     fn handle_asset_load(&mut self, kind: AssetLoadKind, path: PathBuf) {
+        let mut next_loaded_splats = None;
+        let mut load_succeeded = false;
+
         if let Ok(mut scene) = self.scene.lock() {
             clear_scene_preserving_layers(&mut scene);
 
@@ -111,13 +129,20 @@ impl ViewerApp {
                     crate::loader::checkpoint::load_checkpoint(&path, &mut scene)
                 }
                 AssetLoadKind::Gaussian => {
-                    crate::loader::gaussian::load_gaussians(&path, &mut scene)
+                    match crate::loader::gaussian::load_gaussians_with_splats(&path, &mut scene) {
+                        Ok(splats) => {
+                            next_loaded_splats = splats.map(Arc::new);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
                 }
                 AssetLoadKind::Mesh => crate::loader::mesh::load_mesh(&path, &mut scene),
             };
 
             match result {
                 Ok(()) => {
+                    load_succeeded = true;
                     self.ui_state.load_error = None;
                     if scene.has_data() {
                         self.camera.fit_scene(&scene.bounds);
@@ -131,6 +156,12 @@ impl ViewerApp {
                 }
             }
         }
+
+        self.loaded_splats = load_succeeded.then_some(next_loaded_splats).flatten();
+        self.viewport_texture = None;
+        self.viewport_texture_size = None;
+        self.viewport_dirty = true;
+        self.viewport_render_error = None;
     }
 
     fn handle_colmap_loaded(&mut self, result: Result<LoadedColmapDataset, String>) {
@@ -159,6 +190,11 @@ impl ViewerApp {
                 self.ui_state.training_error = None;
                 self.ui_state.preview_error = None;
                 self.loaded_colmap = Some(loaded);
+                self.loaded_splats = None;
+                self.viewport_texture = None;
+                self.viewport_texture_size = None;
+                self.viewport_dirty = true;
+                self.viewport_render_error = None;
                 self.preview_dirty = true;
             }
             Err(err) => {
@@ -307,6 +343,9 @@ impl ViewerApp {
             scene.gaussians = host_splats_to_scene_gaussians(&snapshot);
             scene.recompute_bounds();
         }
+        self.loaded_splats = Some(snapshot);
+        self.viewport_dirty = true;
+        self.viewport_render_error = None;
     }
 
     fn refresh_preview_texture(&mut self, ctx: &egui::Context, size: Vec2) {
@@ -356,6 +395,57 @@ impl ViewerApp {
             Err(err) => {
                 self.ui_state.preview_error = Some(err.to_string());
                 self.preview_dirty = false;
+            }
+        }
+    }
+
+    fn refresh_viewport_texture(&mut self, ctx: &egui::Context, size: Vec2) {
+        let Some(splats) = self.loaded_splats.clone() else {
+            self.viewport_texture = None;
+            self.viewport_texture_size = None;
+            return;
+        };
+
+        let Some(resolution) = PreviewResolution::from_panel_size(size) else {
+            return;
+        };
+        let rounded_size = Some([resolution.width, resolution.height]);
+        let needs_refresh = self.viewport_dirty
+            || self.viewport_texture.is_none()
+            || self.viewport_texture_size != rounded_size;
+        if !needs_refresh {
+            return;
+        }
+
+        let camera = gaussian_camera_from_arcball_viewport(&self.camera, resolution);
+        match self
+            .viewport_bridge
+            .render_snapshot(splats.as_ref(), &camera, resolution)
+        {
+            Ok(PreviewRenderStatus::Frame(image)) => {
+                if let Some(texture) = self.viewport_texture.as_mut() {
+                    texture.set(image, TextureOptions::LINEAR);
+                } else {
+                    self.viewport_texture = Some(ctx.load_texture(
+                        "loaded-gaussian-view",
+                        image,
+                        TextureOptions::LINEAR,
+                    ));
+                }
+                self.viewport_texture_size = rounded_size;
+                self.viewport_render_error = None;
+                self.viewport_dirty = false;
+            }
+            Ok(PreviewRenderStatus::EmptySnapshot) => {
+                self.viewport_texture = None;
+                self.viewport_texture_size = None;
+                self.viewport_render_error = None;
+                self.viewport_dirty = false;
+            }
+            Ok(PreviewRenderStatus::InvalidViewport) => {}
+            Err(err) => {
+                self.viewport_render_error = Some(err.to_string());
+                self.viewport_dirty = false;
             }
         }
     }
@@ -533,17 +623,7 @@ impl eframe::App for ViewerApp {
                 let viewport_rect = ui.max_rect();
                 let viewport_size = [viewport_rect.width(), viewport_rect.height()];
 
-                let callback = egui_wgpu::Callback::new_paint_callback(
-                    viewport_rect,
-                    ViewerCallback {
-                        scene: Arc::clone(&self.scene),
-                        camera: self.camera.clone(),
-                        viewport_size,
-                        surface_format: self.surface_format,
-                    },
-                );
                 let response = ui.allocate_rect(viewport_rect, egui::Sense::drag());
-                ui.painter().add(callback);
 
                 let mut camera_moved = false;
                 if response.dragged_by(egui::PointerButton::Primary) {
@@ -573,9 +653,49 @@ impl eframe::App for ViewerApp {
                     }
                 }
 
+                let true_splat_view = self.loaded_splats.is_some()
+                    && self
+                        .scene
+                        .lock()
+                        .map(|scene| scene.layers.gaussians)
+                        .unwrap_or(false);
+                if true_splat_view {
+                    self.refresh_viewport_texture(ctx, viewport_rect.size());
+                    ui.painter().rect_filled(viewport_rect, 0.0, VIEWPORT_BG);
+                    if let Some(texture) = &self.viewport_texture {
+                        ui.painter().image(
+                            texture.id(),
+                            viewport_rect,
+                            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        draw_preview_placeholder(
+                            ui,
+                            viewport_rect,
+                            self.viewport_render_error
+                                .as_deref()
+                                .unwrap_or("Rendering 3DGS view…"),
+                        );
+                    }
+                }
+
+                let callback = egui_wgpu::Callback::new_paint_callback(
+                    viewport_rect,
+                    ViewerCallback {
+                        scene: Arc::clone(&self.scene),
+                        camera: self.camera.clone(),
+                        viewport_size,
+                        suppress_gaussians: true_splat_view,
+                        surface_format: self.surface_format,
+                    },
+                );
+                ui.painter().add(callback);
+
                 draw_viewport_overlay(ui, &self.camera, has_data);
 
                 if camera_moved {
+                    self.viewport_dirty = true;
                     ctx.request_repaint();
                 }
 

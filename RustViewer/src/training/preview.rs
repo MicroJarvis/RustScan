@@ -146,8 +146,8 @@ impl LivePreviewBridge {
 
 /// Build a RustGS camera from current viewer arcball pose and dataset intrinsics.
 ///
-/// The output camera keeps the dataset optics (scaled to preview size) and uses a
-/// camera-to-world transform with +Z forward, matching RustGS CPU renderer conventions.
+/// The output camera keeps the dataset optics (scaled to preview size) and uses
+/// the world-to-camera transform expected by RustGS projection/rasterization.
 pub fn gaussian_camera_from_arcball(
     arcball: &ArcballCamera,
     dataset_intrinsics: Intrinsics,
@@ -163,10 +163,34 @@ pub fn gaussian_camera_from_arcball(
         resolution.width as u32,
         resolution.height as u32,
     );
-    GaussianCamera::new(scaled_intrinsics, arcball_pose_c2w(arcball))
+    GaussianCamera::new(scaled_intrinsics, arcball_pose_w2c(arcball))
 }
 
-fn arcball_pose_c2w(arcball: &ArcballCamera) -> SE3 {
+/// Build a RustGS camera for a free-orbit viewer viewport.
+///
+/// Unlike the live training preview, standalone splat files do not carry a
+/// dataset camera model, so this synthesizes square-pixel intrinsics from the
+/// arcball vertical FOV and viewport dimensions.
+pub fn gaussian_camera_from_arcball_viewport(
+    arcball: &ArcballCamera,
+    resolution: PreviewResolution,
+) -> GaussianCamera {
+    let width = resolution.width as f32;
+    let height = resolution.height as f32;
+    let fy = 0.5 * height / (0.5 * arcball.fov_y).tan().max(1e-6);
+    let fx = fy;
+    let intrinsics = Intrinsics::new(
+        fx,
+        fy,
+        width * 0.5,
+        height * 0.5,
+        resolution.width as u32,
+        resolution.height as u32,
+    );
+    GaussianCamera::new(intrinsics, arcball_pose_w2c(arcball))
+}
+
+fn arcball_pose_w2c(arcball: &ArcballCamera) -> SE3 {
     let eye = arcball.eye();
     let forward = -arcball.backward();
     let right = arcball.right();
@@ -174,7 +198,7 @@ fn arcball_pose_c2w(arcball: &ArcballCamera) -> SE3 {
     let rotation = Mat3::from_cols(right, down, forward);
     let rotation = Quat::from_mat3(&rotation);
 
-    SE3::from_quat_translation(rotation, eye)
+    SE3::from_quat_translation(rotation, eye).inverse()
 }
 
 fn rgb_f32_to_color_image(
@@ -206,7 +230,8 @@ fn rgb_f32_to_color_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        gaussian_camera_from_arcball, LivePreviewBridge, PreviewRenderStatus, PreviewResolution,
+        gaussian_camera_from_arcball, gaussian_camera_from_arcball_viewport, LivePreviewBridge,
+        PreviewRenderStatus, PreviewResolution,
     };
     use crate::renderer::camera::ArcballCamera;
     use eframe::egui::{Color32, Vec2};
@@ -246,6 +271,25 @@ mod tests {
 
         assert!(right[0] > camera.intrinsics.cx);
         assert!(up[1] < camera.intrinsics.cy);
+    }
+
+    #[test]
+    fn gaussian_camera_from_arcball_viewport_uses_fov_intrinsics() {
+        let arcball =
+            ArcballCamera::from_angles(Vec3::ZERO, 5.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2);
+        let resolution = PreviewResolution::new(800, 600).unwrap();
+
+        let camera = gaussian_camera_from_arcball_viewport(&arcball, resolution);
+
+        assert!((camera.intrinsics.fx - 300.0).abs() < 1e-4);
+        assert!((camera.intrinsics.fy - 300.0).abs() < 1e-4);
+        assert_eq!(camera.intrinsics.cx, 400.0);
+        assert_eq!(camera.intrinsics.cy, 300.0);
+        let projected = camera
+            .project([0.0, 0.0, 0.0])
+            .expect("target should be visible");
+        assert!((projected[0] - 400.0).abs() < 1e-3);
+        assert!((projected[1] - 300.0).abs() < 1e-3);
     }
 
     #[test]
