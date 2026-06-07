@@ -29,8 +29,6 @@ gpu_modules!(
 #[cfg(feature = "gpu")]
 use crate::{TrainingDataset, TrainingError};
 
-#[cfg(feature = "gpu")]
-pub use evaluation::SplatEvaluationRenderer;
 pub use evaluation::MIN_RENDER_SCALE;
 pub use evaluation::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
@@ -50,6 +48,8 @@ pub use evaluation::{
 pub use evaluation::{
     evaluate_splats, evaluation_device, render_evaluation_frame, runtime_from_splats,
 };
+#[cfg(feature = "gpu")]
+pub use evaluation::{SharedWgpuContext, SplatEvaluationRenderer};
 #[cfg(feature = "gpu")]
 pub use events::{
     TrainingControl, TrainingEvent, TrainingEventCadence, TrainingEventRoute,

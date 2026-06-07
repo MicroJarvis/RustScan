@@ -57,8 +57,6 @@ pub use crate::render::{
 };
 
 // Re-export training types
-#[cfg(feature = "gpu")]
-pub use crate::training::SplatEvaluationRenderer;
 pub use crate::training::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
     parity_fixture_id_for_input_path, resolve_litegs_parity_fixture_input_path,
@@ -88,6 +86,8 @@ pub use crate::training::{
     TrainingOptions, TrainingPlanSelected, TrainingRun, TrainingRunCancelled, TrainingRunCompleted,
     TrainingRunReport, TrainingRunStarted, TrainingSnapshotReady,
 };
+#[cfg(feature = "gpu")]
+pub use crate::training::{SharedWgpuContext, SplatEvaluationRenderer};
 pub use crate::training::{TrainingBackend, TrainingConfig, TrainingResult};
 
 // Re-export IO types

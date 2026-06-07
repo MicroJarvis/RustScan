@@ -4,7 +4,8 @@ use crate::renderer::camera::ArcballCamera;
 use eframe::egui::{Color32, ColorImage, Vec2};
 use glam::{Mat3, Quat};
 use rustgs::{
-    EvaluationDevice, GaussianCamera, HostSplats, Intrinsics, SplatEvaluationRenderer, SE3,
+    EvaluationDevice, GaussianCamera, HostSplats, Intrinsics, SharedWgpuContext,
+    SplatEvaluationRenderer, SE3,
 };
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -96,6 +97,12 @@ pub struct AsyncPreviewBridge {
     _worker: thread::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+enum PreviewRenderDevice {
+    Evaluation(EvaluationDevice),
+    SharedWgpu(SharedWgpuContext),
+}
+
 impl Default for AsyncPreviewBridge {
     fn default() -> Self {
         Self::with_device(EvaluationDevice::Gpu)
@@ -104,10 +111,23 @@ impl Default for AsyncPreviewBridge {
 
 impl AsyncPreviewBridge {
     pub fn with_device(device: EvaluationDevice) -> Self {
+        Self::with_render_device(PreviewRenderDevice::Evaluation(device))
+    }
+
+    pub fn with_shared_wgpu_context(context: SharedWgpuContext) -> Self {
+        Self::with_render_device(PreviewRenderDevice::SharedWgpu(context))
+    }
+
+    fn with_render_device(render_device: PreviewRenderDevice) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<AsyncPreviewRequest>();
         let (result_tx, result_rx) = mpsc::channel::<AsyncPreviewResult>();
         let worker = thread::spawn(move || {
-            let mut bridge = LivePreviewBridge::with_device(device);
+            let mut bridge = match render_device {
+                PreviewRenderDevice::Evaluation(device) => LivePreviewBridge::with_device(device),
+                PreviewRenderDevice::SharedWgpu(context) => {
+                    LivePreviewBridge::with_shared_wgpu_context(context)
+                }
+            };
             while let Ok(mut request) = request_rx.recv() {
                 while let Ok(newer_request) = request_rx.try_recv() {
                     request = newer_request;
@@ -200,6 +220,7 @@ impl AsyncPreviewBridge {
 /// Stateful bridge that keeps a cached RustGS renderer and rebuilds it on size changes.
 pub struct LivePreviewBridge {
     device: EvaluationDevice,
+    shared_wgpu_context: Option<SharedWgpuContext>,
     renderer: Option<SplatEvaluationRenderer>,
     renderer_resolution: Option<PreviewResolution>,
 }
@@ -208,6 +229,7 @@ impl Default for LivePreviewBridge {
     fn default() -> Self {
         Self {
             device: EvaluationDevice::Gpu,
+            shared_wgpu_context: None,
             renderer: None,
             renderer_resolution: None,
         }
@@ -218,6 +240,16 @@ impl LivePreviewBridge {
     pub fn with_device(device: EvaluationDevice) -> Self {
         Self {
             device,
+            shared_wgpu_context: None,
+            renderer: None,
+            renderer_resolution: None,
+        }
+    }
+
+    pub fn with_shared_wgpu_context(context: SharedWgpuContext) -> Self {
+        Self {
+            device: EvaluationDevice::Gpu,
+            shared_wgpu_context: Some(context),
             renderer: None,
             renderer_resolution: None,
         }
@@ -270,15 +302,23 @@ impl LivePreviewBridge {
     ) -> Result<&mut SplatEvaluationRenderer, PreviewRenderError> {
         let needs_rebuild = self.renderer_resolution != Some(resolution) || self.renderer.is_none();
         if needs_rebuild {
-            self.renderer = Some(
+            self.renderer = Some(if let Some(context) = self.shared_wgpu_context.clone() {
+                SplatEvaluationRenderer::new_with_wgpu_context(
+                    resolution.width,
+                    resolution.height,
+                    context,
+                    rustgs::DEFAULT_RASTER_COV_BLUR,
+                )
+                .map_err(|err| PreviewRenderError::RendererInit(err.to_string()))?
+            } else {
                 SplatEvaluationRenderer::new(
                     resolution.width,
                     resolution.height,
                     self.device,
                     rustgs::DEFAULT_RASTER_COV_BLUR,
                 )
-                .map_err(|err| PreviewRenderError::RendererInit(err.to_string()))?,
-            );
+                .map_err(|err| PreviewRenderError::RendererInit(err.to_string()))?
+            });
             self.renderer_resolution = Some(resolution);
         }
 

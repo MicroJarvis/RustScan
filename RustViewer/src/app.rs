@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Rect, Sense, TextureHandle, TextureOptions, Vec2};
 use eframe::egui_wgpu;
 use eframe::wgpu;
-use rustgs::{ColmapConfig, HostSplats, TrainingConfig};
+use rustgs::{ColmapConfig, HostSplats, SharedWgpuContext, TrainingConfig};
 
 use crate::loader::checkpoint::LoadError;
 use crate::loader::{
@@ -62,6 +62,7 @@ pub struct ViewerApp {
     viewport_dirty: bool,
     viewport_last_motion: Option<Instant>,
     viewport_render_error: Option<String>,
+    shared_wgpu_context: Option<SharedWgpuContext>,
     /// Actual wgpu surface format read from eframe at startup.
     surface_format: wgpu::TextureFormat,
 }
@@ -81,6 +82,10 @@ impl ViewerApp {
             .as_ref()
             .map(|rs| rs.target_format)
             .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
+        let shared_wgpu_context = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(shared_wgpu_context_from_render_state);
         let app = Self {
             scene: Arc::new(Mutex::new(Scene::default())),
             camera: ArcballCamera::default(),
@@ -91,16 +96,17 @@ impl ViewerApp {
             command_tx,
             training_manager: TrainingManager::new(),
             loaded_splats: None,
-            preview_bridge: LivePreviewBridge::default(),
+            preview_bridge: live_preview_bridge_for(&shared_wgpu_context),
             preview_texture: None,
             preview_texture_size: None,
             preview_dirty: true,
-            viewport_bridge: AsyncPreviewBridge::default(),
+            viewport_bridge: async_preview_bridge_for(&shared_wgpu_context),
             viewport_texture: None,
             viewport_texture_size: None,
             viewport_dirty: true,
             viewport_last_motion: None,
             viewport_render_error: None,
+            shared_wgpu_context,
             surface_format,
         };
 
@@ -164,7 +170,7 @@ impl ViewerApp {
         }
 
         self.loaded_splats = load_succeeded.then_some(next_loaded_splats).flatten();
-        self.viewport_bridge = AsyncPreviewBridge::default();
+        self.viewport_bridge = self.new_async_preview_bridge();
         self.viewport_texture = None;
         self.viewport_texture_size = None;
         self.viewport_dirty = true;
@@ -199,7 +205,7 @@ impl ViewerApp {
                 self.ui_state.preview_error = None;
                 self.loaded_colmap = Some(loaded);
                 self.loaded_splats = None;
-                self.viewport_bridge = AsyncPreviewBridge::default();
+                self.viewport_bridge = self.new_async_preview_bridge();
                 self.viewport_texture = None;
                 self.viewport_texture_size = None;
                 self.viewport_dirty = true;
@@ -211,6 +217,10 @@ impl ViewerApp {
                 self.ui_state.load_error = Some(err);
             }
         }
+    }
+
+    fn new_async_preview_bridge(&self) -> AsyncPreviewBridge {
+        async_preview_bridge_for(&self.shared_wgpu_context)
     }
 
     fn process_panel_actions(&mut self, actions: Vec<PanelAction>) {
@@ -619,6 +629,40 @@ fn clear_scene_preserving_layers(scene: &mut Scene) {
     let layers = scene.layers.clone();
     *scene = Scene::default();
     scene.layers = layers;
+}
+
+fn async_preview_bridge_for(context: &Option<SharedWgpuContext>) -> AsyncPreviewBridge {
+    context
+        .clone()
+        .map(AsyncPreviewBridge::with_shared_wgpu_context)
+        .unwrap_or_default()
+}
+
+fn live_preview_bridge_for(context: &Option<SharedWgpuContext>) -> LivePreviewBridge {
+    context
+        .clone()
+        .map(LivePreviewBridge::with_shared_wgpu_context)
+        .unwrap_or_default()
+}
+
+fn shared_wgpu_context_from_render_state(
+    render_state: &egui_wgpu::RenderState,
+) -> SharedWgpuContext {
+    let backend = render_state.adapter.get_info().backend;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: backend.into(),
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        display: None,
+    });
+    SharedWgpuContext::from_wgpu_parts(
+        instance,
+        render_state.adapter.clone(),
+        render_state.device.clone(),
+        render_state.queue.clone(),
+        backend,
+    )
 }
 
 impl eframe::App for ViewerApp {

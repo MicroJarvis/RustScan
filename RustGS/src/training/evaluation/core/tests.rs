@@ -163,6 +163,66 @@ fn splat_evaluation_renderer_gpu_renders_rgba_frame() {
 }
 
 #[cfg(feature = "gpu")]
+#[test]
+fn splat_evaluation_renderer_uses_existing_wgpu_context() {
+    let context = test_shared_wgpu_context();
+    let splats = test_gpu_splats();
+    let camera = crate::GaussianCamera::new(Intrinsics::from_focal(500.0, 32, 32), SE3::identity());
+    let mut renderer = super::SplatEvaluationRenderer::new_with_wgpu_context(
+        32,
+        32,
+        context,
+        crate::DEFAULT_RASTER_COV_BLUR,
+    )
+    .expect("gpu renderer");
+
+    let rgba = renderer
+        .render_rgba_f32(&splats, &camera)
+        .expect("render frame");
+
+    assert_eq!(rgba.len(), 32 * 32 * 4);
+    assert!(rgba.iter().any(|value| *value > 0.0));
+}
+
+#[cfg(feature = "gpu")]
+fn test_shared_wgpu_context() -> super::SharedWgpuContext {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        display: None,
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let adapter = runtime
+        .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("wgpu adapter");
+    let backend = adapter.get_info().backend;
+    let (device, queue) = runtime
+        .block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("rustgs shared wgpu test device"),
+                required_features: adapter
+                    .features()
+                    .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+                required_limits: adapter.limits(),
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+            }),
+        )
+        .expect("wgpu device");
+    super::SharedWgpuContext::from_wgpu_parts(instance, adapter, device, queue, backend)
+}
+
+#[cfg(feature = "gpu")]
 fn test_gpu_splats() -> crate::HostSplats {
     crate::HostSplats::from_components(
         vec![0.0, 0.0, 2.0],

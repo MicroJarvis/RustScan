@@ -361,6 +361,48 @@ enum SplatEvaluationRendererBackend {
 }
 
 #[cfg(feature = "gpu")]
+#[derive(Clone, Debug)]
+pub struct SharedWgpuContext {
+    device: <GsBackendBase as Backend>::Device,
+}
+
+#[cfg(feature = "gpu")]
+impl SharedWgpuContext {
+    pub fn from_wgpu_setup(setup: burn_wgpu::WgpuSetup) -> Self {
+        let device = burn_wgpu::init_device(setup, shared_wgpu_runtime_options());
+        Self { device }
+    }
+
+    pub fn from_wgpu_parts(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        backend: wgpu::Backend,
+    ) -> Self {
+        Self::from_wgpu_setup(burn_wgpu::WgpuSetup {
+            instance,
+            adapter,
+            device,
+            queue,
+            backend,
+        })
+    }
+
+    fn device(&self) -> <GsBackendBase as Backend>::Device {
+        self.device.clone()
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn shared_wgpu_runtime_options() -> burn_wgpu::RuntimeOptions {
+    burn_wgpu::RuntimeOptions {
+        memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
+        ..burn_wgpu::RuntimeOptions::default()
+    }
+}
+
+#[cfg(feature = "gpu")]
 struct GpuSplatEvaluationRenderer {
     render_width: usize,
     render_height: usize,
@@ -406,6 +448,24 @@ impl SplatEvaluationRenderer {
             ),
         };
         Ok(Self { backend })
+    }
+
+    pub fn new_with_wgpu_context(
+        render_width: usize,
+        render_height: usize,
+        context: SharedWgpuContext,
+        raster_cov_blur: f32,
+    ) -> Result<Self, SplatEvaluationError> {
+        Ok(Self {
+            backend: SplatEvaluationRendererBackend::Gpu(
+                GpuSplatEvaluationRenderer::new_with_device(
+                    render_width,
+                    render_height,
+                    raster_cov_blur,
+                    context.device(),
+                )?,
+            ),
+        })
     }
 
     pub fn render(
@@ -461,6 +521,20 @@ impl GpuSplatEvaluationRenderer {
         render_height: usize,
         raster_cov_blur: f32,
     ) -> Result<Self, SplatEvaluationError> {
+        Self::new_with_device(
+            render_width,
+            render_height,
+            raster_cov_blur,
+            <GsBackendBase as Backend>::Device::default(),
+        )
+    }
+
+    fn new_with_device(
+        render_width: usize,
+        render_height: usize,
+        raster_cov_blur: f32,
+        device: <GsBackendBase as Backend>::Device,
+    ) -> Result<Self, SplatEvaluationError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -474,7 +548,7 @@ impl GpuSplatEvaluationRenderer {
             render_width,
             render_height,
             raster_cov_blur,
-            device: <GsBackendBase as Backend>::Device::default(),
+            device,
             runtime,
             cached_splats: None,
         })

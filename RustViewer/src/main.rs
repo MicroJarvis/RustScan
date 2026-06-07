@@ -6,6 +6,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("RustViewer"),
+        wgpu_options: cubecl_compatible_wgpu_options(),
         ..Default::default()
     };
 
@@ -38,4 +39,31 @@ fn startup_asset_from_args() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+fn cubecl_compatible_wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut options.wgpu_setup {
+        create_new.device_descriptor = std::sync::Arc::new(|adapter| {
+            let base_limits = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {
+                eframe::wgpu::Limits::downlevel_webgl2_defaults()
+            } else {
+                adapter.limits()
+            };
+            eframe::wgpu::DeviceDescriptor {
+                label: Some("RustViewer shared wgpu device"),
+                required_features: adapter
+                    .features()
+                    .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+                required_limits: eframe::wgpu::Limits {
+                    max_texture_dimension_2d: 8192,
+                    ..base_limits
+                },
+                experimental_features: unsafe { eframe::wgpu::ExperimentalFeatures::enabled() },
+                memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+                trace: eframe::wgpu::Trace::Off,
+            }
+        });
+    }
+    options
 }
