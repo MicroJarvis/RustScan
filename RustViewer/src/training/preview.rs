@@ -6,6 +6,8 @@ use glam::{Mat3, Quat};
 use rustgs::{
     EvaluationDevice, GaussianCamera, HostSplats, Intrinsics, SplatEvaluationRenderer, SE3,
 };
+use std::sync::{mpsc, Arc};
+use std::thread;
 
 /// Integer preview target size used by renderer and texture upload paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,21 @@ impl PreviewResolution {
         }
         let width = size.x.floor().max(0.0) as usize;
         let height = size.y.floor().max(0.0) as usize;
+        Self::new(width, height)
+    }
+
+    pub fn from_panel_size_scaled(size: Vec2, scale: f32) -> Option<Self> {
+        if !size.x.is_finite()
+            || !size.y.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.0
+            || size.x < 1.0
+            || size.y < 1.0
+        {
+            return None;
+        }
+        let width = (size.x * scale).floor().max(1.0) as usize;
+        let height = (size.y * scale).floor().max(1.0) as usize;
         Self::new(width, height)
     }
 }
@@ -53,6 +70,133 @@ pub enum PreviewRenderError {
     UnexpectedBufferLength { expected: usize, actual: usize },
 }
 
+struct AsyncPreviewRequest {
+    id: u64,
+    splats: Arc<HostSplats>,
+    camera: GaussianCamera,
+    resolution: PreviewResolution,
+}
+
+struct AsyncPreviewResult {
+    id: u64,
+    result: Result<PreviewRenderStatus, PreviewRenderError>,
+}
+
+/// Background preview renderer for interactive viewports.
+///
+/// Requests are deliberately lossy: when camera input outruns rendering, the
+/// worker drains queued requests and renders only the newest camera.
+pub struct AsyncPreviewBridge {
+    request_tx: mpsc::Sender<AsyncPreviewRequest>,
+    result_rx: mpsc::Receiver<AsyncPreviewResult>,
+    next_request_id: u64,
+    latest_requested_id: Option<u64>,
+    latest_completed_id: Option<u64>,
+    latest_requested_resolution: Option<PreviewResolution>,
+    _worker: thread::JoinHandle<()>,
+}
+
+impl Default for AsyncPreviewBridge {
+    fn default() -> Self {
+        Self::with_device(EvaluationDevice::Gpu)
+    }
+}
+
+impl AsyncPreviewBridge {
+    pub fn with_device(device: EvaluationDevice) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<AsyncPreviewRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<AsyncPreviewResult>();
+        let worker = thread::spawn(move || {
+            let mut bridge = LivePreviewBridge::with_device(device);
+            while let Ok(mut request) = request_rx.recv() {
+                while let Ok(newer_request) = request_rx.try_recv() {
+                    request = newer_request;
+                }
+
+                let result = bridge.render_snapshot(
+                    request.splats.as_ref(),
+                    &request.camera,
+                    request.resolution,
+                );
+                if result_tx
+                    .send(AsyncPreviewResult {
+                        id: request.id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            request_tx,
+            result_rx,
+            next_request_id: 1,
+            latest_requested_id: None,
+            latest_completed_id: None,
+            latest_requested_resolution: None,
+            _worker: worker,
+        }
+    }
+
+    pub fn request_render(
+        &mut self,
+        splats: Arc<HostSplats>,
+        camera: GaussianCamera,
+        resolution: PreviewResolution,
+    ) -> Result<(), PreviewRenderError> {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        self.request_tx
+            .send(AsyncPreviewRequest {
+                id,
+                splats,
+                camera,
+                resolution,
+            })
+            .map_err(|err| {
+                PreviewRenderError::RenderFailed(format!("preview worker stopped: {err}"))
+            })?;
+        self.latest_requested_id = Some(id);
+        self.latest_requested_resolution = Some(resolution);
+        Ok(())
+    }
+
+    pub fn poll_latest(&mut self) -> Option<Result<PreviewRenderStatus, PreviewRenderError>> {
+        let mut latest = None;
+        while let Ok(result) = self.result_rx.try_recv() {
+            if self
+                .latest_completed_id
+                .is_none_or(|completed_id| result.id > completed_id)
+            {
+                latest = Some(result);
+            }
+        }
+
+        latest.map(|result| {
+            self.latest_completed_id = Some(result.id);
+            result.result
+        })
+    }
+
+    pub fn is_render_pending(&self) -> bool {
+        self.latest_requested_id.is_some() && self.latest_completed_id != self.latest_requested_id
+    }
+
+    pub fn has_pending_for(&self, resolution: PreviewResolution) -> bool {
+        self.is_render_pending() && self.latest_requested_resolution == Some(resolution)
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.latest_requested_id = None;
+        self.latest_completed_id = None;
+        self.latest_requested_resolution = None;
+        while self.result_rx.try_recv().is_ok() {}
+    }
+}
+
 /// Stateful bridge that keeps a cached RustGS renderer and rebuilds it on size changes.
 pub struct LivePreviewBridge {
     device: EvaluationDevice,
@@ -63,7 +207,7 @@ pub struct LivePreviewBridge {
 impl Default for LivePreviewBridge {
     fn default() -> Self {
         Self {
-            device: EvaluationDevice::Cpu,
+            device: EvaluationDevice::Gpu,
             renderer: None,
             renderer_resolution: None,
         }
@@ -114,9 +258,9 @@ impl LivePreviewBridge {
 
         let renderer = self.ensure_renderer(resolution)?;
         let rendered = renderer
-            .render(splats, camera)
+            .render_rgba_f32(splats, camera)
             .map_err(|err| PreviewRenderError::RenderFailed(err.to_string()))?;
-        let image = rgb_f32_to_color_image(&rendered, resolution)?;
+        let image = rgba_f32_to_color_image(&rendered, resolution)?;
         Ok(PreviewRenderStatus::Frame(image))
     }
 
@@ -201,42 +345,44 @@ fn arcball_pose_w2c(arcball: &ArcballCamera) -> SE3 {
     SE3::from_quat_translation(rotation, eye).inverse()
 }
 
-fn rgb_f32_to_color_image(
-    rgb: &[f32],
+fn rgba_f32_to_color_image(
+    rgba: &[f32],
     resolution: PreviewResolution,
 ) -> Result<ColorImage, PreviewRenderError> {
-    let expected = resolution.width * resolution.height * 3;
-    if rgb.len() != expected {
+    let expected = resolution.width * resolution.height * 4;
+    if rgba.len() != expected {
         return Err(PreviewRenderError::UnexpectedBufferLength {
             expected,
-            actual: rgb.len(),
+            actual: rgba.len(),
         });
     }
 
     let mut pixels = vec![Color32::BLACK; resolution.width * resolution.height];
-    for (idx, chunk) in rgb.chunks_exact(3).enumerate() {
+    for (idx, chunk) in rgba.chunks_exact(4).enumerate() {
         let r = (chunk[0].clamp(0.0, 1.0) * 255.0).round() as u8;
         let g = (chunk[1].clamp(0.0, 1.0) * 255.0).round() as u8;
         let b = (chunk[2].clamp(0.0, 1.0) * 255.0).round() as u8;
         pixels[idx] = Color32::from_rgb(r, g, b);
     }
 
-    Ok(ColorImage {
-        size: [resolution.width, resolution.height],
+    Ok(ColorImage::new(
+        [resolution.width, resolution.height],
         pixels,
-    })
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        gaussian_camera_from_arcball, gaussian_camera_from_arcball_viewport, LivePreviewBridge,
-        PreviewRenderStatus, PreviewResolution,
+        gaussian_camera_from_arcball, gaussian_camera_from_arcball_viewport, AsyncPreviewBridge,
+        AsyncPreviewResult, LivePreviewBridge, PreviewRenderStatus, PreviewResolution,
     };
     use crate::renderer::camera::ArcballCamera;
     use eframe::egui::{Color32, Vec2};
     use glam::Vec3;
-    use rustgs::{HostSplats, Intrinsics};
+    use rustgs::{EvaluationDevice, HostSplats, Intrinsics};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn gaussian_camera_from_arcball_scales_intrinsics_and_projects_target_to_center() {
@@ -293,6 +439,16 @@ mod tests {
     }
 
     #[test]
+    fn preview_resolution_scales_panel_size_for_interaction() {
+        let resolution = PreviewResolution::from_panel_size_scaled(Vec2::new(801.0, 601.0), 0.5)
+            .expect("scaled viewport");
+
+        assert_eq!(resolution.width, 400);
+        assert_eq!(resolution.height, 300);
+        assert!(PreviewResolution::from_panel_size_scaled(Vec2::ZERO, 0.5).is_none());
+    }
+
+    #[test]
     fn render_from_arcball_returns_invalid_viewport_for_zero_panel_size() {
         let mut bridge = LivePreviewBridge::default();
         let arcball = ArcballCamera::default();
@@ -340,5 +496,85 @@ mod tests {
             }
             other => panic!("expected frame status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn async_preview_bridge_delivers_requested_frame() {
+        let mut bridge = AsyncPreviewBridge::with_device(EvaluationDevice::Cpu);
+        let arcball =
+            ArcballCamera::from_angles(Vec3::ZERO, 5.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_4);
+        let resolution = PreviewResolution::new(32, 32).unwrap();
+        let camera = gaussian_camera_from_arcball_viewport(&arcball, resolution);
+        let splats = Arc::new(
+            HostSplats::from_components(
+                vec![0.0, 0.0, 0.0],
+                vec![0.5f32.ln(), 0.5f32.ln(), 0.5f32.ln()],
+                vec![1.0, 0.0, 0.0, 0.0],
+                vec![4.0],
+                vec![1.0, 1.0, 1.0],
+                0,
+            )
+            .expect("valid single-splat snapshot"),
+        );
+
+        bridge
+            .request_render(splats, camera, resolution)
+            .expect("request should enqueue");
+        assert!(bridge.is_render_pending());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = bridge.poll_latest() {
+                match result.expect("render should succeed") {
+                    PreviewRenderStatus::Frame(image) => {
+                        assert_eq!(image.size, [32, 32]);
+                        assert!(image.pixels.iter().any(|pixel| *pixel != Color32::BLACK));
+                        assert!(!bridge.is_render_pending());
+                        return;
+                    }
+                    other => panic!("expected frame status, got {other:?}"),
+                }
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "async preview worker did not produce a frame"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn async_preview_bridge_delivers_stale_completed_frame_while_newer_request_is_pending() {
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(|| {});
+        let mut bridge = AsyncPreviewBridge {
+            request_tx,
+            result_rx,
+            next_request_id: 3,
+            latest_requested_id: Some(2),
+            latest_completed_id: None,
+            latest_requested_resolution: Some(PreviewResolution::new(32, 32).unwrap()),
+            _worker: worker,
+        };
+
+        result_tx
+            .send(AsyncPreviewResult {
+                id: 1,
+                result: Ok(PreviewRenderStatus::EmptySnapshot),
+            })
+            .expect("test result should enqueue");
+
+        let result = bridge
+            .poll_latest()
+            .expect("stale completed frame should still be delivered")
+            .expect("test result should be ok");
+        assert!(matches!(result, PreviewRenderStatus::EmptySnapshot));
+        assert_eq!(bridge.latest_completed_id, Some(1));
+        assert!(
+            bridge.is_render_pending(),
+            "newer requested frame should remain pending"
+        );
     }
 }

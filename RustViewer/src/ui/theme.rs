@@ -90,7 +90,7 @@ pub const RADIUS_BADGE: u8 = 4;
 /// Configure the egui context to use a dark high-contrast styling.
 /// Call this once at the start of each frame in `App::update()`.
 pub fn configure_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
 
     // Font sizes
     style.text_styles = [
@@ -142,5 +142,5 @@ pub fn configure_theme(ctx: &egui::Context) {
     visuals.selection.stroke = Stroke::new(1.0, SYSTEM_BLUE);
 
     style.visuals = visuals;
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }

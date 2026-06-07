@@ -7,6 +7,12 @@ use std::time::Instant;
 
 #[cfg(feature = "gpu")]
 use crate::core::HostSplats;
+#[cfg(feature = "gpu")]
+use crate::training::engine::{host_splats_to_device, DeviceSplats, GsBackendBase};
+#[cfg(feature = "gpu")]
+use crate::training::forward;
+#[cfg(feature = "gpu")]
+use burn::prelude::Backend;
 
 pub const MIN_RENDER_SCALE: f32 = 0.0625;
 
@@ -40,12 +46,14 @@ fn summarized_final_loss(loss_history: &[f32], frame_count: usize) -> f32 {
 #[serde(rename_all = "snake_case")]
 pub enum EvaluationDevice {
     Cpu,
+    Gpu,
 }
 
 impl std::fmt::Display for EvaluationDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cpu => write!(f, "cpu"),
+            Self::Gpu => write!(f, "gpu"),
         }
     }
 }
@@ -55,9 +63,10 @@ impl FromStr for EvaluationDevice {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "cpu" | "gpu" | "wgpu" | "metal" => Ok(Self::Cpu),
+            "cpu" => Ok(Self::Cpu),
+            "gpu" | "wgpu" | "metal" => Ok(Self::Gpu),
             other => Err(format!(
-                "unsupported evaluation device '{other}'. Expected cpu"
+                "unsupported evaluation device '{other}'. Expected cpu or gpu"
             )),
         }
     }
@@ -342,7 +351,41 @@ pub fn runtime_from_splats(
 
 #[cfg(feature = "gpu")]
 pub struct SplatEvaluationRenderer {
-    renderer: crate::GaussianRenderer,
+    backend: SplatEvaluationRendererBackend,
+}
+
+#[cfg(feature = "gpu")]
+enum SplatEvaluationRendererBackend {
+    Cpu(crate::GaussianRenderer),
+    Gpu(GpuSplatEvaluationRenderer),
+}
+
+#[cfg(feature = "gpu")]
+struct GpuSplatEvaluationRenderer {
+    render_width: usize,
+    render_height: usize,
+    raster_cov_blur: f32,
+    device: <GsBackendBase as Backend>::Device,
+    runtime: tokio::runtime::Runtime,
+    cached_splats: Option<CachedGpuSplats>,
+}
+
+#[cfg(feature = "gpu")]
+struct CachedGpuSplats {
+    key: SplatCacheKey,
+    splats: DeviceSplats<GsBackendBase>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SplatCacheKey {
+    len: usize,
+    sh_degree: usize,
+    positions: usize,
+    log_scales: usize,
+    rotations: usize,
+    opacity_logits: usize,
+    sh_coeffs: usize,
 }
 
 #[cfg(feature = "gpu")]
@@ -350,13 +393,19 @@ impl SplatEvaluationRenderer {
     pub fn new(
         render_width: usize,
         render_height: usize,
-        _device: EvaluationDevice,
+        device: EvaluationDevice,
         raster_cov_blur: f32,
     ) -> Result<Self, SplatEvaluationError> {
-        Ok(Self {
-            renderer: crate::GaussianRenderer::new(render_width, render_height)
-                .with_raster_cov_blur(raster_cov_blur),
-        })
+        let backend = match device {
+            EvaluationDevice::Cpu => SplatEvaluationRendererBackend::Cpu(
+                crate::GaussianRenderer::new(render_width, render_height)
+                    .with_raster_cov_blur(raster_cov_blur),
+            ),
+            EvaluationDevice::Gpu => SplatEvaluationRendererBackend::Gpu(
+                GpuSplatEvaluationRenderer::new(render_width, render_height, raster_cov_blur)?,
+            ),
+        };
+        Ok(Self { backend })
     }
 
     pub fn render(
@@ -364,16 +413,192 @@ impl SplatEvaluationRenderer {
         splats: &HostSplats,
         camera: &GaussianCamera,
     ) -> Result<Vec<f32>, SplatEvaluationError> {
-        let output = self
-            .renderer
-            .render_splats(splats, camera)
-            .map_err(|err| SplatEvaluationError::InvalidInput(err.to_string()))?;
-        Ok(output
-            .color
-            .into_iter()
-            .map(|value| value as f32 / 255.0)
-            .collect())
+        match &mut self.backend {
+            SplatEvaluationRendererBackend::Cpu(renderer) => {
+                let output = renderer
+                    .render_splats(splats, camera)
+                    .map_err(|err| SplatEvaluationError::InvalidInput(err.to_string()))?;
+                Ok(output
+                    .color
+                    .into_iter()
+                    .map(|value| value as f32 / 255.0)
+                    .collect())
+            }
+            SplatEvaluationRendererBackend::Gpu(renderer) => renderer.render(splats, camera),
+        }
     }
+
+    pub fn render_rgba_f32(
+        &mut self,
+        splats: &HostSplats,
+        camera: &GaussianCamera,
+    ) -> Result<Vec<f32>, SplatEvaluationError> {
+        match &mut self.backend {
+            SplatEvaluationRendererBackend::Cpu(renderer) => {
+                let output = renderer
+                    .render_splats(splats, camera)
+                    .map_err(|err| SplatEvaluationError::InvalidInput(err.to_string()))?;
+                let mut rgba = Vec::with_capacity(output.color.len() / 3 * 4);
+                for px in output.color.chunks_exact(3) {
+                    rgba.push(px[0] as f32 / 255.0);
+                    rgba.push(px[1] as f32 / 255.0);
+                    rgba.push(px[2] as f32 / 255.0);
+                    rgba.push(1.0);
+                }
+                Ok(rgba)
+            }
+            SplatEvaluationRendererBackend::Gpu(renderer) => {
+                renderer.render_rgba_f32(splats, camera)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl GpuSplatEvaluationRenderer {
+    fn new(
+        render_width: usize,
+        render_height: usize,
+        raster_cov_blur: f32,
+    ) -> Result<Self, SplatEvaluationError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| {
+                SplatEvaluationError::InvalidInput(format!(
+                    "failed to initialize gpu renderer runtime: {err}"
+                ))
+            })?;
+
+        Ok(Self {
+            render_width,
+            render_height,
+            raster_cov_blur,
+            device: <GsBackendBase as Backend>::Device::default(),
+            runtime,
+            cached_splats: None,
+        })
+    }
+
+    fn render(
+        &mut self,
+        splats: &HostSplats,
+        camera: &GaussianCamera,
+    ) -> Result<Vec<f32>, SplatEvaluationError> {
+        let rgba = self.render_rgba_f32(splats, camera)?;
+        let mut rgb = Vec::with_capacity(self.render_width * self.render_height * 3);
+        for px in rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&px[..3]);
+        }
+        Ok(rgb)
+    }
+
+    fn render_rgba_f32(
+        &mut self,
+        splats: &HostSplats,
+        camera: &GaussianCamera,
+    ) -> Result<Vec<f32>, SplatEvaluationError> {
+        self.ensure_device_splats(splats);
+        let cached = self.cached_splats.as_ref().ok_or_else(|| {
+            SplatEvaluationError::InvalidInput("gpu splat cache was not initialized".to_string())
+        })?;
+        let img_size = (
+            u32::try_from(self.render_width).map_err(|_| {
+                SplatEvaluationError::InvalidInput(format!(
+                    "render width {} exceeds u32",
+                    self.render_width
+                ))
+            })?,
+            u32::try_from(self.render_height).map_err(|_| {
+                SplatEvaluationError::InvalidInput(format!(
+                    "render height {} exceeds u32",
+                    self.render_height
+                ))
+            })?,
+        );
+
+        self.runtime.block_on(render_gpu_rgba_f32(
+            &cached.splats,
+            camera,
+            img_size,
+            &self.device,
+            self.raster_cov_blur,
+        ))
+    }
+
+    fn ensure_device_splats(&mut self, splats: &HostSplats) {
+        let key = SplatCacheKey::from_splats(splats);
+        if self
+            .cached_splats
+            .as_ref()
+            .map(|cached| cached.key == key)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.cached_splats = Some(CachedGpuSplats {
+            key,
+            splats: host_splats_to_device::<GsBackendBase>(splats, &self.device),
+        });
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SplatCacheKey {
+    fn from_splats(splats: &HostSplats) -> Self {
+        let view = splats.as_view();
+        Self {
+            len: splats.len(),
+            sh_degree: splats.sh_degree(),
+            positions: view.positions.as_ptr() as usize,
+            log_scales: view.log_scales.as_ptr() as usize,
+            rotations: view.rotations.as_ptr() as usize,
+            opacity_logits: view.opacity_logits.as_ptr() as usize,
+            sh_coeffs: view.sh_coeffs.as_ptr() as usize,
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+async fn render_gpu_rgba_f32(
+    splats: &DeviceSplats<GsBackendBase>,
+    camera: &GaussianCamera,
+    img_size: (u32, u32),
+    device: &<GsBackendBase as Backend>::Device,
+    raster_cov_blur: f32,
+) -> Result<Vec<f32>, SplatEvaluationError> {
+    let rendered = forward::render_forward::<GsBackendBase>(
+        splats,
+        camera,
+        img_size,
+        [0.0, 0.0, 0.0],
+        device,
+        raster_cov_blur,
+    )
+    .await;
+    let rgba = rendered
+        .out_img
+        .into_data_async()
+        .await
+        .map_err(|err| {
+            SplatEvaluationError::InvalidInput(format!("gpu renderer readback failed: {err}"))
+        })?
+        .into_vec::<f32>()
+        .map_err(|err| {
+            SplatEvaluationError::InvalidInput(format!("gpu renderer output was not f32: {err}"))
+        })?;
+
+    let expected = img_size.0 as usize * img_size.1 as usize * 4;
+    if rgba.len() != expected {
+        return Err(SplatEvaluationError::InvalidInput(format!(
+            "gpu renderer output length {} does not match expected {}",
+            rgba.len(),
+            expected
+        )));
+    }
+
+    Ok(rgba)
 }
 
 #[cfg(feature = "gpu")]

@@ -423,8 +423,8 @@ fn draw_blue_button(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
 
     // Calculate proper centering with 8px gap between icon and text
     let font_id = egui::FontId::proportional(13.0);
-    let icon_width = ui.fonts(|f| f.glyph_width(&font_id, icon.chars().next().unwrap()));
-    let text_width = ui.fonts(|f| {
+    let icon_width = ui.fonts_mut(|f| f.glyph_width(&font_id, icon.chars().next().unwrap()));
+    let text_width = ui.fonts_mut(|f| {
         f.layout_no_wrap(label.to_string(), font_id.clone(), Color32::WHITE)
             .size()
             .x
@@ -481,8 +481,8 @@ fn draw_secondary_button(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
     );
 
     let font_id = egui::FontId::proportional(13.0);
-    let icon_width = ui.fonts(|f| f.glyph_width(&font_id, icon.chars().next().unwrap()));
-    let text_width = ui.fonts(|f| {
+    let icon_width = ui.fonts_mut(|f| f.glyph_width(&font_id, icon.chars().next().unwrap()));
+    let text_width = ui.fonts_mut(|f| {
         f.layout_no_wrap(label.to_string(), font_id.clone(), TEXT_PRIMARY)
             .size()
             .x
@@ -585,8 +585,8 @@ fn draw_auto_fit_button(ui: &mut egui::Ui) -> bool {
     let icon = "🎯";
     let label = "Auto Fit Scene";
     let font_id = egui::FontId::proportional(13.0);
-    let icon_width = ui.fonts(|f| f.glyph_width(&font_id, icon.chars().next().unwrap()));
-    let text_width = ui.fonts(|f| {
+    let icon_width = ui.fonts_mut(|f| f.glyph_width(&font_id, icon.chars().next().unwrap()));
+    let text_width = ui.fonts_mut(|f| {
         f.layout_no_wrap(label.to_string(), font_id.clone(), TEXT_PRIMARY)
             .size()
             .x

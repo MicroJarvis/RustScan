@@ -9,8 +9,8 @@ name = "rust-viewer"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
-egui = "0.31"
+eframe = { version = "0.34.3", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui = "0.34.3"
 glam = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 rfd = "0.14"

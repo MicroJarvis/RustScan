@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Rect, Sense, TextureHandle, TextureOptions, Vec2};
 use eframe::egui_wgpu;
@@ -16,8 +17,8 @@ use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
 use crate::training::preview::{
-    gaussian_camera_from_arcball_viewport, LivePreviewBridge, PreviewRenderStatus,
-    PreviewResolution,
+    gaussian_camera_from_arcball_viewport, AsyncPreviewBridge, LivePreviewBridge,
+    PreviewRenderStatus, PreviewResolution,
 };
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{draw_side_panel, DatasetUiSummary, PanelAction, UiState};
@@ -25,6 +26,9 @@ use crate::ui::theme::{
     overlay_bg, PANEL_BG, TEXT_PRIMARY, TEXT_SECONDARY, VIEWPORT_BG, WINDOW_BG,
 };
 use crate::ui::viewport::{draw_empty_state, draw_viewport_overlay};
+
+const VIEWPORT_INTERACTIVE_RENDER_SCALE: f32 = 0.5;
+const VIEWPORT_INTERACTIVE_IDLE_DELAY: Duration = Duration::from_millis(180);
 
 #[derive(Debug, Clone, Copy)]
 enum AssetLoadKind {
@@ -52,10 +56,11 @@ pub struct ViewerApp {
     preview_texture: Option<TextureHandle>,
     preview_texture_size: Option<[usize; 2]>,
     preview_dirty: bool,
-    viewport_bridge: LivePreviewBridge,
+    viewport_bridge: AsyncPreviewBridge,
     viewport_texture: Option<TextureHandle>,
     viewport_texture_size: Option<[usize; 2]>,
     viewport_dirty: bool,
+    viewport_last_motion: Option<Instant>,
     viewport_render_error: Option<String>,
     /// Actual wgpu surface format read from eframe at startup.
     surface_format: wgpu::TextureFormat,
@@ -90,10 +95,11 @@ impl ViewerApp {
             preview_texture: None,
             preview_texture_size: None,
             preview_dirty: true,
-            viewport_bridge: LivePreviewBridge::default(),
+            viewport_bridge: AsyncPreviewBridge::default(),
             viewport_texture: None,
             viewport_texture_size: None,
             viewport_dirty: true,
+            viewport_last_motion: None,
             viewport_render_error: None,
             surface_format,
         };
@@ -158,9 +164,11 @@ impl ViewerApp {
         }
 
         self.loaded_splats = load_succeeded.then_some(next_loaded_splats).flatten();
+        self.viewport_bridge = AsyncPreviewBridge::default();
         self.viewport_texture = None;
         self.viewport_texture_size = None;
         self.viewport_dirty = true;
+        self.viewport_last_motion = None;
         self.viewport_render_error = None;
     }
 
@@ -191,9 +199,11 @@ impl ViewerApp {
                 self.ui_state.preview_error = None;
                 self.loaded_colmap = Some(loaded);
                 self.loaded_splats = None;
+                self.viewport_bridge = AsyncPreviewBridge::default();
                 self.viewport_texture = None;
                 self.viewport_texture_size = None;
                 self.viewport_dirty = true;
+                self.viewport_last_motion = None;
                 self.viewport_render_error = None;
                 self.preview_dirty = true;
             }
@@ -344,6 +354,7 @@ impl ViewerApp {
             scene.recompute_bounds();
         }
         self.loaded_splats = Some(snapshot);
+        self.viewport_bridge.clear_pending();
         self.viewport_dirty = true;
         self.viewport_render_error = None;
     }
@@ -401,69 +412,114 @@ impl ViewerApp {
 
     fn refresh_viewport_texture(&mut self, ctx: &egui::Context, size: Vec2) {
         let Some(splats) = self.loaded_splats.clone() else {
+            self.viewport_bridge.clear_pending();
             self.viewport_texture = None;
             self.viewport_texture_size = None;
             return;
         };
 
-        let Some(resolution) = PreviewResolution::from_panel_size(size) else {
+        let Some(resolution) = self.viewport_render_resolution(ctx, size) else {
+            self.viewport_bridge.clear_pending();
             return;
         };
         let rounded_size = Some([resolution.width, resolution.height]);
-        let needs_refresh = self.viewport_dirty
+        let needs_request = self.viewport_dirty
             || self.viewport_texture.is_none()
             || self.viewport_texture_size != rounded_size;
-        if !needs_refresh {
-            return;
+
+        let already_waiting_for_same_resolution =
+            !self.viewport_dirty && self.viewport_bridge.has_pending_for(resolution);
+        if needs_request && !already_waiting_for_same_resolution {
+            let camera = gaussian_camera_from_arcball_viewport(&self.camera, resolution);
+            match self
+                .viewport_bridge
+                .request_render(splats, camera, resolution)
+            {
+                Ok(()) => {
+                    self.viewport_dirty = false;
+                    self.viewport_render_error = None;
+                    ctx.request_repaint();
+                }
+                Err(err) => {
+                    self.viewport_render_error = Some(err.to_string());
+                    self.viewport_texture = None;
+                    self.viewport_texture_size = rounded_size;
+                    self.viewport_dirty = false;
+                }
+            }
         }
 
-        let camera = gaussian_camera_from_arcball_viewport(&self.camera, resolution);
-        match self
-            .viewport_bridge
-            .render_snapshot(splats.as_ref(), &camera, resolution)
-        {
-            Ok(PreviewRenderStatus::Frame(image)) => {
-                if let Some(texture) = self.viewport_texture.as_mut() {
-                    texture.set(image, TextureOptions::LINEAR);
-                } else {
-                    self.viewport_texture = Some(ctx.load_texture(
-                        "loaded-gaussian-view",
-                        image,
-                        TextureOptions::LINEAR,
-                    ));
+        if let Some(result) = self.viewport_bridge.poll_latest() {
+            match result {
+                Ok(PreviewRenderStatus::Frame(image)) => {
+                    let image_size = image.size;
+                    if let Some(texture) = self.viewport_texture.as_mut() {
+                        texture.set(image, TextureOptions::LINEAR);
+                    } else {
+                        self.viewport_texture = Some(ctx.load_texture(
+                            "loaded-gaussian-view",
+                            image,
+                            TextureOptions::LINEAR,
+                        ));
+                    }
+                    self.viewport_texture_size = Some(image_size);
+                    self.viewport_render_error = None;
+                    self.viewport_dirty = false;
                 }
-                self.viewport_texture_size = rounded_size;
-                self.viewport_render_error = None;
-                self.viewport_dirty = false;
+                Ok(PreviewRenderStatus::EmptySnapshot) => {
+                    self.viewport_texture = None;
+                    self.viewport_texture_size = None;
+                    self.viewport_render_error = None;
+                    self.viewport_dirty = false;
+                }
+                Ok(PreviewRenderStatus::InvalidViewport) => {}
+                Err(err) => {
+                    self.viewport_render_error = Some(err.to_string());
+                    self.viewport_texture = None;
+                    self.viewport_texture_size = rounded_size;
+                    self.viewport_dirty = false;
+                }
             }
-            Ok(PreviewRenderStatus::EmptySnapshot) => {
-                self.viewport_texture = None;
-                self.viewport_texture_size = None;
-                self.viewport_render_error = None;
-                self.viewport_dirty = false;
-            }
-            Ok(PreviewRenderStatus::InvalidViewport) => {}
-            Err(err) => {
-                self.viewport_render_error = Some(err.to_string());
-                self.viewport_dirty = false;
-            }
+        }
+
+        if self.viewport_bridge.is_render_pending() {
+            ctx.request_repaint();
         }
     }
 
-    fn draw_preview_panel(&mut self, ctx: &egui::Context) {
+    fn viewport_render_resolution(
+        &self,
+        ctx: &egui::Context,
+        size: Vec2,
+    ) -> Option<PreviewResolution> {
+        let Some(last_motion) = self.viewport_last_motion else {
+            return PreviewResolution::from_panel_size(size);
+        };
+
+        let elapsed = Instant::now().saturating_duration_since(last_motion);
+        if elapsed < VIEWPORT_INTERACTIVE_IDLE_DELAY {
+            ctx.request_repaint_after(VIEWPORT_INTERACTIVE_IDLE_DELAY - elapsed);
+            PreviewResolution::from_panel_size_scaled(size, VIEWPORT_INTERACTIVE_RENDER_SCALE)
+        } else {
+            PreviewResolution::from_panel_size(size)
+        }
+    }
+
+    fn draw_preview_panel(&mut self, parent_ui: &mut egui::Ui) {
         if self.loaded_colmap.is_none() {
             return;
         }
 
-        egui::SidePanel::right("training_preview")
-            .min_width(360.0)
-            .default_width(420.0)
+        let ctx = parent_ui.ctx().clone();
+        egui::Panel::right("training_preview")
+            .min_size(360.0)
+            .default_size(420.0)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL_BG)
                     .inner_margin(egui::Margin::same(20)),
             )
-            .show(ctx, |ui| {
+            .show_inside(parent_ui, |ui| {
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new("Live Preview")
@@ -516,7 +572,7 @@ impl ViewerApp {
                         ctx.request_repaint();
                     }
 
-                    self.refresh_preview_texture(ctx, rect.size());
+                    self.refresh_preview_texture(&ctx, rect.size());
                     ui.painter().rect_filled(rect, 10.0, overlay_bg());
 
                     if let Some(texture) = &self.preview_texture {
@@ -566,11 +622,12 @@ fn clear_scene_preserving_layers(scene: &mut Scene) {
 }
 
 impl eframe::App for ViewerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        crate::ui::theme::configure_theme(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        crate::ui::theme::configure_theme(&ctx);
 
         self.poll_commands();
-        self.poll_training_events(ctx);
+        self.poll_training_events(&ctx);
 
         let (has_data, scene_bounds) = self
             .scene
@@ -578,10 +635,10 @@ impl eframe::App for ViewerApp {
             .map(|scene| (scene.has_data(), scene.bounds.clone()))
             .unwrap_or_default();
 
-        egui::TopBottomPanel::top("title_bar")
-            .exact_height(52.0)
+        egui::Panel::top("title_bar")
+            .exact_size(52.0)
             .frame(egui::Frame::new().fill(WINDOW_BG))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add_space(24.0);
                     ui.label(
@@ -594,14 +651,14 @@ impl eframe::App for ViewerApp {
             });
 
         let mut panel_actions = Vec::new();
-        egui::SidePanel::left("control_panel")
-            .exact_width(300.0)
+        egui::Panel::left("control_panel")
+            .exact_size(300.0)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL_BG)
                     .inner_margin(egui::Margin::same(24)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 if let Ok(mut scene) = self.scene.lock() {
                     panel_actions =
                         draw_side_panel(ui, &mut self.ui_state, &mut scene, &mut self.camera);
@@ -609,11 +666,11 @@ impl eframe::App for ViewerApp {
             });
         self.process_panel_actions(panel_actions);
 
-        self.draw_preview_panel(ctx);
+        self.draw_preview_panel(ui);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(VIEWPORT_BG))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 if !has_data {
                     draw_empty_state(ui);
                     draw_viewport_overlay(ui, &self.camera, has_data);
@@ -652,6 +709,11 @@ impl eframe::App for ViewerApp {
                         camera_moved = true;
                     }
                 }
+                if camera_moved {
+                    self.viewport_dirty = true;
+                    self.viewport_last_motion = Some(Instant::now());
+                    ctx.request_repaint();
+                }
 
                 let true_splat_view = self.loaded_splats.is_some()
                     && self
@@ -660,7 +722,7 @@ impl eframe::App for ViewerApp {
                         .map(|scene| scene.layers.gaussians)
                         .unwrap_or(false);
                 if true_splat_view {
-                    self.refresh_viewport_texture(ctx, viewport_rect.size());
+                    self.refresh_viewport_texture(&ctx, viewport_rect.size());
                     ui.painter().rect_filled(viewport_rect, 0.0, VIEWPORT_BG);
                     if let Some(texture) = &self.viewport_texture {
                         ui.painter().image(
@@ -693,11 +755,6 @@ impl eframe::App for ViewerApp {
                 ui.painter().add(callback);
 
                 draw_viewport_overlay(ui, &self.camera, has_data);
-
-                if camera_moved {
-                    self.viewport_dirty = true;
-                    ctx.request_repaint();
-                }
 
                 let _ = scene_bounds;
             });
