@@ -487,31 +487,6 @@ impl SplatEvaluationRenderer {
             SplatEvaluationRendererBackend::Gpu(renderer) => renderer.render(splats, camera),
         }
     }
-
-    pub fn render_rgba_f32(
-        &mut self,
-        splats: &HostSplats,
-        camera: &GaussianCamera,
-    ) -> Result<Vec<f32>, SplatEvaluationError> {
-        match &mut self.backend {
-            SplatEvaluationRendererBackend::Cpu(renderer) => {
-                let output = renderer
-                    .render_splats(splats, camera)
-                    .map_err(|err| SplatEvaluationError::InvalidInput(err.to_string()))?;
-                let mut rgba = Vec::with_capacity(output.color.len() / 3 * 4);
-                for px in output.color.chunks_exact(3) {
-                    rgba.push(px[0] as f32 / 255.0);
-                    rgba.push(px[1] as f32 / 255.0);
-                    rgba.push(px[2] as f32 / 255.0);
-                    rgba.push(1.0);
-                }
-                Ok(rgba)
-            }
-            SplatEvaluationRendererBackend::Gpu(renderer) => {
-                renderer.render_rgba_f32(splats, camera)
-            }
-        }
-    }
 }
 
 #[cfg(feature = "gpu")]
@@ -559,19 +534,6 @@ impl GpuSplatEvaluationRenderer {
         splats: &HostSplats,
         camera: &GaussianCamera,
     ) -> Result<Vec<f32>, SplatEvaluationError> {
-        let rgba = self.render_rgba_f32(splats, camera)?;
-        let mut rgb = Vec::with_capacity(self.render_width * self.render_height * 3);
-        for px in rgba.chunks_exact(4) {
-            rgb.extend_from_slice(&px[..3]);
-        }
-        Ok(rgb)
-    }
-
-    fn render_rgba_f32(
-        &mut self,
-        splats: &HostSplats,
-        camera: &GaussianCamera,
-    ) -> Result<Vec<f32>, SplatEvaluationError> {
         self.ensure_device_splats(splats);
         let cached = self.cached_splats.as_ref().ok_or_else(|| {
             SplatEvaluationError::InvalidInput("gpu splat cache was not initialized".to_string())
@@ -591,7 +553,7 @@ impl GpuSplatEvaluationRenderer {
             })?,
         );
 
-        self.runtime.block_on(render_gpu_rgba_f32(
+        self.runtime.block_on(render_gpu_rgb_f32(
             &cached.splats,
             camera,
             img_size,
@@ -635,7 +597,7 @@ impl SplatCacheKey {
 }
 
 #[cfg(feature = "gpu")]
-async fn render_gpu_rgba_f32(
+async fn render_gpu_rgb_f32(
     splats: &DeviceSplats<GsBackendBase>,
     camera: &GaussianCamera,
     img_size: (u32, u32),
@@ -672,7 +634,12 @@ async fn render_gpu_rgba_f32(
         )));
     }
 
-    Ok(rgba)
+    let mut rgb = Vec::with_capacity(img_size.0 as usize * img_size.1 as usize * 3);
+    for px in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+
+    Ok(rgb)
 }
 
 #[cfg(feature = "gpu")]

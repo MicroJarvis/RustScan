@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Rect, Sense, TextureHandle, TextureOptions, Vec2};
+use eframe::egui::{self, Color32, Rect, Sense, Vec2};
 use eframe::egui_wgpu;
 use eframe::wgpu;
 use rustgs::{ColmapConfig, HostSplats, SharedWgpuContext, TrainingConfig};
@@ -17,7 +17,6 @@ use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
 use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
-use crate::training::preview::{LivePreviewBridge, PreviewRenderStatus};
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{draw_side_panel, DatasetUiSummary, PanelAction, UiState};
 use crate::ui::theme::{
@@ -49,9 +48,7 @@ pub struct ViewerApp {
     command_tx: mpsc::Sender<AppCommand>,
     training_manager: TrainingManager,
     loaded_splats: Option<Arc<HostSplats>>,
-    preview_bridge: LivePreviewBridge,
-    preview_texture: Option<TextureHandle>,
-    preview_texture_size: Option<[usize; 2]>,
+    preview_bridge: Option<GpuViewportBridge>,
     preview_dirty: bool,
     viewport_bridge: Option<GpuViewportBridge>,
     viewport_dirty: bool,
@@ -82,18 +79,10 @@ impl ViewerApp {
             .wgpu_render_state
             .as_ref()
             .map(shared_wgpu_context_from_render_state);
-        let viewport_bridge = cc
-            .wgpu_render_state
-            .as_ref()
-            .zip(shared_wgpu_context.clone())
-            .map(|(render_state, context)| {
-                GpuViewportBridge::new(
-                    context,
-                    render_state.device.clone(),
-                    render_state.queue.clone(),
-                    render_state,
-                )
-            });
+        let preview_bridge =
+            new_gpu_viewport_bridge(&shared_wgpu_context, cc.wgpu_render_state.as_ref());
+        let viewport_bridge =
+            new_gpu_viewport_bridge(&shared_wgpu_context, cc.wgpu_render_state.as_ref());
         let app = Self {
             scene: Arc::new(Mutex::new(Scene::default())),
             camera: ArcballCamera::default(),
@@ -104,9 +93,7 @@ impl ViewerApp {
             command_tx,
             training_manager: TrainingManager::new(),
             loaded_splats: None,
-            preview_bridge: live_preview_bridge_for(&shared_wgpu_context),
-            preview_texture: None,
-            preview_texture_size: None,
+            preview_bridge,
             preview_dirty: true,
             viewport_bridge,
             viewport_dirty: true,
@@ -177,6 +164,7 @@ impl ViewerApp {
         }
 
         self.loaded_splats = load_succeeded.then_some(next_loaded_splats).flatten();
+        self.preview_bridge = self.new_gpu_viewport_bridge();
         self.viewport_bridge = self.new_gpu_viewport_bridge();
         self.viewport_dirty = true;
         self.viewport_last_motion = None;
@@ -210,6 +198,7 @@ impl ViewerApp {
                 self.ui_state.preview_error = None;
                 self.loaded_colmap = Some(loaded);
                 self.loaded_splats = None;
+                self.preview_bridge = self.new_gpu_viewport_bridge();
                 self.viewport_bridge = self.new_gpu_viewport_bridge();
                 self.viewport_dirty = true;
                 self.viewport_last_motion = None;
@@ -381,53 +370,40 @@ impl ViewerApp {
         self.viewport_render_error = None;
     }
 
-    fn refresh_preview_texture(&mut self, ctx: &egui::Context, size: Vec2) {
-        let Some(loaded) = self.loaded_colmap.as_ref() else {
-            self.preview_texture = None;
-            self.preview_texture_size = None;
-            return;
+    fn refresh_preview_texture_id(&mut self, size: Vec2) -> Option<egui::TextureId> {
+        self.loaded_colmap.as_ref()?;
+        let Some(snapshot) = self.training_manager.latest_snapshot() else {
+            self.ui_state.preview_error = None;
+            self.preview_dirty = false;
+            return None;
         };
-
-        let rounded_size = if size.x >= 1.0 && size.y >= 1.0 {
-            Some([size.x.floor() as usize, size.y.floor() as usize])
-        } else {
-            None
-        };
-        let needs_refresh = self.preview_dirty
-            || self.preview_texture.is_none()
-            || self.preview_texture_size != rounded_size;
-        if !needs_refresh {
-            return;
+        if snapshot.is_empty() {
+            self.ui_state.preview_error = None;
+            self.preview_dirty = false;
+            return None;
         }
+        let Some(preview_bridge) = self.preview_bridge.as_mut() else {
+            self.ui_state.preview_error = Some("wgpu render state is unavailable".to_string());
+            self.preview_dirty = false;
+            return None;
+        };
 
-        let snapshot = self.training_manager.latest_snapshot();
-        match self.preview_bridge.render_from_arcball(
-            snapshot.as_deref(),
+        match preview_bridge.render_texture_id(
+            self.wgpu_render_state.as_ref(),
+            snapshot,
             &self.preview_camera,
-            loaded.dataset.intrinsics,
             size,
+            1.0,
         ) {
-            Ok(PreviewRenderStatus::Frame(image)) => {
-                if let Some(texture) = self.preview_texture.as_mut() {
-                    texture.set(image, TextureOptions::LINEAR);
-                } else {
-                    self.preview_texture =
-                        Some(ctx.load_texture("training-preview", image, TextureOptions::LINEAR));
-                }
-                self.preview_texture_size = rounded_size;
+            Ok(texture_id) => {
                 self.ui_state.preview_error = None;
                 self.preview_dirty = false;
+                texture_id
             }
-            Ok(PreviewRenderStatus::EmptySnapshot) => {
-                self.preview_texture = None;
-                self.preview_texture_size = None;
-                self.ui_state.preview_error = None;
-                self.preview_dirty = false;
-            }
-            Ok(PreviewRenderStatus::InvalidViewport) => {}
             Err(err) => {
                 self.ui_state.preview_error = Some(err.to_string());
                 self.preview_dirty = false;
+                None
             }
         }
     }
@@ -537,12 +513,12 @@ impl ViewerApp {
                         ctx.request_repaint();
                     }
 
-                    self.refresh_preview_texture(&ctx, rect.size());
+                    let texture_id = self.refresh_preview_texture_id(rect.size());
                     ui.painter().rect_filled(rect, 10.0, overlay_bg());
 
-                    if let Some(texture) = &self.preview_texture {
+                    if let Some(texture_id) = texture_id {
                         ui.painter().image(
-                            texture.id(),
+                            texture_id,
                             rect,
                             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             Color32::WHITE,
@@ -586,11 +562,20 @@ fn clear_scene_preserving_layers(scene: &mut Scene) {
     scene.layers = layers;
 }
 
-fn live_preview_bridge_for(context: &Option<SharedWgpuContext>) -> LivePreviewBridge {
-    context
-        .clone()
-        .map(LivePreviewBridge::with_shared_wgpu_context)
-        .unwrap_or_default()
+fn new_gpu_viewport_bridge(
+    context: &Option<SharedWgpuContext>,
+    render_state: Option<&egui_wgpu::RenderState>,
+) -> Option<GpuViewportBridge> {
+    render_state
+        .zip(context.clone())
+        .map(|(render_state, context)| {
+            GpuViewportBridge::new(
+                context,
+                render_state.device.clone(),
+                render_state.queue.clone(),
+                render_state,
+            )
+        })
 }
 
 fn shared_wgpu_context_from_render_state(

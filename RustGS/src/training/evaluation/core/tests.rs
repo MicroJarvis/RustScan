@@ -143,27 +143,6 @@ fn splat_evaluation_renderer_gpu_renders_rgb_frame() {
 
 #[cfg(feature = "gpu")]
 #[test]
-fn splat_evaluation_renderer_gpu_renders_rgba_frame() {
-    let splats = test_gpu_splats();
-    let camera = crate::GaussianCamera::new(Intrinsics::from_focal(500.0, 32, 32), SE3::identity());
-    let mut renderer = super::SplatEvaluationRenderer::new(
-        32,
-        32,
-        EvaluationDevice::Gpu,
-        crate::DEFAULT_RASTER_COV_BLUR,
-    )
-    .expect("gpu renderer");
-
-    let rgba = renderer
-        .render_rgba_f32(&splats, &camera)
-        .expect("render frame");
-
-    assert_eq!(rgba.len(), 32 * 32 * 4);
-    assert!(rgba.iter().any(|value| *value > 0.0));
-}
-
-#[cfg(feature = "gpu")]
-#[test]
 fn splat_evaluation_renderer_uses_existing_wgpu_context() {
     let context = test_shared_wgpu_context();
     let splats = test_gpu_splats();
@@ -176,12 +155,10 @@ fn splat_evaluation_renderer_uses_existing_wgpu_context() {
     )
     .expect("gpu renderer");
 
-    let rgba = renderer
-        .render_rgba_f32(&splats, &camera)
-        .expect("render frame");
+    let rgb = renderer.render(&splats, &camera).expect("render frame");
 
-    assert_eq!(rgba.len(), 32 * 32 * 4);
-    assert!(rgba.iter().any(|value| *value > 0.0));
+    assert_eq!(rgb.len(), 32 * 32 * 3);
+    assert!(rgb.iter().any(|value| *value > 0.0));
 }
 
 #[cfg(feature = "gpu")]
