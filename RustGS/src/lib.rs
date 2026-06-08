@@ -41,6 +41,8 @@ pub mod init;
 pub mod io;
 mod sh;
 pub mod training;
+#[cfg(feature = "gpu")]
+pub mod viewport;
 
 use std::path::Path;
 
@@ -82,6 +84,8 @@ pub use crate::training::{
 #[cfg(feature = "gpu")]
 pub use crate::training::{SharedWgpuContext, SplatEvaluationRenderer};
 pub use crate::training::{TrainingBackend, TrainingConfig, TrainingResult};
+#[cfg(feature = "gpu")]
+pub use crate::viewport::{WgpuViewportCamera, WgpuViewportRenderer, WgpuViewportResolution};
 
 // Re-export IO types
 pub use crate::io::colmap_dataset::{load_colmap_dataset, ColmapConfig};

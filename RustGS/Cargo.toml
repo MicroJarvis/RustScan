@@ -39,7 +39,7 @@ burn-wgpu = { git = "https://github.com/tracel-ai/burn", rev = "c33867c60a99958a
 burn-cubecl = { git = "https://github.com/tracel-ai/burn", rev = "c33867c60a99958aafd4d05df782c68d242a6510", default-features = false, features = ["template"], optional = true }
 burn-fusion = { git = "https://github.com/tracel-ai/burn", rev = "c33867c60a99958aafd4d05df782c68d242a6510", default-features = false, optional = true }
 burn-ir = { git = "https://github.com/tracel-ai/burn", rev = "c33867c60a99958aafd4d05df782c68d242a6510", default-features = false, optional = true }
-wgpu = { version = "29.0.1", default-features = false, features = ["naga-ir"], optional = true }
+wgpu = { version = "29.0.1", default-features = false, features = ["naga-ir", "wgsl"], optional = true }
 naga_oil = { version = "0.22", optional = true }
 bytemuck = { version = "1.20", features = ["derive"], optional = true }
 tokio = { version = "1", features = ["macros", "rt"], optional = true }
