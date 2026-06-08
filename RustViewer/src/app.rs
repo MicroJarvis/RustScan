@@ -16,10 +16,8 @@ use crate::loader::{
 use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
-use crate::training::preview::{
-    gaussian_camera_from_arcball_viewport, AsyncPreviewBridge, LivePreviewBridge,
-    PreviewRenderStatus, PreviewResolution,
-};
+use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
+use crate::training::preview::{LivePreviewBridge, PreviewRenderStatus};
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{draw_side_panel, DatasetUiSummary, PanelAction, UiState};
 use crate::ui::theme::{
@@ -27,7 +25,6 @@ use crate::ui::theme::{
 };
 use crate::ui::viewport::{draw_empty_state, draw_viewport_overlay};
 
-const VIEWPORT_INTERACTIVE_RENDER_SCALE: f32 = 0.5;
 const VIEWPORT_INTERACTIVE_IDLE_DELAY: Duration = Duration::from_millis(180);
 
 #[derive(Debug, Clone, Copy)]
@@ -56,13 +53,12 @@ pub struct ViewerApp {
     preview_texture: Option<TextureHandle>,
     preview_texture_size: Option<[usize; 2]>,
     preview_dirty: bool,
-    viewport_bridge: AsyncPreviewBridge,
-    viewport_texture: Option<TextureHandle>,
-    viewport_texture_size: Option<[usize; 2]>,
+    viewport_bridge: Option<GpuViewportBridge>,
     viewport_dirty: bool,
     viewport_last_motion: Option<Instant>,
     viewport_render_error: Option<String>,
     shared_wgpu_context: Option<SharedWgpuContext>,
+    wgpu_render_state: Option<egui_wgpu::RenderState>,
     /// Actual wgpu surface format read from eframe at startup.
     surface_format: wgpu::TextureFormat,
 }
@@ -86,6 +82,18 @@ impl ViewerApp {
             .wgpu_render_state
             .as_ref()
             .map(shared_wgpu_context_from_render_state);
+        let viewport_bridge = cc
+            .wgpu_render_state
+            .as_ref()
+            .zip(shared_wgpu_context.clone())
+            .map(|(render_state, context)| {
+                GpuViewportBridge::new(
+                    context,
+                    render_state.device.clone(),
+                    render_state.queue.clone(),
+                    render_state,
+                )
+            });
         let app = Self {
             scene: Arc::new(Mutex::new(Scene::default())),
             camera: ArcballCamera::default(),
@@ -100,13 +108,12 @@ impl ViewerApp {
             preview_texture: None,
             preview_texture_size: None,
             preview_dirty: true,
-            viewport_bridge: async_preview_bridge_for(&shared_wgpu_context),
-            viewport_texture: None,
-            viewport_texture_size: None,
+            viewport_bridge,
             viewport_dirty: true,
             viewport_last_motion: None,
             viewport_render_error: None,
             shared_wgpu_context,
+            wgpu_render_state: cc.wgpu_render_state.clone(),
             surface_format,
         };
 
@@ -170,9 +177,7 @@ impl ViewerApp {
         }
 
         self.loaded_splats = load_succeeded.then_some(next_loaded_splats).flatten();
-        self.viewport_bridge = self.new_async_preview_bridge();
-        self.viewport_texture = None;
-        self.viewport_texture_size = None;
+        self.viewport_bridge = self.new_gpu_viewport_bridge();
         self.viewport_dirty = true;
         self.viewport_last_motion = None;
         self.viewport_render_error = None;
@@ -205,9 +210,7 @@ impl ViewerApp {
                 self.ui_state.preview_error = None;
                 self.loaded_colmap = Some(loaded);
                 self.loaded_splats = None;
-                self.viewport_bridge = self.new_async_preview_bridge();
-                self.viewport_texture = None;
-                self.viewport_texture_size = None;
+                self.viewport_bridge = self.new_gpu_viewport_bridge();
                 self.viewport_dirty = true;
                 self.viewport_last_motion = None;
                 self.viewport_render_error = None;
@@ -219,8 +222,18 @@ impl ViewerApp {
         }
     }
 
-    fn new_async_preview_bridge(&self) -> AsyncPreviewBridge {
-        async_preview_bridge_for(&self.shared_wgpu_context)
+    fn new_gpu_viewport_bridge(&self) -> Option<GpuViewportBridge> {
+        self.wgpu_render_state
+            .as_ref()
+            .zip(self.shared_wgpu_context.clone())
+            .map(|(render_state, context)| {
+                GpuViewportBridge::new(
+                    context,
+                    render_state.device.clone(),
+                    render_state.queue.clone(),
+                    render_state,
+                )
+            })
     }
 
     fn process_panel_actions(&mut self, actions: Vec<PanelAction>) {
@@ -364,7 +377,6 @@ impl ViewerApp {
             scene.recompute_bounds();
         }
         self.loaded_splats = Some(snapshot);
-        self.viewport_bridge.clear_pending();
         self.viewport_dirty = true;
         self.viewport_render_error = None;
     }
@@ -420,98 +432,41 @@ impl ViewerApp {
         }
     }
 
-    fn refresh_viewport_texture(&mut self, ctx: &egui::Context, size: Vec2) {
-        let Some(splats) = self.loaded_splats.clone() else {
-            self.viewport_bridge.clear_pending();
-            self.viewport_texture = None;
-            self.viewport_texture_size = None;
-            return;
-        };
-
-        let Some(resolution) = self.viewport_render_resolution(ctx, size) else {
-            self.viewport_bridge.clear_pending();
-            return;
-        };
-        let rounded_size = Some([resolution.width, resolution.height]);
-        let needs_request = self.viewport_dirty
-            || self.viewport_texture.is_none()
-            || self.viewport_texture_size != rounded_size;
-
-        let already_waiting_for_same_resolution =
-            !self.viewport_dirty && self.viewport_bridge.has_pending_for(resolution);
-        if needs_request && !already_waiting_for_same_resolution {
-            let camera = gaussian_camera_from_arcball_viewport(&self.camera, resolution);
-            match self
-                .viewport_bridge
-                .request_render(splats, camera, resolution)
-            {
-                Ok(()) => {
-                    self.viewport_dirty = false;
-                    self.viewport_render_error = None;
-                    ctx.request_repaint();
-                }
-                Err(err) => {
-                    self.viewport_render_error = Some(err.to_string());
-                    self.viewport_texture = None;
-                    self.viewport_texture_size = rounded_size;
-                    self.viewport_dirty = false;
-                }
-            }
-        }
-
-        if let Some(result) = self.viewport_bridge.poll_latest() {
-            match result {
-                Ok(PreviewRenderStatus::Frame(image)) => {
-                    let image_size = image.size;
-                    if let Some(texture) = self.viewport_texture.as_mut() {
-                        texture.set(image, TextureOptions::LINEAR);
-                    } else {
-                        self.viewport_texture = Some(ctx.load_texture(
-                            "loaded-gaussian-view",
-                            image,
-                            TextureOptions::LINEAR,
-                        ));
-                    }
-                    self.viewport_texture_size = Some(image_size);
-                    self.viewport_render_error = None;
-                    self.viewport_dirty = false;
-                }
-                Ok(PreviewRenderStatus::EmptySnapshot) => {
-                    self.viewport_texture = None;
-                    self.viewport_texture_size = None;
-                    self.viewport_render_error = None;
-                    self.viewport_dirty = false;
-                }
-                Ok(PreviewRenderStatus::InvalidViewport) => {}
-                Err(err) => {
-                    self.viewport_render_error = Some(err.to_string());
-                    self.viewport_texture = None;
-                    self.viewport_texture_size = rounded_size;
-                    self.viewport_dirty = false;
-                }
-            }
-        }
-
-        if self.viewport_bridge.is_render_pending() {
-            ctx.request_repaint();
-        }
-    }
-
-    fn viewport_render_resolution(
-        &self,
+    fn refresh_viewport_texture_id(
+        &mut self,
         ctx: &egui::Context,
         size: Vec2,
-    ) -> Option<PreviewResolution> {
-        let Some(last_motion) = self.viewport_last_motion else {
-            return PreviewResolution::from_panel_size(size);
+    ) -> Option<egui::TextureId> {
+        let Some(splats) = self.loaded_splats.clone() else {
+            return None;
+        };
+        let Some(viewport_bridge) = self.viewport_bridge.as_mut() else {
+            self.viewport_render_error = Some("wgpu render state is unavailable".to_string());
+            return None;
         };
 
-        let elapsed = Instant::now().saturating_duration_since(last_motion);
-        if elapsed < VIEWPORT_INTERACTIVE_IDLE_DELAY {
-            ctx.request_repaint_after(VIEWPORT_INTERACTIVE_IDLE_DELAY - elapsed);
-            PreviewResolution::from_panel_size_scaled(size, VIEWPORT_INTERACTIVE_RENDER_SCALE)
-        } else {
-            PreviewResolution::from_panel_size(size)
+        let scale =
+            viewport_render_scale(self.viewport_last_motion, VIEWPORT_INTERACTIVE_IDLE_DELAY);
+        if scale < 1.0 {
+            ctx.request_repaint_after(VIEWPORT_INTERACTIVE_IDLE_DELAY);
+        }
+        match viewport_bridge.render_texture_id(
+            self.wgpu_render_state.as_ref(),
+            splats,
+            &self.camera,
+            size,
+            scale,
+        ) {
+            Ok(texture_id) => {
+                self.viewport_render_error = None;
+                self.viewport_dirty = false;
+                texture_id
+            }
+            Err(err) => {
+                self.viewport_render_error = Some(err.to_string());
+                self.viewport_dirty = false;
+                None
+            }
         }
     }
 
@@ -629,13 +584,6 @@ fn clear_scene_preserving_layers(scene: &mut Scene) {
     let layers = scene.layers.clone();
     *scene = Scene::default();
     scene.layers = layers;
-}
-
-fn async_preview_bridge_for(context: &Option<SharedWgpuContext>) -> AsyncPreviewBridge {
-    context
-        .clone()
-        .map(AsyncPreviewBridge::with_shared_wgpu_context)
-        .unwrap_or_default()
 }
 
 fn live_preview_bridge_for(context: &Option<SharedWgpuContext>) -> LivePreviewBridge {
@@ -766,11 +714,11 @@ impl eframe::App for ViewerApp {
                         .map(|scene| scene.layers.gaussians)
                         .unwrap_or(false);
                 if true_splat_view {
-                    self.refresh_viewport_texture(&ctx, viewport_rect.size());
+                    let texture_id = self.refresh_viewport_texture_id(&ctx, viewport_rect.size());
                     ui.painter().rect_filled(viewport_rect, 0.0, VIEWPORT_BG);
-                    if let Some(texture) = &self.viewport_texture {
+                    if let Some(texture_id) = texture_id {
                         ui.painter().image(
-                            texture.id(),
+                            texture_id,
                             viewport_rect,
                             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             Color32::WHITE,
