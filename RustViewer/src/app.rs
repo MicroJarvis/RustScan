@@ -17,6 +17,7 @@ use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
 use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
+use crate::training::preview::PreviewResolution;
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{draw_side_panel, DatasetUiSummary, PanelAction, UiState};
 use crate::ui::theme::{
@@ -25,6 +26,12 @@ use crate::ui::theme::{
 use crate::ui::viewport::{draw_empty_state, draw_viewport_overlay};
 
 const VIEWPORT_INTERACTIVE_IDLE_DELAY: Duration = Duration::from_millis(180);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedTexture {
+    id: egui::TextureId,
+    resolution: PreviewResolution,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum AssetLoadKind {
@@ -50,8 +57,10 @@ pub struct ViewerApp {
     loaded_splats: Option<Arc<HostSplats>>,
     preview_bridge: Option<GpuViewportBridge>,
     preview_dirty: bool,
+    preview_texture: Option<CachedTexture>,
     viewport_bridge: Option<GpuViewportBridge>,
     viewport_dirty: bool,
+    viewport_texture: Option<CachedTexture>,
     viewport_last_motion: Option<Instant>,
     viewport_render_error: Option<String>,
     shared_wgpu_context: Option<SharedWgpuContext>,
@@ -95,8 +104,10 @@ impl ViewerApp {
             loaded_splats: None,
             preview_bridge,
             preview_dirty: true,
+            preview_texture: None,
             viewport_bridge,
             viewport_dirty: true,
+            viewport_texture: None,
             viewport_last_motion: None,
             viewport_render_error: None,
             shared_wgpu_context,
@@ -166,6 +177,8 @@ impl ViewerApp {
         self.loaded_splats = load_succeeded.then_some(next_loaded_splats).flatten();
         self.preview_bridge = self.new_gpu_viewport_bridge();
         self.viewport_bridge = self.new_gpu_viewport_bridge();
+        self.preview_texture = None;
+        self.viewport_texture = None;
         self.viewport_dirty = true;
         self.viewport_last_motion = None;
         self.viewport_render_error = None;
@@ -200,6 +213,8 @@ impl ViewerApp {
                 self.loaded_splats = None;
                 self.preview_bridge = self.new_gpu_viewport_bridge();
                 self.viewport_bridge = self.new_gpu_viewport_bridge();
+                self.preview_texture = None;
+                self.viewport_texture = None;
                 self.viewport_dirty = true;
                 self.viewport_last_motion = None;
                 self.viewport_render_error = None;
@@ -235,7 +250,11 @@ impl ViewerApp {
                 PanelAction::OpenColmap => self.spawn_colmap_load(),
                 PanelAction::StartTraining => self.start_training(),
                 PanelAction::StopTraining => self.stop_training(),
-                PanelAction::AutoFitScene => {}
+                PanelAction::AutoFitScene => {
+                    self.preview_dirty = true;
+                    self.viewport_dirty = true;
+                    self.viewport_last_motion = None;
+                }
             }
         }
     }
@@ -376,12 +395,20 @@ impl ViewerApp {
         let Some(snapshot) = self.training_manager.latest_snapshot() else {
             self.ui_state.preview_error = None;
             self.preview_dirty = false;
+            self.preview_texture = None;
             return None;
         };
         if snapshot.is_empty() {
             self.ui_state.preview_error = None;
             self.preview_dirty = false;
+            self.preview_texture = None;
             return None;
+        }
+        let Some(resolution) = PreviewResolution::from_panel_size_scaled(size, 1.0) else {
+            return self.preview_texture.map(|texture| texture.id);
+        };
+        if !needs_texture_render(self.preview_dirty, self.preview_texture, resolution) {
+            return self.preview_texture.map(|texture| texture.id);
         }
         let Some(preview_bridge) = self.preview_bridge.as_mut() else {
             self.ui_state.preview_error = Some("wgpu render state is unavailable".to_string());
@@ -399,6 +426,7 @@ impl ViewerApp {
             Ok(texture_id) => {
                 self.ui_state.preview_error = None;
                 self.preview_dirty = false;
+                self.preview_texture = texture_id.map(|id| CachedTexture { id, resolution });
                 texture_id
             }
             Err(err) => {
@@ -427,6 +455,12 @@ impl ViewerApp {
         if scale < 1.0 {
             ctx.request_repaint_after(VIEWPORT_INTERACTIVE_IDLE_DELAY);
         }
+        let Some(resolution) = PreviewResolution::from_panel_size_scaled(size, scale) else {
+            return self.viewport_texture.map(|texture| texture.id);
+        };
+        if !needs_texture_render(self.viewport_dirty, self.viewport_texture, resolution) {
+            return self.viewport_texture.map(|texture| texture.id);
+        }
         match viewport_bridge.render_texture_id(
             self.wgpu_render_state.as_ref(),
             splats,
@@ -437,6 +471,7 @@ impl ViewerApp {
             Ok(texture_id) => {
                 self.viewport_render_error = None;
                 self.viewport_dirty = false;
+                self.viewport_texture = texture_id.map(|id| CachedTexture { id, resolution });
                 texture_id
             }
             Err(err) => {
@@ -561,6 +596,17 @@ fn clear_scene_preserving_layers(scene: &mut Scene) {
     let layers = scene.layers.clone();
     *scene = Scene::default();
     scene.layers = layers;
+}
+
+fn needs_texture_render(
+    dirty: bool,
+    cached: Option<CachedTexture>,
+    resolution: PreviewResolution,
+) -> bool {
+    dirty
+        || cached
+            .map(|texture| texture.resolution != resolution)
+            .unwrap_or(true)
 }
 
 fn new_gpu_viewport_bridge(
@@ -807,5 +853,23 @@ mod tests {
         assert!(scene.layers.gaussians);
         assert!(scene.layers.mesh_wireframe);
         assert!(!scene.layers.mesh_solid);
+    }
+
+    #[test]
+    fn texture_render_only_needed_when_dirty_missing_or_resized() {
+        let resolution = PreviewResolution::new(640, 480).unwrap();
+        let cached = Some(CachedTexture {
+            id: egui::TextureId::User(7),
+            resolution,
+        });
+
+        assert!(needs_texture_render(true, cached, resolution));
+        assert!(needs_texture_render(false, None, resolution));
+        assert!(needs_texture_render(
+            false,
+            cached,
+            PreviewResolution::new(320, 240).unwrap()
+        ));
+        assert!(!needs_texture_render(false, cached, resolution));
     }
 }

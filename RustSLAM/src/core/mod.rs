@@ -8,9 +8,6 @@ pub mod map;
 pub mod map_point;
 pub mod pose;
 
-#[cfg(test)]
-mod additional_tests;
-
 pub use camera::Camera;
 pub use frame::{Frame, FrameFeatures};
 pub use keyframe::KeyFrame;

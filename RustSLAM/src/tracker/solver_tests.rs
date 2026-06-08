@@ -376,33 +376,4 @@ mod tests {
     // =========================================================================
     // Integration Tests
     // =========================================================================
-
-    #[test]
-    fn test_full_vo_pipeline() {
-        // Test the full pipeline: tracking -> triangulation -> optimization
-        let _pnp_solver = PnPSolver::new(500.0, 500.0, 320.0, 240.0);
-        let essential_solver = EssentialSolver::new();
-        let triangulator = Triangulator::new();
-
-        // Simulate two frames with known motion
-        let pose1 = SE3::identity();
-        let pose2 = SE3::from_axis_angle(&[0.0, 0.0, 0.1], &[0.5, 0.0, 0.0]);
-
-        // Create fake correspondences
-        let pts1: Vec<[f32; 2]> = vec![[320.0, 240.0], [420.0, 240.0], [320.0, 340.0]];
-        let pts2: Vec<[f32; 2]> = vec![[270.0, 240.0], [370.0, 240.0], [270.0, 340.0]];
-
-        // Compute essential matrix
-        let _ = essential_solver.compute(&[], &pts1, &pts2);
-
-        // Recover pose from essential matrix
-        let E = Mat3::IDENTITY; // Simplified
-        let _ = essential_solver.recover_pose(E);
-
-        // Triangulate points
-        let _ = triangulator.triangulate(&pose1, &pose2, &pts1, &pts2);
-
-        // Pipeline should complete without errors
-        assert!(true);
-    }
 }

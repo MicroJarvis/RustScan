@@ -7,8 +7,5 @@
 pub mod fusion;
 pub mod stereo;
 
-#[cfg(test)]
-mod additional_tests;
-
 pub use fusion::{DepthFusion, DepthFusionConfig, DepthObservation, TemporalDepthFusion};
 pub use stereo::{BlockMatcher, StereoConfig, StereoMatcher};

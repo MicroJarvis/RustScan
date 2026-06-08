@@ -650,16 +650,4 @@ mod tests {
             assert_eq!(viewer.buffer[i], bg[0]);
         }
     }
-
-    #[test]
-    fn test_draw_line() {
-        let mut viewer = MapViewer::new(100, 100);
-
-        // Draw a line from (10,10) to (50,50)
-        viewer.draw_line(10, 10, 50, 50, [255, 0, 0, 255]);
-
-        // Check that pixels on the line are colored
-        // Just verify it doesn't panic
-        assert!(true);
-    }
 }
