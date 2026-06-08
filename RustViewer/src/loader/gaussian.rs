@@ -5,6 +5,8 @@ use std::path::Path;
 use crate::loader::checkpoint::LoadError;
 use crate::renderer::scene::{GaussianSplat, Scene};
 
+const SH_C0: f32 = 0.282_094_8;
+
 /// Load a 3DGS scene.splat/scene.ply and add Gaussians to the scene.
 ///
 /// # Example
@@ -21,9 +23,10 @@ pub fn load_gaussians(path: &Path, scene: &mut Scene) -> Result<(), LoadError> {
     load_gaussians_with_splats(path, scene).map(|_| ())
 }
 
-/// Load a 3DGS scene and return the original RustGS splats when the file uses
-/// RustGS's native layout. Legacy RustSLAM PLY files still load into `scene`,
-/// but return `None` because they do not preserve the full RustGS SH layout.
+/// Load a 3DGS scene and return GPU-renderable RustGS splats.
+///
+/// RustGS files preserve their native SH layout. Legacy RustSLAM PLY files are
+/// converted to SH0-only splats so the viewer still uses the GPU splat path.
 pub fn load_gaussians_with_splats(
     path: &Path,
     scene: &mut Scene,
@@ -53,7 +56,7 @@ pub fn load_gaussians_with_splats(
         scene.bounds.extend(g.position);
     }
 
-    Ok(None)
+    legacy_gaussians_to_splats(&gaussians).map(Some)
 }
 
 fn append_rustgs_splats(splats: &rustgs::HostSplats, scene: &mut Scene) {
@@ -104,6 +107,43 @@ fn load_legacy_rustslam_gaussians(
         })
 }
 
+fn legacy_gaussians_to_splats(
+    gaussians: &[rustslam::fusion::Gaussian],
+) -> Result<rustgs::HostSplats, LoadError> {
+    let mut positions = Vec::with_capacity(gaussians.len() * 3);
+    let mut log_scales = Vec::with_capacity(gaussians.len() * 3);
+    let mut rotations = Vec::with_capacity(gaussians.len() * 4);
+    let mut opacity_logits = Vec::with_capacity(gaussians.len());
+    let mut sh_coeffs = Vec::with_capacity(gaussians.len() * 3);
+
+    for gaussian in gaussians {
+        positions.extend_from_slice(&gaussian.position);
+        log_scales.extend(gaussian.scale.map(|scale| scale.abs().max(1e-8).ln()));
+        rotations.extend_from_slice(&gaussian.rotation);
+        opacity_logits.push(opacity_to_logit(gaussian.opacity));
+        sh_coeffs.extend(gaussian.color.map(rgb_to_sh0_value));
+    }
+
+    rustgs::HostSplats::from_components(
+        positions,
+        log_scales,
+        rotations,
+        opacity_logits,
+        sh_coeffs,
+        0,
+    )
+    .map_err(|err| LoadError::PlyParse(err.to_string()))
+}
+
+fn rgb_to_sh0_value(rgb: f32) -> f32 {
+    (rgb - 0.5) / SH_C0
+}
+
+fn opacity_to_logit(opacity: f32) -> f32 {
+    let opacity = opacity.clamp(1.0 / 255.0, 1.0 - 1.0 / 255.0);
+    (opacity / (1.0 - opacity)).ln()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +171,9 @@ mod tests {
         .unwrap();
 
         let mut scene = Scene::default();
-        load_gaussians(tmp.path(), &mut scene).unwrap();
+        let splats = load_gaussians_with_splats(tmp.path(), &mut scene)
+            .unwrap()
+            .expect("legacy gaussian PLY should be converted for GPU splat rendering");
 
         assert_eq!(scene.gaussians.len(), 1);
         assert_eq!(scene.gaussians[0].position, [1.0, 2.0, 3.0]);
@@ -139,6 +181,17 @@ mod tests {
         assert_eq!(scene.gaussians[0].rotation, [0.707, 0.0, 0.707, 0.0]);
         assert!((scene.gaussians[0].opacity - 0.42).abs() < 1e-6);
         assert_eq!(scene.gaussians[0].color, [0.9, 0.8, 0.7]);
+        assert_eq!(splats.len(), 1);
+        assert_eq!(splats.position(0), [1.0, 2.0, 3.0]);
+        assert!((splats.scale(0)[0] - 0.1).abs() < 1e-6);
+        assert!((splats.scale(0)[1] - 0.2).abs() < 1e-6);
+        assert!((splats.scale(0)[2] - 0.3).abs() < 1e-6);
+        assert_eq!(splats.rotation(0), [0.707, 0.0, 0.707, 0.0]);
+        assert!((splats.opacity(0) - 0.42).abs() < 1e-6);
+        assert_eq!(splats.sh_degree(), 0);
+        for (actual, expected) in splats.rgb_color(0).into_iter().zip([0.9, 0.8, 0.7]) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 
     #[test]

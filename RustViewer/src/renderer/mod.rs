@@ -9,16 +9,14 @@ use eframe::wgpu;
 
 use camera::ArcballCamera;
 use pipelines::{
-    create_gaussian_pipeline, create_line_pipeline, create_mesh_pipeline, create_point_pipeline,
-    create_wireframe_pipeline, expand_points_to_quads, project_gaussians_to_splats, PointVertex,
-    GAUSSIAN_QUAD_INDICES, GAUSSIAN_QUAD_VERTICES,
+    create_line_pipeline, create_mesh_pipeline, create_point_pipeline, create_wireframe_pipeline,
+    expand_points_to_quads, PointVertex,
 };
 use scene::{MeshGpuVertex, Scene};
 
 /// Holds all GPU resources needed to render a scene.
 pub struct SceneRenderer {
     point_pipeline: wgpu::RenderPipeline,
-    gaussian_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
     wireframe_pipeline: wgpu::RenderPipeline,
@@ -28,10 +26,6 @@ pub struct SceneRenderer {
     point_vbuf: Option<wgpu::Buffer>,
     point_ibuf: Option<wgpu::Buffer>,
     point_count: u32,
-    gauss_quad_vbuf: wgpu::Buffer,
-    gauss_ibuf: wgpu::Buffer,
-    gauss_instance_vbuf: Option<wgpu::Buffer>,
-    gauss_instance_count: u32,
     line_vbuf: Option<wgpu::Buffer>,
     line_count: u32,
     mesh_vbuf: Option<wgpu::Buffer>,
@@ -42,7 +36,6 @@ pub struct SceneRenderer {
     // Cached layer flags (set during prepare, used in paint)
     layer_trajectory: bool,
     layer_map_points: bool,
-    layer_gaussians: bool,
     layer_mesh_solid: bool,
     layer_mesh_wireframe: bool,
 }
@@ -87,17 +80,12 @@ impl SceneRenderer {
         });
 
         let point_pipeline = create_point_pipeline(device, surface_format);
-        let gaussian_pipeline = create_gaussian_pipeline(device, surface_format);
         let line_pipeline = create_line_pipeline(device, surface_format);
         let mesh_pipeline = create_mesh_pipeline(device, surface_format, &uniform_bgl);
         let wireframe_pipeline = create_wireframe_pipeline(device, surface_format, &uniform_bgl);
-        let gauss_quad_vbuf =
-            create_vertex_buffer(device, bytemuck::cast_slice(&GAUSSIAN_QUAD_VERTICES));
-        let gauss_ibuf = create_index_buffer(device, bytemuck::cast_slice(&GAUSSIAN_QUAD_INDICES));
 
         Self {
             point_pipeline,
-            gaussian_pipeline,
             line_pipeline,
             mesh_pipeline,
             wireframe_pipeline,
@@ -106,10 +94,6 @@ impl SceneRenderer {
             point_vbuf: None,
             point_ibuf: None,
             point_count: 0,
-            gauss_quad_vbuf,
-            gauss_ibuf,
-            gauss_instance_vbuf: None,
-            gauss_instance_count: 0,
             line_vbuf: None,
             line_count: 0,
             mesh_vbuf: None,
@@ -119,7 +103,6 @@ impl SceneRenderer {
             wireframe_index_count: 0,
             layer_trajectory: true,
             layer_map_points: true,
-            layer_gaussians: true,
             layer_mesh_solid: false,
             layer_mesh_wireframe: true,
         }
@@ -134,23 +117,9 @@ impl SceneRenderer {
         camera: &ArcballCamera,
         viewport_size: [f32; 2],
     ) {
-        self.update_buffers_with_options(device, queue, scene, camera, viewport_size, false);
-    }
-
-    /// Upload scene data to GPU buffers with optional layer overrides.
-    pub fn update_buffers_with_options(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scene: &Scene,
-        camera: &ArcballCamera,
-        viewport_size: [f32; 2],
-        suppress_gaussians: bool,
-    ) {
         // Cache layer flags for use in paint()
         self.layer_trajectory = scene.layers.trajectory;
         self.layer_map_points = scene.layers.map_points;
-        self.layer_gaussians = scene.layers.gaussians && !suppress_gaussians;
         self.layer_mesh_solid = scene.layers.mesh_solid;
         self.layer_mesh_wireframe = scene.layers.mesh_wireframe;
 
@@ -175,17 +144,6 @@ impl SceneRenderer {
             self.point_ibuf = Some(create_index_buffer(device, bytemuck::cast_slice(&idxs)));
         } else {
             self.point_count = 0;
-        }
-
-        // Gaussians
-        if self.layer_gaussians && !scene.gaussians.is_empty() {
-            let instances = project_gaussians_to_splats(&scene.gaussians, camera, viewport_size);
-            self.gauss_instance_count = instances.len() as u32;
-            self.gauss_instance_vbuf = (!instances.is_empty())
-                .then(|| create_vertex_buffer(device, bytemuck::cast_slice(&instances)));
-        } else {
-            self.gauss_instance_count = 0;
-            self.gauss_instance_vbuf = None;
         }
 
         // Trajectory (line list — also pre-project to NDC)
@@ -254,7 +212,7 @@ impl SceneRenderer {
     // TODO(F3): CPU MVP expansion for points is O(n) per frame — move to GPU compute post-MVP.
     // TODO(F4): All GPU buffers rebuilt every frame regardless of changes — add dirty-flag tracking post-MVP.
     pub fn render_with_layers(&self, rpass: &mut wgpu::RenderPass<'static>) {
-        // Draw order: mesh first, then trajectory, then map points, then Gaussians
+        // Draw order: mesh first, then trajectory, then map points.
 
         if self.layer_mesh_solid {
             if let (Some(vbuf), Some(ibuf), count) =
@@ -308,20 +266,6 @@ impl SceneRenderer {
                 }
             }
         }
-
-        if self.layer_gaussians {
-            if let (Some(instance_vbuf), count) =
-                (&self.gauss_instance_vbuf, self.gauss_instance_count)
-            {
-                if count > 0 {
-                    rpass.set_pipeline(&self.gaussian_pipeline);
-                    rpass.set_vertex_buffer(0, self.gauss_quad_vbuf.slice(..));
-                    rpass.set_vertex_buffer(1, instance_vbuf.slice(..));
-                    rpass.set_index_buffer(self.gauss_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..GAUSSIAN_QUAD_INDICES.len() as u32, 0, 0..count);
-                }
-            }
-        }
     }
 }
 
@@ -330,7 +274,6 @@ pub struct ViewerCallback {
     pub scene: std::sync::Arc<std::sync::Mutex<Scene>>,
     pub camera: ArcballCamera,
     pub viewport_size: [f32; 2],
-    pub suppress_gaussians: bool,
     /// Surface format read from eframe at startup — used for lazy pipeline init.
     pub surface_format: wgpu::TextureFormat,
 }
@@ -353,14 +296,7 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
 
         if let Some(renderer) = resources.get_mut::<SceneRenderer>() {
             if let Ok(scene) = self.scene.lock() {
-                renderer.update_buffers_with_options(
-                    device,
-                    queue,
-                    &scene,
-                    &self.camera,
-                    self.viewport_size,
-                    self.suppress_gaussians,
-                );
+                renderer.update_buffers(device, queue, &scene, &self.camera, self.viewport_size);
             }
         }
 

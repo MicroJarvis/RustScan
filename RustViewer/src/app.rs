@@ -725,7 +725,6 @@ impl eframe::App for ViewerApp {
                         scene: Arc::clone(&self.scene),
                         camera: self.camera.clone(),
                         viewport_size,
-                        suppress_gaussians: true_splat_view,
                         surface_format: self.surface_format,
                     },
                 );
