@@ -85,7 +85,7 @@ pub use crate::training::{
 pub use crate::training::{SharedWgpuContext, SplatEvaluationRenderer};
 pub use crate::training::{TrainingBackend, TrainingConfig, TrainingResult};
 #[cfg(feature = "gpu")]
-pub use crate::viewport::{WgpuViewportCamera, WgpuViewportRenderer, WgpuViewportResolution};
+pub use crate::viewport::{BurnViewportRenderer, BurnViewportResolution};
 
 // Re-export IO types
 pub use crate::io::colmap_dataset::{load_colmap_dataset, ColmapConfig};

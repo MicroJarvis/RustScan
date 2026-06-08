@@ -215,13 +215,14 @@ impl ViewerApp {
         self.wgpu_render_state
             .as_ref()
             .zip(self.shared_wgpu_context.clone())
-            .map(|(render_state, context)| {
+            .and_then(|(render_state, context)| {
                 GpuViewportBridge::new(
                     context,
                     render_state.device.clone(),
                     render_state.queue.clone(),
                     render_state,
                 )
+                .ok()
             })
     }
 
@@ -568,13 +569,14 @@ fn new_gpu_viewport_bridge(
 ) -> Option<GpuViewportBridge> {
     render_state
         .zip(context.clone())
-        .map(|(render_state, context)| {
+        .and_then(|(render_state, context)| {
             GpuViewportBridge::new(
                 context,
                 render_state.device.clone(),
                 render_state.queue.clone(),
                 render_state,
             )
+            .ok()
         })
 }
 

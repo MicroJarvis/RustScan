@@ -23,6 +23,17 @@ pub struct SplatView<'a> {
     pub sh_degree: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostSplatsCacheKey {
+    len: usize,
+    sh_degree: usize,
+    positions: usize,
+    log_scales: usize,
+    rotations: usize,
+    opacity_logits: usize,
+    sh_coeffs: usize,
+}
+
 impl HostSplats {
     /// Build a host-side splat set from its packed component arrays.
     pub fn from_components(
@@ -53,6 +64,19 @@ impl HostSplats {
             opacity_logits: &self.opacity_logits,
             sh_coeffs: &self.sh_coeffs,
             sh_degree: self.sh_degree,
+        }
+    }
+
+    pub(crate) fn cache_key(&self) -> HostSplatsCacheKey {
+        let view = self.as_view();
+        HostSplatsCacheKey {
+            len: self.len(),
+            sh_degree: self.sh_degree(),
+            positions: view.positions.as_ptr() as usize,
+            log_scales: view.log_scales.as_ptr() as usize,
+            rotations: view.rotations.as_ptr() as usize,
+            opacity_logits: view.opacity_logits.as_ptr() as usize,
+            sh_coeffs: view.sh_coeffs.as_ptr() as usize,
         }
     }
 

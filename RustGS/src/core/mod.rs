@@ -4,4 +4,5 @@ mod camera;
 pub(crate) mod splats;
 
 pub use camera::{viewmat_from_pose, GaussianCamera};
+pub(crate) use splats::HostSplatsCacheKey;
 pub use splats::{HostSplats, SplatView};

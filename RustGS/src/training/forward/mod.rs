@@ -109,7 +109,13 @@ pub(crate) fn compose_shader(file_path: &str, source: &str) -> String {
     .expect("serialize shader")
 }
 
-fn usize_from_int_data(data: &TensorData, index: usize, label: &str) -> usize {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectionCounts {
+    pub visible: usize,
+    pub intersections: usize,
+}
+
+fn synced_usize_from_int_data(data: &TensorData, index: usize, label: &str) -> usize {
     if let Ok(values) = data.as_slice::<i32>() {
         values[index].max(0) as usize
     } else if let Ok(values) = data.as_slice::<u32>() {
@@ -119,10 +125,10 @@ fn usize_from_int_data(data: &TensorData, index: usize, label: &str) -> usize {
     }
 }
 
-async fn read_projection_counts_async<B: Backend>(
+async fn sync_projection_counts_from_gpu<B: Backend>(
     num_visible_buf: Tensor<B, 1, Int>,
     num_intersections_buf: Tensor<B, 1, Int>,
-) -> (usize, usize) {
+) -> ProjectionCounts {
     let counts = Tensor::<B, 1, Int>::cat(
         vec![
             num_visible_buf.reshape([1]),
@@ -135,10 +141,10 @@ async fn read_projection_counts_async<B: Backend>(
         .await
         .expect("projection count readback");
 
-    (
-        usize_from_int_data(&counts_data, 0, "num_visible"),
-        usize_from_int_data(&counts_data, 1, "num_intersections"),
-    )
+    ProjectionCounts {
+        visible: synced_usize_from_int_data(&counts_data, 0, "num_visible"),
+        intersections: synced_usize_from_int_data(&counts_data, 1, "num_intersections"),
+    }
 }
 
 pub(crate) struct RenderOutput<B: Backend> {
@@ -176,12 +182,13 @@ where
         num_visible_buf,
         num_intersections_buf,
     } = proj_out;
-    let (num_visible, num_intersections) =
-        read_projection_counts_async(num_visible_buf, num_intersections_buf).await;
+    // This is the remaining CPU/GPU sync in the canonical forward path. The counts
+    // choose dynamic buffer sizes for sorting, tile mapping, and rasterization.
+    let counts = sync_projection_counts_from_gpu(num_visible_buf, num_intersections_buf).await;
     let tile_bounds = calc_tile_bounds(img_size);
     let num_tiles = tile_bounds.0 * tile_bounds.1;
 
-    if num_visible == 0 {
+    if counts.visible == 0 {
         let empty_indices = Tensor::<B, 1, Int>::zeros([0], device);
         let projected_splats = Tensor::<B, 2>::zeros([0, 9], device);
         let tile_offsets = Tensor::<B, 1, Int>::zeros([2 * num_tiles as usize], device);
@@ -204,26 +211,26 @@ where
             global_from_compact_gid: empty_indices.clone(),
             compact_gid_from_isect: empty_indices,
             tile_offsets,
-            num_visible,
+            num_visible: counts.visible,
         };
     }
 
     let global_from_compact_gid =
-        sort_by_depth(depths, global_from_presort_gid, num_visible, device);
+        sort_by_depth(depths, global_from_presort_gid, counts.visible, device);
 
     let compact_intersect_counts = intersect_counts.gather(0, global_from_compact_gid.clone());
 
     let projected_splats = project_visible(
         splats,
         &global_from_compact_gid,
-        num_visible,
+        counts.visible,
         camera,
         img_size,
         device,
         cov_blur,
     );
 
-    if num_intersections == 0 {
+    if counts.intersections == 0 {
         let compact_gid_from_isect = Tensor::<B, 1, Int>::zeros([0], device);
         let tile_offsets = Tensor::<B, 1, Int>::zeros([2 * num_tiles as usize], device);
         let raster_out = rasterize(
@@ -245,14 +252,14 @@ where
             global_from_compact_gid,
             compact_gid_from_isect,
             tile_offsets,
-            num_visible,
+            num_visible: counts.visible,
         };
     }
 
     let tile_out = tile_mapping(
         &projected_splats,
         compact_intersect_counts,
-        num_intersections,
+        counts.intersections,
         num_tiles,
         tile_bounds,
         device,
@@ -260,7 +267,7 @@ where
 
     let tile_offsets = get_tile_offsets(
         tile_out.tile_id_from_isect.clone(),
-        num_intersections,
+        counts.intersections,
         tile_bounds,
         device,
     );
@@ -284,7 +291,7 @@ where
         global_from_compact_gid,
         compact_gid_from_isect: tile_out.compact_gid_from_isect,
         tile_offsets,
-        num_visible,
+        num_visible: counts.visible,
     }
 }
 

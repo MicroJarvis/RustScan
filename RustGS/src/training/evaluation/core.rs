@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 #[cfg(feature = "gpu")]
-use crate::core::HostSplats;
+use crate::core::{HostSplats, HostSplatsCacheKey};
 #[cfg(feature = "gpu")]
 use crate::training::engine::{host_splats_to_device, DeviceSplats, GsBackendBase};
 #[cfg(feature = "gpu")]
@@ -385,7 +385,7 @@ impl SharedWgpuContext {
         })
     }
 
-    fn device(&self) -> <GsBackendBase as Backend>::Device {
+    pub(crate) fn device(&self) -> <GsBackendBase as Backend>::Device {
         self.device.clone()
     }
 }
@@ -410,20 +410,8 @@ struct GpuSplatEvaluationRenderer {
 
 #[cfg(feature = "gpu")]
 struct CachedGpuSplats {
-    key: SplatCacheKey,
+    key: HostSplatsCacheKey,
     splats: DeviceSplats<GsBackendBase>,
-}
-
-#[cfg(feature = "gpu")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SplatCacheKey {
-    len: usize,
-    sh_degree: usize,
-    positions: usize,
-    log_scales: usize,
-    rotations: usize,
-    opacity_logits: usize,
-    sh_coeffs: usize,
 }
 
 #[cfg(feature = "gpu")]
@@ -545,7 +533,7 @@ impl GpuSplatEvaluationRenderer {
     }
 
     fn ensure_device_splats(&mut self, splats: &HostSplats) {
-        let key = SplatCacheKey::from_splats(splats);
+        let key = splats.cache_key();
         if self
             .cached_splats
             .as_ref()
@@ -559,22 +547,6 @@ impl GpuSplatEvaluationRenderer {
             key,
             splats: host_splats_to_device::<GsBackendBase>(splats, &self.device),
         });
-    }
-}
-
-#[cfg(feature = "gpu")]
-impl SplatCacheKey {
-    fn from_splats(splats: &HostSplats) -> Self {
-        let view = splats.as_view();
-        Self {
-            len: splats.len(),
-            sh_degree: splats.sh_degree(),
-            positions: view.positions.as_ptr() as usize,
-            log_scales: view.log_scales.as_ptr() as usize,
-            rotations: view.rotations.as_ptr() as usize,
-            opacity_logits: view.opacity_logits.as_ptr() as usize,
-            sh_coeffs: view.sh_coeffs.as_ptr() as usize,
-        }
     }
 }
 

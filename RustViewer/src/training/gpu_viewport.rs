@@ -1,37 +1,38 @@
-//! egui bridge for RustGS's wgpu-native 3DGS viewport renderer.
+//! egui bridge for RustGS's Burn/CubeCL 3DGS viewport renderer.
 
 use crate::renderer::camera::ArcballCamera;
-use crate::training::preview::{PreviewRenderError, PreviewResolution};
+use crate::training::preview::{
+    gaussian_camera_from_arcball_viewport, PreviewRenderError, PreviewResolution,
+};
 use eframe::egui::{TextureId, Vec2};
 use eframe::{egui_wgpu, wgpu};
-use rustgs::{
-    HostSplats, SharedWgpuContext, WgpuViewportCamera, WgpuViewportRenderer, WgpuViewportResolution,
-};
+use rustgs::{BurnViewportRenderer, BurnViewportResolution, HostSplats, SharedWgpuContext};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct GpuViewportBridge {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    renderer: WgpuViewportRenderer,
+    renderer: BurnViewportRenderer,
     texture_id: Option<TextureId>,
 }
 
 impl GpuViewportBridge {
     pub fn new(
-        _context: SharedWgpuContext,
+        context: SharedWgpuContext,
         device: wgpu::Device,
         queue: wgpu::Queue,
         render_state: &egui_wgpu::RenderState,
-    ) -> Self {
+    ) -> Result<Self, PreviewRenderError> {
         let mut bridge = Self {
             device,
             queue,
-            renderer: WgpuViewportRenderer::new(),
+            renderer: BurnViewportRenderer::new(context)
+                .map_err(PreviewRenderError::RendererInit)?,
             texture_id: None,
         };
         bridge.ensure_texture_id(render_state);
-        bridge
+        Ok(bridge)
     }
 
     pub fn render_texture_id(
@@ -48,22 +49,29 @@ impl GpuViewportBridge {
         let Some(resolution) = PreviewResolution::from_panel_size_scaled(panel_size, scale) else {
             return Ok(None);
         };
-        let resolution = WgpuViewportResolution::new(resolution.width, resolution.height)
+        let resolution = BurnViewportResolution::new(resolution.width, resolution.height)
             .ok_or_else(|| PreviewRenderError::RenderFailed("invalid viewport size".to_string()))?;
         if let Some(render_state) = render_state {
             self.ensure_texture_id(render_state);
         }
 
-        let camera = viewport_camera_from_arcball(camera, resolution);
+        let camera = gaussian_camera_from_arcball_viewport(
+            camera,
+            PreviewResolution::new(resolution.width as usize, resolution.height as usize)
+                .ok_or_else(|| {
+                    PreviewRenderError::RenderFailed("invalid viewport size".to_string())
+                })?,
+        );
         let texture_view = self
             .renderer
             .render(
                 &self.device,
                 &self.queue,
                 splats.as_ref(),
-                camera,
+                &camera,
                 resolution,
             )
+            .map_err(PreviewRenderError::RenderFailed)?
             .ok_or_else(|| {
                 PreviewRenderError::RenderFailed("gpu viewport returned no texture".to_string())
             })?;
@@ -121,22 +129,6 @@ pub fn viewport_render_scale(last_motion: Option<Instant>, idle_delay: Duration)
     } else {
         1.0
     }
-}
-
-fn viewport_camera_from_arcball(
-    camera: &ArcballCamera,
-    resolution: WgpuViewportResolution,
-) -> WgpuViewportCamera {
-    let aspect = resolution.width as f32 / resolution.height.max(1) as f32;
-    let view = camera.view_matrix();
-    let proj = camera.proj_matrix(aspect);
-    let eye = camera.eye();
-    WgpuViewportCamera::new(
-        view.to_cols_array_2d(),
-        proj.to_cols_array_2d(),
-        (proj * view).to_cols_array_2d(),
-        eye.to_array(),
-    )
 }
 
 #[cfg(test)]

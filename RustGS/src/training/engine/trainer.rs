@@ -144,7 +144,8 @@ impl WgpuTrainer {
             TensorData::new(sh_scale_values, [1, sh_coeffs.max(1), 1]),
             &device,
         );
-        let opacity_scales = Tensor::<GsBackendBase, 1>::from_floats([config.optimizer.lr_opacity], &device);
+        let opacity_scales =
+            Tensor::<GsBackendBase, 1>::from_floats([config.optimizer.lr_opacity], &device);
 
         optimizer.set_transform_scaling(transform_scales);
         optimizer.set_sh_scaling(sh_scales);
@@ -183,7 +184,8 @@ impl WgpuTrainer {
 
         let decay_iterations = self
             .config
-            .optimizer.lr_decay_iterations
+            .optimizer
+            .lr_decay_iterations
             .unwrap_or(self.config.iterations)
             .max(1);
         let t = (iteration.min(decay_iterations) as f32) / (decay_iterations as f32);
@@ -191,11 +193,19 @@ impl WgpuTrainer {
     }
 
     fn position_lr_at(&self, iteration: usize) -> f32 {
-        self.lr_at(self.config.optimizer.lr_position, self.config.optimizer.lr_pos_final, iteration)
+        self.lr_at(
+            self.config.optimizer.lr_position,
+            self.config.optimizer.lr_pos_final,
+            iteration,
+        )
     }
 
     fn scale_lr_at(&self, iteration: usize) -> f32 {
-        self.lr_at(self.config.optimizer.lr_scale, self.config.optimizer.lr_scale_final, iteration)
+        self.lr_at(
+            self.config.optimizer.lr_scale,
+            self.config.optimizer.lr_scale_final,
+            iteration,
+        )
     }
 
     fn rotation_lr_at(&self, iteration: usize) -> f32 {
@@ -215,7 +225,11 @@ impl WgpuTrainer {
     }
 
     fn color_lr_at(&self, iteration: usize) -> f32 {
-        self.lr_at(self.config.optimizer.lr_color, self.config.optimizer.lr_color_final, iteration)
+        self.lr_at(
+            self.config.optimizer.lr_color,
+            self.config.optimizer.lr_color_final,
+            iteration,
+        )
     }
 
     fn update_optimizer_lrs(&mut self, iteration: usize, sh_coeffs: usize) {
@@ -728,7 +742,10 @@ impl WgpuTrainer {
     }
 
     fn uses_visibility_pruning(&self) -> bool {
-        matches!(self.config.litegs.pruning.prune_mode, LiteGsPruneMode::Threshold)
+        matches!(
+            self.config.litegs.pruning.prune_mode,
+            LiteGsPruneMode::Threshold
+        )
     }
 
     fn collects_actual_visibility_diagnostics(&self) -> bool {
@@ -744,10 +761,11 @@ impl WgpuTrainer {
         let Some(final_blur) = self.config.raster.raster_cov_blur_final else {
             return self.config.raster.raster_cov_blur;
         };
-        let Some(start_epoch) = self
+        let Some(start_epoch) = self.config.raster.raster_cov_blur_final_after_epoch.or(self
             .config
-            .raster.raster_cov_blur_final_after_epoch
-            .or(self.config.litegs.topology.topology_freeze_after_epoch)
+            .litegs
+            .topology
+            .topology_freeze_after_epoch)
         else {
             return self.config.raster.raster_cov_blur;
         };
@@ -774,10 +792,11 @@ impl WgpuTrainer {
         {
             return None;
         }
-        let start_epoch = self
+        let start_epoch = self.config.loss.loss_dynamic_mask_start_epoch.or(self
             .config
-            .loss.loss_dynamic_mask_start_epoch
-            .or(self.config.litegs.topology.topology_freeze_after_epoch)?;
+            .litegs
+            .topology
+            .topology_freeze_after_epoch)?;
         let completed_epoch = iteration.saturating_sub(1) / frame_count;
         if completed_epoch < start_epoch {
             return None;

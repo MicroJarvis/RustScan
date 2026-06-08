@@ -1,6 +1,5 @@
 use super::{
-    combined_loss, gradient_difference_loss, reconstruction_residual_loss, ssim_loss,
-    SsimConfig,
+    combined_loss, gradient_difference_loss, reconstruction_residual_loss, ssim_loss, SsimConfig,
 };
 use crate::training::engine::GsBackendBase;
 use burn::prelude::Backend;
@@ -18,10 +17,7 @@ fn separable_blur_reference<B: Backend>(
     blur_height_reference(horizontal, kernel)
 }
 
-fn blur_width_reference<B: Backend>(
-    tensor: Tensor<B, 4>,
-    kernel: Tensor<B, 1>,
-) -> Tensor<B, 4> {
+fn blur_width_reference<B: Backend>(tensor: Tensor<B, 4>, kernel: Tensor<B, 1>) -> Tensor<B, 4> {
     let [_, _, _, width] = tensor.dims();
     let pad = kernel.dims()[0] / 2;
     let padded = tensor.pad([(0, 0), (pad, pad)], PadMode::Edge);
@@ -39,10 +35,7 @@ fn blur_width_reference<B: Backend>(
     accum
 }
 
-fn blur_height_reference<B: Backend>(
-    tensor: Tensor<B, 4>,
-    kernel: Tensor<B, 1>,
-) -> Tensor<B, 4> {
+fn blur_height_reference<B: Backend>(tensor: Tensor<B, 4>, kernel: Tensor<B, 1>) -> Tensor<B, 4> {
     let [_, _, height, _] = tensor.dims();
     let pad = kernel.dims()[0] / 2;
     let padded = tensor.pad([(pad, pad), (0, 0)], PadMode::Edge);
@@ -129,19 +122,11 @@ async fn test_robust_residual_loss_downweights_large_errors() {
         &device,
     );
 
-    let exact = reconstruction_residual_loss(
-        pred.clone(),
-        target.clone(),
-        0.0,
-        0.0,
-        1.0,
-        0.0,
-        0.0,
-        1.0,
-    )
-    .into_scalar_async()
-    .await
-    .expect("exact residual loss");
+    let exact =
+        reconstruction_residual_loss(pred.clone(), target.clone(), 0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
+            .into_scalar_async()
+            .await
+            .expect("exact residual loss");
     let robust = reconstruction_residual_loss(pred, target, 0.1, 0.0, 1.0, 0.0, 0.0, 1.0)
         .into_scalar_async()
         .await
@@ -159,19 +144,11 @@ async fn test_soft_outlier_loss_preserves_gradient_floor() {
         &device,
     );
 
-    let exact = reconstruction_residual_loss(
-        pred.clone(),
-        target.clone(),
-        0.0,
-        0.0,
-        1.0,
-        0.0,
-        0.0,
-        1.0,
-    )
-    .into_scalar_async()
-    .await
-    .expect("exact residual loss");
+    let exact =
+        reconstruction_residual_loss(pred.clone(), target.clone(), 0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
+            .into_scalar_async()
+            .await
+            .expect("exact residual loss");
     let weighted = reconstruction_residual_loss(pred, target, 0.0, 0.25, 0.25, 0.0, 0.0, 1.0)
         .into_scalar_async()
         .await
@@ -196,19 +173,11 @@ async fn test_dynamic_residual_mask_downweights_high_residual_pixels() {
         &device,
     );
 
-    let exact = reconstruction_residual_loss(
-        pred.clone(),
-        target.clone(),
-        0.0,
-        0.0,
-        1.0,
-        0.0,
-        0.0,
-        1.0,
-    )
-    .into_scalar_async()
-    .await
-    .expect("exact residual loss");
+    let exact =
+        reconstruction_residual_loss(pred.clone(), target.clone(), 0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
+            .into_scalar_async()
+            .await
+            .expect("exact residual loss");
     let masked = reconstruction_residual_loss(pred, target, 0.0, 0.0, 1.0, 0.2, 0.8, 0.25)
         .into_scalar_async()
         .await
@@ -237,10 +206,8 @@ async fn test_gradient_difference_loss_detects_edge_mismatch() {
             target_values[base + 2] = 1.0;
         }
     }
-    let target = Tensor::<GsBackendBase, 3>::from_data(
-        TensorData::new(target_values, [4, 4, 3]),
-        &device,
-    );
+    let target =
+        Tensor::<GsBackendBase, 3>::from_data(TensorData::new(target_values, [4, 4, 3]), &device);
 
     let loss = gradient_difference_loss(pred, target)
         .into_scalar_async()

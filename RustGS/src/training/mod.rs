@@ -16,15 +16,12 @@ macro_rules! gpu_modules {
     };
 }
 
-gpu_modules!(
-    backward,
-    data,
-    engine,
-    events,
-    forward,
-    gpu_primitives,
-    topology,
-);
+gpu_modules!(backward, data, events, gpu_primitives, topology,);
+
+#[cfg(feature = "gpu")]
+pub(crate) mod engine;
+#[cfg(feature = "gpu")]
+pub(crate) mod forward;
 
 #[cfg(feature = "gpu")]
 use crate::{TrainingDataset, TrainingError};
