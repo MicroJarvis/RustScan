@@ -45,14 +45,12 @@ fn summarized_final_loss(loss_history: &[f32], frame_count: usize) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvaluationDevice {
-    Cpu,
     Gpu,
 }
 
 impl std::fmt::Display for EvaluationDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cpu => write!(f, "cpu"),
             Self::Gpu => write!(f, "gpu"),
         }
     }
@@ -63,10 +61,9 @@ impl FromStr for EvaluationDevice {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "cpu" => Ok(Self::Cpu),
             "gpu" | "wgpu" | "metal" => Ok(Self::Gpu),
             other => Err(format!(
-                "unsupported evaluation device '{other}'. Expected cpu or gpu"
+                "unsupported evaluation device '{other}'. Expected gpu"
             )),
         }
     }
@@ -356,7 +353,6 @@ pub struct SplatEvaluationRenderer {
 
 #[cfg(feature = "gpu")]
 enum SplatEvaluationRendererBackend {
-    Cpu(crate::GaussianRenderer),
     Gpu(GpuSplatEvaluationRenderer),
 }
 
@@ -439,10 +435,6 @@ impl SplatEvaluationRenderer {
         raster_cov_blur: f32,
     ) -> Result<Self, SplatEvaluationError> {
         let backend = match device {
-            EvaluationDevice::Cpu => SplatEvaluationRendererBackend::Cpu(
-                crate::GaussianRenderer::new(render_width, render_height)
-                    .with_raster_cov_blur(raster_cov_blur),
-            ),
             EvaluationDevice::Gpu => SplatEvaluationRendererBackend::Gpu(
                 GpuSplatEvaluationRenderer::new(render_width, render_height, raster_cov_blur)?,
             ),
@@ -474,16 +466,6 @@ impl SplatEvaluationRenderer {
         camera: &GaussianCamera,
     ) -> Result<Vec<f32>, SplatEvaluationError> {
         match &mut self.backend {
-            SplatEvaluationRendererBackend::Cpu(renderer) => {
-                let output = renderer
-                    .render_splats(splats, camera)
-                    .map_err(|err| SplatEvaluationError::InvalidInput(err.to_string()))?;
-                Ok(output
-                    .color
-                    .into_iter()
-                    .map(|value| value as f32 / 255.0)
-                    .collect())
-            }
             SplatEvaluationRendererBackend::Gpu(renderer) => renderer.render(splats, camera),
         }
     }

@@ -30,10 +30,7 @@ fn summarize_psnr_samples_tracks_distribution() {
 
 #[test]
 fn evaluation_device_parses_gpu_aliases() {
-    assert_eq!(
-        "cpu".parse::<EvaluationDevice>().unwrap(),
-        EvaluationDevice::Cpu
-    );
+    assert!("cpu".parse::<EvaluationDevice>().is_err());
     assert_eq!(
         "gpu".parse::<EvaluationDevice>().unwrap(),
         EvaluationDevice::Gpu

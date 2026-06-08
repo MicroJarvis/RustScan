@@ -95,7 +95,7 @@ impl Args {
         let mut raster_cov_blur = rustgs::DEFAULT_RASTER_COV_BLUR;
         let mut frame_stride = 1usize;
         let mut max_frames = 0usize;
-        let mut device = String::from("cpu");
+        let mut device = String::from("gpu");
         let mut export_worst_k = 0usize;
         let mut export_dir = None;
         let mut include_frame_ranges = None;
@@ -187,7 +187,7 @@ fn print_help() {
   [--raster-cov-blur 0.3] \
   [--frame-stride 1] \
   [--max-frames 0] \
-  [--device cpu] \
+  [--device gpu] \
   [--json] \
   [--export-worst-k 5] \
   [--export-dir output/psnr_review] \

@@ -142,7 +142,7 @@ fn train_command_parses_training_defaults() {
     assert_eq!(args.eval_include_frame_ranges, None);
     assert_eq!(args.eval_exclude_frame_ranges, None);
     assert_eq!(args.eval_worst_frames, 5);
-    assert_eq!(args.eval_device, "cpu");
+    assert_eq!(args.eval_device, "gpu");
     assert!(!args.eval_json);
     assert_eq!(args.eval_crop_output_dir, None);
     assert_eq!(args.eval_crop_frames, None);
@@ -714,7 +714,7 @@ fn train_command_parses_post_training_eval_flags() {
         "--eval-worst-frames",
         "3",
         "--eval-device",
-        "cpu",
+        "gpu",
         "--eval-json",
         "--eval-crop-output-dir",
         "crops",
@@ -746,7 +746,7 @@ fn train_command_parses_post_training_eval_flags() {
     );
     assert_eq!(args.eval_exclude_frame_ranges.as_deref(), Some("76-93,155"));
     assert_eq!(args.eval_worst_frames, 3);
-    assert_eq!(args.eval_device, "cpu");
+    assert_eq!(args.eval_device, "gpu");
     assert!(args.eval_json);
     assert_eq!(args.eval_crop_output_dir, Some(PathBuf::from("crops")));
     assert_eq!(args.eval_crop_frames.as_deref(), Some("0,90,120"));
@@ -1125,7 +1125,7 @@ fn litegs_parity_report_records_final_psnr_from_evaluation_summary() {
     dataset.add_point([0.0, 0.0, 0.0], None);
     let config = rustgs::TrainingConfig::default();
     let evaluation_summary = rustgs::SplatEvaluationSummary {
-        device: rustgs::EvaluationDevice::Cpu,
+        device: rustgs::EvaluationDevice::Gpu,
         render_scale: 0.25,
         raster_cov_blur: rustgs::DEFAULT_RASTER_COV_BLUR,
         render_width: 16,

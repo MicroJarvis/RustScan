@@ -360,7 +360,7 @@ struct TrainArgs {
     eval_worst_frames: usize,
 
     /// Evaluation device used by the post-training scene evaluation
-    #[arg(long, default_value = "cpu")]
+    #[arg(long, default_value = "gpu")]
     eval_device: String,
 
     /// Print the post-training evaluation summary as JSON
@@ -720,18 +720,22 @@ fn run_render_command(args: RenderArgs) -> anyhow::Result<()> {
     let _ = metadata;
 
     let camera = load_render_camera(&args.camera)?;
-    let renderer = rustgs::GaussianRenderer::new(
+    let mut renderer = rustgs::SplatEvaluationRenderer::new(
         camera.intrinsics.width as usize,
         camera.intrinsics.height as usize,
+        rustgs::EvaluationDevice::Gpu,
+        args.raster_cov_blur,
     )
-    .with_raster_cov_blur(args.raster_cov_blur);
-    let rendered = renderer.render_splats(&splats, &camera)?;
-    let image = image::RgbImage::from_raw(
-        rendered.width as u32,
-        rendered.height as u32,
-        rendered.color,
-    )
-    .context("renderer produced an invalid RGB buffer")?;
+    .map_err(anyhow::Error::from)?;
+    let rendered = renderer
+        .render(&splats, &camera)
+        .map_err(anyhow::Error::from)?;
+    let color: Vec<u8> = rendered
+        .into_iter()
+        .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+        .collect();
+    let image = image::RgbImage::from_raw(camera.intrinsics.width, camera.intrinsics.height, color)
+        .context("renderer produced an invalid RGB buffer")?;
     if let Some(parent) = args.output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -740,8 +744,8 @@ fn run_render_command(args: RenderArgs) -> anyhow::Result<()> {
     image.save(&args.output)?;
     log::info!(
         "Rendered {}x{} image to {:?}",
-        rendered.width,
-        rendered.height,
+        camera.intrinsics.width,
+        camera.intrinsics.height,
         args.output
     );
     Ok(())

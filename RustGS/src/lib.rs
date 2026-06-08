@@ -6,7 +6,6 @@
 //! # Architecture
 //!
 //! - `core`: shared training-neutral types such as cameras
-//! - `render`: Rendering
 //! - `training`: Training loops and optimizers
 //! - `io`: Scene file I/O (.splat, PLY, checkpoints)
 //! - `init`: Splat initialization from point clouds
@@ -40,7 +39,6 @@
 pub mod core;
 pub mod init;
 pub mod io;
-pub mod render;
 mod sh;
 pub mod training;
 
@@ -50,11 +48,6 @@ pub use rustscan_types::{Intrinsics, MapPointData, ScenePose, TrainingDataset, S
 
 // Re-export core types
 pub use crate::core::{GaussianCamera, HostSplats, SplatView};
-
-// Re-export render types
-pub use crate::render::{
-    GaussianRenderer, ProjectedGaussian, RenderBuffer, RenderOutput, TiledRenderer,
-};
 
 // Re-export training types
 pub use crate::training::{

@@ -136,7 +136,7 @@ fn colmap_training_smoke_produces_post_train_evaluation_summary() {
         gaussian_count: run.splats.len(),
         sh_degree: run.splats.sh_degree(),
     };
-    let device = evaluation_device(EvaluationDevice::Cpu).unwrap();
+    let device = evaluation_device(EvaluationDevice::Gpu).unwrap();
     let evaluation = evaluate_splats(
         &dataset,
         &run.splats,
@@ -153,7 +153,7 @@ fn colmap_training_smoke_produces_post_train_evaluation_summary() {
     )
     .unwrap();
 
-    assert_eq!(evaluation.summary.device, EvaluationDevice::Cpu);
+    assert_eq!(evaluation.summary.device, EvaluationDevice::Gpu);
     assert!(evaluation.summary.frame_count > 0);
     assert_eq!(evaluation.summary.splat_count, run.splats.len());
     assert!(evaluation.summary.psnr_mean_db.is_finite());

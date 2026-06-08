@@ -38,8 +38,8 @@ struct Args {
     #[arg(long, default_value = "0.2")]
     raster_cov_blur: f32,
 
-    /// Evaluation device. Currently cpu-compatible rendering is used.
-    #[arg(long, default_value = "cpu")]
+    /// Evaluation device.
+    #[arg(long, default_value = "gpu")]
     device: String,
 
     /// Optional profile name stored in the generated reports.
