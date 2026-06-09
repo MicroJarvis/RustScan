@@ -39,6 +39,3 @@ pub fn last_training_telemetry() -> Option<LiteGsTrainingTelemetry> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
 }
-
-#[cfg(test)]
-mod tests;

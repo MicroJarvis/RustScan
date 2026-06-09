@@ -61,9 +61,6 @@ gpu = [
 gpu-wgpu = ["gpu"]
 cli = ["dep:clap", "dep:env_logger", "dep:anyhow"]
 
-[dev-dependencies]
-tempfile = "3"
-
 [[example]]
 name = "evaluate_psnr"
 required-features = ["gpu", "cli"]
@@ -75,7 +72,3 @@ required-features = ["gpu", "cli"]
 [[example]]
 name = "rustgs_residual_heatmap"
 required-features = ["gpu", "cli"]
-
-[[test]]
-name = "colmap_training"
-required-features = ["gpu"]

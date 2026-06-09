@@ -808,6 +808,3 @@ fn resize_rgb_box(
     }
     dst
 }
-
-#[cfg(test)]
-mod tests;

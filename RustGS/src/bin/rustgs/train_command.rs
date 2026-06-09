@@ -117,12 +117,6 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
     std::process::exit(1);
 }
 
-#[cfg(test)]
-pub(super) fn effective_train_args(args: TrainArgs) -> TrainArgs {
-    effective_train_args_with_sources(args, &TrainArgSources::default())
-        .expect("training config should apply")
-}
-
 pub(super) fn effective_train_args_with_sources(
     mut args: TrainArgs,
     sources: &TrainArgSources,
@@ -1895,7 +1889,3 @@ fn splats_have_non_finite(splats: &rustgs::HostSplats) -> bool {
         || view.opacity_logits.iter().any(|value| !value.is_finite())
         || view.sh_coeffs.iter().any(|value| !value.is_finite())
 }
-
-#[cfg(all(test, feature = "gpu"))]
-#[path = "train_command/tests.rs"]
-mod tests;

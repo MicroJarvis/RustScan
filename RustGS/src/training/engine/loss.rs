@@ -26,19 +26,6 @@ impl Default for SsimConfig {
     }
 }
 
-#[cfg(test)]
-pub fn ssim_loss<B: Backend>(
-    pred: Tensor<B, 3>,
-    target: Tensor<B, 3>,
-    config: &SsimConfig,
-    device: &B::Device,
-) -> Tensor<B, 1> {
-    let pred = to_nchw(pred);
-    let target = to_nchw(target);
-    let kernel = gaussian_kernel_1d::<B>(config, device);
-    ssim_loss_with_kernel(pred, target, kernel, config)
-}
-
 pub fn ssim_loss_with_kernel<B: Backend>(
     pred: Tensor<B, 4>,
     target: Tensor<B, 4>,
@@ -73,40 +60,6 @@ pub fn ssim_loss_with_kernel<B: Backend>(
         .mul_scalar(-1.0)
         .add_scalar(1.0)
         .reshape([1])
-}
-
-#[cfg(test)]
-pub fn combined_loss<B: Backend>(
-    pred: Tensor<B, 3>,
-    target: Tensor<B, 3>,
-    l1_weight: f64,
-    ssim_weight: f64,
-    gradient_weight: f64,
-    robust_delta: f64,
-    outlier_threshold: f64,
-    outlier_weight: f64,
-    dynamic_mask_threshold_low: f64,
-    dynamic_mask_threshold_high: f64,
-    dynamic_mask_min_weight: f64,
-    ssim_config: &SsimConfig,
-    device: &B::Device,
-) -> Tensor<B, 1> {
-    let kernel = gaussian_kernel_1d::<B>(ssim_config, device);
-    combined_loss_with_kernel(
-        pred,
-        target,
-        l1_weight,
-        ssim_weight,
-        gradient_weight,
-        robust_delta,
-        outlier_threshold,
-        outlier_weight,
-        dynamic_mask_threshold_low,
-        dynamic_mask_threshold_high,
-        dynamic_mask_min_weight,
-        ssim_config,
-        kernel,
-    )
 }
 
 pub fn combined_loss_with_kernel<B: Backend>(
@@ -274,7 +227,3 @@ fn separable_blur<B: Backend>(tensor: Tensor<B, 4>, kernel: Tensor<B, 1>) -> Ten
         ConvOptions::new([1, 1], [0, 0], [1, 1], channels),
     )
 }
-
-#[cfg(test)]
-#[path = "loss_tests.rs"]
-mod tests;

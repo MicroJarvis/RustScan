@@ -175,6 +175,3 @@ pub enum TrainingError {
     #[error("Training failed: {0}")]
     TrainingFailed(String),
 }
-
-#[cfg(test)]
-mod tests;

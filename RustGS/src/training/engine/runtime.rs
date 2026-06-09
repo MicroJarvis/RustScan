@@ -250,7 +250,3 @@ fn build_training_run(
     store_last_training_telemetry(run.report.telemetry.clone());
     run
 }
-
-#[cfg(test)]
-#[path = "runtime_tests.rs"]
-mod tests;

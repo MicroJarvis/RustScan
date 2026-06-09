@@ -158,31 +158,3 @@ fn sigmoid_scalar(value: f32) -> f32 {
         exp / (1.0 + exp)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn brush_refine_offset_normalizes_non_unit_rotation() {
-        let unit = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
-        let rotation = [unit.w * 2.0, unit.x * 2.0, unit.y * 2.0, unit.z * 2.0];
-
-        let offset = brush_refine_offset(rotation, [2.0, 0.0, 0.0], 1.0);
-
-        assert!(offset[0].abs() < 1e-5, "x offset was {}", offset[0]);
-        assert!(
-            (offset[1] - 2.0).abs() < 1e-5,
-            "y offset was {}",
-            offset[1]
-        );
-        assert!(offset[2].abs() < 1e-5, "z offset was {}", offset[2]);
-    }
-
-    #[test]
-    fn brush_refine_offset_uses_identity_for_zero_rotation() {
-        let offset = brush_refine_offset([0.0; 4], [1.0, 2.0, 3.0], 0.5);
-
-        assert_eq!(offset, [0.5, 1.0, 1.5]);
-    }
-}

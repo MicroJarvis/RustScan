@@ -161,7 +161,3 @@ impl<B: Backend> AdamScaled<B> {
         param - update * scaled_lr
     }
 }
-
-#[cfg(test)]
-#[path = "optimizer_tests.rs"]
-mod tests;

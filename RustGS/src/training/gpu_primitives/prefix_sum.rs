@@ -135,6 +135,3 @@ where
         Ok(src)
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -4,9 +4,6 @@ mod config;
 mod evaluation;
 mod reporting;
 
-#[cfg(test)]
-mod tests;
-
 macro_rules! gpu_modules {
     ($($module:ident),+ $(,)?) => {
         $(

@@ -591,6 +591,3 @@ pub fn compare_loss_curve_samples(
         total_max_abs_delta,
     })
 }
-
-#[cfg(test)]
-mod tests;

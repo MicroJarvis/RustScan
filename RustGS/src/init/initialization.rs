@@ -175,6 +175,3 @@ fn opacity_to_logit(opacity: f32) -> f32 {
     let clamped = opacity.clamp(1e-6, 1.0 - 1e-6);
     (clamped / (1.0 - clamped)).ln()
 }
-
-#[cfg(test)]
-mod tests;

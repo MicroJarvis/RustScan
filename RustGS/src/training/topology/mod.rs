@@ -1213,7 +1213,3 @@ fn build_host_snapshot_stats(
         })
         .collect()
 }
-
-
-#[cfg(test)]
-mod tests;

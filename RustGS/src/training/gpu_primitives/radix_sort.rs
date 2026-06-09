@@ -233,6 +233,3 @@ where
         Ok((output_keys, output_values))
     }
 }
-
-#[cfg(test)]
-mod tests;

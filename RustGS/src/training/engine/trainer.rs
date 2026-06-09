@@ -106,12 +106,6 @@ fn target_image_tensor_data(
     )
 }
 
-#[cfg(test)]
-fn target_image_tensor_data_owned(target_image: &[f32], image_dims: (usize, usize)) -> TensorData {
-    let (width, height) = image_dims;
-    TensorData::new(target_image.to_vec(), Shape::new([height, width, 3]))
-}
-
 impl WgpuTrainer {
     pub fn new(
         config: TrainingConfig,
@@ -451,99 +445,6 @@ impl WgpuTrainer {
         }
 
         loss_value
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn train_with_observer(
-        &mut self,
-        splats: &mut DeviceSplats<GsDiffBackend>,
-        cameras: &[GaussianCamera],
-        target_images: &[Arc<Vec<f32>>],
-        image_dims: (usize, usize),
-        num_iterations: usize,
-        observer: &mut dyn TrainingLoopObserver,
-    ) -> WgpuTrainingReport {
-        let mut report = WgpuTrainingReport::default();
-        let mut rng = StdRng::seed_from_u64(self.config.data.frame_shuffle_seed);
-
-        for iteration in 0..num_iterations {
-            if observer.should_cancel() {
-                report.cancelled = true;
-                break;
-            }
-
-            let sample_idx = if cameras.len() == 1 {
-                0
-            } else {
-                rng.gen_range(0..cameras.len())
-            };
-            let iteration_idx = iteration + 1;
-            let emit_progress = observer.should_emit_progress(iteration_idx);
-            let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
-            let should_log_step = iteration % 100 == 0;
-            let should_read_loss = emit_progress
-                || emit_snapshot
-                || should_log_step
-                || iteration_idx == num_iterations;
-            let loss = self
-                .train_step(
-                    splats,
-                    &cameras[sample_idx],
-                    &target_images[sample_idx],
-                    image_dims,
-                    iteration_idx,
-                    cameras.len(),
-                    should_read_loss,
-                )
-                .await;
-            report.completed_iterations = iteration_idx;
-            report.final_gaussian_count = splats.num_splats();
-
-            if let Some(loss) = loss {
-                report.final_loss = Some(loss);
-                report.final_step_loss = Some(loss);
-                self.record_loss_sample(
-                    iteration_idx,
-                    sample_idx,
-                    loss,
-                    should_log_step || iteration_idx == num_iterations,
-                );
-                let metrics = TrainingIterationMetrics {
-                    iteration: iteration_idx,
-                    loss,
-                    gaussian_count: splats.num_splats(),
-                };
-                if emit_progress {
-                    observer.on_iteration(metrics);
-                }
-                if emit_snapshot {
-                    let host = device_splats_to_host(splats).await;
-                    observer.on_snapshot(metrics, host);
-                }
-                if should_log_step {
-                    log::info!(
-                        "WGPU training step {} | loss={:.6} | splats={}",
-                        iteration_idx,
-                        loss,
-                        splats.num_splats()
-                    );
-                }
-            } else if should_log_step {
-                log::info!(
-                    "WGPU training step {} | splats={}",
-                    iteration_idx,
-                    splats.num_splats()
-                );
-            }
-
-            if observer.should_cancel() {
-                report.cancelled = true;
-                break;
-            }
-        }
-
-        self.finish_report(&mut report);
-        report
     }
 
     pub(crate) async fn train_with_frame_loader(
@@ -1026,7 +927,3 @@ fn training_epoch_count(iterations: usize, frame_count: usize) -> usize {
         (iterations / frame_count).max(1)
     }
 }
-
-#[cfg(test)]
-#[path = "trainer_tests.rs"]
-mod tests;

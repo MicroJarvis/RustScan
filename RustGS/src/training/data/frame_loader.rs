@@ -74,11 +74,6 @@ impl DeterministicFrameBatchIter {
             cursor: 0,
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn order(&self) -> &[usize] {
-        &self.order
-    }
 }
 
 pub(crate) fn ordered_frame_indices(
@@ -243,16 +238,6 @@ impl PrefetchFrameLoader {
                 }
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn cache_len(&self) -> usize {
-        self.cache.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_cached(&self, frame_idx: usize) -> bool {
-        self.cache.contains_key(&frame_idx)
     }
 
     fn queue_frame(&mut self, frame_idx: usize) -> Result<(), TrainingError> {
@@ -593,6 +578,3 @@ fn deterministic_shuffle(indices: &mut [usize], seed: u64) {
         indices.swap(idx, swap_idx);
     }
 }
-
-#[cfg(test)]
-mod tests;

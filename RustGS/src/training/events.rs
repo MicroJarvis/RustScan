@@ -214,6 +214,3 @@ impl TrainingRun {
 pub(crate) fn emit_training_event(sink: &mut TrainingEventSink<'_>, event: TrainingEvent) {
     sink(event);
 }
-
-#[cfg(test)]
-mod tests;

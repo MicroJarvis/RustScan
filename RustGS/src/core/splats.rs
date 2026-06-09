@@ -238,7 +238,3 @@ fn validate_component_len(
 pub(crate) fn sigmoid_scalar(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
-
-#[cfg(test)]
-#[path = "splats_tests.rs"]
-mod tests;

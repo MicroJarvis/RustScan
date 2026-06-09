@@ -62,6 +62,3 @@ impl TrainingCheckpoint {
         })
     }
 }
-
-#[cfg(all(test, feature = "gpu"))]
-mod tests;

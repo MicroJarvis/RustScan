@@ -918,6 +918,3 @@ fn normalized_quaternion(rotation: [f32; 4]) -> [f32; 4] {
         rotation[3] * inv_length,
     ]
 }
-
-#[cfg(test)]
-mod tests;

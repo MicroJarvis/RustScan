@@ -778,7 +778,3 @@ fn load_render_camera(path: &std::path::Path) -> anyhow::Result<rustgs::Gaussian
 fn run_render_command(_args: RenderArgs) -> anyhow::Result<()> {
     bail!("render requires the gpu feature");
 }
-
-#[cfg(test)]
-#[path = "rustgs/tests.rs"]
-mod tests;

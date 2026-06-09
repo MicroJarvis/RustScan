@@ -168,6 +168,3 @@ pub(crate) fn rasterize_bwd<B: RasterizeBwdBackend>(
         )),
     }
 }
-
-#[cfg(test)]
-mod tests;

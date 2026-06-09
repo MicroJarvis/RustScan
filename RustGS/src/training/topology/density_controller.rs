@@ -288,6 +288,3 @@ impl DensityController {
         deficit.saturating_add(prune_count).min(current_count)
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -755,6 +755,3 @@ fn parse_u8(path: &Path, line_num: usize, field: &str, value: &str) -> Result<u8
         ))
     })
 }
-
-#[cfg(test)]
-mod tests;

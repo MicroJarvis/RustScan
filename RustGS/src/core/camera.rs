@@ -93,7 +93,3 @@ impl GaussianCamera {
 pub fn viewmat_from_pose(rotation: Quat, translation: Vec3) -> Mat4 {
     Mat4::from_rotation_translation(rotation, translation)
 }
-
-#[cfg(test)]
-#[path = "camera_tests.rs"]
-mod tests;

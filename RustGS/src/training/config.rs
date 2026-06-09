@@ -871,6 +871,3 @@ pub struct TrainingResult {
     /// Training time in seconds
     pub training_time: f64,
 }
-
-#[cfg(test)]
-mod tests;

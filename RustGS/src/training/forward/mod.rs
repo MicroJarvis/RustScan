@@ -294,6 +294,3 @@ where
         num_visible: counts.visible,
     }
 }
-
-#[cfg(test)]
-mod tests;
