@@ -14,6 +14,7 @@ pub struct PointVertex {
 }
 
 const POINT_PIXEL_SIZE: f32 = 4.0;
+pub const MESH_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 
 /// Expand a list of points into small screen-space quads (2 triangles each).
 /// Returns (vertices, indices).
@@ -248,7 +249,7 @@ pub fn create_mesh_pipeline(
             cull_mode: None,
             ..Default::default()
         },
-        depth_stencil: None,
+        depth_stencil: Some(mesh_depth_state(true)),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -316,11 +317,21 @@ pub fn create_wireframe_pipeline(
             cull_mode: None,
             ..Default::default()
         },
-        depth_stencil: None,
+        depth_stencil: Some(mesh_depth_state(false)),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn mesh_depth_state(depth_write_enabled: bool) -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: MESH_DEPTH_FORMAT,
+        depth_write_enabled: Some(depth_write_enabled),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
 }
 
 const POINT_WGSL: &str = r#"
@@ -379,9 +390,21 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
-    let lambert = max(abs(dot(in.normal, light_dir)), 0.4);
-    return vec4<f32>(in.color * (0.4 + 0.6 * lambert), 1.0);
+    let n = normalize(in.normal);
+    let key = normalize(vec3<f32>(-0.35, 0.85, 0.45));
+    let fill = normalize(vec3<f32>(0.7, 0.35, -0.5));
+    let rim = normalize(vec3<f32>(-0.55, 0.25, -0.75));
+
+    let key_light = max(dot(n, key), 0.0);
+    let fill_light = max(dot(n, fill), 0.0) * 0.28;
+    let rim_light = pow(max(dot(n, rim), 0.0), 2.0) * 0.22;
+    let ambient = vec3<f32>(0.22, 0.24, 0.27);
+    let warmth = vec3<f32>(1.0, 0.96, 0.90);
+    let cool = vec3<f32>(0.62, 0.72, 0.95);
+
+    let lit = in.color * (ambient + warmth * key_light * 0.78 + cool * fill_light);
+    let highlight = vec3<f32>(rim_light);
+    return vec4<f32>(min(lit + highlight, vec3<f32>(1.0, 1.0, 1.0)), 1.0);
 }
 "#;
 

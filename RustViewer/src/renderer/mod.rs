@@ -7,6 +7,7 @@ pub mod scene;
 use eframe::egui_wgpu;
 use eframe::wgpu;
 
+use crate::robot::RobotRenderMesh;
 use camera::ArcballCamera;
 use pipelines::{
     create_line_pipeline, create_mesh_pipeline, create_point_pipeline, create_wireframe_pipeline,
@@ -33,6 +34,9 @@ pub struct SceneRenderer {
     mesh_index_count: u32,
     wireframe_ibuf: Option<wgpu::Buffer>,
     wireframe_index_count: u32,
+    robot_vbuf: Option<wgpu::Buffer>,
+    robot_ibuf: Option<wgpu::Buffer>,
+    robot_index_count: u32,
     // Cached layer flags (set during prepare, used in paint)
     layer_trajectory: bool,
     layer_map_points: bool,
@@ -101,6 +105,9 @@ impl SceneRenderer {
             mesh_index_count: 0,
             wireframe_ibuf: None,
             wireframe_index_count: 0,
+            robot_vbuf: None,
+            robot_ibuf: None,
+            robot_index_count: 0,
             layer_trajectory: true,
             layer_map_points: true,
             layer_mesh_solid: false,
@@ -116,6 +123,7 @@ impl SceneRenderer {
         scene: &Scene,
         camera: &ArcballCamera,
         viewport_size: [f32; 2],
+        robot_mesh: Option<&RobotRenderMesh>,
     ) {
         // Cache layer flags for use in paint()
         self.layer_trajectory = scene.layers.trajectory;
@@ -206,6 +214,20 @@ impl SceneRenderer {
             self.mesh_index_count = 0;
             self.wireframe_index_count = 0;
         }
+
+        if let Some(robot_mesh) = robot_mesh {
+            self.robot_index_count = robot_mesh.indices.len() as u32;
+            self.robot_vbuf = Some(create_vertex_buffer(
+                device,
+                bytemuck::cast_slice::<MeshGpuVertex, u8>(&robot_mesh.vertices),
+            ));
+            self.robot_ibuf = Some(create_index_buffer(
+                device,
+                bytemuck::cast_slice(&robot_mesh.indices),
+            ));
+        } else {
+            self.robot_index_count = 0;
+        }
     }
 
     /// Issue draw calls using cached layer flags (called from paint() which can't access Scene).
@@ -244,6 +266,18 @@ impl SceneRenderer {
             }
         }
 
+        if let (Some(vbuf), Some(ibuf), count) =
+            (&self.robot_vbuf, &self.robot_ibuf, self.robot_index_count)
+        {
+            if count > 0 {
+                rpass.set_pipeline(&self.mesh_pipeline);
+                rpass.set_bind_group(0, &self.uniform_bg, &[]);
+                rpass.set_vertex_buffer(0, vbuf.slice(..));
+                rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..count, 0, 0..1);
+            }
+        }
+
         if self.layer_trajectory {
             if let (Some(vbuf), count) = (&self.line_vbuf, self.line_count) {
                 if count > 0 {
@@ -274,6 +308,7 @@ pub struct ViewerCallback {
     pub scene: std::sync::Arc<std::sync::Mutex<Scene>>,
     pub camera: ArcballCamera,
     pub viewport_size: [f32; 2],
+    pub robot_mesh: Option<RobotRenderMesh>,
     /// Surface format read from eframe at startup — used for lazy pipeline init.
     pub surface_format: wgpu::TextureFormat,
 }
@@ -296,7 +331,14 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
 
         if let Some(renderer) = resources.get_mut::<SceneRenderer>() {
             if let Ok(scene) = self.scene.lock() {
-                renderer.update_buffers(device, queue, &scene, &self.camera, self.viewport_size);
+                renderer.update_buffers(
+                    device,
+                    queue,
+                    &scene,
+                    &self.camera,
+                    self.viewport_size,
+                    self.robot_mesh.as_ref(),
+                );
             }
         }
 

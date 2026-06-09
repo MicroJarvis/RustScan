@@ -210,5 +210,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         mean2d,
         vec3<f32>(conic[0][0], conic[0][1], conic[1][1]),
         vec4<f32>(color, opacity),
+        mean_c.z,
     );
 }

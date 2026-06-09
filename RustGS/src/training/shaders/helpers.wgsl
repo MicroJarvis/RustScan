@@ -33,9 +33,10 @@ struct ProjectedSplat {
     color_g: f32,
     color_b: f32,
     color_a: f32,
+    depth: f32,
 }
 
-fn create_projected_splat(xy: vec2<f32>, conic: vec3<f32>, color: vec4<f32>) -> ProjectedSplat {
+fn create_projected_splat(xy: vec2<f32>, conic: vec3<f32>, color: vec4<f32>, depth: f32) -> ProjectedSplat {
     return ProjectedSplat(
         xy.x,
         xy.y,
@@ -46,6 +47,7 @@ fn create_projected_splat(xy: vec2<f32>, conic: vec3<f32>, color: vec4<f32>) -> 
         color.g,
         color.b,
         color.a,
+        depth,
     );
 }
 

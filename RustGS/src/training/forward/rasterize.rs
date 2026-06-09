@@ -43,6 +43,7 @@ impl KernelSource for RasterizeKernel {
 pub(crate) struct RasterizeOutput<B: Backend> {
     pub out_img: Tensor<B, 3>,
     pub visible: Tensor<B, 1>,
+    pub depth: Tensor<B, 2>,
 }
 
 pub(crate) trait RasterizeBackend: Backend {
@@ -55,7 +56,11 @@ pub(crate) trait RasterizeBackend: Backend {
         img_size: (u32, u32),
         tile_bounds: (u32, u32),
         background: [f32; 3],
-    ) -> (Self::FloatTensorPrimitive, Self::FloatTensorPrimitive);
+    ) -> (
+        Self::FloatTensorPrimitive,
+        Self::FloatTensorPrimitive,
+        Self::FloatTensorPrimitive,
+    );
 }
 
 impl<F, I, BT> RasterizeBackend for CubeBackend<WgpuRuntime, F, I, BT>
@@ -73,7 +78,11 @@ where
         img_size: (u32, u32),
         tile_bounds: (u32, u32),
         background: [f32; 3],
-    ) -> (Self::FloatTensorPrimitive, Self::FloatTensorPrimitive) {
+    ) -> (
+        Self::FloatTensorPrimitive,
+        Self::FloatTensorPrimitive,
+        Self::FloatTensorPrimitive,
+    ) {
         let compact_gid_from_isect = into_contiguous(compact_gid_from_isect);
         let tile_offsets = into_contiguous(tile_offsets);
         let projected_splats = into_contiguous(projected_splats);
@@ -84,6 +93,7 @@ where
         let out_img =
             Tensor::<Self, 3>::zeros([img_size.1 as usize, img_size.0 as usize, 4], &device);
         let visible = Tensor::<Self, 1>::zeros([total_splats], &device);
+        let depth = Tensor::<Self, 2>::zeros([img_size.1 as usize, img_size.0 as usize], &device);
 
         let num_tiles = tile_bounds.0 * tile_bounds.1;
         if num_tiles > 0 {
@@ -106,6 +116,7 @@ where
                     out_img.clone().into_primitive().tensor().handle.binding(),
                     global_from_compact_gid.handle.binding(),
                     visible.clone().into_primitive().tensor().handle.binding(),
+                    depth.clone().into_primitive().tensor().handle.binding(),
                     uniforms_handle.binding(),
                 ]),
             );
@@ -114,6 +125,7 @@ where
         (
             out_img.into_primitive().tensor(),
             visible.into_primitive().tensor(),
+            depth.into_primitive().tensor(),
         )
     }
 }
@@ -129,7 +141,7 @@ pub(crate) fn rasterize<B: RasterizeBackend>(
     background: [f32; 3],
     _device: &B::Device,
 ) -> RasterizeOutput<B> {
-    let (out_img, visible) = B::rasterize_primitive(
+    let (out_img, visible, depth) = B::rasterize_primitive(
         compact_gid_from_isect.clone().into_primitive(),
         tile_offsets.clone().into_primitive(),
         projected_splats.clone().into_primitive().tensor(),
@@ -143,5 +155,6 @@ pub(crate) fn rasterize<B: RasterizeBackend>(
     RasterizeOutput {
         out_img: Tensor::from_primitive(TensorPrimitive::Float(out_img)),
         visible: Tensor::from_primitive(TensorPrimitive::Float(visible)),
+        depth: Tensor::from_primitive(TensorPrimitive::Float(depth)),
     }
 }

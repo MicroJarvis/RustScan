@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Rect, Sense, Vec2};
 use eframe::egui_wgpu;
 use eframe::wgpu;
+use glam::{Vec3, Vec4};
 use rustgs::{ColmapConfig, HostSplats, SharedWgpuContext, TrainingConfig};
 
 use crate::loader::checkpoint::LoadError;
@@ -16,6 +17,7 @@ use crate::loader::{
 use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
+use crate::robot::{GroundPlane, NavigationMode, RobotController, RobotInput};
 use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
 use crate::training::preview::PreviewResolution;
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
@@ -26,6 +28,7 @@ use crate::ui::theme::{
 use crate::ui::viewport::{draw_empty_state, draw_viewport_overlay};
 
 const VIEWPORT_INTERACTIVE_IDLE_DELAY: Duration = Duration::from_millis(180);
+const GROUND_PICK_POINT_COUNT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CachedTexture {
@@ -45,9 +48,15 @@ enum AppCommand {
     ColmapLoaded(Result<LoadedColmapDataset, String>),
 }
 
+#[derive(Debug, Default)]
+struct GroundPickState {
+    points: Vec<Vec3>,
+}
+
 pub struct ViewerApp {
     scene: Arc<Mutex<Scene>>,
     camera: ArcballCamera,
+    robot: RobotController,
     preview_camera: ArcballCamera,
     ui_state: UiState,
     loaded_colmap: Option<LoadedColmapDataset>,
@@ -62,6 +71,7 @@ pub struct ViewerApp {
     viewport_dirty: bool,
     viewport_texture: Option<CachedTexture>,
     viewport_last_motion: Option<Instant>,
+    ground_pick: Option<GroundPickState>,
     viewport_render_error: Option<String>,
     shared_wgpu_context: Option<SharedWgpuContext>,
     wgpu_render_state: Option<egui_wgpu::RenderState>,
@@ -95,6 +105,7 @@ impl ViewerApp {
         let app = Self {
             scene: Arc::new(Mutex::new(Scene::default())),
             camera: ArcballCamera::default(),
+            robot: RobotController::default(),
             preview_camera: ArcballCamera::default(),
             ui_state: UiState::default(),
             loaded_colmap: None,
@@ -109,6 +120,7 @@ impl ViewerApp {
             viewport_dirty: true,
             viewport_texture: None,
             viewport_last_motion: None,
+            ground_pick: None,
             viewport_render_error: None,
             shared_wgpu_context,
             wgpu_render_state: cc.wgpu_render_state.clone(),
@@ -163,6 +175,7 @@ impl ViewerApp {
                     self.ui_state.load_error = None;
                     if scene.has_data() {
                         self.camera.fit_scene(&scene.bounds);
+                        self.robot.reset_to_scene(&scene.bounds);
                     } else {
                         scene.recompute_bounds();
                     }
@@ -195,6 +208,7 @@ impl ViewerApp {
                     map_training_dataset_to_scene(&loaded.dataset, &mut scene);
                     if scene.has_data() {
                         self.camera.fit_scene(&scene.bounds);
+                        self.robot.reset_to_scene(&scene.bounds);
                         self.preview_camera = self.camera.clone();
                     }
                 }
@@ -252,6 +266,42 @@ impl ViewerApp {
                 PanelAction::StopTraining => self.stop_training(),
                 PanelAction::AutoFitScene => {
                     self.preview_dirty = true;
+                    self.viewport_dirty = true;
+                    self.viewport_last_motion = None;
+                }
+                PanelAction::ResetRobot => {
+                    if let Ok(scene) = self.scene.lock() {
+                        self.robot.reset_to_scene(&scene.bounds);
+                    }
+                    self.ui_state.robot_move_speed = self.robot.move_speed;
+                    self.viewport_dirty = true;
+                    self.viewport_last_motion = None;
+                }
+                PanelAction::SnapRobotToGround => {
+                    if let Ok(scene) = self.scene.lock() {
+                        self.robot.snap_to_scene_ground(&scene);
+                    }
+                    self.viewport_dirty = true;
+                    self.viewport_last_motion = None;
+                }
+                PanelAction::PickRobotGround => {
+                    self.ground_pick = Some(GroundPickState::default());
+                    self.ui_state.navigation_mode = NavigationMode::Orbit;
+                    self.viewport_dirty = true;
+                    self.viewport_last_motion = None;
+                }
+                PanelAction::FlipRobotGround => {
+                    self.robot.flip_ground_plane();
+                    self.viewport_dirty = true;
+                    self.viewport_last_motion = None;
+                }
+                PanelAction::PlaceRobotInView => {
+                    let camera = self.camera.clone();
+                    if let Ok(scene) = self.scene.lock() {
+                        self.robot.place_in_camera_view(&camera, &scene);
+                    }
+                    self.ui_state.robot_visible = true;
+                    self.robot.visible = true;
                     self.viewport_dirty = true;
                     self.viewport_last_motion = None;
                 }
@@ -384,10 +434,62 @@ impl ViewerApp {
         if let Ok(mut scene) = self.scene.lock() {
             scene.gaussians = host_splats_to_scene_gaussians(&snapshot);
             scene.recompute_bounds();
+            self.robot.sync_ground_from_scene(&scene.bounds);
         }
         self.loaded_splats = Some(snapshot);
         self.viewport_dirty = true;
         self.viewport_render_error = None;
+    }
+
+    fn display_camera(&self) -> ArcballCamera {
+        if self.ui_state.navigation_mode == NavigationMode::Robot {
+            self.robot.camera()
+        } else {
+            self.camera.clone()
+        }
+    }
+
+    fn pick_viewport_world_point(
+        &self,
+        viewport_rect: Rect,
+        pointer_pos: egui::Pos2,
+    ) -> Option<Vec3> {
+        let scene = self.scene.lock().ok()?;
+        let use_splat_depth =
+            self.loaded_splats.is_some() && scene.layers.gaussians && !self.viewport_dirty;
+        let splat_depth = use_splat_depth
+            .then(|| {
+                self.viewport_bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.depth_at_viewport_pos(viewport_rect, pointer_pos))
+            })
+            .flatten();
+        pick_viewport_point(
+            &scene,
+            &self.camera,
+            viewport_rect,
+            pointer_pos,
+            splat_depth,
+        )
+    }
+
+    fn record_ground_pick_point(&mut self, point: Vec3, camera_eye: Vec3) {
+        let Some(ground_pick) = self.ground_pick.as_mut() else {
+            return;
+        };
+        ground_pick.points.push(point);
+        if ground_pick.points.len() < GROUND_PICK_POINT_COUNT {
+            return;
+        }
+
+        let points = ground_pick.points.clone();
+        self.ground_pick = None;
+        if let Some(ground_plane) = GroundPlane::from_points(&points, camera_eye) {
+            self.robot.set_ground_plane(ground_plane);
+            self.robot.snap_to_ground();
+            self.viewport_dirty = true;
+            self.viewport_last_motion = None;
+        }
     }
 
     fn refresh_preview_texture_id(&mut self, size: Vec2) -> Option<egui::TextureId> {
@@ -445,6 +547,7 @@ impl ViewerApp {
         let Some(splats) = self.loaded_splats.clone() else {
             return None;
         };
+        let camera = self.display_camera();
         let Some(viewport_bridge) = self.viewport_bridge.as_mut() else {
             self.viewport_render_error = Some("wgpu render state is unavailable".to_string());
             return None;
@@ -464,7 +567,7 @@ impl ViewerApp {
         match viewport_bridge.render_texture_id(
             self.wgpu_render_state.as_ref(),
             splats,
-            &self.camera,
+            &camera,
             size,
             scale,
         ) {
@@ -515,7 +618,8 @@ impl ViewerApp {
 
                     let desired_size =
                         Vec2::new(ui.available_width(), ui.available_height().max(220.0));
-                    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::drag());
+                    let (rect, response) =
+                        ui.allocate_exact_size(desired_size, Sense::click_and_drag());
 
                     let mut preview_moved = false;
                     if response.dragged_by(egui::PointerButton::Primary) {
@@ -653,6 +757,9 @@ impl eframe::App for ViewerApp {
 
         self.poll_commands();
         self.poll_training_events(&ctx);
+        self.robot.visible = self.ui_state.robot_visible;
+        self.robot.camera_mode = self.ui_state.robot_camera_mode;
+        self.robot.move_speed = self.ui_state.robot_move_speed;
 
         let (has_data, scene_bounds) = self
             .scene
@@ -690,6 +797,9 @@ impl eframe::App for ViewerApp {
                 }
             });
         self.process_panel_actions(panel_actions);
+        self.robot.visible = self.ui_state.robot_visible;
+        self.robot.camera_mode = self.ui_state.robot_camera_mode;
+        self.robot.move_speed = self.ui_state.robot_move_speed;
 
         self.draw_preview_panel(ui);
 
@@ -705,33 +815,125 @@ impl eframe::App for ViewerApp {
                 let viewport_rect = ui.max_rect();
                 let viewport_size = [viewport_rect.width(), viewport_rect.height()];
 
-                let response = ui.allocate_rect(viewport_rect, egui::Sense::drag());
+                let response = ui.allocate_rect(viewport_rect, egui::Sense::click_and_drag());
+                if response.clicked() {
+                    response.request_focus();
+                }
+
+                let ground_pick_was_active = self.ground_pick.is_some();
+                if ground_pick_was_active && response.clicked_by(egui::PointerButton::Primary) {
+                    if let Some(pointer_pos) = response.interact_pointer_pos() {
+                        if let Some(point) =
+                            self.pick_viewport_world_point(viewport_rect, pointer_pos)
+                        {
+                            self.record_ground_pick_point(point, self.camera.eye());
+                            ctx.request_repaint();
+                        }
+                    }
+                }
 
                 let mut camera_moved = false;
-                if response.dragged_by(egui::PointerButton::Primary) {
-                    let delta = response.drag_motion();
-                    if ui.input(|input| input.modifiers.shift) {
-                        self.camera.roll(delta.x);
-                    } else {
-                        self.camera.orbit(delta.x, delta.y);
+                if self.ui_state.navigation_mode == NavigationMode::Robot {
+                    let accepts_keyboard = response.hovered()
+                        || response.has_focus()
+                        || response.dragged()
+                        || !ctx.egui_wants_keyboard_input();
+                    if accepts_keyboard {
+                        let (robot_input, dt) = ui.input(|input| {
+                            let mut robot_input = RobotInput::default();
+                            if input.key_down(egui::Key::W) || input.key_down(egui::Key::ArrowUp) {
+                                robot_input.forward += 1.0;
+                            }
+                            if input.key_down(egui::Key::S) || input.key_down(egui::Key::ArrowDown)
+                            {
+                                robot_input.forward -= 1.0;
+                            }
+                            if input.key_down(egui::Key::A) {
+                                robot_input.turn += 1.0;
+                            }
+                            if input.key_down(egui::Key::D) {
+                                robot_input.turn -= 1.0;
+                            }
+                            if input.key_down(egui::Key::Q) || input.key_down(egui::Key::ArrowLeft)
+                            {
+                                robot_input.strafe -= 1.0;
+                            }
+                            if input.key_down(egui::Key::E) || input.key_down(egui::Key::ArrowRight)
+                            {
+                                robot_input.strafe += 1.0;
+                            }
+                            (robot_input, input.stable_dt.min(0.05))
+                        });
+                        if self.robot.apply_input(robot_input, dt) {
+                            camera_moved = true;
+                        }
                     }
-                    camera_moved = true;
-                }
-                if response.dragged_by(egui::PointerButton::Middle) {
-                    let delta = response.drag_motion();
-                    self.camera.roll(delta.x);
-                    camera_moved = true;
-                }
-                if response.dragged_by(egui::PointerButton::Secondary) {
-                    let delta = response.drag_motion();
-                    self.camera.pan(delta.x, delta.y);
-                    camera_moved = true;
-                }
-                if response.hovered() {
-                    let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-                    if scroll != 0.0 {
-                        self.camera.zoom(scroll);
+                    if response.dragged_by(egui::PointerButton::Primary)
+                        || response.dragged_by(egui::PointerButton::Secondary)
+                    {
+                        let delta = response.drag_motion();
+                        self.robot.look(delta.x, delta.y);
                         camera_moved = true;
+                    }
+                    if response.hovered() {
+                        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                        if scroll != 0.0 {
+                            self.robot.adjust_speed(scroll);
+                            self.ui_state.robot_move_speed = self.robot.move_speed;
+                        }
+                    }
+                } else {
+                    if !ground_pick_was_active && response.double_clicked() {
+                        if let Some(pointer_pos) = response.interact_pointer_pos() {
+                            if let Ok(scene) = self.scene.lock() {
+                                let use_splat_depth = self.loaded_splats.is_some()
+                                    && scene.layers.gaussians
+                                    && !self.viewport_dirty;
+                                let splat_depth = use_splat_depth
+                                    .then(|| {
+                                        self.viewport_bridge.as_ref().and_then(|bridge| {
+                                            bridge.depth_at_viewport_pos(viewport_rect, pointer_pos)
+                                        })
+                                    })
+                                    .flatten();
+                                if let Some(target) = pick_viewport_focus(
+                                    &scene,
+                                    &self.camera,
+                                    viewport_rect,
+                                    pointer_pos,
+                                    splat_depth,
+                                ) {
+                                    self.camera.focus_on(target);
+                                    camera_moved = true;
+                                }
+                            }
+                        }
+                    }
+                    if response.dragged_by(egui::PointerButton::Primary) {
+                        let delta = response.drag_motion();
+                        if ui.input(|input| input.modifiers.shift) {
+                            self.camera.roll(delta.x);
+                        } else {
+                            self.camera.orbit(delta.x, delta.y);
+                        }
+                        camera_moved = true;
+                    }
+                    if response.dragged_by(egui::PointerButton::Middle) {
+                        let delta = response.drag_motion();
+                        self.camera.roll(delta.x);
+                        camera_moved = true;
+                    }
+                    if response.dragged_by(egui::PointerButton::Secondary) {
+                        let delta = response.drag_motion();
+                        self.camera.pan(delta.x, delta.y);
+                        camera_moved = true;
+                    }
+                    if response.hovered() {
+                        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                        if scroll != 0.0 {
+                            self.camera.zoom(scroll);
+                            camera_moved = true;
+                        }
                     }
                 }
                 if camera_moved {
@@ -771,14 +973,19 @@ impl eframe::App for ViewerApp {
                     viewport_rect,
                     ViewerCallback {
                         scene: Arc::clone(&self.scene),
-                        camera: self.camera.clone(),
+                        camera: self.display_camera(),
                         viewport_size,
+                        robot_mesh: self.robot.render_mesh(),
                         surface_format: self.surface_format,
                     },
                 );
                 ui.painter().add(callback);
 
-                draw_viewport_overlay(ui, &self.camera, has_data);
+                if let Some(ground_pick) = &self.ground_pick {
+                    draw_ground_pick_overlay(ui, viewport_rect, &self.camera, ground_pick);
+                }
+
+                draw_viewport_overlay(ui, &self.display_camera(), has_data);
 
                 let _ = scene_bounds;
             });
@@ -807,6 +1014,177 @@ fn draw_preview_placeholder(ui: &egui::Ui, rect: Rect, message: &str) {
         egui::FontId::proportional(13.0),
         TEXT_SECONDARY,
     );
+}
+
+fn draw_ground_pick_overlay(
+    ui: &egui::Ui,
+    viewport_rect: Rect,
+    camera: &ArcballCamera,
+    ground_pick: &GroundPickState,
+) {
+    let painter = ui.painter();
+    let label_pos = viewport_rect.left_top() + Vec2::new(16.0, 16.0);
+    painter.text(
+        label_pos,
+        egui::Align2::LEFT_TOP,
+        format!(
+            "Ground points {}/{}",
+            ground_pick.points.len(),
+            GROUND_PICK_POINT_COUNT
+        ),
+        egui::FontId::proportional(13.0),
+        TEXT_PRIMARY,
+    );
+
+    for point in &ground_pick.points {
+        if let Some(screen) = world_to_screen(camera, viewport_rect, *point) {
+            painter.circle_filled(screen, 5.0, Color32::from_rgb(48, 209, 88));
+            painter.circle_stroke(screen, 7.0, egui::Stroke::new(1.5, Color32::BLACK));
+        }
+    }
+}
+
+fn world_to_screen(camera: &ArcballCamera, viewport_rect: Rect, point: Vec3) -> Option<egui::Pos2> {
+    let size = viewport_rect.size();
+    if size.x <= 1.0 || size.y <= 1.0 {
+        return None;
+    }
+    let clip = camera.view_proj(size.x / size.y.max(1.0)) * point.extend(1.0);
+    if clip.w <= 1e-8 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if ndc.z < -1.0 || ndc.z > 1.0 {
+        return None;
+    }
+    Some(egui::pos2(
+        viewport_rect.left() + (ndc.x + 1.0) * 0.5 * size.x,
+        viewport_rect.top() + (1.0 - ndc.y) * 0.5 * size.y,
+    ))
+}
+
+fn pick_viewport_focus(
+    scene: &Scene,
+    camera: &ArcballCamera,
+    viewport_rect: Rect,
+    pointer_pos: egui::Pos2,
+    splat_depth: Option<f32>,
+) -> Option<Vec3> {
+    pick_viewport_point(scene, camera, viewport_rect, pointer_pos, splat_depth)
+}
+
+fn pick_viewport_point(
+    scene: &Scene,
+    camera: &ArcballCamera,
+    viewport_rect: Rect,
+    pointer_pos: egui::Pos2,
+    splat_depth: Option<f32>,
+) -> Option<Vec3> {
+    let ray = viewport_ray(camera, viewport_rect, pointer_pos)?;
+    if let Some(depth) = splat_depth {
+        return focus_from_camera_depth(camera, ray.1, depth);
+    }
+    pick_mesh_focus(scene, ray)
+}
+
+fn focus_from_camera_depth(camera: &ArcballCamera, ray_dir: Vec3, depth: f32) -> Option<Vec3> {
+    if !depth.is_finite() || depth <= 0.0 {
+        return None;
+    }
+    let forward = -camera.backward();
+    let denom = ray_dir.dot(forward);
+    if !denom.is_finite() || denom <= 1e-6 {
+        return None;
+    }
+    let distance = depth / denom;
+    (distance.is_finite() && distance > 0.0).then_some(camera.eye() + ray_dir * distance)
+}
+
+fn viewport_ray(
+    camera: &ArcballCamera,
+    viewport_rect: Rect,
+    pointer_pos: egui::Pos2,
+) -> Option<(Vec3, Vec3)> {
+    let size = viewport_rect.size();
+    if size.x <= 1.0 || size.y <= 1.0 {
+        return None;
+    }
+
+    let x = ((pointer_pos.x - viewport_rect.left()) / size.x) * 2.0 - 1.0;
+    let y = 1.0 - ((pointer_pos.y - viewport_rect.top()) / size.y) * 2.0;
+    let aspect = size.x / size.y.max(1.0);
+    let inv_view_proj = camera.view_proj(aspect).inverse();
+    let near = inv_view_proj * Vec4::new(x, y, -1.0, 1.0);
+    let far = inv_view_proj * Vec4::new(x, y, 1.0, 1.0);
+    if near.w.abs() <= 1e-8 || far.w.abs() <= 1e-8 {
+        return None;
+    }
+
+    let near = near.truncate() / near.w;
+    let far = far.truncate() / far.w;
+    let dir = (far - near).normalize_or_zero();
+    (dir.length_squared() > 0.0).then_some((near, dir))
+}
+
+fn pick_mesh_focus(scene: &Scene, ray: (Vec3, Vec3)) -> Option<Vec3> {
+    if scene.mesh_indices.len() < 3 || scene.mesh_vertices.is_empty() {
+        return None;
+    }
+
+    let (origin, dir) = ray;
+    let mut best_t = f32::INFINITY;
+    let mut best_hit = None;
+    for tri in scene.mesh_indices.chunks_exact(3) {
+        let Some(a) = scene.mesh_vertices.get(tri[0] as usize) else {
+            continue;
+        };
+        let Some(b) = scene.mesh_vertices.get(tri[1] as usize) else {
+            continue;
+        };
+        let Some(c) = scene.mesh_vertices.get(tri[2] as usize) else {
+            continue;
+        };
+        if let Some(t) = ray_triangle_t(
+            origin,
+            dir,
+            Vec3::from_array(a.position),
+            Vec3::from_array(b.position),
+            Vec3::from_array(c.position),
+        ) {
+            if t < best_t {
+                best_t = t;
+                best_hit = Some(origin + dir * t);
+            }
+        }
+    }
+
+    best_hit
+}
+
+fn ray_triangle_t(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let edge1 = b - a;
+    let edge2 = c - a;
+    let h = dir.cross(edge2);
+    let det = edge1.dot(h);
+    if det.abs() < 1e-8 {
+        return None;
+    }
+
+    let inv_det = 1.0 / det;
+    let s = origin - a;
+    let u = inv_det * s.dot(h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+
+    let q = s.cross(edge1);
+    let v = inv_det * dir.dot(q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+
+    let t = inv_det * edge2.dot(q);
+    (t > 1e-5).then_some(t)
 }
 
 #[cfg(test)]
@@ -871,5 +1249,53 @@ mod tests {
             PreviewResolution::new(320, 240).unwrap()
         ));
         assert!(!needs_texture_render(false, cached, resolution));
+    }
+
+    #[test]
+    fn viewport_center_ray_points_at_camera_target() {
+        let camera = ArcballCamera::default();
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let (origin, dir) = viewport_ray(&camera, rect, rect.center()).unwrap();
+        let to_target = (camera.target - origin).normalize();
+
+        assert!(dir.dot(to_target) > 0.999);
+    }
+
+    #[test]
+    fn focus_from_camera_depth_unprojects_center_ray() {
+        let camera = ArcballCamera::default();
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let (_, dir) = viewport_ray(&camera, rect, rect.center()).unwrap();
+
+        let picked = focus_from_camera_depth(&camera, dir, camera.distance).unwrap();
+
+        assert!((picked - Vec3::ZERO).length() < 1e-4);
+    }
+
+    #[test]
+    fn pick_mesh_focus_hits_triangle() {
+        let mut scene = Scene::default();
+        scene.mesh_vertices = vec![
+            MeshGpuVertex {
+                position: [-1.0, -1.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                color: [1.0, 1.0, 1.0],
+            },
+            MeshGpuVertex {
+                position: [1.0, -1.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                color: [1.0, 1.0, 1.0],
+            },
+            MeshGpuVertex {
+                position: [0.0, 1.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                color: [1.0, 1.0, 1.0],
+            },
+        ];
+        scene.mesh_indices = vec![0, 1, 2];
+
+        let hit = pick_mesh_focus(&scene, (Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z)).unwrap();
+
+        assert!((hit - Vec3::ZERO).length() < 1e-4);
     }
 }

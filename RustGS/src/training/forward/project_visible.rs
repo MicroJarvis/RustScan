@@ -65,7 +65,7 @@ where
         let device = transforms.device.clone();
         let client = transforms.client.clone();
 
-        let projected = Tensor::<Self, 2>::zeros([num_visible, 9], &device);
+        let projected = Tensor::<Self, 2>::zeros([num_visible, 10], &device);
 
         if num_visible > 0 {
             let uniforms_handle = client.create_from_slice(bytemuck::bytes_of(&uniforms));

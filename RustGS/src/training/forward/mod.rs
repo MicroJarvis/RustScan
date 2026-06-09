@@ -149,6 +149,7 @@ async fn sync_projection_counts_from_gpu<B: Backend>(
 
 pub(crate) struct RenderOutput<B: Backend> {
     pub out_img: Tensor<B, 3>,
+    pub depth: Tensor<B, 2>,
     pub visible: Tensor<B, 1>,
     pub projected_splats: Tensor<B, 2>,
     pub global_from_compact_gid: Tensor<B, 1, Int>,
@@ -190,7 +191,7 @@ where
 
     if counts.visible == 0 {
         let empty_indices = Tensor::<B, 1, Int>::zeros([0], device);
-        let projected_splats = Tensor::<B, 2>::zeros([0, 9], device);
+        let projected_splats = Tensor::<B, 2>::zeros([0, 10], device);
         let tile_offsets = Tensor::<B, 1, Int>::zeros([2 * num_tiles as usize], device);
         let raster_out = rasterize(
             &empty_indices,
@@ -206,6 +207,7 @@ where
 
         return RenderOutput {
             out_img: raster_out.out_img,
+            depth: raster_out.depth,
             visible: raster_out.visible,
             projected_splats,
             global_from_compact_gid: empty_indices.clone(),
@@ -247,6 +249,7 @@ where
 
         return RenderOutput {
             out_img: raster_out.out_img,
+            depth: raster_out.depth,
             visible: raster_out.visible,
             projected_splats,
             global_from_compact_gid,
@@ -286,6 +289,7 @@ where
 
     RenderOutput {
         out_img: raster_out.out_img,
+        depth: raster_out.depth,
         visible: raster_out.visible,
         projected_splats,
         global_from_compact_gid,

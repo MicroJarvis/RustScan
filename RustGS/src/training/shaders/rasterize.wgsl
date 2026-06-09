@@ -12,7 +12,8 @@ struct RasterizeUniforms {
 @group(0) @binding(3) var<storage, read_write> out_img: array<f32>;
 @group(0) @binding(4) var<storage, read> global_from_compact_gid: array<u32>;
 @group(0) @binding(5) var<storage, read_write> visible: array<f32>;
-@group(0) @binding(6) var<storage, read> uniforms: RasterizeUniforms;
+@group(0) @binding(6) var<storage, read_write> depth: array<f32>;
+@group(0) @binding(7) var<storage, read> uniforms: RasterizeUniforms;
 
 var<workgroup> range_uniform: vec2<u32>;
 var<workgroup> local_batch: array<helpers::ProjectedSplat, helpers::TILE_SIZE>;
@@ -49,6 +50,7 @@ fn main(
     let range = range_uniform;
     var T = 1.0;
     var pix_out = vec3<f32>(0.0);
+    var depth_sum = 0.0;
     var done = !inside;
 
     for (var batch_start = range.x; batch_start < range.y; batch_start += helpers::TILE_SIZE) {
@@ -75,6 +77,7 @@ fn main(
             if sigma >= 0.0 && alpha >= (1.0 / 255.0) {
                 let vis = alpha * T;
                 pix_out += max(vec3<f32>(splat.color_r, splat.color_g, splat.color_b), vec3<f32>(0.0)) * vis;
+                depth_sum += splat.depth * vis;
                 T *= (1.0 - alpha);
                 visible[load_gid[t]] = 1.0;
 
@@ -95,5 +98,7 @@ fn main(
         out_img[base + 1u] = final_rgb.g;
         out_img[base + 2u] = final_rgb.b;
         out_img[base + 3u] = 1.0 - T;
+        let alpha = 1.0 - T;
+        depth[pixel_id] = select(0.0, depth_sum / max(alpha, 1e-6), alpha > (1.0 / 255.0));
     }
 }

@@ -4,6 +4,7 @@ use egui::{Color32, Vec2};
 
 use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::Scene;
+use crate::robot::{NavigationMode, RobotCameraMode};
 use crate::training::{TrainingProgress, TrainingSessionState};
 use crate::ui::theme::*;
 
@@ -16,6 +17,11 @@ pub enum PanelAction {
     StartTraining,
     StopTraining,
     AutoFitScene,
+    ResetRobot,
+    SnapRobotToGround,
+    PlaceRobotInView,
+    PickRobotGround,
+    FlipRobotGround,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +66,10 @@ pub struct UiState {
     pub training_progress: TrainingProgress,
     pub training_error: Option<String>,
     pub preview_error: Option<String>,
+    pub navigation_mode: NavigationMode,
+    pub robot_camera_mode: RobotCameraMode,
+    pub robot_visible: bool,
+    pub robot_move_speed: f32,
 }
 
 impl Default for UiState {
@@ -74,6 +84,10 @@ impl Default for UiState {
             training_progress: TrainingProgress::default(),
             training_error: None,
             preview_error: None,
+            navigation_mode: NavigationMode::Orbit,
+            robot_camera_mode: RobotCameraMode::Follow,
+            robot_visible: true,
+            robot_move_speed: 1.0,
         }
     }
 }
@@ -129,6 +143,11 @@ pub fn draw_side_panel(
 
         draw_section_header(ui, "TRAINING");
         draw_training_controls(ui, state, &mut actions);
+
+        draw_divider(ui);
+
+        draw_section_header(ui, "ROBOT NAVIGATION");
+        draw_robot_controls(ui, state, &mut actions);
 
         draw_divider(ui);
 
@@ -368,6 +387,61 @@ fn draw_training_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut 
                 });
             }
         });
+    });
+}
+
+fn draw_robot_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut Vec<PanelAction>) {
+    ui.horizontal(|ui| {
+        let orbit = state.navigation_mode == NavigationMode::Orbit;
+        if ui.selectable_label(orbit, "Orbit").clicked() {
+            state.navigation_mode = NavigationMode::Orbit;
+        }
+        let robot = state.navigation_mode == NavigationMode::Robot;
+        if ui.selectable_label(robot, "Robot").clicked() {
+            state.navigation_mode = NavigationMode::Robot;
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let follow = state.robot_camera_mode == RobotCameraMode::Follow;
+        if ui.selectable_label(follow, "Follow").clicked() {
+            state.robot_camera_mode = RobotCameraMode::Follow;
+        }
+        let first_person = state.robot_camera_mode == RobotCameraMode::FirstPerson;
+        if ui.selectable_label(first_person, "First Person").clicked() {
+            state.robot_camera_mode = RobotCameraMode::FirstPerson;
+        }
+    });
+
+    ui.add(
+        egui::Slider::new(&mut state.robot_move_speed, 0.05..=10.0)
+            .text("Speed")
+            .clamping(egui::SliderClamping::Always),
+    );
+    ui.checkbox(&mut state.robot_visible, "Show Unitree G1");
+
+    ui.horizontal(|ui| {
+        if draw_secondary_button(ui, "⊙", "Place In View") {
+            actions.push(PanelAction::PlaceRobotInView);
+        }
+        if draw_secondary_button(ui, "⟲", "Reset Robot") {
+            actions.push(PanelAction::ResetRobot);
+        }
+    });
+
+    ui.horizontal(|ui| {
+        if draw_secondary_button(ui, "⌄", "Snap Ground") {
+            actions.push(PanelAction::SnapRobotToGround);
+        }
+        if draw_secondary_button(ui, "◎", "Set Ground") {
+            actions.push(PanelAction::PickRobotGround);
+        }
+    });
+
+    ui.horizontal(|ui| {
+        if draw_secondary_button(ui, "⇅", "Flip Ground") {
+            actions.push(PanelAction::FlipRobotGround);
+        }
     });
 }
 

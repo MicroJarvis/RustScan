@@ -4,7 +4,7 @@ use crate::renderer::camera::ArcballCamera;
 use crate::training::preview::{
     gaussian_camera_from_arcball_viewport, PreviewRenderError, PreviewResolution,
 };
-use eframe::egui::{TextureId, Vec2};
+use eframe::egui::{Pos2, Rect, TextureId, Vec2};
 use eframe::{egui_wgpu, wgpu};
 use rustgs::{BurnViewportRenderer, BurnViewportResolution, HostSplats, SharedWgpuContext};
 use std::sync::Arc;
@@ -15,6 +15,7 @@ pub struct GpuViewportBridge {
     queue: wgpu::Queue,
     renderer: BurnViewportRenderer,
     texture_id: Option<TextureId>,
+    depth_resolution: Option<PreviewResolution>,
 }
 
 impl GpuViewportBridge {
@@ -30,6 +31,7 @@ impl GpuViewportBridge {
             renderer: BurnViewportRenderer::new(context)
                 .map_err(PreviewRenderError::RendererInit)?,
             texture_id: None,
+            depth_resolution: None,
         };
         bridge.ensure_texture_id(render_state);
         Ok(bridge)
@@ -43,6 +45,7 @@ impl GpuViewportBridge {
         panel_size: Vec2,
         scale: f32,
     ) -> Result<Option<TextureId>, PreviewRenderError> {
+        self.depth_resolution = None;
         if splats.is_empty() {
             return Ok(None);
         }
@@ -62,34 +65,58 @@ impl GpuViewportBridge {
                     PreviewRenderError::RenderFailed("invalid viewport size".to_string())
                 })?,
         );
-        let texture_view = self
-            .renderer
-            .render(
-                &self.device,
-                &self.queue,
-                splats.as_ref(),
-                &camera,
-                resolution,
-            )
-            .map_err(PreviewRenderError::RenderFailed)?
-            .ok_or_else(|| {
-                PreviewRenderError::RenderFailed("gpu viewport returned no texture".to_string())
-            })?;
+        {
+            let texture_view = self
+                .renderer
+                .render(
+                    &self.device,
+                    &self.queue,
+                    splats.as_ref(),
+                    &camera,
+                    resolution,
+                )
+                .map_err(PreviewRenderError::RenderFailed)?
+                .ok_or_else(|| {
+                    PreviewRenderError::RenderFailed("gpu viewport returned no texture".to_string())
+                })?;
 
-        if let Some(render_state) = render_state {
-            if let Some(texture_id) = self.texture_id {
-                render_state
-                    .renderer
-                    .write()
-                    .update_egui_texture_from_wgpu_texture(
-                        &self.device,
-                        texture_view,
-                        wgpu::FilterMode::Linear,
-                        texture_id,
-                    );
+            if let Some(render_state) = render_state {
+                if let Some(texture_id) = self.texture_id {
+                    render_state
+                        .renderer
+                        .write()
+                        .update_egui_texture_from_wgpu_texture(
+                            &self.device,
+                            texture_view,
+                            wgpu::FilterMode::Linear,
+                            texture_id,
+                        );
+                }
             }
         }
+        self.depth_resolution = self.renderer.depth_resolution().and_then(|resolution| {
+            PreviewResolution::new(resolution.width as usize, resolution.height as usize)
+        });
         Ok(self.texture_id)
+    }
+
+    pub fn depth_at_viewport_pos(&self, viewport_rect: Rect, pointer_pos: Pos2) -> Option<f32> {
+        let resolution = self.depth_resolution?;
+        let size = viewport_rect.size();
+        if size.x <= 1.0 || size.y <= 1.0 {
+            return None;
+        }
+
+        let u = ((pointer_pos.x - viewport_rect.left()) / size.x).clamp(0.0, 1.0);
+        let v = ((pointer_pos.y - viewport_rect.top()) / size.y).clamp(0.0, 1.0);
+        let x = (u * resolution.width as f32)
+            .floor()
+            .clamp(0.0, (resolution.width.saturating_sub(1)) as f32) as u32;
+        let y = (v * resolution.height as f32)
+            .floor()
+            .clamp(0.0, (resolution.height.saturating_sub(1)) as f32) as u32;
+
+        self.renderer.depth_at(x, y)
     }
 
     fn ensure_texture_id(&mut self, render_state: &egui_wgpu::RenderState) {

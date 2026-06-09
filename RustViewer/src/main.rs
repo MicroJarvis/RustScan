@@ -6,6 +6,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("RustViewer"),
+        depth_buffer: 24,
         wgpu_options: cubecl_compatible_wgpu_options(),
         ..Default::default()
     };

@@ -1,7 +1,7 @@
 //! Arcball camera controller for 3D navigation.
 
 use crate::renderer::scene::SceneBounds;
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat3, Mat4, Quat, Vec3};
 
 /// Arcball camera: orbits around a target point.
 #[derive(Debug, Clone)]
@@ -46,6 +46,36 @@ impl ArcballCamera {
             orientation: (yaw * pitch * roll).normalize(),
             fov_y,
         }
+    }
+
+    pub fn from_raw(target: Vec3, distance: f32, orientation: Quat, fov_y: f32) -> Self {
+        Self {
+            target,
+            distance: distance.max(Self::MIN_DISTANCE),
+            orientation: orientation.normalize(),
+            fov_y,
+        }
+    }
+
+    pub fn from_eye_target(eye: Vec3, target: Vec3, up_hint: Vec3, fov_y: f32) -> Self {
+        let distance = eye.distance(target).max(Self::MIN_DISTANCE);
+        let target = if eye.distance_squared(target) <= 1e-8 {
+            eye + Vec3::NEG_Z
+        } else {
+            target
+        };
+        let backward = (eye - target).normalize_or_zero();
+        let right = up_hint.cross(backward).normalize_or_zero();
+        let up = backward.cross(right).normalize_or_zero();
+        let orientation = if backward.length_squared() > 0.0
+            && right.length_squared() > 0.0
+            && up.length_squared() > 0.0
+        {
+            Quat::from_mat3(&Mat3::from_cols(right, up, backward)).normalize()
+        } else {
+            Quat::IDENTITY
+        };
+        Self::from_raw(target, distance, orientation, fov_y)
     }
 
     /// Eye position in world space.
@@ -114,6 +144,12 @@ impl ArcballCamera {
             self.distance *= Self::ZOOM_FACTOR;
         }
         self.distance = self.distance.max(Self::MIN_DISTANCE);
+    }
+
+    /// Re-center orbit controls on a world-space point while keeping the eye fixed.
+    pub fn focus_on(&mut self, target: Vec3) {
+        let eye = self.eye();
+        *self = Self::from_eye_target(eye, target, self.up(), self.fov_y);
     }
 
     /// Fit the camera to display the full scene bounds.
@@ -207,5 +243,17 @@ mod tests {
             cam.zoom(1.0);
         }
         assert!(cam.distance >= ArcballCamera::MIN_DISTANCE);
+    }
+
+    #[test]
+    fn focus_on_keeps_eye_and_updates_target() {
+        let mut cam = ArcballCamera::default();
+        let eye = cam.eye();
+        let target = Vec3::new(1.0, 2.0, -3.0);
+
+        cam.focus_on(target);
+
+        assert!((cam.eye() - eye).length() < 1e-4);
+        assert!((cam.target - target).length() < 1e-4);
     }
 }

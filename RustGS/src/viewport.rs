@@ -1,7 +1,7 @@
 //! Realtime viewport backed by RustGS's canonical Burn/CubeCL renderer.
 
 use burn::prelude::Backend;
-use burn::tensor::TensorPrimitive;
+use burn::tensor::{Tensor, TensorData, TensorPrimitive};
 use burn_wgpu::{CubeTensor, WgpuResource, WgpuRuntime};
 use wgpu::util::DeviceExt;
 
@@ -32,8 +32,20 @@ pub struct BurnViewportRenderer {
     runtime: tokio::runtime::Runtime,
     cached_splats: Option<CachedSplats>,
     texture: Option<ViewportTexture>,
+    depth: Option<ViewportDepthTensor>,
     converter: Option<TextureConverter>,
     raster_cov_blur: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct BurnViewportDepth {
+    pub resolution: BurnViewportResolution,
+    pub values: Vec<f32>,
+}
+
+struct ViewportDepthTensor {
+    resolution: BurnViewportResolution,
+    tensor: Tensor<GsBackendBase, 2>,
 }
 
 struct CachedSplats {
@@ -72,9 +84,31 @@ impl BurnViewportRenderer {
             runtime,
             cached_splats: None,
             texture: None,
+            depth: None,
             converter: None,
             raster_cov_blur: crate::DEFAULT_RASTER_COV_BLUR,
         })
+    }
+
+    pub fn depth_at(&self, x: u32, y: u32) -> Option<f32> {
+        let depth = self.read_depth().ok()??;
+        let value = *depth.values.get(depth_index(depth.resolution, x, y)?)?;
+        (value.is_finite() && value > 0.0).then_some(value)
+    }
+
+    pub fn depth_resolution(&self) -> Option<BurnViewportResolution> {
+        self.depth.as_ref().map(|depth| depth.resolution)
+    }
+
+    pub fn read_depth(&self) -> Result<Option<BurnViewportDepth>, String> {
+        let Some(depth) = self.depth.as_ref() else {
+            return Ok(None);
+        };
+        let values = read_depth_values(&self.runtime, &depth.tensor, depth.resolution)?;
+        Ok(Some(BurnViewportDepth {
+            resolution: depth.resolution,
+            values,
+        }))
     }
 
     pub fn render(
@@ -86,6 +120,7 @@ impl BurnViewportRenderer {
         resolution: BurnViewportResolution,
     ) -> Result<Option<&wgpu::TextureView>, String> {
         if splats.is_empty() {
+            self.depth = None;
             return Ok(None);
         }
 
@@ -109,6 +144,11 @@ impl BurnViewportRenderer {
                 &self.device,
                 self.raster_cov_blur,
             ));
+
+        self.depth = Some(ViewportDepthTensor {
+            resolution,
+            tensor: rendered.depth,
+        });
 
         let out_tensor = match rendered.out_img.into_primitive() {
             TensorPrimitive::Float(tensor) => tensor,
@@ -185,6 +225,40 @@ impl BurnViewportRenderer {
             self.converter = Some(TextureConverter::new(device));
         }
     }
+}
+
+fn depth_index(resolution: BurnViewportResolution, x: u32, y: u32) -> Option<usize> {
+    if x >= resolution.width || y >= resolution.height {
+        return None;
+    }
+    (y as usize)
+        .checked_mul(resolution.width as usize)?
+        .checked_add(x as usize)
+}
+
+fn read_depth_values(
+    runtime: &tokio::runtime::Runtime,
+    depth: &Tensor<GsBackendBase, 2>,
+    resolution: BurnViewportResolution,
+) -> Result<Vec<f32>, String> {
+    let data = runtime
+        .block_on(depth.clone().into_data_async())
+        .map_err(|err| format!("viewport depth readback failed: {err}"))?;
+    let values = tensor_data_to_f32_vec(data)?;
+    let expected = resolution.width as usize * resolution.height as usize;
+    if values.len() != expected {
+        return Err(format!(
+            "viewport depth length {} does not match expected {}",
+            values.len(),
+            expected
+        ));
+    }
+    Ok(values)
+}
+
+fn tensor_data_to_f32_vec(data: TensorData) -> Result<Vec<f32>, String> {
+    data.into_vec::<f32>()
+        .map_err(|err| format!("viewport depth tensor was not f32: {err}"))
 }
 
 impl TextureConverter {
