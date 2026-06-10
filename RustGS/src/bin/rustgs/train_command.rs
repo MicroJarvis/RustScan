@@ -98,6 +98,7 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
         &splats,
         &config,
         training_telemetry,
+        training_report.training_loop_elapsed,
         training_report.elapsed,
         evaluation_summary.as_ref(),
     ) {
@@ -207,6 +208,11 @@ pub(super) struct TrainConfigOverrides {
     iterations: Option<usize>,
     max_initial_gaussians: Option<usize>,
     sampling_step: Option<usize>,
+    init_point_scale_factor: Option<f32>,
+    init_point_opacity: Option<f32>,
+    init_vksplat_scale_estimator: Option<bool>,
+    init_random_rotations: Option<bool>,
+    init_rotation_seed: Option<u64>,
     max_frames: Option<usize>,
     frame_stride: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_nullable_override")]
@@ -271,6 +277,7 @@ pub(super) struct TrainConfigOverrides {
     lr_position: Option<f32>,
     lr_position_final: Option<f32>,
     lr_decay_iterations: Option<usize>,
+    lr_position_scene_scale: Option<bool>,
     lr_scale: Option<f32>,
     lr_scale_final: Option<f32>,
     lr_rotation: Option<f32>,
@@ -278,7 +285,9 @@ pub(super) struct TrainConfigOverrides {
     lr_opacity: Option<f32>,
     lr_opacity_final: Option<f32>,
     lr_color: Option<f32>,
+    lr_color_rest: Option<f32>,
     lr_color_final: Option<f32>,
+    lr_color_rest_final: Option<f32>,
     loss_l1_weight: Option<f32>,
     loss_ssim_weight: Option<f32>,
     loss_gradient_weight: Option<f32>,
@@ -326,6 +335,36 @@ impl TrainConfigOverrides {
             "sampling_step",
             &mut args.sampling_step,
             self.sampling_step,
+        );
+        apply_override(
+            sources,
+            "init_point_scale_factor",
+            &mut args.init_point_scale_factor,
+            self.init_point_scale_factor,
+        );
+        apply_override(
+            sources,
+            "init_point_opacity",
+            &mut args.init_point_opacity,
+            self.init_point_opacity,
+        );
+        apply_override(
+            sources,
+            "init_vksplat_scale_estimator",
+            &mut args.init_vksplat_scale_estimator,
+            self.init_vksplat_scale_estimator,
+        );
+        apply_override(
+            sources,
+            "init_random_rotations",
+            &mut args.init_random_rotations,
+            self.init_random_rotations,
+        );
+        apply_override(
+            sources,
+            "init_rotation_seed",
+            &mut args.init_rotation_seed,
+            self.init_rotation_seed,
         );
         apply_override(sources, "max_frames", &mut args.max_frames, self.max_frames);
         apply_override(
@@ -622,6 +661,12 @@ impl TrainConfigOverrides {
             &mut args.lr_decay_iterations,
             self.lr_decay_iterations,
         );
+        apply_override(
+            sources,
+            "lr_position_scene_scale",
+            &mut args.lr_position_scene_scale,
+            self.lr_position_scene_scale,
+        );
         apply_override(sources, "lr_scale", &mut args.lr_scale, self.lr_scale);
         apply_override(
             sources,
@@ -651,9 +696,21 @@ impl TrainConfigOverrides {
         apply_override(sources, "lr_color", &mut args.lr_color, self.lr_color);
         apply_override(
             sources,
+            "lr_color_rest",
+            &mut args.lr_color_rest,
+            self.lr_color_rest,
+        );
+        apply_override(
+            sources,
             "lr_color_final",
             &mut args.lr_color_final,
             self.lr_color_final,
+        );
+        apply_override(
+            sources,
+            "lr_color_rest_final",
+            &mut args.lr_color_rest_final,
+            self.lr_color_rest_final,
         );
         apply_override(
             sources,
@@ -1503,6 +1560,11 @@ pub(super) fn build_training_config(args: &TrainArgs) -> anyhow::Result<rustgs::
         initialization: rustgs::TrainingInitializationConfig {
             max_initial_gaussians: args.max_initial_gaussians,
             sampling_step: args.sampling_step,
+            point_scale_factor: args.init_point_scale_factor,
+            point_opacity: args.init_point_opacity,
+            vksplat_scale_estimator: args.init_vksplat_scale_estimator,
+            randomize_rotations: args.init_random_rotations,
+            rotation_seed: args.init_rotation_seed,
             ..rustgs::TrainingInitializationConfig::default()
         },
         data: rustgs::TrainingDataConfig {
@@ -1519,6 +1581,7 @@ pub(super) fn build_training_config(args: &TrainArgs) -> anyhow::Result<rustgs::
             lr_position: args.lr_position,
             lr_pos_final: args.lr_position_final,
             lr_decay_iterations: (args.lr_decay_iterations > 0).then_some(args.lr_decay_iterations),
+            lr_position_scene_scale: args.lr_position_scene_scale,
             lr_scale: args.lr_scale,
             lr_scale_final: args.lr_scale_final,
             lr_rotation: args.lr_rotation,
@@ -1526,7 +1589,9 @@ pub(super) fn build_training_config(args: &TrainArgs) -> anyhow::Result<rustgs::
             lr_opacity: args.lr_opacity,
             lr_opacity_final: args.lr_opacity_final,
             lr_color: args.lr_color,
+            lr_color_rest: args.lr_color_rest,
             lr_color_final: args.lr_color_final,
+            lr_color_rest_final: args.lr_color_rest_final,
         },
         loss: rustgs::TrainingLossConfig {
             loss_l1_weight: args.loss_l1_weight,
@@ -1626,9 +1691,14 @@ fn litegs_profile_overrides(args: &TrainArgs) -> (rustgs::LiteGsSplitScoreMode, 
 
 fn log_litegs_training_config(config: &rustgs::TrainingConfig) {
     log::info!(
-        "LiteGS profile config | profile={} | sh_degree={} | tile_size={} | sparse_grad={} | reg_weight={:.4} | enable_transmittance={} | enable_depth={} | learnable_viewproj={} | lr_pose={:.6} | densify_from={} | densify_until={:?} | topology_freeze_after_epoch={:?} | growth_freeze_after_epoch={:?} | refine_every={} | densification_interval={} | growth_grad_threshold={:.6} | split_score={} | split_grad_threshold={:.6} | depth_scale_gamma={:.3} | growth_select_fraction={:.3} | growth_stop_iter={} | opacity_decay={:.6} | scale_decay={:.6} | opacity_reset_interval={} | opacity_reset_mode={} | prune_mode={} | prune_opacity_threshold={:.6} | prune_visibility_dry_run={} | prune_visibility_threshold={:.3} | prune_high_opacity_threshold={:.3} | prune_until_epoch={:?} | target_primitives={} | lr_decay_iterations={:?} | lr_final(scale={:.6}, rot={:.6}, opacity={:.6}, color={:.6}) | raster_cov_blur={:.3} | raster_cov_blur_final={:?} | raster_cov_blur_final_after_epoch={:?} | loss_weights(l1={:.3}, ssim={:.3}, gradient={:.3}, robust_delta={:.3}, outlier_threshold={:.3}, outlier_weight={:.3}, dynamic_mask_low={:.3}, dynamic_mask_high={:.3}, dynamic_mask_min_weight={:.3}, dynamic_mask_start_epoch={:?})",
+        "LiteGS profile config | profile={} | sh_degree={} | init(point_scale={:.3}, point_opacity={:.3}, vksplat_scale={}, random_rot={}, rotation_seed={}) | tile_size={} | sparse_grad={} | reg_weight={:.4} | enable_transmittance={} | enable_depth={} | learnable_viewproj={} | lr_pose={:.6} | densify_from={} | densify_until={:?} | topology_freeze_after_epoch={:?} | growth_freeze_after_epoch={:?} | refine_every={} | densification_interval={} | growth_grad_threshold={:.6} | split_score={} | split_grad_threshold={:.6} | depth_scale_gamma={:.3} | growth_select_fraction={:.3} | growth_stop_iter={} | opacity_decay={:.6} | scale_decay={:.6} | opacity_reset_interval={} | opacity_reset_mode={} | prune_mode={} | prune_opacity_threshold={:.6} | prune_visibility_dry_run={} | prune_visibility_threshold={:.3} | prune_high_opacity_threshold={:.3} | prune_until_epoch={:?} | target_primitives={} | lr_decay_iterations={:?} | lr_position_scene_scale={} | lr_final(scale={:.6}, rot={:.6}, opacity={:.6}, color={:.6}, color_rest={:.6}) | raster_cov_blur={:.3} | raster_cov_blur_final={:?} | raster_cov_blur_final_after_epoch={:?} | loss_weights(l1={:.3}, ssim={:.3}, gradient={:.3}, robust_delta={:.3}, outlier_threshold={:.3}, outlier_weight={:.3}, dynamic_mask_low={:.3}, dynamic_mask_high={:.3}, dynamic_mask_min_weight={:.3}, dynamic_mask_start_epoch={:?})",
         config.litegs.features.training_profile,
         config.litegs.rendering.sh_degree,
+        config.initialization.point_scale_factor,
+        config.initialization.point_opacity,
+        config.initialization.vksplat_scale_estimator,
+        config.initialization.randomize_rotations,
+        config.initialization.rotation_seed,
         config.litegs.rendering.tile_size,
         config.litegs.features.sparse_grad,
         config.litegs.features.reg_weight,
@@ -1660,10 +1730,12 @@ fn log_litegs_training_config(config: &rustgs::TrainingConfig) {
         config.litegs.pruning.prune_until_epoch,
         config.litegs.topology.target_primitives,
         config.optimizer.lr_decay_iterations,
+        config.optimizer.lr_position_scene_scale,
         config.optimizer.lr_scale_final,
         config.optimizer.lr_rotation_final,
         config.optimizer.lr_opacity_final,
         config.optimizer.lr_color_final,
+        config.optimizer.lr_color_rest_final,
         config.raster.raster_cov_blur,
         config.raster.raster_cov_blur_final,
         config.raster.raster_cov_blur_final.and_then(|_| {
@@ -1712,7 +1784,8 @@ pub(super) fn maybe_write_litegs_parity_report(
     splats: &rustgs::HostSplats,
     config: &rustgs::TrainingConfig,
     training_telemetry: Option<&rustgs::LiteGsTrainingTelemetry>,
-    training_elapsed: Duration,
+    training_loop_elapsed: Duration,
+    total_training_elapsed: Duration,
     evaluation_summary: Option<&rustgs::SplatEvaluationSummary>,
 ) -> anyhow::Result<()> {
     maybe_write_litegs_parity_report_with_manifest_dir(
@@ -1722,7 +1795,8 @@ pub(super) fn maybe_write_litegs_parity_report(
         splats,
         config,
         training_telemetry,
-        training_elapsed,
+        training_loop_elapsed,
+        total_training_elapsed,
         evaluation_summary,
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
@@ -1735,7 +1809,8 @@ pub(super) fn maybe_write_litegs_parity_report_with_manifest_dir(
     splats: &rustgs::HostSplats,
     config: &rustgs::TrainingConfig,
     training_telemetry: Option<&rustgs::LiteGsTrainingTelemetry>,
-    training_elapsed: Duration,
+    training_loop_elapsed: Duration,
+    total_training_elapsed: Duration,
     evaluation_summary: Option<&rustgs::SplatEvaluationSummary>,
     manifest_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -1783,11 +1858,18 @@ pub(super) fn maybe_write_litegs_parity_report_with_manifest_dir(
     report.metrics.had_nan = splats_have_non_finite(splats);
     report.metrics.had_oom = false;
 
-    report.timing.training_ms = Some(training_elapsed.as_millis() as u64);
-    report.timing.total_wall_clock_ms = Some(training_elapsed.as_millis() as u64);
+    report.timing.training_ms = Some(training_loop_elapsed.as_millis() as u64);
+    report.timing.total_wall_clock_ms = Some(total_training_elapsed.as_millis() as u64);
+    report.timing.setup_ms = total_training_elapsed
+        .checked_sub(training_loop_elapsed)
+        .map(|elapsed| elapsed.as_millis() as u64);
 
     report.notes.push(
         "LiteGsMacV1 now evaluates the active SH degree for view-dependent color during wgpu training and can apply rotation-aware projection gradients when rotation learning is enabled."
+            .to_string(),
+    );
+    report.notes.push(
+        "Timing training_ms records only the wgpu training loop; total_wall_clock_ms also includes RustGS initialization, upload, and final readback."
             .to_string(),
     );
     if training_telemetry.is_none() {

@@ -36,9 +36,11 @@ pub(crate) struct ProjectUniforms {
     pub pixel_center: [f32; 2],
     pub camera_position: [f32; 4],
     pub sh_degree: u32,
+    pub storage_sh_degree: u32,
     pub total_splats: u32,
     pub num_visible: u32,
     pub cov_blur: f32,
+    pub _pad: [u32; 3],
 }
 
 impl ProjectUniforms {
@@ -47,10 +49,12 @@ impl ProjectUniforms {
         img_size: (u32, u32),
         tile_bounds: (u32, u32),
         sh_degree: u32,
+        storage_sh_degree: u32,
         total_splats: u32,
         num_visible: u32,
         cov_blur: f32,
     ) -> Self {
+        let sh_degree = sh_degree.min(storage_sh_degree);
         let camera_position = camera.position();
         Self {
             viewmat: camera.view_matrix().to_cols_array_2d(),
@@ -60,9 +64,11 @@ impl ProjectUniforms {
             pixel_center: [camera.intrinsics.cx, camera.intrinsics.cy],
             camera_position: [camera_position.x, camera_position.y, camera_position.z, 0.0],
             sh_degree,
+            storage_sh_degree,
             total_splats,
             num_visible,
             cov_blur: cov_blur.max(0.0),
+            _pad: [0; 3],
         }
     }
 }
@@ -175,7 +181,38 @@ where
         + PrefixSumBackend
         + RadixSortBackend,
 {
-    let proj_out = project_forward(splats, camera, img_size, device, cov_blur);
+    render_forward_with_active_sh(
+        splats,
+        splats.sh_degree,
+        camera,
+        img_size,
+        background,
+        device,
+        cov_blur,
+    )
+    .await
+}
+
+pub(crate) async fn render_forward_with_active_sh<B>(
+    splats: &DeviceSplats<B>,
+    active_sh_degree: u32,
+    camera: &GaussianCamera,
+    img_size: (u32, u32),
+    background: [f32; 3],
+    device: &B::Device,
+    cov_blur: f32,
+) -> RenderOutput<B>
+where
+    B: projection::ProjectionBackend
+        + sorting::SortingBackend
+        + project_visible::ProjectVisibleBackend
+        + tile_mapping::TileMappingBackend
+        + rasterize::RasterizeBackend
+        + PrefixSumBackend
+        + RadixSortBackend,
+{
+    let active_sh_degree = active_sh_degree.min(splats.sh_degree);
+    let proj_out = project_forward(splats, active_sh_degree, camera, img_size, device, cov_blur);
     let projection::ProjectForwardOutput {
         global_from_presort_gid,
         depths,
@@ -224,6 +261,7 @@ where
 
     let projected_splats = project_visible(
         splats,
+        active_sh_degree,
         &global_from_compact_gid,
         counts.visible,
         camera,

@@ -13,7 +13,7 @@ pub(crate) fn build_initial_splats(
     }
 
     let sh_degree = config.litegs.rendering.sh_degree;
-    let init_config = gaussian_init_config_for_training();
+    let init_config = gaussian_init_config_for_training(config);
     let splats = initialize_host_splats_from_points(&dataset.initial_points, &init_config, sh_degree)?;
 
     splats
@@ -22,6 +22,13 @@ pub(crate) fn build_initial_splats(
     Ok(splats)
 }
 
-pub(super) fn gaussian_init_config_for_training() -> GaussianInitConfig {
-    GaussianInitConfig::default()
+pub(super) fn gaussian_init_config_for_training(config: &TrainingConfig) -> GaussianInitConfig {
+    GaussianInitConfig {
+        scale_factor: config.initialization.point_scale_factor,
+        opacity: config.initialization.point_opacity,
+        vksplat_scale_estimator: config.initialization.vksplat_scale_estimator,
+        randomize_rotations: config.initialization.randomize_rotations,
+        rotation_seed: config.initialization.rotation_seed,
+        ..GaussianInitConfig::default()
+    }
 }

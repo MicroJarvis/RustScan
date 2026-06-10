@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
+use glam::{Mat3, Mat4, Vec3, Vec4};
+
 use crate::{Intrinsics, ScenePose, TrainingDataset, TrainingError, SE3};
 
 /// Configuration for loading a COLMAP dataset.
@@ -20,6 +22,8 @@ pub struct ColmapConfig {
     pub frame_stride: usize,
     /// Depth scale for converting depth values to meters.
     pub depth_scale: f32,
+    /// Apply VkSplat/Nerfstudio-style camera and point-cloud normalization.
+    pub normalize_world_space: bool,
 }
 
 impl Default for ColmapConfig {
@@ -28,6 +32,7 @@ impl Default for ColmapConfig {
             max_frames: 0,
             frame_stride: 1,
             depth_scale: 1.0,
+            normalize_world_space: false,
         }
     }
 }
@@ -235,13 +240,22 @@ pub fn load_colmap_dataset(
             ))
         })?;
 
+    let mut poses: Vec<SE3> = images.iter().map(scene_pose_from_colmap_image).collect();
+    let mut point_positions: Vec<Vec3> = points
+        .iter()
+        .map(|point| Vec3::new(point.x as f32, point.y as f32, point.z as f32))
+        .collect();
+
+    if config.normalize_world_space {
+        normalize_world_space(&mut poses, &mut point_positions);
+    }
+
     // Build dataset
     let mut dataset = TrainingDataset::new(intrinsics).with_depth_scale(config.depth_scale);
-
     // Add initial points from COLMAP sparse reconstruction
-    for point in &points {
+    for (point, position) in points.iter().zip(point_positions.iter()) {
         dataset.add_point(
-            [point.x as f32, point.y as f32, point.z as f32],
+            [position.x, position.y, position.z],
             Some([
                 point.r as f32 / 255.0,
                 point.g as f32 / 255.0,
@@ -261,8 +275,9 @@ pub fn load_colmap_dataset(
     let mut missing_image_examples = Vec::new();
 
     // Add poses
-    for (frame_idx, image) in images
-        .into_iter()
+    for (frame_idx, (image, pose)) in images
+        .iter()
+        .zip(poses.iter())
         .take(considered)
         .step_by(stride)
         .enumerate()
@@ -276,12 +291,7 @@ pub fn load_colmap_dataset(
             continue;
         }
 
-        // COLMAP stores world-to-camera extrinsics:
-        //   X_cam = R * X_world + t
-        // ScenePose expects camera-to-world, so invert here.
-        let pose = scene_pose_from_colmap_image(&image);
-
-        let scene_pose = ScenePose::new(frame_idx as u64, image_path, pose, image.image_id as f64);
+        let scene_pose = ScenePose::new(frame_idx as u64, image_path, *pose, image.image_id as f64);
         dataset.add_pose(scene_pose);
     }
 
@@ -356,6 +366,298 @@ fn scene_pose_from_colmap_image(image: &ColmapImage) -> SE3 {
         &[image.tx as f32, image.ty as f32, image.tz as f32],
     );
     world_to_camera.inverse()
+}
+
+fn normalize_world_space(poses: &mut [SE3], points: &mut [Vec3]) {
+    if poses.is_empty() || points.is_empty() {
+        return;
+    }
+
+    let t1 = similarity_from_cameras(poses);
+    transform_poses(t1, poses);
+    transform_points(t1, points);
+
+    let t2 = align_principal_axes(points);
+    transform_poses(t2, poses);
+    transform_points(t2, points);
+
+    let z_median = median(points.iter().map(|point| point.z).collect());
+    let z_mean = points.iter().map(|point| point.z).sum::<f32>() / points.len() as f32;
+    if z_median > z_mean {
+        let flip = Mat4::from_cols(
+            Vec4::new(1.0, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, -1.0, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, -1.0, 0.0),
+            Vec4::new(0.0, 0.0, 0.0, 1.0),
+        );
+        transform_poses(flip, poses);
+        transform_points(flip, points);
+    }
+}
+
+fn transform_poses(transform: Mat4, poses: &mut [SE3]) {
+    for pose in poses {
+        let transformed = transform * se3_to_mat4(*pose);
+        let scale = transformed.x_axis.truncate().length();
+        let inv_scale = if scale > 1e-12 { scale.recip() } else { 1.0 };
+        let rotation = Mat3::from_cols(
+            transformed.x_axis.truncate() * inv_scale,
+            transformed.y_axis.truncate() * inv_scale,
+            transformed.z_axis.truncate() * inv_scale,
+        );
+        let translation = transformed.w_axis.truncate();
+        *pose = SE3::from_quat_translation(glam::Quat::from_mat3(&rotation), translation);
+    }
+}
+
+fn transform_points(transform: Mat4, points: &mut [Vec3]) {
+    let linear = Mat3::from_cols(
+        transform.x_axis.truncate(),
+        transform.y_axis.truncate(),
+        transform.z_axis.truncate(),
+    );
+    let translation = transform.w_axis.truncate();
+    for point in points {
+        *point = linear * *point + translation;
+    }
+}
+
+fn se3_to_mat4(pose: SE3) -> Mat4 {
+    Mat4::from_rotation_translation(pose.quat(), pose.vec())
+}
+
+fn similarity_from_cameras(poses: &[SE3]) -> Mat4 {
+    let mut positions = Vec::with_capacity(poses.len());
+    let mut ups = Vec::with_capacity(poses.len());
+    let mut forwards = Vec::with_capacity(poses.len());
+
+    for pose in poses {
+        let rotation = Mat3::from_quat(pose.quat());
+        positions.push(pose.vec());
+        ups.push(rotation * Vec3::new(0.0, -1.0, 0.0));
+        forwards.push(rotation * Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    let mut world_up = Vec3::ZERO;
+    for up in &ups {
+        world_up += *up;
+    }
+    world_up /= ups.len() as f32;
+    world_up = world_up
+        .try_normalize()
+        .unwrap_or(Vec3::new(0.0, -1.0, 0.0));
+
+    let up_camspace = Vec3::new(0.0, -1.0, 0.0);
+    let c = up_camspace.dot(world_up);
+    let cross = world_up.cross(up_camspace);
+    let align = if c > -1.0 {
+        let skew = Mat3::from_cols(
+            Vec3::new(0.0, -cross.z, cross.y),
+            Vec3::new(cross.z, 0.0, -cross.x),
+            Vec3::new(-cross.y, cross.x, 0.0),
+        );
+        Mat3::IDENTITY + skew + (skew * skew) * (1.0 / (1.0 + c))
+    } else {
+        Mat3::from_cols(
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        )
+    };
+
+    for position in &mut positions {
+        *position = align * *position;
+    }
+    for forward in &mut forwards {
+        *forward = align * *forward;
+    }
+
+    let nearest_points: Vec<Vec3> = positions
+        .iter()
+        .zip(forwards.iter())
+        .map(|(position, forward)| *position + (-*position).dot(*forward) * *forward)
+        .collect();
+    let translate = -median_vec3(&nearest_points);
+
+    let distances: Vec<f32> = positions
+        .iter()
+        .map(|position| (*position + translate).length())
+        .collect();
+    let median_distance = median(distances);
+    let scale = if median_distance > 1e-12 {
+        median_distance.recip()
+    } else {
+        1.0
+    };
+
+    Mat4::from_cols(
+        (align.x_axis * scale).extend(0.0),
+        (align.y_axis * scale).extend(0.0),
+        (align.z_axis * scale).extend(0.0),
+        (translate * scale).extend(1.0),
+    )
+}
+
+fn align_principal_axes(points: &[Vec3]) -> Mat4 {
+    if points.is_empty() {
+        return Mat4::IDENTITY;
+    }
+
+    let centroid = median_vec3(points);
+    let mut covariance = [[0.0_f64; 3]; 3];
+    let mut mean = [0.0_f64; 3];
+
+    for point in points {
+        let translated = [
+            (point.x - centroid.x) as f64,
+            (point.y - centroid.y) as f64,
+            (point.z - centroid.z) as f64,
+        ];
+        for i in 0..3 {
+            mean[i] += translated[i];
+            for j in 0..3 {
+                covariance[i][j] += translated[i] * translated[j];
+            }
+        }
+    }
+
+    let denom = points.len().saturating_sub(1).max(1) as f64;
+    for i in 0..3 {
+        mean[i] /= points.len() as f64;
+        for j in 0..3 {
+            covariance[i][j] /= denom;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            covariance[i][j] -= mean[i] * mean[j];
+        }
+    }
+
+    let (eigenvectors, eigenvalues) = jacobi_eigen_3x3(covariance);
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&lhs, &rhs| {
+        eigenvalues[rhs]
+            .partial_cmp(&eigenvalues[lhs])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut eigen_cols = [
+        vec3_from_f64_col(eigenvectors, order[0]),
+        vec3_from_f64_col(eigenvectors, order[1]),
+        vec3_from_f64_col(eigenvectors, order[2]),
+    ];
+    if eigen_cols[0].cross(eigen_cols[1]).dot(eigen_cols[2]) < 0.0 {
+        eigen_cols[0] = -eigen_cols[0];
+    }
+
+    let eigen = Mat3::from_cols(eigen_cols[0], eigen_cols[1], eigen_cols[2]);
+    let rotation = eigen.transpose();
+    let translation = -(rotation * centroid);
+    Mat4::from_cols(
+        rotation.x_axis.extend(0.0),
+        rotation.y_axis.extend(0.0),
+        rotation.z_axis.extend(0.0),
+        translation.extend(1.0),
+    )
+}
+
+fn jacobi_eigen_3x3(mut a: [[f64; 3]; 3]) -> ([[f64; 3]; 3], [f32; 3]) {
+    let mut eigenvectors = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        eigenvectors[i][i] = 1.0;
+    }
+
+    for _ in 0..12 {
+        let mut p = 0usize;
+        let mut q = 1usize;
+        let mut max_off_diag = a[0][1].abs();
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                let value = a[i][j].abs();
+                if value > max_off_diag {
+                    max_off_diag = value;
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if max_off_diag < 1e-8 {
+            break;
+        }
+
+        let theta = 0.5 * (2.0 * a[p][q]).atan2(a[q][q] - a[p][p]);
+        let c = theta.cos();
+        let s = theta.sin();
+
+        let mut g = [[0.0_f64; 3]; 3];
+        for i in 0..3 {
+            g[i][i] = 1.0;
+        }
+        g[p][p] = c;
+        g[p][q] = -s;
+        g[q][p] = s;
+        g[q][q] = c;
+
+        a = mat3_mul(mat3_mul(mat3_transpose(g), a), g);
+        eigenvectors = mat3_mul(eigenvectors, g);
+    }
+
+    (
+        eigenvectors,
+        [a[0][0] as f32, a[1][1] as f32, a[2][2] as f32],
+    )
+}
+
+fn vec3_from_f64_col(matrix: [[f64; 3]; 3], col: usize) -> Vec3 {
+    Vec3::new(
+        matrix[0][col] as f32,
+        matrix[1][col] as f32,
+        matrix[2][col] as f32,
+    )
+    .normalize_or_zero()
+}
+
+fn mat3_transpose(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    [
+        [matrix[0][0], matrix[1][0], matrix[2][0]],
+        [matrix[0][1], matrix[1][1], matrix[2][1]],
+        [matrix[0][2], matrix[1][2], matrix[2][2]],
+    ]
+}
+
+fn mat3_mul(lhs: [[f64; 3]; 3], rhs: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = lhs[i][0] * rhs[0][j] + lhs[i][1] * rhs[1][j] + lhs[i][2] * rhs[2][j];
+        }
+    }
+    out
+}
+
+fn median_vec3(values: &[Vec3]) -> Vec3 {
+    if values.is_empty() {
+        return Vec3::ZERO;
+    }
+    Vec3::new(
+        median(values.iter().map(|value| value.x).collect()),
+        median(values.iter().map(|value| value.y).collect()),
+        median(values.iter().map(|value| value.z).collect()),
+    )
+}
+
+fn median(mut values: Vec<f32>) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    if n.is_multiple_of(2) {
+        (values[n / 2 - 1] + values[n / 2]) * 0.5
+    } else {
+        values[n / 2]
+    }
 }
 
 fn resolve_image_dir(sparse_dir: &Path) -> Result<PathBuf, TrainingError> {

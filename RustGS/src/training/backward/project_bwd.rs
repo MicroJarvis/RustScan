@@ -81,7 +81,7 @@ where
         let client = params.client.clone();
 
         let num_splats = params.shape()[0];
-        let num_coeffs = sh_coeff_count_for_degree(uniforms.sh_degree as usize);
+        let num_coeffs = sh_coeff_count_for_degree(uniforms.storage_sh_degree as usize);
 
         let v_params = Tensor::<Self, 2>::zeros([num_splats, 11], &device);
         let v_sh_coeffs = Tensor::<Self, 3>::zeros([num_splats, num_coeffs, 3], &device);
@@ -128,6 +128,7 @@ where
 
 pub(crate) fn project_bwd<B: ProjectBwdBackend>(
     splats: &DeviceSplats<B>,
+    active_sh_degree: u32,
     global_from_compact_gid: Tensor<B, 1, Int>,
     v_splats: Tensor<B, 2>,
     screen_grad_splats: Tensor<B, 2>,
@@ -141,6 +142,7 @@ pub(crate) fn project_bwd<B: ProjectBwdBackend>(
         camera,
         img_size,
         calc_tile_bounds(img_size),
+        active_sh_degree,
         splats.sh_degree,
         splats.num_splats() as u32,
         num_visible as u32,

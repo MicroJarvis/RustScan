@@ -106,10 +106,7 @@ fn main(
             }
 
             let next_T = pix_out.a * (1.0f - alpha);
-            if next_T <= 1e-4f {
-                done = true;
-                continue;
-            }
+            let stop_after_current = next_T < 1e-4f;
 
             let vis = alpha * pix_out.a;
             let v_rgb = select(vec3<f32>(0.0), vis * v_out.rgb, color.rgb >= vec3<f32>(0.0));
@@ -162,6 +159,9 @@ fn main(
             write_screen_grad_atomic(screen_base + 4u, 1.0);
 
             pix_out.a = next_T;
+            if stop_after_current {
+                done = true;
+            }
         }
 
         workgroupBarrier();

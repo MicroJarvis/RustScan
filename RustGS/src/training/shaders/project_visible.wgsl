@@ -167,8 +167,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let dir = mean - uniforms.camera_position.xyz;
     let viewdir = dir * inverseSqrt(max(dot(dir, dir), 1e-12));
-    let num_coeffs = helpers::num_sh_coeffs(uniforms.sh_degree);
-    var coeff_base = global_gid * num_coeffs * 3u;
+    let num_storage_coeffs = helpers::num_sh_coeffs(uniforms.storage_sh_degree);
+    var coeff_base = global_gid * num_storage_coeffs * 3u;
 
     var sh = ShCoeffs();
     sh.b0_c0 = read_coeff(&coeff_base);

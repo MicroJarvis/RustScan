@@ -510,6 +510,12 @@ pub struct TrainingOptimizerConfig {
     /// Number of iterations used for exponential learning-rate decay.
     /// Defaults to total iterations when unset.
     pub lr_decay_iterations: Option<usize>,
+    /// Scale the position learning-rate by the camera-scene radius.
+    ///
+    /// This follows vksplat/gsplat conventions and keeps world-space updates
+    /// comparable across differently scaled COLMAP reconstructions.
+    #[serde(default)]
+    pub lr_position_scene_scale: bool,
     /// Learning rate for scales
     pub lr_scale: f32,
     /// Scale learning-rate final value. Set to 0 to keep lr_scale constant.
@@ -524,8 +530,14 @@ pub struct TrainingOptimizerConfig {
     pub lr_opacity_final: f32,
     /// Learning rate for colors
     pub lr_color: f32,
+    /// Learning rate for non-DC spherical harmonic color coefficients.
+    #[serde(default = "default_lr_color_rest")]
+    pub lr_color_rest: f32,
     /// Color learning-rate final value. Set to 0 to keep lr_color constant.
     pub lr_color_final: f32,
+    /// Non-DC SH learning-rate final value. Set to 0 to keep lr_color_rest constant.
+    #[serde(default)]
+    pub lr_color_rest_final: f32,
 }
 
 impl Default for TrainingOptimizerConfig {
@@ -534,6 +546,7 @@ impl Default for TrainingOptimizerConfig {
             lr_position: 0.00016,
             lr_pos_final: 0.0000016,
             lr_decay_iterations: None,
+            lr_position_scene_scale: false,
             lr_scale: 0.005,
             lr_scale_final: 0.0,
             lr_rotation: 0.001,
@@ -541,7 +554,9 @@ impl Default for TrainingOptimizerConfig {
             lr_opacity: 0.05,
             lr_opacity_final: 0.0,
             lr_color: 0.0025,
+            lr_color_rest: 0.0025 / 20.0,
             lr_color_final: 0.0,
+            lr_color_rest_final: 0.0,
         }
     }
 }
@@ -560,8 +575,19 @@ impl TrainingOptimizerConfig {
         validate_lr("lr_opacity", self.lr_opacity, true, invalid);
         validate_lr("lr_opacity_final", self.lr_opacity_final, false, invalid);
         validate_lr("lr_color", self.lr_color, true, invalid);
+        validate_lr("lr_color_rest", self.lr_color_rest, true, invalid);
         validate_lr("lr_color_final", self.lr_color_final, false, invalid);
+        validate_lr(
+            "lr_color_rest_final",
+            self.lr_color_rest_final,
+            false,
+            invalid,
+        );
     }
+}
+
+fn default_lr_color_rest() -> f32 {
+    0.0025 / 20.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -674,6 +700,16 @@ pub struct TrainingInitializationConfig {
     /// Disabled by default for RGB-only datasets because pseudo-depth targets
     /// can destabilize geometric optimization.
     pub use_synthetic_depth: bool,
+    /// Scale factor applied to sparse-point nearest-neighbor distances.
+    pub point_scale_factor: f32,
+    /// Initial sparse-point opacity in probability space.
+    pub point_opacity: f32,
+    /// Use VkSplat/Nerfstudio sparse-point scale estimation.
+    pub vksplat_scale_estimator: bool,
+    /// Use deterministic random unit quaternions for sparse-point rotations.
+    pub randomize_rotations: bool,
+    /// Seed used when randomizing sparse-point rotations.
+    pub rotation_seed: u64,
 }
 
 impl Default for TrainingInitializationConfig {
@@ -684,6 +720,11 @@ impl Default for TrainingInitializationConfig {
             min_depth: 0.01,
             max_depth: 10.0,
             use_synthetic_depth: false,
+            point_scale_factor: 0.5,
+            point_opacity: 0.5,
+            vksplat_scale_estimator: false,
+            randomize_rotations: false,
+            rotation_seed: 42,
         }
     }
 }
@@ -699,6 +740,10 @@ impl TrainingInitializationConfig {
         if !self.max_depth.is_finite() || self.max_depth <= self.min_depth {
             invalid.push("max_depth must be finite and greater than min_depth".to_string());
         }
+        if !self.point_scale_factor.is_finite() || self.point_scale_factor <= 0.0 {
+            invalid.push("point_scale_factor must be finite and > 0".to_string());
+        }
+        validate_unit_interval("point_opacity", self.point_opacity, invalid);
     }
 }
 

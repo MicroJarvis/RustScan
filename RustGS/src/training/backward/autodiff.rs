@@ -58,6 +58,7 @@ pub(crate) struct RenderCheckpoint<B: Backend> {
     pub sh_coeffs: Tensor<B, 3>,
     pub raw_opacities: Tensor<B, 1>,
     pub sh_degree: u32,
+    pub active_sh_degree: u32,
     pub camera: GaussianCamera,
     pub img_size: (u32, u32),
     pub background: [f32; 3],
@@ -116,6 +117,7 @@ impl<B: RenderBackend> Backward<B, 4> for RenderBackward {
         );
         let bwd = project_bwd::<B>(
             &splats,
+            state.active_sh_degree,
             state.global_from_compact_gid,
             raster_bwd.v_splats,
             raster_bwd.screen_grad_splats,
@@ -143,6 +145,7 @@ impl<B: RenderBackend> Backward<B, 4> for RenderBackward {
 
 async fn render_splats_impl<B, C>(
     splats: &DeviceSplats<Autodiff<B, C>>,
+    active_sh_degree: u32,
     camera: &GaussianCamera,
     img_size: (u32, u32),
     background: [f32; 3],
@@ -179,8 +182,10 @@ where
     };
 
     let device = inner_splats.transforms.val().device();
-    let fwd_out = forward::render_forward::<B>(
+    let active_sh_degree = active_sh_degree.min(splats.sh_degree);
+    let fwd_out = forward::render_forward_with_active_sh::<B>(
         &inner_splats,
+        active_sh_degree,
         camera,
         img_size,
         background,
@@ -209,6 +214,7 @@ where
                 sh_coeffs: Tensor::from_primitive(TensorPrimitive::Float(sh_coeffs_inner)),
                 raw_opacities: Tensor::from_primitive(TensorPrimitive::Float(raw_opacities_inner)),
                 sh_degree: splats.sh_degree,
+                active_sh_degree,
                 camera: camera.clone(),
                 img_size,
                 background,
@@ -237,15 +243,21 @@ where
     }
 }
 
-pub(crate) async fn render_splats_with_visibility(
+pub(crate) async fn render_splats_with_visibility_active_sh(
     splats: &DeviceSplats<GsDiffBackend>,
+    active_sh_degree: u32,
     camera: &GaussianCamera,
     img_size: (u32, u32),
     background: [f32; 3],
     cov_blur: f32,
 ) -> RenderSplatsOutput<GsDiffBackend> {
     render_splats_impl::<GsBackendBase, NoCheckpointing>(
-        splats, camera, img_size, background, cov_blur,
+        splats,
+        active_sh_degree,
+        camera,
+        img_size,
+        background,
+        cov_blur,
     )
     .await
 }

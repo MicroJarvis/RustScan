@@ -55,11 +55,17 @@ pub fn ssim_loss_with_kernel<B: Backend>(
         * (sigma_x_sq + sigma_y_sq + c2).clamp_min(1e-8_f32);
     let ssim_map = numerator / denominator;
 
-    ssim_map
-        .mean()
-        .mul_scalar(-1.0)
-        .add_scalar(1.0)
-        .reshape([1])
+    let [_batch, _channels, height, width] = ssim_map.dims();
+    let halo = config.window_size / 2;
+    let ssim_mean = if height > halo * 2 && width > halo * 2 {
+        ssim_map
+            .slice(s![.., .., halo..height - halo, halo..width - halo])
+            .mean()
+    } else {
+        ssim_map.mean()
+    };
+
+    ssim_mean.mul_scalar(-1.0).add_scalar(1.0).reshape([1])
 }
 
 pub fn combined_loss_with_kernel<B: Backend>(
@@ -87,11 +93,17 @@ pub fn combined_loss_with_kernel<B: Backend>(
         dynamic_mask_threshold_high as f32,
         dynamic_mask_min_weight as f32,
     );
-    let gradient = gradient_difference_loss(pred.clone(), target.clone());
-    let ssim = ssim_loss_with_kernel(to_nchw(pred), to_nchw(target), ssim_kernel, ssim_config);
-    l1.mul_scalar(l1_weight as f32)
-        + ssim.mul_scalar(ssim_weight as f32)
-        + gradient.mul_scalar(gradient_weight as f32)
+    let gradient = if gradient_weight > 0.0 {
+        gradient_difference_loss(pred.clone(), target.clone())
+    } else {
+        l1.clone().mul_scalar(0.0)
+    };
+    let mut total = l1.mul_scalar(l1_weight as f32) + gradient.mul_scalar(gradient_weight as f32);
+    if ssim_weight > 0.0 {
+        let ssim = ssim_loss_with_kernel(to_nchw(pred), to_nchw(target), ssim_kernel, ssim_config);
+        total = total + ssim.mul_scalar(ssim_weight as f32);
+    }
+    total
 }
 
 fn reconstruction_residual_loss<B: Backend>(
@@ -211,7 +223,7 @@ fn separable_blur<B: Backend>(tensor: Tensor<B, 4>, kernel: Tensor<B, 1>) -> Ten
         .reshape([1, 1, 1, kernel_size])
         .repeat_dim(0, channels);
     let horizontal = conv2d(
-        tensor.pad([(0, 0), (pad, pad)], PadMode::Edge),
+        tensor.pad([(0, 0), (pad, pad)], PadMode::Constant(0.0)),
         horizontal_kernel,
         None,
         ConvOptions::new([1, 1], [0, 0], [1, 1], channels),
@@ -221,7 +233,7 @@ fn separable_blur<B: Backend>(tensor: Tensor<B, 4>, kernel: Tensor<B, 1>) -> Ten
         .repeat_dim(0, channels);
 
     conv2d(
-        horizontal.pad([(pad, pad), (0, 0)], PadMode::Edge),
+        horizontal.pad([(pad, pad), (0, 0)], PadMode::Constant(0.0)),
         vertical_kernel,
         None,
         ConvOptions::new([1, 1], [0, 0], [1, 1], channels),

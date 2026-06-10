@@ -113,6 +113,7 @@ where
 
 pub(crate) fn project_forward<B: ProjectionBackend>(
     splats: &DeviceSplats<B>,
+    active_sh_degree: u32,
     camera: &GaussianCamera,
     img_size: (u32, u32),
     _device: &B::Device,
@@ -123,6 +124,7 @@ pub(crate) fn project_forward<B: ProjectionBackend>(
         camera,
         img_size,
         tile_bounds,
+        active_sh_degree,
         splats.sh_degree,
         splats.num_splats() as u32,
         splats.num_splats() as u32,

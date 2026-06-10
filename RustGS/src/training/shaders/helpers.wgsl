@@ -12,6 +12,7 @@ struct ProjectUniforms {
     pixel_center: vec2<f32>,
     camera_position: vec4<f32>,
     sh_degree: u32,
+    storage_sh_degree: u32,
     total_splats: u32,
     num_visible: u32,
     cov_blur: f32,

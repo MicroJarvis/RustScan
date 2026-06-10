@@ -184,6 +184,7 @@ impl<'a> TrainingOptions<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrainingRunReport {
     pub elapsed: Duration,
+    pub training_loop_elapsed: Duration,
     pub final_loss: Option<f32>,
     pub final_step_loss: Option<f32>,
     pub gaussian_count: usize,

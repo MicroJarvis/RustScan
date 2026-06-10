@@ -1,11 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use burn::prelude::*;
 use burn::tensor::{s, AllocationProperty, Bytes as BurnBytes, DType, Shape, TensorData};
 use bytes::Bytes as SharedBytes;
-use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::core::GaussianCamera;
 use crate::core::HostSplats;
@@ -23,6 +24,7 @@ use super::backend::{GsBackendBase, GsDevice, GsDiffBackend};
 use super::loss::{combined_loss_with_kernel, gaussian_kernel_1d, SsimConfig};
 use super::optimizer::{AdamScaled, AdamScaledConfig};
 use super::splats::{device_splats_to_host, DeviceSplats};
+use super::topology_accum::{accumulate_topology_stats, TopologyAccumulatorSet};
 
 #[derive(Debug, Clone, Default)]
 pub struct WgpuTrainingReport {
@@ -31,6 +33,7 @@ pub struct WgpuTrainingReport {
     pub final_gaussian_count: usize,
     pub completed_iterations: usize,
     pub cancelled: bool,
+    pub training_loop_elapsed: Duration,
     pub telemetry: LiteGsTrainingTelemetry,
 }
 
@@ -63,26 +66,39 @@ pub struct WgpuTrainer {
     config: TrainingConfig,
     optimizer: AdamScaled<GsBackendBase>,
     device: GsDevice,
-    grad_2d_accum: Tensor<GsDiffBackend, 1>,
-    screen_grad_2d_accum: Tensor<GsDiffBackend, 1>,
-    abs_grad_2d_accum: Tensor<GsDiffBackend, 1>,
-    abs_pixel_grad_2d_accum: Tensor<GsDiffBackend, 1>,
-    pixel_coverage_accum: Tensor<GsDiffBackend, 1>,
-    camera_depth_accum: Tensor<GsDiffBackend, 1>,
-    grad_color_accum: Tensor<GsDiffBackend, 1>,
-    num_observations: Tensor<GsDiffBackend, 1>,
-    visible_observations: Tensor<GsDiffBackend, 1>,
-    actual_visible_observations: Tensor<GsDiffBackend, 1>,
+    grad_2d_accum: Tensor<GsBackendBase, 1>,
+    screen_grad_2d_accum: Tensor<GsBackendBase, 1>,
+    abs_grad_2d_accum: Tensor<GsBackendBase, 1>,
+    abs_pixel_grad_2d_accum: Tensor<GsBackendBase, 1>,
+    pixel_coverage_accum: Tensor<GsBackendBase, 1>,
+    camera_depth_accum: Tensor<GsBackendBase, 1>,
+    grad_color_accum: Tensor<GsBackendBase, 1>,
+    num_observations: Tensor<GsBackendBase, 1>,
+    visible_observations: Tensor<GsBackendBase, 1>,
+    actual_visible_observations: Tensor<GsBackendBase, 1>,
     splat_birth_iterations: Vec<usize>,
     splat_invisible_windows: Vec<usize>,
     ssim_config: SsimConfig,
     ssim_kernel: Tensor<GsDiffBackend, 1>,
     telemetry: LiteGsTrainingTelemetry,
+    position_lr_scene_scale: f32,
+    optimizer_lr_state: Option<OptimizerLrState>,
 }
 
 #[derive(Clone)]
 struct SharedTargetImageBytes {
     data: Arc<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OptimizerLrState {
+    sh_coeffs: usize,
+    pos_lr: f32,
+    rotation_lr: f32,
+    scale_lr: f32,
+    opacity_lr: f32,
+    color_lr: f32,
+    color_rest_lr: f32,
 }
 
 impl AsRef<[u8]> for SharedTargetImageBytes {
@@ -106,23 +122,38 @@ fn target_image_tensor_data(
     )
 }
 
+pub(crate) fn target_image_tensor(
+    target_image: &Arc<Vec<f32>>,
+    image_dims: (usize, usize),
+    device: &GsDevice,
+) -> Tensor<GsDiffBackend, 3> {
+    Tensor::<GsDiffBackend, 3>::from_data(
+        target_image_tensor_data(target_image, image_dims),
+        device,
+    )
+}
+
 impl WgpuTrainer {
     pub fn new(
         config: TrainingConfig,
         device: GsDevice,
         initial_splats: usize,
         sh_coeffs: usize,
+        scene_scale: f32,
     ) -> Self {
         let mut optimizer = AdamScaled::<GsBackendBase>::new(AdamScaledConfig {
             lr: 1.0,
+            eps: 1e-15,
             ..AdamScaledConfig::default()
         });
+        let position_lr_scene_scale = effective_position_lr_scene_scale(&config, scene_scale);
+        let position_lr = config.optimizer.lr_position * position_lr_scene_scale;
 
         let transform_scales = Tensor::<GsBackendBase, 2>::from_data(
             TensorData::from([[
-                config.optimizer.lr_position,
-                config.optimizer.lr_position,
-                config.optimizer.lr_position,
+                position_lr,
+                position_lr,
+                position_lr,
                 config.optimizer.lr_rotation,
                 config.optimizer.lr_rotation,
                 config.optimizer.lr_rotation,
@@ -133,7 +164,11 @@ impl WgpuTrainer {
             ]]),
             &device,
         );
-        let sh_scale_values = vec![config.optimizer.lr_color; sh_coeffs.max(1)];
+        let sh_scale_values = sh_lr_values(
+            sh_coeffs,
+            config.optimizer.lr_color,
+            config.optimizer.lr_color_rest,
+        );
         let sh_scales = Tensor::<GsBackendBase, 3>::from_data(
             TensorData::new(sh_scale_values, [1, sh_coeffs.max(1), 1]),
             &device,
@@ -147,7 +182,8 @@ impl WgpuTrainer {
         let ssim_config = SsimConfig::default();
         let ssim_kernel = gaussian_kernel_1d::<GsDiffBackend>(&ssim_config, &device);
 
-        let telemetry = initial_training_telemetry(&config, initial_splats);
+        let telemetry =
+            initial_training_telemetry(&config, initial_splats, position_lr_scene_scale);
 
         Self {
             config,
@@ -168,6 +204,8 @@ impl WgpuTrainer {
             ssim_config,
             ssim_kernel,
             telemetry,
+            position_lr_scene_scale,
+            optimizer_lr_state: None,
         }
     }
 
@@ -191,7 +229,7 @@ impl WgpuTrainer {
             self.config.optimizer.lr_position,
             self.config.optimizer.lr_pos_final,
             iteration,
-        )
+        ) * self.position_lr_scene_scale
     }
 
     fn scale_lr_at(&self, iteration: usize) -> f32 {
@@ -226,10 +264,40 @@ impl WgpuTrainer {
         )
     }
 
+    fn color_rest_lr_at(&self, iteration: usize) -> f32 {
+        self.lr_at(
+            self.config.optimizer.lr_color_rest,
+            self.config.optimizer.lr_color_rest_final,
+            iteration,
+        )
+    }
+
+    fn active_sh_degree_at(&self, iteration: usize, storage_sh_degree: u32) -> u32 {
+        let scheduled = iteration.saturating_sub(1) / 1000;
+        (scheduled as u32).min(storage_sh_degree)
+    }
+
     fn update_optimizer_lrs(&mut self, iteration: usize, sh_coeffs: usize) {
         let pos_lr = self.position_lr_at(iteration);
         let rotation_lr = self.rotation_lr_at(iteration);
         let scale_lr = self.scale_lr_at(iteration);
+        let opacity_lr = self.opacity_lr_at(iteration);
+        let color_lr = self.color_lr_at(iteration);
+        let color_rest_lr = self.color_rest_lr_at(iteration);
+        let lr_state = OptimizerLrState {
+            sh_coeffs,
+            pos_lr,
+            rotation_lr,
+            scale_lr,
+            opacity_lr,
+            color_lr,
+            color_rest_lr,
+        };
+
+        if self.optimizer_lr_state == Some(lr_state) {
+            return;
+        }
+
         let transform_scales = Tensor::<GsBackendBase, 2>::from_data(
             TensorData::from([[
                 pos_lr,
@@ -245,44 +313,67 @@ impl WgpuTrainer {
             ]]),
             &self.device,
         );
-        let sh_scale_values = vec![self.color_lr_at(iteration); sh_coeffs.max(1)];
+        let sh_scale_values = sh_lr_values(sh_coeffs, color_lr, color_rest_lr);
         let sh_scales = Tensor::<GsBackendBase, 3>::from_data(
             TensorData::new(sh_scale_values, [1, sh_coeffs.max(1), 1]),
             &self.device,
         );
-        let opacity_scales =
-            Tensor::<GsBackendBase, 1>::from_floats([self.opacity_lr_at(iteration)], &self.device);
+        let opacity_scales = Tensor::<GsBackendBase, 1>::from_floats([opacity_lr], &self.device);
 
         self.optimizer.set_transform_scaling(transform_scales);
         self.optimizer.set_sh_scaling(sh_scales);
         self.optimizer.set_opacity_scaling(opacity_scales);
+        self.optimizer_lr_state = Some(lr_state);
+        self.telemetry.learning_rates.xyz = Some(pos_lr);
+        self.telemetry.learning_rates.sh_0 = Some(color_lr);
+        self.telemetry.learning_rates.sh_rest = Some(color_rest_lr);
+        self.telemetry.learning_rates.opacity = Some(opacity_lr);
+        self.telemetry.learning_rates.scale = Some(scale_lr);
+        self.telemetry.learning_rates.rot = Some(rotation_lr);
     }
 
     pub async fn train_step(
         &mut self,
         splats: &mut DeviceSplats<GsDiffBackend>,
         camera: &GaussianCamera,
-        target_image: &Arc<Vec<f32>>,
+        target_img: Tensor<GsDiffBackend, 3>,
         image_dims: (usize, usize),
         iteration: usize,
         frame_count: usize,
         read_loss_scalar: bool,
+        collect_topology_stats: bool,
     ) -> Option<f32> {
+        let profile_step = log::log_enabled!(log::Level::Debug)
+            && (iteration <= 3 || iteration.is_multiple_of(100));
+        let step_started_at = Instant::now();
         let (width, height) = image_dims;
         let background = [0.0, 0.0, 0.0];
-        let target_img = Tensor::<GsDiffBackend, 3>::from_data(
-            target_image_tensor_data(target_image, image_dims),
-            &self.device,
-        );
+        let target_ready_elapsed = step_started_at.elapsed();
 
-        let rendered = backward::render_splats_with_visibility(
+        let active_sh_degree = self.active_sh_degree_at(iteration, splats.sh_degree);
+        self.telemetry.active_sh_degree = Some(active_sh_degree as usize);
+        let rendered = backward::render_splats_with_visibility_active_sh(
             splats,
+            active_sh_degree,
             camera,
             (width as u32, height as u32),
             background,
             self.raster_cov_blur_at(iteration, frame_count),
         )
         .await;
+        let forward_elapsed = if profile_step {
+            let started = Instant::now();
+            let _ = rendered
+                .image
+                .clone()
+                .mean()
+                .into_scalar_async()
+                .await
+                .expect("render profile sync");
+            Some(started.elapsed())
+        } else {
+            None
+        };
         let pred_rgb = rendered.image.slice(s![.., .., 0..3]);
         let dynamic_mask = self.dynamic_loss_mask_at(iteration, frame_count);
         let loss = combined_loss_with_kernel(
@@ -300,7 +391,9 @@ impl WgpuTrainer {
             &self.ssim_config,
             self.ssim_kernel.clone(),
         );
-        let loss_value = if read_loss_scalar {
+        let read_loss_for_profile = profile_step && !read_loss_scalar;
+        let loss_sync_started_at = Instant::now();
+        let loss_value = if read_loss_scalar || read_loss_for_profile {
             let loss_value = loss.clone().into_scalar_async().await.expect("loss scalar");
             if !loss_value.is_finite() {
                 log::warn!(
@@ -312,6 +405,8 @@ impl WgpuTrainer {
         } else {
             None
         };
+        let loss_elapsed =
+            (read_loss_scalar || read_loss_for_profile).then(|| loss_sync_started_at.elapsed());
         let mut grads = loss.backward();
 
         let transforms_grad = splats
@@ -332,10 +427,24 @@ impl WgpuTrainer {
             .unwrap_or_else(|| {
                 Tensor::<GsBackendBase, 2>::zeros([splats.num_splats(), 7], &self.device)
             });
+        let backward_elapsed = if profile_step {
+            let started = Instant::now();
+            let _ = transforms_grad
+                .clone()
+                .abs()
+                .mean()
+                .into_scalar_async()
+                .await
+                .expect("backward profile sync");
+            Some(started.elapsed())
+        } else {
+            None
+        };
 
         // Brush keeps a strong gradient-validation path; mirror that observability here
         // so we can quickly spot silent no-op training regressions.
-        let should_log_diagnostics = iteration <= 3 || iteration.is_multiple_of(100);
+        let should_log_diagnostics = log::log_enabled!(log::Level::Debug)
+            && (iteration <= 3 || iteration.is_multiple_of(100));
         let grad_transforms_for_diag = if should_log_diagnostics {
             Some(transforms_grad.clone())
         } else {
@@ -371,16 +480,46 @@ impl WgpuTrainer {
             iteration.saturating_sub(1),
             splats.sh_coeffs.val().dims()[1],
         );
-        self.accumulate_gradients(
-            &transforms_grad,
-            &screen_grad_stats,
-            &sh_grad,
-            &rendered.visible,
-            self.uses_visibility_pruning(),
-            self.collects_actual_visibility_diagnostics(),
-        );
+        if collect_topology_stats {
+            self.accumulate_gradients(
+                &transforms_grad,
+                &screen_grad_stats,
+                &sh_grad,
+                &rendered.visible,
+                self.uses_visibility_pruning(),
+                self.collects_actual_visibility_diagnostics(),
+            );
+        }
         self.optimizer
             .step_device_splats(splats, transforms_grad, sh_grad, opacity_grad);
+        let optimizer_elapsed = if profile_step {
+            let started = Instant::now();
+            let _ = splats
+                .transforms
+                .val()
+                .inner()
+                .abs()
+                .mean()
+                .into_scalar_async()
+                .await
+                .expect("optimizer profile sync");
+            Some(started.elapsed())
+        } else {
+            None
+        };
+
+        if profile_step {
+            log::debug!(
+                "WGPU train profile step {} | target={:.3}ms | forward_sync={:.3}ms | loss_sync={:.3}ms | backward_sync={:.3}ms | optimizer_sync={:.3}ms | total_so_far={:.3}ms",
+                iteration,
+                target_ready_elapsed.as_secs_f64() * 1000.0,
+                forward_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                loss_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                backward_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                optimizer_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                step_started_at.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         if should_log_diagnostics {
             let grad_transforms_mean_abs = grad_transforms_for_diag
@@ -466,9 +605,14 @@ impl WgpuTrainer {
         }
 
         let mut report = WgpuTrainingReport::default();
-        let mut rng = StdRng::seed_from_u64(self.config.data.frame_shuffle_seed);
         self.telemetry.topology.total_epochs =
             Some(training_epoch_count(num_iterations, cameras.len()));
+        let collect_topology_stats =
+            training_uses_topology_stats(&self.config, num_iterations, cameras.len());
+        let mut target_tensor_cache = HashMap::<usize, Tensor<GsDiffBackend, 3>>::new();
+        let mut target_tensor_lru = VecDeque::<usize>::new();
+        let target_tensor_cache_capacity = self.config.data.frame_cache_capacity.max(1);
+        let training_loop_started_at = Instant::now();
 
         for iteration in 0..num_iterations {
             if observer.should_cancel() {
@@ -476,37 +620,48 @@ impl WgpuTrainer {
                 break;
             }
 
-            let sample_idx = if cameras.len() == 1 {
-                0
-            } else {
-                rng.gen_range(0..cameras.len())
-            };
+            let sample_idx = iteration % cameras.len();
             let frame_idx = frame_order[sample_idx];
             frame_loader.prefetch_order_window(frame_order, sample_idx)?;
             let decoded = frame_loader.get(frame_idx)?;
-            let target_image = decoded.target_rgb.clone().ok_or_else(|| {
-                TrainingError::TrainingFailed(format!(
-                    "frame loader did not prepare target_rgb for frame {frame_idx}"
-                ))
-            })?;
+            let target_img = match target_tensor_cache.get(&frame_idx).cloned() {
+                Some(cached) => {
+                    touch_target_tensor_cache(&mut target_tensor_lru, frame_idx);
+                    cached
+                }
+                None => {
+                    let target_image = decoded.target_rgb.clone().ok_or_else(|| {
+                        TrainingError::TrainingFailed(format!(
+                            "frame loader did not prepare target_rgb for frame {frame_idx}"
+                        ))
+                    })?;
+                    let tensor = target_image_tensor(&target_image, image_dims, &self.device);
+                    target_tensor_cache.insert(frame_idx, tensor.clone());
+                    touch_target_tensor_cache(&mut target_tensor_lru, frame_idx);
+                    while target_tensor_cache.len() > target_tensor_cache_capacity {
+                        if let Some(evicted) = target_tensor_lru.pop_front() {
+                            target_tensor_cache.remove(&evicted);
+                        }
+                    }
+                    tensor
+                }
+            };
 
             let iteration_idx = iteration + 1;
             let emit_progress = observer.should_emit_progress(iteration_idx);
             let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
-            let should_log_step = iteration.is_multiple_of(100);
-            let should_read_loss = emit_progress
-                || emit_snapshot
-                || should_log_step
-                || iteration_idx == num_iterations;
+            let should_log_step = iteration_idx.is_multiple_of(100);
+            let should_read_loss = emit_progress || emit_snapshot || should_log_step;
             let loss = self
                 .train_step(
                     splats,
                     &cameras[sample_idx],
-                    &target_image,
+                    target_img,
                     image_dims,
                     iteration_idx,
                     cameras.len(),
                     should_read_loss,
+                    collect_topology_stats,
                 )
                 .await;
             report.completed_iterations = iteration_idx;
@@ -555,6 +710,7 @@ impl WgpuTrainer {
             }
         }
 
+        report.training_loop_elapsed = training_loop_started_at.elapsed();
         self.finish_report(&mut report);
         Ok(report)
     }
@@ -573,73 +729,41 @@ impl WgpuTrainer {
         collect_actual_visibility_diagnostics: bool,
     ) {
         // This is the post-projection transform gradient, not the per-pixel
-        // screen-space mean gradient required by AbsGS-style densification.
-        let grad_2d = transforms_grad
-            .clone()
-            .slice(s![.., 0..3])
-            .abs()
-            .mean_dim(1)
-            .squeeze_dim::<1>(1);
-        let screen_grad_2d = screen_grad_stats
-            .clone()
-            .slice(s![.., 0..2])
-            .powi_scalar(2)
-            .sum_dim(1)
-            .sqrt()
-            .squeeze_dim::<1>(1);
-        let abs_grad_2d = screen_grad_stats
-            .clone()
-            .slice(s![.., 2..4])
-            .powi_scalar(2)
-            .sum_dim(1)
-            .sqrt()
-            .squeeze_dim::<1>(1);
-        let abs_pixel_grad_2d = screen_grad_stats
-            .clone()
-            .slice(s![.., 4..5])
-            .squeeze_dim::<1>(1);
-        let pixel_coverage = screen_grad_stats
-            .clone()
-            .slice(s![.., 5..6])
-            .squeeze_dim::<1>(1);
-        let camera_depth = screen_grad_stats
-            .clone()
-            .slice(s![.., 6..7])
-            .squeeze_dim::<1>(1);
-        let grad_color = sh_grad
-            .clone()
-            .abs()
-            .mean_dim(2)
-            .mean_dim(1)
-            .squeeze_dim::<2>(2)
-            .squeeze_dim::<1>(1);
-
-        let grad_2d = Tensor::<GsDiffBackend, 1>::from_inner(grad_2d);
-        let screen_grad_2d = Tensor::<GsDiffBackend, 1>::from_inner(screen_grad_2d);
-        let abs_grad_2d = Tensor::<GsDiffBackend, 1>::from_inner(abs_grad_2d);
-        let abs_pixel_grad_2d = Tensor::<GsDiffBackend, 1>::from_inner(abs_pixel_grad_2d);
-        let pixel_coverage = Tensor::<GsDiffBackend, 1>::from_inner(pixel_coverage);
-        let camera_depth = Tensor::<GsDiffBackend, 1>::from_inner(camera_depth);
-        let grad_color = Tensor::<GsDiffBackend, 1>::from_inner(grad_color);
-
-        self.grad_2d_accum = self.grad_2d_accum.clone() + grad_2d;
-        self.screen_grad_2d_accum = self.screen_grad_2d_accum.clone() + screen_grad_2d;
-        self.abs_grad_2d_accum = self.abs_grad_2d_accum.clone() + abs_grad_2d;
-        self.abs_pixel_grad_2d_accum = self.abs_pixel_grad_2d_accum.clone() + abs_pixel_grad_2d;
-        self.pixel_coverage_accum = self.pixel_coverage_accum.clone() + pixel_coverage;
-        self.camera_depth_accum = self.camera_depth_accum.clone() + camera_depth;
-        self.grad_color_accum = self.grad_color_accum.clone() + grad_color;
-        self.num_observations = self.num_observations.clone().add_scalar(1.0);
-        if collect_actual_visibility_diagnostics {
-            self.actual_visible_observations =
-                self.actual_visible_observations.clone() + visible.clone().detach();
-        }
-        let visible_increment = if use_actual_visibility {
-            visible.clone()
-        } else {
-            Tensor::<GsDiffBackend, 1>::ones([visible.dims()[0]], &self.device)
+        // screen-space mean gradient required by AbsGS-style densification. The
+        // fused kernel preserves the old statistics while avoiding a long chain
+        // of tiny Burn tensor ops after every backward pass.
+        let accum = TopologyAccumulatorSet {
+            grad_2d: self.grad_2d_accum.clone(),
+            screen_grad_2d: self.screen_grad_2d_accum.clone(),
+            abs_grad_2d: self.abs_grad_2d_accum.clone(),
+            abs_pixel_grad_2d: self.abs_pixel_grad_2d_accum.clone(),
+            pixel_coverage: self.pixel_coverage_accum.clone(),
+            camera_depth: self.camera_depth_accum.clone(),
+            grad_color: self.grad_color_accum.clone(),
+            num_observations: self.num_observations.clone(),
+            visible_observations: self.visible_observations.clone(),
+            actual_visible_observations: self.actual_visible_observations.clone(),
         };
-        self.visible_observations = self.visible_observations.clone() + visible_increment;
+        let updated = accumulate_topology_stats(
+            transforms_grad.clone(),
+            screen_grad_stats.clone(),
+            sh_grad.clone(),
+            visible.clone().inner(),
+            accum,
+            use_actual_visibility,
+            collect_actual_visibility_diagnostics,
+        );
+
+        self.grad_2d_accum = updated.grad_2d;
+        self.screen_grad_2d_accum = updated.screen_grad_2d;
+        self.abs_grad_2d_accum = updated.abs_grad_2d;
+        self.abs_pixel_grad_2d_accum = updated.abs_pixel_grad_2d;
+        self.pixel_coverage_accum = updated.pixel_coverage;
+        self.camera_depth_accum = updated.camera_depth;
+        self.grad_color_accum = updated.grad_color;
+        self.num_observations = updated.num_observations;
+        self.visible_observations = updated.visible_observations;
+        self.actual_visible_observations = updated.actual_visible_observations;
     }
 
     fn uses_visibility_pruning(&self) -> bool {
@@ -896,17 +1020,51 @@ impl WgpuTrainer {
     }
 }
 
+fn touch_target_tensor_cache(lru: &mut VecDeque<usize>, frame_idx: usize) {
+    if let Some(position) = lru.iter().position(|cached| *cached == frame_idx) {
+        lru.remove(position);
+    }
+    lru.push_back(frame_idx);
+}
+
+fn sh_lr_values(sh_coeffs: usize, dc_lr: f32, rest_lr: f32) -> Vec<f32> {
+    let coeffs = sh_coeffs.max(1);
+    let mut values = vec![rest_lr; coeffs];
+    values[0] = dc_lr;
+    values
+}
+
+fn effective_position_lr_scene_scale(config: &TrainingConfig, scene_scale: f32) -> f32 {
+    if config.optimizer.lr_position_scene_scale && scene_scale.is_finite() && scene_scale > 1e-8 {
+        scene_scale
+    } else {
+        1.0
+    }
+}
+
+fn training_uses_topology_stats(
+    config: &TrainingConfig,
+    num_iterations: usize,
+    frame_count: usize,
+) -> bool {
+    if num_iterations == 0 || frame_count == 0 {
+        return false;
+    }
+    (1..=num_iterations).any(|iteration| should_apply_topology_step(config, iteration, frame_count))
+}
+
 fn initial_training_telemetry(
     config: &TrainingConfig,
     initial_splats: usize,
+    position_lr_scene_scale: f32,
 ) -> LiteGsTrainingTelemetry {
     LiteGsTrainingTelemetry {
         active_sh_degree: Some(config.litegs.rendering.sh_degree),
         rotation_frozen: config.optimizer.lr_rotation == 0.0,
         learning_rates: LiteGsOptimizerLrs {
-            xyz: Some(config.optimizer.lr_position),
+            xyz: Some(config.optimizer.lr_position * position_lr_scene_scale),
             sh_0: Some(config.optimizer.lr_color),
-            sh_rest: Some(config.optimizer.lr_color),
+            sh_rest: Some(config.optimizer.lr_color_rest),
             opacity: Some(config.optimizer.lr_opacity),
             scale: Some(config.optimizer.lr_scale),
             rot: Some(config.optimizer.lr_rotation),

@@ -51,6 +51,26 @@ struct TrainArgs {
     #[arg(long, default_value = "0")]
     sampling_step: usize,
 
+    /// Sparse-point scale factor applied to nearest-neighbor distances
+    #[arg(long, default_value = "0.5")]
+    init_point_scale_factor: f32,
+
+    /// Sparse-point initial opacity
+    #[arg(long, default_value = "0.5")]
+    init_point_opacity: f32,
+
+    /// Match VkSplat/Nerfstudio sparse-point scale estimation
+    #[arg(long, default_value_t = false)]
+    init_vksplat_scale_estimator: bool,
+
+    /// Use deterministic random unit quaternions for sparse-point rotations
+    #[arg(long, default_value_t = false)]
+    init_random_rotations: bool,
+
+    /// Seed used when --init-random-rotations is enabled
+    #[arg(long, default_value = "42")]
+    init_rotation_seed: u64,
+
     /// Maximum number of input RGB frames to consider before applying --frame-stride (0 = all)
     #[arg(long, default_value = "0")]
     max_frames: usize,
@@ -251,6 +271,10 @@ struct TrainArgs {
     #[arg(long, default_value = "0")]
     lr_decay_iterations: usize,
 
+    /// Scale position learning rate by the camera-scene radius
+    #[arg(long, default_value_t = false)]
+    lr_position_scene_scale: bool,
+
     /// Scale learning rate
     #[arg(long, default_value = "0.005")]
     lr_scale: f32,
@@ -279,9 +303,17 @@ struct TrainArgs {
     #[arg(long, default_value = "0.0025")]
     lr_color: f32,
 
+    /// Non-DC spherical harmonic color learning rate
+    #[arg(long, default_value = "0.000125")]
+    lr_color_rest: f32,
+
     /// Color/SH learning rate final value (0 = keep color LR constant)
     #[arg(long, default_value = "0")]
     lr_color_final: f32,
+
+    /// Non-DC SH color learning rate final value (0 = keep lr-color-rest constant)
+    #[arg(long, default_value = "0")]
+    lr_color_rest_final: f32,
 
     /// L1 image reconstruction loss weight
     #[arg(long, default_value = "0.8")]

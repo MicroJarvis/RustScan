@@ -68,9 +68,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let viewdir_delta = mean - uniforms.camera_position.xyz;
     let viewdir = viewdir_delta * inverseSqrt(max(dot(viewdir_delta, viewdir_delta), 1e-12));
     let sh_grads = helpers::sh_to_color_vjp(uniforms.sh_degree, viewdir, v_color);
-    let num_coeffs = helpers::num_sh_coeffs(uniforms.sh_degree);
-    let sh_base = global_gid * num_coeffs * 3u;
-    for (var coeff_idx = 0u; coeff_idx < num_coeffs; coeff_idx++) {
+    let num_active_coeffs = helpers::num_sh_coeffs(uniforms.sh_degree);
+    let num_storage_coeffs = helpers::num_sh_coeffs(uniforms.storage_sh_degree);
+    let sh_base = global_gid * num_storage_coeffs * 3u;
+    for (var coeff_idx = 0u; coeff_idx < num_active_coeffs; coeff_idx++) {
         let grad = sh_grads[coeff_idx];
         let dst = sh_base + coeff_idx * 3u;
         v_sh_coeffs[dst] = grad.x;

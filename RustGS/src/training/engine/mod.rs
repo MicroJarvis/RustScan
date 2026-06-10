@@ -3,6 +3,7 @@ mod loss;
 mod optimizer;
 mod runtime;
 mod splats;
+mod topology_accum;
 mod trainer;
 
 pub(crate) use backend::{GsBackendBase, GsDiffBackend};

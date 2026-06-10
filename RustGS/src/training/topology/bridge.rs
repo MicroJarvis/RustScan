@@ -22,18 +22,18 @@ pub(crate) struct TopologySnapshot {
     pub invisible_windows: Vec<usize>,
 }
 
-pub(crate) async fn snapshot_for_topology<B: Backend>(
-    splats: &DeviceSplats<B>,
-    grad_2d_accum: &Tensor<B, 1>,
-    screen_grad_2d_accum: &Tensor<B, 1>,
-    abs_grad_2d_accum: &Tensor<B, 1>,
-    abs_pixel_grad_2d_accum: &Tensor<B, 1>,
-    pixel_coverage_accum: &Tensor<B, 1>,
-    camera_depth_accum: &Tensor<B, 1>,
-    grad_color_accum: &Tensor<B, 1>,
-    num_observations: &Tensor<B, 1>,
-    visible_observations: &Tensor<B, 1>,
-    actual_visible_observations: Option<&Tensor<B, 1>>,
+pub(crate) async fn snapshot_for_topology<S: Backend, A: Backend>(
+    splats: &DeviceSplats<S>,
+    grad_2d_accum: &Tensor<A, 1>,
+    screen_grad_2d_accum: &Tensor<A, 1>,
+    abs_grad_2d_accum: &Tensor<A, 1>,
+    abs_pixel_grad_2d_accum: &Tensor<A, 1>,
+    pixel_coverage_accum: &Tensor<A, 1>,
+    camera_depth_accum: &Tensor<A, 1>,
+    grad_color_accum: &Tensor<A, 1>,
+    num_observations: &Tensor<A, 1>,
+    visible_observations: &Tensor<A, 1>,
+    actual_visible_observations: Option<&Tensor<A, 1>>,
 ) -> TopologySnapshot {
     let splats_host = device_splats_to_host(splats).await;
     let transaction = Transaction::default()

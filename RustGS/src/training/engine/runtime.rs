@@ -2,6 +2,8 @@
 
 use std::time::Instant;
 
+use glam::Vec3;
+
 use crate::core::GaussianCamera;
 use crate::core::HostSplats;
 use crate::training::data::frame_loader::{
@@ -22,7 +24,8 @@ use crate::{Intrinsics, TrainingDataset, TrainingError};
 use super::backend::{GsDevice, GsDiffBackend};
 use super::splats::{device_splats_to_host, host_splats_to_device};
 use super::trainer::{
-    TrainingIterationMetrics, TrainingLoopObserver, WgpuTrainer, WgpuTrainingReport,
+    target_image_tensor, TrainingIterationMetrics, TrainingLoopObserver, WgpuTrainer,
+    WgpuTrainingReport,
 };
 
 pub fn train_splats(
@@ -32,6 +35,7 @@ pub fn train_splats(
 ) -> Result<TrainingRun, TrainingError> {
     let control = options.control;
     let mut noop = |_event| {};
+    let emit_iteration_events = options.on_event.is_some();
     let on_event = options.on_event.as_deref_mut();
     let on_event = on_event.unwrap_or(&mut noop);
 
@@ -50,7 +54,7 @@ pub fn train_splats(
         }),
     );
 
-    let run = run_training(dataset, config, &control, on_event)?;
+    let run = run_training(dataset, config, &control, emit_iteration_events, on_event)?;
 
     if run.report.cancelled {
         emit_training_event(
@@ -75,6 +79,7 @@ fn run_training<F>(
     dataset: &TrainingDataset,
     config: &TrainingConfig,
     control: &TrainingControl,
+    emit_iteration_events: bool,
     on_event: &mut F,
 ) -> Result<TrainingRun, TrainingError>
 where
@@ -115,6 +120,8 @@ where
             target_height,
         ));
     }
+    let scene_scale = camera_scene_scale(dataset, &frame_order);
+    log::info!("WGPU training scene scale: {:.6}", scene_scale);
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -124,6 +131,17 @@ where
         })?
         .block_on(async move {
             let device = GsDevice::default();
+            warm_up_training_kernels(
+                &initial_splats,
+                config,
+                &device,
+                &cameras,
+                &frame_order,
+                &mut loader,
+                (target_width, target_height),
+                scene_scale,
+            )
+            .await?;
             let mut device_splats =
                 host_splats_to_device::<GsDiffBackend>(&initial_splats, &device);
             let sh_coeffs = device_splats.sh_coeffs.val().dims()[1];
@@ -132,10 +150,12 @@ where
                 device.clone(),
                 device_splats.num_splats(),
                 sh_coeffs,
+                scene_scale,
             );
             let mut observer = TrainingEventObserver {
                 control,
                 cadence: control.cadence(),
+                emit_iteration_events,
                 started_at,
                 on_event,
             };
@@ -155,12 +175,66 @@ where
         })
 }
 
+async fn warm_up_training_kernels(
+    initial_splats: &HostSplats,
+    config: &TrainingConfig,
+    device: &GsDevice,
+    cameras: &[GaussianCamera],
+    frame_order: &[usize],
+    frame_loader: &mut PrefetchFrameLoader,
+    image_dims: (usize, usize),
+    scene_scale: f32,
+) -> Result<(), TrainingError> {
+    if config.iterations == 0 || cameras.is_empty() || frame_order.is_empty() {
+        return Ok(());
+    }
+
+    let frame_idx = frame_order[0];
+    frame_loader.prefetch_order_window(frame_order, 0)?;
+    let decoded = frame_loader.get(frame_idx)?;
+    let target_image = decoded.target_rgb.clone().ok_or_else(|| {
+        TrainingError::TrainingFailed(format!(
+            "frame loader did not prepare target_rgb for warmup frame {frame_idx}"
+        ))
+    })?;
+    let target_img = target_image_tensor(&target_image, image_dims, device);
+
+    let mut warmup_splats = host_splats_to_device::<GsDiffBackend>(initial_splats, device);
+    let sh_coeffs = warmup_splats.sh_coeffs.val().dims()[1];
+    let mut warmup_trainer = WgpuTrainer::new(
+        config.clone(),
+        device.clone(),
+        warmup_splats.num_splats(),
+        sh_coeffs,
+        scene_scale,
+    );
+    let started_at = Instant::now();
+    let _ = warmup_trainer
+        .train_step(
+            &mut warmup_splats,
+            &cameras[0],
+            target_img,
+            image_dims,
+            1,
+            cameras.len(),
+            false,
+            false,
+        )
+        .await;
+    log::debug!(
+        "WGPU training warmup completed in {:.3}ms",
+        started_at.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
 struct TrainingEventObserver<'a, F>
 where
     F: FnMut(TrainingEvent) + ?Sized,
 {
     control: &'a TrainingControl,
     cadence: TrainingEventCadence,
+    emit_iteration_events: bool,
     started_at: Instant,
     on_event: &'a mut F,
 }
@@ -174,11 +248,11 @@ where
     }
 
     fn should_emit_progress(&self, iteration: usize) -> bool {
-        self.cadence.should_emit_progress(iteration)
+        self.emit_iteration_events && self.cadence.should_emit_progress(iteration)
     }
 
     fn should_emit_snapshot(&self, iteration: usize) -> bool {
-        self.cadence.should_emit_snapshot(iteration)
+        self.emit_iteration_events && self.cadence.should_emit_snapshot(iteration)
     }
 
     fn on_iteration(&mut self, metrics: TrainingIterationMetrics) {
@@ -222,6 +296,43 @@ fn gaussian_camera_from_scene_pose(
     GaussianCamera::new(scaled_intrinsics, pose.inverse())
 }
 
+fn camera_scene_scale(dataset: &TrainingDataset, frame_order: &[usize]) -> f32 {
+    let mut center = Vec3::ZERO;
+    let mut count = 0usize;
+    for &pose_idx in frame_order {
+        let Some(pose) = dataset.poses.get(pose_idx) else {
+            continue;
+        };
+        let position = pose.pose.vec();
+        if position.x.is_finite() && position.y.is_finite() && position.z.is_finite() {
+            center += position;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 1.0;
+    }
+    center /= count as f32;
+
+    let mut radius = 0.0f32;
+    for &pose_idx in frame_order {
+        let Some(pose) = dataset.poses.get(pose_idx) else {
+            continue;
+        };
+        let position = pose.pose.vec();
+        if position.x.is_finite() && position.y.is_finite() && position.z.is_finite() {
+            radius = radius.max(position.distance(center));
+        }
+    }
+
+    let scene_scale = radius * 1.1;
+    if scene_scale.is_finite() && scene_scale > 1e-8 {
+        scene_scale
+    } else {
+        1.0
+    }
+}
+
 fn build_training_run(
     splats: HostSplats,
     report: WgpuTrainingReport,
@@ -237,6 +348,7 @@ fn build_training_run(
     let run = TrainingRun {
         report: TrainingRunReport {
             elapsed,
+            training_loop_elapsed: report.training_loop_elapsed,
             final_loss,
             final_step_loss: report.final_step_loss.or(final_loss),
             gaussian_count,

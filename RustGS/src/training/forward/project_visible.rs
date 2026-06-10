@@ -92,6 +92,7 @@ where
 
 pub(crate) fn project_visible<B: ProjectVisibleBackend>(
     splats: &DeviceSplats<B>,
+    active_sh_degree: u32,
     global_from_compact_gid: &Tensor<B, 1, Int>,
     num_visible: usize,
     camera: &GaussianCamera,
@@ -104,6 +105,7 @@ pub(crate) fn project_visible<B: ProjectVisibleBackend>(
         camera,
         img_size,
         tile_bounds,
+        active_sh_degree,
         splats.sh_degree,
         splats.num_splats() as u32,
         num_visible as u32,
