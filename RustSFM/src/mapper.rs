@@ -1,5 +1,6 @@
 use crate::colmap::{
-    export_colmap, read_camera_model, read_colmap_poses, world_to_camera_rotation,
+    export_colmap, read_camera_model, read_colmap_cameras, read_colmap_poses,
+    world_to_camera_rotation,
 };
 use crate::geometry::{
     camera_center, estimate_pair_geometry, estimate_pair_geometry_with_options,
@@ -132,7 +133,17 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
     if paths.len() < 2 {
         bail!("need at least two images");
     }
-    let mut camera = if let Some(reference) = &config.reference {
+    let mut reference_camera_setup = config
+        .reference
+        .as_ref()
+        .and_then(|reference| reference_camera_setup(reference, &paths).ok());
+    let mut camera = if let Some(setup) = &reference_camera_setup {
+        setup
+            .cameras
+            .first()
+            .copied()
+            .unwrap_or_else(|| fallback_camera(&paths[0]))
+    } else if let Some(reference) = &config.reference {
         read_camera_model(reference).unwrap_or_else(|_| fallback_camera(&paths[0]))
     } else {
         fallback_camera(&paths[0])
@@ -149,6 +160,25 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
     if let Some(cy) = config.cy {
         camera.set_cy(cy);
     }
+    if let Some(setup) = &mut reference_camera_setup {
+        for setup_camera in &mut setup.cameras {
+            if let Some(fx) = config.fx {
+                setup_camera.set_fx(fx);
+            }
+            if let Some(fy) = config.fy {
+                setup_camera.set_fy(fy);
+            }
+            if let Some(cx) = config.cx {
+                setup_camera.set_cx(cx);
+            }
+            if let Some(cy) = config.cy {
+                setup_camera.set_cy(cy);
+            }
+        }
+        if let Some(first) = setup.cameras.first().copied() {
+            camera = first;
+        }
+    }
 
     let frames_start = Instant::now();
     let mut sift_extraction = config.sift_extraction.clone();
@@ -162,8 +192,10 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         &sift_extraction,
     )?;
     let frames_elapsed_ms = frames_start.elapsed().as_secs_f64() * 1000.0;
-    camera.width = frames[0].width;
-    camera.height = frames[0].height;
+    if reference_camera_setup.is_none() {
+        camera.width = frames[0].width;
+        camera.height = frames[0].height;
+    }
     let pair_start = Instant::now();
     let pairs = build_pair_graph(&frames, camera, config, &sift_matching)?;
     let pair_elapsed_ms = pair_start.elapsed().as_secs_f64() * 1000.0;
@@ -180,7 +212,13 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         debug_log.extend(pair_reference_error_summary(&pairs, &frames, reference));
     }
     let incremental_start = Instant::now();
-    let (mut reconstruction, incremental_log) = incremental_map(&frames, camera, &pairs, config)?;
+    let (mut reconstruction, incremental_log) = incremental_map(
+        &frames,
+        camera,
+        reference_camera_setup.as_ref(),
+        &pairs,
+        config,
+    )?;
     let incremental_elapsed_ms = incremental_start.elapsed().as_secs_f64() * 1000.0;
     debug_log.push(format!("timing_incremental_ms={incremental_elapsed_ms:.2}"));
     debug_log.extend(incremental_log);
@@ -260,6 +298,65 @@ fn collect_images(input: &Path, max_images: Option<usize>) -> Result<Vec<PathBuf
         paths.truncate(max);
     }
     Ok(paths)
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceCameraSetup {
+    cameras: Vec<CameraModel>,
+    camera_ids: Vec<u32>,
+    image_ids: Vec<u32>,
+    image_camera_indices: Vec<usize>,
+}
+
+fn reference_camera_setup(
+    reference: &Path,
+    image_paths: &[PathBuf],
+) -> Result<ReferenceCameraSetup> {
+    let cameras_with_ids = read_colmap_cameras(reference)?;
+    if cameras_with_ids.is_empty() {
+        bail!("reference model has no cameras");
+    }
+    let camera_ids = cameras_with_ids
+        .iter()
+        .map(|(camera_id, _)| *camera_id)
+        .collect::<Vec<_>>();
+    let cameras = cameras_with_ids
+        .iter()
+        .map(|(_, camera)| *camera)
+        .collect::<Vec<_>>();
+    let camera_index_by_id = camera_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, &camera_id)| (camera_id, idx))
+        .collect::<HashMap<_, _>>();
+    let poses = read_colmap_poses(reference)?;
+    let pose_by_name = poses
+        .iter()
+        .map(|pose| (pose.name.as_str(), pose))
+        .collect::<HashMap<_, _>>();
+
+    let mut image_ids = Vec::with_capacity(image_paths.len());
+    let mut image_camera_indices = Vec::with_capacity(image_paths.len());
+    for (idx, path) in image_paths.iter().enumerate() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if let Some(pose) = pose_by_name.get(name) {
+            image_ids.push(pose.image_id);
+            image_camera_indices.push(*camera_index_by_id.get(&pose.camera_id).unwrap_or(&0));
+        } else {
+            image_ids.push(idx as u32 + 1);
+            image_camera_indices.push(0);
+        }
+    }
+
+    Ok(ReferenceCameraSetup {
+        cameras,
+        camera_ids,
+        image_ids,
+        image_camera_indices,
+    })
 }
 
 fn fallback_camera(first_image: &Path) -> CameraModel {
@@ -1164,18 +1261,35 @@ fn relative_world_direction(pair: &PairGeometry) -> Option<glam::Vec3> {
 fn incremental_map(
     frames: &[ImageFrame],
     camera: CameraModel,
+    reference_camera_setup: Option<&ReferenceCameraSetup>,
     pairs: &[PairGeometry],
     config: &MapperConfig,
 ) -> Result<(Reconstruction, Vec<String>)> {
     let mut debug_log = Vec::new();
+    let (cameras, camera_ids, image_ids, image_camera_indices) =
+        if let Some(setup) = reference_camera_setup {
+            (
+                setup.cameras.clone(),
+                setup.camera_ids.clone(),
+                setup.image_ids.clone(),
+                setup.image_camera_indices.clone(),
+            )
+        } else {
+            (
+                vec![camera],
+                vec![1],
+                (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
+                vec![0; frames.len()],
+            )
+        };
     let mut reconstruction = Reconstruction {
         camera,
-        cameras: vec![camera],
-        camera_ids: vec![1],
+        cameras,
+        camera_ids,
         image_names: frames.iter().map(|f| f.name.clone()).collect(),
         image_paths: frames.iter().map(|f| f.path.clone()).collect(),
-        image_ids: (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
-        image_camera_indices: vec![0; frames.len()],
+        image_ids,
+        image_camera_indices,
         poses: vec![None; frames.len()],
         observations: frames
             .iter()
@@ -1202,16 +1316,8 @@ fn incremental_map(
     reconstruction.poses[initial.right] = Some(initial.relative_pose);
     triangulate_pair(initial, frames, &mut reconstruction, config);
 
-    let pnp_solver = PnPSolver {
-        ransac_threshold: camera.cam_from_img_threshold(config.pnp_threshold_px as f64) as f32,
-        ransac_confidence: 0.999,
-        ransac_max_iterations: config.pnp_iterations,
-        ..PnPSolver::new(1.0, 1.0, 0.0, 0.0)
-    };
     while reconstruction.poses.iter().any(|p| p.is_none()) {
-        let Some(choice) =
-            choose_next_registration(frames, pairs, &reconstruction, &pnp_solver, config)
-        else {
+        let Some(choice) = choose_next_registration(frames, pairs, &reconstruction, config) else {
             break;
         };
         reconstruction.poses[choice.image] = Some(choice.pose);
@@ -1252,7 +1358,6 @@ fn choose_next_registration(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
-    pnp_solver: &PnPSolver,
     config: &MapperConfig,
 ) -> Option<RegistrationChoice> {
     let mut best = None::<(f32, RegistrationChoice)>;
@@ -1265,9 +1370,7 @@ fn choose_next_registration(
         let mut pnp_inliers = 0usize;
         let mut mean_error_px = f32::INFINITY;
 
-        if let Some(abs_pose) =
-            solve_absolute_pose(image, frames, pairs, reconstruction, pnp_solver, config)
-        {
+        if let Some(abs_pose) = solve_absolute_pose(image, frames, pairs, reconstruction, config) {
             let accept_absolute = if let Some(relative_pose) = pose {
                 abs_pose.inliers >= 24
                     && abs_pose.mean_error_px <= config.max_reprojection_error_px
@@ -1417,10 +1520,15 @@ fn solve_absolute_pose(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
-    solver: &PnPSolver,
     config: &MapperConfig,
 ) -> Option<AbsolutePose> {
     let camera = reconstruction.camera_for_image(image);
+    let solver = PnPSolver {
+        ransac_threshold: camera.cam_from_img_threshold(config.pnp_threshold_px as f64) as f32,
+        ransac_confidence: 0.999,
+        ransac_max_iterations: config.pnp_iterations,
+        ..PnPSolver::new(1.0, 1.0, 0.0, 0.0)
+    };
     let mut problem = PnPProblem::new();
     let mut xy_and_points = Vec::new();
     let mut used_features = HashSet::new();
@@ -2801,5 +2909,36 @@ fn triangulate_pair(
                 },
             ],
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn reference_camera_setup_maps_images_to_shared_cameras() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("cameras.txt"),
+            "11 PINHOLE 640 480 500 501 320 240\n42 SIMPLE_RADIAL 800 600 700 401 299 0\n",
+        )?;
+        fs::write(
+            sparse.join("images.txt"),
+            "7 1 0 0 0 0 0 0 11 a.jpg\n\n8 1 0 0 0 0 0 0 42 b.jpg\n\n",
+        )?;
+        let image_paths = vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg")];
+
+        let setup = reference_camera_setup(dir.path(), &image_paths)?;
+
+        assert_eq!(setup.camera_ids, vec![11, 42]);
+        assert_eq!(setup.image_ids, vec![7, 8]);
+        assert_eq!(setup.image_camera_indices, vec![0, 1]);
+        assert_eq!(setup.cameras[1].model_name(), "SIMPLE_RADIAL");
+        Ok(())
     }
 }

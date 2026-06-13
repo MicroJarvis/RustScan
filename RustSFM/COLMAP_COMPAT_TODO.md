@@ -22,7 +22,9 @@ reconstruction parity.
      per-image camera references.
    - Text/binary camera reading now preserves all cameras; text export writes
      camera ids and per-image camera ownership instead of hard-coding camera 1.
-   - Remaining work: mapper input/reference loading still initializes a single
+   - Reference-model initialization now keeps COLMAP camera/image ids and maps
+     images back to their shared cameras.
+   - Remaining work: non-reference mapper input still initializes a single
      shared camera, and two-view estimation still accepts one camera.
 4. [partial] Introduce COLMAP-compatible identifiers for cameras, images,
    points, frames, rigs, and sensors instead of relying on contiguous vector
@@ -74,12 +76,13 @@ reconstruction parity.
 14. Port absolute pose estimation and refinement, including focal/extra
     parameter estimation, bogus camera reset, inlier ratio checks, and
     generalized absolute pose for rigs.
-    - Partial: RustSFM now lifts absolute-pose 2D observations through the
-      per-image `CameraModel::CamFromImg` before PnP, so distorted/non-pinhole
-      cameras no longer enter PnP through raw pinhole intrinsics.
-    - Remaining work: replace the local P3P/DLT-RANSAC/refinement path with
-      COLMAP-equivalent absolute pose estimation, focal/extra-parameter
-      refinement, bogus camera reset, and generalized rig pose.
+   - Partial: RustSFM now lifts absolute-pose 2D observations through the
+     per-image `CameraModel::CamFromImg` before PnP, so distorted/non-pinhole
+     cameras no longer enter PnP through raw pinhole intrinsics; PnP thresholds
+     are also created from the registering image camera.
+   - Remaining work: replace the local P3P/DLT-RANSAC/refinement path with
+     COLMAP-equivalent absolute pose estimation, focal/extra-parameter
+     refinement, bogus camera reset, and generalized rig pose.
 15. Port structure-less registration fallback.
 
 ## P4 - Triangulation And Observation Management
