@@ -94,9 +94,14 @@ reconstruction parity.
    - Added a mapper bridge that maps database-cache image names and the
      correspondence graph into frame-indexed pair matches, with an opt-in
      two-view estimation path for database-derived candidate pairs.
+   - Added a `--database` mapper path that loads COLMAP database cache,
+     replaces frame keypoints with database keypoints, preserves database
+     camera/image ownership, and estimates pairs from verified database
+     correspondences instead of local matching when provided.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache ENU pose-prior conversion and making the default mapper consume
-     database-derived candidate pairs.
+     cache ENU pose-prior conversion, using stored two-view geometry poses
+     directly where valid, and making database-driven reconstruction the main
+     COLMAP-style mapper path.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 

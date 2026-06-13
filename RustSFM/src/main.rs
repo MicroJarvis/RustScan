@@ -25,6 +25,8 @@ struct ReconstructArgs {
     #[arg(long)]
     reference: Option<PathBuf>,
     #[arg(long)]
+    database: Option<PathBuf>,
+    #[arg(long)]
     max_images: Option<usize>,
     #[arg(long, default_value = "sift")]
     feature_type: FeatureType,
@@ -95,6 +97,7 @@ fn main() -> Result<()> {
                 input: args.input,
                 output: args.output,
                 reference: args.reference,
+                database: args.database,
                 max_images: args.max_images,
                 feature_type: args.feature_type,
                 max_features: args.max_features,

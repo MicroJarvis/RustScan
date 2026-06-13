@@ -2,7 +2,7 @@ use crate::colmap::{
     export_colmap, read_camera_model, read_colmap_cameras, read_colmap_poses,
     world_to_camera_rotation,
 };
-use crate::database::DatabaseCache;
+use crate::database::{ColmapDatabase, DatabaseCache, DatabaseCacheOptions};
 use crate::geometry::{
     camera_center, estimate_pair_geometry_with_cameras,
     estimate_pair_geometry_with_options_and_cameras, mean_pair_reprojection_error_with_cameras,
@@ -27,7 +27,7 @@ use rustslam::features::HammingMatcher;
 use rustslam::tracker::{PnPProblem, PnPSolver};
 use rustslam::{FeatureExtractor, FeatureMatcher, OrbExtractor, SE3};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -37,6 +37,12 @@ pub struct DatabasePairMatches {
     pub left: usize,
     pub right: usize,
     pub matches: Vec<rustslam::Match>,
+}
+
+#[derive(Debug, Clone)]
+struct MapperDatabaseInput {
+    cache: DatabaseCache,
+    keypoints_by_name: HashMap<String, Vec<rustslam::KeyPoint>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +68,7 @@ pub struct MapperConfig {
     pub input: PathBuf,
     pub output: PathBuf,
     pub reference: Option<PathBuf>,
+    pub database: Option<PathBuf>,
     pub max_images: Option<usize>,
     pub feature_type: FeatureType,
     pub max_features: usize,
@@ -93,6 +100,7 @@ impl Default for MapperConfig {
             input: PathBuf::new(),
             output: PathBuf::new(),
             reference: None,
+            database: None,
             max_images: None,
             feature_type: FeatureType::Sift,
             max_features: 8192,
@@ -193,25 +201,62 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
     sift_extraction.max_num_features = config.max_features;
     let mut sift_matching = config.sift_matching.clone();
     sift_matching.max_ratio = config.match_ratio as f32;
-    let frames = extract_frames(
+    let mut frames = extract_frames(
         &paths,
         config.max_features,
         config.feature_type,
         &sift_extraction,
     )?;
+    let mapper_database =
+        load_mapper_database(config.database.as_deref(), &frames, config.min_matches)?;
+    if let Some(database) = mapper_database.as_ref() {
+        apply_database_keypoints(&mut frames, &database.keypoints_by_name);
+        if reference_camera_setup.is_none() {
+            reference_camera_setup = database_camera_setup(&database.cache, &paths).ok();
+            if let Some(setup) = &mut reference_camera_setup {
+                for setup_camera in &mut setup.cameras {
+                    if let Some(fx) = config.fx {
+                        setup_camera.set_fx(fx);
+                    }
+                    if let Some(fy) = config.fy {
+                        setup_camera.set_fy(fy);
+                    }
+                    if let Some(cx) = config.cx {
+                        setup_camera.set_cx(cx);
+                    }
+                    if let Some(cy) = config.cy {
+                        setup_camera.set_cy(cy);
+                    }
+                }
+                if let Some(first) = setup.cameras.first().copied() {
+                    camera = first;
+                }
+            }
+        }
+    }
     let frames_elapsed_ms = frames_start.elapsed().as_secs_f64() * 1000.0;
     if reference_camera_setup.is_none() {
         camera.width = frames[0].width;
         camera.height = frames[0].height;
     }
     let pair_start = Instant::now();
-    let pairs = build_pair_graph(
-        &frames,
-        camera,
-        reference_camera_setup.as_ref(),
-        config,
-        &sift_matching,
-    )?;
+    let pairs = if let Some(database) = mapper_database.as_ref() {
+        estimate_database_pair_geometries(
+            &frames,
+            &database.cache,
+            camera,
+            reference_camera_setup.as_ref(),
+            config,
+        )?
+    } else {
+        build_pair_graph(
+            &frames,
+            camera,
+            reference_camera_setup.as_ref(),
+            config,
+            &sift_matching,
+        )?
+    };
     let pair_elapsed_ms = pair_start.elapsed().as_secs_f64() * 1000.0;
     if pairs.is_empty() {
         bail!("no verified image pairs");
@@ -372,6 +417,139 @@ fn reference_camera_setup(
         image_ids,
         image_camera_indices,
     })
+}
+
+fn load_mapper_database(
+    database: Option<&Path>,
+    frames: &[ImageFrame],
+    min_num_matches: usize,
+) -> Result<Option<MapperDatabaseInput>> {
+    let Some(database) = database else {
+        return Ok(None);
+    };
+    let image_names = frames
+        .iter()
+        .map(|frame| frame.name.clone())
+        .collect::<BTreeSet<_>>();
+    let db = ColmapDatabase::open(database)?;
+    let cache = db.load_cache(&DatabaseCacheOptions {
+        min_num_matches,
+        ignore_watermarks: false,
+        image_names,
+        load_all_images: false,
+    })?;
+    let mut keypoints_by_name = HashMap::new();
+    for image in cache.images.values() {
+        let keypoints = db
+            .read_keypoints(image.image_id)?
+            .into_iter()
+            .map(|kp| kp.to_keypoint())
+            .collect::<Vec<_>>();
+        keypoints_by_name.insert(image.name.clone(), keypoints);
+    }
+    Ok(Some(MapperDatabaseInput {
+        cache,
+        keypoints_by_name,
+    }))
+}
+
+fn database_camera_setup(
+    cache: &DatabaseCache,
+    image_paths: &[PathBuf],
+) -> Result<ReferenceCameraSetup> {
+    if cache.cameras.is_empty() {
+        bail!("database cache has no cameras");
+    }
+    let mut camera_ids = Vec::with_capacity(cache.cameras.len());
+    let mut cameras = Vec::with_capacity(cache.cameras.len());
+    for (&camera_id, db_camera) in &cache.cameras {
+        let camera = CameraModel::from_colmap(
+            db_camera.camera.model_id,
+            db_camera.camera.width,
+            db_camera.camera.height,
+            &db_camera.camera.params,
+        )
+        .with_context(|| format!("unsupported database camera_id={camera_id}"))?;
+        camera_ids.push(camera_id);
+        cameras.push(camera);
+    }
+    let camera_index_by_id = camera_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, &camera_id)| (camera_id, idx))
+        .collect::<HashMap<_, _>>();
+    let image_by_name = cache
+        .images
+        .values()
+        .map(|image| (image.name.as_str(), image))
+        .collect::<HashMap<_, _>>();
+
+    let mut image_ids = Vec::with_capacity(image_paths.len());
+    let mut image_camera_indices = Vec::with_capacity(image_paths.len());
+    for (idx, path) in image_paths.iter().enumerate() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if let Some(image) = image_by_name.get(name) {
+            image_ids.push(image.image_id);
+            image_camera_indices.push(*camera_index_by_id.get(&image.camera_id).unwrap_or(&0));
+        } else {
+            image_ids.push(idx as u32 + 1);
+            image_camera_indices.push(0);
+        }
+    }
+
+    Ok(ReferenceCameraSetup {
+        cameras,
+        camera_ids,
+        image_ids,
+        image_camera_indices,
+    })
+}
+
+fn apply_database_keypoints(
+    frames: &mut [ImageFrame],
+    keypoints_by_name: &HashMap<String, Vec<rustslam::KeyPoint>>,
+) {
+    for frame in frames {
+        let Some(keypoints) = keypoints_by_name.get(frame.name.as_str()) else {
+            continue;
+        };
+        if !keypoints.is_empty() {
+            frame.keypoints = keypoints.clone();
+            frame.descriptors = rustslam::Descriptors::new();
+            frame.sift = crate::sift::SiftFeatures::default();
+            frame.wide_descriptors = crate::wide::WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            };
+            frame.strong_feature_indices = Vec::new();
+            frame.colors = sample_keypoint_colors(frame);
+        }
+    }
+}
+
+fn sample_keypoint_colors(frame: &ImageFrame) -> Vec<[u8; 3]> {
+    let Ok(reader) = ImageReader::open(&frame.path) else {
+        return vec![[0, 0, 0]; frame.keypoints.len()];
+    };
+    let Ok(image) = reader.decode() else {
+        return vec![[0, 0, 0]; frame.keypoints.len()];
+    };
+    let image = image.to_rgb8();
+    let width = image.width().max(1);
+    let height = image.height().max(1);
+    frame
+        .keypoints
+        .iter()
+        .map(|kp| {
+            let x = kp.x().round().clamp(0.0, (width - 1) as f32) as u32;
+            let y = kp.y().round().clamp(0.0, (height - 1) as f32) as u32;
+            image.get_pixel(x, y).0
+        })
+        .collect()
 }
 
 fn fallback_camera(first_image: &Path) -> CameraModel {
@@ -3142,6 +3320,81 @@ mod tests {
         assert_eq!(pairs[0].matches.len(), 2);
         assert_eq!(pairs[0].matches[0].query_idx, 0);
         assert_eq!(pairs[0].matches[0].train_idx, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn mapper_database_input_loads_keypoints_and_camera_ownership() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 5,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 200,
+                    height: 150,
+                    params: vec![80.0, 81.0, 100.0, 75.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name, keypoints) in [
+            (
+                11,
+                "left.jpg",
+                vec![
+                    ColmapKeypoint::new(10.0, 20.0),
+                    ColmapKeypoint::new(30.0, 40.0),
+                ],
+            ),
+            (
+                12,
+                "right.jpg",
+                vec![
+                    ColmapKeypoint::new(50.0, 60.0),
+                    ColmapKeypoint::new(70.0, 80.0),
+                ],
+            ),
+        ] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 5,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(image_id, &keypoints)?;
+        }
+        db.write_two_view_geometry(
+            11,
+            12,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![FeatureMatch::new(0, 1), FeatureMatch::new(1, 0)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+
+        let database = load_mapper_database(Some(&db_path), &frames, 0)?.expect("database input");
+        apply_database_keypoints(&mut frames, &database.keypoints_by_name);
+        let setup = database_camera_setup(
+            &database.cache,
+            &[frames[0].path.clone(), frames[1].path.clone()],
+        )?;
+
+        assert_eq!(frames[0].keypoints[0].x(), 10.0);
+        assert_eq!(frames[0].keypoints[1].y(), 40.0);
+        assert_eq!(frames[1].keypoints[0].x(), 50.0);
+        assert_eq!(setup.camera_ids, vec![5]);
+        assert_eq!(setup.image_ids, vec![11, 12]);
+        assert_eq!(setup.image_camera_indices, vec![0, 0]);
+        assert_eq!(setup.cameras[0].fx, 80.0);
         Ok(())
     }
 
