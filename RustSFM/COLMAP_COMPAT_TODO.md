@@ -73,6 +73,9 @@ reconstruction parity.
      descriptors, raw matches, and two-view geometries, including COLMAP
      image-pair ordering, matrix blob encoding, optional F/E/H/qvec/tvec blobs,
      and legacy 2/4-column keypoint blobs.
+   - Added a database-to-correspondence-graph construction path from stored
+     keypoint counts and two-view geometries, matching the core
+     `DatabaseCache` flow before mapper integration.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
      cache loading, cameras/images/rigs/frames database tables, and mapper
      integration.

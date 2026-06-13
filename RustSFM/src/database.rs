@@ -1,5 +1,6 @@
 use crate::correspondence_graph::{
-    image_pair_to_pair_id, should_swap_image_pair, FeatureMatch, ImageId, ImagePairId,
+    image_pair_to_pair_id, pair_id_to_image_pair, should_swap_image_pair, CorrespondenceGraph,
+    FeatureMatch, ImageId, ImagePairId, TwoViewGeometryRecord,
 };
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -245,6 +246,21 @@ impl ColmapDatabase {
         ColmapDescriptors::new(feature_type, rows, cols, data)
     }
 
+    pub fn read_keypoint_counts(&self) -> Result<Vec<(ImageId, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT image_id, rows FROM keypoints ORDER BY image_id;")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((
+                row.get::<_, i64>(0)? as ImageId,
+                row.get::<_, i64>(1)? as usize,
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn write_matches(
         &self,
         image_id1: ImageId,
@@ -423,6 +439,84 @@ impl ColmapDatabase {
             ));
         }
         Ok(out)
+    }
+
+    pub fn read_two_view_geometries(&self) -> Result<Vec<(ImagePairId, ColmapTwoViewGeometry)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pair_id, rows, cols, data, config, F, E, H, qvec, tvec
+             FROM two_view_geometries
+             WHERE rows > 0 OR F IS NOT NULL OR E IS NOT NULL OR H IS NOT NULL
+                OR qvec IS NOT NULL OR tvec IS NOT NULL;",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let pair_id = row.get::<_, i64>(0)? as ImagePairId;
+            let match_rows = row.get::<_, i64>(1)? as usize;
+            let cols = row.get::<_, i64>(2)? as usize;
+            let data = row.get::<_, Vec<u8>>(3)?;
+            out.push((
+                pair_id,
+                ColmapTwoViewGeometry {
+                    config: row.get::<_, i32>(4)?,
+                    inlier_matches: decode_matches_blob(match_rows, cols, &data)?,
+                    f_matrix: row
+                        .get::<_, Option<Vec<u8>>>(5)?
+                        .as_deref()
+                        .map(decode_matrix3_colmap_blob)
+                        .transpose()?,
+                    e_matrix: row
+                        .get::<_, Option<Vec<u8>>>(6)?
+                        .as_deref()
+                        .map(decode_matrix3_colmap_blob)
+                        .transpose()?,
+                    h_matrix: row
+                        .get::<_, Option<Vec<u8>>>(7)?
+                        .as_deref()
+                        .map(decode_matrix3_colmap_blob)
+                        .transpose()?,
+                    qvec: row
+                        .get::<_, Option<Vec<u8>>>(8)?
+                        .as_deref()
+                        .map(decode_vec4_blob)
+                        .transpose()?,
+                    tvec: row
+                        .get::<_, Option<Vec<u8>>>(9)?
+                        .as_deref()
+                        .map(decode_vec3_blob)
+                        .transpose()?,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    pub fn build_correspondence_graph(&self) -> Result<CorrespondenceGraph> {
+        let mut graph = CorrespondenceGraph::new();
+        for (image_id, num_points2d) in self.read_keypoint_counts()? {
+            graph
+                .add_image(image_id, num_points2d)
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        }
+        for (pair_id, geometry) in self.read_two_view_geometries()? {
+            let (image_id1, image_id2) =
+                pair_id_to_image_pair(pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+            if !graph.exists_image(image_id1) || !graph.exists_image(image_id2) {
+                continue;
+            }
+            graph
+                .add_two_view_geometry(
+                    image_id1,
+                    image_id2,
+                    TwoViewGeometryRecord {
+                        config: geometry.config,
+                        inlier_matches: geometry.inlier_matches,
+                    },
+                )
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        }
+        graph.finalize().map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        Ok(graph)
     }
 }
 
@@ -660,6 +754,60 @@ mod tests {
         assert_eq!(
             db.read_two_view_geometry_num_inliers().unwrap(),
             vec![(image_pair_to_pair_id(8, 4).unwrap(), 2)]
+        );
+    }
+
+    #[test]
+    fn builds_correspondence_graph_from_database_two_view_geometries() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let keypoints = vec![
+            ColmapKeypoint::new(0.0, 0.0),
+            ColmapKeypoint::new(1.0, 1.0),
+            ColmapKeypoint::new(2.0, 2.0),
+        ];
+        db.write_keypoints(1, &keypoints).unwrap();
+        db.write_keypoints(2, &keypoints).unwrap();
+        db.write_keypoints(3, &keypoints).unwrap();
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(0, 0), m(1, 1), m(3, 2)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+        db.write_two_view_geometry(
+            2,
+            3,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(1, 2)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+
+        let graph = db.build_correspondence_graph().unwrap();
+
+        assert_eq!(graph.num_images(), 3);
+        assert_eq!(graph.num_image_pairs(), 2);
+        assert_eq!(graph.num_observations_for_image(1).unwrap(), 2);
+        assert_eq!(graph.num_matches_between_images(1, 2).unwrap(), 2);
+        assert_eq!(
+            graph.extract_matches_between_images(1, 2).unwrap(),
+            vec![m(0, 0), m(1, 1)]
+        );
+        let mut transitive = graph.extract_transitive_correspondences(1, 1, 2).unwrap();
+        transitive.sort();
+        assert_eq!(
+            transitive,
+            vec![
+                crate::correspondence_graph::Correspondence::new(2, 1),
+                crate::correspondence_graph::Correspondence::new(3, 2),
+            ]
         );
     }
 
