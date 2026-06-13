@@ -1854,6 +1854,7 @@ fn incremental_map(
         triangulator.complete_tracks(&tri_options, &modified);
         let modified = triangulator.get_modified_points3d().clone();
         triangulator.merge_tracks(&tri_options, &modified);
+        triangulator.retriangulate(&tri_options);
     }
 
     while reconstruction.poses.iter().any(|p| p.is_none()) {
@@ -1876,6 +1877,7 @@ fn incremental_map(
             triangulator.complete_tracks(&tri_options, &modified);
             let modified = triangulator.get_modified_points3d().clone();
             triangulator.merge_tracks(&tri_options, &modified);
+            triangulator.retriangulate(&tri_options);
         }
     }
     Ok((reconstruction, debug_log))

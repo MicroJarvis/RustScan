@@ -65,6 +65,7 @@ pub struct IncrementalTriangulator<'a> {
     reconstruction: &'a mut Reconstruction,
     modified_point3d_ids: HashSet<usize>,
     merge_trials: HashSet<(usize, usize)>,
+    retriangulation_trials: HashSet<(usize, usize)>,
 }
 
 impl<'a> IncrementalTriangulator<'a> {
@@ -79,6 +80,7 @@ impl<'a> IncrementalTriangulator<'a> {
             reconstruction,
             modified_point3d_ids: HashSet::new(),
             merge_trials: HashSet::new(),
+            retriangulation_trials: HashSet::new(),
         }
     }
 
@@ -205,6 +207,89 @@ impl<'a> IncrementalTriangulator<'a> {
     pub fn merge_all_tracks(&mut self, options: &IncrementalTriangulatorOptions) -> usize {
         let point_ids = (0..self.reconstruction.points.len()).collect::<HashSet<_>>();
         self.merge_tracks(options, &point_ids)
+    }
+
+    pub fn retriangulate(&mut self, options: &IncrementalTriangulatorOptions) -> usize {
+        let mut total = 0usize;
+        for pair in self.pairs {
+            if self
+                .reconstruction
+                .poses
+                .get(pair.left)
+                .copied()
+                .flatten()
+                .is_none()
+                || self
+                    .reconstruction
+                    .poses
+                    .get(pair.right)
+                    .copied()
+                    .flatten()
+                    .is_none()
+            {
+                continue;
+            }
+            let pair_key = ordered_point_pair(pair.left, pair.right);
+            if self.retriangulation_trials.contains(&pair_key) {
+                continue;
+            }
+            let (tri_corrs, total_corrs) = self.pair_triangulation_counts(pair);
+            if total_corrs == 0 || tri_corrs as f32 / total_corrs as f32 >= options.re_min_ratio {
+                continue;
+            }
+            if options.re_max_trials == 0 {
+                continue;
+            }
+            self.retriangulation_trials.insert(pair_key);
+            for match_ in &pair.inlier_matches {
+                let left_feature = match_.query_idx as usize;
+                let right_feature = match_.train_idx as usize;
+                if !self.valid_observation(pair.left, left_feature)
+                    || !self.valid_observation(pair.right, right_feature)
+                {
+                    continue;
+                }
+                let left_point = self.reconstruction.observations[pair.left][left_feature];
+                let right_point = self.reconstruction.observations[pair.right][right_feature];
+                match (left_point, right_point) {
+                    (Some(_), Some(_)) => {}
+                    (Some(point_id), None) => {
+                        if self.continue_track(
+                            options,
+                            point_id,
+                            pair.right,
+                            right_feature,
+                            options.complete_max_reproj_error_px,
+                        ) {
+                            total += 1;
+                        }
+                    }
+                    (None, Some(point_id)) => {
+                        if self.continue_track(
+                            options,
+                            point_id,
+                            pair.left,
+                            left_feature,
+                            options.complete_max_reproj_error_px,
+                        ) {
+                            total += 1;
+                        }
+                    }
+                    (None, None) => {
+                        if self.create_pair_track(
+                            options,
+                            pair,
+                            pair.left,
+                            left_feature,
+                            right_feature,
+                        ) {
+                            total += 2;
+                        }
+                    }
+                }
+            }
+        }
+        total
     }
 
     pub fn clear_modified_points3d(&mut self) {
@@ -470,6 +555,27 @@ impl<'a> IncrementalTriangulator<'a> {
             }
         }
         0
+    }
+
+    fn pair_triangulation_counts(&self, pair: &PairGeometry) -> (usize, usize) {
+        let mut tri_corrs = 0usize;
+        let mut total_corrs = 0usize;
+        for match_ in &pair.inlier_matches {
+            let left_feature = match_.query_idx as usize;
+            let right_feature = match_.train_idx as usize;
+            if !self.valid_observation(pair.left, left_feature)
+                || !self.valid_observation(pair.right, right_feature)
+            {
+                continue;
+            }
+            total_corrs += 1;
+            let left_point = self.reconstruction.observations[pair.left][left_feature];
+            let right_point = self.reconstruction.observations[pair.right][right_feature];
+            if left_point.is_some() && left_point == right_point {
+                tri_corrs += 1;
+            }
+        }
+        (tri_corrs, total_corrs)
     }
 
     fn try_merge_pair(
@@ -862,6 +968,33 @@ mod tests {
         );
 
         assert_eq!(merged, 0);
+        assert_eq!(triangulator.reconstruction.points.len(), 2);
+    }
+
+    #[test]
+    fn retriangulate_creates_under_reconstructed_pair_points() {
+        let mut frames = vec![frame(0), frame(1)];
+        frames[1].keypoints = vec![
+            rustslam::KeyPoint::new(55.0, 50.0),
+            rustslam::KeyPoint::new(60.0, 50.0),
+        ];
+        let pairs = vec![pair(0, 1, &[(0, 0), (1, 1)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+
+        let mut triangulator = IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction);
+        let added = triangulator.retriangulate(&IncrementalTriangulatorOptions {
+            re_min_ratio: 0.5,
+            min_angle_deg: 0.1,
+            merge_max_reproj_error_px: 10.0,
+            ..IncrementalTriangulatorOptions::default()
+        });
+
+        assert_eq!(added, 4);
         assert_eq!(triangulator.reconstruction.points.len(), 2);
     }
 
