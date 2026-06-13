@@ -32,8 +32,10 @@ reconstruction parity.
    points, frames, rigs, and sensors instead of relying on contiguous vector
    indices.
    - Added camera/image ids to reconstruction and image pose I/O.
-   - Remaining work: point ids, rigs, frames, sensors, database ids, and full
-     sparse model binary/text round-trip.
+   - Added point3D ids to reconstruction export so observations and points can
+     preserve non-contiguous COLMAP point ids instead of hard-coding index + 1.
+   - Remaining work: reading point ids, rigs, frames, sensors, database ids, and
+     full sparse model binary/text round-trip.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 

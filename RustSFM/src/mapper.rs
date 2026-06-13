@@ -238,6 +238,7 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
             .map(|f| vec![None; f.keypoints.len()])
             .collect();
         reconstruction.points.clear();
+        reconstruction.point_ids.clear();
         let mapping_pairs = pairs
             .iter()
             .filter(|pair| !pair.pose_graph_only)
@@ -1334,6 +1335,7 @@ fn incremental_map(
             .map(|f| vec![None; f.keypoints.len()])
             .collect(),
         keypoints: frames.iter().map(|f| f.keypoints.clone()).collect(),
+        point_ids: Vec::new(),
         points: Vec::new(),
     };
     let mapping_pairs = pairs
@@ -1790,6 +1792,7 @@ fn rebuild_tracks_from_pair_graph(
             }
         }
         let color = average_track_color(&observations, frames);
+        reconstruction.point_ids.push(id as u64 + 1);
         reconstruction.points.push(Point3D {
             xyz,
             color,
@@ -1810,7 +1813,13 @@ fn filter_reprojection_tracks(
         .collect::<Vec<_>>();
     let mut removed = 0usize;
     let mut filtered_points = Vec::with_capacity(reconstruction.points.len());
-    for mut point in reconstruction.points.drain(..) {
+    let old_point_ids = std::mem::take(&mut reconstruction.point_ids);
+    let mut filtered_point_ids = Vec::with_capacity(reconstruction.points.len());
+    for (idx, mut point) in reconstruction.points.drain(..).enumerate() {
+        let point3d_id = old_point_ids
+            .get(idx)
+            .copied()
+            .unwrap_or_else(|| idx as u64 + 1);
         let before = point.track.len();
         point.track.retain(|obs| {
             let Some(pose) = reconstruction.poses.get(obs.image).copied().flatten() else {
@@ -1833,11 +1842,13 @@ fn filter_reprojection_tracks(
         removed += before.saturating_sub(point.track.len());
         if point.track.len() >= 2 {
             filtered_points.push(point);
+            filtered_point_ids.push(point3d_id);
         } else {
             removed += point.track.len();
         }
     }
     reconstruction.points = filtered_points;
+    reconstruction.point_ids = filtered_point_ids;
     rebuild_observation_index(reconstruction);
     removed
 }
@@ -2932,6 +2943,7 @@ fn triangulate_pair(
         let id = reconstruction.points.len();
         reconstruction.observations[pair.left][li] = Some(id);
         reconstruction.observations[pair.right][ri] = Some(id);
+        reconstruction.point_ids.push(id as u64 + 1);
         reconstruction.points.push(Point3D {
             xyz,
             color: frames[pair.left].colors[li],

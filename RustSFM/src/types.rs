@@ -884,6 +884,7 @@ pub struct Reconstruction {
     pub poses: Vec<Option<SE3>>,
     pub observations: Vec<Vec<Option<usize>>>,
     pub keypoints: Vec<Vec<KeyPoint>>,
+    pub point_ids: Vec<u64>,
     pub points: Vec<Point3D>,
 }
 
@@ -909,6 +910,13 @@ impl Reconstruction {
             .get(image)
             .copied()
             .unwrap_or_else(|| image as u32 + 1)
+    }
+
+    pub fn point3d_id(&self, point: usize) -> u64 {
+        self.point_ids
+            .get(point)
+            .copied()
+            .unwrap_or_else(|| point as u64 + 1)
     }
 }
 

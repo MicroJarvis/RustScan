@@ -228,8 +228,8 @@ fn write_images_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()> 
                 write!(w, " ")?;
             }
             let point_id = reconstruction.observations[idx][feature_idx]
-                .map(|id| id as i64 + 1)
-                .unwrap_or(-1);
+                .map(|id| reconstruction.point3d_id(id).to_string())
+                .unwrap_or_else(|| "-1".to_string());
             write!(w, "{:.6} {:.6} {}", kp.x(), kp.y(), point_id)?;
         }
         writeln!(w)?;
@@ -245,7 +245,7 @@ fn write_points3d_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()
         write!(
             w,
             "{} {:.9} {:.9} {:.9} {} {} {} {:.6}",
-            idx + 1,
+            reconstruction.point3d_id(idx),
             p.xyz[0],
             p.xyz[1],
             p.xyz[2],
@@ -453,9 +453,9 @@ pub fn se3_to_colmap_pose(name: String, pose: SE3) -> ColmapPose {
 mod tests {
     use super::*;
     use crate::types::{
-        COLMAP_FULL_OPENCV, COLMAP_PINHOLE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
+        Point3D, COLMAP_FULL_OPENCV, COLMAP_PINHOLE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
     };
-    use rustslam::SE3;
+    use rustslam::{KeyPoint, SE3};
     use tempfile::tempdir;
 
     #[test]
@@ -580,6 +580,49 @@ mod tests {
     }
 
     #[test]
+    fn exports_preserved_non_contiguous_point3d_ids() -> Result<()> {
+        let dir = tempdir()?;
+        let camera =
+            CameraModel::from_colmap(COLMAP_PINHOLE, 640, 480, &[500.0, 501.0, 320.0, 240.0])
+                .unwrap();
+        let mut reconstruction = test_reconstruction_with_cameras(vec![(1, camera)], vec![0, 0]);
+        reconstruction.poses = vec![Some(SE3::identity()), Some(SE3::identity())];
+        reconstruction.keypoints = vec![
+            vec![test_keypoint(10.0, 20.0)],
+            vec![test_keypoint(30.0, 40.0)],
+        ];
+        reconstruction.observations = vec![vec![Some(0)], vec![Some(0)]];
+        reconstruction.point_ids = vec![99];
+        reconstruction.points = vec![Point3D {
+            xyz: [1.0, 2.0, 3.0],
+            color: [4, 5, 6],
+            error: 0.25,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        }];
+
+        write_images_txt(&dir.path().join("images.txt"), &reconstruction)?;
+        write_points3d_txt(&dir.path().join("points3D.txt"), &reconstruction)?;
+
+        let images = fs::read_to_string(dir.path().join("images.txt"))?;
+        let points = fs::read_to_string(dir.path().join("points3D.txt"))?;
+        assert!(images.contains("10.000000 20.000000 99"));
+        assert!(images.contains("30.000000 40.000000 99"));
+        assert!(
+            points.contains("\n99 1.000000000 2.000000000 3.000000000 4 5 6 0.250000 1 0 2 0\n")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn manual_intrinsic_override_updates_exported_params() {
         let mut camera =
             CameraModel::from_colmap(COLMAP_PINHOLE, 640, 480, &[500.0, 501.0, 320.0, 240.0])
@@ -615,7 +658,18 @@ mod tests {
             poses: vec![None; image_count],
             observations: vec![Vec::new(); image_count],
             keypoints: vec![Vec::new(); image_count],
+            point_ids: Vec::new(),
             points: Vec::new(),
+        }
+    }
+
+    fn test_keypoint(x: f32, y: f32) -> KeyPoint {
+        KeyPoint {
+            pt: (x, y),
+            size: 1.0,
+            angle: 0.0,
+            response: 1.0,
+            octave: 0,
         }
     }
 }
