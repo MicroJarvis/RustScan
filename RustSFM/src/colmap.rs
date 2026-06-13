@@ -59,6 +59,53 @@ pub struct ColmapPoint3D {
     pub track: Vec<ColmapTrackElement>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColmapSensorType {
+    Invalid,
+    Camera,
+    Imu,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColmapSensorId {
+    pub sensor_type: ColmapSensorType,
+    pub sensor_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColmapRigid3 {
+    pub qvec: [f64; 4],
+    pub tvec: [f64; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColmapRigSensor {
+    pub sensor_id: ColmapSensorId,
+    pub sensor_from_rig: Option<ColmapRigid3>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColmapRig {
+    pub rig_id: u32,
+    pub ref_sensor_id: Option<ColmapSensorId>,
+    pub sensors: Vec<ColmapRigSensor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColmapDataId {
+    pub sensor_id: ColmapSensorId,
+    pub data_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColmapFrame {
+    pub frame_id: u32,
+    pub rig_id: u32,
+    pub rig_from_world: ColmapRigid3,
+    pub data_ids: Vec<ColmapDataId>,
+}
+
 pub fn read_camera_model(root: &Path) -> Result<CameraModel> {
     let sparse = resolve_sparse_dir(root)?;
     let bin = sparse.join("cameras.bin");
@@ -157,6 +204,24 @@ pub fn read_colmap_points3d(root: &Path) -> Result<Vec<ColmapPoint3D>> {
     )
 }
 
+pub fn read_colmap_rigs(root: &Path) -> Result<Vec<ColmapRig>> {
+    let sparse = resolve_sparse_dir(root)?;
+    let txt = sparse.join("rigs.txt");
+    if txt.exists() {
+        return read_rigs_txt(&txt);
+    }
+    bail!("missing rigs.txt under {}", sparse.display())
+}
+
+pub fn read_colmap_frames(root: &Path) -> Result<Vec<ColmapFrame>> {
+    let sparse = resolve_sparse_dir(root)?;
+    let txt = sparse.join("frames.txt");
+    if txt.exists() {
+        return read_frames_txt(&txt);
+    }
+    bail!("missing frames.txt under {}", sparse.display())
+}
+
 pub fn resolve_sparse_dir(root: &Path) -> Result<PathBuf> {
     if has_model_files(root) {
         return Ok(root.to_path_buf());
@@ -182,6 +247,8 @@ fn has_model_files(path: &Path) -> bool {
         || path.join("cameras.txt").exists()
         || path.join("points3D.bin").exists()
         || path.join("points3D.txt").exists()
+        || path.join("rigs.txt").exists()
+        || path.join("frames.txt").exists()
 }
 
 pub fn camera_center(pose: &ColmapPose) -> Vector3<f64> {
@@ -574,6 +641,144 @@ fn read_points3d_bin(path: &Path) -> Result<Vec<ColmapPoint3D>> {
     Ok(points)
 }
 
+fn read_rigs_txt(path: &Path) -> Result<Vec<ColmapRig>> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut rigs = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 2 || parts[0].parse::<u32>().is_err() {
+            continue;
+        }
+        let rig_id = parts[0].parse()?;
+        let num_sensors = parts[1].parse::<usize>()?;
+        let mut cursor = 2usize;
+        let ref_sensor_id = if num_sensors > 0 {
+            Some(parse_sensor_id(&parts, &mut cursor, path)?)
+        } else {
+            None
+        };
+        let mut sensors = Vec::new();
+        for _ in 0..num_sensors.saturating_sub(1) {
+            let sensor_id = parse_sensor_id(&parts, &mut cursor, path)?;
+            let has_pose = parse_next::<u32>(&parts, &mut cursor, path)? == 1;
+            let sensor_from_rig = if has_pose {
+                Some(parse_rigid3(&parts, &mut cursor, path)?)
+            } else {
+                None
+            };
+            sensors.push(ColmapRigSensor {
+                sensor_id,
+                sensor_from_rig,
+            });
+        }
+        if cursor != parts.len() {
+            bail!("unexpected trailing rig fields in {}", path.display());
+        }
+        rigs.push(ColmapRig {
+            rig_id,
+            ref_sensor_id,
+            sensors,
+        });
+    }
+    Ok(rigs)
+}
+
+fn read_frames_txt(path: &Path) -> Result<Vec<ColmapFrame>> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut frames = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 10 || parts[0].parse::<u32>().is_err() {
+            continue;
+        }
+        let mut cursor = 0usize;
+        let frame_id = parse_next(&parts, &mut cursor, path)?;
+        let rig_id = parse_next(&parts, &mut cursor, path)?;
+        let rig_from_world = parse_rigid3(&parts, &mut cursor, path)?;
+        let num_data_ids = parse_next::<usize>(&parts, &mut cursor, path)?;
+        let mut data_ids = Vec::with_capacity(num_data_ids);
+        for _ in 0..num_data_ids {
+            let sensor_id = parse_sensor_id(&parts, &mut cursor, path)?;
+            let data_id = parse_next(&parts, &mut cursor, path)?;
+            data_ids.push(ColmapDataId { sensor_id, data_id });
+        }
+        if cursor != parts.len() {
+            bail!("unexpected trailing frame fields in {}", path.display());
+        }
+        frames.push(ColmapFrame {
+            frame_id,
+            rig_id,
+            rig_from_world,
+            data_ids,
+        });
+    }
+    Ok(frames)
+}
+
+fn parse_rigid3(parts: &[&str], cursor: &mut usize, path: &Path) -> Result<ColmapRigid3> {
+    Ok(ColmapRigid3 {
+        qvec: [
+            parse_next(parts, cursor, path)?,
+            parse_next(parts, cursor, path)?,
+            parse_next(parts, cursor, path)?,
+            parse_next(parts, cursor, path)?,
+        ],
+        tvec: [
+            parse_next(parts, cursor, path)?,
+            parse_next(parts, cursor, path)?,
+            parse_next(parts, cursor, path)?,
+        ],
+    })
+}
+
+fn parse_sensor_id(parts: &[&str], cursor: &mut usize, path: &Path) -> Result<ColmapSensorId> {
+    let sensor_type = parse_next_str(parts, cursor, path)?;
+    let sensor_id = parse_next(parts, cursor, path)?;
+    Ok(ColmapSensorId {
+        sensor_type: ColmapSensorType::from_colmap_str(sensor_type),
+        sensor_id,
+    })
+}
+
+fn parse_next<T>(parts: &[&str], cursor: &mut usize, path: &Path) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let value = parse_next_str(parts, cursor, path)?;
+    Ok(value.parse()?)
+}
+
+fn parse_next_str<'a>(parts: &'a [&'a str], cursor: &mut usize, path: &Path) -> Result<&'a str> {
+    let value = parts
+        .get(*cursor)
+        .copied()
+        .with_context(|| format!("truncated COLMAP text record in {}", path.display()))?;
+    *cursor += 1;
+    Ok(value)
+}
+
+impl ColmapSensorType {
+    fn from_colmap_str(value: &str) -> Self {
+        match value {
+            "INVALID" => Self::Invalid,
+            "CAMERA" => Self::Camera,
+            "IMU" => Self::Imu,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 fn read_u8(r: &mut impl Read) -> std::io::Result<u8> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
@@ -936,6 +1141,90 @@ mod tests {
                 ColmapTrackElement {
                     image_id: 8,
                     point2d_idx: 13,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_text_rigs_with_reference_and_sensor_poses() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("rigs.txt"),
+            "# rigs\n3 3 CAMERA 11 CAMERA 12 1 1 0 0 0 0.1 0.2 0.3 IMU 5 0\n",
+        )?;
+
+        let rigs = read_colmap_rigs(dir.path())?;
+
+        assert_eq!(rigs.len(), 1);
+        assert_eq!(rigs[0].rig_id, 3);
+        assert_eq!(
+            rigs[0].ref_sensor_id,
+            Some(ColmapSensorId {
+                sensor_type: ColmapSensorType::Camera,
+                sensor_id: 11,
+            })
+        );
+        assert_eq!(rigs[0].sensors.len(), 2);
+        assert_eq!(
+            rigs[0].sensors[0].sensor_id,
+            ColmapSensorId {
+                sensor_type: ColmapSensorType::Camera,
+                sensor_id: 12,
+            }
+        );
+        assert_eq!(
+            rigs[0].sensors[0].sensor_from_rig,
+            Some(ColmapRigid3 {
+                qvec: [1.0, 0.0, 0.0, 0.0],
+                tvec: [0.1, 0.2, 0.3],
+            })
+        );
+        assert_eq!(rigs[0].sensors[1].sensor_from_rig, None);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_text_frames_with_data_ids() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("frames.txt"),
+            "# frames\n9 3 1 0 0 0 0.4 0.5 0.6 2 CAMERA 11 7 IMU 5 99\n",
+        )?;
+
+        let frames = read_colmap_frames(dir.path())?;
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_id, 9);
+        assert_eq!(frames[0].rig_id, 3);
+        assert_eq!(
+            frames[0].rig_from_world,
+            ColmapRigid3 {
+                qvec: [1.0, 0.0, 0.0, 0.0],
+                tvec: [0.4, 0.5, 0.6],
+            }
+        );
+        assert_eq!(
+            frames[0].data_ids,
+            vec![
+                ColmapDataId {
+                    sensor_id: ColmapSensorId {
+                        sensor_type: ColmapSensorType::Camera,
+                        sensor_id: 11,
+                    },
+                    data_id: 7,
+                },
+                ColmapDataId {
+                    sensor_id: ColmapSensorId {
+                        sensor_type: ColmapSensorType::Imu,
+                        sensor_id: 5,
+                    },
+                    data_id: 99,
                 },
             ]
         );
