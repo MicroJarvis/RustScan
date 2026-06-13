@@ -1203,10 +1203,10 @@ fn incremental_map(
     triangulate_pair(initial, frames, &mut reconstruction, config);
 
     let pnp_solver = PnPSolver {
-        ransac_threshold: config.pnp_threshold_px,
+        ransac_threshold: camera.cam_from_img_threshold(config.pnp_threshold_px as f64) as f32,
         ransac_confidence: 0.999,
         ransac_max_iterations: config.pnp_iterations,
-        ..PnPSolver::new(camera.fx, camera.fy, camera.cx, camera.cy)
+        ..PnPSolver::new(1.0, 1.0, 0.0, 0.0)
     };
     while reconstruction.poses.iter().any(|p| p.is_none()) {
         let Some(choice) =
@@ -1420,6 +1420,7 @@ fn solve_absolute_pose(
     solver: &PnPSolver,
     config: &MapperConfig,
 ) -> Option<AbsolutePose> {
+    let camera = reconstruction.camera_for_image(image);
     let mut problem = PnPProblem::new();
     let mut xy_and_points = Vec::new();
     let mut used_features = HashSet::new();
@@ -1455,8 +1456,9 @@ fn solve_absolute_pose(
             }
             let kp = &frames[image].keypoints[feature];
             let xy = [kp.x(), kp.y()];
+            let norm_xy = camera.cam_from_img_f32(xy[0], xy[1])?;
             let xyz = reconstruction.points[point_id].xyz;
-            problem.add_correspondence(xy, xyz);
+            problem.add_correspondence(norm_xy, xyz);
             xy_and_points.push((xy, xyz));
         }
     }
@@ -1470,12 +1472,7 @@ fn solve_absolute_pose(
         if !inliers.get(idx).copied().unwrap_or(false) {
             continue;
         }
-        let err = crate::geometry::reprojection_error_px(
-            xyz,
-            pose,
-            xy,
-            reconstruction.camera_for_image(image),
-        );
+        let err = crate::geometry::reprojection_error_px(xyz, pose, xy, camera);
         if err <= config.max_reprojection_error_px {
             count += 1;
             total_error += err;
