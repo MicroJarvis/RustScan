@@ -1,12 +1,16 @@
-use crate::colmap::ColmapCamera;
+use crate::colmap::{
+    ColmapCamera, ColmapDataId, ColmapRig, ColmapRigSensor, ColmapRigid3, ColmapSensorId,
+    ColmapSensorType,
+};
 use crate::correspondence_graph::{
     image_pair_to_pair_id, pair_id_to_image_pair, should_swap_image_pair, CorrespondenceGraph,
     FeatureMatch, ImageId, ImagePairId, TwoViewGeometryRecord,
 };
 use crate::types::colmap_camera_model_num_params;
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Rows};
 use rustslam::{Descriptors, KeyPoint};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,6 +152,13 @@ pub struct ColmapDatabaseImage {
     pub frame_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColmapDatabaseFrame {
+    pub frame_id: u32,
+    pub rig_id: u32,
+    pub data_ids: Vec<ColmapDataId>,
+}
+
 impl ColmapDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).context("open COLMAP database")?;
@@ -172,7 +183,33 @@ impl ColmapDatabase {
                  camera_id INTEGER NOT NULL,
                  CHECK(image_id >= 0 and image_id < 2147483647),
                  FOREIGN KEY(camera_id) REFERENCES cameras(camera_id));
-             CREATE UNIQUE INDEX IF NOT EXISTS index_name ON images(name);",
+             CREATE UNIQUE INDEX IF NOT EXISTS index_name ON images(name);
+             CREATE TABLE IF NOT EXISTS rigs
+                (rig_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                 ref_sensor_id INTEGER NOT NULL,
+                 ref_sensor_type INTEGER NOT NULL);
+             CREATE UNIQUE INDEX IF NOT EXISTS rig_ref_sensor_assignment
+                ON rigs(ref_sensor_id, ref_sensor_type);
+             CREATE TABLE IF NOT EXISTS rig_sensors
+                (rig_id INTEGER NOT NULL,
+                 sensor_id INTEGER NOT NULL,
+                 sensor_type INTEGER NOT NULL,
+                 sensor_from_rig BLOB,
+                 FOREIGN KEY(rig_id) REFERENCES rigs(rig_id) ON DELETE CASCADE);
+             CREATE UNIQUE INDEX IF NOT EXISTS rig_sensor_assignment
+                ON rig_sensors(sensor_id, sensor_type);
+             CREATE TABLE IF NOT EXISTS frames
+                (frame_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                 rig_id INTEGER NOT NULL,
+                 FOREIGN KEY(rig_id) REFERENCES rigs(rig_id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS frame_data
+                (frame_id INTEGER NOT NULL,
+                 data_id INTEGER NOT NULL,
+                 sensor_id INTEGER NOT NULL,
+                 sensor_type INTEGER NOT NULL,
+                 FOREIGN KEY(frame_id) REFERENCES frames(frame_id) ON DELETE CASCADE);
+             CREATE UNIQUE INDEX IF NOT EXISTS frame_sensor_assignment
+                ON frame_data(data_id, sensor_type);",
         )?;
         self.create_feature_tables()?;
         Ok(())
@@ -319,6 +356,108 @@ impl ColmapDatabase {
             out.push(read_image_row(row)?);
         }
         Ok(out)
+    }
+
+    pub fn write_rig(&self, rig: &ColmapRig, use_rig_id: bool) -> Result<u32> {
+        let ref_sensor_id = rig
+            .ref_sensor_id
+            .as_ref()
+            .context("COLMAP database rig requires a reference sensor")?;
+        if rig.sensors.is_empty() {
+            bail!("COLMAP database rig requires at least one sensor");
+        }
+        if use_rig_id {
+            self.conn.execute(
+                "INSERT INTO rigs(rig_id, ref_sensor_id, ref_sensor_type) VALUES(?1, ?2, ?3);",
+                params![
+                    rig.rig_id,
+                    ref_sensor_id.sensor_id,
+                    sensor_type_to_i64(&ref_sensor_id.sensor_type)?
+                ],
+            )?;
+            write_rig_sensors(&self.conn, rig.rig_id, rig)?;
+            Ok(rig.rig_id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO rigs(rig_id, ref_sensor_id, ref_sensor_type) VALUES(NULL, ?1, ?2);",
+                params![
+                    ref_sensor_id.sensor_id,
+                    sensor_type_to_i64(&ref_sensor_id.sensor_type)?
+                ],
+            )?;
+            let rig_id = self.conn.last_insert_rowid() as u32;
+            write_rig_sensors(&self.conn, rig_id, rig)?;
+            Ok(rig_id)
+        }
+    }
+
+    pub fn read_rig(&self, rig_id: u32) -> Result<Option<ColmapRig>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rigs.rig_id, rigs.ref_sensor_id, rigs.ref_sensor_type,
+                    rig_sensors.sensor_id, rig_sensors.sensor_type, rig_sensors.sensor_from_rig
+             FROM rigs
+             LEFT OUTER JOIN rig_sensors ON rigs.rig_id = rig_sensors.rig_id
+             WHERE rigs.rig_id = ?1
+             ORDER BY rigs.rig_id;",
+        )?;
+        let mut rows = stmt.query(params![rig_id])?;
+        Ok(collect_rig_rows(&mut rows)?.into_iter().next())
+    }
+
+    pub fn read_all_rigs(&self) -> Result<Vec<ColmapRig>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rigs.rig_id, rigs.ref_sensor_id, rigs.ref_sensor_type,
+                    rig_sensors.sensor_id, rig_sensors.sensor_type, rig_sensors.sensor_from_rig
+             FROM rigs
+             LEFT OUTER JOIN rig_sensors ON rigs.rig_id = rig_sensors.rig_id
+             ORDER BY rigs.rig_id;",
+        )?;
+        let mut rows = stmt.query([])?;
+        collect_rig_rows(&mut rows)
+    }
+
+    pub fn write_frame(&self, frame: &ColmapDatabaseFrame, use_frame_id: bool) -> Result<u32> {
+        if use_frame_id {
+            self.conn.execute(
+                "INSERT INTO frames(frame_id, rig_id) VALUES(?1, ?2);",
+                params![frame.frame_id, frame.rig_id],
+            )?;
+            write_frame_data(&self.conn, frame.frame_id, frame)?;
+            Ok(frame.frame_id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO frames(frame_id, rig_id) VALUES(NULL, ?1);",
+                params![frame.rig_id],
+            )?;
+            let frame_id = self.conn.last_insert_rowid() as u32;
+            write_frame_data(&self.conn, frame_id, frame)?;
+            Ok(frame_id)
+        }
+    }
+
+    pub fn read_frame(&self, frame_id: u32) -> Result<Option<ColmapDatabaseFrame>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT frames.frame_id, frames.rig_id, frame_data.data_id,
+                    frame_data.sensor_id, frame_data.sensor_type
+             FROM frames
+             LEFT OUTER JOIN frame_data ON frames.frame_id = frame_data.frame_id
+             WHERE frames.frame_id = ?1
+             ORDER BY frames.frame_id;",
+        )?;
+        let mut rows = stmt.query(params![frame_id])?;
+        Ok(collect_frame_rows(&mut rows)?.into_iter().next())
+    }
+
+    pub fn read_all_frames(&self) -> Result<Vec<ColmapDatabaseFrame>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT frames.frame_id, frames.rig_id, frame_data.data_id,
+                    frame_data.sensor_id, frame_data.sensor_type
+             FROM frames
+             LEFT OUTER JOIN frame_data ON frames.frame_id = frame_data.frame_id
+             ORDER BY frames.frame_id;",
+        )?;
+        let mut rows = stmt.query([])?;
+        collect_frame_rows(&mut rows)
     }
 
     pub fn write_keypoints(&self, image_id: ImageId, keypoints: &[ColmapKeypoint]) -> Result<()> {
@@ -698,6 +837,134 @@ fn read_image_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseImage> {
     })
 }
 
+fn collect_rig_rows(rows: &mut Rows<'_>) -> Result<Vec<ColmapRig>> {
+    let mut rigs = BTreeMap::<u32, ColmapRig>::new();
+    while let Some(row) = rows.next()? {
+        let rig_id = row.get::<_, i64>(0)? as u32;
+        if let std::collections::btree_map::Entry::Vacant(entry) = rigs.entry(rig_id) {
+            entry.insert(ColmapRig {
+                rig_id,
+                ref_sensor_id: Some(ColmapSensorId {
+                    sensor_id: row.get::<_, i64>(1)? as u32,
+                    sensor_type: sensor_type_from_i64(row.get::<_, i64>(2)?),
+                }),
+                sensors: Vec::new(),
+            });
+        }
+        let rig = rigs.get_mut(&rig_id).expect("rig inserted");
+        push_rig_sensor_from_row(rig, row)?;
+    }
+    Ok(rigs.into_values().collect())
+}
+
+fn push_rig_sensor_from_row(rig: &mut ColmapRig, row: &Row<'_>) -> Result<()> {
+    let sensor_id = row.get::<_, Option<i64>>(3)?;
+    let Some(sensor_id) = sensor_id else {
+        return Ok(());
+    };
+    let sensor_from_rig = row
+        .get::<_, Option<Vec<u8>>>(5)?
+        .as_deref()
+        .map(decode_rigid3_blob)
+        .transpose()?;
+    rig.sensors.push(ColmapRigSensor {
+        sensor_id: ColmapSensorId {
+            sensor_id: sensor_id as u32,
+            sensor_type: sensor_type_from_i64(row.get::<_, i64>(4)?),
+        },
+        sensor_from_rig,
+    });
+    Ok(())
+}
+
+fn collect_frame_rows(rows: &mut Rows<'_>) -> Result<Vec<ColmapDatabaseFrame>> {
+    let mut frames = BTreeMap::<u32, ColmapDatabaseFrame>::new();
+    while let Some(row) = rows.next()? {
+        let frame_id = row.get::<_, i64>(0)? as u32;
+        if let std::collections::btree_map::Entry::Vacant(entry) = frames.entry(frame_id) {
+            entry.insert(ColmapDatabaseFrame {
+                frame_id,
+                rig_id: row.get::<_, i64>(1)? as u32,
+                data_ids: Vec::new(),
+            });
+        }
+        let frame = frames.get_mut(&frame_id).expect("frame inserted");
+        push_frame_data_from_row(frame, row)?;
+    }
+    Ok(frames.into_values().collect())
+}
+
+fn push_frame_data_from_row(frame: &mut ColmapDatabaseFrame, row: &Row<'_>) -> Result<()> {
+    let data_id = row.get::<_, Option<i64>>(2)?;
+    let Some(data_id) = data_id else {
+        return Ok(());
+    };
+    frame.data_ids.push(ColmapDataId {
+        data_id: data_id as u64,
+        sensor_id: ColmapSensorId {
+            sensor_id: row.get::<_, i64>(3)? as u32,
+            sensor_type: sensor_type_from_i64(row.get::<_, i64>(4)?),
+        },
+    });
+    Ok(())
+}
+
+fn write_rig_sensors(conn: &Connection, rig_id: u32, rig: &ColmapRig) -> Result<()> {
+    for sensor in &rig.sensors {
+        if rig.ref_sensor_id.as_ref() == Some(&sensor.sensor_id) {
+            continue;
+        }
+        let pose_blob = sensor.sensor_from_rig.as_ref().map(encode_rigid3_blob);
+        conn.execute(
+            "INSERT INTO rig_sensors(rig_id, sensor_id, sensor_type, sensor_from_rig)
+             VALUES(?1, ?2, ?3, ?4);",
+            params![
+                rig_id,
+                sensor.sensor_id.sensor_id,
+                sensor_type_to_i64(&sensor.sensor_id.sensor_type)?,
+                pose_blob
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn write_frame_data(conn: &Connection, frame_id: u32, frame: &ColmapDatabaseFrame) -> Result<()> {
+    for data_id in &frame.data_ids {
+        conn.execute(
+            "INSERT INTO frame_data(frame_id, data_id, sensor_id, sensor_type)
+             VALUES(?1, ?2, ?3, ?4);",
+            params![
+                frame_id,
+                data_id.data_id as i64,
+                data_id.sensor_id.sensor_id,
+                sensor_type_to_i64(&data_id.sensor_id.sensor_type)?
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn sensor_type_to_i64(sensor_type: &ColmapSensorType) -> Result<i64> {
+    match sensor_type {
+        ColmapSensorType::Invalid => Ok(-1),
+        ColmapSensorType::Camera => Ok(0),
+        ColmapSensorType::Imu => Ok(1),
+        ColmapSensorType::Other(value) => {
+            bail!("cannot write non-COLMAP sensor type {value:?} to SQLite database")
+        }
+    }
+}
+
+fn sensor_type_from_i64(value: i64) -> ColmapSensorType {
+    match value {
+        -1 => ColmapSensorType::Invalid,
+        0 => ColmapSensorType::Camera,
+        1 => ColmapSensorType::Imu,
+        other => ColmapSensorType::Other(other.to_string()),
+    }
+}
+
 fn validate_camera_params(camera: &ColmapCamera) -> Result<()> {
     let expected = colmap_camera_model_num_params(camera.model_id)
         .with_context(|| format!("unsupported COLMAP camera model id {}", camera.model_id))?;
@@ -864,6 +1131,21 @@ fn decode_f64_values_vec(data: &[u8]) -> Result<Vec<f64>> {
         .collect())
 }
 
+fn encode_rigid3_blob(rigid: &ColmapRigid3) -> Vec<u8> {
+    let mut values = Vec::with_capacity(7);
+    values.extend_from_slice(&rigid.qvec);
+    values.extend_from_slice(&rigid.tvec);
+    encode_f64_blob(&values)
+}
+
+fn decode_rigid3_blob(data: &[u8]) -> Result<ColmapRigid3> {
+    let values = decode_f64_values::<7>(data)?;
+    Ok(ColmapRigid3 {
+        qvec: [values[0], values[1], values[2], values[3]],
+        tvec: [values[4], values[5], values[6]],
+    })
+}
+
 fn encode_matrix3_colmap_blob(matrix: [f64; 9]) -> Vec<u8> {
     encode_f64_blob(&transpose3(matrix))
 }
@@ -966,6 +1248,104 @@ mod tests {
         let image = db.read_image(image_id).unwrap().unwrap();
         assert_eq!(image.name, "auto.jpg");
         assert_eq!(image.camera_id, camera_id);
+    }
+
+    #[test]
+    fn rigs_and_frames_roundtrip_through_colmap_tables() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let ref_sensor = ColmapSensorId {
+            sensor_type: ColmapSensorType::Camera,
+            sensor_id: 10,
+        };
+        let other_sensor = ColmapSensorId {
+            sensor_type: ColmapSensorType::Camera,
+            sensor_id: 11,
+        };
+        let rig = ColmapRig {
+            rig_id: 5,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                ColmapRigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                ColmapRigSensor {
+                    sensor_id: other_sensor.clone(),
+                    sensor_from_rig: Some(ColmapRigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [0.1, 0.2, 0.3],
+                    }),
+                },
+            ],
+        };
+
+        assert_eq!(db.write_rig(&rig, true).unwrap(), 5);
+        let mut expected_rig = rig.clone();
+        expected_rig.sensors = vec![rig.sensors[1].clone()];
+        assert_eq!(db.read_rig(5).unwrap(), Some(expected_rig.clone()));
+        assert_eq!(db.read_all_rigs().unwrap(), vec![expected_rig]);
+
+        let frame = ColmapDatabaseFrame {
+            frame_id: 7,
+            rig_id: 5,
+            data_ids: vec![
+                ColmapDataId {
+                    sensor_id: ref_sensor,
+                    data_id: 101,
+                },
+                ColmapDataId {
+                    sensor_id: other_sensor,
+                    data_id: 102,
+                },
+            ],
+        };
+        assert_eq!(db.write_frame(&frame, true).unwrap(), 7);
+        assert_eq!(db.read_frame(7).unwrap(), Some(frame.clone()));
+        assert_eq!(db.read_all_frames().unwrap(), vec![frame]);
+    }
+
+    #[test]
+    fn rig_and_frame_autoincrement_ids_match_sqlite_rowid() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let rig_id = db
+            .write_rig(
+                &ColmapRig {
+                    rig_id: 0,
+                    ref_sensor_id: Some(ColmapSensorId {
+                        sensor_type: ColmapSensorType::Camera,
+                        sensor_id: 1,
+                    }),
+                    sensors: vec![ColmapRigSensor {
+                        sensor_id: ColmapSensorId {
+                            sensor_type: ColmapSensorType::Camera,
+                            sensor_id: 1,
+                        },
+                        sensor_from_rig: None,
+                    }],
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(rig_id, 1);
+        let frame_id = db
+            .write_frame(
+                &ColmapDatabaseFrame {
+                    frame_id: 0,
+                    rig_id,
+                    data_ids: vec![ColmapDataId {
+                        sensor_id: ColmapSensorId {
+                            sensor_type: ColmapSensorType::Camera,
+                            sensor_id: 1,
+                        },
+                        data_id: 44,
+                    }],
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(frame_id, 1);
     }
 
     #[test]

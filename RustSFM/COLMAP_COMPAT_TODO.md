@@ -79,9 +79,10 @@ reconstruction parity.
    - Added SQLite cameras/images table read-write support with COLMAP camera
      parameter blobs, prior-focal flags, explicit or autoincrement ids, and
      image-name lookup.
+   - Added SQLite rigs/rig_sensors/frames/frame_data read-write support for
+     COLMAP rig sensor ids, optional sensor-from-rig poses, and frame data ids.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache loading, rigs/frames/pose-prior database tables, and mapper
-     integration.
+     cache loading, pose-prior database tables, and mapper integration.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 
