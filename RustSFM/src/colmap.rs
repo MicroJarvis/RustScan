@@ -35,7 +35,7 @@ pub struct ColmapImage {
     pub points2d: Vec<ColmapPoint2D>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ColmapCamera {
     pub camera_id: u32,
     pub model_id: i32,

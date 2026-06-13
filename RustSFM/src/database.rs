@@ -1,9 +1,11 @@
+use crate::colmap::ColmapCamera;
 use crate::correspondence_graph::{
     image_pair_to_pair_id, pair_id_to_image_pair, should_swap_image_pair, CorrespondenceGraph,
     FeatureMatch, ImageId, ImagePairId, TwoViewGeometryRecord,
 };
+use crate::types::colmap_camera_model_num_params;
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use rustslam::{Descriptors, KeyPoint};
 use std::path::Path;
 
@@ -132,12 +134,48 @@ pub struct ColmapDatabase {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColmapDatabaseCamera {
+    pub camera: ColmapCamera,
+    pub has_prior_focal_length: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColmapDatabaseImage {
+    pub image_id: ImageId,
+    pub name: String,
+    pub camera_id: u32,
+    pub frame_id: Option<u32>,
+}
+
 impl ColmapDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).context("open COLMAP database")?;
         let db = Self { conn };
-        db.create_feature_tables()?;
+        db.create_core_tables()?;
         Ok(db)
+    }
+
+    pub fn create_core_tables(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS cameras
+                (camera_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                 model INTEGER NOT NULL,
+                 width INTEGER NOT NULL,
+                 height INTEGER NOT NULL,
+                 params BLOB,
+                 prior_focal_length INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS images
+                (image_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                 name TEXT NOT NULL UNIQUE,
+                 camera_id INTEGER NOT NULL,
+                 CHECK(image_id >= 0 and image_id < 2147483647),
+                 FOREIGN KEY(camera_id) REFERENCES cameras(camera_id));
+             CREATE UNIQUE INDEX IF NOT EXISTS index_name ON images(name);",
+        )?;
+        self.create_feature_tables()?;
+        Ok(())
     }
 
     pub fn create_feature_tables(&self) -> Result<()> {
@@ -171,6 +209,116 @@ impl ColmapDatabase {
                  tvec BLOB);",
         )?;
         Ok(())
+    }
+
+    pub fn write_camera(&self, camera: &ColmapDatabaseCamera, use_camera_id: bool) -> Result<u32> {
+        validate_camera_params(&camera.camera)?;
+        let params_blob = encode_f64_blob(&camera.camera.params);
+        if use_camera_id {
+            self.conn.execute(
+                "INSERT INTO cameras(camera_id, model, width, height, params, prior_focal_length)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6);",
+                params![
+                    camera.camera.camera_id,
+                    camera.camera.model_id,
+                    camera.camera.width,
+                    camera.camera.height,
+                    params_blob,
+                    camera.has_prior_focal_length as i64
+                ],
+            )?;
+            Ok(camera.camera.camera_id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO cameras(camera_id, model, width, height, params, prior_focal_length)
+                 VALUES(NULL, ?1, ?2, ?3, ?4, ?5);",
+                params![
+                    camera.camera.model_id,
+                    camera.camera.width,
+                    camera.camera.height,
+                    params_blob,
+                    camera.has_prior_focal_length as i64
+                ],
+            )?;
+            Ok(self.conn.last_insert_rowid() as u32)
+        }
+    }
+
+    pub fn read_camera(&self, camera_id: u32) -> Result<Option<ColmapDatabaseCamera>> {
+        self.conn
+            .query_row(
+                "SELECT camera_id, model, width, height, params, prior_focal_length
+                 FROM cameras WHERE camera_id = ?1;",
+                params![camera_id],
+                read_camera_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn read_all_cameras(&self) -> Result<Vec<ColmapDatabaseCamera>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT camera_id, model, width, height, params, prior_focal_length
+             FROM cameras;",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(read_camera_row(row)?);
+        }
+        Ok(out)
+    }
+
+    pub fn write_image(&self, image: &ColmapDatabaseImage, use_image_id: bool) -> Result<ImageId> {
+        if use_image_id {
+            self.conn.execute(
+                "INSERT INTO images(image_id, name, camera_id) VALUES(?1, ?2, ?3);",
+                params![image.image_id, &image.name, image.camera_id],
+            )?;
+            Ok(image.image_id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO images(image_id, name, camera_id) VALUES(NULL, ?1, ?2);",
+                params![&image.name, image.camera_id],
+            )?;
+            Ok(self.conn.last_insert_rowid() as ImageId)
+        }
+    }
+
+    pub fn read_image(&self, image_id: ImageId) -> Result<Option<ColmapDatabaseImage>> {
+        self.conn
+            .query_row(
+                "SELECT image_id, name, camera_id, NULL as frame_id
+                 FROM images WHERE image_id = ?1;",
+                params![image_id],
+                read_image_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn read_image_with_name(&self, name: &str) -> Result<Option<ColmapDatabaseImage>> {
+        self.conn
+            .query_row(
+                "SELECT image_id, name, camera_id, NULL as frame_id
+                 FROM images WHERE name = ?1;",
+                params![name],
+                read_image_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn read_all_images(&self) -> Result<Vec<ColmapDatabaseImage>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT image_id, name, camera_id, NULL as frame_id FROM images;")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(read_image_row(row)?);
+        }
+        Ok(out)
     }
 
     pub fn write_keypoints(&self, image_id: ImageId, keypoints: &[ColmapKeypoint]) -> Result<()> {
@@ -520,6 +668,59 @@ impl ColmapDatabase {
     }
 }
 
+fn read_camera_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseCamera> {
+    let camera_id = row.get::<_, i64>(0)? as u32;
+    let model_id = row.get::<_, i64>(1)? as i32;
+    let width = row.get::<_, i64>(2)? as u32;
+    let height = row.get::<_, i64>(3)? as u32;
+    let params_blob = row.get::<_, Vec<u8>>(4)?;
+    let params = decode_f64_values_vec(&params_blob).map_err(to_sql_error)?;
+    let camera = ColmapCamera {
+        camera_id,
+        model_id,
+        width,
+        height,
+        params,
+    };
+    validate_camera_params(&camera).map_err(to_sql_error)?;
+    Ok(ColmapDatabaseCamera {
+        camera,
+        has_prior_focal_length: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+fn read_image_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseImage> {
+    Ok(ColmapDatabaseImage {
+        image_id: row.get::<_, i64>(0)? as ImageId,
+        name: row.get(1)?,
+        camera_id: row.get::<_, i64>(2)? as u32,
+        frame_id: row.get::<_, Option<i64>>(3)?.map(|id| id as u32),
+    })
+}
+
+fn validate_camera_params(camera: &ColmapCamera) -> Result<()> {
+    let expected = colmap_camera_model_num_params(camera.model_id)
+        .with_context(|| format!("unsupported COLMAP camera model id {}", camera.model_id))?;
+    if camera.params.len() != expected {
+        bail!(
+            "camera_id={} model_id={} has {} params, expected {}",
+            camera.camera_id,
+            camera.model_id,
+            camera.params.len(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn to_sql_error(err: anyhow::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Blob,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+    )
+}
+
 fn encode_keypoints_blob(keypoints: &[ColmapKeypoint]) -> (usize, usize, Vec<u8>) {
     let mut values = Vec::with_capacity(keypoints.len() * 6);
     for kp in keypoints {
@@ -653,6 +854,16 @@ fn decode_f64_values<const N: usize>(data: &[u8]) -> Result<[f64; N]> {
     Ok(out)
 }
 
+fn decode_f64_values_vec(data: &[u8]) -> Result<Vec<f64>> {
+    if data.len() % std::mem::size_of::<f64>() != 0 {
+        bail!("float64 blob byte length is not divisible by 8");
+    }
+    Ok(data
+        .chunks_exact(8)
+        .map(|chunk| f64::from_ne_bytes(chunk.try_into().expect("chunk length")))
+        .collect())
+}
+
 fn encode_matrix3_colmap_blob(matrix: [f64; 9]) -> Vec<u8> {
     encode_f64_blob(&transpose3(matrix))
 }
@@ -683,6 +894,78 @@ mod tests {
 
     fn m(point2d_idx1: u32, point2d_idx2: u32) -> FeatureMatch {
         FeatureMatch::new(point2d_idx1, point2d_idx2)
+    }
+
+    #[test]
+    fn cameras_and_images_roundtrip_through_colmap_tables() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let camera = ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 7,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 1920,
+                height: 1080,
+                params: vec![1000.0, 1001.0, 960.0, 540.0],
+            },
+            has_prior_focal_length: true,
+        };
+
+        assert_eq!(db.write_camera(&camera, true).unwrap(), 7);
+        assert_eq!(db.read_camera(7).unwrap(), Some(camera.clone()));
+        assert_eq!(db.read_all_cameras().unwrap(), vec![camera.clone()]);
+
+        let image = ColmapDatabaseImage {
+            image_id: 11,
+            name: "images/0001.jpg".to_string(),
+            camera_id: 7,
+            frame_id: None,
+        };
+        assert_eq!(db.write_image(&image, true).unwrap(), 11);
+        assert_eq!(db.read_image(11).unwrap(), Some(image.clone()));
+        assert_eq!(
+            db.read_image_with_name("images/0001.jpg").unwrap(),
+            Some(image.clone())
+        );
+        assert_eq!(db.read_all_images().unwrap(), vec![image]);
+    }
+
+    #[test]
+    fn camera_and_image_autoincrement_ids_match_sqlite_rowid() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let camera_id = db
+            .write_camera(
+                &ColmapDatabaseCamera {
+                    camera: ColmapCamera {
+                        camera_id: 0,
+                        model_id: crate::types::COLMAP_SIMPLE_PINHOLE,
+                        width: 640,
+                        height: 480,
+                        params: vec![500.0, 320.0, 240.0],
+                    },
+                    has_prior_focal_length: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(camera_id, 1);
+
+        let image_id = db
+            .write_image(
+                &ColmapDatabaseImage {
+                    image_id: 0,
+                    name: "auto.jpg".to_string(),
+                    camera_id,
+                    frame_id: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(image_id, 1);
+        let image = db.read_image(image_id).unwrap().unwrap();
+        assert_eq!(image.name, "auto.jpg");
+        assert_eq!(image.camera_id, camera_id);
     }
 
     #[test]

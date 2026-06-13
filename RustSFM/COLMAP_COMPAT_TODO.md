@@ -76,8 +76,11 @@ reconstruction parity.
    - Added a database-to-correspondence-graph construction path from stored
      keypoint counts and two-view geometries, matching the core
      `DatabaseCache` flow before mapper integration.
+   - Added SQLite cameras/images table read-write support with COLMAP camera
+     parameter blobs, prior-focal flags, explicit or autoincrement ids, and
+     image-name lookup.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache loading, cameras/images/rigs/frames database tables, and mapper
+     cache loading, rigs/frames/pose-prior database tables, and mapper
      integration.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
