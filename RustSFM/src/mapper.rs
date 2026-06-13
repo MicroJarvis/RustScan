@@ -10,6 +10,7 @@ use crate::geometry::{
     pose_from_rotation_center, pose_rotation, pose_with_flipped_translation, relative_rotation_deg,
     PairEstimationOptions,
 };
+use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
 use crate::sift::{
     extract_sift_features_with_options, match_sift_with_options, SiftExtractionOptions,
@@ -1889,6 +1890,7 @@ fn choose_next_registration(
     config: &MapperConfig,
 ) -> Option<RegistrationChoice> {
     let mut best = None::<(f32, RegistrationChoice)>;
+    let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
     for image in 0..reconstruction.poses.len() {
         if reconstruction.poses[image].is_some() {
             continue;
@@ -1936,7 +1938,7 @@ fn choose_next_registration(
             mean_error_px,
             pair_rot_error,
         };
-        let score = registration_score(&choice, pairs, reconstruction);
+        let score = registration_score(&choice, &obs_manager);
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
             best = Some((score, choice));
         }
@@ -2020,30 +2022,24 @@ fn initial_pair_score(pair: &PairGeometry, image_correspondences: &HashMap<usize
         - forward_penalty
 }
 
-fn registration_score(
-    choice: &RegistrationChoice,
-    pairs: &[PairGeometry],
-    reconstruction: &Reconstruction,
-) -> f32 {
-    let support = pairs
-        .iter()
-        .filter(|p| p.left == choice.image || p.right == choice.image)
-        .filter(|p| {
-            let other = if p.left == choice.image {
-                p.right
-            } else {
-                p.left
-            };
-            reconstruction.poses[other].is_some()
-        })
-        .map(|p| (p.inliers as f32).sqrt() + (p.triangulated as f32).sqrt())
-        .sum::<f32>();
+fn registration_score(choice: &RegistrationChoice, obs_manager: &ObservationManager) -> f32 {
+    let visible_points = obs_manager.num_visible_points3d(choice.image) as f32;
+    let visible_corrs = obs_manager.num_visible_correspondences(choice.image) as f32;
+    let visibility_score = obs_manager.point3d_visibility_score(choice.image) as f32;
+    let observation_ratio = if obs_manager.num_observations(choice.image) == 0 {
+        0.0
+    } else {
+        visible_points / obs_manager.num_observations(choice.image) as f32
+    };
+    let support = visible_points * 8.0 + visible_corrs.sqrt() * 12.0 + visibility_score * 2.0;
     let pnp_bonus = if choice.source == "pnp" {
         choice.pnp_inliers as f32 * 2.0 - choice.mean_error_px.min(20.0) * 8.0
     } else {
         0.0
     };
-    support + pnp_bonus - choice.pair_rot_error * 25.0 - choice.image as f32 * 0.001
+    support + observation_ratio * 50.0 + pnp_bonus
+        - choice.pair_rot_error * 25.0
+        - choice.image as f32 * 0.001
 }
 
 fn relative_pose_candidate(
@@ -3796,6 +3792,60 @@ mod tests {
         assert_eq!((chosen.left, chosen.right), (1, 3));
     }
 
+    #[test]
+    fn registration_score_prefers_more_visible_points3d() {
+        let frames = vec![
+            minimal_frame(0, "seed.jpg"),
+            minimal_frame(1, "weak.jpg"),
+            minimal_frame(2, "strong.jpg"),
+        ];
+        let pairs = vec![
+            pair_with_inliers(0, 1, &[(0, 0)]),
+            pair_with_inliers(0, 2, &[(0, 0), (1, 1)]),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[0][1] = Some(1);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 0,
+                feature: 0,
+            }],
+        });
+        reconstruction.points.push(Point3D {
+            xyz: [0.1, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 0,
+                feature: 1,
+            }],
+        });
+        let manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+        let weak = RegistrationChoice {
+            image: 1,
+            pose: SE3::identity(),
+            source: "relative",
+            pnp_inliers: 0,
+            mean_error_px: f32::INFINITY,
+            pair_rot_error: 0.0,
+        };
+        let strong = RegistrationChoice {
+            image: 2,
+            pose: SE3::identity(),
+            source: "relative",
+            pnp_inliers: 0,
+            mean_error_px: f32::INFINITY,
+            pair_rot_error: 0.0,
+        };
+
+        assert!(registration_score(&strong, &manager) > registration_score(&weak, &manager));
+    }
+
     fn test_pair(
         left: usize,
         right: usize,
@@ -3820,6 +3870,39 @@ mod tests {
             rotation_deg: 0.0,
             median_triangulation_angle_deg,
             pose_graph_only: false,
+        }
+    }
+
+    fn pair_with_inliers(left: usize, right: usize, matches: &[(u32, u32)]) -> PairGeometry {
+        let mut pair = test_pair(left, right, matches.len(), 0, 1.0, [1.0, 0.0, 0.0]);
+        pair.inlier_matches = matches
+            .iter()
+            .map(|&(query_idx, train_idx)| rustslam::Match {
+                query_idx,
+                train_idx,
+                distance: 0.0,
+            })
+            .collect();
+        pair
+    }
+
+    fn test_reconstruction(frames: &[ImageFrame]) -> Reconstruction {
+        Reconstruction {
+            camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            cameras: vec![CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0)],
+            camera_ids: vec![1],
+            image_names: frames.iter().map(|frame| frame.name.clone()).collect(),
+            image_paths: frames.iter().map(|frame| frame.path.clone()).collect(),
+            image_ids: (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
+            image_camera_indices: vec![0; frames.len()],
+            poses: vec![None; frames.len()],
+            observations: frames
+                .iter()
+                .map(|frame| vec![None; frame.keypoints.len()])
+                .collect(),
+            keypoints: frames.iter().map(|frame| frame.keypoints.clone()).collect(),
+            point_ids: Vec::new(),
+            points: Vec::new(),
         }
     }
 

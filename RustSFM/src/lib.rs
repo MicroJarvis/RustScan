@@ -7,6 +7,7 @@ pub mod five_point;
 mod five_point_generated;
 pub mod geometry;
 pub mod mapper;
+pub mod observation_manager;
 pub mod polynomial;
 pub mod pose_graph;
 pub mod sift;
