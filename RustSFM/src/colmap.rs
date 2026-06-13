@@ -95,7 +95,7 @@ pub struct ColmapRig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColmapDataId {
     pub sensor_id: ColmapSensorId,
-    pub data_id: u32,
+    pub data_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +206,10 @@ pub fn read_colmap_points3d(root: &Path) -> Result<Vec<ColmapPoint3D>> {
 
 pub fn read_colmap_rigs(root: &Path) -> Result<Vec<ColmapRig>> {
     let sparse = resolve_sparse_dir(root)?;
+    let bin = sparse.join("rigs.bin");
+    if bin.exists() {
+        return read_rigs_bin(&bin);
+    }
     let txt = sparse.join("rigs.txt");
     if txt.exists() {
         return read_rigs_txt(&txt);
@@ -215,6 +219,10 @@ pub fn read_colmap_rigs(root: &Path) -> Result<Vec<ColmapRig>> {
 
 pub fn read_colmap_frames(root: &Path) -> Result<Vec<ColmapFrame>> {
     let sparse = resolve_sparse_dir(root)?;
+    let bin = sparse.join("frames.bin");
+    if bin.exists() {
+        return read_frames_bin(&bin);
+    }
     let txt = sparse.join("frames.txt");
     if txt.exists() {
         return read_frames_txt(&txt);
@@ -247,7 +255,9 @@ fn has_model_files(path: &Path) -> bool {
         || path.join("cameras.txt").exists()
         || path.join("points3D.bin").exists()
         || path.join("points3D.txt").exists()
+        || path.join("rigs.bin").exists()
         || path.join("rigs.txt").exists()
+        || path.join("frames.bin").exists()
         || path.join("frames.txt").exists()
 }
 
@@ -725,6 +735,81 @@ fn read_frames_txt(path: &Path) -> Result<Vec<ColmapFrame>> {
     Ok(frames)
 }
 
+fn read_rigs_bin(path: &Path) -> Result<Vec<ColmapRig>> {
+    let mut f = File::open(path)?;
+    let n = read_u64(&mut f)? as usize;
+    let mut rigs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let rig_id = read_u32(&mut f)?;
+        let num_sensors = read_u32(&mut f)? as usize;
+        let ref_sensor_id = if num_sensors > 0 {
+            Some(read_sensor_id_bin(&mut f)?)
+        } else {
+            None
+        };
+        let mut sensors = Vec::with_capacity(num_sensors.saturating_sub(1));
+        for _ in 0..num_sensors.saturating_sub(1) {
+            let sensor_id = read_sensor_id_bin(&mut f)?;
+            let has_pose = read_u8(&mut f)? != 0;
+            let sensor_from_rig = if has_pose {
+                Some(read_rigid3_bin(&mut f)?)
+            } else {
+                None
+            };
+            sensors.push(ColmapRigSensor {
+                sensor_id,
+                sensor_from_rig,
+            });
+        }
+        rigs.push(ColmapRig {
+            rig_id,
+            ref_sensor_id,
+            sensors,
+        });
+    }
+    Ok(rigs)
+}
+
+fn read_frames_bin(path: &Path) -> Result<Vec<ColmapFrame>> {
+    let mut f = File::open(path)?;
+    let n = read_u64(&mut f)? as usize;
+    let mut frames = Vec::with_capacity(n);
+    for _ in 0..n {
+        let frame_id = read_u32(&mut f)?;
+        let rig_id = read_u32(&mut f)?;
+        let rig_from_world = read_rigid3_bin(&mut f)?;
+        let num_data_ids = read_u32(&mut f)? as usize;
+        let mut data_ids = Vec::with_capacity(num_data_ids);
+        for _ in 0..num_data_ids {
+            data_ids.push(ColmapDataId {
+                sensor_id: read_sensor_id_bin(&mut f)?,
+                data_id: read_u64(&mut f)?,
+            });
+        }
+        frames.push(ColmapFrame {
+            frame_id,
+            rig_id,
+            rig_from_world,
+            data_ids,
+        });
+    }
+    Ok(frames)
+}
+
+fn read_sensor_id_bin(r: &mut impl Read) -> Result<ColmapSensorId> {
+    Ok(ColmapSensorId {
+        sensor_type: ColmapSensorType::from_colmap_i32(read_i32(r)?),
+        sensor_id: read_u32(r)?,
+    })
+}
+
+fn read_rigid3_bin(r: &mut impl Read) -> Result<ColmapRigid3> {
+    Ok(ColmapRigid3 {
+        qvec: [read_f64(r)?, read_f64(r)?, read_f64(r)?, read_f64(r)?],
+        tvec: [read_f64(r)?, read_f64(r)?, read_f64(r)?],
+    })
+}
+
 fn parse_rigid3(parts: &[&str], cursor: &mut usize, path: &Path) -> Result<ColmapRigid3> {
     Ok(ColmapRigid3 {
         qvec: [
@@ -774,6 +859,15 @@ impl ColmapSensorType {
             "INVALID" => Self::Invalid,
             "CAMERA" => Self::Camera,
             "IMU" => Self::Imu,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn from_colmap_i32(value: i32) -> Self {
+        match value {
+            -1 => Self::Invalid,
+            0 => Self::Camera,
+            1 => Self::Imu,
             other => Self::Other(other.to_string()),
         }
     }
@@ -1227,6 +1321,88 @@ mod tests {
                     data_id: 99,
                 },
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_binary_rigs_with_sensor_poses() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&11u32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&12u32.to_le_bytes());
+        bytes.push(1);
+        for value in [1.0f64, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(sparse.join("rigs.bin"), bytes)?;
+
+        let rigs = read_colmap_rigs(dir.path())?;
+
+        assert_eq!(rigs.len(), 1);
+        assert_eq!(rigs[0].rig_id, 3);
+        assert_eq!(
+            rigs[0].ref_sensor_id,
+            Some(ColmapSensorId {
+                sensor_type: ColmapSensorType::Camera,
+                sensor_id: 11,
+            })
+        );
+        assert_eq!(
+            rigs[0].sensors,
+            vec![ColmapRigSensor {
+                sensor_id: ColmapSensorId {
+                    sensor_type: ColmapSensorType::Camera,
+                    sensor_id: 12,
+                },
+                sensor_from_rig: Some(ColmapRigid3 {
+                    qvec: [1.0, 0.0, 0.0, 0.0],
+                    tvec: [0.1, 0.2, 0.3],
+                }),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_binary_frames_with_u64_data_ids() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        for value in [1.0f64, 0.0, 0.0, 0.0, 0.4, 0.5, 0.6] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&11u32.to_le_bytes());
+        bytes.extend_from_slice(&4_294_967_299u64.to_le_bytes());
+        fs::write(sparse.join("frames.bin"), bytes)?;
+
+        let frames = read_colmap_frames(dir.path())?;
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_id, 9);
+        assert_eq!(frames[0].rig_id, 3);
+        assert_eq!(
+            frames[0].data_ids,
+            vec![ColmapDataId {
+                sensor_id: ColmapSensorId {
+                    sensor_type: ColmapSensorType::Camera,
+                    sensor_id: 11,
+                },
+                data_id: 4_294_967_299,
+            }]
         );
         Ok(())
     }

@@ -38,11 +38,10 @@ reconstruction parity.
      point3D associations while preserving the existing pose reader API.
    - Added text/binary COLMAP `points3D` reading with point ids, RGB, error,
      and track image/feature ids.
-   - Added text COLMAP `rigs` and `frames` reading with sensor/data ids and
+   - Added text/binary COLMAP `rigs` and `frames` reading with sensor/data ids and
      rig/frame poses.
    - Remaining work: integrating read point ids into full reconstruction
-     loading, binary rigs/frames, database ids, and full sparse model
-     round-trip.
+     loading, database ids, and full sparse model round-trip.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
