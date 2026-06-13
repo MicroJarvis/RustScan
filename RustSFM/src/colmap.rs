@@ -28,6 +28,21 @@ pub struct ColmapCamera {
     pub params: Vec<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColmapTrackElement {
+    pub image_id: u32,
+    pub point2d_idx: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColmapPoint3D {
+    pub point3d_id: u64,
+    pub xyz: [f64; 3],
+    pub color: [u8; 3],
+    pub error: f64,
+    pub track: Vec<ColmapTrackElement>,
+}
+
 pub fn read_camera_model(root: &Path) -> Result<CameraModel> {
     let sparse = resolve_sparse_dir(root)?;
     let bin = sparse.join("cameras.bin");
@@ -97,6 +112,22 @@ pub fn read_colmap_poses(root: &Path) -> Result<Vec<ColmapPose>> {
     bail!("missing images.bin/images.txt under {}", sparse.display())
 }
 
+pub fn read_colmap_points3d(root: &Path) -> Result<Vec<ColmapPoint3D>> {
+    let sparse = resolve_sparse_dir(root)?;
+    let bin = sparse.join("points3D.bin");
+    if bin.exists() {
+        return read_points3d_bin(&bin);
+    }
+    let txt = sparse.join("points3D.txt");
+    if txt.exists() {
+        return read_points3d_txt(&txt);
+    }
+    bail!(
+        "missing points3D.bin/points3D.txt under {}",
+        sparse.display()
+    )
+}
+
 pub fn resolve_sparse_dir(root: &Path) -> Result<PathBuf> {
     if has_model_files(root) {
         return Ok(root.to_path_buf());
@@ -120,6 +151,8 @@ fn has_model_files(path: &Path) -> bool {
         || path.join("images.txt").exists()
         || path.join("cameras.bin").exists()
         || path.join("cameras.txt").exists()
+        || path.join("points3D.bin").exists()
+        || path.join("points3D.txt").exists()
 }
 
 pub fn camera_center(pose: &ColmapPose) -> Vector3<f64> {
@@ -399,6 +432,77 @@ fn read_cameras_bin(path: &Path) -> Result<Vec<ColmapCamera>> {
     Ok(cameras)
 }
 
+fn read_points3d_txt(path: &Path) -> Result<Vec<ColmapPoint3D>> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut points = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 8 || parts[0].parse::<u64>().is_err() {
+            continue;
+        }
+        let mut track = Vec::new();
+        for chunk in parts[8..].chunks(2) {
+            if chunk.len() != 2 {
+                bail!(
+                    "point3D track must contain IMAGE_ID/POINT2D_IDX pairs in {}",
+                    path.display()
+                );
+            }
+            track.push(ColmapTrackElement {
+                image_id: chunk[0].parse()?,
+                point2d_idx: chunk[1].parse()?,
+            });
+        }
+        points.push(ColmapPoint3D {
+            point3d_id: parts[0].parse()?,
+            xyz: [parts[1].parse()?, parts[2].parse()?, parts[3].parse()?],
+            color: [parts[4].parse()?, parts[5].parse()?, parts[6].parse()?],
+            error: parts[7].parse()?,
+            track,
+        });
+    }
+    Ok(points)
+}
+
+fn read_points3d_bin(path: &Path) -> Result<Vec<ColmapPoint3D>> {
+    let mut f = File::open(path)?;
+    let n = read_u64(&mut f)? as usize;
+    let mut points = Vec::with_capacity(n);
+    for _ in 0..n {
+        let point3d_id = read_u64(&mut f)?;
+        let xyz = [read_f64(&mut f)?, read_f64(&mut f)?, read_f64(&mut f)?];
+        let color = [read_u8(&mut f)?, read_u8(&mut f)?, read_u8(&mut f)?];
+        let error = read_f64(&mut f)?;
+        let track_length = read_u64(&mut f)? as usize;
+        let mut track = Vec::with_capacity(track_length);
+        for _ in 0..track_length {
+            track.push(ColmapTrackElement {
+                image_id: read_u32(&mut f)?,
+                point2d_idx: read_u64(&mut f)?,
+            });
+        }
+        points.push(ColmapPoint3D {
+            point3d_id,
+            xyz,
+            color,
+            error,
+            track,
+        });
+    }
+    Ok(points)
+}
+
+fn read_u8(r: &mut impl Read) -> std::io::Result<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
 fn read_u32(r: &mut impl Read) -> std::io::Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
@@ -618,6 +722,84 @@ mod tests {
         assert!(images.contains("30.000000 40.000000 99"));
         assert!(
             points.contains("\n99 1.000000000 2.000000000 3.000000000 4 5 6 0.250000 1 0 2 0\n")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_text_points3d_with_non_contiguous_ids_and_tracks() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("points3D.txt"),
+            "# points\n99 1.0 2.0 3.0 4 5 6 0.25 7 12 8 13\n150 -1.0 0.5 9.0 9 8 7 1.5\n",
+        )?;
+
+        let points = read_colmap_points3d(dir.path())?;
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].point3d_id, 99);
+        assert_eq!(points[0].xyz, [1.0, 2.0, 3.0]);
+        assert_eq!(points[0].color, [4, 5, 6]);
+        assert_eq!(points[0].error, 0.25);
+        assert_eq!(
+            points[0].track,
+            vec![
+                ColmapTrackElement {
+                    image_id: 7,
+                    point2d_idx: 12,
+                },
+                ColmapTrackElement {
+                    image_id: 8,
+                    point2d_idx: 13,
+                },
+            ]
+        );
+        assert_eq!(points[1].point3d_id, 150);
+        assert!(points[1].track.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reads_binary_points3d_with_tracks() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&123u64.to_le_bytes());
+        for value in [1.5f64, -2.0, 3.25] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[10, 20, 30]);
+        bytes.extend_from_slice(&0.75f64.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&12u64.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&13u64.to_le_bytes());
+        fs::write(sparse.join("points3D.bin"), bytes)?;
+
+        let points = read_colmap_points3d(dir.path())?;
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].point3d_id, 123);
+        assert_eq!(points[0].xyz, [1.5, -2.0, 3.25]);
+        assert_eq!(points[0].color, [10, 20, 30]);
+        assert_eq!(points[0].error, 0.75);
+        assert_eq!(
+            points[0].track,
+            vec![
+                ColmapTrackElement {
+                    image_id: 7,
+                    point2d_idx: 12,
+                },
+                ColmapTrackElement {
+                    image_id: 8,
+                    point2d_idx: 13,
+                },
+            ]
         );
         Ok(())
     }
