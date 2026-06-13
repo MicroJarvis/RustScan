@@ -104,6 +104,8 @@ reconstruction parity.
    - Added official COLMAP two-view geometry configuration constants and made
      database-cache edge loading reject `UNDEFINED`/`DEGENERATE` geometries
      while preserving watermark filtering semantics.
+   - `PairGeometry` now carries the COLMAP two-view configuration, preserving
+     database configs and marking Rust-estimated calibrated pairs explicitly.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
      cache ENU pose-prior conversion, complete pose/config semantics for all
      two-view geometry cases, and making database-driven reconstruction the

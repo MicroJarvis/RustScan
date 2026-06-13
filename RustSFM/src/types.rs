@@ -847,6 +847,7 @@ pub struct ImageFrame {
 pub struct PairGeometry {
     pub left: usize,
     pub right: usize,
+    pub two_view_config: i32,
     pub matches: Vec<Match>,
     pub inlier_matches: Vec<Match>,
     pub relative_pose: SE3,

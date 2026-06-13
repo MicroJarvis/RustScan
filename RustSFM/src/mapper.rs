@@ -877,6 +877,7 @@ fn database_pair_geometry_from_stored_pose(
     Some(PairGeometry {
         left: pair.left,
         right: pair.right,
+        two_view_config: geometry.config,
         matches: pair.matches.clone(),
         inlier_matches: metrics.inlier_matches,
         relative_pose: pose,
@@ -3655,6 +3656,10 @@ mod tests {
 
         assert_eq!(pair.left, 0);
         assert_eq!(pair.right, 1);
+        assert_eq!(
+            pair.two_view_config,
+            crate::database::COLMAP_TWO_VIEW_CALIBRATED
+        );
         assert_eq!(pair.inliers, 4);
         assert_eq!(pair.triangulated, 4);
         assert!(pair.mean_reprojection_error_px < 1.0e-4);

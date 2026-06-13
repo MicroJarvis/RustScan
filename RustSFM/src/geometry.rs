@@ -315,6 +315,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
     Some(PairGeometry {
         left: left_idx,
         right: right_idx,
+        two_view_config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
         matches: valid_matches,
         inlier_matches: output_inlier_matches,
         relative_pose,
