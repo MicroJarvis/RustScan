@@ -271,6 +271,7 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         frames_elapsed_ms, pair_elapsed_ms
     ));
     debug_log.extend(pair_connectivity_summary(&pairs, &frames));
+    debug_log.extend(pair_config_summary(&pairs));
     if let Some(reference) = &config.reference {
         debug_log.extend(pair_reference_error_summary(&pairs, &frames, reference));
     }
@@ -1251,6 +1252,44 @@ fn pair_quality_summary(pairs: &[PairGeometry]) -> Vec<String> {
         high_error,
         pairs.len()
     )]
+}
+
+fn pair_config_summary(pairs: &[PairGeometry]) -> Vec<String> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut counts = pairs
+        .iter()
+        .fold(HashMap::<i32, usize>::new(), |mut counts, pair| {
+            *counts.entry(pair.two_view_config).or_default() += 1;
+            counts
+        });
+    let mut configs = counts.keys().copied().collect::<Vec<_>>();
+    configs.sort_unstable();
+    let parts = configs
+        .into_iter()
+        .map(|config| {
+            let count = counts.remove(&config).unwrap_or(0);
+            format!("{}={}", colmap_two_view_config_name(config), count)
+        })
+        .collect::<Vec<_>>();
+    vec![format!("pair_config {}", parts.join(" "))]
+}
+
+fn colmap_two_view_config_name(config: i32) -> &'static str {
+    match config {
+        crate::database::COLMAP_TWO_VIEW_UNDEFINED => "UNDEFINED",
+        crate::database::COLMAP_TWO_VIEW_DEGENERATE => "DEGENERATE",
+        crate::database::COLMAP_TWO_VIEW_CALIBRATED => "CALIBRATED",
+        crate::database::COLMAP_TWO_VIEW_UNCALIBRATED => "UNCALIBRATED",
+        crate::database::COLMAP_TWO_VIEW_PLANAR => "PLANAR",
+        crate::database::COLMAP_TWO_VIEW_PANORAMIC => "PANORAMIC",
+        crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC => "PLANAR_OR_PANORAMIC",
+        crate::database::COLMAP_TWO_VIEW_WATERMARK => "WATERMARK",
+        crate::database::COLMAP_TWO_VIEW_MULTIPLE => "MULTIPLE",
+        crate::database::COLMAP_TWO_VIEW_CALIBRATED_RIG => "CALIBRATED_RIG",
+        _ => "UNKNOWN",
+    }
 }
 
 fn pair_connectivity_summary(pairs: &[PairGeometry], frames: &[ImageFrame]) -> Vec<String> {

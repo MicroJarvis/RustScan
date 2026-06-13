@@ -106,6 +106,8 @@ reconstruction parity.
      while preserving watermark filtering semantics.
    - `PairGeometry` now carries the COLMAP two-view configuration, preserving
      database configs and marking Rust-estimated calibrated pairs explicitly.
+   - Reconstruction summaries now report pair counts by COLMAP two-view
+     configuration to support stage-by-stage parity checks.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
      cache ENU pose-prior conversion, complete pose/config semantics for all
      two-view geometry cases, and making database-driven reconstruction the
