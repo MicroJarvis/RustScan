@@ -64,6 +64,7 @@ pub struct IncrementalTriangulator<'a> {
     pairs: &'a [PairGeometry],
     reconstruction: &'a mut Reconstruction,
     modified_point3d_ids: HashSet<usize>,
+    merge_trials: HashSet<(usize, usize)>,
 }
 
 impl<'a> IncrementalTriangulator<'a> {
@@ -77,6 +78,7 @@ impl<'a> IncrementalTriangulator<'a> {
             pairs,
             reconstruction,
             modified_point3d_ids: HashSet::new(),
+            merge_trials: HashSet::new(),
         }
     }
 
@@ -186,6 +188,23 @@ impl<'a> IncrementalTriangulator<'a> {
     pub fn complete_all_tracks(&mut self, options: &IncrementalTriangulatorOptions) -> usize {
         let point_ids = (0..self.reconstruction.points.len()).collect::<HashSet<_>>();
         self.complete_tracks(options, &point_ids)
+    }
+
+    pub fn merge_tracks(
+        &mut self,
+        options: &IncrementalTriangulatorOptions,
+        point_ids: &HashSet<usize>,
+    ) -> usize {
+        point_ids
+            .iter()
+            .copied()
+            .map(|point_id| self.merge_track(options, point_id))
+            .sum()
+    }
+
+    pub fn merge_all_tracks(&mut self, options: &IncrementalTriangulatorOptions) -> usize {
+        let point_ids = (0..self.reconstruction.points.len()).collect::<HashSet<_>>();
+        self.merge_tracks(options, &point_ids)
     }
 
     pub fn clear_modified_points3d(&mut self) {
@@ -418,6 +437,201 @@ impl<'a> IncrementalTriangulator<'a> {
         }
         correspondences
     }
+
+    fn merge_track(&mut self, options: &IncrementalTriangulatorOptions, point_id: usize) -> usize {
+        if point_id >= self.reconstruction.points.len() {
+            return 0;
+        }
+        let track = self.reconstruction.points[point_id].track.clone();
+        for obs in track {
+            for (corr_image, corr_feature) in self.corresponding_features(obs.image, obs.feature) {
+                if !self.valid_observation(corr_image, corr_feature) {
+                    continue;
+                }
+                let Some(other_point_id) =
+                    self.reconstruction.observations[corr_image][corr_feature]
+                else {
+                    continue;
+                };
+                if other_point_id == point_id || other_point_id >= self.reconstruction.points.len()
+                {
+                    continue;
+                }
+                let key = ordered_point_pair(point_id, other_point_id);
+                if !self.merge_trials.insert(key) {
+                    continue;
+                }
+                if self.try_merge_pair(options, point_id, other_point_id) {
+                    let merged = key.0;
+                    let merged_count = self.reconstruction.points[merged].track.len();
+                    let recursive_count = self.merge_track(options, merged);
+                    return recursive_count.max(merged_count);
+                }
+            }
+        }
+        0
+    }
+
+    fn try_merge_pair(
+        &mut self,
+        options: &IncrementalTriangulatorOptions,
+        point_id1: usize,
+        point_id2: usize,
+    ) -> bool {
+        if point_id1 == point_id2
+            || point_id1 >= self.reconstruction.points.len()
+            || point_id2 >= self.reconstruction.points.len()
+        {
+            return false;
+        }
+        let (keep_id, remove_id) = ordered_point_pair(point_id1, point_id2);
+        let keep = self.reconstruction.points[keep_id].clone();
+        let remove = self.reconstruction.points[remove_id].clone();
+        if tracks_conflict_by_image(&keep.track, &remove.track) {
+            return false;
+        }
+        let merged_xyz =
+            weighted_average_xyz(keep.xyz, keep.track.len(), remove.xyz, remove.track.len());
+        let mut merged_track = keep.track.clone();
+        merged_track.extend(remove.track.iter().cloned());
+        if !self.track_reprojects(merged_xyz, &merged_track, options.merge_max_reproj_error_px) {
+            return false;
+        }
+
+        let merged_color = average_color(&merged_track, self.frames);
+        let merged_error = mean_track_reprojection_error(
+            merged_xyz,
+            &merged_track,
+            self.frames,
+            self.reconstruction,
+        )
+        .unwrap_or(0.0);
+        self.reconstruction.points[keep_id].xyz = merged_xyz;
+        self.reconstruction.points[keep_id].color = merged_color;
+        self.reconstruction.points[keep_id].error = merged_error;
+        self.reconstruction.points[keep_id].track = merged_track;
+        for obs in &self.reconstruction.points[keep_id].track {
+            self.reconstruction.observations[obs.image][obs.feature] = Some(keep_id);
+        }
+        self.remove_point(remove_id);
+        self.modified_point3d_ids.remove(&point_id1);
+        self.modified_point3d_ids.remove(&point_id2);
+        self.modified_point3d_ids.insert(keep_id);
+        true
+    }
+
+    fn track_reprojects(
+        &self,
+        xyz: [f32; 3],
+        track: &[TrackObservation],
+        max_reproj_error_px: f32,
+    ) -> bool {
+        track.iter().all(|obs| {
+            let Some(pose) = self.reconstruction.poses[obs.image] else {
+                return false;
+            };
+            let keypoint = &self.frames[obs.image].keypoints[obs.feature];
+            let error = crate::geometry::reprojection_error_px(
+                xyz,
+                pose,
+                [keypoint.x(), keypoint.y()],
+                self.reconstruction.camera_for_image(obs.image),
+            );
+            error.is_finite() && error <= max_reproj_error_px
+        })
+    }
+
+    fn remove_point(&mut self, point_id: usize) {
+        if point_id >= self.reconstruction.points.len() {
+            return;
+        }
+        let removed = self.reconstruction.points.remove(point_id);
+        if point_id < self.reconstruction.point_ids.len() {
+            self.reconstruction.point_ids.remove(point_id);
+        }
+        for obs in removed.track {
+            if self.reconstruction.observations[obs.image][obs.feature] == Some(point_id) {
+                self.reconstruction.observations[obs.image][obs.feature] = None;
+            }
+        }
+        for point in &mut self.reconstruction.points {
+            for obs in &point.track {
+                if let Some(id) = self.reconstruction.observations[obs.image][obs.feature] {
+                    if id > point_id {
+                        self.reconstruction.observations[obs.image][obs.feature] = Some(id - 1);
+                    }
+                }
+            }
+        }
+        self.modified_point3d_ids = self
+            .modified_point3d_ids
+            .iter()
+            .filter_map(|&id| {
+                if id == point_id {
+                    None
+                } else if id > point_id {
+                    Some(id - 1)
+                } else {
+                    Some(id)
+                }
+            })
+            .collect();
+    }
+}
+
+fn ordered_point_pair(a: usize, b: usize) -> (usize, usize) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn tracks_conflict_by_image(left: &[TrackObservation], right: &[TrackObservation]) -> bool {
+    let mut images = left.iter().map(|obs| obs.image).collect::<HashSet<_>>();
+    right.iter().any(|obs| !images.insert(obs.image))
+}
+
+fn weighted_average_xyz(
+    left_xyz: [f32; 3],
+    left_len: usize,
+    right_xyz: [f32; 3],
+    right_len: usize,
+) -> [f32; 3] {
+    let left_weight = left_len as f32;
+    let right_weight = right_len as f32;
+    let denom = (left_weight + right_weight).max(1.0);
+    [
+        (left_xyz[0] * left_weight + right_xyz[0] * right_weight) / denom,
+        (left_xyz[1] * left_weight + right_xyz[1] * right_weight) / denom,
+        (left_xyz[2] * left_weight + right_xyz[2] * right_weight) / denom,
+    ]
+}
+
+fn mean_track_reprojection_error(
+    xyz: [f32; 3],
+    track: &[TrackObservation],
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> Option<f32> {
+    let mut total = 0.0f32;
+    let mut count = 0usize;
+    for obs in track {
+        let pose = reconstruction.poses[obs.image]?;
+        let keypoint = &frames[obs.image].keypoints[obs.feature];
+        let error = crate::geometry::reprojection_error_px(
+            xyz,
+            pose,
+            [keypoint.x(), keypoint.y()],
+            reconstruction.camera_for_image(obs.image),
+        );
+        if !error.is_finite() {
+            return None;
+        }
+        total += error;
+        count += 1;
+    }
+    (count > 0).then_some(total / count as f32)
 }
 
 fn triangulation_angle_deg(left_pose: SE3, right_pose: SE3, point: [f32; 3]) -> Option<f32> {
@@ -555,6 +769,100 @@ mod tests {
         assert_eq!(completed, 1);
         assert_eq!(triangulator.reconstruction.observations[2][0], Some(0));
         assert_eq!(triangulator.reconstruction.points[0].track.len(), 3);
+    }
+
+    #[test]
+    fn merge_tracks_combines_corresponding_points() {
+        let frames = vec![frame(0), frame(1)];
+        let pairs = vec![pair(0, 1, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(1);
+        reconstruction.point_ids.extend([1, 2]);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [10, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 0,
+                feature: 0,
+            }],
+        });
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 10, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 1,
+                feature: 0,
+            }],
+        });
+
+        let mut triangulator = IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction);
+        let merged = triangulator.merge_tracks(
+            &IncrementalTriangulatorOptions {
+                merge_max_reproj_error_px: 10.0,
+                ..IncrementalTriangulatorOptions::default()
+            },
+            &HashSet::from([0]),
+        );
+
+        assert_eq!(merged, 2);
+        assert_eq!(triangulator.reconstruction.points.len(), 1);
+        assert_eq!(triangulator.reconstruction.points[0].track.len(), 2);
+        assert_eq!(triangulator.reconstruction.observations[0][0], Some(0));
+        assert_eq!(triangulator.reconstruction.observations[1][0], Some(0));
+        assert_eq!(triangulator.get_modified_points3d(), &HashSet::from([0]));
+    }
+
+    #[test]
+    fn merge_tracks_rejects_same_image_track_conflicts() {
+        let frames = vec![frame(0), frame(1)];
+        let pairs = vec![pair(0, 1, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(1);
+        reconstruction.point_ids.extend([1, 2]);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 1,
+                },
+            ],
+        });
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 1,
+                feature: 0,
+            }],
+        });
+
+        let mut triangulator = IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction);
+        let merged = triangulator.merge_tracks(
+            &IncrementalTriangulatorOptions {
+                merge_max_reproj_error_px: 10.0,
+                ..IncrementalTriangulatorOptions::default()
+            },
+            &HashSet::from([0]),
+        );
+
+        assert_eq!(merged, 0);
+        assert_eq!(triangulator.reconstruction.points.len(), 2);
     }
 
     fn reconstruction(frames: &[ImageFrame]) -> Reconstruction {
