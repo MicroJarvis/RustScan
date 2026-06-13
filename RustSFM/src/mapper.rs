@@ -2,6 +2,7 @@ use crate::colmap::{
     export_colmap, read_camera_model, read_colmap_cameras, read_colmap_poses,
     world_to_camera_rotation,
 };
+use crate::database::DatabaseCache;
 use crate::geometry::{
     camera_center, estimate_pair_geometry_with_cameras,
     estimate_pair_geometry_with_options_and_cameras, mean_pair_reprojection_error_with_cameras,
@@ -30,6 +31,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+#[derive(Debug, Clone)]
+pub struct DatabasePairMatches {
+    pub left: usize,
+    pub right: usize,
+    pub matches: Vec<rustslam::Match>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureType {
@@ -540,6 +548,91 @@ fn build_pair_graph(
     enforce_adjacent_translation_continuity(&mut pairs);
     regularize_low_parallax_adjacent_translations(&mut pairs);
     filter_translation_outlier_pairs(&mut pairs);
+    Ok(pairs)
+}
+
+pub fn database_pair_matches_for_frames(
+    frames: &[ImageFrame],
+    cache: &DatabaseCache,
+) -> Result<Vec<DatabasePairMatches>> {
+    let frame_by_name = frames
+        .iter()
+        .enumerate()
+        .map(|(idx, frame)| (frame.name.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut out = Vec::new();
+    for pair_id in cache.correspondence_graph.image_pairs() {
+        let (image_id1, image_id2) = crate::correspondence_graph::pair_id_to_image_pair(pair_id)
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let Some(image1) = cache.images.get(&image_id1) else {
+            continue;
+        };
+        let Some(image2) = cache.images.get(&image_id2) else {
+            continue;
+        };
+        let Some(&frame1) = frame_by_name.get(image1.name.as_str()) else {
+            continue;
+        };
+        let Some(&frame2) = frame_by_name.get(image2.name.as_str()) else {
+            continue;
+        };
+        let (left, right) = if frame1 <= frame2 {
+            (frame1, frame2)
+        } else {
+            (frame2, frame1)
+        };
+        let (left_image_id, right_image_id) = if frame1 <= frame2 {
+            (image_id1, image_id2)
+        } else {
+            (image_id2, image_id1)
+        };
+        let matches = cache
+            .correspondence_graph
+            .extract_matches_between_images(left_image_id, right_image_id)
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        out.push(DatabasePairMatches {
+            left,
+            right,
+            matches,
+        });
+    }
+    out.sort_by_key(|pair| (pair.left, pair.right));
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn estimate_database_pair_geometries(
+    frames: &[ImageFrame],
+    cache: &DatabaseCache,
+    camera: CameraModel,
+    reference_camera_setup: Option<&ReferenceCameraSetup>,
+    config: &MapperConfig,
+) -> Result<Vec<PairGeometry>> {
+    let pair_matches = database_pair_matches_for_frames(frames, cache)?;
+    let pairs = pair_matches
+        .par_iter()
+        .filter_map(|pair| {
+            let left_camera = setup_camera_for_image(reference_camera_setup, pair.left, camera);
+            let right_camera = setup_camera_for_image(reference_camera_setup, pair.right, camera);
+            estimate_pair_geometry_with_cameras(
+                pair.left,
+                pair.right,
+                &frames[pair.left],
+                &frames[pair.right],
+                &pair.matches,
+                left_camera,
+                right_camera,
+                config.essential_threshold_px,
+                config.essential_iterations,
+                config.min_inliers,
+                config.min_triangulated,
+            )
+            .filter(keep_verified_pair)
+        })
+        .collect::<Vec<_>>();
     Ok(pairs)
 }
 
@@ -2965,6 +3058,11 @@ fn triangulate_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::correspondence_graph::FeatureMatch;
+    use crate::database::{
+        ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapKeypoint,
+        ColmapTwoViewGeometry, DatabaseCacheOptions,
+    };
     use std::fs;
     use tempfile::tempdir;
 
@@ -2990,5 +3088,83 @@ mod tests {
         assert_eq!(setup.image_camera_indices, vec![0, 1]);
         assert_eq!(setup.cameras[1].model_name(), "SIMPLE_RADIAL");
         Ok(())
+    }
+
+    #[test]
+    fn database_pair_matches_map_colmap_image_names_to_frames() -> Result<()> {
+        let dir = tempdir()?;
+        let db = ColmapDatabase::open(dir.path().join("database.db"))?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(10, "b.jpg"), (20, "a.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(
+                image_id,
+                &[ColmapKeypoint::new(0.0, 0.0), ColmapKeypoint::new(1.0, 1.0)],
+            )?;
+        }
+        db.write_two_view_geometry(
+            10,
+            20,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![FeatureMatch::new(1, 0), FeatureMatch::new(0, 1)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let cache = db.load_cache(&DatabaseCacheOptions::default())?;
+        let frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+
+        let pairs = database_pair_matches_for_frames(&frames, &cache)?;
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].left, 0);
+        assert_eq!(pairs[0].right, 1);
+        assert_eq!(pairs[0].matches.len(), 2);
+        assert_eq!(pairs[0].matches[0].query_idx, 0);
+        assert_eq!(pairs[0].matches[0].train_idx, 1);
+        Ok(())
+    }
+
+    fn minimal_frame(id: usize, name: &str) -> ImageFrame {
+        ImageFrame {
+            id,
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            width: 100,
+            height: 100,
+            keypoints: vec![
+                rustslam::KeyPoint::new(0.0, 0.0),
+                rustslam::KeyPoint::new(1.0, 1.0),
+            ],
+            descriptors: rustslam::Descriptors::new(),
+            sift: crate::sift::SiftFeatures::default(),
+            wide_descriptors: crate::wide::WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            },
+            strong_feature_indices: Vec::new(),
+            colors: vec![[0, 0, 0], [0, 0, 0]],
+        }
     }
 }

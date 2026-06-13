@@ -91,8 +91,12 @@ reconstruction parity.
      via `frame_data`.
    - Added legacy database-cache compatibility for databases without frames by
      creating COLMAP-style trivial frames per image.
+   - Added a mapper bridge that maps database-cache image names and the
+     correspondence graph into frame-indexed pair matches, with an opt-in
+     two-view estimation path for database-derived candidate pairs.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache ENU pose-prior conversion and mapper integration.
+     cache ENU pose-prior conversion and making the default mapper consume
+     database-derived candidate pairs.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 
