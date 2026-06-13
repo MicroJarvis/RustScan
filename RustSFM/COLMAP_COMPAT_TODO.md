@@ -61,8 +61,17 @@ reconstruction parity.
      distance, cross check, and max matches into the current matcher.
    - Remaining work: guided matching, full matching strategy selection,
      COLMAP database persistence, and exact FAISS/GPU matcher parity.
-7. Build a persistent COLMAP-style database/cache layer with keypoints,
-   descriptors, matches, two-view geometries, and correspondence graph.
+7. [partial] Build a persistent COLMAP-style database/cache layer with
+   keypoints, descriptors, matches, two-view geometries, and correspondence
+   graph.
+   - Added a COLMAP-style in-memory correspondence graph foundation, including
+     image-pair ids, duplicate/out-of-bounds match filtering, bidirectional
+     observation correspondences, finalize-time flattening, transitive
+     correspondence extraction, match extraction between image pairs, and
+     two-view observation checks.
+   - Remaining work: SQLite COLMAP database schema/read-write parity, database
+     cache loading, persistent keypoint/descriptor/match/two-view geometry
+     blobs, and mapper integration.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 

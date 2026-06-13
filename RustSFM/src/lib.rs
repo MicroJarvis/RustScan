@@ -1,6 +1,7 @@
 pub mod ba;
 pub mod colmap;
 pub mod compare;
+pub mod correspondence_graph;
 pub mod five_point;
 mod five_point_generated;
 pub mod geometry;
