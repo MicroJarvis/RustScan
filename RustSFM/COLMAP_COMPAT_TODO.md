@@ -101,6 +101,9 @@ reconstruction parity.
    - Database-driven pair estimation now reuses stored `qvec/tvec` two-view
      geometry poses when present and valid, falling back to local two-view
      estimation otherwise.
+   - Added official COLMAP two-view geometry configuration constants and made
+     database-cache edge loading reject `UNDEFINED`/`DEGENERATE` geometries
+     while preserving watermark filtering semantics.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
      cache ENU pose-prior conversion, complete pose/config semantics for all
      two-view geometry cases, and making database-driven reconstruction the

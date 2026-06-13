@@ -13,6 +13,17 @@ use rustslam::{Descriptors, KeyPoint};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub const COLMAP_TWO_VIEW_UNDEFINED: i32 = 0;
+pub const COLMAP_TWO_VIEW_DEGENERATE: i32 = 1;
+pub const COLMAP_TWO_VIEW_CALIBRATED: i32 = 2;
+pub const COLMAP_TWO_VIEW_UNCALIBRATED: i32 = 3;
+pub const COLMAP_TWO_VIEW_PLANAR: i32 = 4;
+pub const COLMAP_TWO_VIEW_PANORAMIC: i32 = 5;
+pub const COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC: i32 = 6;
+pub const COLMAP_TWO_VIEW_WATERMARK: i32 = 7;
+pub const COLMAP_TWO_VIEW_MULTIPLE: i32 = 8;
+pub const COLMAP_TWO_VIEW_CALIBRATED_RIG: i32 = 9;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColmapKeypoint {
     pub x: f32,
@@ -115,7 +126,7 @@ pub struct ColmapTwoViewGeometry {
 impl Default for ColmapTwoViewGeometry {
     fn default() -> Self {
         Self {
-            config: 0,
+            config: COLMAP_TWO_VIEW_UNDEFINED,
             inlier_matches: Vec::new(),
             f_matrix: None,
             e_matrix: None,
@@ -1075,16 +1086,28 @@ fn read_camera_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseCamera> {
     })
 }
 
-const COLMAP_TWO_VIEW_WATERMARK_CONFIG: i32 = 7;
-
 fn use_inlier_matches(
     options: &DatabaseCacheOptions,
     two_view_geometry_config: i32,
     num_matches: usize,
 ) -> bool {
     num_matches >= options.min_num_matches
-        && (!options.ignore_watermarks
-            || two_view_geometry_config != COLMAP_TWO_VIEW_WATERMARK_CONFIG)
+        && is_colmap_two_view_geometry_with_inliers(two_view_geometry_config)
+        && (!options.ignore_watermarks || two_view_geometry_config != COLMAP_TWO_VIEW_WATERMARK)
+}
+
+pub fn is_colmap_two_view_geometry_with_inliers(config: i32) -> bool {
+    matches!(
+        config,
+        COLMAP_TWO_VIEW_CALIBRATED
+            | COLMAP_TWO_VIEW_UNCALIBRATED
+            | COLMAP_TWO_VIEW_PLANAR
+            | COLMAP_TWO_VIEW_PANORAMIC
+            | COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC
+            | COLMAP_TWO_VIEW_WATERMARK
+            | COLMAP_TWO_VIEW_MULTIPLE
+            | COLMAP_TWO_VIEW_CALIBRATED_RIG
+    )
 }
 
 fn candidate_frame_ids(
@@ -1793,7 +1816,7 @@ mod tests {
             2,
             3,
             &ColmapTwoViewGeometry {
-                config: COLMAP_TWO_VIEW_WATERMARK_CONFIG,
+                config: COLMAP_TWO_VIEW_WATERMARK,
                 inlier_matches: vec![m(0, 0), m(1, 1), m(2, 2)],
                 ..ColmapTwoViewGeometry::default()
             },
@@ -1836,6 +1859,74 @@ mod tests {
             all_cache.images.keys().copied().collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn database_cache_rejects_degenerate_and_undefined_two_view_geometries() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let camera = ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 1,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 100,
+                height: 100,
+                params: vec![50.0, 50.0, 50.0, 50.0],
+            },
+            has_prior_focal_length: true,
+        };
+        db.write_camera(&camera, true).unwrap();
+        for image_id in 1..=3 {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: format!("{image_id}.jpg"),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )
+            .unwrap();
+            db.write_keypoints(
+                image_id,
+                &[ColmapKeypoint::new(0.0, 0.0), ColmapKeypoint::new(1.0, 1.0)],
+            )
+            .unwrap();
+        }
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: COLMAP_TWO_VIEW_DEGENERATE,
+                inlier_matches: vec![m(0, 0), m(1, 1)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+        db.write_two_view_geometry(
+            2,
+            3,
+            &ColmapTwoViewGeometry {
+                config: COLMAP_TWO_VIEW_UNDEFINED,
+                inlier_matches: vec![m(0, 0), m(1, 1)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+
+        let cache = db.load_cache(&DatabaseCacheOptions::default()).unwrap();
+
+        assert!(cache.images.is_empty());
+        assert_eq!(cache.correspondence_graph.num_image_pairs(), 0);
+        assert!(!is_colmap_two_view_geometry_with_inliers(
+            COLMAP_TWO_VIEW_DEGENERATE
+        ));
+        assert!(!is_colmap_two_view_geometry_with_inliers(
+            COLMAP_TWO_VIEW_UNDEFINED
+        ));
+        assert!(is_colmap_two_view_geometry_with_inliers(
+            COLMAP_TWO_VIEW_CALIBRATED
+        ));
     }
 
     #[test]
