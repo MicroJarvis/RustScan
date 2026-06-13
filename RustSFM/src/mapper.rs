@@ -3,9 +3,9 @@ use crate::colmap::{
     world_to_camera_rotation,
 };
 use crate::geometry::{
-    camera_center, estimate_pair_geometry, estimate_pair_geometry_with_options,
-    mean_pair_reprojection_error_with_cameras, pose_from_rotation_center, pose_rotation,
-    pose_with_flipped_translation, PairEstimationOptions,
+    camera_center, estimate_pair_geometry_with_cameras,
+    estimate_pair_geometry_with_options_and_cameras, mean_pair_reprojection_error_with_cameras,
+    pose_from_rotation_center, pose_rotation, pose_with_flipped_translation, PairEstimationOptions,
 };
 use crate::pose_graph::initialize_pose_graph;
 use crate::sift::{
@@ -197,7 +197,13 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         camera.height = frames[0].height;
     }
     let pair_start = Instant::now();
-    let pairs = build_pair_graph(&frames, camera, config, &sift_matching)?;
+    let pairs = build_pair_graph(
+        &frames,
+        camera,
+        reference_camera_setup.as_ref(),
+        config,
+        &sift_matching,
+    )?;
     let pair_elapsed_ms = pair_start.elapsed().as_secs_f64() * 1000.0;
     if pairs.is_empty() {
         bail!("no verified image pairs");
@@ -480,6 +486,7 @@ fn strong_feature_indices(keypoints: &[rustslam::KeyPoint], limit: usize) -> Vec
 fn build_pair_graph(
     frames: &[ImageFrame],
     camera: CameraModel,
+    reference_camera_setup: Option<&ReferenceCameraSetup>,
     config: &MapperConfig,
     sift_matching: &SiftMatchingOptions,
 ) -> Result<Vec<PairGeometry>> {
@@ -494,11 +501,14 @@ fn build_pair_graph(
     let mut pairs = candidates
         .par_iter()
         .filter_map(|&(left, right)| {
+            let left_camera = setup_camera_for_image(reference_camera_setup, left, camera);
+            let right_camera = setup_camera_for_image(reference_camera_setup, right, camera);
             estimate_candidate_pair(
                 left,
                 right,
                 frames,
-                camera,
+                left_camera,
+                right_camera,
                 config,
                 Some(&matcher),
                 sift_matching,
@@ -508,9 +518,18 @@ fn build_pair_graph(
     if std::env::var_os("RUSTSFM_RING_CLOSURE").is_some() {
         let mut closure_pairs = Vec::new();
         for (left, right) in intra_segment_ring_candidates(frames.len(), 192) {
-            if let Some(pair) =
-                estimate_candidate_pair(left, right, frames, camera, config, None, sift_matching)
-            {
+            let left_camera = setup_camera_for_image(reference_camera_setup, left, camera);
+            let right_camera = setup_camera_for_image(reference_camera_setup, right, camera);
+            if let Some(pair) = estimate_candidate_pair(
+                left,
+                right,
+                frames,
+                left_camera,
+                right_camera,
+                config,
+                None,
+                sift_matching,
+            ) {
                 closure_pairs.push(pair);
             }
         }
@@ -523,11 +542,28 @@ fn build_pair_graph(
     Ok(pairs)
 }
 
+fn setup_camera_for_image(
+    setup: Option<&ReferenceCameraSetup>,
+    image: usize,
+    fallback: CameraModel,
+) -> CameraModel {
+    setup
+        .and_then(|setup| {
+            setup
+                .image_camera_indices
+                .get(image)
+                .and_then(|&camera_idx| setup.cameras.get(camera_idx))
+        })
+        .copied()
+        .unwrap_or(fallback)
+}
+
 fn estimate_candidate_pair(
     left: usize,
     right: usize,
     frames: &[ImageFrame],
-    camera: CameraModel,
+    left_camera: CameraModel,
+    right_camera: CameraModel,
     config: &MapperConfig,
     matcher: Option<&HammingMatcher>,
     sift_matching: &SiftMatchingOptions,
@@ -572,13 +608,14 @@ fn estimate_candidate_pair(
             .collect::<Vec<_>>()
     };
     let mut pair = if is_ring_bridge_candidate(left, right) {
-        estimate_pair_geometry_with_options(
+        estimate_pair_geometry_with_options_and_cameras(
             left,
             right,
             &frames[left],
             &frames[right],
             &matches,
-            camera,
+            left_camera,
+            right_camera,
             config.essential_threshold_px,
             config.essential_iterations.min(200),
             config.min_inliers,
@@ -591,13 +628,14 @@ fn estimate_candidate_pair(
             },
         )
     } else {
-        estimate_pair_geometry(
+        estimate_pair_geometry_with_cameras(
             left,
             right,
             &frames[left],
             &frames[right],
             &matches,
-            camera,
+            left_camera,
+            right_camera,
             config.essential_threshold_px,
             config.essential_iterations,
             config.min_inliers,

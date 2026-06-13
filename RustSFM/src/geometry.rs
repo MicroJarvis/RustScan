@@ -1,5 +1,6 @@
 use crate::two_view::{
-    estimate_calibrated_two_view_with_observations, triangulate_world_point, TwoViewOptions,
+    estimate_calibrated_two_view_with_observations_and_cameras, triangulate_world_point,
+    TwoViewOptions,
 };
 use crate::types::{CameraModel, ImageFrame, PairGeometry};
 use glam::{Quat, Vec3};
@@ -57,13 +58,43 @@ pub fn estimate_pair_geometry(
     min_inliers: usize,
     min_triangulated: usize,
 ) -> Option<PairGeometry> {
-    estimate_pair_geometry_with_options(
+    estimate_pair_geometry_with_cameras(
         left_idx,
         right_idx,
         left,
         right,
         matches,
         camera,
+        camera,
+        essential_threshold,
+        essential_iterations,
+        min_inliers,
+        min_triangulated,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_pair_geometry_with_cameras(
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+) -> Option<PairGeometry> {
+    estimate_pair_geometry_with_options_and_cameras(
+        left_idx,
+        right_idx,
+        left,
+        right,
+        matches,
+        left_camera,
+        right_camera,
         essential_threshold,
         essential_iterations,
         min_inliers,
@@ -105,6 +136,37 @@ pub fn estimate_pair_geometry_with_options(
     min_triangulated: usize,
     options: PairEstimationOptions,
 ) -> Option<PairGeometry> {
+    estimate_pair_geometry_with_options_and_cameras(
+        left_idx,
+        right_idx,
+        left,
+        right,
+        matches,
+        camera,
+        camera,
+        essential_threshold,
+        essential_iterations,
+        min_inliers,
+        min_triangulated,
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_pair_geometry_with_options_and_cameras(
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+    options: PairEstimationOptions,
+) -> Option<PairGeometry> {
     if matches.len() < min_inliers.max(8) {
         return None;
     }
@@ -122,8 +184,8 @@ pub fn estimate_pair_geometry_with_options(
         }
         let lk = &left.keypoints[li];
         let rk = &right.keypoints[ri];
-        norm_left.push(camera.normalize(lk.x(), lk.y()));
-        norm_right.push(camera.normalize(rk.x(), rk.y()));
+        norm_left.push(left_camera.normalize(lk.x(), lk.y()));
+        norm_right.push(right_camera.normalize(rk.x(), rk.y()));
         obs_left_px.push([lk.x(), lk.y()]);
         obs_right_px.push([rk.x(), rk.y()]);
         valid_matches.push(m.clone());
@@ -131,13 +193,15 @@ pub fn estimate_pair_geometry_with_options(
     if valid_matches.len() < min_inliers.max(8) {
         return None;
     }
-    let normalized_threshold = camera.cam_from_img_threshold(essential_threshold as f64);
-    let estimate = estimate_calibrated_two_view_with_observations(
+    let normalized_threshold =
+        mean_cam_from_img_threshold(left_camera, right_camera, essential_threshold as f64);
+    let estimate = estimate_calibrated_two_view_with_observations_and_cameras(
         &norm_left,
         &norm_right,
         &obs_left_px,
         &obs_right_px,
-        camera,
+        left_camera,
+        right_camera,
         &TwoViewOptions {
             ransac_threshold: normalized_threshold,
             ransac_max_iterations: essential_iterations,
@@ -188,13 +252,14 @@ pub fn estimate_pair_geometry_with_options(
                 let m = &pose_inlier_matches[idx];
                 let lk = &left.keypoints[m.query_idx as usize];
                 let rk = &right.keypoints[m.train_idx as usize];
-                let err = mean_pair_reprojection_error(
+                let err = mean_pair_reprojection_error_with_cameras(
                     xyz,
                     SE3::identity(),
                     refined,
                     [lk.x(), lk.y()],
                     [rk.x(), rk.y()],
-                    camera,
+                    left_camera,
+                    right_camera,
                 );
                 if err.is_finite() {
                     reproj_sum += err;
@@ -235,8 +300,14 @@ pub fn estimate_pair_geometry_with_options(
     }
     let mut output_inlier_matches = pose_inlier_matches;
     if std::env::var_os("RUSTSFM_DENSE_PAIR_INLIERS").is_some() {
-        let dense_inlier_matches =
-            collect_pose_consistent_matches(matches, left, right, camera, relative_pose);
+        let dense_inlier_matches = collect_pose_consistent_matches(
+            matches,
+            left,
+            right,
+            left_camera,
+            right_camera,
+            relative_pose,
+        );
         if dense_inlier_matches.len() > output_inlier_matches.len() {
             output_inlier_matches = limit_dense_pair_inliers(dense_inlier_matches);
         }
@@ -254,6 +325,15 @@ pub fn estimate_pair_geometry_with_options(
         median_triangulation_angle_deg: estimate.median_triangulation_angle_deg,
         pose_graph_only: false,
     })
+}
+
+fn mean_cam_from_img_threshold(
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    threshold_px: f64,
+) -> f64 {
+    0.5 * (left_camera.cam_from_img_threshold(threshold_px)
+        + right_camera.cam_from_img_threshold(threshold_px))
 }
 
 fn limit_dense_pair_inliers(mut matches: Vec<Match>) -> Vec<Match> {
@@ -282,12 +362,13 @@ fn collect_pose_consistent_matches(
     matches: &[Match],
     left: &ImageFrame,
     right: &ImageFrame,
-    camera: CameraModel,
+    left_camera: CameraModel,
+    right_camera: CameraModel,
     relative_pose: SE3,
 ) -> Vec<Match> {
     let mut inliers = Vec::new();
     let max_reproj = dense_pair_reprojection_threshold_px();
-    let max_sampson = dense_pair_sampson_threshold(camera);
+    let max_sampson = dense_pair_sampson_threshold(left_camera, right_camera);
     for m in matches {
         let li = m.query_idx as usize;
         let ri = m.train_idx as usize;
@@ -296,8 +377,8 @@ fn collect_pose_consistent_matches(
         }
         let lk = &left.keypoints[li];
         let rk = &right.keypoints[ri];
-        let left_xy = camera.normalize(lk.x(), lk.y());
-        let right_xy = camera.normalize(rk.x(), rk.y());
+        let left_xy = left_camera.normalize(lk.x(), lk.y());
+        let right_xy = right_camera.normalize(rk.x(), rk.y());
         let residual = sampson_residual(relative_pose, left_xy, right_xy);
         if !residual.is_finite() || residual.abs() > max_sampson {
             continue;
@@ -310,13 +391,14 @@ fn collect_pose_consistent_matches(
         ) else {
             continue;
         };
-        let err = mean_pair_reprojection_error(
+        let err = mean_pair_reprojection_error_with_cameras(
             xyz,
             SE3::identity(),
             relative_pose,
             [lk.x(), lk.y()],
             [rk.x(), rk.y()],
-            camera,
+            left_camera,
+            right_camera,
         );
         if err.is_finite() && err <= max_reproj {
             inliers.push(m.clone());
@@ -333,13 +415,13 @@ fn dense_pair_reprojection_threshold_px() -> f32 {
         .unwrap_or(2.0)
 }
 
-fn dense_pair_sampson_threshold(camera: CameraModel) -> f32 {
+fn dense_pair_sampson_threshold(left_camera: CameraModel, right_camera: CameraModel) -> f32 {
     let px = std::env::var("RUSTSFM_DENSE_PAIR_SAMPSON_PX")
         .ok()
         .and_then(|value| value.parse::<f32>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(2.0);
-    camera.cam_from_img_threshold(px as f64) as f32
+    mean_cam_from_img_threshold(left_camera, right_camera, px as f64) as f32
 }
 
 fn sampson_refine_rotation_limit_deg() -> f32 {

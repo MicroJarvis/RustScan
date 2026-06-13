@@ -61,6 +61,20 @@ pub fn estimate_calibrated_two_view_with_observations(
     camera: CameraModel,
     options: &TwoViewOptions,
 ) -> Option<TwoViewEstimate> {
+    estimate_calibrated_two_view_with_observations_and_cameras(
+        pts1, pts2, obs1_px, obs2_px, camera, camera, options,
+    )
+}
+
+pub fn estimate_calibrated_two_view_with_observations_and_cameras(
+    pts1: &[[f32; 2]],
+    pts2: &[[f32; 2]],
+    obs1_px: &[[f32; 2]],
+    obs2_px: &[[f32; 2]],
+    camera1: CameraModel,
+    camera2: CameraModel,
+    options: &TwoViewOptions,
+) -> Option<TwoViewEstimate> {
     let n = pts1.len().min(pts2.len());
     if n < options.min_inliers.max(5) {
         return None;
@@ -184,7 +198,8 @@ pub fn estimate_calibrated_two_view_with_observations(
         obs1_px,
         obs2_px,
         &support.inlier_mask,
-        camera,
+        camera1,
+        camera2,
     )?;
     if pose_score.triangulated < options.min_triangulated {
         return None;
@@ -533,7 +548,8 @@ fn choose_pose_from_essential(
     obs1_px: &[[f32; 2]],
     obs2_px: &[[f32; 2]],
     inlier_mask: &[bool],
-    camera: CameraModel,
+    camera1: CameraModel,
+    camera2: CameraModel,
 ) -> Option<PoseCandidateScore> {
     let candidates = decompose_essential_matrix(essential)?;
     candidates
@@ -566,7 +582,8 @@ fn choose_pose_from_essential(
                         .get(idx)
                         .copied()
                         .unwrap_or([pts2[idx].x as f32, pts2[idx].y as f32]),
-                    camera,
+                    camera1,
+                    camera2,
                 );
                 if !err.is_finite() || err > 16.0 {
                     continue;
@@ -684,10 +701,11 @@ fn pair_reprojection_error_px(
     point2: &Vector3<f64>,
     observation1_px: [f32; 2],
     observation2_px: [f32; 2],
-    camera: CameraModel,
+    camera1: CameraModel,
+    camera2: CameraModel,
 ) -> f64 {
-    let err1 = camera_reprojection_error_px(point1, observation1_px, camera);
-    let err2 = camera_reprojection_error_px(point2, observation2_px, camera);
+    let err1 = camera_reprojection_error_px(point1, observation1_px, camera1);
+    let err2 = camera_reprojection_error_px(point2, observation2_px, camera2);
     0.5 * (err1 + err2)
 }
 
@@ -765,5 +783,40 @@ impl Lcg {
             }
         }
         sample
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_reprojection_error_uses_each_image_camera() {
+        let camera1 = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let camera2 = CameraModel::new_pinhole(800, 600, 900.0, 700.0, 30.0, 40.0);
+        let point1 = Vector3::new(0.1, -0.05, 1.0);
+        let point2 = Vector3::new(0.2, -0.1, 1.4);
+        let obs1 = camera1.img_from_cam(point1.x, point1.y, point1.z).unwrap();
+        let obs2 = camera2.img_from_cam(point2.x, point2.y, point2.z).unwrap();
+
+        let err = pair_reprojection_error_px(
+            &point1,
+            &point2,
+            [obs1[0] as f32, obs1[1] as f32],
+            [obs2[0] as f32, obs2[1] as f32],
+            camera1,
+            camera2,
+        );
+        let wrong_right_camera_err = pair_reprojection_error_px(
+            &point1,
+            &point2,
+            [obs1[0] as f32, obs1[1] as f32],
+            [obs2[0] as f32, obs2[1] as f32],
+            camera1,
+            camera1,
+        );
+
+        assert!(err < 1.0e-4);
+        assert!(wrong_right_camera_err > 100.0);
     }
 }

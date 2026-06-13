@@ -24,8 +24,10 @@ reconstruction parity.
      camera ids and per-image camera ownership instead of hard-coding camera 1.
    - Reference-model initialization now keeps COLMAP camera/image ids and maps
      images back to their shared cameras.
+   - Reference-model two-view estimation now passes each image's camera and
+     averages the normalized RANSAC threshold like COLMAP.
    - Remaining work: non-reference mapper input still initializes a single
-     shared camera, and two-view estimation still accepts one camera.
+     shared camera.
 4. [partial] Introduce COLMAP-compatible identifiers for cameras, images,
    points, frames, rigs, and sensors instead of relying on contiguous vector
    indices.
