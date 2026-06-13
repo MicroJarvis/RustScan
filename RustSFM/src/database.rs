@@ -159,6 +159,24 @@ pub struct ColmapDatabaseFrame {
     pub data_ids: Vec<ColmapDataId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColmapPosePriorCoordinateSystem {
+    Undefined,
+    Wgs84,
+    Cartesian,
+    Other(i64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColmapPosePrior {
+    pub pose_prior_id: u32,
+    pub corr_data_id: ColmapDataId,
+    pub position: [f64; 3],
+    pub position_covariance: [f64; 9],
+    pub coordinate_system: ColmapPosePriorCoordinateSystem,
+    pub gravity: [f64; 3],
+}
+
 impl ColmapDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).context("open COLMAP database")?;
@@ -209,7 +227,18 @@ impl ColmapDatabase {
                  sensor_type INTEGER NOT NULL,
                  FOREIGN KEY(frame_id) REFERENCES frames(frame_id) ON DELETE CASCADE);
              CREATE UNIQUE INDEX IF NOT EXISTS frame_sensor_assignment
-                ON frame_data(data_id, sensor_type);",
+                ON frame_data(data_id, sensor_type);
+             CREATE TABLE IF NOT EXISTS pose_priors
+                (pose_prior_id INTEGER PRIMARY KEY NOT NULL,
+                 corr_data_id INTEGER NOT NULL,
+                 corr_sensor_id INTEGER NOT NULL,
+                 corr_sensor_type INTEGER NOT NULL,
+                 position BLOB,
+                 position_covariance BLOB,
+                 gravity BLOB,
+                 coordinate_system INTEGER NOT NULL);
+             CREATE UNIQUE INDEX IF NOT EXISTS pose_prior_data_assignment
+                ON pose_priors(corr_data_id, corr_sensor_id, corr_sensor_type);",
         )?;
         self.create_feature_tables()?;
         Ok(())
@@ -458,6 +487,79 @@ impl ColmapDatabase {
         )?;
         let mut rows = stmt.query([])?;
         collect_frame_rows(&mut rows)
+    }
+
+    pub fn write_pose_prior(
+        &self,
+        pose_prior: &ColmapPosePrior,
+        use_pose_prior_id: bool,
+    ) -> Result<u32> {
+        let position = encode_f64_blob(&pose_prior.position);
+        let position_covariance = encode_f64_blob(&pose_prior.position_covariance);
+        let gravity = encode_f64_blob(&pose_prior.gravity);
+        if use_pose_prior_id {
+            self.conn.execute(
+                "INSERT INTO pose_priors(
+                    pose_prior_id, corr_data_id, corr_sensor_id, corr_sensor_type,
+                    position, position_covariance, coordinate_system, gravity)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+                params![
+                    pose_prior.pose_prior_id,
+                    pose_prior.corr_data_id.data_id as i64,
+                    pose_prior.corr_data_id.sensor_id.sensor_id,
+                    sensor_type_to_i64(&pose_prior.corr_data_id.sensor_id.sensor_type)?,
+                    position,
+                    position_covariance,
+                    coordinate_system_to_i64(&pose_prior.coordinate_system)?,
+                    gravity
+                ],
+            )?;
+            Ok(pose_prior.pose_prior_id)
+        } else {
+            self.conn.execute(
+                "INSERT INTO pose_priors(
+                    pose_prior_id, corr_data_id, corr_sensor_id, corr_sensor_type,
+                    position, position_covariance, coordinate_system, gravity)
+                 VALUES(NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                params![
+                    pose_prior.corr_data_id.data_id as i64,
+                    pose_prior.corr_data_id.sensor_id.sensor_id,
+                    sensor_type_to_i64(&pose_prior.corr_data_id.sensor_id.sensor_type)?,
+                    position,
+                    position_covariance,
+                    coordinate_system_to_i64(&pose_prior.coordinate_system)?,
+                    gravity
+                ],
+            )?;
+            Ok(self.conn.last_insert_rowid() as u32)
+        }
+    }
+
+    pub fn read_pose_prior(&self, pose_prior_id: u32) -> Result<Option<ColmapPosePrior>> {
+        self.conn
+            .query_row(
+                "SELECT pose_prior_id, corr_data_id, corr_sensor_id, corr_sensor_type,
+                        position, position_covariance, coordinate_system, gravity
+                 FROM pose_priors WHERE pose_prior_id = ?1;",
+                params![pose_prior_id],
+                read_pose_prior_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn read_all_pose_priors(&self) -> Result<Vec<ColmapPosePrior>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pose_prior_id, corr_data_id, corr_sensor_id, corr_sensor_type,
+                    position, position_covariance, coordinate_system, gravity
+             FROM pose_priors;",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(read_pose_prior_row(row)?);
+        }
+        Ok(out)
     }
 
     pub fn write_keypoints(&self, image_id: ImageId, keypoints: &[ColmapKeypoint]) -> Result<()> {
@@ -837,6 +939,27 @@ fn read_image_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseImage> {
     })
 }
 
+fn read_pose_prior_row(row: &Row<'_>) -> rusqlite::Result<ColmapPosePrior> {
+    let position_blob = row.get::<_, Vec<u8>>(4)?;
+    let position_covariance_blob = row.get::<_, Vec<u8>>(5)?;
+    let gravity_blob = row.get::<_, Vec<u8>>(7)?;
+    Ok(ColmapPosePrior {
+        pose_prior_id: row.get::<_, i64>(0)? as u32,
+        corr_data_id: ColmapDataId {
+            data_id: row.get::<_, i64>(1)? as u64,
+            sensor_id: ColmapSensorId {
+                sensor_id: row.get::<_, i64>(2)? as u32,
+                sensor_type: sensor_type_from_i64(row.get::<_, i64>(3)?),
+            },
+        },
+        position: decode_f64_values::<3>(&position_blob).map_err(to_sql_error)?,
+        position_covariance: decode_f64_values::<9>(&position_covariance_blob)
+            .map_err(to_sql_error)?,
+        coordinate_system: coordinate_system_from_i64(row.get::<_, i64>(6)?),
+        gravity: decode_f64_values::<3>(&gravity_blob).map_err(to_sql_error)?,
+    })
+}
+
 fn collect_rig_rows(rows: &mut Rows<'_>) -> Result<Vec<ColmapRig>> {
     let mut rigs = BTreeMap::<u32, ColmapRig>::new();
     while let Some(row) = rows.next()? {
@@ -962,6 +1085,26 @@ fn sensor_type_from_i64(value: i64) -> ColmapSensorType {
         0 => ColmapSensorType::Camera,
         1 => ColmapSensorType::Imu,
         other => ColmapSensorType::Other(other.to_string()),
+    }
+}
+
+fn coordinate_system_to_i64(coordinate_system: &ColmapPosePriorCoordinateSystem) -> Result<i64> {
+    match coordinate_system {
+        ColmapPosePriorCoordinateSystem::Undefined => Ok(-1),
+        ColmapPosePriorCoordinateSystem::Wgs84 => Ok(0),
+        ColmapPosePriorCoordinateSystem::Cartesian => Ok(1),
+        ColmapPosePriorCoordinateSystem::Other(value) => {
+            bail!("cannot write non-COLMAP pose prior coordinate system {value}")
+        }
+    }
+}
+
+fn coordinate_system_from_i64(value: i64) -> ColmapPosePriorCoordinateSystem {
+    match value {
+        -1 => ColmapPosePriorCoordinateSystem::Undefined,
+        0 => ColmapPosePriorCoordinateSystem::Wgs84,
+        1 => ColmapPosePriorCoordinateSystem::Cartesian,
+        other => ColmapPosePriorCoordinateSystem::Other(other),
     }
 }
 
@@ -1346,6 +1489,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(frame_id, 1);
+    }
+
+    #[test]
+    fn pose_priors_roundtrip_through_colmap_table() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let pose_prior = ColmapPosePrior {
+            pose_prior_id: 12,
+            corr_data_id: ColmapDataId {
+                data_id: 42,
+                sensor_id: ColmapSensorId {
+                    sensor_type: ColmapSensorType::Camera,
+                    sensor_id: 3,
+                },
+            },
+            position: [1.0, 2.0, 3.0],
+            position_covariance: [1.0, 0.1, 0.2, 0.1, 2.0, 0.3, 0.2, 0.3, 3.0],
+            coordinate_system: ColmapPosePriorCoordinateSystem::Cartesian,
+            gravity: [0.0, 1.0, 0.0],
+        };
+
+        assert_eq!(db.write_pose_prior(&pose_prior, true).unwrap(), 12);
+        assert_eq!(db.read_pose_prior(12).unwrap(), Some(pose_prior.clone()));
+        assert_eq!(db.read_all_pose_priors().unwrap(), vec![pose_prior]);
+    }
+
+    #[test]
+    fn pose_prior_autoincrement_id_matches_sqlite_rowid() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let pose_prior_id = db
+            .write_pose_prior(
+                &ColmapPosePrior {
+                    pose_prior_id: 0,
+                    corr_data_id: ColmapDataId {
+                        data_id: 5,
+                        sensor_id: ColmapSensorId {
+                            sensor_type: ColmapSensorType::Camera,
+                            sensor_id: 1,
+                        },
+                    },
+                    position: [f64::NAN; 3],
+                    position_covariance: [f64::NAN; 9],
+                    coordinate_system: ColmapPosePriorCoordinateSystem::Wgs84,
+                    gravity: [0.0, 0.0, 1.0],
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(pose_prior_id, 1);
+        let read = db.read_pose_prior(pose_prior_id).unwrap().unwrap();
+        assert_eq!(read.pose_prior_id, 1);
+        assert_eq!(
+            read.coordinate_system,
+            ColmapPosePriorCoordinateSystem::Wgs84
+        );
+        assert!(read.position.iter().all(|v| v.is_nan()));
     }
 
     #[test]
