@@ -83,6 +83,9 @@ pub struct MapperConfig {
     pub min_matches: usize,
     pub min_inliers: usize,
     pub min_triangulated: usize,
+    pub init_min_num_inliers: usize,
+    pub init_min_tri_angle_deg: f32,
+    pub init_max_forward_motion: f32,
     pub essential_threshold_px: f32,
     pub essential_iterations: u32,
     pub pnp_threshold_px: f32,
@@ -115,6 +118,9 @@ impl Default for MapperConfig {
             min_matches: 15,
             min_inliers: 15,
             min_triangulated: 4,
+            init_min_num_inliers: 100,
+            init_min_tri_angle_deg: 16.0,
+            init_max_forward_motion: 0.95,
             essential_threshold_px: 2.0,
             essential_iterations: 10000,
             pnp_threshold_px: 8.0,
@@ -1826,7 +1832,7 @@ fn incremental_map(
         .cloned()
         .collect::<Vec<_>>();
     let pairs = mapping_pairs.as_slice();
-    let initial = choose_initial_pair(pairs).context("no initial pair")?;
+    let initial = choose_initial_pair(pairs, config).context("no initial pair")?;
     debug_log.push(format!(
         "initial_pair {} -> {} inliers={} triangulated={}",
         frames[initial.left].name,
@@ -1938,19 +1944,80 @@ fn choose_next_registration(
     best.map(|(_, choice)| choice)
 }
 
-fn choose_initial_pair(pairs: &[PairGeometry]) -> Option<&PairGeometry> {
+fn choose_initial_pair<'a>(
+    pairs: &'a [PairGeometry],
+    config: &MapperConfig,
+) -> Option<&'a PairGeometry> {
+    let image_correspondences = image_correspondence_counts(pairs);
     pairs
         .iter()
-        .filter(|p| p.right == p.left + 1)
-        .filter(|p| p.inliers >= 32 && p.triangulated >= 16)
-        .min_by_key(|p| p.left)
+        .filter(|p| is_colmap_style_initial_pair(p, config))
+        .max_by(|a, b| compare_initial_pairs(a, b, &image_correspondences))
         .or_else(|| {
             pairs
                 .iter()
-                .filter(|p| p.right == p.left + 1)
-                .max_by_key(|p| p.inliers + p.triangulated)
+                .filter(|p| {
+                    p.inliers >= config.min_inliers && p.triangulated >= config.min_triangulated
+                })
+                .max_by(|a, b| compare_initial_pairs(a, b, &image_correspondences))
         })
-        .or_else(|| pairs.iter().max_by_key(|p| p.inliers + p.triangulated))
+        .or_else(|| {
+            pairs
+                .iter()
+                .max_by(|a, b| compare_initial_pairs(a, b, &image_correspondences))
+        })
+}
+
+fn is_colmap_style_initial_pair(pair: &PairGeometry, config: &MapperConfig) -> bool {
+    pair.inliers >= config.init_min_num_inliers
+        && pair.median_triangulation_angle_deg > config.init_min_tri_angle_deg
+        && pair.triangulated >= config.min_triangulated
+        && initial_pair_forward_motion(pair) < config.init_max_forward_motion
+}
+
+fn initial_pair_forward_motion(pair: &PairGeometry) -> f32 {
+    let translation = glam::Vec3::from_array(pair.relative_pose.translation());
+    let norm = translation.length();
+    if norm <= f32::EPSILON || !norm.is_finite() {
+        return f32::INFINITY;
+    }
+    (translation.z / norm).abs()
+}
+
+fn image_correspondence_counts(pairs: &[PairGeometry]) -> HashMap<usize, usize> {
+    let mut counts = HashMap::new();
+    for pair in pairs {
+        *counts.entry(pair.left).or_default() += pair.inliers;
+        *counts.entry(pair.right).or_default() += pair.inliers;
+    }
+    counts
+}
+
+fn compare_initial_pairs(
+    a: &PairGeometry,
+    b: &PairGeometry,
+    image_correspondences: &HashMap<usize, usize>,
+) -> std::cmp::Ordering {
+    initial_pair_score(a, image_correspondences)
+        .partial_cmp(&initial_pair_score(b, image_correspondences))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| b.left.cmp(&a.left))
+        .then_with(|| b.right.cmp(&a.right))
+}
+
+fn initial_pair_score(pair: &PairGeometry, image_correspondences: &HashMap<usize, usize>) -> f32 {
+    let left_corrs = *image_correspondences.get(&pair.left).unwrap_or(&0) as f32;
+    let right_corrs = *image_correspondences.get(&pair.right).unwrap_or(&0) as f32;
+    let pair_corrs = pair.inliers as f32;
+    let tri_angle = pair.median_triangulation_angle_deg.max(0.0);
+    let triangulated = pair.triangulated as f32;
+    let forward_penalty = initial_pair_forward_motion(pair).min(1.0) * 500.0;
+    left_corrs.sqrt() * 20.0
+        + right_corrs.sqrt() * 20.0
+        + pair_corrs * 10.0
+        + triangulated * 3.0
+        + tri_angle * 30.0
+        - forward_penalty
 }
 
 fn registration_score(
@@ -3704,6 +3771,56 @@ mod tests {
         assert!(pair.mean_reprojection_error_px < 1.0e-4);
         assert_eq!(pair.relative_pose.translation(), [-1.0, 0.0, 0.0]);
         Ok(())
+    }
+
+    #[test]
+    fn initial_pair_prefers_strong_non_adjacent_colmap_style_candidate() {
+        let weak_adjacent = test_pair(0, 1, 120, 60, 20.0, [1.0, 0.0, 0.0]);
+        let strong_non_adjacent = test_pair(0, 3, 220, 140, 25.0, [1.0, 0.1, 0.0]);
+        let pairs = vec![weak_adjacent, strong_non_adjacent];
+
+        let chosen = choose_initial_pair(&pairs, &MapperConfig::default()).unwrap();
+
+        assert_eq!((chosen.left, chosen.right), (0, 3));
+    }
+
+    #[test]
+    fn initial_pair_rejects_forward_motion_and_low_triangulation_in_strict_pass() {
+        let forward_motion = test_pair(0, 1, 300, 200, 30.0, [0.0, 0.0, 1.0]);
+        let low_angle = test_pair(0, 2, 260, 180, 2.0, [1.0, 0.0, 0.0]);
+        let stable = test_pair(1, 3, 140, 90, 18.0, [1.0, 0.0, 0.1]);
+        let pairs = vec![forward_motion, low_angle, stable];
+
+        let chosen = choose_initial_pair(&pairs, &MapperConfig::default()).unwrap();
+
+        assert_eq!((chosen.left, chosen.right), (1, 3));
+    }
+
+    fn test_pair(
+        left: usize,
+        right: usize,
+        inliers: usize,
+        triangulated: usize,
+        median_triangulation_angle_deg: f32,
+        translation: [f32; 3],
+    ) -> PairGeometry {
+        PairGeometry {
+            left,
+            right,
+            two_view_config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+            matches: Vec::new(),
+            inlier_matches: Vec::new(),
+            relative_pose: SE3::from_quat_translation(
+                glam::Quat::IDENTITY,
+                glam::Vec3::from_array(translation),
+            ),
+            inliers,
+            triangulated,
+            mean_reprojection_error_px: 1.0,
+            rotation_deg: 0.0,
+            median_triangulation_angle_deg,
+            pose_graph_only: false,
+        }
     }
 
     fn minimal_frame(id: usize, name: &str) -> ImageFrame {
