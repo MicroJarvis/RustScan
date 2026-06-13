@@ -10,6 +10,7 @@ use crate::geometry::{
     pose_from_rotation_center, pose_rotation, pose_with_flipped_translation, relative_rotation_deg,
     PairEstimationOptions,
 };
+use crate::incremental_triangulator::{IncrementalTriangulator, IncrementalTriangulatorOptions};
 use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
 use crate::sift::{
@@ -1843,7 +1844,13 @@ fn incremental_map(
     ));
     reconstruction.poses[initial.left] = Some(SE3::identity());
     reconstruction.poses[initial.right] = Some(initial.relative_pose);
-    triangulate_pair(initial, frames, &mut reconstruction, config);
+    let tri_options =
+        IncrementalTriangulatorOptions::from_mapper_threshold(config.max_reprojection_error_px);
+    {
+        let mut triangulator = IncrementalTriangulator::new(frames, pairs, &mut reconstruction);
+        triangulator.triangulate_image(&tri_options, initial.left);
+        triangulator.triangulate_image(&tri_options, initial.right);
+    }
 
     while reconstruction.poses.iter().any(|p| p.is_none()) {
         let Some(choice) = choose_next_registration(frames, pairs, &reconstruction, config) else {
@@ -1858,16 +1865,9 @@ fn incremental_map(
             choice.mean_error_px,
             choice.pair_rot_error
         ));
-        add_existing_observations(choice.image, frames, pairs, &mut reconstruction, config);
-        for pair in pairs
-            .iter()
-            .filter(|p| p.left == choice.image || p.right == choice.image)
         {
-            if reconstruction.poses[pair.left].is_some()
-                && reconstruction.poses[pair.right].is_some()
-            {
-                triangulate_pair(pair, frames, &mut reconstruction, config);
-            }
+            let mut triangulator = IncrementalTriangulator::new(frames, pairs, &mut reconstruction);
+            triangulator.triangulate_image(&tri_options, choice.image);
         }
     }
     Ok((reconstruction, debug_log))
@@ -2215,6 +2215,7 @@ fn registered_pair_rotation_error(
     }
 }
 
+#[allow(dead_code)]
 fn add_existing_observations(
     image: usize,
     frames: &[ImageFrame],
@@ -3423,6 +3424,7 @@ impl DisjointSet {
     }
 }
 
+#[allow(dead_code)]
 fn triangulate_pair(
     pair: &PairGeometry,
     frames: &[ImageFrame],

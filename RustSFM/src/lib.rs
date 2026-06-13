@@ -6,6 +6,7 @@ pub mod database;
 pub mod five_point;
 mod five_point_generated;
 pub mod geometry;
+pub mod incremental_triangulator;
 pub mod mapper;
 pub mod observation_manager;
 pub mod polynomial;
