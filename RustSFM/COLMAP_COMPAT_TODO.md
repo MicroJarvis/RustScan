@@ -69,9 +69,13 @@ reconstruction parity.
      observation correspondences, finalize-time flattening, transitive
      correspondence extraction, match extraction between image pairs, and
      two-view observation checks.
+   - Added SQLite COLMAP feature-table read/write support for keypoints,
+     descriptors, raw matches, and two-view geometries, including COLMAP
+     image-pair ordering, matrix blob encoding, optional F/E/H/qvec/tvec blobs,
+     and legacy 2/4-column keypoint blobs.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache loading, persistent keypoint/descriptor/match/two-view geometry
-     blobs, and mapper integration.
+     cache loading, cameras/images/rigs/frames database tables, and mapper
+     integration.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 
