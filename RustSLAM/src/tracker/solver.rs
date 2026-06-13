@@ -88,7 +88,7 @@ impl PnPSolver {
             .map(|p| [(p[0] - self.cx) / self.fx, (p[1] - self.cy) / self.fy])
             .collect();
 
-        let threshold = (self.ransac_threshold / self.fx.max(self.fy).max(1.0)).max(0.01);
+        let threshold = (self.ransac_threshold / self.fx.max(self.fy).max(1.0)).max(1.0e-6);
         let seed = deterministic_pnp_seed(&normalized_pts, &problem.object_points);
         let mut rng = Lcg::new(seed);
 
@@ -145,6 +145,58 @@ impl PnPSolver {
             }
         }
 
+        // Wide-baseline or nearly-planar image sets can make the minimal P3P
+        // hypotheses brittle. Add a bounded DLT-RANSAC pass as a non-minimal
+        // absolute-pose hypothesis, then keep the same inlier/refinement path.
+        let dlt_sample_size = 6usize;
+        let dlt_rescue_threshold = 12usize.min(n / 10).max(dlt_sample_size);
+        if n >= dlt_sample_size && best_inlier_count < dlt_rescue_threshold {
+            let dlt_max_iterations = self.ransac_max_iterations.clamp(64, 1024);
+            let mut dlt_adaptive_max_iter = dlt_max_iterations;
+            for iter in 0..dlt_max_iterations {
+                if iter >= dlt_adaptive_max_iter {
+                    break;
+                }
+                let sample = rng.sample_unique(n, dlt_sample_size);
+                if sample.len() < dlt_sample_size {
+                    continue;
+                }
+                let mut sample_img = Vec::with_capacity(sample.len());
+                let mut sample_obj = Vec::with_capacity(sample.len());
+                for idx in sample {
+                    sample_img.push(normalized_pts[idx]);
+                    sample_obj.push(problem.object_points[idx]);
+                }
+                let Some(pose) = self.estimate_pose_dlt(&sample_img, &sample_obj) else {
+                    continue;
+                };
+                let (inliers, inlier_count, mean_error) =
+                    self.evaluate_pose(&pose, &normalized_pts, &problem.object_points, threshold);
+                let significant_gain = inlier_count > best_inlier_count + (4usize).max(n / 20);
+                let rescue_hypothesis = best_inlier_count < dlt_sample_size.max(8)
+                    && inlier_count >= dlt_sample_size.max(8);
+                let cleaner_tie =
+                    inlier_count > best_inlier_count && mean_error < best_mean_error * 0.75;
+                if rescue_hypothesis || significant_gain || cleaner_tie {
+                    best_inlier_count = inlier_count;
+                    best_inliers = inliers;
+                    best_pose = Some(pose);
+                    best_mean_error = mean_error;
+                }
+
+                if best_inlier_count >= dlt_sample_size {
+                    let inlier_ratio = best_inlier_count as f32 / n as f32;
+                    let p_all_inlier = inlier_ratio.powi(dlt_sample_size as i32);
+                    if p_all_inlier > 1e-9 {
+                        let needed = ((1.0f32 - self.ransac_confidence).ln()
+                            / (1.0f32 - p_all_inlier).ln())
+                        .ceil() as u32;
+                        dlt_adaptive_max_iter = needed.min(dlt_max_iterations);
+                    }
+                }
+            }
+        }
+
         if let Some(pose) = self.estimate_pose_dlt(&normalized_pts, &problem.object_points) {
             let (inliers, inlier_count, mean_error) =
                 self.evaluate_pose(&pose, &normalized_pts, &problem.object_points, threshold);
@@ -166,6 +218,11 @@ impl PnPSolver {
             if best_inlier_count >= 4 {
                 *pose =
                     self.refine_pose(pose, &normalized_pts, &problem.object_points, &best_inliers);
+                let (refined_inliers, refined_inlier_count, _) =
+                    self.evaluate_pose(pose, &normalized_pts, &problem.object_points, threshold);
+                if refined_inlier_count >= 4 {
+                    best_inliers = refined_inliers;
+                }
             }
         }
 
@@ -629,6 +686,8 @@ impl EssentialSolver {
         let mut rng = Lcg::new(n as u64 + (self.ransac_max_iterations as u64));
         let mut best_inliers = Vec::new();
         let mut best_e = None;
+        let mut best_inlier_count = 0usize;
+        let mut best_error = f32::INFINITY;
 
         for _ in 0..self.ransac_max_iterations {
             let sample = rng.sample_unique(n, 8);
@@ -645,16 +704,35 @@ impl EssentialSolver {
 
             let e = self.compute_essential(&s1, &s2)?;
             let inliers = self.inlier_mask(pts1, pts2, &e);
-            let count = inliers.iter().filter(|&&x| x).count();
-            if count > best_inliers.iter().filter(|&&x| x).count() {
+            let (count, mean_error) = self.inlier_stats(pts1, pts2, &e, &inliers);
+            if count > best_inlier_count || (count == best_inlier_count && mean_error < best_error)
+            {
                 best_inliers = inliers;
                 best_e = Some(e);
+                best_inlier_count = count;
+                best_error = mean_error;
             }
         }
 
-        let e = best_e.or_else(|| self.compute_essential(pts1, pts2))?;
+        let mut e = best_e.or_else(|| self.compute_essential(pts1, pts2))?;
         if best_inliers.is_empty() {
             best_inliers = self.inlier_mask(pts1, pts2, &e);
+        }
+
+        let inlier_count = best_inliers.iter().filter(|&&x| x).count();
+        if inlier_count >= 8 {
+            let mut refined_pts1 = Vec::with_capacity(inlier_count);
+            let mut refined_pts2 = Vec::with_capacity(inlier_count);
+            for i in 0..n {
+                if best_inliers[i] {
+                    refined_pts1.push(pts1[i]);
+                    refined_pts2.push(pts2[i]);
+                }
+            }
+            if let Some(refined_e) = self.compute_essential(&refined_pts1, &refined_pts2) {
+                e = refined_e;
+                best_inliers = self.inlier_mask(pts1, pts2, &e);
+            }
         }
 
         Some((e, best_inliers))
@@ -741,7 +819,8 @@ impl EssentialSolver {
         }
 
         let s = svd.singular_values;
-        let sigma = Matrix3::from_diagonal(&NaVec3::new(s[0], s[1], 0.0));
+        let essential_sigma = 0.5 * (s[0] + s[1]);
+        let sigma = Matrix3::from_diagonal(&NaVec3::new(essential_sigma, essential_sigma, 0.0));
         let e_rank2 = u * sigma * v_t;
         mat3_from_na(&e_rank2)
     }
@@ -769,6 +848,42 @@ impl EssentialSolver {
         }
 
         inliers
+    }
+
+    fn inlier_stats(
+        &self,
+        pts1: &[[f32; 2]],
+        pts2: &[[f32; 2]],
+        e: &Mat3,
+        inliers: &[bool],
+    ) -> (usize, f32) {
+        let n = pts1.len().min(pts2.len()).min(inliers.len());
+        let na_e = mat3_to_na(e);
+        let mut count = 0usize;
+        let mut total_error = 0.0f32;
+
+        for i in 0..n {
+            if !inliers[i] {
+                continue;
+            }
+            let x1 = NaVec3::new(pts1[i][0], pts1[i][1], 1.0);
+            let x2 = NaVec3::new(pts2[i][0], pts2[i][1], 1.0);
+            let ex1 = na_e * x1;
+            let etx2 = na_e.transpose() * x2;
+            let x2t_ex1 = x2.transpose() * na_e * x1;
+            let denom = ex1[0] * ex1[0] + ex1[1] * ex1[1] + etx2[0] * etx2[0] + etx2[1] * etx2[1];
+            if denom > 1e-12 {
+                total_error += (x2t_ex1[(0, 0)] * x2t_ex1[(0, 0)]) / denom;
+                count += 1;
+            }
+        }
+
+        let mean_error = if count > 0 {
+            total_error / count as f32
+        } else {
+            f32::INFINITY
+        };
+        (count, mean_error)
     }
 
     /// Recover pose from essential matrix
@@ -837,9 +952,8 @@ impl EssentialSolver {
         }
 
         let e_norm = self.solve_8point(&a)?;
-        let e_rank2 = self.enforce_rank2(e_norm);
-        let e = t2.transpose() * e_rank2 * t1;
-        Some(e)
+        let e = t2.transpose() * e_norm * t1;
+        Some(self.enforce_rank2(e))
     }
 }
 

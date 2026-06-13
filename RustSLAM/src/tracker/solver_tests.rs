@@ -162,6 +162,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_pnp_threshold_respects_high_focal_pixel_error() {
+        let mut solver = PnPSolver::new(3000.0, 3000.0, 768.0, 1024.0);
+        solver.ransac_threshold = 8.0;
+        solver.ransac_max_iterations = 5000;
+        let pose = SE3::identity();
+        let object_points: Vec<[f32; 3]> = (0..36)
+            .map(|idx| {
+                let x = ((idx % 6) as f32 - 2.5) * 0.25;
+                let y = (((idx / 6) % 6) as f32 - 2.5) * 0.2;
+                let z = 4.0 + (idx % 7) as f32 * 0.25;
+                [x, y, z]
+            })
+            .collect();
+
+        let mut problem = PnPProblem::new();
+        for (idx, point_world) in object_points.iter().enumerate() {
+            let point_camera = pose.transform_point(point_world);
+            let mut pixel = [
+                solver.fx * point_camera[0] / point_camera[2] + solver.cx,
+                solver.fy * point_camera[1] / point_camera[2] + solver.cy,
+            ];
+            if idx == object_points.len() - 1 {
+                pixel[0] += 20.0;
+            }
+            problem.add_correspondence(pixel, *point_world);
+        }
+
+        let (_estimated_pose, inliers) = solver.solve(&problem).expect("pnp pose");
+        assert!(
+            !inliers[object_points.len() - 1],
+            "20px error must be outside an 8px high-focal PnP threshold"
+        );
+    }
+
     // =========================================================================
     // Essential Matrix Solver Tests
     // =========================================================================
@@ -229,6 +264,137 @@ mod tests {
             // Enforce rank-2 constraint by SVD
             let _ = solver.enforce_rank2(E);
         }
+    }
+
+    #[test]
+    fn test_essential_recover_pose_matches_known_relative_pose() {
+        let solver = EssentialSolver {
+            ransac_threshold: 1.0e-2,
+            ransac_max_iterations: 256,
+        };
+        let triangulator = Triangulator::new();
+        let truth = SE3::from_axis_angle(&[0.015, -0.02, 0.01], &[0.25, -0.04, 0.02]);
+        let points = [
+            [-0.8, -0.5, 4.0],
+            [-0.3, -0.4, 4.8],
+            [0.2, -0.35, 5.2],
+            [0.7, -0.25, 4.5],
+            [-0.6, 0.1, 5.4],
+            [-0.1, 0.2, 4.2],
+            [0.4, 0.25, 5.7],
+            [0.9, 0.3, 4.9],
+            [-0.5, 0.55, 6.1],
+            [0.1, 0.6, 5.5],
+            [0.6, 0.65, 4.6],
+            [1.0, 0.7, 6.0],
+        ];
+        let mut pts1 = Vec::with_capacity(points.len());
+        let mut pts2 = Vec::with_capacity(points.len());
+        for point in points {
+            let right = truth.transform_point(&point);
+            pts1.push([point[0] / point[2], point[1] / point[2]]);
+            pts2.push([right[0] / right[2], right[1] / right[2]]);
+        }
+
+        let truth_rotation = truth.rotation_matrix();
+        let rotation = Mat3::from_cols(
+            Vec3::new(
+                truth_rotation[0][0],
+                truth_rotation[1][0],
+                truth_rotation[2][0],
+            ),
+            Vec3::new(
+                truth_rotation[0][1],
+                truth_rotation[1][1],
+                truth_rotation[2][1],
+            ),
+            Vec3::new(
+                truth_rotation[0][2],
+                truth_rotation[1][2],
+                truth_rotation[2][2],
+            ),
+        );
+        let translation = Vec3::from(truth.translation());
+        let skew_translation = Mat3::from_cols(
+            Vec3::new(0.0, translation.z, -translation.y),
+            Vec3::new(-translation.z, 0.0, translation.x),
+            Vec3::new(translation.y, -translation.x, 0.0),
+        );
+        let true_essential = skew_translation * rotation;
+
+        assert_recovered_pose_matches(
+            &solver,
+            &triangulator,
+            &truth,
+            true_essential,
+            &pts1,
+            &pts2,
+            1.0e-3,
+            1.0e-3,
+        );
+
+        let (essential, inliers) = solver
+            .compute(&[], &pts1, &pts2)
+            .expect("synthetic essential matrix");
+        assert!(inliers.iter().filter(|&&value| value).count() >= 8);
+
+        assert_recovered_pose_matches(
+            &solver,
+            &triangulator,
+            &truth,
+            essential,
+            &pts1,
+            &pts2,
+            1.0e-3,
+            1.0e-3,
+        );
+    }
+
+    fn assert_recovered_pose_matches(
+        solver: &EssentialSolver,
+        triangulator: &Triangulator,
+        truth: &SE3,
+        essential: Mat3,
+        pts1: &[[f32; 2]],
+        pts2: &[[f32; 2]],
+        max_rotation_error_rad: f32,
+        max_translation_error_rad: f32,
+    ) {
+        let candidates = solver.recover_pose(essential);
+        let best = candidates
+            .iter()
+            .max_by_key(|candidate| {
+                triangulator
+                    .triangulate(&SE3::identity(), candidate, pts1, pts2)
+                    .iter()
+                    .filter(|point| point.is_some())
+                    .count()
+            })
+            .expect("pose candidate");
+
+        let truth_rotation = truth.rotation_matrix();
+        let best_rotation = best.rotation_matrix();
+        let mut trace = 0.0f32;
+        for row in 0..3 {
+            for col in 0..3 {
+                trace += truth_rotation[row][col] * best_rotation[row][col];
+            }
+        }
+        let rotation_error = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0).acos();
+        assert!(
+            rotation_error < max_rotation_error_rad,
+            "rotation error too large: {} rad",
+            rotation_error
+        );
+
+        let truth_t = Vec3::from(truth.translation()).normalize();
+        let best_t = Vec3::from(best.translation()).normalize();
+        let translation_angle = truth_t.dot(best_t).clamp(-1.0, 1.0).acos();
+        assert!(
+            translation_angle < max_translation_error_rad,
+            "translation direction error too large: {} rad",
+            translation_angle
+        );
     }
 
     // =========================================================================

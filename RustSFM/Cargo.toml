@@ -1,0 +1,27 @@
+[package]
+name = "rustsfm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+glam = "0.25"
+image = "0.25"
+log = "0.4"
+lowe-sift = "0.2.1"
+nalgebra = "0.33"
+rayon = "1.10"
+rustslam = { path = "../RustSLAM", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[lib]
+name = "rustsfm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustsfm"
+path = "src/main.rs"

@@ -6,7 +6,7 @@ description = "Workspace-level orchestration CLI for RustScan reconstruction wor
 authors = ["RustScan Developers"]
 
 [workspace]
-members = ["rustscan-types", "RustMesh", "RustSLAM", "RustGS", "RustViewer", "RustFF"]
+members = ["rustscan-types", "RustMesh", "RustSLAM", "RustGS", "RustViewer", "RustFF", "RustSFM"]
 resolver = "2"
 
 [workspace.dependencies]
