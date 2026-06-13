@@ -34,6 +34,8 @@ reconstruction parity.
    - Added camera/image ids to reconstruction and image pose I/O.
    - Added point3D ids to reconstruction export so observations and points can
      preserve non-contiguous COLMAP point ids instead of hard-coding index + 1.
+   - Added text/binary COLMAP image reading with 2D keypoints and optional
+     point3D associations while preserving the existing pose reader API.
    - Added text/binary COLMAP `points3D` reading with point ids, RGB, error,
      and track image/feature ids.
    - Remaining work: integrating read point ids into full reconstruction

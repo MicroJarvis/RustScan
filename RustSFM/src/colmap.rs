@@ -19,6 +19,22 @@ pub struct ColmapPose {
     pub tvec: [f64; 3],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColmapPoint2D {
+    pub xy: [f64; 2],
+    pub point3d_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColmapImage {
+    pub image_id: u32,
+    pub camera_id: u32,
+    pub name: String,
+    pub qvec: [f64; 4],
+    pub tvec: [f64; 3],
+    pub points2d: Vec<ColmapPoint2D>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColmapCamera {
     pub camera_id: u32,
@@ -100,6 +116,19 @@ fn camera_model_from_colmap(camera: ColmapCamera) -> Result<CameraModel> {
 }
 
 pub fn read_colmap_poses(root: &Path) -> Result<Vec<ColmapPose>> {
+    Ok(read_colmap_images(root)?
+        .into_iter()
+        .map(|image| ColmapPose {
+            image_id: image.image_id,
+            camera_id: image.camera_id,
+            name: image.name,
+            qvec: image.qvec,
+            tvec: image.tvec,
+        })
+        .collect())
+}
+
+pub fn read_colmap_images(root: &Path) -> Result<Vec<ColmapImage>> {
     let sparse = resolve_sparse_dir(root)?;
     let bin = sparse.join("images.bin");
     if bin.exists() {
@@ -295,10 +324,11 @@ fn write_points3d_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()
     Ok(())
 }
 
-fn read_images_txt(path: &Path) -> Result<Vec<ColmapPose>> {
+fn read_images_txt(path: &Path) -> Result<Vec<ColmapImage>> {
     let reader = BufReader::new(File::open(path)?);
-    let mut poses = Vec::new();
-    for line in reader.lines() {
+    let mut images = Vec::new();
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -308,7 +338,11 @@ fn read_images_txt(path: &Path) -> Result<Vec<ColmapPose>> {
         if parts.len() < 10 || parts[0].parse::<u32>().is_err() {
             continue;
         }
-        poses.push(ColmapPose {
+        let points_line = lines
+            .next()
+            .transpose()?
+            .with_context(|| format!("missing points2D line after image in {}", path.display()))?;
+        images.push(ColmapImage {
             image_id: parts[0].parse()?,
             camera_id: parts[8].parse()?,
             qvec: [
@@ -319,15 +353,49 @@ fn read_images_txt(path: &Path) -> Result<Vec<ColmapPose>> {
             ],
             tvec: [parts[5].parse()?, parts[6].parse()?, parts[7].parse()?],
             name: parts[9].to_string(),
+            points2d: parse_points2d_txt(&points_line, path)?,
         });
     }
-    Ok(poses)
+    Ok(images)
 }
 
-fn read_images_bin(path: &Path) -> Result<Vec<ColmapPose>> {
+fn parse_points2d_txt(line: &str, path: &Path) -> Result<Vec<ColmapPoint2D>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+    if parts.len() % 3 != 0 {
+        bail!(
+            "points2D line must contain X/Y/POINT3D_ID triples in {}",
+            path.display()
+        );
+    }
+    parts
+        .chunks(3)
+        .map(|chunk| {
+            let point3d_id = parse_optional_point3d_id_text(chunk[2])?;
+            Ok(ColmapPoint2D {
+                xy: [chunk[0].parse()?, chunk[1].parse()?],
+                point3d_id,
+            })
+        })
+        .collect()
+}
+
+fn parse_optional_point3d_id_text(value: &str) -> Result<Option<u64>> {
+    let signed = value.parse::<i64>()?;
+    if signed < 0 {
+        Ok(None)
+    } else {
+        Ok(Some(signed as u64))
+    }
+}
+
+fn read_images_bin(path: &Path) -> Result<Vec<ColmapImage>> {
     let mut f = File::open(path)?;
     let n = read_u64(&mut f)? as usize;
-    let mut poses = Vec::with_capacity(n);
+    let mut images = Vec::with_capacity(n);
     for _ in 0..n {
         let image_id = read_u32(&mut f)?;
         let qvec = [
@@ -340,20 +408,29 @@ fn read_images_bin(path: &Path) -> Result<Vec<ColmapPose>> {
         let camera_id = read_u32(&mut f)?;
         let name = read_cstr(&mut f)?;
         let m = read_u64(&mut f)? as usize;
+        let mut points2d = Vec::with_capacity(m);
         for _ in 0..m {
-            read_f64(&mut f)?;
-            read_f64(&mut f)?;
-            read_u64(&mut f)?;
+            let xy = [read_f64(&mut f)?, read_f64(&mut f)?];
+            let raw_point3d_id = read_u64(&mut f)?;
+            points2d.push(ColmapPoint2D {
+                xy,
+                point3d_id: optional_point3d_id_bin(raw_point3d_id),
+            });
         }
-        poses.push(ColmapPose {
+        images.push(ColmapImage {
             image_id,
             camera_id,
             name,
             qvec,
             tvec,
+            points2d,
         });
     }
-    Ok(poses)
+    Ok(images)
+}
+
+fn optional_point3d_id_bin(point3d_id: u64) -> Option<u64> {
+    (point3d_id != u64::MAX).then_some(point3d_id)
 }
 
 fn read_cameras_txt(path: &Path) -> Result<Vec<ColmapCamera>> {
@@ -635,6 +712,67 @@ mod tests {
         assert_eq!(camera.cx, 512.0);
         assert_eq!(camera.cy, 384.0);
         assert_eq!(camera.params_slice()[11], 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_text_images_with_points2d_and_optional_point3d_ids() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("images.txt"),
+            "# images\n7 1 0 0 0 0 0 0 11 image.jpg\n10.5 20.5 99 30.0 40.0 -1\n",
+        )?;
+
+        let images = read_colmap_images(dir.path())?;
+        let poses = read_colmap_poses(dir.path())?;
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image_id, 7);
+        assert_eq!(images[0].camera_id, 11);
+        assert_eq!(images[0].name, "image.jpg");
+        assert_eq!(images[0].points2d.len(), 2);
+        assert_eq!(images[0].points2d[0].xy, [10.5, 20.5]);
+        assert_eq!(images[0].points2d[0].point3d_id, Some(99));
+        assert_eq!(images[0].points2d[1].point3d_id, None);
+        assert_eq!(poses[0].image_id, 7);
+        assert_eq!(poses[0].name, "image.jpg");
+        Ok(())
+    }
+
+    #[test]
+    fn reads_binary_images_with_points2d() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        for value in [1.0f64, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&11u32.to_le_bytes());
+        bytes.extend_from_slice(b"image.jpg\0");
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        for (x, y, point3d_id) in [(10.5f64, 20.5f64, 99u64), (30.0, 40.0, u64::MAX)] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
+            bytes.extend_from_slice(&point3d_id.to_le_bytes());
+        }
+        fs::write(sparse.join("images.bin"), bytes)?;
+
+        let images = read_colmap_images(dir.path())?;
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image_id, 7);
+        assert_eq!(images[0].camera_id, 11);
+        assert_eq!(images[0].name, "image.jpg");
+        assert_eq!(images[0].qvec, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(images[0].tvec, [0.1, 0.2, 0.3]);
+        assert_eq!(images[0].points2d[0].xy, [10.5, 20.5]);
+        assert_eq!(images[0].points2d[0].point3d_id, Some(99));
+        assert_eq!(images[0].points2d[1].point3d_id, None);
         Ok(())
     }
 
