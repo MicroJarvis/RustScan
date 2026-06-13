@@ -86,8 +86,11 @@ reconstruction parity.
    - Added a lightweight database cache loader that collects rigs, cameras,
      frames, images, pose priors, and a filtered correspondence graph using
      COLMAP-style `min_num_matches`, watermark, and `load_all_images` controls.
+   - Added COLMAP-style image-name filtering at frame granularity, including
+     loading all images in a selected frame and reading image frame ownership
+     via `frame_data`.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache image-name/frame filtering, ENU pose-prior conversion, and mapper
+     cache legacy no-frame compatibility, ENU pose-prior conversion, and mapper
      integration.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
