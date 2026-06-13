@@ -2,11 +2,13 @@ use crate::colmap::{
     export_colmap, read_camera_model, read_colmap_cameras, read_colmap_poses,
     world_to_camera_rotation,
 };
-use crate::database::{ColmapDatabase, DatabaseCache, DatabaseCacheOptions};
+use crate::correspondence_graph::ImagePairId;
+use crate::database::{ColmapDatabase, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions};
 use crate::geometry::{
     camera_center, estimate_pair_geometry_with_cameras,
     estimate_pair_geometry_with_options_and_cameras, mean_pair_reprojection_error_with_cameras,
-    pose_from_rotation_center, pose_rotation, pose_with_flipped_translation, PairEstimationOptions,
+    pose_from_rotation_center, pose_rotation, pose_with_flipped_translation, relative_rotation_deg,
+    PairEstimationOptions,
 };
 use crate::pose_graph::initialize_pose_graph;
 use crate::sift::{
@@ -43,6 +45,7 @@ pub struct DatabasePairMatches {
 struct MapperDatabaseInput {
     cache: DatabaseCache,
     keypoints_by_name: HashMap<String, Vec<rustslam::KeyPoint>>,
+    two_view_geometries: HashMap<ImagePairId, ColmapTwoViewGeometry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +247,7 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         estimate_database_pair_geometries(
             &frames,
             &database.cache,
+            &database.two_view_geometries,
             camera,
             reference_camera_setup.as_ref(),
             config,
@@ -447,9 +451,14 @@ fn load_mapper_database(
             .collect::<Vec<_>>();
         keypoints_by_name.insert(image.name.clone(), keypoints);
     }
+    let two_view_geometries = db
+        .read_two_view_geometries()?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
     Ok(Some(MapperDatabaseInput {
         cache,
         keypoints_by_name,
+        two_view_geometries,
     }))
 }
 
@@ -785,6 +794,7 @@ pub fn database_pair_matches_for_frames(
 fn estimate_database_pair_geometries(
     frames: &[ImageFrame],
     cache: &DatabaseCache,
+    stored_geometries: &HashMap<ImagePairId, ColmapTwoViewGeometry>,
     camera: CameraModel,
     reference_camera_setup: Option<&ReferenceCameraSetup>,
     config: &MapperConfig,
@@ -795,23 +805,184 @@ fn estimate_database_pair_geometries(
         .filter_map(|pair| {
             let left_camera = setup_camera_for_image(reference_camera_setup, pair.left, camera);
             let right_camera = setup_camera_for_image(reference_camera_setup, pair.right, camera);
-            estimate_pair_geometry_with_cameras(
-                pair.left,
-                pair.right,
-                &frames[pair.left],
-                &frames[pair.right],
-                &pair.matches,
+            database_pair_geometry_from_stored_pose(
+                pair,
+                frames,
+                cache,
+                stored_geometries,
                 left_camera,
                 right_camera,
-                config.essential_threshold_px,
-                config.essential_iterations,
-                config.min_inliers,
-                config.min_triangulated,
+                config,
             )
+            .or_else(|| {
+                estimate_pair_geometry_with_cameras(
+                    pair.left,
+                    pair.right,
+                    &frames[pair.left],
+                    &frames[pair.right],
+                    &pair.matches,
+                    left_camera,
+                    right_camera,
+                    config.essential_threshold_px,
+                    config.essential_iterations,
+                    config.min_inliers,
+                    config.min_triangulated,
+                )
+            })
             .filter(keep_verified_pair)
         })
         .collect::<Vec<_>>();
     Ok(pairs)
+}
+
+fn database_pair_geometry_from_stored_pose(
+    pair: &DatabasePairMatches,
+    frames: &[ImageFrame],
+    cache: &DatabaseCache,
+    stored_geometries: &HashMap<ImagePairId, ColmapTwoViewGeometry>,
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    config: &MapperConfig,
+) -> Option<PairGeometry> {
+    let left_name = frames.get(pair.left)?.name.as_str();
+    let right_name = frames.get(pair.right)?.name.as_str();
+    let image_by_name = cache
+        .images
+        .values()
+        .map(|image| (image.name.as_str(), image.image_id))
+        .collect::<HashMap<_, _>>();
+    let left_image_id = *image_by_name.get(left_name)?;
+    let right_image_id = *image_by_name.get(right_name)?;
+    if left_image_id > right_image_id {
+        return None;
+    }
+    let pair_id =
+        crate::correspondence_graph::image_pair_to_pair_id(left_image_id, right_image_id).ok()?;
+    let geometry = stored_geometries.get(&pair_id)?;
+    let pose = stored_two_view_pose(geometry)?;
+    let metrics = stored_pose_pair_metrics(
+        pair,
+        &frames[pair.left],
+        &frames[pair.right],
+        pose,
+        left_camera,
+        right_camera,
+        config.max_reprojection_error_px,
+    )?;
+    if metrics.triangulated < config.min_triangulated
+        || metrics.inlier_matches.len() < config.min_inliers
+    {
+        return None;
+    }
+    Some(PairGeometry {
+        left: pair.left,
+        right: pair.right,
+        matches: pair.matches.clone(),
+        inlier_matches: metrics.inlier_matches,
+        relative_pose: pose,
+        inliers: metrics.inliers,
+        triangulated: metrics.triangulated,
+        mean_reprojection_error_px: metrics.mean_reprojection_error_px,
+        rotation_deg: relative_rotation_deg(pose, SE3::identity()),
+        median_triangulation_angle_deg: metrics.median_triangulation_angle_deg,
+        pose_graph_only: false,
+    })
+}
+
+fn stored_two_view_pose(geometry: &ColmapTwoViewGeometry) -> Option<SE3> {
+    let q = geometry.qvec?;
+    let t = geometry.tvec?;
+    let rotation = glam::Quat::from_xyzw(q[1] as f32, q[2] as f32, q[3] as f32, q[0] as f32);
+    if !rotation.is_finite() {
+        return None;
+    }
+    let rotation = rotation.normalize();
+    let translation = glam::Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32);
+    let translation = translation.try_normalize()?;
+    Some(SE3::from_quat_translation(rotation, translation))
+}
+
+struct StoredPosePairMetrics {
+    inlier_matches: Vec<rustslam::Match>,
+    inliers: usize,
+    triangulated: usize,
+    mean_reprojection_error_px: f32,
+    median_triangulation_angle_deg: f32,
+}
+
+fn stored_pose_pair_metrics(
+    pair: &DatabasePairMatches,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    pose: SE3,
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    max_reprojection_error_px: f32,
+) -> Option<StoredPosePairMetrics> {
+    let mut inlier_matches = Vec::new();
+    let mut reproj_sum = 0.0f32;
+    let mut triangulation_angles = Vec::new();
+    for m in &pair.matches {
+        let li = m.query_idx as usize;
+        let ri = m.train_idx as usize;
+        if li >= left.keypoints.len() || ri >= right.keypoints.len() {
+            continue;
+        }
+        let lk = &left.keypoints[li];
+        let rk = &right.keypoints[ri];
+        let left_xy = left_camera.normalize(lk.x(), lk.y());
+        let right_xy = right_camera.normalize(rk.x(), rk.y());
+        let Some(xyz) =
+            crate::two_view::triangulate_world_point(SE3::identity(), pose, left_xy, right_xy)
+        else {
+            continue;
+        };
+        let err = mean_pair_reprojection_error_with_cameras(
+            xyz,
+            SE3::identity(),
+            pose,
+            [lk.x(), lk.y()],
+            [rk.x(), rk.y()],
+            left_camera,
+            right_camera,
+        );
+        if !err.is_finite() || err > max_reprojection_error_px {
+            continue;
+        }
+        if let Some(angle) = pair_triangulation_angle_deg(SE3::identity(), pose, xyz) {
+            triangulation_angles.push(angle);
+        }
+        reproj_sum += err;
+        inlier_matches.push(m.clone());
+    }
+    let inliers = inlier_matches.len();
+    if inliers == 0 {
+        return None;
+    }
+    Some(StoredPosePairMetrics {
+        inlier_matches,
+        inliers,
+        triangulated: triangulation_angles.len(),
+        mean_reprojection_error_px: reproj_sum / inliers as f32,
+        median_triangulation_angle_deg: median_f32(&mut triangulation_angles),
+    })
+}
+
+fn pair_triangulation_angle_deg(left_pose: SE3, right_pose: SE3, point: [f32; 3]) -> Option<f32> {
+    let c1 = camera_center(left_pose);
+    let c2 = camera_center(right_pose);
+    let p = glam::Vec3::from_array(point);
+    let v1 = (p - c1).try_normalize()?;
+    let v2 = (p - c2).try_normalize()?;
+    Some(v1.dot(v2).abs().clamp(-1.0, 1.0).acos().to_degrees())
+}
+
+fn median_f32(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values[values.len() / 2]
 }
 
 fn setup_camera_for_image(
@@ -3395,6 +3566,99 @@ mod tests {
         assert_eq!(setup.image_ids, vec![11, 12]);
         assert_eq!(setup.image_camera_indices, vec![0, 0]);
         assert_eq!(setup.cameras[0].fx, 80.0);
+        Ok(())
+    }
+
+    #[test]
+    fn database_pair_geometry_uses_stored_two_view_pose() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        let left_keypoints = vec![
+            ColmapKeypoint::new(45.0, 45.0),
+            ColmapKeypoint::new(55.0, 45.0),
+            ColmapKeypoint::new(45.0, 55.0),
+            ColmapKeypoint::new(55.0, 55.0),
+        ];
+        let right_keypoints = vec![
+            ColmapKeypoint::new(40.0, 45.0),
+            ColmapKeypoint::new(50.0, 45.0),
+            ColmapKeypoint::new(40.0, 55.0),
+            ColmapKeypoint::new(50.0, 55.0),
+        ];
+        for (image_id, name, keypoints) in [
+            (1, "left.jpg", left_keypoints),
+            (2, "right.jpg", right_keypoints),
+        ] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(image_id, &keypoints)?;
+        }
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: (0..4).map(|idx| FeatureMatch::new(idx, idx)).collect(),
+                qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                tvec: Some([-1.0, 0.0, 0.0]),
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        let database = load_mapper_database(Some(&db_path), &frames, 0)?.expect("database input");
+        apply_database_keypoints(&mut frames, &database.keypoints_by_name);
+        let pair_matches = database_pair_matches_for_frames(&frames, &database.cache)?;
+        let camera = CameraModel::from_colmap(
+            crate::types::COLMAP_PINHOLE,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 50.0],
+        )
+        .unwrap();
+
+        let pair = database_pair_geometry_from_stored_pose(
+            &pair_matches[0],
+            &frames,
+            &database.cache,
+            &database.two_view_geometries,
+            camera,
+            camera,
+            &MapperConfig {
+                min_inliers: 4,
+                min_triangulated: 4,
+                max_reprojection_error_px: 1.0,
+                ..MapperConfig::default()
+            },
+        )
+        .expect("stored pose pair");
+
+        assert_eq!(pair.left, 0);
+        assert_eq!(pair.right, 1);
+        assert_eq!(pair.inliers, 4);
+        assert_eq!(pair.triangulated, 4);
+        assert!(pair.mean_reprojection_error_px < 1.0e-4);
+        assert_eq!(pair.relative_pose.translation(), [-1.0, 0.0, 0.0]);
         Ok(())
     }
 

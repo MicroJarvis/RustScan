@@ -98,10 +98,13 @@ reconstruction parity.
      replaces frame keypoints with database keypoints, preserves database
      camera/image ownership, and estimates pairs from verified database
      correspondences instead of local matching when provided.
+   - Database-driven pair estimation now reuses stored `qvec/tvec` two-view
+     geometry poses when present and valid, falling back to local two-view
+     estimation otherwise.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache ENU pose-prior conversion, using stored two-view geometry poses
-     directly where valid, and making database-driven reconstruction the main
-     COLMAP-style mapper path.
+     cache ENU pose-prior conversion, complete pose/config semantics for all
+     two-view geometry cases, and making database-driven reconstruction the
+     main COLMAP-style mapper path.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 
