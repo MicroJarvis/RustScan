@@ -83,8 +83,12 @@ reconstruction parity.
      COLMAP rig sensor ids, optional sensor-from-rig poses, and frame data ids.
    - Added SQLite pose_priors read-write support with correlated sensor/data
      ids, position/covariance/gravity blobs, and coordinate-system metadata.
+   - Added a lightweight database cache loader that collects rigs, cameras,
+     frames, images, pose priors, and a filtered correspondence graph using
+     COLMAP-style `min_num_matches`, watermark, and `load_all_images` controls.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache loading, database-cache filtering options, and mapper integration.
+     cache image-name/frame filtering, ENU pose-prior conversion, and mapper
+     integration.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 

@@ -177,6 +177,33 @@ pub struct ColmapPosePrior {
     pub gravity: [f64; 3],
 }
 
+#[derive(Debug, Clone)]
+pub struct DatabaseCacheOptions {
+    pub min_num_matches: usize,
+    pub ignore_watermarks: bool,
+    pub load_all_images: bool,
+}
+
+impl Default for DatabaseCacheOptions {
+    fn default() -> Self {
+        Self {
+            min_num_matches: 0,
+            ignore_watermarks: false,
+            load_all_images: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DatabaseCache {
+    pub rigs: BTreeMap<u32, ColmapRig>,
+    pub cameras: BTreeMap<u32, ColmapDatabaseCamera>,
+    pub frames: BTreeMap<u32, ColmapDatabaseFrame>,
+    pub images: BTreeMap<ImageId, ColmapDatabaseImage>,
+    pub pose_priors: Vec<ColmapPosePrior>,
+    pub correspondence_graph: CorrespondenceGraph,
+}
+
 impl ColmapDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).context("open COLMAP database")?;
@@ -907,6 +934,75 @@ impl ColmapDatabase {
         graph.finalize().map_err(|err| anyhow::anyhow!("{err:?}"))?;
         Ok(graph)
     }
+
+    pub fn load_cache(&self, options: &DatabaseCacheOptions) -> Result<DatabaseCache> {
+        let rigs = self
+            .read_all_rigs()?
+            .into_iter()
+            .map(|rig| (rig.rig_id, rig))
+            .collect::<BTreeMap<_, _>>();
+        let cameras = self
+            .read_all_cameras()?
+            .into_iter()
+            .map(|camera| (camera.camera.camera_id, camera))
+            .collect::<BTreeMap<_, _>>();
+        let frames = self
+            .read_all_frames()?
+            .into_iter()
+            .map(|frame| (frame.frame_id, frame))
+            .collect::<BTreeMap<_, _>>();
+        let mut images = self
+            .read_all_images()?
+            .into_iter()
+            .map(|image| (image.image_id, image))
+            .collect::<BTreeMap<_, _>>();
+        let keypoint_counts = self.read_keypoint_counts()?;
+        let two_view_geometries = self.read_two_view_geometries()?;
+
+        if !options.load_all_images {
+            let connected = connected_images_from_geometries(options, &two_view_geometries)?;
+            images.retain(|image_id, _| connected.contains(image_id));
+        }
+
+        let mut graph = CorrespondenceGraph::new();
+        for (image_id, num_points2d) in keypoint_counts {
+            if images.contains_key(&image_id) {
+                graph
+                    .add_image(image_id, num_points2d)
+                    .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+            }
+        }
+        for (pair_id, geometry) in two_view_geometries {
+            if !use_inlier_matches(options, geometry.config, geometry.inlier_matches.len()) {
+                continue;
+            }
+            let (image_id1, image_id2) =
+                pair_id_to_image_pair(pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+            if !graph.exists_image(image_id1) || !graph.exists_image(image_id2) {
+                continue;
+            }
+            graph
+                .add_two_view_geometry(
+                    image_id1,
+                    image_id2,
+                    TwoViewGeometryRecord {
+                        config: geometry.config,
+                        inlier_matches: geometry.inlier_matches,
+                    },
+                )
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        }
+        graph.finalize().map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        Ok(DatabaseCache {
+            rigs,
+            cameras,
+            frames,
+            images,
+            pose_priors: self.read_all_pose_priors()?,
+            correspondence_graph: graph,
+        })
+    }
 }
 
 fn read_camera_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseCamera> {
@@ -928,6 +1024,35 @@ fn read_camera_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseCamera> {
         camera,
         has_prior_focal_length: row.get::<_, i64>(5)? != 0,
     })
+}
+
+const COLMAP_TWO_VIEW_WATERMARK_CONFIG: i32 = 7;
+
+fn use_inlier_matches(
+    options: &DatabaseCacheOptions,
+    two_view_geometry_config: i32,
+    num_matches: usize,
+) -> bool {
+    num_matches >= options.min_num_matches
+        && (!options.ignore_watermarks
+            || two_view_geometry_config != COLMAP_TWO_VIEW_WATERMARK_CONFIG)
+}
+
+fn connected_images_from_geometries(
+    options: &DatabaseCacheOptions,
+    geometries: &[(ImagePairId, ColmapTwoViewGeometry)],
+) -> Result<std::collections::BTreeSet<ImageId>> {
+    let mut connected = std::collections::BTreeSet::new();
+    for (pair_id, geometry) in geometries {
+        if !use_inlier_matches(options, geometry.config, geometry.inlier_matches.len()) {
+            continue;
+        }
+        let (image_id1, image_id2) =
+            pair_id_to_image_pair(*pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        connected.insert(image_id1);
+        connected.insert(image_id2);
+    }
+    Ok(connected)
 }
 
 fn read_image_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseImage> {
@@ -1546,6 +1671,100 @@ mod tests {
             ColmapPosePriorCoordinateSystem::Wgs84
         );
         assert!(read.position.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn database_cache_filters_pairs_and_unconnected_images() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let camera = ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 1,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 100,
+                height: 100,
+                params: vec![50.0, 50.0, 50.0, 50.0],
+            },
+            has_prior_focal_length: true,
+        };
+        db.write_camera(&camera, true).unwrap();
+        for image_id in 1..=3 {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: format!("{image_id}.jpg"),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )
+            .unwrap();
+            db.write_keypoints(
+                image_id,
+                &[
+                    ColmapKeypoint::new(0.0, 0.0),
+                    ColmapKeypoint::new(1.0, 1.0),
+                    ColmapKeypoint::new(2.0, 2.0),
+                ],
+            )
+            .unwrap();
+        }
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(0, 0), m(1, 1)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+        db.write_two_view_geometry(
+            2,
+            3,
+            &ColmapTwoViewGeometry {
+                config: COLMAP_TWO_VIEW_WATERMARK_CONFIG,
+                inlier_matches: vec![m(0, 0), m(1, 1), m(2, 2)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+
+        let cache = db
+            .load_cache(&DatabaseCacheOptions {
+                min_num_matches: 2,
+                ignore_watermarks: true,
+                load_all_images: false,
+            })
+            .unwrap();
+        assert_eq!(cache.images.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(cache.cameras.len(), 1);
+        assert_eq!(cache.correspondence_graph.num_image_pairs(), 1);
+        assert_eq!(
+            cache
+                .correspondence_graph
+                .num_matches_between_images(1, 2)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            cache
+                .correspondence_graph
+                .num_matches_between_images(2, 3)
+                .unwrap(),
+            0
+        );
+
+        let all_cache = db
+            .load_cache(&DatabaseCacheOptions {
+                load_all_images: true,
+                ..DatabaseCacheOptions::default()
+            })
+            .unwrap();
+        assert_eq!(
+            all_cache.images.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
