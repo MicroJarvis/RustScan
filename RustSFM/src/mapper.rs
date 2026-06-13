@@ -1850,6 +1850,8 @@ fn incremental_map(
         let mut triangulator = IncrementalTriangulator::new(frames, pairs, &mut reconstruction);
         triangulator.triangulate_image(&tri_options, initial.left);
         triangulator.triangulate_image(&tri_options, initial.right);
+        let modified = triangulator.get_modified_points3d().clone();
+        triangulator.complete_tracks(&tri_options, &modified);
     }
 
     while reconstruction.poses.iter().any(|p| p.is_none()) {
@@ -1868,6 +1870,8 @@ fn incremental_map(
         {
             let mut triangulator = IncrementalTriangulator::new(frames, pairs, &mut reconstruction);
             triangulator.triangulate_image(&tri_options, choice.image);
+            let modified = triangulator.get_modified_points3d().clone();
+            triangulator.complete_tracks(&tri_options, &modified);
         }
     }
     Ok((reconstruction, debug_log))

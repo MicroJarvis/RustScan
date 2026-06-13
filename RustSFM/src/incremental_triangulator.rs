@@ -1,7 +1,7 @@
 use crate::geometry::{camera_center, mean_pair_reprojection_error_with_cameras};
 use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
 use rustslam::SE3;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy)]
 pub struct IncrementalTriangulatorOptions {
@@ -50,11 +50,12 @@ impl IncrementalTriangulatorOptions {
 pub struct TriangulationReport {
     pub created_points: usize,
     pub continued_observations: usize,
+    pub completed_observations: usize,
 }
 
 impl TriangulationReport {
     pub fn total_observations(self) -> usize {
-        self.created_points * 2 + self.continued_observations
+        self.created_points * 2 + self.continued_observations + self.completed_observations
     }
 }
 
@@ -168,6 +169,23 @@ impl<'a> IncrementalTriangulator<'a> {
 
     pub fn get_modified_points3d(&self) -> &HashSet<usize> {
         &self.modified_point3d_ids
+    }
+
+    pub fn complete_tracks(
+        &mut self,
+        options: &IncrementalTriangulatorOptions,
+        point_ids: &HashSet<usize>,
+    ) -> usize {
+        point_ids
+            .iter()
+            .copied()
+            .map(|point_id| self.complete_track(options, point_id))
+            .sum()
+    }
+
+    pub fn complete_all_tracks(&mut self, options: &IncrementalTriangulatorOptions) -> usize {
+        let point_ids = (0..self.reconstruction.points.len()).collect::<HashSet<_>>();
+        self.complete_tracks(options, &point_ids)
     }
 
     pub fn clear_modified_points3d(&mut self) {
@@ -323,6 +341,83 @@ impl<'a> IncrementalTriangulator<'a> {
         self.modified_point3d_ids.insert(point_id);
         true
     }
+
+    fn complete_track(
+        &mut self,
+        options: &IncrementalTriangulatorOptions,
+        point_id: usize,
+    ) -> usize {
+        if point_id >= self.reconstruction.points.len() {
+            return 0;
+        }
+        let mut completed = 0usize;
+        let mut visited = self.reconstruction.points[point_id]
+            .track
+            .iter()
+            .map(|obs| (obs.image, obs.feature))
+            .collect::<HashSet<_>>();
+        let mut current = self.reconstruction.points[point_id]
+            .track
+            .iter()
+            .map(|obs| (obs.image, obs.feature))
+            .collect::<VecDeque<_>>();
+
+        for _ in 0..options.complete_max_transitivity {
+            if current.is_empty() {
+                break;
+            }
+            let mut next = VecDeque::new();
+            while let Some((image, feature)) = current.pop_front() {
+                for (corr_image, corr_feature) in self.corresponding_features(image, feature) {
+                    if !visited.insert((corr_image, corr_feature)) {
+                        continue;
+                    }
+                    if self
+                        .reconstruction
+                        .poses
+                        .get(corr_image)
+                        .copied()
+                        .flatten()
+                        .is_none()
+                        || !self.valid_observation(corr_image, corr_feature)
+                        || self.reconstruction.observations[corr_image][corr_feature].is_some()
+                    {
+                        continue;
+                    }
+                    if self.continue_track(
+                        options,
+                        point_id,
+                        corr_image,
+                        corr_feature,
+                        options.complete_max_reproj_error_px,
+                    ) {
+                        completed += 1;
+                        next.push_back((corr_image, corr_feature));
+                    }
+                }
+            }
+            current = next;
+        }
+        completed
+    }
+
+    fn corresponding_features(&self, image: usize, feature: usize) -> Vec<(usize, usize)> {
+        let mut correspondences = Vec::new();
+        for pair in self
+            .pairs
+            .iter()
+            .filter(|pair| pair.left == image || pair.right == image)
+        {
+            for match_ in &pair.inlier_matches {
+                if pair.left == image && match_.query_idx as usize == feature {
+                    correspondences.push((pair.right, match_.train_idx as usize));
+                } else if pair.right == image && match_.train_idx as usize == feature {
+                    correspondences.push((pair.left, match_.query_idx as usize));
+                }
+            }
+        }
+        correspondences
+    }
 }
 
 fn triangulation_angle_deg(left_pose: SE3, right_pose: SE3, point: [f32; 3]) -> Option<f32> {
@@ -418,6 +513,48 @@ mod tests {
         assert_eq!(report.continued_observations, 1);
         assert_eq!(triangulator.reconstruction.points[0].track.len(), 2);
         assert_eq!(triangulator.get_modified_points3d(), &HashSet::from([0]));
+    }
+
+    #[test]
+    fn complete_tracks_adds_transitive_observations() {
+        let frames = vec![frame(0), frame(1), frame(2)];
+        let pairs = vec![pair(0, 1, &[(0, 0)]), pair(1, 2, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.poses[2] = Some(SE3::identity());
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.point_ids.push(1);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+
+        let mut triangulator = IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction);
+        let completed = triangulator.complete_tracks(
+            &IncrementalTriangulatorOptions {
+                complete_max_transitivity: 2,
+                complete_max_reproj_error_px: 10.0,
+                ..IncrementalTriangulatorOptions::default()
+            },
+            &HashSet::from([0]),
+        );
+
+        assert_eq!(completed, 1);
+        assert_eq!(triangulator.reconstruction.observations[2][0], Some(0));
+        assert_eq!(triangulator.reconstruction.points[0].track.len(), 3);
     }
 
     fn reconstruction(frames: &[ImageFrame]) -> Reconstruction {
