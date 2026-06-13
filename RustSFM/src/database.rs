@@ -957,7 +957,7 @@ impl ColmapDatabase {
             .into_iter()
             .map(|camera| (camera.camera.camera_id, camera))
             .collect::<BTreeMap<_, _>>();
-        let frames = self
+        let mut frames = self
             .read_all_frames()?
             .into_iter()
             .map(|frame| (frame.frame_id, frame))
@@ -967,6 +967,26 @@ impl ColmapDatabase {
             .into_iter()
             .map(|image| (image.image_id, image))
             .collect::<BTreeMap<_, _>>();
+        if frames.is_empty() {
+            for image in images.values_mut() {
+                let frame_id = image.image_id;
+                image.frame_id = Some(frame_id);
+                frames.insert(
+                    frame_id,
+                    ColmapDatabaseFrame {
+                        frame_id,
+                        rig_id: image.camera_id,
+                        data_ids: vec![ColmapDataId {
+                            sensor_id: ColmapSensorId {
+                                sensor_type: ColmapSensorType::Camera,
+                                sensor_id: image.camera_id,
+                            },
+                            data_id: image.image_id as u64,
+                        }],
+                    },
+                );
+            }
+        }
         let keypoint_counts = self.read_keypoint_counts()?;
         let two_view_geometries = self.read_two_view_geometries()?;
         let image_to_frame = images
@@ -1955,6 +1975,70 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(connected_cache.correspondence_graph.num_image_pairs(), 1);
+    }
+
+    #[test]
+    fn database_cache_creates_trivial_frames_for_legacy_databases() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 9,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )
+        .unwrap();
+        for image_id in 1..=2 {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: format!("legacy_{image_id}.jpg"),
+                    camera_id: 9,
+                    frame_id: None,
+                },
+                true,
+            )
+            .unwrap();
+            db.write_keypoints(
+                image_id,
+                &[ColmapKeypoint::new(0.0, 0.0), ColmapKeypoint::new(1.0, 1.0)],
+            )
+            .unwrap();
+        }
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(0, 0), m(1, 1)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+
+        let cache = db.load_cache(&DatabaseCacheOptions::default()).unwrap();
+
+        assert_eq!(cache.frames.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(cache.images.get(&1).unwrap().frame_id, Some(1));
+        assert_eq!(cache.images.get(&2).unwrap().frame_id, Some(2));
+        assert_eq!(cache.frames.get(&1).unwrap().rig_id, 9);
+        assert_eq!(
+            cache.frames.get(&1).unwrap().data_ids,
+            vec![ColmapDataId {
+                sensor_id: ColmapSensorId {
+                    sensor_type: ColmapSensorType::Camera,
+                    sensor_id: 9,
+                },
+                data_id: 1,
+            }]
+        );
     }
 
     #[test]

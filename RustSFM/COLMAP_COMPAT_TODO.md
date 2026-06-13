@@ -89,9 +89,10 @@ reconstruction parity.
    - Added COLMAP-style image-name filtering at frame granularity, including
      loading all images in a selected frame and reading image frame ownership
      via `frame_data`.
+   - Added legacy database-cache compatibility for databases without frames by
+     creating COLMAP-style trivial frames per image.
    - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache legacy no-frame compatibility, ENU pose-prior conversion, and mapper
-     integration.
+     cache ENU pose-prior conversion and mapper integration.
 8. Remove sequence-specific local-window and 192-frame ring heuristics from the
    default mapper path; keep them only behind explicit experimental options.
 
