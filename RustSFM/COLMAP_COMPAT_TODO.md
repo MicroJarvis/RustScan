@@ -52,8 +52,12 @@ reconstruction parity.
      and track image/feature ids.
    - Added text/binary COLMAP `rigs` and `frames` reading with sensor/data ids and
      rig/frame poses.
-   - Remaining work: integrating read point ids into full reconstruction
-     loading, database ids, and full sparse model round-trip.
+   - Added full text/binary sparse model loading into `Reconstruction`, preserving
+     camera ids, image ids, point3D ids, image camera ownership, keypoints,
+     point observations, and point tracks, with text export/read round-trip
+     coverage.
+   - Remaining work: database ids and rig/frame ownership in the mapper's
+     mutable reconstruction, plus full sparse model round-trip for rigs/frames.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 

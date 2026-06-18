@@ -1097,7 +1097,7 @@ pub struct PairGeometry {
     pub pose_graph_only: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackObservation {
     pub image: usize,
     pub feature: usize,

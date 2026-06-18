@@ -1,11 +1,12 @@
 use crate::types::{
-    colmap_camera_model_id, colmap_camera_model_num_params, CameraModel, Reconstruction,
+    colmap_camera_model_id, colmap_camera_model_num_params, CameraModel, Point3D, Reconstruction,
     TrackObservation,
 };
 use anyhow::{bail, Context, Result};
 use nalgebra::{Matrix3, Quaternion, UnitQuaternion, Vector3};
 use rustslam::SE3;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -204,6 +205,26 @@ pub fn read_colmap_points3d(root: &Path) -> Result<Vec<ColmapPoint3D>> {
     )
 }
 
+pub fn read_colmap_reconstruction(root: &Path) -> Result<Reconstruction> {
+    let colmap_cameras = read_colmap_cameras(root)?;
+    let images = read_colmap_images(root)?;
+    let points3d = read_optional_colmap_points3d(root)?;
+    reconstruction_from_colmap_parts(colmap_cameras, images, points3d)
+}
+
+fn read_optional_colmap_points3d(root: &Path) -> Result<Vec<ColmapPoint3D>> {
+    let sparse = resolve_sparse_dir(root)?;
+    let bin = sparse.join("points3D.bin");
+    if bin.exists() {
+        return read_points3d_bin(&bin);
+    }
+    let txt = sparse.join("points3D.txt");
+    if txt.exists() {
+        return read_points3d_txt(&txt);
+    }
+    Ok(Vec::new())
+}
+
 pub fn read_colmap_rigs(root: &Path) -> Result<Vec<ColmapRig>> {
     let sparse = resolve_sparse_dir(root)?;
     let bin = sparse.join("rigs.bin");
@@ -276,6 +297,201 @@ pub fn world_to_camera_rotation(pose: &ColmapPose) -> Matrix3<f64> {
     ))
     .to_rotation_matrix()
     .into_inner()
+}
+
+fn reconstruction_from_colmap_parts(
+    colmap_cameras: Vec<(u32, CameraModel)>,
+    images: Vec<ColmapImage>,
+    points3d: Vec<ColmapPoint3D>,
+) -> Result<Reconstruction> {
+    if colmap_cameras.is_empty() {
+        bail!("COLMAP reconstruction has no cameras");
+    }
+    let (camera_ids, cameras): (Vec<_>, Vec<_>) = colmap_cameras.into_iter().unzip();
+    let camera_index_by_id = camera_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, &camera_id)| (camera_id, idx))
+        .collect::<HashMap<_, _>>();
+    let image_index_by_id = images
+        .iter()
+        .enumerate()
+        .map(|(idx, image)| (image.image_id, idx))
+        .collect::<HashMap<_, _>>();
+
+    let image_camera_indices = images
+        .iter()
+        .map(|image| {
+            camera_index_by_id
+                .get(&image.camera_id)
+                .copied()
+                .with_context(|| {
+                    format!(
+                        "image_id={} references missing camera_id={}",
+                        image.image_id, image.camera_id
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let keypoints = images
+        .iter()
+        .map(|image| {
+            image
+                .points2d
+                .iter()
+                .map(|point| keypoint_from_colmap_point2d(point))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut observations = keypoints
+        .iter()
+        .map(|points| vec![None; points.len()])
+        .collect::<Vec<_>>();
+    let point_index_by_id = points3d
+        .iter()
+        .enumerate()
+        .map(|(idx, point)| (point.point3d_id, idx))
+        .collect::<BTreeMap<_, _>>();
+
+    for (image_idx, image) in images.iter().enumerate() {
+        for (point2d_idx, point2d) in image.points2d.iter().enumerate() {
+            let Some(point3d_id) = point2d.point3d_id else {
+                continue;
+            };
+            let Some(&point_idx) = point_index_by_id.get(&point3d_id) else {
+                continue;
+            };
+            observations[image_idx][point2d_idx] = Some(point_idx);
+        }
+    }
+
+    let mut points = points3d
+        .iter()
+        .map(|point| {
+            let track = point
+                .track
+                .iter()
+                .filter_map(|elem| {
+                    let image = *image_index_by_id.get(&elem.image_id)?;
+                    let feature = elem.point2d_idx as usize;
+                    keypoints
+                        .get(image)
+                        .filter(|points| feature < points.len())
+                        .map(|_| TrackObservation { image, feature })
+                })
+                .collect::<Vec<_>>();
+            Point3D {
+                xyz: [
+                    point.xyz[0] as f32,
+                    point.xyz[1] as f32,
+                    point.xyz[2] as f32,
+                ],
+                color: point.color,
+                error: point.error as f32,
+                track,
+            }
+        })
+        .collect::<Vec<_>>();
+    ensure_observations_have_point_tracks(&observations, &mut points);
+    ensure_point_tracks_have_observations(&mut observations, &points);
+
+    let poses = images
+        .iter()
+        .map(|image| Some(se3_from_colmap_pose(image.qvec, image.tvec)))
+        .collect::<Vec<_>>();
+    let image_names = images
+        .iter()
+        .map(|image| image.name.clone())
+        .collect::<Vec<_>>();
+    let image_paths = image_names.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let image_ids = images
+        .iter()
+        .map(|image| image.image_id)
+        .collect::<Vec<_>>();
+    let point_ids = points3d
+        .iter()
+        .map(|point| point.point3d_id)
+        .collect::<Vec<_>>();
+
+    Ok(Reconstruction {
+        camera: cameras[0],
+        cameras,
+        camera_ids,
+        image_names,
+        image_paths,
+        image_ids,
+        image_camera_indices,
+        poses,
+        observations,
+        keypoints,
+        point_ids,
+        points,
+    })
+}
+
+fn keypoint_from_colmap_point2d(point: &ColmapPoint2D) -> rustslam::KeyPoint {
+    rustslam::KeyPoint {
+        pt: (point.xy[0] as f32, point.xy[1] as f32),
+        size: 1.0,
+        angle: 0.0,
+        response: 1.0,
+        octave: 0,
+    }
+}
+
+fn se3_from_colmap_pose(qvec: [f64; 4], tvec: [f64; 3]) -> SE3 {
+    let rotation = glam::Quat::from_xyzw(
+        qvec[1] as f32,
+        qvec[2] as f32,
+        qvec[3] as f32,
+        qvec[0] as f32,
+    )
+    .normalize();
+    SE3::from_quat_translation(
+        rotation,
+        glam::Vec3::new(tvec[0] as f32, tvec[1] as f32, tvec[2] as f32),
+    )
+}
+
+fn ensure_point_tracks_have_observations(
+    observations: &mut [Vec<Option<usize>>],
+    points: &[Point3D],
+) {
+    for (point_idx, point) in points.iter().enumerate() {
+        for obs in &point.track {
+            if let Some(slot) = observations
+                .get_mut(obs.image)
+                .and_then(|image_obs| image_obs.get_mut(obs.feature))
+            {
+                if slot.is_none() {
+                    *slot = Some(point_idx);
+                }
+            }
+        }
+    }
+}
+
+fn ensure_observations_have_point_tracks(
+    observations: &[Vec<Option<usize>>],
+    points: &mut [Point3D],
+) {
+    for (image, image_observations) in observations.iter().enumerate() {
+        for (feature, point_idx) in image_observations.iter().enumerate() {
+            let Some(point_idx) = point_idx else {
+                continue;
+            };
+            let Some(point) = points.get_mut(*point_idx) else {
+                continue;
+            };
+            if !point
+                .track
+                .iter()
+                .any(|obs| obs.image == image && obs.feature == feature)
+            {
+                point.track.push(TrackObservation { image, feature });
+            }
+        }
+    }
 }
 
 pub fn export_colmap(
@@ -1238,6 +1454,71 @@ mod tests {
                 },
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_full_text_reconstruction_preserving_ids_tracks_and_cameras() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("cameras.txt"),
+            "# cameras\n11 PINHOLE 640 480 500 501 320 240\n42 SIMPLE_RADIAL 800 600 700 401 299 0.01\n",
+        )?;
+        fs::write(
+            sparse.join("images.txt"),
+            concat!(
+                "# images\n",
+                "7 1 0 0 0 0.1 0.2 0.3 11 left.jpg\n",
+                "10 20 99 30 40 -1\n",
+                "8 0.9238795325112867 0 0.3826834323650898 0 1 2 3 42 right.jpg\n",
+                "15 25 99\n"
+            ),
+        )?;
+        fs::write(
+            sparse.join("points3D.txt"),
+            "# points\n99 1.5 2.5 3.5 4 5 6 0.125 7 0 8 0\n",
+        )?;
+
+        let reconstruction = read_colmap_reconstruction(dir.path())?;
+
+        assert_eq!(reconstruction.camera_ids, vec![11, 42]);
+        assert_eq!(reconstruction.image_ids, vec![7, 8]);
+        assert_eq!(reconstruction.image_camera_indices, vec![0, 1]);
+        assert_eq!(
+            reconstruction.image_names,
+            vec!["left.jpg".to_string(), "right.jpg".to_string()]
+        );
+        assert_eq!(reconstruction.point_ids, vec![99]);
+        assert_eq!(reconstruction.keypoints[0].len(), 2);
+        assert_eq!(reconstruction.keypoints[1].len(), 1);
+        assert_eq!(
+            reconstruction.observations,
+            vec![vec![Some(0), None], vec![Some(0)]]
+        );
+        assert_eq!(
+            reconstruction.points[0].track,
+            vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ]
+        );
+
+        let exported = dir.path().join("exported");
+        export_colmap(&exported, &reconstruction, false)?;
+        let roundtrip = read_colmap_reconstruction(&exported)?;
+        assert_eq!(roundtrip.camera_ids, vec![11, 42]);
+        assert_eq!(roundtrip.image_ids, vec![7, 8]);
+        assert_eq!(roundtrip.point_ids, vec![99]);
+        assert_eq!(roundtrip.observations, reconstruction.observations);
+        assert_eq!(roundtrip.points[0].track, reconstruction.points[0].track);
         Ok(())
     }
 
