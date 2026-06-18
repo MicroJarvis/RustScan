@@ -78,10 +78,14 @@ reconstruction parity.
      after BA/pose refinement and before export, keeping `frames.txt`
      `rig_from_world` consistent with `images.txt` poses for known
      `sensor_from_rig` setups.
+   - Mapper BA options now carry COLMAP-style constant rig and
+     `sensor_from_rig` scheduling: explicit constant rig ids are exposed on the
+     CLI, and local BA fixes non-reference `sensor_from_rig` poses when the
+     local bundle does not contain every registered frame for that rig.
    - Remaining work: generalized pose registration for non-trivial rigs,
-     frame/rig-level BA parameter scheduling, exact filtered-frame event
-     counters in all mapper cleanup paths, and treating rig/sensor poses as
-     first-class BA parameter blocks instead of post-BA projection.
+     exact filtered-frame event counters in all mapper cleanup paths, and
+     treating frame rig poses and rig sensor poses as first-class BA parameter
+     blocks instead of post-BA projection.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
@@ -417,8 +421,11 @@ reconstruction parity.
     - Frame `rig_from_world` metadata is refreshed after successful BA so
       exported sparse models preserve the current frame pose instead of the
       original registration pose.
+    - Local BA now applies COLMAP's rig coverage boundary for
+      `sensor_from_rig`: explicit constant rigs and rigs only partially covered
+      by the local frame set keep all non-reference rig sensor poses fixed.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
-      strategies, and rig/sensor parameter controls.
+      strategies, and first-class rig/sensor BA parameter blocks.
 21. Match COLMAP global BA scheduling, convergence settings, optional redundant
     point handling, pose priors, normalization, and iterative refinement loops.
     - Added COLMAP-style global BA scheduling after initialization, during
@@ -434,6 +441,9 @@ reconstruction parity.
     - Global BA image-growth scheduling now uses registered frame counts so
       multi-camera frames do not prematurely trigger global BA merely because
       they contain multiple images.
+    - Global BA options now preserve explicit constant rig ids and their
+      non-reference `sensor_from_rig` constant set for the future
+      rig-parameterized BA backend.
     - Remaining work: exact COLMAP `BundleAdjustmentConfig::FixGauge`
       strategies, reconstruction normalization, pose priors, redundant 3D point
       pruning, and Ceres-equivalent convergence settings.

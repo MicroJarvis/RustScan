@@ -242,6 +242,7 @@ pub struct MapperConfig {
     pub ba_refine_focal_length: bool,
     pub ba_refine_principal_point: bool,
     pub ba_refine_extra_params: bool,
+    pub ba_constant_rig_ids: Vec<u32>,
     pub ba_constant_camera_ids: Vec<u32>,
     pub min_focal_length_ratio: f64,
     pub max_focal_length_ratio: f64,
@@ -304,6 +305,7 @@ impl Default for MapperConfig {
             ba_refine_focal_length: true,
             ba_refine_principal_point: false,
             ba_refine_extra_params: true,
+            ba_constant_rig_ids: Vec::new(),
             ba_constant_camera_ids: Vec::new(),
             min_focal_length_ratio: 0.1,
             max_focal_length_ratio: 10.0,
@@ -1039,6 +1041,8 @@ fn mapper_ba_options(
         constant_images,
         variable_cameras: None,
         constant_cameras: ba_constant_camera_indices(config, reconstruction),
+        constant_rigs: ba_constant_rig_ids(config, reconstruction),
+        constant_sensor_from_rig: ba_constant_sensor_from_rig_ids(config, reconstruction),
         refine_focal_length: config.ba_refine_focal_length,
         refine_principal_point: config.ba_refine_principal_point,
         refine_extra_params: config.ba_refine_extra_params,
@@ -1066,6 +1070,12 @@ fn mapper_local_ba_options(
         registration_stats,
         &variable_images,
     );
+    let local_constant_sensors = local_ba_constant_sensor_from_rig_ids(
+        config,
+        reconstruction,
+        registration_stats,
+        &variable_images,
+    );
     let mut options = mapper_ba_options(
         config,
         reconstruction,
@@ -1076,6 +1086,7 @@ fn mapper_local_ba_options(
         constant_point_ids,
     );
     options.constant_cameras = local_constant_cameras;
+    options.constant_sensor_from_rig = local_constant_sensors;
     options
 }
 
@@ -1195,6 +1206,107 @@ fn ba_constant_camera_indices(
         .enumerate()
         .filter_map(|(idx, camera_id)| constant_ids.contains(camera_id).then_some(idx))
         .collect()
+}
+
+fn ba_constant_rig_ids(config: &MapperConfig, reconstruction: &Reconstruction) -> Vec<u32> {
+    if config.ba_constant_rig_ids.is_empty() {
+        return Vec::new();
+    }
+    let available = reconstruction
+        .rigs
+        .iter()
+        .map(|rig| rig.rig_id)
+        .collect::<HashSet<_>>();
+    let mut rig_ids = config
+        .ba_constant_rig_ids
+        .iter()
+        .copied()
+        .filter(|rig_id| available.contains(rig_id))
+        .collect::<Vec<_>>();
+    rig_ids.sort_unstable();
+    rig_ids.dedup();
+    rig_ids
+}
+
+fn ba_constant_sensor_from_rig_ids(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+) -> Vec<SensorId> {
+    constant_sensor_from_rig_ids_for_rigs(
+        reconstruction,
+        ba_constant_rig_ids(config, reconstruction).into_iter(),
+    )
+}
+
+fn local_ba_constant_sensor_from_rig_ids(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    registration_stats: &RegistrationStats,
+    variable_images: &[usize],
+) -> Vec<SensorId> {
+    let constant_rigs = config.ba_constant_rig_ids.iter().copied();
+    let partial_rigs =
+        local_ba_partial_rig_ids(reconstruction, registration_stats, variable_images);
+    constant_sensor_from_rig_ids_for_rigs(reconstruction, constant_rigs.chain(partial_rigs))
+}
+
+fn local_ba_partial_rig_ids(
+    reconstruction: &Reconstruction,
+    registration_stats: &RegistrationStats,
+    variable_images: &[usize],
+) -> Vec<u32> {
+    let mut local_frame_indices = HashSet::new();
+    let mut local_frames_per_rig = HashMap::<u32, usize>::new();
+    for &image in variable_images {
+        let Some(frame_idx) = reconstruction.frame_index_for_image(image) else {
+            continue;
+        };
+        if !local_frame_indices.insert(frame_idx) {
+            continue;
+        }
+        let Some(frame) = reconstruction.frames.get(frame_idx) else {
+            continue;
+        };
+        *local_frames_per_rig.entry(frame.rig_id).or_default() += 1;
+    }
+    let mut partial_rigs = local_frames_per_rig
+        .into_iter()
+        .filter_map(|(rig_id, local_count)| {
+            let registered_count = registration_stats
+                .num_reg_frames_per_rig
+                .get(&rig_id)
+                .copied()
+                .unwrap_or(0);
+            (local_count < registered_count).then_some(rig_id)
+        })
+        .collect::<Vec<_>>();
+    partial_rigs.sort_unstable();
+    partial_rigs
+}
+
+fn constant_sensor_from_rig_ids_for_rigs(
+    reconstruction: &Reconstruction,
+    rig_ids: impl IntoIterator<Item = u32>,
+) -> Vec<SensorId> {
+    let rig_ids = rig_ids.into_iter().collect::<HashSet<_>>();
+    let mut sensor_ids = reconstruction
+        .rigs
+        .iter()
+        .filter(|rig| rig_ids.contains(&rig.rig_id))
+        .flat_map(|rig| {
+            rig.sensors
+                .iter()
+                .filter(|sensor| {
+                    rig.ref_sensor_id
+                        .as_ref()
+                        .is_none_or(|ref_sensor_id| ref_sensor_id != &sensor.sensor_id)
+                })
+                .map(|sensor| sensor.sensor_id.clone())
+        })
+        .collect::<Vec<_>>();
+    sensor_ids.sort_unstable();
+    sensor_ids.dedup();
+    sensor_ids
 }
 
 fn local_ba_constant_camera_indices(
@@ -7295,6 +7407,133 @@ mod tests {
         assert_eq!(options.variable_images, Some(vec![1, 2, 3]));
         assert_eq!(options.constant_images, Vec::<usize>::new());
         assert_eq!(options.constant_cameras, vec![0]);
+    }
+
+    #[test]
+    fn local_ba_options_fix_sensor_from_rig_when_rig_is_partially_covered() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref_a.jpg"),
+            minimal_frame(1, "rig_aux_a.jpg"),
+            minimal_frame(2, "rig_ref_b.jpg"),
+            minimal_frame(3, "rig_aux_b.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [1.0, 0.0, 0.0],
+                    }),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![
+            Frame {
+                frame_id: 9,
+                rig_id: 3,
+                rig_from_world: Rigid3::identity(),
+                data_ids: Vec::new(),
+            },
+            Frame {
+                frame_id: 10,
+                rig_id: 3,
+                rig_from_world: Rigid3::identity(),
+                data_ids: Vec::new(),
+            },
+        ];
+        reconstruction.image_frame_indices = vec![Some(0), Some(0), Some(1), Some(1)];
+        for image in 0..frames.len() {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        let stats = registration_stats(&reconstruction);
+
+        let partial_options = mapper_local_ba_options(
+            &MapperConfig::default(),
+            &reconstruction,
+            &stats,
+            5,
+            vec![0],
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(partial_options.variable_images, Some(vec![0, 1]));
+        assert_eq!(
+            partial_options.constant_sensor_from_rig,
+            vec![aux_sensor.clone()]
+        );
+
+        let full_options = mapper_local_ba_options(
+            &MapperConfig::default(),
+            &reconstruction,
+            &stats,
+            5,
+            vec![0, 2],
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(full_options.variable_images, Some(vec![0, 1, 2, 3]));
+        assert!(full_options.constant_sensor_from_rig.is_empty());
+    }
+
+    #[test]
+    fn mapper_ba_constant_rig_ids_fix_non_ref_sensors() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor,
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [1.0, 0.0, 0.0],
+                    }),
+                },
+            ],
+        }];
+        let config = MapperConfig {
+            ba_constant_rig_ids: vec![99, 3, 3],
+            ..MapperConfig::default()
+        };
+
+        let options = mapper_ba_options(&config, &reconstruction, 3, None, vec![], None, None);
+
+        assert_eq!(options.constant_rigs, vec![3]);
+        assert_eq!(options.constant_sensor_from_rig, vec![aux_sensor]);
     }
 
     #[test]

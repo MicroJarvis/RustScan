@@ -1,7 +1,7 @@
 use crate::types::{
     colmap_camera_model_focal_idxs, colmap_camera_model_principal_point_idxs, CameraModel,
-    ImageFrame, Reconstruction, COLMAP_FULL_OPENCV, COLMAP_OPENCV, COLMAP_PINHOLE, COLMAP_RADIAL,
-    COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
+    ImageFrame, Reconstruction, SensorId, COLMAP_FULL_OPENCV, COLMAP_OPENCV, COLMAP_PINHOLE,
+    COLMAP_RADIAL, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
 };
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
@@ -30,6 +30,8 @@ pub struct BundleAdjustmentOptions {
     pub constant_images: Vec<usize>,
     pub variable_cameras: Option<Vec<usize>>,
     pub constant_cameras: Vec<usize>,
+    pub constant_rigs: Vec<u32>,
+    pub constant_sensor_from_rig: Vec<SensorId>,
     pub refine_focal_length: bool,
     pub refine_principal_point: bool,
     pub refine_extra_params: bool,
@@ -53,6 +55,8 @@ impl Default for BundleAdjustmentOptions {
             constant_images: Vec::new(),
             variable_cameras: None,
             constant_cameras: Vec::new(),
+            constant_rigs: Vec::new(),
+            constant_sensor_from_rig: Vec::new(),
             refine_focal_length: false,
             refine_principal_point: false,
             refine_extra_params: false,

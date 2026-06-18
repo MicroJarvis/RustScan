@@ -1111,7 +1111,7 @@ pub struct Point3D {
     pub track: Vec<TrackObservation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SensorType {
     Invalid,
     Camera,
@@ -1119,7 +1119,7 @@ pub enum SensorType {
     Other(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SensorId {
     pub sensor_type: SensorType,
     pub sensor_id: u32,

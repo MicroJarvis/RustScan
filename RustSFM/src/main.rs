@@ -101,6 +101,8 @@ struct ReconstructArgs {
     ba_refine_principal_point: bool,
     #[arg(long, default_value_t = false)]
     no_ba_refine_extra_params: bool,
+    #[arg(long = "ba-constant-rig-id", value_delimiter = ',')]
+    ba_constant_rig_ids: Vec<u32>,
     #[arg(long = "ba-constant-camera-id", value_delimiter = ',')]
     ba_constant_camera_ids: Vec<u32>,
     #[arg(long, default_value = "0.1")]
@@ -212,6 +214,7 @@ fn main() -> Result<()> {
                 ba_refine_focal_length: !args.no_ba_refine_focal_length,
                 ba_refine_principal_point: args.ba_refine_principal_point,
                 ba_refine_extra_params: !args.no_ba_refine_extra_params,
+                ba_constant_rig_ids: args.ba_constant_rig_ids,
                 ba_constant_camera_ids: args.ba_constant_camera_ids,
                 min_focal_length_ratio: args.min_focal_length_ratio,
                 max_focal_length_ratio: args.max_focal_length_ratio,
