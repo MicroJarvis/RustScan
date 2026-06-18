@@ -1,6 +1,6 @@
 use crate::five_point_generated;
 use crate::polynomial;
-use nalgebra::{DMatrix, Matrix3, SMatrix, SVector, SymmetricEigen, Vector3};
+use nalgebra::{DMatrix, Matrix3, SMatrix, SVector, Vector3};
 
 pub type EssentialBasis = SMatrix<f64, 9, 4>;
 
@@ -93,23 +93,67 @@ pub fn five_point_nullspace(
             x2.z * x1.z,
         ]);
     }
-    let a = DMatrix::<f64>::from_row_slice(n, 9, &rows);
-    let ata = a.transpose() * a;
-    let eigen = SymmetricEigen::new(ata);
-    let mut order = (0..9).collect::<Vec<_>>();
-    order.sort_by(|&i, &j| {
-        eigen.eigenvalues[i]
-            .partial_cmp(&eigen.eigenvalues[j])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let q = DMatrix::<f64>::from_row_slice(n, 9, &rows);
+    if n == 5 {
+        five_point_minimal_nullspace(&q)
+    } else {
+        five_point_svd_nullspace(&q)
+    }
+}
+
+fn five_point_minimal_nullspace(q: &DMatrix<f64>) -> Option<EssentialBasis> {
+    if q.nrows() != 5 || q.ncols() != 9 {
+        return None;
+    }
+    let qr = q.transpose().qr();
+    let mut q_t = DMatrix::<f64>::identity(9, 9);
+    qr.q_tr_mul(&mut q_t);
     let mut basis = EssentialBasis::zeros();
     for basis_col in 0..4 {
-        let col = eigen.eigenvectors.column(order[basis_col]);
         for idx in 0..9 {
-            basis[(idx, basis_col)] = col[idx];
+            basis[(idx, basis_col)] = q_t[(5 + basis_col, idx)];
         }
     }
     Some(basis)
+}
+
+fn five_point_svd_nullspace(q: &DMatrix<f64>) -> Option<EssentialBasis> {
+    if q.ncols() != 9 || q.nrows() <= 5 {
+        return None;
+    }
+    let svd = q.clone().svd(false, true);
+    let vt = complete_right_singular_rows(svd.v_t?)?;
+    let mut basis = EssentialBasis::zeros();
+    for basis_col in 0..4 {
+        for idx in 0..9 {
+            basis[(idx, basis_col)] = vt[(5 + basis_col, idx)];
+        }
+    }
+    Some(basis)
+}
+
+fn complete_right_singular_rows(vt: DMatrix<f64>) -> Option<DMatrix<f64>> {
+    if vt.ncols() != 9 || vt.nrows() > 9 {
+        return None;
+    }
+    if vt.nrows() == 9 {
+        return Some(vt);
+    }
+    let qr = vt.transpose().qr();
+    let mut q_t = DMatrix::<f64>::identity(9, 9);
+    qr.q_tr_mul(&mut q_t);
+    let mut full = DMatrix::<f64>::zeros(9, 9);
+    for row in 0..vt.nrows() {
+        for col in 0..9 {
+            full[(row, col)] = vt[(row, col)];
+        }
+    }
+    for row in vt.nrows()..9 {
+        for col in 0..9 {
+            full[(row, col)] = q_t[(row, col)];
+        }
+    }
+    Some(full)
 }
 
 fn basis_as_colmap_data(basis: &EssentialBasis) -> [f64; 36] {
@@ -186,6 +230,36 @@ mod tests {
             Vector3::new(0.5, -0.1, 3.5),
             Vector3::new(-0.2, 0.4, 4.2),
             Vector3::new(0.4, 0.3, 3.8),
+        ];
+        let rays1 = points.iter().map(|p| p / p.z).collect::<Vec<_>>();
+        let rays2 = points
+            .iter()
+            .map(|p| {
+                let q = rotation * p + translation;
+                q / q.z
+            })
+            .collect::<Vec<_>>();
+        let basis = five_point_nullspace(&rays1, &rays2).expect("basis");
+        let e_vec = matrix_to_vec9(essential.normalize());
+        let projection = basis * (basis.transpose() * e_vec);
+        let residual = (e_vec - projection).norm();
+        assert!(residual < 1.0e-8, "residual={residual}");
+    }
+
+    #[test]
+    fn five_point_overdetermined_nullspace_contains_true_essential() {
+        let rotation = nalgebra::Rotation3::from_euler_angles(0.02, -0.03, 0.04).into_inner();
+        let translation = Vector3::new(0.12, -0.08, 0.03).normalize();
+        let essential = skew(translation) * rotation;
+        let points = [
+            Vector3::new(-0.4, -0.2, 3.0),
+            Vector3::new(0.1, -0.3, 4.0),
+            Vector3::new(0.5, -0.1, 3.5),
+            Vector3::new(-0.2, 0.4, 4.2),
+            Vector3::new(0.4, 0.3, 3.8),
+            Vector3::new(-0.1, 0.2, 5.1),
+            Vector3::new(0.3, -0.4, 4.8),
+            Vector3::new(-0.5, 0.1, 3.6),
         ];
         let rays1 = points.iter().map(|p| p / p.z).collect::<Vec<_>>();
         let rays2 = points

@@ -235,6 +235,11 @@ reconstruction parity.
       expressions and filters companion-matrix roots with the official
       imaginary-part threshold instead of Rust-only sorting/deduplication and
       residual heuristics.
+    - Five-point nullspace extraction now follows COLMAP's solver branch
+      structure: exactly five camera rays use a Householder-Q nullspace from
+      `Q^T`, while larger support sets use right-singular vectors with an
+      explicit full-`V^T` completion for wide matrices instead of the previous
+      `Q^T Q` eigenvector basis.
     - Fundamental/essential eight-point minimal nullspace extraction now
       reconstructs COLMAP's full Householder-Q column for exactly eight
       correspondences instead of using the previous explicit free-variable
@@ -244,7 +249,7 @@ reconstruction parity.
       instead of the previous `A^T A` eigenvector basis.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level full-pivot Householder
-      parity for minimal nullspaces and byte-level five-point nullspace /
+      parity for minimal nullspaces and byte-level Eigen JacobiSVD /
       companion root parity.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
