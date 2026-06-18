@@ -101,6 +101,7 @@ impl BundleAdjustmentTerminationType {
 pub enum BundleAdjustmentTerminationReason {
     GradientTolerance,
     FunctionTolerance,
+    ParameterTolerance,
     MaxIterations,
     LinearizationFailure,
     LinearSolveFailure,
@@ -124,6 +125,9 @@ pub struct BundleAdjustmentReport {
     pub final_cost: f64,
     pub observations: usize,
     pub residuals: usize,
+    pub effective_parameters: usize,
+    pub gradient_max_norm: f64,
+    pub step_norm: f64,
     pub termination_type: BundleAdjustmentTerminationType,
     pub termination_reason: BundleAdjustmentTerminationReason,
 }
@@ -233,6 +237,8 @@ pub fn refine_bundle_adjustment(
     let mut rejected_steps = 0usize;
     let mut consecutive_invalid_steps = 0usize;
     let mut consecutive_nonmonotonic_steps = 0usize;
+    let mut gradient_max_norm = f64::INFINITY;
+    let mut step_norm = 0.0;
     let mut termination_type = BundleAdjustmentTerminationType::NoConvergence;
     let mut termination_reason = BundleAdjustmentTerminationReason::MaxIterations;
     let mut damping = 1.0e-3;
@@ -255,6 +261,12 @@ pub fn refine_bundle_adjustment(
             termination_reason = BundleAdjustmentTerminationReason::LinearizationFailure;
             break;
         };
+        gradient_max_norm = system.g.amax();
+        if options.gradient_tolerance > 0.0 && gradient_max_norm <= options.gradient_tolerance {
+            termination_type = BundleAdjustmentTerminationType::Convergence;
+            termination_reason = BundleAdjustmentTerminationReason::GradientTolerance;
+            break;
+        }
         let Some(delta) = system.h.lu().solve(&(-system.g)) else {
             linear_solve_failures += 1;
             unsuccessful_steps += 1;
@@ -272,6 +284,7 @@ pub fn refine_bundle_adjustment(
             continue;
         };
         let delta_norm = delta.norm();
+        step_norm = delta_norm;
         if !delta.iter().all(|v| v.is_finite()) || delta_norm > 20.0 {
             invalid_steps += 1;
             unsuccessful_steps += 1;
@@ -288,9 +301,9 @@ pub fn refine_bundle_adjustment(
             }
             continue;
         }
-        if delta_norm <= options.gradient_tolerance.max(options.parameter_tolerance) {
+        if options.parameter_tolerance > 0.0 && delta_norm <= options.parameter_tolerance {
             termination_type = BundleAdjustmentTerminationType::Convergence;
-            termination_reason = BundleAdjustmentTerminationReason::GradientTolerance;
+            termination_reason = BundleAdjustmentTerminationReason::ParameterTolerance;
             break;
         }
 
@@ -387,6 +400,10 @@ pub fn refine_bundle_adjustment(
         final_cost,
         observations: observations.len(),
         residuals,
+        effective_parameters: nonpoint_dim
+            + point_effective_parameter_count(&observations, &constant_point_filter),
+        gradient_max_norm,
+        step_norm,
         termination_type,
         termination_reason,
     })
@@ -525,6 +542,19 @@ fn count_variable_residuals(
         })
         .count();
     variable_observations * 2
+}
+
+fn point_effective_parameter_count(
+    observations: &[BaObservation],
+    constant_point_filter: &HashSet<usize>,
+) -> usize {
+    let mut points = observations
+        .iter()
+        .filter_map(|obs| (!constant_point_filter.contains(&obs.point)).then_some(obs.point))
+        .collect::<Vec<_>>();
+    points.sort_unstable();
+    points.dedup();
+    points.len() * 3
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3949,6 +3979,9 @@ mod tests {
         assert!(report.attempted_iterations >= report.iterations);
         assert!(report.residuals <= report.observations * 2);
         assert!(report.brief_report().contains("termination="));
+        assert_eq!(report.effective_parameters, 2 + scene_points.len() * 3);
+        assert!(report.gradient_max_norm.is_finite());
+        assert!(report.step_norm.is_finite());
         assert!(
             (60.0 - reconstruction.cameras[0].fx as f64).abs()
                 < (60.0 - initial_camera.fx as f64).abs()
@@ -4038,6 +4071,92 @@ mod tests {
             BundleAdjustmentTerminationReason::FunctionTolerance
         );
         assert!(report.attempted_iterations < 8);
+    }
+
+    #[test]
+    fn bundle_adjustment_uses_parameter_tolerance_for_convergence() {
+        let true_camera = CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0);
+        let initial_camera = CameraModel::new_pinhole(100, 100, 45.0, 45.0, 50.0, 50.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.45, 0.02, 0.0)),
+        ];
+        let scene_points = [
+            [-0.6, -0.4, 3.2],
+            [-0.2, -0.4, 3.0],
+            [0.3, -0.35, 3.4],
+            [0.7, -0.2, 3.6],
+            [-0.5, 0.1, 3.3],
+            [0.0, 0.0, 3.1],
+            [0.45, 0.15, 3.5],
+            [-0.25, 0.45, 3.7],
+            [0.55, 0.5, 3.8],
+        ];
+        let mut frames = vec![frame(0), frame(1)];
+        for image in 0..2 {
+            frames[image].keypoints = scene_points
+                .iter()
+                .map(|&point| {
+                    let xy = project_point(true_camera, poses[image], point).unwrap();
+                    rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
+                })
+                .collect();
+        }
+
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.camera = initial_camera;
+        reconstruction.cameras = vec![initial_camera];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[1] = Some(poses[1]);
+        for (idx, xyz) in scene_points.into_iter().enumerate() {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.observations[1][idx] = Some(idx);
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![
+                    TrackObservation {
+                        image: 0,
+                        feature: idx,
+                    },
+                    TrackObservation {
+                        image: 1,
+                        feature: idx,
+                    },
+                ],
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+
+        let report = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 8,
+                gradient_tolerance: 0.0,
+                parameter_tolerance: 1.0e6,
+                huber_delta_px: 4.0,
+                max_observation_error_px: 50.0,
+                variable_images: Some(Vec::new()),
+                variable_cameras: Some(vec![0]),
+                refine_focal_length: true,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.termination_type,
+            BundleAdjustmentTerminationType::Convergence
+        );
+        assert_eq!(
+            report.termination_reason,
+            BundleAdjustmentTerminationReason::ParameterTolerance
+        );
+        assert_eq!(report.attempted_iterations, 1);
+        assert!(report.step_norm <= 1.0e6);
+        assert!(report.gradient_max_norm.is_finite());
     }
 
     #[test]

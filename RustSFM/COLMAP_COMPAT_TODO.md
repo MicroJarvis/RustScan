@@ -417,6 +417,9 @@ reconstruction parity.
     - BA pose updates now follow COLMAP/Ceres parameter-block semantics:
       quaternion manifold updates for rotation and direct Euclidean updates for
       translation, instead of coupled SE(3) exponential updates.
+    - BA termination now separates Ceres-style gradient and parameter tolerance
+      exits and reports reduced effective parameter counts, gradient max-norm,
+      and step norm in the solver summary.
     - Remaining work: replace hand-rolled LM with Ceres-equivalent solver
       behavior, robust trust-region/linear-solver behavior, and full backend
       solver-summary parity.
