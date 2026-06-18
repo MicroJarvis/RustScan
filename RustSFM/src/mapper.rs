@@ -562,6 +562,7 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         ));
         debug_log.push("pose_graph_refinement enabled".to_string());
     }
+    sync_registered_frame_poses_from_images(&mut reconstruction);
     let registered_images = reconstruction.poses.iter().filter(|p| p.is_some()).count();
     export_colmap(&config.output, &reconstruction, config.copy_images)?;
     Ok(ReconstructionSummary {
@@ -1111,7 +1112,54 @@ fn refine_bundle_adjustment_checked(
         );
         return None;
     }
+    sync_registered_frame_poses_from_images(reconstruction);
     report
+}
+
+fn sync_registered_frame_poses_from_images(reconstruction: &mut Reconstruction) {
+    for frame_idx in 0..reconstruction.frames.len() {
+        let Some((rig_from_world, image_poses)) =
+            frame_consistent_poses_from_registered_images(reconstruction, frame_idx)
+        else {
+            continue;
+        };
+        reconstruction.frames[frame_idx].rig_from_world = Rigid3::from_se3(rig_from_world);
+        for (image, pose) in image_poses {
+            if let Some(slot) = reconstruction.poses.get_mut(image) {
+                *slot = Some(pose);
+            }
+        }
+    }
+}
+
+fn frame_consistent_poses_from_registered_images(
+    reconstruction: &Reconstruction,
+    frame_idx: usize,
+) -> Option<(SE3, Vec<(usize, SE3)>)> {
+    let frame = reconstruction.frames.get(frame_idx)?;
+    let registered_image = reconstruction
+        .image_indices_for_frame_index(frame_idx)
+        .into_iter()
+        .find(|&image| reconstruction.poses.get(image).copied().flatten().is_some())?;
+    let selected_pose = reconstruction.poses[registered_image]?;
+    let selected_sensor_id =
+        reconstruction.frame_sensor_id_for_image(frame_idx, registered_image)?;
+    let selected_sensor_from_rig = reconstruction
+        .sensor_from_rig(frame.rig_id, selected_sensor_id)
+        .unwrap_or_else(SE3::identity);
+    let rig_from_world = selected_sensor_from_rig.inverse().compose(&selected_pose);
+    let image_poses = reconstruction
+        .image_indices_for_frame_index(frame_idx)
+        .into_iter()
+        .filter_map(|image| {
+            let sensor_id = reconstruction.frame_sensor_id_for_image(frame_idx, image)?;
+            let sensor_from_rig = reconstruction
+                .sensor_from_rig(frame.rig_id, sensor_id)
+                .unwrap_or_else(SE3::identity);
+            Some((image, sensor_from_rig.compose(&rig_from_world)))
+        })
+        .collect::<Vec<_>>();
+    (!image_poses.is_empty()).then_some((rig_from_world, image_poses))
 }
 
 fn restore_ba_state(
@@ -2744,6 +2792,7 @@ fn incremental_map(
             &mut debug_log,
         );
     }
+    sync_registered_frame_poses_from_images(&mut reconstruction);
     Ok((reconstruction, debug_log))
 }
 
@@ -7399,6 +7448,79 @@ mod tests {
         assert_eq!(stats.registered_images_with_camera_id(11), 1);
         assert_eq!(stats.registered_images_with_camera_id(12), 0);
         assert_eq!(stats.num_total_reg_images, 1);
+    }
+
+    #[test]
+    fn sync_registered_frame_poses_updates_exported_rig_from_world_after_pose_changes() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [1.0, 0.0, 0.0],
+                    }),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: vec![
+                DataId {
+                    sensor_id: ref_sensor,
+                    data_id: reconstruction.image_id(0) as u64,
+                },
+                DataId {
+                    sensor_id: aux_sensor,
+                    data_id: reconstruction.image_id(1) as u64,
+                },
+            ],
+        }];
+        reconstruction.image_frame_indices = vec![Some(0), Some(0)];
+        reconstruction.poses[0] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(5.0, 0.0, 0.0),
+        ));
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(99.0, 0.0, 0.0),
+        ));
+
+        sync_registered_frame_poses_from_images(&mut reconstruction);
+
+        assert_eq!(
+            reconstruction.frames[0].rig_from_world.tvec,
+            [5.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            reconstruction.poses[0].unwrap().translation(),
+            [5.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            reconstruction.poses[1].unwrap().translation(),
+            [6.0, 0.0, 0.0]
+        );
     }
 
     #[test]

@@ -74,10 +74,14 @@ reconstruction parity.
    - Local BA option construction now expands selected images to their full
      COLMAP registration frames, and global BA scheduling counts registered
      frames rather than individual frame images.
+   - Registered frame poses are now synchronized from their current image poses
+     after BA/pose refinement and before export, keeping `frames.txt`
+     `rig_from_world` consistent with `images.txt` poses for known
+     `sensor_from_rig` setups.
    - Remaining work: generalized pose registration for non-trivial rigs,
      frame/rig-level BA parameter scheduling, exact filtered-frame event
-     counters in all mapper cleanup paths, and full COLMAP frame pose export
-     after BA updates.
+     counters in all mapper cleanup paths, and treating rig/sensor poses as
+     first-class BA parameter blocks instead of post-BA projection.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
@@ -410,6 +414,9 @@ reconstruction parity.
       fixes shared camera intrinsics when the local image set does not contain
       every currently registered image for that camera, matching COLMAP's
       per-camera local BA scheduling boundary.
+    - Frame `rig_from_world` metadata is refreshed after successful BA so
+      exported sparse models preserve the current frame pose instead of the
+      original registration pose.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
       strategies, and rig/sensor parameter controls.
 21. Match COLMAP global BA scheduling, convergence settings, optional redundant
