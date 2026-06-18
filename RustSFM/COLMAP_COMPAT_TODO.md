@@ -400,12 +400,15 @@ reconstruction parity.
       nonmonotonic steps. The Rust solver uses these controls to classify
       convergence, no-convergence, and failure summaries.
     - BA now uses analytic pose/point Jacobians for SIMPLE_PINHOLE, PINHOLE,
-      SIMPLE_RADIAL, RADIAL, OPENCV, and FULL_OPENCV reprojection residuals,
-      with the remaining camera models falling back to numerical derivatives.
+      SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, FOV, SIMPLE_FISHEYE,
+      FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, and OPENCV_FISHEYE
+      reprojection residuals, with the remaining camera models falling back to
+      numerical derivatives.
     - BA now uses analytic camera-intrinsic Jacobians for SIMPLE_PINHOLE,
-      PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, and FULL_OPENCV focal/
-      principal-point/distortion parameters, with more complex camera models
-      still using numerical fallback.
+      PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, FOV,
+      SIMPLE_FISHEYE, FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, and
+      OPENCV_FISHEYE focal/principal-point/distortion parameters, with the
+      remaining complex camera models still using numerical fallback.
     - BA now uses analytic chain-rule Jacobians for COLMAP frame
       `rig_from_world` and non-reference `sensor_from_rig` pose blocks,
       replacing the finite-difference rig/sensor pose derivatives in the
@@ -415,7 +418,7 @@ reconstruction parity.
       translation, instead of coupled SE(3) exponential updates.
     - Remaining work: replace numerical Jacobians/hand-rolled LM with
       Ceres-equivalent solver behavior, analytic/Jet-equivalent residuals for
-      FOV/fisheye/thin-prism camera models, and robust
+      thin-prism, division, and EUCM camera models, and robust
       trust-region/linear-solver behavior plus full backend solver-summary
       parity.
 20. Match COLMAP local BA image selection, gauge fixing, robust losses,

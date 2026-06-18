@@ -616,7 +616,8 @@ pub fn colmap_camera_model_extra_idxs(model_id: i32) -> Option<&'static [usize]>
             Some(&[])
         }
         COLMAP_SIMPLE_RADIAL | COLMAP_SIMPLE_RADIAL_FISHEYE | COLMAP_SIMPLE_DIVISION => Some(&[3]),
-        COLMAP_RADIAL | COLMAP_RADIAL_FISHEYE | COLMAP_DIVISION | COLMAP_FOV => Some(&[3, 4]),
+        COLMAP_RADIAL | COLMAP_RADIAL_FISHEYE | COLMAP_DIVISION => Some(&[3, 4]),
+        COLMAP_FOV => Some(&[4]),
         COLMAP_OPENCV | COLMAP_OPENCV_FISHEYE => Some(&[4, 5, 6, 7]),
         COLMAP_FULL_OPENCV | COLMAP_THIN_PRISM_FISHEYE => Some(&[4, 5, 6, 7, 8, 9, 10, 11]),
         COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => Some(&[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
@@ -1431,6 +1432,19 @@ mod tests {
 
         assert!(camera.cam_from_img(1400.0, 300.0).is_none());
         assert!(camera.cam_from_img_f32(1400.0, 300.0).is_none());
+    }
+
+    #[test]
+    fn fov_extra_param_group_only_contains_omega() {
+        assert_eq!(
+            colmap_camera_model_focal_idxs(COLMAP_FOV),
+            Some(&[0, 1][..])
+        );
+        assert_eq!(
+            colmap_camera_model_principal_point_idxs(COLMAP_FOV),
+            Some([2, 3])
+        );
+        assert_eq!(colmap_camera_model_extra_idxs(COLMAP_FOV), Some(&[4][..]));
     }
 
     #[test]

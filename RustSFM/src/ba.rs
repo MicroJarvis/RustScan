@@ -1,7 +1,9 @@
 use crate::types::{
     colmap_camera_model_focal_idxs, colmap_camera_model_principal_point_idxs, CameraModel, Frame,
-    ImageFrame, Reconstruction, Rig, Rigid3, SensorId, COLMAP_FULL_OPENCV, COLMAP_OPENCV,
-    COLMAP_PINHOLE, COLMAP_RADIAL, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
+    ImageFrame, Reconstruction, Rig, Rigid3, SensorId, COLMAP_FISHEYE, COLMAP_FOV,
+    COLMAP_FULL_OPENCV, COLMAP_OPENCV, COLMAP_OPENCV_FISHEYE, COLMAP_PINHOLE, COLMAP_RADIAL,
+    COLMAP_RADIAL_FISHEYE, COLMAP_SIMPLE_FISHEYE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
+    COLMAP_SIMPLE_RADIAL_FISHEYE,
 };
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
@@ -10,6 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 
 type Mat2x3 = SMatrix<f64, 2, 3>;
 type Mat2x6 = SMatrix<f64, 2, 6>;
+type Mat2 = SMatrix<f64, 2, 2>;
 type Mat3 = SMatrix<f64, 3, 3>;
 type Vec2 = SVector<f64, 2>;
 type Vec3d = SVector<f64, 3>;
@@ -1772,6 +1775,49 @@ fn analytic_img_from_cam_jacobian(camera: CameraModel, x: f64, y: f64, z: f64) -
             j_norm[(1, 0)] = fy * dy_du;
             j_norm[(1, 1)] = fy * dy_dv;
         }
+        COLMAP_FOV => {
+            let fx = camera.params[0];
+            let fy = camera.params[1];
+            let terms = fov_distortion_terms(camera.params[4], u, v)?;
+            j_norm[(0, 0)] = fx * (terms.factor + 2.0 * u * u * terms.factor_derivative_r2);
+            j_norm[(0, 1)] = fx * (2.0 * u * v * terms.factor_derivative_r2);
+            j_norm[(1, 0)] = fy * (2.0 * u * v * terms.factor_derivative_r2);
+            j_norm[(1, 1)] = fy * (terms.factor + 2.0 * v * v * terms.factor_derivative_r2);
+        }
+        COLMAP_SIMPLE_FISHEYE | COLMAP_FISHEYE => {
+            let fx = camera.params[0];
+            let fy = if camera.model_id == COLMAP_SIMPLE_FISHEYE {
+                camera.params[0]
+            } else {
+                camera.params[1]
+            };
+            let fisheye = fisheye_normal_terms(u, v)?;
+            j_norm[(0, 0)] = fx * fisheye.jacobian[(0, 0)];
+            j_norm[(0, 1)] = fx * fisheye.jacobian[(0, 1)];
+            j_norm[(1, 0)] = fy * fisheye.jacobian[(1, 0)];
+            j_norm[(1, 1)] = fy * fisheye.jacobian[(1, 1)];
+        }
+        COLMAP_SIMPLE_RADIAL_FISHEYE | COLMAP_RADIAL_FISHEYE | COLMAP_OPENCV_FISHEYE => {
+            let fx = camera.params[0];
+            let fy = match camera.model_id {
+                COLMAP_OPENCV_FISHEYE => camera.params[1],
+                _ => camera.params[0],
+            };
+            let fisheye = fisheye_normal_terms(u, v)?;
+            let terms = fisheye_radial_terms(camera, fisheye.u, fisheye.v)?;
+            let dx_duu = terms.radial + 2.0 * fisheye.u * fisheye.u * terms.radial_derivative;
+            let dx_dvv = 2.0 * fisheye.u * fisheye.v * terms.radial_derivative;
+            let dy_duu = dx_dvv;
+            let dy_dvv = terms.radial + 2.0 * fisheye.v * fisheye.v * terms.radial_derivative;
+            j_norm[(0, 0)] =
+                fx * (dx_duu * fisheye.jacobian[(0, 0)] + dx_dvv * fisheye.jacobian[(1, 0)]);
+            j_norm[(0, 1)] =
+                fx * (dx_duu * fisheye.jacobian[(0, 1)] + dx_dvv * fisheye.jacobian[(1, 1)]);
+            j_norm[(1, 0)] =
+                fy * (dy_duu * fisheye.jacobian[(0, 0)] + dy_dvv * fisheye.jacobian[(1, 0)]);
+            j_norm[(1, 1)] =
+                fy * (dy_duu * fisheye.jacobian[(0, 1)] + dy_dvv * fisheye.jacobian[(1, 1)]);
+        }
         _ => return None,
     }
     if !j_norm.iter().all(|value| value.is_finite()) {
@@ -1913,6 +1959,104 @@ fn analytic_camera_param_jacobian(
             camera.params[0] * (r2 + 2.0 * nx * nx),
             camera.params[1] * 2.0 * nx * ny,
         )),
+        (COLMAP_FOV, 0..=4) => {
+            let terms = fov_distortion_terms(camera.params[4], nx, ny)?;
+            match param {
+                0 => Some(Vec2::new(terms.x, 0.0)),
+                1 => Some(Vec2::new(0.0, terms.y)),
+                2 => Some(Vec2::new(1.0, 0.0)),
+                3 => Some(Vec2::new(0.0, 1.0)),
+                4 => Some(Vec2::new(
+                    camera.params[0] * nx * terms.factor_derivative_omega,
+                    camera.params[1] * ny * terms.factor_derivative_omega,
+                )),
+                _ => None,
+            }
+        }
+        (COLMAP_SIMPLE_FISHEYE, 0..=2) => {
+            let fisheye = fisheye_normal_terms(nx, ny)?;
+            match param {
+                0 => Some(Vec2::new(fisheye.u, fisheye.v)),
+                1 => Some(Vec2::new(1.0, 0.0)),
+                2 => Some(Vec2::new(0.0, 1.0)),
+                _ => None,
+            }
+        }
+        (COLMAP_FISHEYE, 0..=3) => {
+            let fisheye = fisheye_normal_terms(nx, ny)?;
+            match param {
+                0 => Some(Vec2::new(fisheye.u, 0.0)),
+                1 => Some(Vec2::new(0.0, fisheye.v)),
+                2 => Some(Vec2::new(1.0, 0.0)),
+                3 => Some(Vec2::new(0.0, 1.0)),
+                _ => None,
+            }
+        }
+        (COLMAP_SIMPLE_RADIAL_FISHEYE, 0..=3) => {
+            let fisheye = fisheye_normal_terms(nx, ny)?;
+            let terms = fisheye_radial_terms(camera, fisheye.u, fisheye.v)?;
+            let distorted_u = fisheye.u * terms.radial;
+            let distorted_v = fisheye.v * terms.radial;
+            match param {
+                0 => Some(Vec2::new(distorted_u, distorted_v)),
+                1 => Some(Vec2::new(1.0, 0.0)),
+                2 => Some(Vec2::new(0.0, 1.0)),
+                3 => Some(Vec2::new(
+                    camera.params[0] * fisheye.u * terms.r2,
+                    camera.params[0] * fisheye.v * terms.r2,
+                )),
+                _ => None,
+            }
+        }
+        (COLMAP_RADIAL_FISHEYE, 0..=4) => {
+            let fisheye = fisheye_normal_terms(nx, ny)?;
+            let terms = fisheye_radial_terms(camera, fisheye.u, fisheye.v)?;
+            let distorted_u = fisheye.u * terms.radial;
+            let distorted_v = fisheye.v * terms.radial;
+            match param {
+                0 => Some(Vec2::new(distorted_u, distorted_v)),
+                1 => Some(Vec2::new(1.0, 0.0)),
+                2 => Some(Vec2::new(0.0, 1.0)),
+                3 => Some(Vec2::new(
+                    camera.params[0] * fisheye.u * terms.r2,
+                    camera.params[0] * fisheye.v * terms.r2,
+                )),
+                4 => Some(Vec2::new(
+                    camera.params[0] * fisheye.u * terms.r4,
+                    camera.params[0] * fisheye.v * terms.r4,
+                )),
+                _ => None,
+            }
+        }
+        (COLMAP_OPENCV_FISHEYE, 0..=7) => {
+            let fisheye = fisheye_normal_terms(nx, ny)?;
+            let terms = fisheye_radial_terms(camera, fisheye.u, fisheye.v)?;
+            let distorted_u = fisheye.u * terms.radial;
+            let distorted_v = fisheye.v * terms.radial;
+            match param {
+                0 => Some(Vec2::new(distorted_u, 0.0)),
+                1 => Some(Vec2::new(0.0, distorted_v)),
+                2 => Some(Vec2::new(1.0, 0.0)),
+                3 => Some(Vec2::new(0.0, 1.0)),
+                4 => Some(Vec2::new(
+                    camera.params[0] * fisheye.u * terms.r2,
+                    camera.params[1] * fisheye.v * terms.r2,
+                )),
+                5 => Some(Vec2::new(
+                    camera.params[0] * fisheye.u * terms.r4,
+                    camera.params[1] * fisheye.v * terms.r4,
+                )),
+                6 => Some(Vec2::new(
+                    camera.params[0] * fisheye.u * terms.r6,
+                    camera.params[1] * fisheye.v * terms.r6,
+                )),
+                7 => Some(Vec2::new(
+                    camera.params[0] * fisheye.u * terms.r8,
+                    camera.params[1] * fisheye.v * terms.r8,
+                )),
+                _ => None,
+            }
+        }
         (COLMAP_FULL_OPENCV, 0..=11) => {
             let fx = camera.params[0];
             let fy = camera.params[1];
@@ -2030,6 +2174,162 @@ fn full_opencv_radial_terms(
         terms.den,
         terms.radial,
         terms.radial_derivative,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+struct FisheyeNormalTerms {
+    u: f64,
+    v: f64,
+    jacobian: Mat2,
+}
+
+fn fisheye_normal_terms(u: f64, v: f64) -> Option<FisheyeNormalTerms> {
+    let r2 = u * u + v * v;
+    let r = r2.sqrt();
+    let mut uu = u;
+    let mut vv = v;
+    let mut jacobian = Mat2::identity();
+    if r > f64::EPSILON {
+        let theta = r.atan();
+        let scale = theta / r;
+        uu *= scale;
+        vv *= scale;
+        let dscale_dr = (r / (1.0 + r2) - theta) / r2;
+        let dscale_du = dscale_dr * u / r;
+        let dscale_dv = dscale_dr * v / r;
+        jacobian[(0, 0)] = scale + u * dscale_du;
+        jacobian[(0, 1)] = u * dscale_dv;
+        jacobian[(1, 0)] = v * dscale_du;
+        jacobian[(1, 1)] = scale + v * dscale_dv;
+    }
+    if [uu, vv].iter().all(|value| value.is_finite())
+        && jacobian.iter().all(|value| value.is_finite())
+    {
+        Some(FisheyeNormalTerms {
+            u: uu,
+            v: vv,
+            jacobian,
+        })
+    } else {
+        None
+    }
+}
+
+struct FisheyeRadialTerms {
+    r2: f64,
+    r4: f64,
+    r6: f64,
+    r8: f64,
+    radial: f64,
+    radial_derivative: f64,
+}
+
+fn fisheye_radial_terms(camera: CameraModel, u: f64, v: f64) -> Option<FisheyeRadialTerms> {
+    let r2 = u * u + v * v;
+    let r4 = r2 * r2;
+    let r6 = r4 * r2;
+    let r8 = r4 * r4;
+    let (k1, k2, k3, k4) = match camera.model_id {
+        COLMAP_SIMPLE_RADIAL_FISHEYE => (camera.params[3], 0.0, 0.0, 0.0),
+        COLMAP_RADIAL_FISHEYE => (camera.params[3], camera.params[4], 0.0, 0.0),
+        COLMAP_OPENCV_FISHEYE => (
+            camera.params[4],
+            camera.params[5],
+            camera.params[6],
+            camera.params[7],
+        ),
+        _ => return None,
+    };
+    let radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+    let radial_derivative = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4 + 4.0 * k4 * r6;
+    let terms = FisheyeRadialTerms {
+        r2,
+        r4,
+        r6,
+        r8,
+        radial,
+        radial_derivative,
+    };
+    if [
+        terms.r2,
+        terms.r4,
+        terms.r6,
+        terms.r8,
+        terms.radial,
+        terms.radial_derivative,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+struct FovDistortionTerms {
+    x: f64,
+    y: f64,
+    factor: f64,
+    factor_derivative_r2: f64,
+    factor_derivative_omega: f64,
+}
+
+fn fov_distortion_terms(omega: f64, u: f64, v: f64) -> Option<FovDistortionTerms> {
+    const EPSILON: f64 = 1.0e-4;
+    let r2 = u * u + v * v;
+    let omega2 = omega * omega;
+    let (factor, factor_derivative_r2, factor_derivative_omega) = if omega2 < EPSILON {
+        (
+            omega2 * r2 / 3.0 - omega2 / 12.0 + 1.0,
+            omega2 / 3.0,
+            2.0 * omega * (r2 / 3.0 - 1.0 / 12.0),
+        )
+    } else if r2 < EPSILON {
+        let t = (omega / 2.0).tan();
+        let dt_domega = 0.5 * (1.0 + t * t);
+        let factor = -2.0 * t * (4.0 * r2 * t * t - 3.0) / (3.0 * omega);
+        let factor_derivative_r2 = -8.0 * t * t * t / (3.0 * omega);
+        let numerator = -8.0 * r2 * t * t * t + 6.0 * t;
+        let numerator_derivative = dt_domega * (6.0 - 24.0 * r2 * t * t);
+        let factor_derivative_omega =
+            (numerator_derivative * omega - numerator) / (3.0 * omega * omega);
+        (factor, factor_derivative_r2, factor_derivative_omega)
+    } else {
+        let r = r2.sqrt();
+        let t = (omega / 2.0).tan();
+        let a = 2.0 * r * t;
+        let numerator = a.atan();
+        let den = r * omega;
+        let factor = numerator / den;
+        let dnum_dr = 2.0 * t / (1.0 + a * a);
+        let dfactor_dr = (dnum_dr * den - numerator * omega) / (den * den);
+        let factor_derivative_r2 = dfactor_dr / (2.0 * r);
+        let da_domega = r * (1.0 + t * t);
+        let dnum_domega = da_domega / (1.0 + a * a);
+        let factor_derivative_omega = (dnum_domega * den - numerator * r) / (den * den);
+        (factor, factor_derivative_r2, factor_derivative_omega)
+    };
+    let terms = FovDistortionTerms {
+        x: u * factor,
+        y: v * factor,
+        factor,
+        factor_derivative_r2,
+        factor_derivative_omega,
+    };
+    if [
+        terms.x,
+        terms.y,
+        terms.factor,
+        terms.factor_derivative_r2,
+        terms.factor_derivative_omega,
     ]
     .iter()
     .all(|value| value.is_finite())
@@ -2314,6 +2614,32 @@ mod tests {
                 ],
             )
             .unwrap(),
+            CameraModel::from_colmap(COLMAP_FOV, 200, 160, &[90.0, 96.0, 100.0, 80.0, 0.25])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_SIMPLE_FISHEYE, 200, 160, &[95.0, 100.0, 80.0])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_FISHEYE, 200, 160, &[90.0, 96.0, 100.0, 80.0]).unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_SIMPLE_RADIAL_FISHEYE,
+                200,
+                160,
+                &[95.0, 100.0, 80.0, 0.02],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_RADIAL_FISHEYE,
+                200,
+                160,
+                &[95.0, 100.0, 80.0, 0.02, -0.001],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_OPENCV_FISHEYE,
+                200,
+                160,
+                &[90.0, 96.0, 100.0, 80.0, 0.02, -0.001, 0.0001, -0.00001],
+            )
+            .unwrap(),
         ];
         let pose = SE3::from_quat_translation(
             Quat::from_rotation_y(0.12) * Quat::from_rotation_x(-0.04),
@@ -2426,6 +2752,32 @@ mod tests {
                     90.0, 96.0, 100.0, 80.0, 0.02, -0.001, 0.0005, -0.0003, 0.00001, 0.00002,
                     -0.00001, 0.000005,
                 ],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(COLMAP_FOV, 200, 160, &[90.0, 96.0, 100.0, 80.0, 0.25])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_SIMPLE_FISHEYE, 200, 160, &[95.0, 100.0, 80.0])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_FISHEYE, 200, 160, &[90.0, 96.0, 100.0, 80.0]).unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_SIMPLE_RADIAL_FISHEYE,
+                200,
+                160,
+                &[95.0, 100.0, 80.0, 0.02],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_RADIAL_FISHEYE,
+                200,
+                160,
+                &[95.0, 100.0, 80.0, 0.02, -0.001],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_OPENCV_FISHEYE,
+                200,
+                160,
+                &[90.0, 96.0, 100.0, 80.0, 0.02, -0.001, 0.0001, -0.00001],
             )
             .unwrap(),
         ];
