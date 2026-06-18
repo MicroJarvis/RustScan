@@ -82,10 +82,14 @@ reconstruction parity.
      `sensor_from_rig` scheduling: explicit constant rig ids are exposed on the
      CLI, and local BA fixes non-reference `sensor_from_rig` poses when the
      local bundle does not contain every registered frame for that rig.
+   - Bundle adjustment now creates a shared frame `rig_from_world` pose block
+     for registered multi-image COLMAP frames instead of optimizing each frame
+     image as an independent pose, and propagates the optimized frame pose back
+     through fixed `sensor_from_rig` transforms.
    - Remaining work: generalized pose registration for non-trivial rigs,
      exact filtered-frame event counters in all mapper cleanup paths, and
-     treating frame rig poses and rig sensor poses as first-class BA parameter
-     blocks instead of post-BA projection.
+     treating rig sensor poses as first-class BA parameter blocks instead of
+     fixed transforms.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
@@ -424,8 +428,11 @@ reconstruction parity.
     - Local BA now applies COLMAP's rig coverage boundary for
       `sensor_from_rig`: explicit constant rigs and rigs only partially covered
       by the local frame set keep all non-reference rig sensor poses fixed.
+    - BA now uses shared frame pose blocks for registered COLMAP frames, keeping
+      all images in the same frame tied to `sensor_from_rig * rig_from_world`
+      during optimization instead of repairing frame consistency only after BA.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
-      strategies, and first-class rig/sensor BA parameter blocks.
+      strategies, and first-class `sensor_from_rig` BA parameter blocks.
 21. Match COLMAP global BA scheduling, convergence settings, optional redundant
     point handling, pose priors, normalization, and iterative refinement loops.
     - Added COLMAP-style global BA scheduling after initialization, during
