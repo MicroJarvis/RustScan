@@ -227,10 +227,14 @@ reconstruction parity.
       unnormalized sample coordinates, explicit determinant cubic
       coefficients, and COLMAP's cubic root polishing path; it is pinned by
       COLMAP's official seven-point reference case.
+    - Fundamental/essential eight-point support now uses COLMAP's RMS
+      point-normalization convention for F, COLMAP-shaped raw camera-ray
+      estimation for E, and official COLMAP reference coverage for the
+      eight-point F solver.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level official seven-point
-      nullspace extraction, official eight-point fundamental parity, and
-      official essential estimators.
+      nullspace extraction, byte-level eight-point Householder-Q nullspace
+      extraction, and the generated official five-point essential estimator.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.

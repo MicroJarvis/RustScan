@@ -940,10 +940,8 @@ fn estimate_fundamental_eight_point_indexed(
         ]);
     }
     let a = DMatrix::<f64>::from_row_slice(indices.len(), 9, &rows);
-    let svd = a.svd(false, true);
-    let vt = svd.v_t?;
-    let q = vt.row(vt.nrows() - 1);
-    let f_norm = Matrix3::from_row_slice(&[q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]]);
+    let q = colmap_eight_point_nullspace(&a)?;
+    let f_norm = Matrix3::from_row_slice(&q);
     let svd_f = f_norm.svd(true, true);
     let u = svd_f.u?;
     let vt = svd_f.v_t?;
@@ -953,6 +951,55 @@ fn estimate_fundamental_eight_point_indexed(
     let f = t2.transpose() * f_rank2 * t1;
     let norm = f.norm();
     (norm > 1.0e-12 && norm.is_finite()).then_some(f / norm)
+}
+
+fn colmap_eight_point_nullspace(a: &DMatrix<f64>) -> Option<[f64; 9]> {
+    if a.ncols() != 9 || a.nrows() < 8 {
+        return None;
+    }
+    if a.nrows() == 8 {
+        return eight_point_minimal_nullspace(a);
+    }
+    let svd = a.clone().svd(false, true);
+    let vt = svd.v_t?;
+    let q = vt.row(8);
+    Some([q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]])
+}
+
+fn eight_point_minimal_nullspace(a: &DMatrix<f64>) -> Option<[f64; 9]> {
+    let mut best: Option<([f64; 9], f64)> = None;
+    for free_col in 0..9 {
+        let lhs = DMatrix::<f64>::from_fn(8, 8, |row, col| {
+            let source_col = if col < free_col { col } else { col + 1 };
+            a[(row, source_col)]
+        });
+        let rhs = DVector::<f64>::from_fn(8, |row, _| -a[(row, free_col)]);
+        let Some(solution) = lhs.lu().solve(&rhs) else {
+            continue;
+        };
+        let mut q = [0.0f64; 9];
+        q[free_col] = 1.0;
+        for col in 0..8 {
+            let target_col = if col < free_col { col } else { col + 1 };
+            q[target_col] = solution[col];
+        }
+        let norm = q.iter().map(|value| value * value).sum::<f64>().sqrt();
+        if !norm.is_finite() || norm <= 1.0e-12 {
+            continue;
+        }
+        for value in q.iter_mut() {
+            *value /= norm;
+        }
+        let residual = (a * DVector::<f64>::from_column_slice(&q)).norm();
+        if residual.is_finite()
+            && best
+                .as_ref()
+                .is_none_or(|(_, best_residual)| residual < *best_residual)
+        {
+            best = Some((q, residual));
+        }
+    }
+    best.map(|(q, _)| q)
 }
 
 fn refine_fundamental_support(
@@ -1182,29 +1229,9 @@ fn estimate_essential_eight_point_indexed(
     if indices.len() < 8 {
         return None;
     }
-    let (norm1, t1) = normalize_points_indexed(pts1, indices)?;
-    let (norm2, t2) = normalize_points_indexed(pts2, indices)?;
-    let mut rows = Vec::with_capacity(indices.len() * 9);
-    for (x1, x2) in norm1.iter().zip(norm2.iter()) {
-        rows.extend_from_slice(&[
-            x2.x * x1.x,
-            x2.x * x1.y,
-            x2.x * x1.z,
-            x2.y * x1.x,
-            x2.y * x1.y,
-            x2.y * x1.z,
-            x2.z * x1.x,
-            x2.z * x1.y,
-            x2.z * x1.z,
-        ]);
-    }
-    let a = DMatrix::<f64>::from_row_slice(indices.len(), 9, &rows);
-    let svd = a.svd(false, true);
-    let vt = svd.v_t?;
-    let q = vt.row(vt.nrows() - 1);
-    let e_norm = Matrix3::from_row_slice(&[q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]]);
-    let e = t2.transpose() * e_norm * t1;
-    enforce_essential_constraints(e)
+    let a = essential_eight_point_constraint_matrix(pts1, pts2, indices)?;
+    let q = colmap_eight_point_nullspace(&a)?;
+    enforce_essential_constraints(Matrix3::from_row_slice(&q))
 }
 
 fn estimate_essential_eight_point_indexed_lightweight(
@@ -1215,6 +1242,19 @@ fn estimate_essential_eight_point_indexed_lightweight(
     if indices.len() < 8 {
         return None;
     }
+    let a = essential_eight_point_constraint_matrix(pts1, pts2, indices)?;
+    let svd = a.svd(false, true);
+    let vt = svd.v_t?;
+    let q = vt.row(vt.nrows() - 1);
+    let e = Matrix3::from_row_slice(&[q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]]);
+    enforce_essential_constraints(e)
+}
+
+fn essential_eight_point_constraint_matrix(
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    indices: &[usize],
+) -> Option<DMatrix<f64>> {
     let mut rows = Vec::with_capacity(indices.len() * 9);
     for &idx in indices {
         let x1 = pts1.get(idx)?;
@@ -1231,12 +1271,7 @@ fn estimate_essential_eight_point_indexed_lightweight(
             x2.z * x1.z,
         ]);
     }
-    let a = DMatrix::<f64>::from_row_slice(indices.len(), 9, &rows);
-    let svd = a.svd(false, true);
-    let vt = svd.v_t?;
-    let q = vt.row(vt.nrows() - 1);
-    let e = Matrix3::from_row_slice(&[q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]]);
-    enforce_essential_constraints(e)
+    Some(DMatrix::<f64>::from_row_slice(indices.len(), 9, &rows))
 }
 
 fn normalize_points_indexed(
@@ -1255,15 +1290,15 @@ fn normalize_points_indexed(
     centroid.x /= indices.len() as f64;
     centroid.y /= indices.len() as f64;
 
-    let mut mean_dist = 0.0f64;
+    let mut rms_dist_sq = 0.0f64;
     for &idx in indices {
         let p = pts.get(idx)?;
         let x = p.x / p.z - centroid.x;
         let y = p.y / p.z - centroid.y;
-        mean_dist += (x * x + y * y).sqrt();
+        rms_dist_sq += x * x + y * y;
     }
-    mean_dist /= indices.len() as f64;
-    let scale = std::f64::consts::SQRT_2 / mean_dist.max(1.0e-12);
+    let rms_dist = (rms_dist_sq / indices.len() as f64).sqrt();
+    let scale = std::f64::consts::SQRT_2 / rms_dist.max(1.0e-12);
     let transform = Matrix3::new(
         scale,
         0.0,
@@ -2012,6 +2047,16 @@ mod tests {
         }
     }
 
+    fn skew_matrix(t: Vector3<f64>) -> Matrix3<f64> {
+        Matrix3::new(0.0, -t.z, t.y, t.z, 0.0, -t.x, -t.y, t.x, 0.0)
+    }
+
+    fn essential_distance(a: Matrix3<f64>, b: Matrix3<f64>) -> f64 {
+        let a = a.normalize();
+        let b = b.normalize();
+        (a - b).norm().min((a + b).norm())
+    }
+
     #[test]
     fn adaptive_ransac_iterations_matches_colmap_trial_formula() {
         assert_eq!(adaptive_ransac_iterations(50, 100, 10_000, 0.999, 5), 726);
@@ -2141,6 +2186,95 @@ mod tests {
                 .fold(0.0, f64::max);
             det < 1.0e-8 && max_residual < 1.0e-10
         }));
+    }
+
+    #[test]
+    fn normalize_points_indexed_matches_colmap_rms_scaling() {
+        let points = (0..11)
+            .map(|i| Vector3::new(i as f64, i as f64, 1.0))
+            .collect::<Vec<_>>();
+        let indices = (0..points.len()).collect::<Vec<_>>();
+
+        let (normalized, transform) = normalize_points_indexed(&points, &indices).unwrap();
+
+        assert!((transform[(0, 0)] - 0.31622776601683794).abs() < 1.0e-15);
+        assert!((transform[(1, 1)] - 0.31622776601683794).abs() < 1.0e-15);
+        assert!((transform[(0, 2)] + 1.5811388300841898).abs() < 1.0e-15);
+        assert!((transform[(1, 2)] + 1.5811388300841898).abs() < 1.0e-15);
+        let mean_x = normalized.iter().map(|p| p.x / p.z).sum::<f64>() / normalized.len() as f64;
+        let mean_y = normalized.iter().map(|p| p.y / p.z).sum::<f64>() / normalized.len() as f64;
+        assert!(mean_x.abs() < 1.0e-12);
+        assert!(mean_y.abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn fundamental_eight_point_matches_colmap_reference() {
+        let points1_raw = [
+            1.839035, 1.924743, 0.543582, 0.375221, 0.473240, 0.142522, 0.964910, 0.598376,
+            0.102388, 0.140092, 15.994343, 9.622164, 0.285901, 0.430055, 0.091150, 0.254594,
+        ];
+        let points2_raw = [
+            1.002114, 1.129644, 1.521742, 1.846002, 1.084332, 0.275134, 0.293328, 0.588992,
+            0.839509, 0.087290, 1.779735, 1.116857, 0.878616, 0.602447, 0.642616, 1.028681,
+        ];
+        let pts1 = (0..8)
+            .map(|i| Vector3::new(points1_raw[2 * i], points1_raw[2 * i + 1], 1.0))
+            .collect::<Vec<_>>();
+        let pts2 = (0..8)
+            .map(|i| Vector3::new(points2_raw[2 * i], points2_raw[2 * i + 1], 1.0))
+            .collect::<Vec<_>>();
+
+        let f = estimate_fundamental_eight_point_indexed(&pts1, &pts2, &[0, 1, 2, 3, 4, 5, 6, 7])
+            .unwrap();
+        let f = f / f[(2, 2)];
+        let expected = Matrix3::new(
+            -9.85701, 18.97038, -1.55224, -3.24832, 2.04346, 0.977619, 11.22355, -19.43171, 1.0,
+        );
+
+        for (actual, expected) in f.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn essential_eight_point_uses_colmap_raw_ray_estimator() {
+        let rotation = Rotation3::from_euler_angles(0.03, -0.04, 0.02);
+        let translation = Vector3::new(0.2, -0.03, 0.05).normalize();
+        let expected = (skew_matrix(translation) * rotation.matrix()).normalize();
+        let points_world = [
+            Vector3::new(-0.4, -0.2, 3.0),
+            Vector3::new(0.1, -0.3, 4.0),
+            Vector3::new(0.5, -0.1, 3.5),
+            Vector3::new(-0.2, 0.4, 4.2),
+            Vector3::new(0.4, 0.3, 3.8),
+            Vector3::new(-0.6, 0.15, 4.5),
+            Vector3::new(0.25, -0.45, 3.7),
+            Vector3::new(0.7, 0.25, 4.8),
+        ];
+        let pts1 = points_world
+            .iter()
+            .map(|p| Vector3::new(p.x / p.z, p.y / p.z, 1.0))
+            .collect::<Vec<_>>();
+        let pts2 = points_world
+            .iter()
+            .map(|p| {
+                let q = rotation * p + translation;
+                Vector3::new(q.x / q.z, q.y / q.z, 1.0)
+            })
+            .collect::<Vec<_>>();
+
+        let estimated =
+            estimate_essential_eight_point_indexed(&pts1, &pts2, &[0, 1, 2, 3, 4, 5, 6, 7])
+                .unwrap();
+        let direct = estimate_essential_eight_point_indexed_lightweight(
+            &pts1,
+            &pts2,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+        )
+        .unwrap();
+
+        assert!(essential_distance(estimated, expected) < 1.0e-8);
+        assert!(direct.iter().all(|value| value.is_finite()));
     }
 
     fn transform_homography_point(h: &Matrix3<f64>, x: f64, y: f64) -> Vector3<f64> {
