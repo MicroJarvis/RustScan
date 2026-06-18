@@ -72,6 +72,7 @@ impl Default for BundleAdjustmentOptions {
 pub enum BundleAdjustmentGauge {
     Default,
     ThreePoints,
+    TwoCamsFromWorld,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,10 +157,12 @@ pub fn refine_bundle_adjustment(
         .as_ref()
         .map(|ids| ids.iter().copied().collect::<HashSet<_>>())
         .unwrap_or_default();
-    let pose_blocks = variable_pose_blocks(
+    let mut pose_blocks = variable_pose_blocks(
         reconstruction,
         options.variable_images.as_deref(),
         &options.constant_images,
+        &options.constant_rigs,
+        matches!(options.gauge, BundleAdjustmentGauge::Default),
     );
     if reconstruction.points.is_empty() {
         return None;
@@ -170,20 +173,29 @@ pub fn refine_bundle_adjustment(
         options.max_observation_error_px,
         point_filter.as_ref(),
     );
-    let sensor_pose_specs = sensor_pose_specs(
-        reconstruction,
-        &pose_blocks,
-        &options,
-        pose_blocks.blocks.len() * 6,
-    );
+    if matches!(options.gauge, BundleAdjustmentGauge::TwoCamsFromWorld) {
+        let fixed = apply_two_cams_from_world_gauge(
+            &mut pose_blocks,
+            reconstruction,
+            &options,
+            &observations,
+        );
+        if !fixed {
+            add_three_point_gauge(&mut constant_point_filter, reconstruction, &observations);
+        }
+    } else if matches!(options.gauge, BundleAdjustmentGauge::ThreePoints) {
+        add_three_point_gauge(&mut constant_point_filter, reconstruction, &observations);
+    }
+    reindex_pose_blocks(&mut pose_blocks);
+
+    let sensor_pose_specs = sensor_pose_specs(reconstruction, &pose_blocks, &options);
     let camera_param_specs = camera_param_specs(
         reconstruction,
         &observations,
         &options,
-        pose_blocks.blocks.len() * 6 + sensor_pose_specs.len() * 6,
+        pose_blocks.dim + sensor_pose_specs.len() * 6,
     );
-    let nonpoint_dim =
-        pose_blocks.blocks.len() * 6 + sensor_pose_specs.len() * 6 + camera_param_specs.len();
+    let nonpoint_dim = pose_blocks.dim + sensor_pose_specs.len() * 6 + camera_param_specs.len();
     if nonpoint_dim == 0 || observations.len() * 2 < nonpoint_dim {
         return None;
     }
@@ -198,10 +210,6 @@ pub fn refine_bundle_adjustment(
     if residuals == 0 {
         return None;
     }
-    if matches!(options.gauge, BundleAdjustmentGauge::ThreePoints) {
-        add_three_point_gauge(&mut constant_point_filter, reconstruction, &observations);
-    }
-
     let initial_poses = reconstruction.poses.clone();
     let initial_frames = reconstruction.frames.clone();
     sync_frame_pose_blocks_from_images(reconstruction, &pose_blocks);
@@ -502,7 +510,10 @@ fn count_variable_residuals(
                 || pose_blocks
                     .image_to_block
                     .get(obs.image)
-                    .is_some_and(|block| block.is_some())
+                    .copied()
+                    .flatten()
+                    .and_then(|block| pose_blocks.blocks.get(block))
+                    .is_some_and(|block| pose_block_dim(block) > 0)
                 || frame_sensor_key_for_image(reconstruction, obs.image)
                     .is_some_and(|key| variable_sensors.contains(&key))
                 || camera_index_for_image(reconstruction, obs.image)
@@ -542,6 +553,7 @@ struct NonPointBlock {
 struct PoseBlockSet {
     blocks: Vec<PoseBlock>,
     image_to_block: Vec<Option<usize>>,
+    dim: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +561,7 @@ struct PoseBlock {
     kind: PoseBlockKind,
     images: Vec<usize>,
     offset: usize,
+    free_axes: [bool; 6],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,15 +593,31 @@ fn variable_pose_blocks(
     reconstruction: &Reconstruction,
     variable_images: Option<&[usize]>,
     constant_images: &[usize],
+    constant_rigs: &[u32],
+    apply_default_gauge: bool,
 ) -> PoseBlockSet {
     let mut constant_images = constant_images.iter().copied().collect::<HashSet<_>>();
-    if variable_images.is_none() && constant_images.is_empty() && !reconstruction.poses.is_empty() {
-        constant_images.insert(0);
-    }
-    let constant_frames = constant_images
+    let constant_rigs = constant_rigs.iter().copied().collect::<HashSet<_>>();
+    let mut constant_frames = constant_images
         .iter()
         .filter_map(|&image| reconstruction.frame_index_for_image(image))
         .collect::<HashSet<_>>();
+    for (frame_idx, frame) in reconstruction.frames.iter().enumerate() {
+        if constant_rigs.contains(&frame.rig_id) {
+            constant_frames.insert(frame_idx);
+        }
+    }
+    if apply_default_gauge
+        && variable_images.is_none()
+        && constant_images.is_empty()
+        && constant_frames.is_empty()
+        && !reconstruction.poses.is_empty()
+    {
+        constant_images.insert(0);
+        if let Some(frame_idx) = reconstruction.frame_index_for_image(0) {
+            constant_frames.insert(frame_idx);
+        }
+    }
     let candidate_images = if let Some(images) = variable_images {
         images.to_vec()
     } else {
@@ -603,10 +632,7 @@ fn variable_pose_blocks(
     let mut frame_candidates = BTreeMap::<usize, ()>::new();
     let mut image_candidates = Vec::new();
     for image in candidate_images {
-        if image >= reconstruction.poses.len()
-            || reconstruction.poses[image].is_none()
-            || constant_images.contains(&image)
-        {
+        if image >= reconstruction.poses.len() || reconstruction.poses[image].is_none() {
             continue;
         }
         if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
@@ -616,7 +642,7 @@ fn variable_pose_blocks(
                 continue;
             }
             frame_candidates.insert(frame_idx, ());
-        } else {
+        } else if !constant_images.contains(&image) {
             image_candidates.push(image);
         }
     }
@@ -637,6 +663,7 @@ fn variable_pose_blocks(
             kind: PoseBlockKind::Frame(frame_idx),
             images,
             offset: block_idx * 6,
+            free_axes: [true; 6],
         });
     }
     for image in image_candidates {
@@ -646,13 +673,189 @@ fn variable_pose_blocks(
             kind: PoseBlockKind::Image(image),
             images: vec![image],
             offset: block_idx * 6,
+            free_axes: [true; 6],
         });
     }
 
-    PoseBlockSet {
+    let mut pose_blocks = PoseBlockSet {
         blocks,
         image_to_block,
+        dim: 0,
+    };
+    reindex_pose_blocks(&mut pose_blocks);
+    pose_blocks
+}
+
+fn reindex_pose_blocks(pose_blocks: &mut PoseBlockSet) {
+    let mut offset = 0usize;
+    for block in &mut pose_blocks.blocks {
+        block.offset = offset;
+        offset += pose_block_dim(block);
     }
+    pose_blocks.dim = offset;
+}
+
+fn pose_block_dim(block: &PoseBlock) -> usize {
+    block.free_axes.iter().filter(|&&free| free).count()
+}
+
+fn pose_block_active_axes(block: &PoseBlock) -> Vec<usize> {
+    block
+        .free_axes
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, &free)| free.then_some(axis))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GaugeUnitKey {
+    Image(usize),
+    Frame(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GaugePoseUnit {
+    key: GaugeUnitKey,
+    block: Option<usize>,
+    pose: SE3,
+}
+
+fn apply_two_cams_from_world_gauge(
+    pose_blocks: &mut PoseBlockSet,
+    reconstruction: &Reconstruction,
+    options: &BundleAdjustmentOptions,
+    observations: &[BaObservation],
+) -> bool {
+    if pose_blocks.dim == 0 {
+        return true;
+    }
+
+    let units = gauge_pose_units(reconstruction, pose_blocks, options, observations);
+    let mut fixed_unit: Option<GaugePoseUnit> = None;
+    for unit in &units {
+        if !gauge_unit_pose_is_constant(*unit, pose_blocks) {
+            continue;
+        }
+        if let Some(first) = fixed_unit {
+            if first.key != unit.key {
+                return true;
+            }
+        } else {
+            fixed_unit = Some(*unit);
+        }
+    }
+
+    let mut first_unit = fixed_unit;
+    let mut second_unit = None;
+    let mut fixed_dim = 0usize;
+    for unit in units {
+        if first_unit.is_none() {
+            first_unit = Some(unit);
+            continue;
+        }
+        let first = first_unit.unwrap();
+        if first.key == unit.key || !gauge_unit_pose_is_variable(unit, pose_blocks) {
+            continue;
+        }
+        if let Some(dim) = two_cam_gauge_fixed_translation_dim(first.pose, unit.pose) {
+            second_unit = Some(unit);
+            fixed_dim = dim;
+            break;
+        }
+    }
+
+    let (Some(first), Some(second)) = (first_unit, second_unit) else {
+        return false;
+    };
+    if let Some(block_idx) = first.block {
+        pose_blocks.blocks[block_idx].free_axes = [false; 6];
+    }
+    if let Some(block_idx) = second.block {
+        pose_blocks.blocks[block_idx].free_axes[3 + fixed_dim] = false;
+    }
+    true
+}
+
+fn gauge_pose_units(
+    reconstruction: &Reconstruction,
+    pose_blocks: &PoseBlockSet,
+    options: &BundleAdjustmentOptions,
+    observations: &[BaObservation],
+) -> Vec<GaugePoseUnit> {
+    let mut units = Vec::new();
+    let mut seen = HashSet::new();
+    let mut images = observations.iter().map(|obs| obs.image).collect::<Vec<_>>();
+    images.sort_unstable();
+    images.dedup();
+    for image in images {
+        if reconstruction.poses[image].is_none()
+            || !gauge_image_sensor_is_constant(reconstruction, image, options)
+        {
+            continue;
+        }
+        let key = reconstruction
+            .frame_index_for_image(image)
+            .map(GaugeUnitKey::Frame)
+            .unwrap_or(GaugeUnitKey::Image(image));
+        if !seen.insert(key) {
+            continue;
+        }
+        let pose = match key {
+            GaugeUnitKey::Image(_) => reconstruction.poses[image],
+            GaugeUnitKey::Frame(frame_idx) => reconstruction
+                .frames
+                .get(frame_idx)
+                .map(|frame| frame.rig_from_world.to_se3()),
+        };
+        let Some(pose) = pose else {
+            continue;
+        };
+        let block = pose_blocks.image_to_block.get(image).copied().flatten();
+        units.push(GaugePoseUnit { key, block, pose });
+    }
+    units
+}
+
+fn gauge_image_sensor_is_constant(
+    reconstruction: &Reconstruction,
+    image: usize,
+    options: &BundleAdjustmentOptions,
+) -> bool {
+    let Some(key) = frame_sensor_key_for_image(reconstruction, image) else {
+        return true;
+    };
+    ref_sensor_key(reconstruction, &key)
+        || options
+            .constant_sensor_from_rig
+            .iter()
+            .any(|sensor_id| sensor_id == &key.sensor_id)
+}
+
+fn gauge_unit_pose_is_constant(unit: GaugePoseUnit, pose_blocks: &PoseBlockSet) -> bool {
+    unit.block
+        .and_then(|block| pose_blocks.blocks.get(block))
+        .is_none_or(|block| pose_block_dim(block) == 0)
+}
+
+fn gauge_unit_pose_is_variable(unit: GaugePoseUnit, pose_blocks: &PoseBlockSet) -> bool {
+    unit.block
+        .and_then(|block| pose_blocks.blocks.get(block))
+        .is_some_and(|block| pose_block_dim(block) > 0)
+}
+
+fn two_cam_gauge_fixed_translation_dim(first: SE3, second: SE3) -> Option<usize> {
+    let baseline = first.compose(&second.inverse()).translation();
+    let mut fixed_dim = 0usize;
+    let mut max_abs = baseline[0].abs();
+    for dim in 1..3 {
+        let value = baseline[dim].abs();
+        if value > max_abs {
+            max_abs = value;
+            fixed_dim = dim;
+        }
+    }
+    (max_abs > 1.0e-9).then_some(fixed_dim)
 }
 
 fn frame_registered_images_with_sensors(
@@ -778,7 +981,6 @@ fn sensor_pose_specs(
     reconstruction: &Reconstruction,
     pose_blocks: &PoseBlockSet,
     options: &BundleAdjustmentOptions,
-    first_offset: usize,
 ) -> Vec<SensorPoseSpec> {
     let constant_sensors = options
         .constant_sensor_from_rig
@@ -805,7 +1007,7 @@ fn sensor_pose_specs(
         .enumerate()
         .map(|(idx, key)| SensorPoseSpec {
             key,
-            offset: first_offset + idx * 6,
+            offset: pose_blocks.dim + idx * 6,
         })
         .collect()
 }
@@ -897,8 +1099,7 @@ fn build_schur_system(
         .map(|spec| (spec.key.clone(), spec.offset))
         .collect::<BTreeMap<_, _>>();
 
-    let nonpoint_dim =
-        pose_blocks.blocks.len() * 6 + sensor_pose_specs.len() * 6 + camera_param_specs.len();
+    let nonpoint_dim = pose_blocks.dim + sensor_pose_specs.len() * 6 + camera_param_specs.len();
     let mut h_cc = DMatrix::<f64>::zeros(nonpoint_dim, nonpoint_dim);
     let mut g_c = DVector::<f64>::zeros(nonpoint_dim);
     let mut point_blocks = (0..reconstruction.points.len())
@@ -940,7 +1141,9 @@ fn build_schur_system(
                     )? * sqrt_w
                 }
             };
-            nonpoint_jacobians.push((block.offset, mat2x6_to_dmatrix(j_pose)));
+            if let Some(j_pose) = pose_block_jacobian(j_pose, block) {
+                nonpoint_jacobians.push((block.offset, j_pose));
+            }
         }
         if let Some(key) = frame_sensor_key_for_image(reconstruction, obs.image) {
             if let Some(&offset) = sensor_pose_lookup.get(&key) {
@@ -1042,7 +1245,14 @@ fn apply_schur_delta(
     step: f64,
 ) {
     for block in &pose_blocks.blocks {
-        let delta = Vec6::from_iterator((0..6).map(|k| nonpoint_delta[block.offset + k] * step));
+        let mut delta = Vec6::zeros();
+        let mut local_col = 0usize;
+        for axis in 0..6 {
+            if block.free_axes[axis] {
+                delta[axis] = nonpoint_delta[block.offset + local_col] * step;
+                local_col += 1;
+            }
+        }
         apply_pose_block_delta(reconstruction, block, delta);
     }
 
@@ -1761,6 +1971,16 @@ fn mat2x6_to_dmatrix(matrix: Mat2x6) -> DMatrix<f64> {
     DMatrix::from_fn(2, 6, |row, col| matrix[(row, col)])
 }
 
+fn pose_block_jacobian(matrix: Mat2x6, block: &PoseBlock) -> Option<DMatrix<f64>> {
+    let axes = pose_block_active_axes(block);
+    if axes.is_empty() {
+        return None;
+    }
+    Some(DMatrix::from_fn(2, axes.len(), |row, col| {
+        matrix[(row, axes[col])]
+    }))
+}
+
 fn vec2_to_dmatrix(vector: Vec2) -> DMatrix<f64> {
     DMatrix::from_column_slice(2, 1, &[vector[0], vector[1]])
 }
@@ -2200,7 +2420,7 @@ mod tests {
             Vec3::new(1.6, 0.0, 0.0),
         ));
 
-        let variable = variable_pose_blocks(&reconstruction, None, &[2]);
+        let variable = variable_pose_blocks(&reconstruction, None, &[2], &[], true);
         let variable_images = variable
             .blocks
             .iter()
@@ -2243,6 +2463,89 @@ mod tests {
         assert!(constant_points.contains(&1));
         assert!(!constant_points.contains(&2));
         assert!(constant_points.contains(&3));
+    }
+
+    #[test]
+    fn two_cams_from_world_gauge_fixes_first_pose_and_one_translation_axis() {
+        let frames = vec![frame(0), frame(1), frame(2)];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            Quat::IDENTITY,
+            Vec3::new(0.1, 0.8, 0.2),
+        ));
+        reconstruction.poses[2] = Some(SE3::from_quat_translation(
+            Quat::IDENTITY,
+            Vec3::new(1.4, 0.2, 0.1),
+        ));
+        let mut pose_blocks = variable_pose_blocks(&reconstruction, None, &[], &[], false);
+
+        assert!(apply_two_cams_from_world_gauge(
+            &mut pose_blocks,
+            &reconstruction,
+            &BundleAdjustmentOptions::default(),
+            &[
+                BaObservation {
+                    image: 0,
+                    point: 0,
+                    xy: [0.0, 0.0],
+                },
+                BaObservation {
+                    image: 1,
+                    point: 0,
+                    xy: [0.0, 0.0],
+                },
+                BaObservation {
+                    image: 2,
+                    point: 0,
+                    xy: [0.0, 0.0],
+                },
+            ],
+        ));
+        reindex_pose_blocks(&mut pose_blocks);
+
+        assert_eq!(pose_blocks.dim, 11);
+        assert_eq!(pose_blocks.blocks[0].free_axes, [false; 6]);
+        assert_eq!(
+            pose_blocks.blocks[1].free_axes,
+            [true, true, true, true, false, true]
+        );
+        assert_eq!(pose_blocks.blocks[1].offset, 0);
+        assert_eq!(pose_blocks.blocks[2].offset, 5);
+    }
+
+    #[test]
+    fn two_cams_from_world_gauge_falls_back_when_baseline_is_degenerate() {
+        let frames = vec![frame(0), frame(1)];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        let mut pose_blocks = variable_pose_blocks(&reconstruction, None, &[], &[], false);
+
+        assert!(!apply_two_cams_from_world_gauge(
+            &mut pose_blocks,
+            &reconstruction,
+            &BundleAdjustmentOptions::default(),
+            &[
+                BaObservation {
+                    image: 0,
+                    point: 0,
+                    xy: [0.0, 0.0],
+                },
+                BaObservation {
+                    image: 1,
+                    point: 0,
+                    xy: [0.0, 0.0],
+                },
+            ],
+        ));
+        reindex_pose_blocks(&mut pose_blocks);
+
+        assert_eq!(pose_blocks.dim, 12);
+        assert!(pose_blocks
+            .blocks
+            .iter()
+            .all(|block| block.free_axes == [true; 6]));
     }
 
     #[test]

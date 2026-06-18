@@ -93,9 +93,12 @@ reconstruction parity.
      to three linearly independent 3D points to constant point blocks, and
      global BA gauge-image selection now counts distinct COLMAP registration
      units instead of accidentally choosing two images from the same frame.
+   - Global BA now requests COLMAP-style `TWO_CAMS_FROM_WORLD` gauge handling:
+     the first observed registration unit is fixed fully, the second fixes only
+     the largest-baseline translation coordinate, and degenerate cases fall
+     back to `THREE_POINTS`.
    - Remaining work: generalized pose registration for non-trivial rigs,
-     exact filtered-frame event counters in all mapper cleanup paths, exact
-     global `TWO_CAMS_FROM_WORLD` partial translation gauge, and
+     exact filtered-frame event counters in all mapper cleanup paths, and
      Ceres-equivalent rig/sensor solver behavior.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
@@ -467,10 +470,12 @@ reconstruction parity.
     - Global BA gauge selection now chooses images from distinct registration
       frames/units before fixing pose blocks, avoiding same-frame multi-camera
       images as duplicate gauge anchors.
-    - Remaining work: exact COLMAP `BundleAdjustmentConfig::FixGauge`
-      `TWO_CAMS_FROM_WORLD` partial translation constraint, reconstruction
-      normalization, pose priors, redundant 3D point pruning, and
-      Ceres-equivalent convergence settings.
+    - Global BA now uses COLMAP-style `TWO_CAMS_FROM_WORLD` gauge handling
+      rather than fixing two full image poses: the first observed registration
+      unit is fixed, the second keeps rotation and two translation axes
+      variable, and insufficient-baseline cases fall back to `THREE_POINTS`.
+    - Remaining work: reconstruction normalization, pose priors, redundant 3D
+      point pruning, and Ceres-equivalent convergence settings.
 
 ## P6 - I/O, Multi-Model Pipeline, And Parity Tests
 

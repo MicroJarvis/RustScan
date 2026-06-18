@@ -523,16 +523,16 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         }
         if std::env::var_os("RUSTSFM_EXPERIMENTAL_BA").is_some() {
             let ba_iterations = global_ba_iterations(config);
-            let gauge_images = global_ba_gauge_images(&reconstruction);
-            let ba_options = mapper_ba_options(
+            let mut ba_options = mapper_ba_options(
                 config,
                 &reconstruction,
                 ba_iterations,
                 None,
-                gauge_images,
+                Vec::new(),
                 None,
                 None,
             );
+            ba_options.gauge = crate::ba::BundleAdjustmentGauge::TwoCamsFromWorld;
             if let Some(report) =
                 refine_bundle_adjustment_checked(&frames, &mut reconstruction, config, ba_options)
             {
@@ -3150,15 +3150,16 @@ fn refine_global_bundle_with_postprocessing(
             break;
         }
         attempted = true;
-        let ba_options = mapper_ba_options(
+        let mut ba_options = mapper_ba_options(
             config,
             reconstruction,
             global_ba_iterations(config),
             None,
-            gauge_images.clone(),
+            Vec::new(),
             None,
             None,
         );
+        ba_options.gauge = crate::ba::BundleAdjustmentGauge::TwoCamsFromWorld;
         let Some(report) =
             refine_bundle_adjustment_checked(frames, reconstruction, config, ba_options)
         else {
