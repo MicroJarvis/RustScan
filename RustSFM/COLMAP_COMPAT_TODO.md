@@ -209,9 +209,12 @@ reconstruction parity.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
+    - Two-view E/F/H fixed-seed sampling now uses COLMAP's MT19937-32 random
+      source plus the local libc++ `std::uniform_int_distribution<uint32_t>`
+      bit-extraction behavior for `RandomSampler::Shuffle`.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
-      exact estimator stack and byte-for-byte official PRNG /
-      `uniform_int_distribution` sample sequence.
+      exact estimator stack, including the official seven/eight-point
+      fundamental, essential, and homography estimators.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
