@@ -422,6 +422,10 @@ reconstruction parity.
       and step norm in the solver summary.
     - BA now applies the configured linear-solver iteration budget to its
       solver wrapper and reports accumulated linear-solver iterations.
+    - BA step acceptance now computes a trust-region-style actual/predicted
+      decrease ratio, exposes it in the solver summary, and adjusts damping
+      from step quality instead of using a fixed reduction on every accepted
+      step.
     - Remaining work: replace hand-rolled LM with Ceres-equivalent solver
       behavior, robust trust-region/linear-solver behavior, and full backend
       solver-summary parity.

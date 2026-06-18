@@ -129,6 +129,8 @@ pub struct BundleAdjustmentReport {
     pub effective_parameters: usize,
     pub gradient_max_norm: f64,
     pub step_norm: f64,
+    pub step_quality: f64,
+    pub damping: f64,
     pub termination_type: BundleAdjustmentTerminationType,
     pub termination_reason: BundleAdjustmentTerminationReason,
 }
@@ -140,14 +142,17 @@ impl BundleAdjustmentReport {
 
     pub fn brief_report(&self) -> String {
         format!(
-            "termination={:?} reason={:?} residuals={} iterations={}/{} cost={:.6}->{:.6}",
+            "termination={:?} reason={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6}",
             self.termination_type,
             self.termination_reason,
             self.residuals,
+            self.effective_parameters,
             self.iterations,
             self.attempted_iterations,
+            self.linear_solver_iterations,
             self.initial_cost,
-            self.final_cost
+            self.final_cost,
+            self.step_quality
         )
     }
 }
@@ -241,6 +246,7 @@ pub fn refine_bundle_adjustment(
     let mut consecutive_nonmonotonic_steps = 0usize;
     let mut gradient_max_norm = f64::INFINITY;
     let mut step_norm = 0.0;
+    let mut step_quality = f64::NAN;
     let mut termination_type = BundleAdjustmentTerminationType::NoConvergence;
     let mut termination_reason = BundleAdjustmentTerminationReason::MaxIterations;
     let mut damping = 1.0e-3;
@@ -324,6 +330,7 @@ pub fn refine_bundle_adjustment(
         let base_cameras = reconstruction.cameras.clone();
         let mut accepted = false;
         for step in [1.0, 0.5, 0.25, 0.125, 0.0625] {
+            let predicted_decrease = predicted_model_decrease(&system.h, &system.g, &delta, step);
             apply_schur_delta(
                 reconstruction,
                 &observations,
@@ -335,10 +342,16 @@ pub fn refine_bundle_adjustment(
                 step,
             );
             let candidate_cost = total_cost(reconstruction, &observations, options.huber_delta_px);
-            if candidate_cost.is_finite() && candidate_cost + 1.0e-8 < final_cost {
+            let actual_decrease = final_cost - candidate_cost;
+            step_quality = step_quality_ratio(actual_decrease, predicted_decrease);
+            if candidate_cost.is_finite()
+                && predicted_decrease > 0.0
+                && actual_decrease > 0.0
+                && step_quality > 0.0
+            {
                 let previous_cost = final_cost;
                 final_cost = candidate_cost;
-                damping = (damping * 0.5).max(1.0e-8);
+                damping = update_damping_after_step(damping, step_quality);
                 completed += 1;
                 accepted = true;
                 consecutive_invalid_steps = 0;
@@ -364,7 +377,7 @@ pub fn refine_bundle_adjustment(
             rejected_steps += 1;
             consecutive_invalid_steps = 0;
             consecutive_nonmonotonic_steps += 1;
-            damping *= 4.0;
+            damping = (damping * 4.0).min(1.0e12);
             termination_reason = BundleAdjustmentTerminationReason::NoAcceptedStep;
             if options.max_consecutive_nonmonotonic_steps > 0
                 && consecutive_nonmonotonic_steps >= options.max_consecutive_nonmonotonic_steps
@@ -410,6 +423,8 @@ pub fn refine_bundle_adjustment(
             + point_effective_parameter_count(&observations, &constant_point_filter),
         gradient_max_norm,
         step_norm,
+        step_quality,
+        damping,
         termination_type,
         termination_reason,
     })
@@ -595,6 +610,36 @@ fn solve_linear_system(
     LinearSolveResult {
         delta: hessian.clone().lu().solve(&(-gradient)),
         iterations: 1,
+    }
+}
+
+fn predicted_model_decrease(
+    hessian: &DMatrix<f64>,
+    gradient: &DVector<f64>,
+    delta: &DVector<f64>,
+    step: f64,
+) -> f64 {
+    let scaled_delta = delta * step;
+    let linear = gradient.dot(&scaled_delta);
+    let quadratic = 0.5 * scaled_delta.dot(&(hessian * &scaled_delta));
+    -(linear + quadratic)
+}
+
+fn step_quality_ratio(actual_decrease: f64, predicted_decrease: f64) -> f64 {
+    if !actual_decrease.is_finite() || !predicted_decrease.is_finite() || predicted_decrease <= 0.0
+    {
+        return f64::NEG_INFINITY;
+    }
+    actual_decrease / predicted_decrease
+}
+
+fn update_damping_after_step(damping: f64, quality: f64) -> f64 {
+    if quality > 0.75 {
+        (damping * 0.5).max(1.0e-8)
+    } else if quality < 0.25 {
+        (damping * 2.0).min(1.0e12)
+    } else {
+        damping
     }
 }
 
@@ -3139,6 +3184,14 @@ mod tests {
     }
 
     #[test]
+    fn trust_region_quality_updates_damping() {
+        assert_eq!(update_damping_after_step(1.0e-3, 0.9), 5.0e-4);
+        assert_eq!(update_damping_after_step(1.0e-3, 0.5), 1.0e-3);
+        assert_eq!(update_damping_after_step(1.0e-3, 0.1), 2.0e-3);
+        assert_eq!(update_damping_after_step(1.0e-10, 0.9), 1.0e-8);
+    }
+
+    #[test]
     fn analytic_projection_jacobians_match_numerical_differences() {
         let cameras = [
             CameraModel::from_colmap(COLMAP_SIMPLE_PINHOLE, 200, 160, &[95.0, 100.0, 80.0])
@@ -4007,10 +4060,14 @@ mod tests {
         assert!(report.attempted_iterations >= report.iterations);
         assert!(report.residuals <= report.observations * 2);
         assert!(report.brief_report().contains("termination="));
+        assert!(report.brief_report().contains("step_quality="));
         assert_eq!(report.effective_parameters, 2 + scene_points.len() * 3);
         assert!(report.linear_solver_iterations >= report.successful_steps);
         assert!(report.gradient_max_norm.is_finite());
         assert!(report.step_norm.is_finite());
+        assert!(report.step_quality.is_finite());
+        assert!(report.step_quality > 0.0);
+        assert!(report.damping.is_finite());
         assert!(
             (60.0 - reconstruction.cameras[0].fx as f64).abs()
                 < (60.0 - initial_camera.fx as f64).abs()
