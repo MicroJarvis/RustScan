@@ -1033,7 +1033,7 @@ fn mapper_ba_options(
     point_ids: Option<Vec<usize>>,
     constant_point_ids: Option<Vec<usize>>,
 ) -> crate::ba::BundleAdjustmentOptions {
-    crate::ba::BundleAdjustmentOptions {
+    let mut options = crate::ba::BundleAdjustmentOptions {
         iterations,
         huber_delta_px: global_ba_huber_delta_px(),
         max_observation_error_px: global_ba_max_observation_error_px(config),
@@ -1049,7 +1049,21 @@ fn mapper_ba_options(
         point_ids,
         constant_point_ids,
         ..crate::ba::BundleAdjustmentOptions::default()
-    }
+    };
+    apply_colmap_global_ba_solver_options(&mut options);
+    options
+}
+
+fn apply_colmap_global_ba_solver_options(options: &mut crate::ba::BundleAdjustmentOptions) {
+    options.gradient_tolerance = 1.0;
+    options.parameter_tolerance = 0.0;
+    options.max_linear_solver_iterations = 100;
+}
+
+fn apply_colmap_local_ba_solver_options(options: &mut crate::ba::BundleAdjustmentOptions) {
+    options.gradient_tolerance = 10.0;
+    options.parameter_tolerance = 0.0;
+    options.max_linear_solver_iterations = 100;
 }
 
 fn mapper_local_ba_options(
@@ -1088,6 +1102,7 @@ fn mapper_local_ba_options(
     options.constant_cameras = local_constant_cameras;
     options.constant_sensor_from_rig = local_constant_sensors;
     options.gauge = crate::ba::BundleAdjustmentGauge::ThreePoints;
+    apply_colmap_local_ba_solver_options(&mut options);
     options
 }
 
@@ -7376,6 +7391,9 @@ mod tests {
         assert!(!options.refine_principal_point);
         assert!(options.refine_extra_params);
         assert!(options.constant_cameras.is_empty());
+        assert_eq!(options.gradient_tolerance, 1.0);
+        assert_eq!(options.parameter_tolerance, 0.0);
+        assert_eq!(options.max_linear_solver_iterations, 100);
     }
 
     #[test]
@@ -7421,6 +7439,9 @@ mod tests {
         assert_eq!(options.constant_images, Vec::<usize>::new());
         assert_eq!(options.constant_cameras, vec![0]);
         assert_eq!(options.gauge, crate::ba::BundleAdjustmentGauge::ThreePoints);
+        assert_eq!(options.gradient_tolerance, 10.0);
+        assert_eq!(options.parameter_tolerance, 0.0);
+        assert_eq!(options.max_linear_solver_iterations, 100);
     }
 
     #[test]

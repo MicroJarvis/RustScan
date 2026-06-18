@@ -426,6 +426,10 @@ reconstruction parity.
       decrease ratio, exposes it in the solver summary, and adjusts damping
       from step quality instead of using a fixed reduction on every accepted
       step.
+    - Mapper local/global BA option construction now applies COLMAP
+      incremental-pipeline Ceres convergence settings: local BA uses gradient
+      tolerance 10 and global BA uses gradient tolerance 1, both with 100
+      linear-solver iterations and zero parameter tolerance.
     - Remaining work: replace hand-rolled LM with Ceres-equivalent solver
       behavior, robust trust-region/linear-solver behavior, and full backend
       solver-summary parity.
