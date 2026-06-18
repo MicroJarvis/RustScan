@@ -420,6 +420,8 @@ reconstruction parity.
     - BA termination now separates Ceres-style gradient and parameter tolerance
       exits and reports reduced effective parameter counts, gradient max-norm,
       and step norm in the solver summary.
+    - BA now applies the configured linear-solver iteration budget to its
+      solver wrapper and reports accumulated linear-solver iterations.
     - Remaining work: replace hand-rolled LM with Ceres-equivalent solver
       behavior, robust trust-region/linear-solver behavior, and full backend
       solver-summary parity.
