@@ -967,39 +967,23 @@ fn colmap_eight_point_nullspace(a: &DMatrix<f64>) -> Option<[f64; 9]> {
 }
 
 fn eight_point_minimal_nullspace(a: &DMatrix<f64>) -> Option<[f64; 9]> {
-    let mut best: Option<([f64; 9], f64)> = None;
-    for free_col in 0..9 {
-        let lhs = DMatrix::<f64>::from_fn(8, 8, |row, col| {
-            let source_col = if col < free_col { col } else { col + 1 };
-            a[(row, source_col)]
-        });
-        let rhs = DVector::<f64>::from_fn(8, |row, _| -a[(row, free_col)]);
-        let Some(solution) = lhs.lu().solve(&rhs) else {
-            continue;
-        };
-        let mut q = [0.0f64; 9];
-        q[free_col] = 1.0;
-        for col in 0..8 {
-            let target_col = if col < free_col { col } else { col + 1 };
-            q[target_col] = solution[col];
-        }
-        let norm = q.iter().map(|value| value * value).sum::<f64>().sqrt();
-        if !norm.is_finite() || norm <= 1.0e-12 {
-            continue;
-        }
-        for value in q.iter_mut() {
-            *value /= norm;
-        }
-        let residual = (a * DVector::<f64>::from_column_slice(&q)).norm();
-        if residual.is_finite()
-            && best
-                .as_ref()
-                .is_none_or(|(_, best_residual)| residual < *best_residual)
-        {
-            best = Some((q, residual));
-        }
+    if a.nrows() != 8 || a.ncols() != 9 {
+        return None;
     }
-    best.map(|(q, _)| q)
+    let qr = a.transpose().qr();
+    let mut q_t = DMatrix::<f64>::identity(9, 9);
+    qr.q_tr_mul(&mut q_t);
+    Some([
+        q_t[(8, 0)],
+        q_t[(8, 1)],
+        q_t[(8, 2)],
+        q_t[(8, 3)],
+        q_t[(8, 4)],
+        q_t[(8, 5)],
+        q_t[(8, 6)],
+        q_t[(8, 7)],
+        q_t[(8, 8)],
+    ])
 }
 
 fn refine_fundamental_support(
@@ -2234,6 +2218,28 @@ mod tests {
         for (actual, expected) in f.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() < 1.0e-5);
         }
+    }
+
+    #[test]
+    fn eight_point_minimal_nullspace_uses_full_householder_q_column() {
+        let a = DMatrix::<f64>::from_row_slice(
+            8,
+            9,
+            &[
+                0.2, -0.1, 1.0, 0.3, 0.5, -0.4, 1.1, -0.7, 0.9, -0.6, 0.8, 0.2, 0.4, -1.2, 0.7,
+                -0.3, 0.6, 1.0, 1.4, -0.9, 0.5, -0.8, 0.1, 0.3, 0.7, 1.2, -0.5, -1.1, 0.4, 0.6,
+                0.9, -0.2, 1.3, -0.7, 0.5, 0.8, 0.3, 1.1, -0.4, -0.6, 0.2, 0.9, -1.0, 0.7, 1.5,
+                -0.2, 0.5, 1.0, -0.8, 0.4, 0.6, -1.1, 0.2, 0.9, -0.3, 0.6, -0.5, 1.2, 0.7, -0.9,
+                0.8, 0.3, 1.0, -0.4, 0.2, -1.3, 0.5, 1.1, -0.7, 0.9, -0.1, 0.4,
+            ],
+        );
+
+        let q = eight_point_minimal_nullspace(&a).unwrap();
+        let residual = (&a * DVector::<f64>::from_column_slice(&q)).norm();
+        let norm = q.iter().map(|value| value * value).sum::<f64>().sqrt();
+
+        assert!(residual < 1.0e-10, "residual={residual}");
+        assert!((norm - 1.0).abs() < 1.0e-12);
     }
 
     #[test]

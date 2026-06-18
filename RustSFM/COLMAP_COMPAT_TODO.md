@@ -235,10 +235,14 @@ reconstruction parity.
       expressions and filters companion-matrix roots with the official
       imaginary-part threshold instead of Rust-only sorting/deduplication and
       residual heuristics.
+    - Fundamental/essential eight-point minimal nullspace extraction now
+      reconstructs COLMAP's full Householder-Q column for exactly eight
+      correspondences instead of using the previous explicit free-variable
+      nullspace solve.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level official seven-point
-      nullspace extraction, byte-level eight-point Householder-Q nullspace
-      extraction, and byte-level five-point nullspace / companion root parity.
+      nullspace extraction and byte-level five-point nullspace / companion
+      root parity.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
