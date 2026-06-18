@@ -2025,10 +2025,13 @@ mod tests {
             camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
             cameras: vec![CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0)],
             camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
             image_names: frames.iter().map(|frame| frame.name.clone()).collect(),
             image_paths: frames.iter().map(|frame| frame.path.clone()).collect(),
             image_ids: (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
             image_camera_indices: vec![0; frames.len()],
+            image_frame_indices: vec![None; frames.len()],
             poses: vec![None; frames.len()],
             observations: frames
                 .iter()

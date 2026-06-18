@@ -59,8 +59,11 @@ reconstruction parity.
    - Added a full sparse-model container that reads/writes `rigs` and `frames`
      alongside the reconstruction, with text round-trip coverage for
      rig/frame ownership data.
-   - Remaining work: database ids and rig/frame ownership in the mapper's
-     mutable reconstruction/state machine.
+   - Added mapper-level rig/frame metadata and per-image frame ownership, wired
+     through reference sparse models, database cache initialization, and
+     COLMAP text export.
+   - Remaining work: full frame/rig-level registration, deregistration,
+     generalized pose, and BA parameter scheduling semantics.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 

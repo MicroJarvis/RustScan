@@ -1,6 +1,7 @@
 use crate::colmap::{
     export_colmap, read_camera_model, read_colmap_cameras, read_colmap_poses,
-    world_to_camera_rotation,
+    read_colmap_sparse_model, world_to_camera_rotation, ColmapDataId, ColmapRig, ColmapRigSensor,
+    ColmapRigid3, ColmapSensorId, ColmapSensorType,
 };
 use crate::correspondence_graph::ImagePairId;
 use crate::database::{ColmapDatabase, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions};
@@ -25,8 +26,8 @@ use crate::sift::{
 };
 use crate::types::{
     colmap_camera_model_extra_idxs, colmap_camera_model_focal_idxs,
-    colmap_camera_model_principal_point_idxs, CameraModel, ImageFrame, PairGeometry, Point3D,
-    Reconstruction, TrackObservation,
+    colmap_camera_model_principal_point_idxs, CameraModel, DataId, Frame, ImageFrame, PairGeometry,
+    Point3D, Reconstruction, Rig, RigSensor, Rigid3, SensorId, SensorType, TrackObservation,
 };
 use crate::wide::{
     build_wide_descriptors, match_wide_mutual, match_wide_mutual_indices, rgb_to_gray,
@@ -511,8 +512,11 @@ struct ReferenceCameraSetup {
     cameras: Vec<CameraModel>,
     camera_ids: Vec<u32>,
     camera_has_prior_focal_length: Vec<bool>,
+    rigs: Vec<Rig>,
+    frames: Vec<Frame>,
     image_ids: Vec<u32>,
     image_camera_indices: Vec<usize>,
+    image_frame_indices: Vec<Option<usize>>,
 }
 
 fn reference_camera_setup(
@@ -541,9 +545,31 @@ fn reference_camera_setup(
         .iter()
         .map(|pose| (pose.name.as_str(), pose))
         .collect::<HashMap<_, _>>();
+    let sparse_model = read_colmap_sparse_model(reference).ok();
+    let rigs = sparse_model
+        .as_ref()
+        .map(|model| model.reconstruction.rigs.clone())
+        .unwrap_or_default();
+    let frames = sparse_model
+        .as_ref()
+        .map(|model| model.reconstruction.frames.clone())
+        .unwrap_or_default();
+    let image_frame_by_id = sparse_model
+        .as_ref()
+        .map(|model| {
+            model
+                .reconstruction
+                .image_ids
+                .iter()
+                .copied()
+                .zip(model.reconstruction.image_frame_indices.iter().copied())
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
 
     let mut image_ids = Vec::with_capacity(image_paths.len());
     let mut image_camera_indices = Vec::with_capacity(image_paths.len());
+    let mut image_frame_indices = Vec::with_capacity(image_paths.len());
     for (idx, path) in image_paths.iter().enumerate() {
         let name = path
             .file_name()
@@ -552,9 +578,11 @@ fn reference_camera_setup(
         if let Some(pose) = pose_by_name.get(name) {
             image_ids.push(pose.image_id);
             image_camera_indices.push(*camera_index_by_id.get(&pose.camera_id).unwrap_or(&0));
+            image_frame_indices.push(*image_frame_by_id.get(&pose.image_id).unwrap_or(&None));
         } else {
             image_ids.push(idx as u32 + 1);
             image_camera_indices.push(0);
+            image_frame_indices.push(None);
         }
     }
 
@@ -562,8 +590,11 @@ fn reference_camera_setup(
         cameras,
         camera_ids,
         camera_has_prior_focal_length: vec![true; cameras_with_ids.len()],
+        rigs,
+        frames,
         image_ids,
         image_camera_indices,
+        image_frame_indices,
     })
 }
 
@@ -638,9 +669,21 @@ fn database_camera_setup(
         .values()
         .map(|image| (image.name.as_str(), image))
         .collect::<HashMap<_, _>>();
+    let rigs = cache.rigs.values().map(rig_from_colmap).collect::<Vec<_>>();
+    let frames = cache
+        .frames
+        .values()
+        .map(database_frame_to_frame)
+        .collect::<Vec<_>>();
+    let frame_index_by_id = frames
+        .iter()
+        .enumerate()
+        .map(|(idx, frame)| (frame.frame_id, idx))
+        .collect::<HashMap<_, _>>();
 
     let mut image_ids = Vec::with_capacity(image_paths.len());
     let mut image_camera_indices = Vec::with_capacity(image_paths.len());
+    let mut image_frame_indices = Vec::with_capacity(image_paths.len());
     for (idx, path) in image_paths.iter().enumerate() {
         let name = path
             .file_name()
@@ -649,9 +692,15 @@ fn database_camera_setup(
         if let Some(image) = image_by_name.get(name) {
             image_ids.push(image.image_id);
             image_camera_indices.push(*camera_index_by_id.get(&image.camera_id).unwrap_or(&0));
+            image_frame_indices.push(
+                image
+                    .frame_id
+                    .and_then(|frame_id| frame_index_by_id.get(&frame_id).copied()),
+            );
         } else {
             image_ids.push(idx as u32 + 1);
             image_camera_indices.push(0);
+            image_frame_indices.push(None);
         }
     }
 
@@ -659,8 +708,11 @@ fn database_camera_setup(
         cameras,
         camera_ids,
         camera_has_prior_focal_length,
+        rigs,
+        frames,
         image_ids,
         image_camera_indices,
+        image_frame_indices,
     })
 }
 
@@ -700,8 +752,68 @@ fn local_image_camera_setup(frames: &[ImageFrame], config: &MapperConfig) -> Ref
         cameras,
         camera_ids,
         camera_has_prior_focal_length: vec![true; frames.len()],
+        rigs: Vec::new(),
+        frames: Vec::new(),
         image_ids,
         image_camera_indices,
+        image_frame_indices: vec![None; frames.len()],
+    }
+}
+
+fn rig_from_colmap(rig: &ColmapRig) -> Rig {
+    Rig {
+        rig_id: rig.rig_id,
+        ref_sensor_id: rig.ref_sensor_id.as_ref().map(sensor_id_from_colmap),
+        sensors: rig.sensors.iter().map(rig_sensor_from_colmap).collect(),
+    }
+}
+
+fn rig_sensor_from_colmap(sensor: &ColmapRigSensor) -> RigSensor {
+    RigSensor {
+        sensor_id: sensor_id_from_colmap(&sensor.sensor_id),
+        sensor_from_rig: sensor.sensor_from_rig.as_ref().map(rigid3_from_colmap),
+    }
+}
+
+fn database_frame_to_frame(frame: &crate::database::ColmapDatabaseFrame) -> Frame {
+    Frame {
+        frame_id: frame.frame_id,
+        rig_id: frame.rig_id,
+        rig_from_world: Rigid3 {
+            qvec: [1.0, 0.0, 0.0, 0.0],
+            tvec: [0.0, 0.0, 0.0],
+        },
+        data_ids: frame.data_ids.iter().map(data_id_from_colmap).collect(),
+    }
+}
+
+fn sensor_id_from_colmap(sensor_id: &ColmapSensorId) -> SensorId {
+    SensorId {
+        sensor_type: sensor_type_from_colmap(&sensor_id.sensor_type),
+        sensor_id: sensor_id.sensor_id,
+    }
+}
+
+fn sensor_type_from_colmap(sensor_type: &ColmapSensorType) -> SensorType {
+    match sensor_type {
+        ColmapSensorType::Invalid => SensorType::Invalid,
+        ColmapSensorType::Camera => SensorType::Camera,
+        ColmapSensorType::Imu => SensorType::Imu,
+        ColmapSensorType::Other(value) => SensorType::Other(value.clone()),
+    }
+}
+
+fn rigid3_from_colmap(rigid: &ColmapRigid3) -> Rigid3 {
+    Rigid3 {
+        qvec: rigid.qvec,
+        tvec: rigid.tvec,
+    }
+}
+
+fn data_id_from_colmap(data_id: &ColmapDataId) -> DataId {
+    DataId {
+        sensor_id: sensor_id_from_colmap(&data_id.sensor_id),
+        data_id: data_id.data_id,
     }
 }
 
@@ -2142,33 +2254,50 @@ fn incremental_map(
     config: &MapperConfig,
 ) -> Result<(Reconstruction, Vec<String>)> {
     let mut debug_log = Vec::new();
-    let (cameras, camera_ids, camera_has_prior_focal_length, image_ids, image_camera_indices) =
-        if let Some(setup) = reference_camera_setup {
-            (
-                setup.cameras.clone(),
-                setup.camera_ids.clone(),
-                setup.camera_has_prior_focal_length.clone(),
-                setup.image_ids.clone(),
-                setup.image_camera_indices.clone(),
-            )
-        } else {
-            (
-                vec![camera],
-                vec![1],
-                vec![true],
-                (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
-                vec![0; frames.len()],
-            )
-        };
+    let (
+        cameras,
+        camera_ids,
+        camera_has_prior_focal_length,
+        rigs,
+        rig_frames,
+        image_ids,
+        image_camera_indices,
+        image_frame_indices,
+    ) = if let Some(setup) = reference_camera_setup {
+        (
+            setup.cameras.clone(),
+            setup.camera_ids.clone(),
+            setup.camera_has_prior_focal_length.clone(),
+            setup.rigs.clone(),
+            setup.frames.clone(),
+            setup.image_ids.clone(),
+            setup.image_camera_indices.clone(),
+            setup.image_frame_indices.clone(),
+        )
+    } else {
+        (
+            vec![camera],
+            vec![1],
+            vec![true],
+            Vec::new(),
+            Vec::new(),
+            (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
+            vec![0; frames.len()],
+            vec![None; frames.len()],
+        )
+    };
     let camera_priors = cameras.clone();
     let mut reconstruction = Reconstruction {
         camera,
         cameras,
         camera_ids,
+        rigs,
+        frames: rig_frames,
         image_names: frames.iter().map(|f| f.name.clone()).collect(),
         image_paths: frames.iter().map(|f| f.path.clone()).collect(),
         image_ids,
         image_camera_indices,
+        image_frame_indices,
         poses: vec![None; frames.len()],
         observations: frames
             .iter()
@@ -6387,10 +6516,13 @@ fn triangulate_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::colmap::{
+        ColmapDataId, ColmapRig, ColmapRigSensor, ColmapSensorId, ColmapSensorType,
+    };
     use crate::correspondence_graph::FeatureMatch;
     use crate::database::{
-        ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapKeypoint,
-        ColmapTwoViewGeometry, DatabaseCacheOptions,
+        ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseFrame, ColmapDatabaseImage,
+        ColmapKeypoint, ColmapTwoViewGeometry, DatabaseCacheOptions,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -6423,6 +6555,32 @@ mod tests {
         assert_eq!(setup.image_ids, vec![7, 8]);
         assert_eq!(setup.image_camera_indices, vec![0, 1]);
         assert_eq!(setup.cameras[1].model_name(), "SIMPLE_RADIAL");
+        Ok(())
+    }
+
+    #[test]
+    fn reference_camera_setup_preserves_frame_ownership() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("cameras.txt"),
+            "11 PINHOLE 640 480 500 501 320 240\n",
+        )?;
+        fs::write(sparse.join("images.txt"), "7 1 0 0 0 0 0 0 11 a.jpg\n\n")?;
+        fs::write(sparse.join("points3D.txt"), "# points\n")?;
+        fs::write(sparse.join("rigs.txt"), "3 1 CAMERA 11\n")?;
+        fs::write(
+            sparse.join("frames.txt"),
+            "9 3 1 0 0 0 0 0 0 1 CAMERA 11 7\n",
+        )?;
+
+        let setup = reference_camera_setup(dir.path(), &[PathBuf::from("a.jpg")])?;
+
+        assert_eq!(setup.rigs.len(), 1);
+        assert_eq!(setup.frames.len(), 1);
+        assert_eq!(setup.frames[0].frame_id, 9);
+        assert_eq!(setup.image_frame_indices, vec![Some(0)]);
         Ok(())
     }
 
@@ -6481,6 +6639,79 @@ mod tests {
         assert_eq!(pairs[0].matches.len(), 2);
         assert_eq!(pairs[0].matches[0].query_idx, 0);
         assert_eq!(pairs[0].matches[0].train_idx, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn database_camera_setup_preserves_frame_ownership() -> Result<()> {
+        let dir = tempdir()?;
+        let db = ColmapDatabase::open(dir.path().join("database.db"))?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 11,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 80,
+                    params: vec![50.0, 51.0, 50.0, 40.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        db.write_image(
+            &ColmapDatabaseImage {
+                image_id: 7,
+                name: "a.jpg".to_string(),
+                camera_id: 11,
+                frame_id: None,
+            },
+            true,
+        )?;
+        db.write_rig(
+            &ColmapRig {
+                rig_id: 3,
+                ref_sensor_id: Some(ColmapSensorId {
+                    sensor_type: ColmapSensorType::Camera,
+                    sensor_id: 11,
+                }),
+                sensors: vec![ColmapRigSensor {
+                    sensor_id: ColmapSensorId {
+                        sensor_type: ColmapSensorType::Camera,
+                        sensor_id: 11,
+                    },
+                    sensor_from_rig: None,
+                }],
+            },
+            true,
+        )?;
+        db.write_frame(
+            &ColmapDatabaseFrame {
+                frame_id: 9,
+                rig_id: 3,
+                data_ids: vec![ColmapDataId {
+                    sensor_id: ColmapSensorId {
+                        sensor_type: ColmapSensorType::Camera,
+                        sensor_id: 11,
+                    },
+                    data_id: 7,
+                }],
+            },
+            true,
+        )?;
+        db.write_keypoints(7, &[ColmapKeypoint::new(0.0, 0.0)])?;
+        let cache = db.load_cache(&DatabaseCacheOptions {
+            min_num_matches: 0,
+            load_all_images: true,
+            ..DatabaseCacheOptions::default()
+        })?;
+
+        let setup = database_camera_setup(&cache, &[PathBuf::from("a.jpg")])?;
+
+        assert_eq!(setup.rigs.len(), 1);
+        assert_eq!(setup.frames.len(), 1);
+        assert_eq!(setup.frames[0].frame_id, 9);
+        assert_eq!(setup.image_frame_indices, vec![Some(0)]);
         Ok(())
     }
 
@@ -8536,10 +8767,13 @@ mod tests {
             camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
             cameras: vec![CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0)],
             camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
             image_names: frames.iter().map(|frame| frame.name.clone()).collect(),
             image_paths: frames.iter().map(|frame| frame.path.clone()).collect(),
             image_ids: (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
             image_camera_indices: vec![0; frames.len()],
+            image_frame_indices: vec![None; frames.len()],
             poses: vec![None; frames.len()],
             observations: frames
                 .iter()

@@ -1111,15 +1111,65 @@ pub struct Point3D {
     pub track: Vec<TrackObservation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SensorType {
+    Invalid,
+    Camera,
+    Imu,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorId {
+    pub sensor_type: SensorType,
+    pub sensor_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rigid3 {
+    pub qvec: [f64; 4],
+    pub tvec: [f64; 3],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RigSensor {
+    pub sensor_id: SensorId,
+    pub sensor_from_rig: Option<Rigid3>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rig {
+    pub rig_id: u32,
+    pub ref_sensor_id: Option<SensorId>,
+    pub sensors: Vec<RigSensor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataId {
+    pub sensor_id: SensorId,
+    pub data_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frame {
+    pub frame_id: u32,
+    pub rig_id: u32,
+    pub rig_from_world: Rigid3,
+    pub data_ids: Vec<DataId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Reconstruction {
     pub camera: CameraModel,
     pub cameras: Vec<CameraModel>,
     pub camera_ids: Vec<u32>,
+    pub rigs: Vec<Rig>,
+    pub frames: Vec<Frame>,
     pub image_names: Vec<String>,
     pub image_paths: Vec<PathBuf>,
     pub image_ids: Vec<u32>,
     pub image_camera_indices: Vec<usize>,
+    pub image_frame_indices: Vec<Option<usize>>,
     pub poses: Vec<Option<SE3>>,
     pub observations: Vec<Vec<Option<usize>>>,
     pub keypoints: Vec<Vec<KeyPoint>>,
@@ -1151,11 +1201,24 @@ impl Reconstruction {
             .unwrap_or_else(|| image as u32 + 1)
     }
 
+    pub fn frame_id_for_image(&self, image: usize) -> Option<u32> {
+        self.image_frame_indices
+            .get(image)
+            .copied()
+            .flatten()
+            .and_then(|frame_idx| self.frames.get(frame_idx))
+            .map(|frame| frame.frame_id)
+    }
+
     pub fn point3d_id(&self, point: usize) -> u64 {
         self.point_ids
             .get(point)
             .copied()
             .unwrap_or_else(|| point as u64 + 1)
+    }
+
+    pub fn empty_metadata(image_count: usize) -> (Vec<Rig>, Vec<Frame>, Vec<Option<usize>>) {
+        (Vec::new(), Vec::new(), vec![None; image_count])
     }
 }
 

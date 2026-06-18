@@ -1,6 +1,6 @@
 use crate::types::{
-    colmap_camera_model_id, colmap_camera_model_num_params, CameraModel, Point3D, Reconstruction,
-    TrackObservation,
+    colmap_camera_model_id, colmap_camera_model_num_params, CameraModel, DataId, Frame, Point3D,
+    Reconstruction, Rig, RigSensor, Rigid3, SensorId, SensorType, TrackObservation,
 };
 use anyhow::{bail, Context, Result};
 use nalgebra::{Matrix3, Quaternion, UnitQuaternion, Vector3};
@@ -220,10 +220,14 @@ pub fn read_colmap_reconstruction(root: &Path) -> Result<Reconstruction> {
 }
 
 pub fn read_colmap_sparse_model(root: &Path) -> Result<ColmapSparseModel> {
+    let mut reconstruction = read_colmap_reconstruction(root)?;
+    let rigs = read_optional_colmap_rigs(root)?;
+    let frames = read_optional_colmap_frames(root)?;
+    apply_rig_frame_metadata_to_reconstruction(&mut reconstruction, &rigs, &frames);
     Ok(ColmapSparseModel {
-        reconstruction: read_colmap_reconstruction(root)?,
-        rigs: read_optional_colmap_rigs(root)?,
-        frames: read_optional_colmap_frames(root)?,
+        reconstruction,
+        rigs,
+        frames,
     })
 }
 
@@ -374,6 +378,7 @@ fn reconstruction_from_colmap_parts(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
+    let (rigs, frames, image_frame_indices) = Reconstruction::empty_metadata(images.len());
     let keypoints = images
         .iter()
         .map(|image| {
@@ -458,16 +463,98 @@ fn reconstruction_from_colmap_parts(
         camera: cameras[0],
         cameras,
         camera_ids,
+        rigs,
+        frames,
         image_names,
         image_paths,
         image_ids,
         image_camera_indices,
+        image_frame_indices,
         poses,
         observations,
         keypoints,
         point_ids,
         points,
     })
+}
+
+fn apply_rig_frame_metadata_to_reconstruction(
+    reconstruction: &mut Reconstruction,
+    rigs: &[ColmapRig],
+    frames: &[ColmapFrame],
+) {
+    reconstruction.rigs = rigs.iter().map(rig_from_colmap).collect();
+    reconstruction.frames = frames.iter().map(frame_from_colmap).collect();
+    let frame_index_by_camera_data_id = frames
+        .iter()
+        .enumerate()
+        .flat_map(|(frame_idx, frame)| {
+            frame
+                .data_ids
+                .iter()
+                .filter(|data_id| data_id.sensor_id.sensor_type == ColmapSensorType::Camera)
+                .map(move |data_id| (data_id.data_id as u32, frame_idx))
+        })
+        .collect::<HashMap<_, _>>();
+    reconstruction.image_frame_indices = reconstruction
+        .image_ids
+        .iter()
+        .map(|image_id| frame_index_by_camera_data_id.get(image_id).copied())
+        .collect();
+}
+
+fn rig_from_colmap(rig: &ColmapRig) -> Rig {
+    Rig {
+        rig_id: rig.rig_id,
+        ref_sensor_id: rig.ref_sensor_id.as_ref().map(sensor_id_from_colmap),
+        sensors: rig.sensors.iter().map(rig_sensor_from_colmap).collect(),
+    }
+}
+
+fn rig_sensor_from_colmap(sensor: &ColmapRigSensor) -> RigSensor {
+    RigSensor {
+        sensor_id: sensor_id_from_colmap(&sensor.sensor_id),
+        sensor_from_rig: sensor.sensor_from_rig.as_ref().map(rigid3_from_colmap),
+    }
+}
+
+fn frame_from_colmap(frame: &ColmapFrame) -> Frame {
+    Frame {
+        frame_id: frame.frame_id,
+        rig_id: frame.rig_id,
+        rig_from_world: rigid3_from_colmap(&frame.rig_from_world),
+        data_ids: frame.data_ids.iter().map(data_id_from_colmap).collect(),
+    }
+}
+
+fn sensor_id_from_colmap(sensor_id: &ColmapSensorId) -> SensorId {
+    SensorId {
+        sensor_type: sensor_type_from_colmap(&sensor_id.sensor_type),
+        sensor_id: sensor_id.sensor_id,
+    }
+}
+
+fn sensor_type_from_colmap(sensor_type: &ColmapSensorType) -> SensorType {
+    match sensor_type {
+        ColmapSensorType::Invalid => SensorType::Invalid,
+        ColmapSensorType::Camera => SensorType::Camera,
+        ColmapSensorType::Imu => SensorType::Imu,
+        ColmapSensorType::Other(value) => SensorType::Other(value.clone()),
+    }
+}
+
+fn rigid3_from_colmap(rigid: &ColmapRigid3) -> Rigid3 {
+    Rigid3 {
+        qvec: rigid.qvec,
+        tvec: rigid.tvec,
+    }
+}
+
+fn data_id_from_colmap(data_id: &ColmapDataId) -> DataId {
+    DataId {
+        sensor_id: sensor_id_from_colmap(&data_id.sensor_id),
+        data_id: data_id.data_id,
+    }
 }
 
 fn keypoint_from_colmap_point2d(point: &ColmapPoint2D) -> rustslam::KeyPoint {
@@ -558,6 +645,20 @@ pub fn export_colmap(
     write_cameras_txt(&sparse_dir.join("cameras.txt"), reconstruction)?;
     write_images_txt(&sparse_dir.join("images.txt"), reconstruction)?;
     write_points3d_txt(&sparse_dir.join("points3D.txt"), reconstruction)?;
+    if !reconstruction.rigs.is_empty() || !reconstruction.frames.is_empty() {
+        let rigs = reconstruction
+            .rigs
+            .iter()
+            .map(rig_to_colmap)
+            .collect::<Vec<_>>();
+        let frames = reconstruction
+            .frames
+            .iter()
+            .map(frame_to_colmap)
+            .collect::<Vec<_>>();
+        write_rigs_txt(&sparse_dir.join("rigs.txt"), &rigs)?;
+        write_frames_txt(&sparse_dir.join("frames.txt"), &frames)?;
+    }
     Ok(())
 }
 
@@ -755,6 +856,60 @@ fn format_rigid3(rigid: &ColmapRigid3) -> String {
         .map(|value| format!("{value:.17}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn rig_to_colmap(rig: &Rig) -> ColmapRig {
+    ColmapRig {
+        rig_id: rig.rig_id,
+        ref_sensor_id: rig.ref_sensor_id.as_ref().map(sensor_id_to_colmap),
+        sensors: rig.sensors.iter().map(rig_sensor_to_colmap).collect(),
+    }
+}
+
+fn rig_sensor_to_colmap(sensor: &RigSensor) -> ColmapRigSensor {
+    ColmapRigSensor {
+        sensor_id: sensor_id_to_colmap(&sensor.sensor_id),
+        sensor_from_rig: sensor.sensor_from_rig.as_ref().map(rigid3_to_colmap),
+    }
+}
+
+fn frame_to_colmap(frame: &Frame) -> ColmapFrame {
+    ColmapFrame {
+        frame_id: frame.frame_id,
+        rig_id: frame.rig_id,
+        rig_from_world: rigid3_to_colmap(&frame.rig_from_world),
+        data_ids: frame.data_ids.iter().map(data_id_to_colmap).collect(),
+    }
+}
+
+fn sensor_id_to_colmap(sensor_id: &SensorId) -> ColmapSensorId {
+    ColmapSensorId {
+        sensor_type: sensor_type_to_colmap(&sensor_id.sensor_type),
+        sensor_id: sensor_id.sensor_id,
+    }
+}
+
+fn sensor_type_to_colmap(sensor_type: &SensorType) -> ColmapSensorType {
+    match sensor_type {
+        SensorType::Invalid => ColmapSensorType::Invalid,
+        SensorType::Camera => ColmapSensorType::Camera,
+        SensorType::Imu => ColmapSensorType::Imu,
+        SensorType::Other(value) => ColmapSensorType::Other(value.clone()),
+    }
+}
+
+fn rigid3_to_colmap(rigid: &Rigid3) -> ColmapRigid3 {
+    ColmapRigid3 {
+        qvec: rigid.qvec,
+        tvec: rigid.tvec,
+    }
+}
+
+fn data_id_to_colmap(data_id: &DataId) -> ColmapDataId {
+    ColmapDataId {
+        sensor_id: sensor_id_to_colmap(&data_id.sensor_id),
+        data_id: data_id.data_id,
+    }
 }
 
 fn read_images_txt(path: &Path) -> Result<Vec<ColmapImage>> {
@@ -1686,6 +1841,9 @@ mod tests {
         )?;
 
         let model = read_colmap_sparse_model(dir.path())?;
+        assert_eq!(model.reconstruction.rigs.len(), 1);
+        assert_eq!(model.reconstruction.frames.len(), 1);
+        assert_eq!(model.reconstruction.image_frame_indices, vec![Some(0)]);
         let exported = dir.path().join("exported_model");
         export_colmap_sparse_model(&exported, &model, false)?;
         let roundtrip = read_colmap_sparse_model(&exported)?;
@@ -1700,6 +1858,12 @@ mod tests {
         );
         assert_eq!(roundtrip.rigs, model.rigs);
         assert_eq!(roundtrip.frames, model.frames);
+
+        let exported_from_reconstruction = dir.path().join("exported_from_reconstruction");
+        export_colmap(&exported_from_reconstruction, &model.reconstruction, false)?;
+        let reconstruction_roundtrip = read_colmap_sparse_model(&exported_from_reconstruction)?;
+        assert_eq!(reconstruction_roundtrip.rigs, model.rigs);
+        assert_eq!(reconstruction_roundtrip.frames, model.frames);
         Ok(())
     }
 
@@ -1894,6 +2058,8 @@ mod tests {
             camera,
             cameras: camera_models,
             camera_ids,
+            rigs: Vec::new(),
+            frames: Vec::new(),
             image_names: (0..image_count)
                 .map(|idx| format!("image_{idx}.jpg"))
                 .collect(),
@@ -1902,6 +2068,7 @@ mod tests {
                 .collect(),
             image_ids: (0..image_count).map(|idx| idx as u32 + 1).collect(),
             image_camera_indices,
+            image_frame_indices: vec![None; image_count],
             poses: vec![None; image_count],
             observations: vec![Vec::new(); image_count],
             keypoints: vec![Vec::new(); image_count],
