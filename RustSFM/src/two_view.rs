@@ -3,7 +3,9 @@ use crate::geometry::relative_rotation_deg;
 use crate::polynomial;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
-use nalgebra::{DMatrix, Matrix3, Matrix3x4, Rotation3, SymmetricEigen, UnitQuaternion, Vector3};
+use nalgebra::{
+    DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, SymmetricEigen, UnitQuaternion, Vector3,
+};
 use rustslam::SE3;
 
 #[derive(Debug, Clone)]
@@ -1020,25 +1022,48 @@ fn estimate_homography_dlt_indexed(
     if indices.len() < 4 {
         return None;
     }
-    let (norm1, t1) = normalize_points_indexed(pts1, indices)?;
-    let (norm2, t2) = normalize_points_indexed(pts2, indices)?;
     let mut rows = Vec::with_capacity(indices.len() * 18);
-    for (x1, x2) in norm1.iter().zip(norm2.iter()) {
+    for &idx in indices {
+        let x1 = pts1.get(idx)?;
+        let x2 = pts2.get(idx)?;
         let x = x1.x / x1.z;
         let y = x1.y / x1.z;
         let u = x2.x / x2.z;
         let v = x2.y / x2.z;
-        rows.extend_from_slice(&[-x, -y, -1.0, 0.0, 0.0, 0.0, u * x, u * y, u]);
-        rows.extend_from_slice(&[0.0, 0.0, 0.0, -x, -y, -1.0, v * x, v * y, v]);
+        rows.extend_from_slice(&[x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, -u]);
+        rows.extend_from_slice(&[0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, -v]);
     }
     let a = DMatrix::<f64>::from_row_slice(indices.len() * 2, 9, &rows);
-    let svd = a.svd(false, true);
-    let vt = svd.v_t?;
-    let q = vt.row(vt.nrows() - 1);
-    let h_norm = Matrix3::from_row_slice(&[q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]]);
-    let h = t2.try_inverse()? * h_norm * t1;
-    let norm = h.norm();
-    (norm > 1.0e-12 && norm.is_finite()).then_some(h / norm)
+    let h = if indices.len() == 4 {
+        let lhs = DMatrix::<f64>::from_fn(8, 8, |row, col| a[(row, col)]);
+        let rhs = DVector::<f64>::from_fn(8, |row, _| -a[(row, 8)]);
+        let h = lhs.lu().solve(&rhs)?;
+        if h.iter().any(|value| value.is_nan()) {
+            return None;
+        }
+        Matrix3::from_row_slice(&[h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1.0])
+    } else {
+        let svd = a.svd(false, true);
+        if colmap_svd_rank(&svd.singular_values) < 8 {
+            return None;
+        }
+        let vt = svd.v_t?;
+        let q = vt.row(8);
+        Matrix3::from_row_slice(&[q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8]])
+    };
+    (h.determinant().abs() >= 1.0e-8).then_some(h)
+}
+
+fn colmap_svd_rank(singular_values: &DVector<f64>) -> usize {
+    if singular_values.is_empty() {
+        return 0;
+    }
+    let threshold = (singular_values[0] * singular_values.len().max(1) as f64 * f64::EPSILON)
+        .max(f64::MIN_POSITIVE);
+    singular_values
+        .iter()
+        .filter(|value| **value >= threshold)
+        .count()
 }
 
 fn refine_homography_support(
@@ -2037,6 +2062,73 @@ mod tests {
                 .fold(0.0, f64::max);
             det < 1.0e-8 && max_residual < 1.0e-10
         }));
+    }
+
+    fn transform_homography_point(h: &Matrix3<f64>, x: f64, y: f64) -> Vector3<f64> {
+        let p = h * Vector3::new(x, y, 1.0);
+        Vector3::new(p.x / p.z, p.y / p.z, 1.0)
+    }
+
+    #[test]
+    fn homography_four_point_estimator_matches_colmap_lu_path() {
+        let expected = Matrix3::new(1.2, 0.15, 3.0, -0.08, 0.9, -2.0, 0.001, -0.002, 1.0);
+        let pts1 = vec![
+            Vector3::new(-1.0, -1.0, 1.0),
+            Vector3::new(2.0, -0.5, 1.0),
+            Vector3::new(1.4, 1.3, 1.0),
+            Vector3::new(-0.7, 1.1, 1.0),
+        ];
+        let pts2 = pts1
+            .iter()
+            .map(|p| transform_homography_point(&expected, p.x, p.y))
+            .collect::<Vec<_>>();
+
+        let estimated = estimate_homography_dlt_indexed(&pts1, &pts2, &[0, 1, 2, 3]).unwrap();
+
+        for (actual, expected) in estimated.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn homography_multi_point_estimator_matches_colmap_svd_path() {
+        let expected = Matrix3::new(0.8, -0.2, 4.0, 0.12, 1.1, 1.5, -0.003, 0.001, 1.0);
+        let pts1 = vec![
+            Vector3::new(-2.0, -1.0, 1.0),
+            Vector3::new(1.5, -0.8, 1.0),
+            Vector3::new(2.0, 1.2, 1.0),
+            Vector3::new(-1.3, 1.4, 1.0),
+            Vector3::new(0.2, 0.3, 1.0),
+        ];
+        let pts2 = pts1
+            .iter()
+            .map(|p| transform_homography_point(&expected, p.x, p.y))
+            .collect::<Vec<_>>();
+
+        let estimated = estimate_homography_dlt_indexed(&pts1, &pts2, &[0, 1, 2, 3, 4]).unwrap();
+        let estimated = estimated / estimated[(2, 2)];
+
+        for (actual, expected) in estimated.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1.0e-8);
+        }
+    }
+
+    #[test]
+    fn homography_estimator_rejects_singular_colmap_models() {
+        let singular = Matrix3::new(1.0, 0.2, 0.5, 0.0, 0.0, 0.0, 0.01, -0.02, 1.0);
+        let pts1 = vec![
+            Vector3::new(-2.0, -1.0, 1.0),
+            Vector3::new(1.5, -0.8, 1.0),
+            Vector3::new(2.0, 1.2, 1.0),
+            Vector3::new(-1.3, 1.4, 1.0),
+            Vector3::new(0.2, 0.3, 1.0),
+        ];
+        let pts2 = pts1
+            .iter()
+            .map(|p| transform_homography_point(&singular, p.x, p.y))
+            .collect::<Vec<_>>();
+
+        assert!(estimate_homography_dlt_indexed(&pts1, &pts2, &[0, 1, 2, 3, 4]).is_none());
     }
 
     #[test]

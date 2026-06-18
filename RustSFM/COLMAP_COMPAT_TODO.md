@@ -218,11 +218,14 @@ reconstruction parity.
     - Homography RANSAC support now uses COLMAP's one-way squared forward
       projection residual (`H * x1 -> x2`) instead of the previous symmetric
       bidirectional transfer error.
+    - Homography estimation now follows COLMAP's official estimator shape:
+      four-point samples use the unnormalized 8x8 partial-pivot LU solve,
+      larger inlier sets use the unnormalized 2N x 9 SVD nullspace with
+      Eigen-style rank rejection, and singular homographies are rejected by
+      the official determinant threshold.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level official seven/eight-point
-      fundamental parity, official essential estimators, and the official
-      homography 4-point LU / multi-point SVD estimator with determinant
-      rejection.
+      fundamental parity and official essential estimators.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
