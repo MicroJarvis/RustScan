@@ -329,6 +329,24 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         two_view_config = crate::database::COLMAP_TWO_VIEW_WATERMARK;
     }
 
+    let homography_pose_score = if matches!(
+        two_view_config,
+        crate::database::COLMAP_TWO_VIEW_PLANAR | crate::database::COLMAP_TWO_VIEW_PANORAMIC
+    ) {
+        h_support.as_ref().and_then(|(homography, _)| {
+            choose_pose_from_homography(
+                homography,
+                camera1,
+                camera2,
+                &pts1,
+                &pts2,
+                &selected_mask,
+                two_view_config,
+            )
+        })
+    } else {
+        None
+    };
     let (pose_essential, pose_mask) = pose_essential_and_mask(
         essential,
         f_support.as_ref().map(|(model, _)| model),
@@ -343,16 +361,20 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         camera2,
         options,
     );
-    let pose_score = choose_pose_from_essential(
-        &pose_essential,
-        &pts1,
-        &pts2,
-        obs1_px,
-        obs2_px,
-        &pose_mask,
-        camera1,
-        camera2,
-    )?;
+    let pose_score = if let Some(score) = homography_pose_score {
+        score
+    } else {
+        choose_pose_from_essential(
+            &pose_essential,
+            &pts1,
+            &pts2,
+            obs1_px,
+            obs2_px,
+            &pose_mask,
+            camera1,
+            camera2,
+        )?
+    };
     if pose_score.triangulated < options.min_triangulated {
         return None;
     }
@@ -423,6 +445,23 @@ fn estimate_force_h_two_view(
         two_view_config = crate::database::COLMAP_TWO_VIEW_WATERMARK;
     }
 
+    let homography_pose_score = if matches!(
+        two_view_config,
+        crate::database::COLMAP_TWO_VIEW_PLANAR | crate::database::COLMAP_TWO_VIEW_PANORAMIC
+    ) {
+        choose_pose_from_homography(
+            &homography,
+            camera1,
+            camera2,
+            pts1,
+            pts2,
+            &h_support.inlier_mask,
+            two_view_config,
+        )
+    } else {
+        None
+    };
+
     let inlier_indices = h_support
         .inlier_mask
         .iter()
@@ -443,9 +482,13 @@ fn estimate_force_h_two_view(
     } else {
         h_support.inlier_mask.clone()
     };
-    let pose_score = choose_pose_from_essential(
-        &essential, pts1, pts2, obs1_px, obs2_px, &pose_mask, camera1, camera2,
-    )?;
+    let pose_score = if let Some(score) = homography_pose_score {
+        score
+    } else {
+        choose_pose_from_essential(
+            &essential, pts1, pts2, obs1_px, obs2_px, &pose_mask, camera1, camera2,
+        )?
+    };
     if pose_score.triangulated < options.min_triangulated {
         return None;
     }
@@ -1590,6 +1633,84 @@ fn classify_homography_motion_by_rotation(
     }
 }
 
+fn choose_pose_from_homography(
+    homography: &Matrix3<f64>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+    rays1: &[Vector3<f64>],
+    rays2: &[Vector3<f64>],
+    inlier_mask: &[bool],
+    two_view_config: i32,
+) -> Option<PoseCandidateScore> {
+    let candidates = decompose_homography_matrix(homography, camera1, camera2)?;
+    let mut best: Option<(HomographyPoseCandidate, usize, f64, Vec<Vector3<f64>>)> = None;
+    for candidate in candidates {
+        let mut points = Vec::new();
+        let mut residual_sum = 0.0;
+        for (idx, &is_inlier) in inlier_mask.iter().enumerate() {
+            if !is_inlier {
+                continue;
+            }
+            let (Some(ray1), Some(ray2)) = (rays1.get(idx), rays2.get(idx)) else {
+                continue;
+            };
+            let Some(point) =
+                triangulate_midpoint(&candidate.rotation, &candidate.translation, ray1, ray2)
+            else {
+                continue;
+            };
+            let point2 = candidate.rotation * point + candidate.translation;
+            residual_sum += 1.0 - clamp_unit(ray1.normalize().dot(&point.normalize()));
+            residual_sum += 1.0 - clamp_unit(ray2.normalize().dot(&point2.normalize()));
+            points.push(point);
+        }
+        if best.as_ref().is_none_or(
+            |(_, best_count, best_residual, _): &(
+                HomographyPoseCandidate,
+                usize,
+                f64,
+                Vec<Vector3<f64>>,
+            )| {
+                points.len() > *best_count
+                    || (points.len() == *best_count && residual_sum < *best_residual)
+            },
+        ) {
+            best = Some((candidate, points.len(), residual_sum, points));
+        }
+    }
+    let (candidate, triangulated, residual_sum, points) = best?;
+    if two_view_config == crate::database::COLMAP_TWO_VIEW_PLANAR && triangulated == 0 {
+        return None;
+    }
+    let pose = se3_from_parts(&candidate.rotation, &candidate.translation)?;
+    let median_angle_deg = if two_view_config == crate::database::COLMAP_TWO_VIEW_PANORAMIC {
+        0.0
+    } else {
+        let center2 = -candidate.rotation.transpose() * candidate.translation;
+        let mut angles = points
+            .iter()
+            .map(|point| triangulation_angle_deg(&Vector3::zeros(), &center2, point))
+            .filter(|angle| angle.is_finite())
+            .collect::<Vec<_>>();
+        if angles.is_empty() {
+            0.0
+        } else {
+            angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            angles[angles.len() / 2]
+        }
+    };
+    Some(PoseCandidateScore {
+        pose,
+        triangulated,
+        mean_reprojection_error_px: if triangulated == 0 {
+            0.0
+        } else {
+            (residual_sum / triangulated as f64) as f32
+        },
+        median_angle_deg,
+    })
+}
+
 fn pose_from_homography_matrix(
     homography: &Matrix3<f64>,
     camera1: CameraModel,
@@ -2665,6 +2786,61 @@ mod tests {
         assert!((best.rotation - rotation).norm() < 1.0e-6);
         assert!((best.translation.normalize() - ref_translation).norm() < 1.0e-6);
         assert!((best.normal - ref_normal).norm() < 1.0e-5);
+    }
+
+    #[test]
+    fn planar_geometry_uses_homography_pose_handoff() {
+        let rotation =
+            UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(1.0, 0.1, 0.2, 0.3))
+                .to_rotation_matrix()
+                .into_inner();
+        let ref_translation = Vector3::new(1.0, 0.0, 0.0);
+        let ref_normal = Vector3::new(0.0, 0.0, -1.0);
+        let h = rotation - ref_translation * ref_normal.transpose();
+        let rays1 = vec![
+            Vector3::new(0.1, 0.1, 1.0).normalize(),
+            Vector3::new(0.4, 0.1, 1.0).normalize(),
+            Vector3::new(0.1, 0.4, 1.0).normalize(),
+            Vector3::new(0.4, 0.4, 1.0).normalize(),
+            Vector3::new(0.0, 0.0, 1.0).normalize(),
+        ];
+        let rays2 = rays1
+            .iter()
+            .map(|ray| (h * ray).normalize())
+            .collect::<Vec<_>>();
+        let camera = CameraModel::new_pinhole(1, 1, 1.0, 1.0, 0.0, 0.0);
+        let inliers = vec![true; rays1.len()];
+        let score = choose_pose_from_homography(
+            &h,
+            camera,
+            camera,
+            &rays1,
+            &rays2,
+            &inliers,
+            crate::database::COLMAP_TWO_VIEW_PLANAR,
+        )
+        .expect("homography pose");
+
+        assert_eq!(score.triangulated, rays1.len());
+        let pose_rotation = Matrix3::from_row_slice(&[
+            score.pose.rotation_matrix()[0][0] as f64,
+            score.pose.rotation_matrix()[0][1] as f64,
+            score.pose.rotation_matrix()[0][2] as f64,
+            score.pose.rotation_matrix()[1][0] as f64,
+            score.pose.rotation_matrix()[1][1] as f64,
+            score.pose.rotation_matrix()[1][2] as f64,
+            score.pose.rotation_matrix()[2][0] as f64,
+            score.pose.rotation_matrix()[2][1] as f64,
+            score.pose.rotation_matrix()[2][2] as f64,
+        ]);
+        let pose_translation = Vector3::new(
+            score.pose.translation()[0] as f64,
+            score.pose.translation()[1] as f64,
+            score.pose.translation()[2] as f64,
+        );
+        assert!((pose_rotation - rotation).norm() < 1.0e-6);
+        assert!((pose_translation.normalize() - ref_translation).norm() < 1.0e-6);
+        assert!(score.median_angle_deg > 0.0);
     }
 
     fn transform_homography_point(h: &Matrix3<f64>, x: f64, y: f64) -> Vector3<f64> {

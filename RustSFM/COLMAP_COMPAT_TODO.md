@@ -200,8 +200,12 @@ reconstruction parity.
    - Homography decomposition and pose selection are now pinned by COLMAP's
      official nominal `DecomposeHomographyMatrix` and `PoseFromHomographyMatrix`
      reference fixtures.
-   - Remaining work: finish exact pose handoff for planar geometry and
-     implement `CALIBRATED_RIG` generalized relative pose.
+   - Planar and panoramic two-view estimates now hand off the selected
+     homography pose into the returned relative pose instead of falling back to
+     essential/fundamental pose selection, including the forced-homography path.
+   - Remaining work: persist/report planar homography pose metadata with full
+     COLMAP `TwoViewGeometry` semantics and implement `CALIBRATED_RIG`
+     generalized relative pose.
 10. [partial] Replace the local RANSAC implementation with COLMAP-equivalent
     RANSAC / LORANSAC support scoring, stopping criteria, random seeding, and
     solver selection.
