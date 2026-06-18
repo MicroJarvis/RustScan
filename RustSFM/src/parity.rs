@@ -21,6 +21,7 @@ pub struct ParityReport {
     pub raw: DatabaseLayerStats,
     pub cache: DatabaseLayerStats,
     pub bridge: BridgeStats,
+    pub initial_pair_input: InitialPairInputReport,
     pub config_histogram: Vec<TwoViewConfigCount>,
     pub differences: Vec<ParityDifference>,
 }
@@ -47,6 +48,32 @@ pub struct BridgeStats {
     pub matches: usize,
     pub missing_requested_images: Vec<String>,
     pub unmatched_cache_pairs: Vec<PairName>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct InitialPairInputReport {
+    pub min_num_inliers: usize,
+    pub total_candidates: usize,
+    pub eligible_candidates: usize,
+    pub selected: Option<InitialPairCandidate>,
+    pub top_candidates: Vec<InitialPairCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InitialPairCandidate {
+    pub rank: usize,
+    pub left: String,
+    pub right: String,
+    pub left_image_id: ImageId,
+    pub right_image_id: ImageId,
+    pub config: i32,
+    pub config_name: String,
+    pub inlier_matches: usize,
+    pub left_total_inliers: usize,
+    pub right_total_inliers: usize,
+    pub score: f32,
+    pub eligible: bool,
+    pub rejection_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +127,7 @@ pub fn compare_database_parity(
         &frames,
         &bridge_pairs,
     )?;
+    let initial_pair_input = initial_pair_input_report(&cache, 100)?;
     let config_histogram = two_view_config_histogram(&db)?;
     let differences = parity_differences(&requested_images, &raw, &cache_stats, &bridge);
 
@@ -109,6 +137,7 @@ pub fn compare_database_parity(
         raw,
         cache: cache_stats,
         bridge,
+        initial_pair_input,
         config_histogram,
         differences,
     })
@@ -275,6 +304,119 @@ fn two_view_config_histogram(db: &ColmapDatabase) -> Result<Vec<TwoViewConfigCou
         entry.inlier_matches += geometry.inlier_matches.len();
     }
     Ok(counts.into_values().collect())
+}
+
+fn initial_pair_input_report(
+    cache: &crate::database::DatabaseCache,
+    min_num_inliers: usize,
+) -> Result<InitialPairInputReport> {
+    let pair_matches = cache.correspondence_graph.num_matches_between_all_images();
+    let mut image_inliers = BTreeMap::<ImageId, usize>::new();
+    for (&pair_id, &matches) in &pair_matches {
+        let (image_id1, image_id2) =
+            pair_id_to_image_pair(pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        *image_inliers.entry(image_id1).or_default() += matches as usize;
+        *image_inliers.entry(image_id2).or_default() += matches as usize;
+    }
+
+    let mut candidates = Vec::new();
+    for (&pair_id, &matches) in &pair_matches {
+        let (image_id1, image_id2) =
+            pair_id_to_image_pair(pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let Some(image1) = cache.images.get(&image_id1) else {
+            continue;
+        };
+        let Some(image2) = cache.images.get(&image_id2) else {
+            continue;
+        };
+        let geometry = cache
+            .correspondence_graph
+            .extract_two_view_geometry(image_id1, image_id2, false)
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let inlier_matches = matches as usize;
+        let mut rejection_reasons = Vec::new();
+        if inlier_matches < min_num_inliers {
+            rejection_reasons.push(format!("inliers_lt_{min_num_inliers}"));
+        }
+        if !is_initial_pair_usable_config(geometry.config) {
+            rejection_reasons.push(format!(
+                "config_{}",
+                two_view_config_name(geometry.config).to_ascii_lowercase()
+            ));
+        }
+        let left_total_inliers = *image_inliers.get(&image_id1).unwrap_or(&0);
+        let right_total_inliers = *image_inliers.get(&image_id2).unwrap_or(&0);
+        let score =
+            initial_pair_input_score(inlier_matches, left_total_inliers, right_total_inliers);
+        candidates.push(InitialPairCandidate {
+            rank: 0,
+            left: image1.name.clone(),
+            right: image2.name.clone(),
+            left_image_id: image_id1,
+            right_image_id: image_id2,
+            config: geometry.config,
+            config_name: two_view_config_name(geometry.config).to_string(),
+            inlier_matches,
+            left_total_inliers,
+            right_total_inliers,
+            score,
+            eligible: rejection_reasons.is_empty(),
+            rejection_reasons,
+        });
+    }
+    candidates.sort_by(|a, b| {
+        b.eligible
+            .cmp(&a.eligible)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.left_image_id.cmp(&b.left_image_id))
+            .then_with(|| a.right_image_id.cmp(&b.right_image_id))
+    });
+    for (rank, candidate) in candidates.iter_mut().enumerate() {
+        candidate.rank = rank + 1;
+    }
+    let selected = candidates
+        .iter()
+        .find(|candidate| candidate.eligible)
+        .cloned();
+    let eligible_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .count();
+    let total_candidates = candidates.len();
+    candidates.truncate(50);
+    Ok(InitialPairInputReport {
+        min_num_inliers,
+        total_candidates,
+        eligible_candidates,
+        selected,
+        top_candidates: candidates,
+    })
+}
+
+fn is_initial_pair_usable_config(config: i32) -> bool {
+    matches!(
+        config,
+        COLMAP_TWO_VIEW_CALIBRATED
+            | COLMAP_TWO_VIEW_UNCALIBRATED
+            | COLMAP_TWO_VIEW_PLANAR
+            | COLMAP_TWO_VIEW_PANORAMIC
+            | COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC
+            | COLMAP_TWO_VIEW_CALIBRATED_RIG
+    )
+}
+
+fn initial_pair_input_score(
+    pair_inliers: usize,
+    left_total_inliers: usize,
+    right_total_inliers: usize,
+) -> f32 {
+    (left_total_inliers as f32).sqrt() * 20.0
+        + (right_total_inliers as f32).sqrt() * 20.0
+        + pair_inliers as f32 * 10.0
 }
 
 fn parity_differences(
@@ -449,6 +591,13 @@ mod tests {
         assert_eq!(report.cache.two_view_pairs, 1);
         assert_eq!(report.bridge.frame_pairs, 1);
         assert_eq!(report.bridge.matches, 2);
+        assert_eq!(report.initial_pair_input.total_candidates, 1);
+        assert_eq!(report.initial_pair_input.eligible_candidates, 0);
+        assert!(report.initial_pair_input.selected.is_none());
+        assert_eq!(
+            report.initial_pair_input.top_candidates[0].rejection_reasons,
+            vec!["inliers_lt_100".to_string()]
+        );
         assert!(report
             .config_histogram
             .iter()
@@ -473,6 +622,81 @@ mod tests {
             .iter()
             .any(|diff| diff.kind == "missing_requested_images"));
         drop(db);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_pair_input_prefers_high_inlier_verified_pair() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            let keypoints = (0..140)
+                .map(|idx| crate::database::ColmapKeypoint::new(idx as f32, idx as f32))
+                .collect::<Vec<_>>();
+            db.write_keypoints(image_id, &keypoints)?;
+        }
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: COLMAP_TWO_VIEW_CALIBRATED,
+                inlier_matches: (0..120).map(|idx| FeatureMatch::new(idx, idx)).collect(),
+                ..Default::default()
+            },
+        )?;
+        db.write_two_view_geometry(
+            2,
+            3,
+            &ColmapTwoViewGeometry {
+                config: COLMAP_TWO_VIEW_WATERMARK,
+                inlier_matches: (0..130).map(|idx| FeatureMatch::new(idx, idx)).collect(),
+                ..Default::default()
+            },
+        )?;
+
+        let report = compare_database_parity(&path, Vec::<String>::new(), 1, false, false)?;
+        let selected = report
+            .initial_pair_input
+            .selected
+            .as_ref()
+            .expect("selected candidate");
+        assert_eq!(
+            (selected.left.as_str(), selected.right.as_str()),
+            ("a.jpg", "b.jpg")
+        );
+        assert_eq!(selected.inlier_matches, 120);
+        assert_eq!(report.initial_pair_input.eligible_candidates, 1);
+        assert!(report
+            .initial_pair_input
+            .top_candidates
+            .iter()
+            .any(|candidate| candidate.config == COLMAP_TWO_VIEW_WATERMARK
+                && candidate
+                    .rejection_reasons
+                    .contains(&"config_watermark".to_string())));
         Ok(())
     }
 }
