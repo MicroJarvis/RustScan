@@ -239,10 +239,13 @@ reconstruction parity.
       reconstructs COLMAP's full Householder-Q column for exactly eight
       correspondences instead of using the previous explicit free-variable
       nullspace solve.
+    - Fundamental seven-point minimal nullspace extraction now also uses a
+      full Householder-Q reconstruction for the two-dimensional nullspace
+      instead of the previous `A^T A` eigenvector basis.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
-      exact estimator stack, including byte-level official seven-point
-      nullspace extraction and byte-level five-point nullspace / companion
-      root parity.
+      exact estimator stack, including byte-level full-pivot Householder
+      parity for minimal nullspaces and byte-level five-point nullspace /
+      companion root parity.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.

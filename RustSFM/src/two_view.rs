@@ -2,9 +2,7 @@ use crate::five_point::estimate_five_point_essential;
 use crate::geometry::relative_rotation_deg;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
-use nalgebra::{
-    DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, SymmetricEigen, UnitQuaternion, Vector3,
-};
+use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
 use rustslam::SE3;
 
 #[derive(Debug, Clone)]
@@ -798,27 +796,11 @@ fn estimate_fundamental_seven_point_indexed(
         rows.extend_from_slice(&[u * x, u * y, u, v * x, v * y, v, x, y, 1.0]);
     }
     let a = DMatrix::<f64>::from_row_slice(indices.len(), 9, &rows);
-    let ata = a.transpose() * a;
-    let eigen = SymmetricEigen::new(ata);
-    let mut order = (0..eigen.eigenvalues.len()).collect::<Vec<_>>();
-    order.sort_by(|&lhs, &rhs| {
-        eigen.eigenvalues[lhs]
-            .partial_cmp(&eigen.eigenvalues[rhs])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if order.len() < 2 {
+    let Some(basis) = right_nullspace_householder(&a, 2) else {
         return Vec::new();
-    }
-    let f2_col = eigen.eigenvectors.column(order[0]);
-    let f1_col = eigen.eigenvectors.column(order[1]);
-    let f2 = [
-        f2_col[0], f2_col[1], f2_col[2], f2_col[3], f2_col[4], f2_col[5], f2_col[6], f2_col[7],
-        f2_col[8],
-    ];
-    let mut f1 = [
-        f1_col[0], f1_col[1], f1_col[2], f1_col[3], f1_col[4], f1_col[5], f1_col[6], f1_col[7],
-        f1_col[8],
-    ];
+    };
+    let mut f1 = basis[0];
+    let f2 = basis[1];
     for (a, b) in f1.iter_mut().zip(f2.iter()) {
         *a -= *b;
     }
@@ -967,23 +949,36 @@ fn colmap_eight_point_nullspace(a: &DMatrix<f64>) -> Option<[f64; 9]> {
 }
 
 fn eight_point_minimal_nullspace(a: &DMatrix<f64>) -> Option<[f64; 9]> {
-    if a.nrows() != 8 || a.ncols() != 9 {
+    let basis = right_nullspace_householder(a, 1)?;
+    let q = basis.first()?;
+    Some(*q)
+}
+
+fn right_nullspace_householder(a: &DMatrix<f64>, nullity: usize) -> Option<Vec<[f64; 9]>> {
+    if a.ncols() != 9 || a.nrows() + nullity != 9 {
         return None;
     }
     let qr = a.transpose().qr();
     let mut q_t = DMatrix::<f64>::identity(9, 9);
     qr.q_tr_mul(&mut q_t);
-    Some([
-        q_t[(8, 0)],
-        q_t[(8, 1)],
-        q_t[(8, 2)],
-        q_t[(8, 3)],
-        q_t[(8, 4)],
-        q_t[(8, 5)],
-        q_t[(8, 6)],
-        q_t[(8, 7)],
-        q_t[(8, 8)],
-    ])
+    let first = 9 - nullity;
+    Some(
+        (first..9)
+            .map(|row| {
+                [
+                    q_t[(row, 0)],
+                    q_t[(row, 1)],
+                    q_t[(row, 2)],
+                    q_t[(row, 3)],
+                    q_t[(row, 4)],
+                    q_t[(row, 5)],
+                    q_t[(row, 6)],
+                    q_t[(row, 7)],
+                    q_t[(row, 8)],
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn refine_fundamental_support(
