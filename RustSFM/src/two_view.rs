@@ -1602,7 +1602,7 @@ fn pose_from_homography_matrix(
     let mut best_translation_norm_sq = 0.0;
     let mut best_points = 0usize;
     let mut best_residual_sum = f64::MAX;
-    for (r, t) in candidates {
+    for candidate in candidates {
         let mut points = 0usize;
         let mut residual_sum = 0.0;
         for (idx, &is_inlier) in inlier_mask.iter().enumerate() {
@@ -1612,10 +1612,12 @@ fn pose_from_homography_matrix(
             let (Some(ray1), Some(ray2)) = (rays1.get(idx), rays2.get(idx)) else {
                 continue;
             };
-            let Some(point) = triangulate_midpoint(&r, &t, ray1, ray2) else {
+            let Some(point) =
+                triangulate_midpoint(&candidate.rotation, &candidate.translation, ray1, ray2)
+            else {
                 continue;
             };
-            let point2 = r * point + t;
+            let point2 = candidate.rotation * point + candidate.translation;
             let err1 = 1.0 - clamp_unit(ray1.normalize().dot(&point.normalize()));
             let err2 = 1.0 - clamp_unit(ray2.normalize().dot(&point2.normalize()));
             residual_sum += err1 + err2;
@@ -1624,17 +1626,25 @@ fn pose_from_homography_matrix(
         if points > best_points || (points == best_points && residual_sum < best_residual_sum) {
             best_points = points;
             best_residual_sum = residual_sum;
-            best_translation_norm_sq = t.norm_squared();
+            best_translation_norm_sq = candidate.translation.norm_squared();
         }
     }
     (best_points > 0).then_some((best_translation_norm_sq, best_points))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HomographyPoseCandidate {
+    rotation: Matrix3<f64>,
+    translation: Vector3<f64>,
+    #[allow(dead_code)]
+    normal: Vector3<f64>,
 }
 
 fn decompose_homography_matrix(
     homography: &Matrix3<f64>,
     camera1: CameraModel,
     camera2: CameraModel,
-) -> Option<Vec<(Matrix3<f64>, Vector3<f64>)>> {
+) -> Option<Vec<HomographyPoseCandidate>> {
     let k1 = camera_intrinsic_matrix(camera1);
     let k2_inv = camera_intrinsic_matrix(camera2).try_inverse()?;
     let mut h_norm = k2_inv * homography * k1;
@@ -1649,7 +1659,11 @@ fn decompose_homography_matrix(
 
     let s = h_norm.transpose() * h_norm - Matrix3::<f64>::identity();
     if max_abs_coeff(&s) < 1.0e-3 {
-        return Some(vec![(h_norm, Vector3::zeros())]);
+        return Some(vec![HomographyPoseCandidate {
+            rotation: h_norm,
+            translation: Vector3::zeros(),
+            normal: Vector3::zeros(),
+        }]);
     }
 
     let m00 = opposite_minor(&s, 0, 0);
@@ -1704,7 +1718,28 @@ fn decompose_homography_matrix(
     let t1 = r1 * t1_star;
     let r2 = compute_homography_rotation(&h_norm, &t2_star, &n2, v);
     let t2 = r2 * t2_star;
-    Some(vec![(r1, t1), (r1, -t1), (r2, t2), (r2, -t2)])
+    Some(vec![
+        HomographyPoseCandidate {
+            rotation: r1,
+            translation: t1,
+            normal: -n1,
+        },
+        HomographyPoseCandidate {
+            rotation: r1,
+            translation: -t1,
+            normal: n1,
+        },
+        HomographyPoseCandidate {
+            rotation: r2,
+            translation: t2,
+            normal: -n2,
+        },
+        HomographyPoseCandidate {
+            rotation: r2,
+            translation: -t2,
+            normal: n2,
+        },
+    ])
 }
 
 fn compute_homography_rotation(
@@ -2534,6 +2569,102 @@ mod tests {
             classify_homography_motion(&planar_h, camera, camera, &rays1, &rays2, &inliers),
             crate::database::COLMAP_TWO_VIEW_PLANAR
         );
+    }
+
+    #[test]
+    fn homography_decomposition_matches_colmap_nominal_reference() {
+        let mut h = Matrix3::new(
+            2.649157564634028,
+            4.583875997496426,
+            70.694447785121326,
+            -1.072756858861583,
+            3.533262150437228,
+            1513.656999614321649,
+            0.001303887589576,
+            0.003042206876298,
+            1.0,
+        );
+        h *= 3.0;
+        let camera = CameraModel::new_pinhole(640, 480, 640.0, 640.0, 320.0, 240.0);
+        let candidates = decompose_homography_matrix(&h, camera, camera).expect("candidates");
+        assert_eq!(candidates.len(), 4);
+
+        let ref_rotation = Matrix3::new(
+            0.43307983549125,
+            0.545749113549648,
+            -0.717356090899523,
+            -0.85630229674426,
+            0.497582023798831,
+            -0.138414255706431,
+            0.281404038139784,
+            0.67421809131173,
+            0.682818960388909,
+        );
+        let ref_translation = Vector3::new(1.826751712278038, 1.264718492450820, 0.195080809998819);
+        let ref_normal = Vector3::new(-0.244875830334816, -0.480857890778889, -0.841909446789566);
+
+        assert!(
+            candidates.iter().any(|candidate| {
+                (candidate.rotation - ref_rotation).norm() < 1.0e-6
+                    && (candidate.translation - ref_translation).norm() < 1.0e-6
+                    && (candidate.normal - ref_normal).norm() < 1.0e-6
+            }),
+            "reference homography solution missing: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn pose_from_homography_matches_colmap_nominal_reference() {
+        let rotation =
+            UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(1.0, 0.1, 0.2, 0.3))
+                .to_rotation_matrix()
+                .into_inner();
+        let ref_translation = Vector3::new(1.0, 0.0, 0.0);
+        let ref_normal = Vector3::new(0.0, 0.0, -1.0);
+        let h = rotation - ref_translation * ref_normal.transpose();
+        let rays1 = vec![
+            Vector3::new(0.1, 0.1, 1.0).normalize(),
+            Vector3::new(0.4, 0.1, 1.0).normalize(),
+            Vector3::new(0.1, 0.4, 1.0).normalize(),
+            Vector3::new(0.4, 0.4, 1.0).normalize(),
+            Vector3::new(0.0, 0.0, 1.0).normalize(),
+        ];
+        let rays2 = rays1
+            .iter()
+            .map(|ray| (h * ray).normalize())
+            .collect::<Vec<_>>();
+        let camera = CameraModel::new_pinhole(1, 1, 1.0, 1.0, 0.0, 0.0);
+        let candidates = decompose_homography_matrix(&h, camera, camera).expect("candidates");
+        let inliers = vec![true; rays1.len()];
+        let mut best: Option<(HomographyPoseCandidate, usize, f64)> = None;
+        for candidate in candidates {
+            let mut points = 0usize;
+            let mut residual_sum = 0.0;
+            for idx in 0..rays1.len() {
+                let Some(point) = triangulate_midpoint(
+                    &candidate.rotation,
+                    &candidate.translation,
+                    &rays1[idx],
+                    &rays2[idx],
+                ) else {
+                    continue;
+                };
+                let point2 = candidate.rotation * point + candidate.translation;
+                residual_sum += 1.0 - clamp_unit(rays1[idx].dot(&point.normalize()));
+                residual_sum += 1.0 - clamp_unit(rays2[idx].dot(&point2.normalize()));
+                points += 1;
+            }
+            if best.as_ref().is_none_or(|(_, best_points, best_residual)| {
+                points > *best_points || (points == *best_points && residual_sum < *best_residual)
+            }) {
+                best = Some((candidate, points, residual_sum));
+            }
+        }
+        let (best, points, _) = best.expect("best pose");
+        assert_eq!(points, inliers.len());
+        assert!((best.rotation - rotation).norm() < 1.0e-6);
+        assert!((best.translation.normalize() - ref_translation).norm() < 1.0e-6);
+        assert!((best.normal - ref_normal).norm() < 1.0e-5);
     }
 
     fn transform_homography_point(h: &Matrix3<f64>, x: f64, y: f64) -> Vector3<f64> {

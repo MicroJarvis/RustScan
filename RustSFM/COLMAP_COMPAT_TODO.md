@@ -197,9 +197,11 @@ reconstruction parity.
      reprojection winner with midpoint triangulation, and classify
      `PLANAR_OR_PANORAMIC` by the selected pose translation norm instead of
      the previous closest-rotation residual heuristic.
-   - Remaining work: validate homography decomposition numerics against
-     COLMAP reference fixtures, finish exact pose handoff for planar geometry,
-     and implement `CALIBRATED_RIG` generalized relative pose.
+   - Homography decomposition and pose selection are now pinned by COLMAP's
+     official nominal `DecomposeHomographyMatrix` and `PoseFromHomographyMatrix`
+     reference fixtures.
+   - Remaining work: finish exact pose handoff for planar geometry and
+     implement `CALIBRATED_RIG` generalized relative pose.
 10. [partial] Replace the local RANSAC implementation with COLMAP-equivalent
     RANSAC / LORANSAC support scoring, stopping criteria, random seeding, and
     solver selection.
