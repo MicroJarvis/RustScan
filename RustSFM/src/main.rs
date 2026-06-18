@@ -268,9 +268,13 @@ fn main() -> Result<()> {
                 args.load_all_images,
             )?;
             println!(
-                "COLMAP database parity: raw_images={} cache_images={} raw_pairs={} cache_pairs={} bridge_pairs={} bridge_matches={} differences={}",
+                "COLMAP database parity: raw_images={} cache_images={} raw_frames={} cache_frames={} raw_frame_data={} cache_frame_data={} raw_pairs={} cache_pairs={} bridge_pairs={} bridge_matches={} differences={}",
                 report.raw.images,
                 report.cache.images,
+                report.raw.frames,
+                report.cache.frames,
+                report.raw.frame_data,
+                report.cache.frame_data,
                 report.raw.two_view_pairs,
                 report.cache.two_view_pairs,
                 report.bridge.frame_pairs,

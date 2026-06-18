@@ -1131,6 +1131,45 @@ pub struct Rigid3 {
     pub tvec: [f64; 3],
 }
 
+impl Rigid3 {
+    pub fn identity() -> Self {
+        Self {
+            qvec: [1.0, 0.0, 0.0, 0.0],
+            tvec: [0.0, 0.0, 0.0],
+        }
+    }
+
+    pub fn to_se3(&self) -> SE3 {
+        let w = self.qvec[0] as f32;
+        let x = self.qvec[1] as f32;
+        let y = self.qvec[2] as f32;
+        let z = self.qvec[3] as f32;
+        let norm = (w * w + x * x + y * y + z * z).sqrt();
+        let rotation = if norm > f32::EPSILON && norm.is_finite() {
+            glam::Quat::from_xyzw(x / norm, y / norm, z / norm, w / norm)
+        } else {
+            glam::Quat::IDENTITY
+        };
+        SE3::from_quat_translation(
+            rotation,
+            glam::Vec3::new(
+                self.tvec[0] as f32,
+                self.tvec[1] as f32,
+                self.tvec[2] as f32,
+            ),
+        )
+    }
+
+    pub fn from_se3(pose: SE3) -> Self {
+        let q = pose.quaternion();
+        let t = pose.translation();
+        Self {
+            qvec: [q[3] as f64, q[0] as f64, q[1] as f64, q[2] as f64],
+            tvec: [t[0] as f64, t[1] as f64, t[2] as f64],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RigSensor {
     pub sensor_id: SensorId,
@@ -1156,6 +1195,13 @@ pub struct Frame {
     pub rig_id: u32,
     pub rig_from_world: Rigid3,
     pub data_ids: Vec<DataId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameRegistrationPoses {
+    pub frame_idx: usize,
+    pub rig_from_world: SE3,
+    pub image_poses: Vec<(usize, SE3)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1202,12 +1248,105 @@ impl Reconstruction {
     }
 
     pub fn frame_id_for_image(&self, image: usize) -> Option<u32> {
+        self.frame_index_for_image(image)
+            .and_then(|frame_idx| self.frames.get(frame_idx))
+            .map(|frame| frame.frame_id)
+    }
+
+    pub fn frame_index_for_image(&self, image: usize) -> Option<usize> {
         self.image_frame_indices
             .get(image)
             .copied()
             .flatten()
-            .and_then(|frame_idx| self.frames.get(frame_idx))
-            .map(|frame| frame.frame_id)
+            .filter(|&frame_idx| frame_idx < self.frames.len())
+    }
+
+    pub fn image_indices_for_frame_index(&self, frame_idx: usize) -> Vec<usize> {
+        if frame_idx >= self.frames.len() {
+            return Vec::new();
+        }
+        self.image_frame_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(image, &candidate)| (candidate == Some(frame_idx)).then_some(image))
+            .collect()
+    }
+
+    pub fn image_indices_for_registration_unit(&self, image: usize) -> Vec<usize> {
+        if image >= self.poses.len() {
+            return Vec::new();
+        }
+        if let Some(frame_idx) = self.frame_index_for_image(image) {
+            let images = self.image_indices_for_frame_index(frame_idx);
+            if !images.is_empty() {
+                return images;
+            }
+        }
+        vec![image]
+    }
+
+    pub fn frame_registration_poses_for_image(
+        &self,
+        image: usize,
+        image_pose: SE3,
+    ) -> Option<FrameRegistrationPoses> {
+        let frame_idx = self.frame_index_for_image(image)?;
+        let frame = self.frames.get(frame_idx)?;
+        let selected_sensor_id = self.frame_sensor_id_for_image(frame_idx, image)?;
+        let selected_sensor_from_rig = self
+            .sensor_from_rig(frame.rig_id, selected_sensor_id)
+            .unwrap_or_else(SE3::identity);
+        let rig_from_world = selected_sensor_from_rig.inverse().compose(&image_pose);
+        let image_poses = self
+            .image_indices_for_frame_index(frame_idx)
+            .into_iter()
+            .map(|frame_image| {
+                let pose = self
+                    .frame_sensor_id_for_image(frame_idx, frame_image)
+                    .and_then(|sensor_id| self.sensor_from_rig(frame.rig_id, sensor_id))
+                    .map(|sensor_from_rig| sensor_from_rig.compose(&rig_from_world))
+                    .unwrap_or(rig_from_world);
+                (frame_image, pose)
+            })
+            .collect::<Vec<_>>();
+        Some(FrameRegistrationPoses {
+            frame_idx,
+            rig_from_world,
+            image_poses,
+        })
+    }
+
+    pub fn frame_sensor_id_for_image(&self, frame_idx: usize, image: usize) -> Option<&SensorId> {
+        let image_id = self.image_id(image) as u64;
+        self.frames
+            .get(frame_idx)?
+            .data_ids
+            .iter()
+            .find_map(|data_id| {
+                (data_id.sensor_id.sensor_type == SensorType::Camera && data_id.data_id == image_id)
+                    .then_some(&data_id.sensor_id)
+            })
+    }
+
+    pub fn sensor_from_rig(&self, rig_id: u32, sensor_id: &SensorId) -> Option<SE3> {
+        let rig = self.rigs.iter().find(|rig| rig.rig_id == rig_id)?;
+        if rig
+            .ref_sensor_id
+            .as_ref()
+            .is_some_and(|ref_sensor_id| ref_sensor_id == sensor_id)
+        {
+            return Some(SE3::identity());
+        }
+        rig.sensors
+            .iter()
+            .find(|sensor| &sensor.sensor_id == sensor_id)
+            .map(|sensor| {
+                sensor
+                    .sensor_from_rig
+                    .as_ref()
+                    .map(Rigid3::to_se3)
+                    .unwrap_or_else(SE3::identity)
+            })
     }
 
     pub fn point3d_id(&self, point: usize) -> u64 {

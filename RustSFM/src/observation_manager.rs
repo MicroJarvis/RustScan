@@ -168,10 +168,40 @@ impl ObservationManager {
         image: usize,
         pose: SE3,
     ) -> bool {
-        let Some(slot) = reconstruction.poses.get_mut(image) else {
+        self.register_frame_for_image(frames, pairs, reconstruction, image, pose)
+    }
+
+    pub fn register_frame_for_image(
+        &mut self,
+        frames: &[ImageFrame],
+        pairs: &[PairGeometry],
+        reconstruction: &mut Reconstruction,
+        image: usize,
+        pose: SE3,
+    ) -> bool {
+        if image >= reconstruction.poses.len() {
             return false;
-        };
-        *slot = Some(pose);
+        }
+        if let Some(frame_registration) =
+            reconstruction.frame_registration_poses_for_image(image, pose)
+        {
+            if frame_registration.image_poses.is_empty() {
+                return false;
+            }
+            for (frame_image, frame_pose) in frame_registration.image_poses {
+                if let Some(slot) = reconstruction.poses.get_mut(frame_image) {
+                    *slot = Some(frame_pose);
+                }
+            }
+            if let Some(frame) = reconstruction.frames.get_mut(frame_registration.frame_idx) {
+                frame.rig_from_world =
+                    crate::types::Rigid3::from_se3(frame_registration.rig_from_world);
+            }
+        } else if let Some(slot) = reconstruction.poses.get_mut(image) {
+            *slot = Some(pose);
+        } else {
+            return false;
+        }
         self.rebuild(frames, pairs, reconstruction);
         true
     }
@@ -183,24 +213,52 @@ impl ObservationManager {
         reconstruction: &mut Reconstruction,
         image: usize,
     ) -> bool {
+        self.deregister_frame_for_image(frames, pairs, reconstruction, image)
+    }
+
+    pub fn deregister_frame_for_image(
+        &mut self,
+        frames: &[ImageFrame],
+        pairs: &[PairGeometry],
+        reconstruction: &mut Reconstruction,
+        image: usize,
+    ) -> bool {
         if image >= reconstruction.poses.len() {
             return false;
         }
-        let features = reconstruction
-            .observations
-            .get(image)
-            .map(|observations| {
-                observations
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(feature, point_id)| point_id.is_some().then_some(feature))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for feature in features {
-            self.delete_observation(frames, pairs, reconstruction, image, feature);
+        let frame_images = reconstruction.image_indices_for_registration_unit(image);
+        if frame_images.iter().all(|&frame_image| {
+            reconstruction
+                .poses
+                .get(frame_image)
+                .is_none_or(|pose| pose.is_none())
+        }) {
+            return false;
         }
-        reconstruction.poses[image] = None;
+        for frame_image in frame_images {
+            let features = reconstruction
+                .observations
+                .get(frame_image)
+                .map(|observations| {
+                    observations
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(feature, point_id)| point_id.is_some().then_some(feature))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for feature in features {
+                self.delete_observation(frames, pairs, reconstruction, frame_image, feature);
+            }
+            if let Some(slot) = reconstruction.poses.get_mut(frame_image) {
+                *slot = None;
+            }
+        }
+        if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
+            if let Some(frame) = reconstruction.frames.get_mut(frame_idx) {
+                frame.rig_from_world = crate::types::Rigid3::identity();
+            }
+        }
         self.rebuild(frames, pairs, reconstruction);
         true
     }
@@ -572,7 +630,10 @@ fn next_point3d_id(reconstruction: &Reconstruction) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CameraModel, ImageFrame, Point3D, Reconstruction, TrackObservation};
+    use crate::types::{
+        CameraModel, DataId, Frame, ImageFrame, Point3D, Reconstruction, Rig, RigSensor, Rigid3,
+        SensorId, SensorType, TrackObservation,
+    };
     use rustslam::{Descriptors, Match, SE3};
     use std::path::PathBuf;
 
@@ -653,6 +714,34 @@ mod tests {
     }
 
     #[test]
+    fn register_image_registers_whole_rig_frame_with_sensor_poses() {
+        let frames = vec![frame(0, 100, 100), frame(1, 100, 100), frame(2, 100, 100)];
+        let pairs = vec![pair(1, 2, &[(0, 0), (1, 1)])];
+        let mut reconstruction = reconstruction(&frames);
+        add_two_camera_rig_frame(&mut reconstruction, 0, 1);
+        let mut manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+        let selected_pose =
+            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(10.0, 0.0, 0.0));
+
+        assert!(manager.register_image(&frames, &pairs, &mut reconstruction, 1, selected_pose));
+
+        assert_eq!(
+            reconstruction.poses[0].unwrap().translation(),
+            [9.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            reconstruction.poses[1].unwrap().translation(),
+            [10.0, 0.0, 0.0]
+        );
+        assert!(reconstruction.poses[2].is_none());
+        assert_eq!(
+            reconstruction.frames[0].rig_from_world.tvec,
+            [9.0, 0.0, 0.0]
+        );
+        assert_eq!(manager.num_visible_correspondences(2), 2);
+    }
+
+    #[test]
     fn deregister_image_deletes_its_observations_and_refreshes_stats() {
         let frames = vec![frame(0, 100, 100), frame(1, 100, 100), frame(2, 100, 100)];
         let pairs = vec![pair(0, 1, &[(0, 0)]), pair(1, 2, &[(0, 0)])];
@@ -698,6 +787,55 @@ mod tests {
         assert_eq!(reconstruction.observations[2][0], Some(0));
         assert_eq!(manager.num_visible_correspondences(1), 1);
         assert_eq!(manager.num_visible_correspondences(0), 1);
+    }
+
+    #[test]
+    fn deregister_image_deregisters_whole_rig_frame() {
+        let frames = vec![frame(0, 100, 100), frame(1, 100, 100), frame(2, 100, 100)];
+        let pairs = vec![pair(0, 2, &[(0, 0)]), pair(1, 2, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        add_two_camera_rig_frame(&mut reconstruction, 0, 1);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.poses[2] = Some(SE3::identity());
+        let mut manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+        manager
+            .add_point3d(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                Point3D {
+                    xyz: [0.0, 0.0, 1.0],
+                    color: [0, 0, 0],
+                    error: 0.0,
+                    track: vec![
+                        TrackObservation {
+                            image: 0,
+                            feature: 0,
+                        },
+                        TrackObservation {
+                            image: 1,
+                            feature: 0,
+                        },
+                        TrackObservation {
+                            image: 2,
+                            feature: 0,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+        assert!(manager.deregister_image(&frames, &pairs, &mut reconstruction, 1));
+
+        assert!(reconstruction.poses[0].is_none());
+        assert!(reconstruction.poses[1].is_none());
+        assert!(reconstruction.poses[2].is_some());
+        assert_eq!(reconstruction.observations[0][0], None);
+        assert_eq!(reconstruction.observations[1][0], None);
+        assert_eq!(reconstruction.observations[2][0], None);
+        assert!(reconstruction.points.is_empty());
+        assert_eq!(reconstruction.frames[0].rig_from_world, Rigid3::identity());
     }
 
     #[test]
@@ -958,6 +1096,51 @@ mod tests {
             point_ids: Vec::new(),
             points: Vec::new(),
         }
+    }
+
+    fn add_two_camera_rig_frame(reconstruction: &mut Reconstruction, left: usize, right: usize) {
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let right_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: right_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [1.0, 0.0, 0.0],
+                    }),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: vec![
+                DataId {
+                    sensor_id: ref_sensor,
+                    data_id: reconstruction.image_id(left) as u64,
+                },
+                DataId {
+                    sensor_id: right_sensor,
+                    data_id: reconstruction.image_id(right) as u64,
+                },
+            ],
+        }];
+        reconstruction.image_frame_indices[left] = Some(0);
+        reconstruction.image_frame_indices[right] = Some(0);
     }
 
     fn pair(left: usize, right: usize, matches: &[(u32, u32)]) -> PairGeometry {

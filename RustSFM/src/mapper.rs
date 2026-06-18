@@ -60,6 +60,123 @@ struct MapperDatabaseInput {
     two_view_geometries: HashMap<ImagePairId, ColmapTwoViewGeometry>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RegistrationStats {
+    num_reg_frames_per_rig: HashMap<u32, usize>,
+    num_reg_images_per_camera: HashMap<u32, usize>,
+    num_registrations: Vec<usize>,
+    num_total_reg_images: usize,
+    num_shared_reg_images: usize,
+}
+
+impl RegistrationStats {
+    fn from_reconstruction(reconstruction: &Reconstruction) -> Self {
+        let mut stats = Self {
+            num_registrations: vec![0; reconstruction.poses.len()],
+            ..Self::default()
+        };
+        let mut registered_frames = HashSet::new();
+        for image in 0..reconstruction.poses.len() {
+            if reconstruction.poses[image].is_none() {
+                continue;
+            }
+            if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
+                if registered_frames.insert(frame_idx) {
+                    stats.register_frame_event(reconstruction, frame_idx);
+                }
+            } else {
+                stats.register_image_event(reconstruction, image);
+            }
+        }
+        stats
+    }
+
+    fn register_image_event(&mut self, reconstruction: &Reconstruction, image: usize) {
+        if image >= reconstruction.poses.len() {
+            return;
+        }
+        let camera_id = reconstruction.camera_id_for_image(image);
+        *self.num_reg_images_per_camera.entry(camera_id).or_default() += 1;
+        if image >= self.num_registrations.len() {
+            self.num_registrations.resize(image + 1, 0);
+        }
+        self.num_registrations[image] += 1;
+        if self.num_registrations[image] == 1 {
+            self.num_total_reg_images += 1;
+        } else {
+            self.num_shared_reg_images += 1;
+        }
+    }
+
+    #[allow(dead_code)]
+    fn deregister_image_event(&mut self, reconstruction: &Reconstruction, image: usize) {
+        if image >= reconstruction.poses.len() {
+            return;
+        }
+        let camera_id = reconstruction.camera_id_for_image(image);
+        if let Some(count) = self.num_reg_images_per_camera.get_mut(&camera_id) {
+            *count = count.saturating_sub(1);
+        }
+        if let Some(registrations) = self.num_registrations.get_mut(image) {
+            if *registrations > 0 {
+                *registrations -= 1;
+                if *registrations == 0 {
+                    self.num_total_reg_images = self.num_total_reg_images.saturating_sub(1);
+                } else {
+                    self.num_shared_reg_images = self.num_shared_reg_images.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    fn register_frame_for_image_event(&mut self, reconstruction: &Reconstruction, image: usize) {
+        if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
+            self.register_frame_event(reconstruction, frame_idx);
+        } else {
+            self.register_image_event(reconstruction, image);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn deregister_frame_for_image_event(&mut self, reconstruction: &Reconstruction, image: usize) {
+        if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
+            self.deregister_frame_event(reconstruction, frame_idx);
+        } else {
+            self.deregister_image_event(reconstruction, image);
+        }
+    }
+
+    fn register_frame_event(&mut self, reconstruction: &Reconstruction, frame_idx: usize) {
+        let Some(frame) = reconstruction.frames.get(frame_idx) else {
+            return;
+        };
+        *self.num_reg_frames_per_rig.entry(frame.rig_id).or_default() += 1;
+        for image in reconstruction.image_indices_for_frame_index(frame_idx) {
+            self.register_image_event(reconstruction, image);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn deregister_frame_event(&mut self, reconstruction: &Reconstruction, frame_idx: usize) {
+        let Some(frame) = reconstruction.frames.get(frame_idx) else {
+            return;
+        };
+        if let Some(count) = self.num_reg_frames_per_rig.get_mut(&frame.rig_id) {
+            *count = count.saturating_sub(1);
+        }
+        for image in reconstruction.image_indices_for_frame_index(frame_idx) {
+            self.deregister_image_event(reconstruction, image);
+        }
+    }
+
+    fn registered_images_with_camera_id(&self, camera_id: u32) -> usize {
+        self.num_reg_images_per_camera
+            .get(&camera_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureType {
     Orb,
@@ -2313,7 +2430,7 @@ fn incremental_map(
         .cloned()
         .collect::<Vec<_>>();
     let pairs = mapping_pairs.as_slice();
-    let initial = choose_initial_pair(pairs, config).context("no initial pair")?;
+    let initial = choose_initial_pair(pairs, &reconstruction, config).context("no initial pair")?;
     debug_log.push(format!(
         "initial_pair {} -> {} inliers={} triangulated={}",
         frames[initial.left].name,
@@ -2338,6 +2455,7 @@ fn incremental_map(
             initial.relative_pose,
         );
     }
+    let mut registration_stats = RegistrationStats::from_reconstruction(&reconstruction);
     let gauge_image = initial.left;
     let tri_options =
         IncrementalTriangulatorOptions::from_mapper_threshold(config.max_reprojection_error_px);
@@ -2375,6 +2493,7 @@ fn incremental_map(
             config,
             &camera_priors,
             &camera_has_prior_focal_length,
+            &registration_stats,
         ) else {
             break;
         };
@@ -2455,7 +2574,8 @@ fn incremental_map(
             ));
             continue;
         }
-        reg_trials[choice.image] = 0;
+        registration_stats.register_frame_for_image_event(&reconstruction, choice.image);
+        reset_registration_unit_trials(&reconstruction, choice.image, &mut reg_trials);
         debug_log.push(registration_log);
         if structureless_track_report.total_observations() > 0 {
             debug_log.push(format!(
@@ -2511,6 +2631,7 @@ fn incremental_map(
             config,
             &camera_priors,
             &camera_has_prior_focal_length,
+            &registration_stats,
         );
     }
     if should_run_final_global_ba(&global_ba_schedule, &reconstruction, config) {
@@ -2550,11 +2671,12 @@ fn choose_next_registration(
     config: &MapperConfig,
     camera_priors: &[CameraModel],
     camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
 ) -> Option<RegistrationChoice> {
     let mut best = None::<(f32, RegistrationChoice)>;
     let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
     for image in 0..reconstruction.poses.len() {
-        if reconstruction.poses[image].is_some() {
+        if registration_unit_is_registered(reconstruction, image) {
             continue;
         }
         if reg_trials.get(image).copied().unwrap_or(0) >= config.max_reg_trials {
@@ -2568,6 +2690,7 @@ fn choose_next_registration(
             config,
             camera_priors,
             camera_has_prior_focal_length,
+            registration_stats,
         ) {
             (abs_pose, "pnp")
         } else {
@@ -2579,6 +2702,7 @@ fn choose_next_registration(
                 config,
                 &obs_manager,
                 camera_priors,
+                registration_stats,
             ) else {
                 continue;
             };
@@ -2621,10 +2745,11 @@ fn mark_unregistered_images_with_no_absolute_pose(
     config: &MapperConfig,
     camera_priors: &[CameraModel],
     camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
 ) {
     let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
     for image in 0..reconstruction.poses.len() {
-        if reconstruction.poses[image].is_some()
+        if registration_unit_is_registered(reconstruction, image)
             || reg_trials.get(image).copied().unwrap_or(0) >= config.max_reg_trials
         {
             continue;
@@ -2637,6 +2762,7 @@ fn mark_unregistered_images_with_no_absolute_pose(
             config,
             camera_priors,
             camera_has_prior_focal_length,
+            registration_stats,
         )
         .or_else(|| {
             solve_structureless_absolute_pose(
@@ -2647,6 +2773,7 @@ fn mark_unregistered_images_with_no_absolute_pose(
                 config,
                 &obs_manager,
                 camera_priors,
+                registration_stats,
             )
         })
         .map(|pose| {
@@ -2657,6 +2784,32 @@ fn mark_unregistered_images_with_no_absolute_pose(
         .unwrap_or(false);
         if !has_pose {
             reg_trials[image] += 1;
+        }
+    }
+}
+
+fn registration_unit_is_registered(reconstruction: &Reconstruction, image: usize) -> bool {
+    reconstruction
+        .image_indices_for_registration_unit(image)
+        .iter()
+        .any(|&frame_image| {
+            reconstruction
+                .poses
+                .get(frame_image)
+                .copied()
+                .flatten()
+                .is_some()
+        })
+}
+
+fn reset_registration_unit_trials(
+    reconstruction: &Reconstruction,
+    image: usize,
+    reg_trials: &mut [usize],
+) {
+    for frame_image in reconstruction.image_indices_for_registration_unit(image) {
+        if let Some(trials) = reg_trials.get_mut(frame_image) {
+            *trials = 0;
         }
     }
 }
@@ -3236,20 +3389,34 @@ fn absolute_pose_pair_rotation_limit_deg() -> f32 {
 
 fn choose_initial_pair<'a>(
     pairs: &'a [PairGeometry],
+    reconstruction: &Reconstruction,
     config: &MapperConfig,
 ) -> Option<&'a PairGeometry> {
     let image_correspondences = image_correspondence_counts(pairs);
     pairs
         .iter()
-        .filter(|p| is_colmap_style_initial_pair(p, config))
+        .filter(|p| is_colmap_style_initial_pair(p, reconstruction, config))
         .max_by(|a, b| compare_initial_pairs(a, b, &image_correspondences))
 }
 
-fn is_colmap_style_initial_pair(pair: &PairGeometry, config: &MapperConfig) -> bool {
+fn is_colmap_style_initial_pair(
+    pair: &PairGeometry,
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> bool {
     pair.inliers >= config.init_min_num_inliers
         && pair.median_triangulation_angle_deg > config.init_min_tri_angle_deg
         && pair.triangulated >= config.min_triangulated
         && initial_pair_forward_motion(pair) < config.init_max_forward_motion
+        && !same_registration_frame(reconstruction, pair.left, pair.right)
+}
+
+fn same_registration_frame(reconstruction: &Reconstruction, left: usize, right: usize) -> bool {
+    left != right
+        && reconstruction
+            .frame_index_for_image(left)
+            .zip(reconstruction.frame_index_for_image(right))
+            .is_some_and(|(left_frame, right_frame)| left_frame == right_frame)
 }
 
 fn initial_pair_forward_motion(pair: &PairGeometry) -> f32 {
@@ -3362,6 +3529,7 @@ fn solve_structureless_absolute_pose(
     config: &MapperConfig,
     obs_manager: &ObservationManager,
     camera_priors: &[CameraModel],
+    registration_stats: &RegistrationStats,
 ) -> Option<AbsolutePose> {
     if let Some(abs_pose) = solve_colmap_structureless_absolute_pose(
         image,
@@ -3371,6 +3539,7 @@ fn solve_structureless_absolute_pose(
         config,
         obs_manager,
         camera_priors,
+        registration_stats,
     ) {
         return Some(abs_pose);
     }
@@ -3385,6 +3554,7 @@ fn solve_structureless_absolute_pose(
         config,
         obs_manager,
         camera_priors,
+        registration_stats,
     )
 }
 
@@ -3396,11 +3566,18 @@ fn solve_colmap_structureless_absolute_pose(
     config: &MapperConfig,
     obs_manager: &ObservationManager,
     camera_priors: &[CameraModel],
+    registration_stats: &RegistrationStats,
 ) -> Option<AbsolutePose> {
     if registered_image_count(reconstruction) < 2 {
         return None;
     }
-    let camera = registration_camera_for_image(image, reconstruction, config, camera_priors);
+    let camera = registration_camera_for_image(
+        image,
+        reconstruction,
+        config,
+        camera_priors,
+        registration_stats,
+    );
     if camera_has_bogus_params(camera, config) {
         return None;
     }
@@ -3564,11 +3741,18 @@ fn solve_experimental_structureless_pair_pose_fallback(
     config: &MapperConfig,
     obs_manager: &ObservationManager,
     camera_priors: &[CameraModel],
+    registration_stats: &RegistrationStats,
 ) -> Option<AbsolutePose> {
     if registered_image_count(reconstruction) < 2 {
         return None;
     }
-    let camera = registration_camera_for_image(image, reconstruction, config, camera_priors);
+    let camera = registration_camera_for_image(
+        image,
+        reconstruction,
+        config,
+        camera_priors,
+        registration_stats,
+    );
     if camera_has_bogus_params(camera, config) {
         return None;
     }
@@ -4182,8 +4366,15 @@ fn solve_absolute_pose(
     config: &MapperConfig,
     camera_priors: &[CameraModel],
     camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
 ) -> Option<AbsolutePose> {
-    let camera = registration_camera_for_image(image, reconstruction, config, camera_priors);
+    let camera = registration_camera_for_image(
+        image,
+        reconstruction,
+        config,
+        camera_priors,
+        registration_stats,
+    );
     if camera_has_bogus_params(camera, config) {
         return None;
     }
@@ -4238,6 +4429,7 @@ fn solve_absolute_pose(
         reconstruction,
         config,
         camera_has_prior_focal_length,
+        registration_stats,
     );
     let (pose, inliers, camera) = solve_absolute_pose_with_camera_hypotheses(
         &pose_observations,
@@ -4261,7 +4453,13 @@ fn solve_absolute_pose(
         reconstruction,
         &refinement_observations,
         camera,
-        absolute_pose_refine_camera_params_enabled(image, camera, reconstruction, config),
+        absolute_pose_refine_camera_params_enabled(
+            image,
+            camera,
+            reconstruction,
+            config,
+            registration_stats,
+        ),
         config,
     )?;
     let final_eval = evaluate_absolute_pose(pose, &pose_observations, None, camera, config)?;
@@ -4424,6 +4622,7 @@ fn absolute_pose_estimate_focal_length_enabled(
     reconstruction: &Reconstruction,
     config: &MapperConfig,
     camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
 ) -> bool {
     if !config.ba_refine_focal_length {
         return false;
@@ -4448,7 +4647,7 @@ fn absolute_pose_estimate_focal_length_enabled(
     {
         return false;
     }
-    registered_images_with_camera(reconstruction, image, camera_idx) == 0
+    registration_stats.registered_images_with_camera_id(camera_id) == 0
         || camera_has_bogus_params(camera, config)
 }
 
@@ -4564,6 +4763,7 @@ fn absolute_pose_refine_camera_params_enabled(
     camera: CameraModel,
     reconstruction: &Reconstruction,
     config: &MapperConfig,
+    registration_stats: &RegistrationStats,
 ) -> bool {
     let camera_idx = reconstruction
         .image_camera_indices
@@ -4579,7 +4779,7 @@ fn absolute_pose_refine_camera_params_enabled(
         return false;
     }
     let registered_images_with_camera =
-        registered_images_with_camera(reconstruction, image, camera_idx);
+        registration_stats.registered_images_with_camera_id(camera_id);
     if registered_images_with_camera > 0 && !camera_has_bogus_params(camera, config) {
         return false;
     }
@@ -5305,12 +5505,18 @@ fn registration_camera_for_image(
     reconstruction: &Reconstruction,
     config: &MapperConfig,
     camera_priors: &[CameraModel],
+    registration_stats: &RegistrationStats,
 ) -> CameraModel {
     let camera = reconstruction.camera_for_image(image);
     let Some(camera_idx) = reconstruction.image_camera_indices.get(image).copied() else {
         return camera;
     };
-    if registered_images_with_camera(reconstruction, image, camera_idx) == 0 {
+    let camera_id = reconstruction
+        .camera_ids
+        .get(camera_idx)
+        .copied()
+        .unwrap_or(1);
+    if registration_stats.registered_images_with_camera_id(camera_id) == 0 {
         if let Some(prior) = healthy_camera_prior(camera_idx, config, camera_priors) {
             return prior;
         }
@@ -5328,28 +5534,6 @@ fn healthy_camera_prior(
 ) -> Option<CameraModel> {
     let prior = camera_priors.get(camera_idx).copied()?;
     (!camera_has_bogus_params(prior, config)).then_some(prior)
-}
-
-fn registered_images_with_camera(
-    reconstruction: &Reconstruction,
-    image: usize,
-    camera_idx: usize,
-) -> usize {
-    reconstruction
-        .poses
-        .iter()
-        .enumerate()
-        .filter(|&(other_image, pose)| {
-            other_image != image
-                && pose.is_some()
-                && reconstruction
-                    .image_camera_indices
-                    .get(other_image)
-                    .copied()
-                    .unwrap_or(0)
-                    == camera_idx
-        })
-        .count()
 }
 
 fn unique_track_observations(observations: Vec<TrackObservation>) -> Option<Vec<TrackObservation>> {
@@ -6979,13 +7163,15 @@ mod tests {
             1,
             reconstruction.camera_for_image(1),
             &reconstruction,
-            &MapperConfig::default()
+            &MapperConfig::default(),
+            &registration_stats(&reconstruction),
         ));
         assert!(absolute_pose_refine_camera_params_enabled(
             2,
             reconstruction.camera_for_image(2),
             &reconstruction,
-            &MapperConfig::default()
+            &MapperConfig::default(),
+            &registration_stats(&reconstruction),
         ));
 
         let constant_config = MapperConfig {
@@ -6996,7 +7182,8 @@ mod tests {
             2,
             reconstruction.camera_for_image(2),
             &reconstruction,
-            &constant_config
+            &constant_config,
+            &registration_stats(&reconstruction),
         ));
 
         reconstruction.cameras[0].params[0] = 1.0;
@@ -7005,8 +7192,63 @@ mod tests {
             1,
             reconstruction.camera_for_image(1),
             &reconstruction,
-            &MapperConfig::default()
+            &MapperConfig::default(),
+            &registration_stats(&reconstruction),
         ));
+    }
+
+    #[test]
+    fn registration_stats_track_frame_rig_camera_and_shared_image_events() {
+        let frames = vec![
+            minimal_frame(0, "seed.jpg"),
+            minimal_frame(1, "rig_ref.jpg"),
+            minimal_frame(2, "rig_aux.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![11, 12];
+        reconstruction.image_camera_indices = vec![0, 0, 1];
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(SensorId {
+                sensor_type: SensorType::Camera,
+                sensor_id: 11,
+            }),
+            sensors: Vec::new(),
+        }];
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: Vec::new(),
+        }];
+        reconstruction.image_frame_indices[1] = Some(0);
+        reconstruction.image_frame_indices[2] = Some(0);
+
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        assert_eq!(stats.num_total_reg_images, 1);
+        assert_eq!(stats.registered_images_with_camera_id(11), 1);
+
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.poses[2] = Some(SE3::identity());
+        stats.register_frame_for_image_event(&reconstruction, 1);
+
+        assert_eq!(stats.num_reg_frames_per_rig.get(&3), Some(&1));
+        assert_eq!(stats.registered_images_with_camera_id(11), 2);
+        assert_eq!(stats.registered_images_with_camera_id(12), 1);
+        assert_eq!(stats.num_total_reg_images, 3);
+        assert_eq!(stats.num_shared_reg_images, 0);
+
+        stats.deregister_frame_for_image_event(&reconstruction, 2);
+
+        assert_eq!(stats.num_reg_frames_per_rig.get(&3), Some(&0));
+        assert_eq!(stats.registered_images_with_camera_id(11), 1);
+        assert_eq!(stats.registered_images_with_camera_id(12), 0);
+        assert_eq!(stats.num_total_reg_images, 1);
     }
 
     #[test]
@@ -7024,8 +7266,13 @@ mod tests {
         reconstruction.poses[0] = Some(SE3::identity());
         let priors = vec![prior, prior];
 
-        let camera =
-            registration_camera_for_image(1, &reconstruction, &MapperConfig::default(), &priors);
+        let camera = registration_camera_for_image(
+            1,
+            &reconstruction,
+            &MapperConfig::default(),
+            &priors,
+            &registration_stats(&reconstruction),
+        );
 
         assert_eq!(camera.fx, prior.fx);
         assert_eq!(camera.fy, prior.fy);
@@ -7046,8 +7293,13 @@ mod tests {
         reconstruction.poses[0] = Some(SE3::identity());
         let priors = vec![prior];
 
-        let camera =
-            registration_camera_for_image(1, &reconstruction, &MapperConfig::default(), &priors);
+        let camera = registration_camera_for_image(
+            1,
+            &reconstruction,
+            &MapperConfig::default(),
+            &priors,
+            &registration_stats(&reconstruction),
+        );
 
         assert_eq!(camera.fx, refined.fx);
         assert_eq!(camera.fy, refined.fy);
@@ -7075,6 +7327,7 @@ mod tests {
             &reconstruction,
             &MapperConfig::default(),
             &[true, false],
+            &registration_stats(&reconstruction),
         ));
         assert!(!absolute_pose_estimate_focal_length_enabled(
             1,
@@ -7082,6 +7335,7 @@ mod tests {
             &reconstruction,
             &MapperConfig::default(),
             &[true, true],
+            &registration_stats(&reconstruction),
         ));
     }
 
@@ -7311,6 +7565,7 @@ mod tests {
             &MapperConfig::default(),
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         )
         .is_none());
     }
@@ -7338,6 +7593,7 @@ mod tests {
             &MapperConfig::default(),
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         )
         .is_none());
     }
@@ -7420,6 +7676,7 @@ mod tests {
             &config,
             &camera_priors,
             &[true, false],
+            &registration_stats(&reconstruction),
         )
         .unwrap();
 
@@ -7653,6 +7910,7 @@ mod tests {
             &config,
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         );
 
         assert!(choice.is_none());
@@ -7682,6 +7940,7 @@ mod tests {
             &config,
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         )
         .unwrap();
 
@@ -7756,6 +8015,7 @@ mod tests {
             &config,
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         )
         .unwrap();
 
@@ -7895,6 +8155,7 @@ mod tests {
             &config,
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         );
 
         assert!(choice.is_none());
@@ -7920,6 +8181,7 @@ mod tests {
             &config,
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         );
 
         assert!(choice.is_none());
@@ -7957,6 +8219,7 @@ mod tests {
             &config,
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         )
         .unwrap();
 
@@ -7990,6 +8253,7 @@ mod tests {
             &config,
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
+            &registration_stats(&reconstruction),
         );
 
         assert_eq!(reg_trials[1], 0);
@@ -8268,8 +8532,11 @@ mod tests {
         let weak_adjacent = test_pair(0, 1, 120, 60, 20.0, [1.0, 0.0, 0.0]);
         let strong_non_adjacent = test_pair(0, 3, 220, 140, 25.0, [1.0, 0.1, 0.0]);
         let pairs = vec![weak_adjacent, strong_non_adjacent];
+        let frames = structureless_frames(4);
+        let reconstruction = test_reconstruction(&frames);
 
-        let chosen = choose_initial_pair(&pairs, &MapperConfig::default()).unwrap();
+        let chosen =
+            choose_initial_pair(&pairs, &reconstruction, &MapperConfig::default()).unwrap();
 
         assert_eq!((chosen.left, chosen.right), (0, 3));
     }
@@ -8280,8 +8547,11 @@ mod tests {
         let low_angle = test_pair(0, 2, 260, 180, 2.0, [1.0, 0.0, 0.0]);
         let stable = test_pair(1, 3, 140, 90, 18.0, [1.0, 0.0, 0.1]);
         let pairs = vec![forward_motion, low_angle, stable];
+        let frames = structureless_frames(4);
+        let reconstruction = test_reconstruction(&frames);
 
-        let chosen = choose_initial_pair(&pairs, &MapperConfig::default()).unwrap();
+        let chosen =
+            choose_initial_pair(&pairs, &reconstruction, &MapperConfig::default()).unwrap();
 
         assert_eq!((chosen.left, chosen.right), (1, 3));
     }
@@ -8292,8 +8562,32 @@ mod tests {
         let low_angle = test_pair(0, 2, 260, 180, 2.0, [1.0, 0.0, 0.0]);
         let low_inliers = test_pair(1, 3, 50, 90, 18.0, [1.0, 0.0, 0.1]);
         let pairs = vec![forward_motion, low_angle, low_inliers];
+        let frames = structureless_frames(4);
+        let reconstruction = test_reconstruction(&frames);
 
-        assert!(choose_initial_pair(&pairs, &MapperConfig::default()).is_none());
+        assert!(choose_initial_pair(&pairs, &reconstruction, &MapperConfig::default()).is_none());
+    }
+
+    #[test]
+    fn initial_pair_skips_images_from_same_frame() {
+        let same_frame = test_pair(0, 1, 500, 450, 25.0, [1.0, 0.0, 0.0]);
+        let cross_frame = test_pair(1, 2, 180, 140, 18.0, [1.0, 0.0, 0.0]);
+        let pairs = vec![same_frame, cross_frame];
+        let frames = structureless_frames(3);
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: Vec::new(),
+        }];
+        reconstruction.image_frame_indices[0] = Some(0);
+        reconstruction.image_frame_indices[1] = Some(0);
+
+        let chosen =
+            choose_initial_pair(&pairs, &reconstruction, &MapperConfig::default()).unwrap();
+
+        assert_eq!((chosen.left, chosen.right), (1, 2));
     }
 
     #[test]
@@ -8760,6 +9054,10 @@ mod tests {
 
     fn camera_prior_focal_flags(reconstruction: &Reconstruction, value: bool) -> Vec<bool> {
         vec![value; reconstruction.cameras.len()]
+    }
+
+    fn registration_stats(reconstruction: &Reconstruction) -> RegistrationStats {
+        RegistrationStats::from_reconstruction(reconstruction)
     }
 
     fn test_reconstruction(frames: &[ImageFrame]) -> Reconstruction {

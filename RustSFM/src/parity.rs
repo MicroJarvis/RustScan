@@ -32,6 +32,9 @@ pub struct DatabaseLayerStats {
     pub images: usize,
     pub frames: usize,
     pub rigs: usize,
+    pub frame_data: usize,
+    pub images_with_frame: usize,
+    pub images_without_frame: usize,
     pub pose_priors: usize,
     pub keypoint_rows: usize,
     pub keypoints: usize,
@@ -147,11 +150,22 @@ fn raw_database_stats(db: &ColmapDatabase) -> Result<DatabaseLayerStats> {
     let keypoint_counts = db.read_keypoint_counts()?;
     let raw_matches = db.read_all_matches()?;
     let two_view_geometries = db.read_two_view_geometries()?;
+    let images = db.read_all_images()?;
+    let frames = db.read_all_frames()?;
     Ok(DatabaseLayerStats {
         cameras: db.read_all_cameras()?.len(),
-        images: db.read_all_images()?.len(),
-        frames: db.read_all_frames()?.len(),
+        images: images.len(),
+        frames: frames.len(),
         rigs: db.read_all_rigs()?.len(),
+        frame_data: frames.iter().map(|frame| frame.data_ids.len()).sum(),
+        images_with_frame: images
+            .iter()
+            .filter(|image| image.frame_id.is_some())
+            .count(),
+        images_without_frame: images
+            .iter()
+            .filter(|image| image.frame_id.is_none())
+            .count(),
         pose_priors: db.read_all_pose_priors()?.len(),
         keypoint_rows: keypoint_counts.len(),
         keypoints: keypoint_counts.iter().map(|(_, count)| *count).sum(),
@@ -186,6 +200,21 @@ fn cache_stats(
         images: cache.images.len(),
         frames: cache.frames.len(),
         rigs: cache.rigs.len(),
+        frame_data: cache
+            .frames
+            .values()
+            .map(|frame| frame.data_ids.len())
+            .sum(),
+        images_with_frame: cache
+            .images
+            .values()
+            .filter(|image| image.frame_id.is_some())
+            .count(),
+        images_without_frame: cache
+            .images
+            .values()
+            .filter(|image| image.frame_id.is_none())
+            .count(),
         pose_priors: cache.pose_priors.len(),
         keypoint_rows: cache.images.len(),
         keypoints,
@@ -585,9 +614,17 @@ mod tests {
 
         let report = compare_database_parity(&path, Vec::<String>::new(), 1, true, false)?;
         assert_eq!(report.raw.images, 3);
+        assert_eq!(report.raw.frames, 0);
+        assert_eq!(report.raw.frame_data, 0);
+        assert_eq!(report.raw.images_with_frame, 0);
+        assert_eq!(report.raw.images_without_frame, 3);
         assert_eq!(report.raw.two_view_pairs, 3);
         assert_eq!(report.raw.verified_two_view_pairs, 2);
         assert_eq!(report.cache.images, 2);
+        assert_eq!(report.cache.frames, 3);
+        assert_eq!(report.cache.frame_data, 3);
+        assert_eq!(report.cache.images_with_frame, 2);
+        assert_eq!(report.cache.images_without_frame, 0);
         assert_eq!(report.cache.two_view_pairs, 1);
         assert_eq!(report.bridge.frame_pairs, 1);
         assert_eq!(report.bridge.matches, 2);

@@ -62,8 +62,19 @@ reconstruction parity.
    - Added mapper-level rig/frame metadata and per-image frame ownership, wired
      through reference sparse models, database cache initialization, and
      COLMAP text export.
-   - Remaining work: full frame/rig-level registration, deregistration,
-     generalized pose, and BA parameter scheduling semantics.
+   - Added frame-aware mapper registration helpers: registering or
+     deregistering one image now operates on its full COLMAP frame, preserves
+     `rig_from_world`, derives sibling camera poses from known
+     `sensor_from_rig` transforms, and avoids selecting same-frame images as
+     initial-pair seeds.
+   - Added COLMAP-shaped registration event counters for registered frames per
+     rig, registered images per camera, total registration counts, and shared
+     registration counts, plus parity reporting for frame ownership and
+     `frame_data` coverage.
+   - Remaining work: generalized pose registration for non-trivial rigs,
+     frame/rig-level BA parameter scheduling, exact filtered-frame event
+     counters in all mapper cleanup paths, and full COLMAP frame pose export
+     after BA updates.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
@@ -303,9 +314,13 @@ reconstruction parity.
      instead of rewriting reconstruction point/observation tables directly.
    - Added register/deregister image bookkeeping, including visible
      correspondence refresh and deregistration-time observation deletion.
+   - Extended registration/deregistration hooks to operate at COLMAP frame
+     granularity, deleting observations and refreshing correspondence stats
+     for every image in the frame, with rig sensor pose propagation for known
+     `sensor_from_rig` setups.
    - Remaining work: keep a longer-lived mapper-level observation manager and
-     extend the image-level registration hooks to full COLMAP frame/rig
-     semantics.
+     finish exact COLMAP frame/rig semantics for generalized pose, BA
+     scheduling, and all filtering/deregistration cleanup events.
 17. [partial] Port `IncrementalTriangulator` create/continue/merge/complete/retriangulate
     behavior, transitivity, angular/reprojection thresholds, and two-view-track
     handling.
