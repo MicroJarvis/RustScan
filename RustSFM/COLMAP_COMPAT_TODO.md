@@ -192,9 +192,14 @@ reconstruction parity.
    - Mapper pair filtering now treats WATERMARK and MULTIPLE as verified
      geometry classes that are not used as default incremental reconstruction
      edges.
-   - Remaining work: exact homography pose decomposition, exact official
-     planar-vs-panoramic disambiguation, and `CALIBRATED_RIG` generalized
-     relative pose.
+   - Homography-dominant planar/panoramic disambiguation now follows COLMAP's
+     homography-pose path: decompose normalized H, choose the cheirality/bearing
+     reprojection winner with midpoint triangulation, and classify
+     `PLANAR_OR_PANORAMIC` by the selected pose translation norm instead of
+     the previous closest-rotation residual heuristic.
+   - Remaining work: validate homography decomposition numerics against
+     COLMAP reference fixtures, finish exact pose handoff for planar geometry,
+     and implement `CALIBRATED_RIG` generalized relative pose.
 10. [partial] Replace the local RANSAC implementation with COLMAP-equivalent
     RANSAC / LORANSAC support scoring, stopping criteria, random seeding, and
     solver selection.

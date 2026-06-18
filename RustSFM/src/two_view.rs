@@ -305,7 +305,14 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
     }
     if two_view_config == crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC {
         if let Some((homography, _)) = h_support.as_ref() {
-            two_view_config = classify_homography_motion(homography, camera1, camera2);
+            two_view_config = classify_homography_motion(
+                homography,
+                camera1,
+                camera2,
+                &pts1,
+                &pts2,
+                &selected_mask,
+            );
         }
     }
     if options.detect_watermark
@@ -394,7 +401,14 @@ fn estimate_force_h_two_view(
         return None;
     }
 
-    let mut two_view_config = classify_homography_motion(&homography, camera1, camera2);
+    let mut two_view_config = classify_homography_motion(
+        &homography,
+        camera1,
+        camera2,
+        pts1,
+        pts2,
+        &h_support.inlier_mask,
+    );
     if options.detect_watermark
         && detect_watermark_matches(
             camera1,
@@ -1542,6 +1556,25 @@ fn classify_homography_motion(
     homography: &Matrix3<f64>,
     camera1: CameraModel,
     camera2: CameraModel,
+    rays1: &[Vector3<f64>],
+    rays2: &[Vector3<f64>],
+    inlier_mask: &[bool],
+) -> i32 {
+    if let Some((translation_norm_sq, _triangulated)) =
+        pose_from_homography_matrix(homography, camera1, camera2, rays1, rays2, inlier_mask)
+    {
+        if translation_norm_sq < 1.0e-12 {
+            return crate::database::COLMAP_TWO_VIEW_PANORAMIC;
+        }
+        return crate::database::COLMAP_TWO_VIEW_PLANAR;
+    }
+    classify_homography_motion_by_rotation(homography, camera1, camera2)
+}
+
+fn classify_homography_motion_by_rotation(
+    homography: &Matrix3<f64>,
+    camera1: CameraModel,
+    camera2: CameraModel,
 ) -> i32 {
     let Some(h_norm) = normalize_pixel_homography(homography, camera1, camera2) else {
         return crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC;
@@ -1555,6 +1588,181 @@ fn classify_homography_motion(
     } else {
         crate::database::COLMAP_TWO_VIEW_PLANAR
     }
+}
+
+fn pose_from_homography_matrix(
+    homography: &Matrix3<f64>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+    rays1: &[Vector3<f64>],
+    rays2: &[Vector3<f64>],
+    inlier_mask: &[bool],
+) -> Option<(f64, usize)> {
+    let candidates = decompose_homography_matrix(homography, camera1, camera2)?;
+    let mut best_translation_norm_sq = 0.0;
+    let mut best_points = 0usize;
+    let mut best_residual_sum = f64::MAX;
+    for (r, t) in candidates {
+        let mut points = 0usize;
+        let mut residual_sum = 0.0;
+        for (idx, &is_inlier) in inlier_mask.iter().enumerate() {
+            if !is_inlier {
+                continue;
+            }
+            let (Some(ray1), Some(ray2)) = (rays1.get(idx), rays2.get(idx)) else {
+                continue;
+            };
+            let Some(point) = triangulate_midpoint(&r, &t, ray1, ray2) else {
+                continue;
+            };
+            let point2 = r * point + t;
+            let err1 = 1.0 - clamp_unit(ray1.normalize().dot(&point.normalize()));
+            let err2 = 1.0 - clamp_unit(ray2.normalize().dot(&point2.normalize()));
+            residual_sum += err1 + err2;
+            points += 1;
+        }
+        if points > best_points || (points == best_points && residual_sum < best_residual_sum) {
+            best_points = points;
+            best_residual_sum = residual_sum;
+            best_translation_norm_sq = t.norm_squared();
+        }
+    }
+    (best_points > 0).then_some((best_translation_norm_sq, best_points))
+}
+
+fn decompose_homography_matrix(
+    homography: &Matrix3<f64>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+) -> Option<Vec<(Matrix3<f64>, Vector3<f64>)>> {
+    let k1 = camera_intrinsic_matrix(camera1);
+    let k2_inv = camera_intrinsic_matrix(camera2).try_inverse()?;
+    let mut h_norm = k2_inv * homography * k1;
+    let svd = h_norm.svd(false, false);
+    if svd.singular_values.len() < 2 || svd.singular_values[1].abs() <= 1.0e-12 {
+        return None;
+    }
+    h_norm /= svd.singular_values[1];
+    if h_norm.determinant() < 0.0 {
+        h_norm *= -1.0;
+    }
+
+    let s = h_norm.transpose() * h_norm - Matrix3::<f64>::identity();
+    if max_abs_coeff(&s) < 1.0e-3 {
+        return Some(vec![(h_norm, Vector3::zeros())]);
+    }
+
+    let m00 = opposite_minor(&s, 0, 0);
+    let m11 = opposite_minor(&s, 1, 1);
+    let m22 = opposite_minor(&s, 2, 2);
+    let rtm00 = m00.max(0.0).sqrt();
+    let rtm11 = m11.max(0.0).sqrt();
+    let rtm22 = m22.max(0.0).sqrt();
+    let m01 = opposite_minor(&s, 0, 1);
+    let m12 = opposite_minor(&s, 1, 2);
+    let m02 = opposite_minor(&s, 0, 2);
+    let e12 = sign_of_number(m12);
+    let e02 = sign_of_number(m02);
+    let e01 = sign_of_number(m01);
+    let ns = [s[(0, 0)].abs(), s[(1, 1)].abs(), s[(2, 2)].abs()];
+    let idx = ns
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)?;
+
+    let (np1, np2) = match idx {
+        0 => (
+            Vector3::new(s[(0, 0)], s[(0, 1)] + rtm22, s[(0, 2)] + e12 * rtm11),
+            Vector3::new(s[(0, 0)], s[(0, 1)] - rtm22, s[(0, 2)] - e12 * rtm11),
+        ),
+        1 => (
+            Vector3::new(s[(0, 1)] + rtm22, s[(1, 1)], s[(1, 2)] - e02 * rtm00),
+            Vector3::new(s[(0, 1)] - rtm22, s[(1, 1)], s[(1, 2)] + e02 * rtm00),
+        ),
+        2 => (
+            Vector3::new(s[(0, 2)] + e01 * rtm11, s[(1, 2)] + rtm00, s[(2, 2)]),
+            Vector3::new(s[(0, 2)] - e01 * rtm11, s[(1, 2)] - rtm00, s[(2, 2)]),
+        ),
+        _ => return None,
+    };
+    let trace_s = s.trace();
+    let v = 2.0 * (1.0 + trace_s - m00 - m11 - m22).max(0.0).sqrt();
+    if !v.is_finite() || v.abs() <= 1.0e-12 {
+        return None;
+    }
+    let esii = sign_of_number(s[(idx, idx)]);
+    let r = (2.0 + trace_s + v).max(0.0).sqrt();
+    let n_t = (2.0 + trace_s - v).max(0.0).sqrt();
+    let n1 = np1.try_normalize(1.0e-12)?;
+    let n2 = np2.try_normalize(1.0e-12)?;
+    let half_nt = 0.5 * n_t;
+    let esii_t_r = esii * r;
+    let t1_star = half_nt * (esii_t_r * n2 - n_t * n1);
+    let t2_star = half_nt * (esii_t_r * n1 - n_t * n2);
+    let r1 = compute_homography_rotation(&h_norm, &t1_star, &n1, v);
+    let t1 = r1 * t1_star;
+    let r2 = compute_homography_rotation(&h_norm, &t2_star, &n2, v);
+    let t2 = r2 * t2_star;
+    Some(vec![(r1, t1), (r1, -t1), (r2, t2), (r2, -t2)])
+}
+
+fn compute_homography_rotation(
+    h_normalized: &Matrix3<f64>,
+    tstar: &Vector3<f64>,
+    normal: &Vector3<f64>,
+    v: f64,
+) -> Matrix3<f64> {
+    h_normalized * (Matrix3::<f64>::identity() - (2.0 / v) * (tstar * normal.transpose()))
+}
+
+fn triangulate_midpoint(
+    r: &Matrix3<f64>,
+    t: &Vector3<f64>,
+    ray1: &Vector3<f64>,
+    ray2: &Vector3<f64>,
+) -> Option<Vector3<f64>> {
+    let cam1_from_cam2_rotation = r.transpose();
+    let ray2_in_cam1 = cam1_from_cam2_rotation * ray2;
+    let cam2_in_cam1 = cam1_from_cam2_rotation * -t;
+    let a = Matrix3::<f64>::from_columns(&[*ray1, -ray2_in_cam1, -cam2_in_cam1]);
+    let svd = a.svd(false, true);
+    let vt = svd.v_t?;
+    if vt.nrows() < 3 || vt[(2, 2)].abs() <= f64::EPSILON {
+        return None;
+    }
+    let lambda0 = vt[(2, 0)] / vt[(2, 2)];
+    let lambda1 = vt[(2, 1)] / vt[(2, 2)];
+    if lambda0 <= f64::EPSILON || lambda1 <= f64::EPSILON {
+        return None;
+    }
+    Some(0.5 * (lambda0 * ray1 + cam2_in_cam1 + lambda1 * ray2_in_cam1))
+}
+
+fn opposite_minor(matrix: &Matrix3<f64>, row: usize, col: usize) -> f64 {
+    let col1 = if col == 0 { 1 } else { 0 };
+    let col2 = if col == 2 { 1 } else { 2 };
+    let row1 = if row == 0 { 1 } else { 0 };
+    let row2 = if row == 2 { 1 } else { 2 };
+    matrix[(row1, col2)] * matrix[(row2, col1)] - matrix[(row1, col1)] * matrix[(row2, col2)]
+}
+
+fn sign_of_number(value: f64) -> f64 {
+    if value >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn max_abs_coeff(matrix: &Matrix3<f64>) -> f64 {
+    matrix
+        .iter()
+        .fold(0.0f64, |max, value| max.max(value.abs()))
+}
+
+fn clamp_unit(value: f64) -> f64 {
+    value.clamp(-1.0, 1.0)
 }
 
 fn normalize_pixel_homography(
@@ -2276,6 +2484,56 @@ mod tests {
 
         assert!(essential_distance(estimated, expected) < 1.0e-8);
         assert!(direct.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn homography_motion_classification_uses_pose_translation() {
+        let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let k = camera_intrinsic_matrix(camera);
+        let rotation = Rotation3::from_euler_angles(0.03, -0.02, 0.05).into_inner();
+        let pure_rotation_h = k * rotation * k.try_inverse().unwrap();
+        let scene_points = [
+            Vector3::new(-0.4, -0.2, 3.0),
+            Vector3::new(0.1, -0.3, 4.0),
+            Vector3::new(0.5, -0.1, 3.5),
+            Vector3::new(-0.2, 0.4, 4.2),
+            Vector3::new(0.4, 0.3, 3.8),
+            Vector3::new(-0.6, 0.15, 4.5),
+            Vector3::new(0.25, -0.45, 3.7),
+            Vector3::new(0.7, 0.25, 4.8),
+        ];
+        let rays1 = scene_points
+            .iter()
+            .map(|p| Vector3::new(p.x / p.z, p.y / p.z, 1.0).normalize())
+            .collect::<Vec<_>>();
+        let rays2 = rays1
+            .iter()
+            .map(|ray| (rotation * ray).normalize())
+            .collect::<Vec<_>>();
+        let inliers = vec![true; rays1.len()];
+
+        assert_eq!(
+            classify_homography_motion(&pure_rotation_h, camera, camera, &rays1, &rays2, &inliers),
+            crate::database::COLMAP_TWO_VIEW_PANORAMIC
+        );
+
+        let translation = Vector3::new(0.2, -0.03, 0.05);
+        let normal = Vector3::new(0.0, 0.0, 1.0);
+        let distance = 3.0;
+        let planar_h =
+            k * (rotation - translation * normal.transpose() / distance) * k.try_inverse().unwrap();
+        let rays2 = rays1
+            .iter()
+            .map(|ray| {
+                let point = distance * ray / normal.dot(ray);
+                (rotation * point + translation).normalize()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            classify_homography_motion(&planar_h, camera, camera, &rays1, &rays2, &inliers),
+            crate::database::COLMAP_TWO_VIEW_PLANAR
+        );
     }
 
     fn transform_homography_point(h: &Matrix3<f64>, x: f64, y: f64) -> Vector3<f64> {
