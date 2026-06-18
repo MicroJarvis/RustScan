@@ -401,14 +401,15 @@ reconstruction parity.
       convergence, no-convergence, and failure summaries.
     - BA now uses analytic pose/point Jacobians for SIMPLE_PINHOLE, PINHOLE,
       SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, FOV, SIMPLE_FISHEYE,
-      FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, and OPENCV_FISHEYE
-      reprojection residuals, with the remaining camera models falling back to
-      numerical derivatives.
+      FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, OPENCV_FISHEYE,
+      THIN_PRISM_FISHEYE, RAD_TAN_THIN_PRISM_FISHEYE, SIMPLE_DIVISION,
+      DIVISION, and EUCM reprojection residuals.
     - BA now uses analytic camera-intrinsic Jacobians for SIMPLE_PINHOLE,
       PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, FOV,
       SIMPLE_FISHEYE, FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, and
-      OPENCV_FISHEYE focal/principal-point/distortion parameters, with the
-      remaining complex camera models still using numerical fallback.
+      OPENCV_FISHEYE, THIN_PRISM_FISHEYE, RAD_TAN_THIN_PRISM_FISHEYE,
+      SIMPLE_DIVISION, DIVISION, and EUCM focal/principal-point/distortion
+      parameters.
     - BA now uses analytic chain-rule Jacobians for COLMAP frame
       `rig_from_world` and non-reference `sensor_from_rig` pose blocks,
       replacing the finite-difference rig/sensor pose derivatives in the
@@ -416,11 +417,9 @@ reconstruction parity.
     - BA pose updates now follow COLMAP/Ceres parameter-block semantics:
       quaternion manifold updates for rotation and direct Euclidean updates for
       translation, instead of coupled SE(3) exponential updates.
-    - Remaining work: replace numerical Jacobians/hand-rolled LM with
-      Ceres-equivalent solver behavior, analytic/Jet-equivalent residuals for
-      thin-prism, division, and EUCM camera models, and robust
-      trust-region/linear-solver behavior plus full backend solver-summary
-      parity.
+    - Remaining work: replace hand-rolled LM with Ceres-equivalent solver
+      behavior, robust trust-region/linear-solver behavior, and full backend
+      solver-summary parity.
 20. Match COLMAP local BA image selection, gauge fixing, robust losses,
     constant camera/rig controls, and short-track point selection.
     - Added a first COLMAP-style local BA pass after each successful

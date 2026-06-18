@@ -1,9 +1,10 @@
 use crate::types::{
     colmap_camera_model_focal_idxs, colmap_camera_model_principal_point_idxs, CameraModel, Frame,
-    ImageFrame, Reconstruction, Rig, Rigid3, SensorId, COLMAP_FISHEYE, COLMAP_FOV,
-    COLMAP_FULL_OPENCV, COLMAP_OPENCV, COLMAP_OPENCV_FISHEYE, COLMAP_PINHOLE, COLMAP_RADIAL,
-    COLMAP_RADIAL_FISHEYE, COLMAP_SIMPLE_FISHEYE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
-    COLMAP_SIMPLE_RADIAL_FISHEYE,
+    ImageFrame, Reconstruction, Rig, Rigid3, SensorId, COLMAP_DIVISION, COLMAP_EUCM,
+    COLMAP_FISHEYE, COLMAP_FOV, COLMAP_FULL_OPENCV, COLMAP_OPENCV, COLMAP_OPENCV_FISHEYE,
+    COLMAP_PINHOLE, COLMAP_RADIAL, COLMAP_RADIAL_FISHEYE, COLMAP_RAD_TAN_THIN_PRISM_FISHEYE,
+    COLMAP_SIMPLE_DIVISION, COLMAP_SIMPLE_FISHEYE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
+    COLMAP_SIMPLE_RADIAL_FISHEYE, COLMAP_THIN_PRISM_FISHEYE,
 };
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
@@ -1818,6 +1819,60 @@ fn analytic_img_from_cam_jacobian(camera: CameraModel, x: f64, y: f64, z: f64) -
             j_norm[(1, 1)] =
                 fy * (dy_duu * fisheye.jacobian[(0, 1)] + dy_dvv * fisheye.jacobian[(1, 1)]);
         }
+        COLMAP_THIN_PRISM_FISHEYE | COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => {
+            let fx = camera.params[0];
+            let fy = camera.params[1];
+            let fisheye = fisheye_normal_terms(u, v)?;
+            let distortion = fisheye_distortion_terms(camera, fisheye.u, fisheye.v)?;
+            let j_total = Mat2::identity() + distortion.jacobian;
+            j_norm[(0, 0)] = fx
+                * (j_total[(0, 0)] * fisheye.jacobian[(0, 0)]
+                    + j_total[(0, 1)] * fisheye.jacobian[(1, 0)]);
+            j_norm[(0, 1)] = fx
+                * (j_total[(0, 0)] * fisheye.jacobian[(0, 1)]
+                    + j_total[(0, 1)] * fisheye.jacobian[(1, 1)]);
+            j_norm[(1, 0)] = fy
+                * (j_total[(1, 0)] * fisheye.jacobian[(0, 0)]
+                    + j_total[(1, 1)] * fisheye.jacobian[(1, 0)]);
+            j_norm[(1, 1)] = fy
+                * (j_total[(1, 0)] * fisheye.jacobian[(0, 1)]
+                    + j_total[(1, 1)] * fisheye.jacobian[(1, 1)]);
+        }
+        COLMAP_SIMPLE_DIVISION | COLMAP_DIVISION => {
+            let fx = camera.params[0];
+            let fy = if camera.model_id == COLMAP_SIMPLE_DIVISION {
+                camera.params[0]
+            } else {
+                camera.params[1]
+            };
+            let k = if camera.model_id == COLMAP_SIMPLE_DIVISION {
+                camera.params[3]
+            } else {
+                camera.params[4]
+            };
+            let terms = division_projection_terms(x, y, z, k)?;
+            return Some(Mat2x3::from_row_slice(&[
+                fx * terms.j_cam[(0, 0)],
+                fx * terms.j_cam[(0, 1)],
+                fx * terms.j_cam[(0, 2)],
+                fy * terms.j_cam[(1, 0)],
+                fy * terms.j_cam[(1, 1)],
+                fy * terms.j_cam[(1, 2)],
+            ]));
+        }
+        COLMAP_EUCM => {
+            let fx = camera.params[0];
+            let fy = camera.params[1];
+            let terms = eucm_projection_terms(x, y, z, camera.params[4], camera.params[5])?;
+            return Some(Mat2x3::from_row_slice(&[
+                fx * terms.j_cam[(0, 0)],
+                fx * terms.j_cam[(0, 1)],
+                fx * terms.j_cam[(0, 2)],
+                fy * terms.j_cam[(1, 0)],
+                fy * terms.j_cam[(1, 1)],
+                fy * terms.j_cam[(1, 2)],
+            ]));
+        }
         _ => return None,
     }
     if !j_norm.iter().all(|value| value.is_finite()) {
@@ -2054,6 +2109,142 @@ fn analytic_camera_param_jacobian(
                     camera.params[0] * fisheye.u * terms.r8,
                     camera.params[1] * fisheye.v * terms.r8,
                 )),
+                _ => None,
+            }
+        }
+        (COLMAP_THIN_PRISM_FISHEYE, 0..=11) => {
+            let fx = camera.params[0];
+            let fy = camera.params[1];
+            let fisheye = fisheye_normal_terms(nx, ny)?;
+            let terms = fisheye_distortion_terms(camera, fisheye.u, fisheye.v)?;
+            let r2 = fisheye.u * fisheye.u + fisheye.v * fisheye.v;
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let r8 = r4 * r4;
+            match param {
+                0 => Some(Vec2::new(terms.x, 0.0)),
+                1 => Some(Vec2::new(0.0, terms.y)),
+                2 => Some(Vec2::new(1.0, 0.0)),
+                3 => Some(Vec2::new(0.0, 1.0)),
+                4 => Some(Vec2::new(fx * fisheye.u * r2, fy * fisheye.v * r2)),
+                5 => Some(Vec2::new(fx * fisheye.u * r4, fy * fisheye.v * r4)),
+                6 => Some(Vec2::new(
+                    fx * 2.0 * fisheye.u * fisheye.v,
+                    fy * (r2 + 2.0 * fisheye.v * fisheye.v),
+                )),
+                7 => Some(Vec2::new(
+                    fx * (r2 + 2.0 * fisheye.u * fisheye.u),
+                    fy * 2.0 * fisheye.u * fisheye.v,
+                )),
+                8 => Some(Vec2::new(fx * fisheye.u * r6, fy * fisheye.v * r6)),
+                9 => Some(Vec2::new(fx * fisheye.u * r8, fy * fisheye.v * r8)),
+                10 => Some(Vec2::new(fx * r2, 0.0)),
+                11 => Some(Vec2::new(0.0, fy * r2)),
+                _ => None,
+            }
+        }
+        (COLMAP_RAD_TAN_THIN_PRISM_FISHEYE, 0..=15) => {
+            let fx = camera.params[0];
+            let fy = camera.params[1];
+            let fisheye = fisheye_normal_terms(nx, ny)?;
+            let terms = fisheye_distortion_terms(camera, fisheye.u, fisheye.v)?;
+            let theta2 = fisheye.u * fisheye.u + fisheye.v * fisheye.v;
+            let mut th_radial = 1.0;
+            let mut theta_power = 1.0;
+            for coeff in &camera.params[4..10] {
+                theta_power *= theta2;
+                th_radial += coeff * theta_power;
+            }
+            let x_dist = th_radial * fisheye.u;
+            let y_dist = th_radial * fisheye.v;
+            let x2 = x_dist * x_dist;
+            let y2 = y_dist * y_dist;
+            let xy = x_dist * y_dist;
+            let r2_dist = x2 + y2;
+            let r4_dist = r2_dist * r2_dist;
+            match param {
+                0 => Some(Vec2::new(terms.x, 0.0)),
+                1 => Some(Vec2::new(0.0, terms.y)),
+                2 => Some(Vec2::new(1.0, 0.0)),
+                3 => Some(Vec2::new(0.0, 1.0)),
+                4..=9 => {
+                    let intermediate =
+                        rad_tan_thin_prism_intermediate_terms(camera, fisheye.u, fisheye.v)?;
+                    let power = theta2.powi((param - 3) as i32);
+                    let radial_du = intermediate.j_xy[(0, 0)] * fisheye.u * power
+                        + intermediate.j_xy[(0, 1)] * fisheye.v * power;
+                    let radial_dv = intermediate.j_xy[(1, 0)] * fisheye.u * power
+                        + intermediate.j_xy[(1, 1)] * fisheye.v * power;
+                    Some(Vec2::new(fx * radial_du, fy * radial_dv))
+                }
+                10 => Some(Vec2::new(fx * (r2_dist + 2.0 * x2), fy * 2.0 * xy)),
+                11 => Some(Vec2::new(fx * 2.0 * xy, fy * (r2_dist + 2.0 * y2))),
+                12 => Some(Vec2::new(fx * r2_dist, 0.0)),
+                13 => Some(Vec2::new(fx * r4_dist, 0.0)),
+                14 => Some(Vec2::new(0.0, fy * r2_dist)),
+                15 => Some(Vec2::new(0.0, fy * r4_dist)),
+                _ => None,
+            }
+        }
+        (COLMAP_SIMPLE_DIVISION, 0..=3) => {
+            let terms = division_projection_terms(x, y, z, camera.params[3])?;
+            match param {
+                0 => Some(Vec2::new(terms.x, terms.y)),
+                1 => Some(Vec2::new(1.0, 0.0)),
+                2 => Some(Vec2::new(0.0, 1.0)),
+                3 => {
+                    let q = x * x + y * y;
+                    let dscale_dk = 4.0 * q / (terms.disc_sqrt * (z + terms.disc_sqrt).powi(2));
+                    Some(Vec2::new(
+                        camera.params[0] * x * dscale_dk,
+                        camera.params[0] * y * dscale_dk,
+                    ))
+                }
+                _ => None,
+            }
+        }
+        (COLMAP_DIVISION, 0..=4) => {
+            let terms = division_projection_terms(x, y, z, camera.params[4])?;
+            match param {
+                0 => Some(Vec2::new(terms.x, 0.0)),
+                1 => Some(Vec2::new(0.0, terms.y)),
+                2 => Some(Vec2::new(1.0, 0.0)),
+                3 => Some(Vec2::new(0.0, 1.0)),
+                4 => {
+                    let q = x * x + y * y;
+                    let dscale_dk = 4.0 * q / (terms.disc_sqrt * (z + terms.disc_sqrt).powi(2));
+                    Some(Vec2::new(
+                        camera.params[0] * x * dscale_dk,
+                        camera.params[1] * y * dscale_dk,
+                    ))
+                }
+                _ => None,
+            }
+        }
+        (COLMAP_EUCM, 0..=5) => {
+            let alpha = camera.params[4];
+            let beta = camera.params[5];
+            let terms = eucm_projection_terms(x, y, z, alpha, beta)?;
+            match param {
+                0 => Some(Vec2::new(terms.x, 0.0)),
+                1 => Some(Vec2::new(0.0, terms.y)),
+                2 => Some(Vec2::new(1.0, 0.0)),
+                3 => Some(Vec2::new(0.0, 1.0)),
+                4 => {
+                    let dden_dalpha = terms.rho - z;
+                    Some(Vec2::new(
+                        -camera.params[0] * x * dden_dalpha / (terms.den * terms.den),
+                        -camera.params[1] * y * dden_dalpha / (terms.den * terms.den),
+                    ))
+                }
+                5 => {
+                    let q = x * x + y * y;
+                    let dden_dbeta = alpha * q / (2.0 * terms.rho);
+                    Some(Vec2::new(
+                        -camera.params[0] * x * dden_dbeta / (terms.den * terms.den),
+                        -camera.params[1] * y * dden_dbeta / (terms.den * terms.den),
+                    ))
+                }
                 _ => None,
             }
         }
@@ -2333,6 +2524,308 @@ fn fov_distortion_terms(omega: f64, u: f64, v: f64) -> Option<FovDistortionTerms
     ]
     .iter()
     .all(|value| value.is_finite())
+    {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+struct FisheyeDistortionTerms {
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    jacobian: Mat2,
+}
+
+fn fisheye_distortion_terms(camera: CameraModel, u: f64, v: f64) -> Option<FisheyeDistortionTerms> {
+    match camera.model_id {
+        COLMAP_THIN_PRISM_FISHEYE => thin_prism_fisheye_distortion_terms(camera, u, v),
+        COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => {
+            rad_tan_thin_prism_fisheye_distortion_terms(camera, u, v)
+        }
+        _ => None,
+    }
+}
+
+fn thin_prism_fisheye_distortion_terms(
+    camera: CameraModel,
+    u: f64,
+    v: f64,
+) -> Option<FisheyeDistortionTerms> {
+    let k1 = camera.params[4];
+    let k2 = camera.params[5];
+    let p1 = camera.params[6];
+    let p2 = camera.params[7];
+    let k3 = camera.params[8];
+    let k4 = camera.params[9];
+    let sx1 = camera.params[10];
+    let sy1 = camera.params[11];
+    let r2 = u * u + v * v;
+    let r4 = r2 * r2;
+    let r6 = r4 * r2;
+    let r8 = r4 * r4;
+    let radial_offset = k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+    let radial_derivative = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4 + 4.0 * k4 * r6;
+    let dx = u * radial_offset + 2.0 * p1 * u * v + p2 * (r2 + 2.0 * u * u) + sx1 * r2;
+    let dy = v * radial_offset + 2.0 * p2 * u * v + p1 * (r2 + 2.0 * v * v) + sy1 * r2;
+    let mut jacobian =
+        radial_tangential_offset_jacobian(u, v, radial_offset, radial_derivative, p1, p2);
+    jacobian[(0, 0)] += 2.0 * sx1 * u;
+    jacobian[(0, 1)] += 2.0 * sx1 * v;
+    jacobian[(1, 0)] += 2.0 * sy1 * u;
+    jacobian[(1, 1)] += 2.0 * sy1 * v;
+    finite_fisheye_distortion_terms(u, v, dx, dy, jacobian)
+}
+
+fn rad_tan_thin_prism_fisheye_distortion_terms(
+    camera: CameraModel,
+    u: f64,
+    v: f64,
+) -> Option<FisheyeDistortionTerms> {
+    let p0 = camera.params[10];
+    let p1 = camera.params[11];
+    let s0 = camera.params[12];
+    let s1 = camera.params[13];
+    let s2 = camera.params[14];
+    let s3 = camera.params[15];
+    let theta2 = u * u + v * v;
+    let mut th_radial = 1.0;
+    let mut th_radial_derivative = 0.0;
+    let mut theta_power = 1.0;
+    for (idx, coeff) in camera.params[4..10].iter().enumerate() {
+        th_radial_derivative += (idx as f64 + 1.0) * coeff * theta_power;
+        theta_power *= theta2;
+        th_radial += coeff * theta_power;
+    }
+
+    let x = th_radial * u;
+    let y = th_radial * v;
+    let dx_du = th_radial + 2.0 * u * u * th_radial_derivative;
+    let dx_dv = 2.0 * u * v * th_radial_derivative;
+    let dy_du = dx_dv;
+    let dy_dv = th_radial + 2.0 * v * v * th_radial_derivative;
+
+    let x2 = x * x;
+    let y2 = y * y;
+    let xy = x * y;
+    let r2 = x2 + y2;
+    let r4 = r2 * r2;
+    let dx_tang = 2.0 * p1 * xy + p0 * (r2 + 2.0 * x2);
+    let dy_tang = 2.0 * p0 * xy + p1 * (r2 + 2.0 * y2);
+    let dx_tp = s0 * r2 + s1 * r4;
+    let dy_tp = s2 * r2 + s3 * r4;
+    let dx = x + dx_tang + dx_tp - u;
+    let dy = y + dy_tang + dy_tp - v;
+
+    let dtx_dx = 2.0 * p1 * y + 6.0 * p0 * x + 2.0 * s0 * x + 4.0 * s1 * r2 * x;
+    let dtx_dy = 2.0 * p1 * x + 2.0 * p0 * y + 2.0 * s0 * y + 4.0 * s1 * r2 * y;
+    let dty_dx = 2.0 * p0 * y + 2.0 * p1 * x + 2.0 * s2 * x + 4.0 * s3 * r2 * x;
+    let dty_dy = 2.0 * p0 * x + 6.0 * p1 * y + 2.0 * s2 * y + 4.0 * s3 * r2 * y;
+    let jacobian = Mat2::from_row_slice(&[
+        (1.0 + dtx_dx) * dx_du + dtx_dy * dy_du - 1.0,
+        (1.0 + dtx_dx) * dx_dv + dtx_dy * dy_dv,
+        dty_dx * dx_du + (1.0 + dty_dy) * dy_du,
+        dty_dx * dx_dv + (1.0 + dty_dy) * dy_dv - 1.0,
+    ]);
+    finite_fisheye_distortion_terms(u, v, dx, dy, jacobian)
+}
+
+struct RadTanThinPrismIntermediateTerms {
+    x: f64,
+    y: f64,
+    r2: f64,
+    r4: f64,
+    j_xy: Mat2,
+}
+
+fn rad_tan_thin_prism_intermediate_terms(
+    camera: CameraModel,
+    u: f64,
+    v: f64,
+) -> Option<RadTanThinPrismIntermediateTerms> {
+    let p0 = camera.params[10];
+    let p1 = camera.params[11];
+    let s0 = camera.params[12];
+    let s1 = camera.params[13];
+    let s2 = camera.params[14];
+    let s3 = camera.params[15];
+    let theta2 = u * u + v * v;
+    let mut th_radial = 1.0;
+    let mut theta_power = 1.0;
+    for coeff in &camera.params[4..10] {
+        theta_power *= theta2;
+        th_radial += coeff * theta_power;
+    }
+    let x = th_radial * u;
+    let y = th_radial * v;
+    let r2 = x * x + y * y;
+    let r4 = r2 * r2;
+    let dtx_dx = 2.0 * p1 * y + 6.0 * p0 * x + 2.0 * s0 * x + 4.0 * s1 * r2 * x;
+    let dtx_dy = 2.0 * p1 * x + 2.0 * p0 * y + 2.0 * s0 * y + 4.0 * s1 * r2 * y;
+    let dty_dx = 2.0 * p0 * y + 2.0 * p1 * x + 2.0 * s2 * x + 4.0 * s3 * r2 * x;
+    let dty_dy = 2.0 * p0 * x + 6.0 * p1 * y + 2.0 * s2 * y + 4.0 * s3 * r2 * y;
+    let terms = RadTanThinPrismIntermediateTerms {
+        x,
+        y,
+        r2,
+        r4,
+        j_xy: Mat2::from_row_slice(&[1.0 + dtx_dx, dtx_dy, dty_dx, 1.0 + dty_dy]),
+    };
+    if [terms.x, terms.y, terms.r2, terms.r4]
+        .iter()
+        .all(|value| value.is_finite())
+        && terms.j_xy.iter().all(|value| value.is_finite())
+    {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+fn finite_fisheye_distortion_terms(
+    u: f64,
+    v: f64,
+    dx: f64,
+    dy: f64,
+    jacobian: Mat2,
+) -> Option<FisheyeDistortionTerms> {
+    let terms = FisheyeDistortionTerms {
+        x: u + dx,
+        y: v + dy,
+        dx,
+        dy,
+        jacobian,
+    };
+    if [terms.x, terms.y, terms.dx, terms.dy]
+        .iter()
+        .all(|value| value.is_finite())
+        && terms.jacobian.iter().all(|value| value.is_finite())
+    {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+fn radial_tangential_offset_jacobian(
+    u: f64,
+    v: f64,
+    radial: f64,
+    radial_derivative: f64,
+    p1: f64,
+    p2: f64,
+) -> Mat2 {
+    Mat2::from_row_slice(&[
+        radial + 2.0 * u * u * radial_derivative + 2.0 * p1 * v + 6.0 * p2 * u,
+        2.0 * u * v * radial_derivative + 2.0 * p1 * u + 2.0 * p2 * v,
+        2.0 * u * v * radial_derivative + 2.0 * p2 * v + 2.0 * p1 * u,
+        radial + 2.0 * v * v * radial_derivative + 6.0 * p1 * v + 2.0 * p2 * u,
+    ])
+}
+
+struct DivisionProjectionTerms {
+    x: f64,
+    y: f64,
+    scale: f64,
+    disc_sqrt: f64,
+    j_cam: Mat2x3,
+}
+
+fn division_projection_terms(x: f64, y: f64, z: f64, k: f64) -> Option<DivisionProjectionTerms> {
+    let q = x * x + y * y;
+    let disc_sq = z * z - 4.0 * k * q;
+    if disc_sq < 0.0 {
+        return None;
+    }
+    let disc_sqrt = disc_sq.sqrt();
+    let den = z + disc_sqrt;
+    if den.abs() <= f64::EPSILON {
+        return None;
+    }
+    let scale = 2.0 / den;
+    let den_derivative_x = -4.0 * k * x / disc_sqrt;
+    let den_derivative_y = -4.0 * k * y / disc_sqrt;
+    let den_derivative_z = 1.0 + z / disc_sqrt;
+    let scale_derivative_x = -2.0 * den_derivative_x / (den * den);
+    let scale_derivative_y = -2.0 * den_derivative_y / (den * den);
+    let scale_derivative_z = -2.0 * den_derivative_z / (den * den);
+    let j_cam = Mat2x3::from_row_slice(&[
+        scale + x * scale_derivative_x,
+        x * scale_derivative_y,
+        x * scale_derivative_z,
+        y * scale_derivative_x,
+        scale + y * scale_derivative_y,
+        y * scale_derivative_z,
+    ]);
+    let terms = DivisionProjectionTerms {
+        x: scale * x,
+        y: scale * y,
+        scale,
+        disc_sqrt,
+        j_cam,
+    };
+    if [terms.x, terms.y, terms.scale, terms.disc_sqrt]
+        .iter()
+        .all(|value| value.is_finite())
+        && terms.j_cam.iter().all(|value| value.is_finite())
+    {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+struct EucmProjectionTerms {
+    x: f64,
+    y: f64,
+    rho: f64,
+    den: f64,
+    j_cam: Mat2x3,
+}
+
+fn eucm_projection_terms(
+    x: f64,
+    y: f64,
+    z: f64,
+    alpha: f64,
+    beta: f64,
+) -> Option<EucmProjectionTerms> {
+    let q = x * x + y * y;
+    let rho2 = beta * q + z * z;
+    if rho2 < 0.0 {
+        return None;
+    }
+    let rho = rho2.sqrt();
+    let den = alpha * rho + (1.0 - alpha) * z;
+    if den < f64::EPSILON {
+        return None;
+    }
+    let inv_den = 1.0 / den;
+    let dden_dx = alpha * beta * x / rho;
+    let dden_dy = alpha * beta * y / rho;
+    let dden_dz = alpha * z / rho + (1.0 - alpha);
+    let inv_den2 = inv_den * inv_den;
+    let j_cam = Mat2x3::from_row_slice(&[
+        inv_den - x * dden_dx * inv_den2,
+        -x * dden_dy * inv_den2,
+        -x * dden_dz * inv_den2,
+        -y * dden_dx * inv_den2,
+        inv_den - y * dden_dy * inv_den2,
+        -y * dden_dz * inv_den2,
+    ]);
+    let terms = EucmProjectionTerms {
+        x: x * inv_den,
+        y: y * inv_den,
+        rho,
+        den,
+        j_cam,
+    };
+    if [terms.x, terms.y, terms.rho, terms.den]
+        .iter()
+        .all(|value| value.is_finite())
+        && terms.j_cam.iter().all(|value| value.is_finite())
     {
         Some(terms)
     } else {
@@ -2640,6 +3133,32 @@ mod tests {
                 &[90.0, 96.0, 100.0, 80.0, 0.02, -0.001, 0.0001, -0.00001],
             )
             .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_THIN_PRISM_FISHEYE,
+                200,
+                160,
+                &[
+                    90.0, 96.0, 100.0, 80.0, 0.01, -0.0005, 0.0001, -0.0001, 0.00001, -0.00001,
+                    0.00002, -0.00002,
+                ],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_RAD_TAN_THIN_PRISM_FISHEYE,
+                200,
+                160,
+                &[
+                    90.0, 96.0, 100.0, 80.0, 0.01, -0.0005, 0.00001, -0.000001, 0.0, 0.0, 0.0001,
+                    -0.0001, 0.00002, -0.00002, 0.00001, -0.00001,
+                ],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(COLMAP_SIMPLE_DIVISION, 200, 160, &[95.0, 100.0, 80.0, 0.02])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_DIVISION, 200, 160, &[90.0, 96.0, 100.0, 80.0, 0.02])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_EUCM, 200, 160, &[90.0, 96.0, 100.0, 80.0, 0.4, 1.2])
+                .unwrap(),
         ];
         let pose = SE3::from_quat_translation(
             Quat::from_rotation_y(0.12) * Quat::from_rotation_x(-0.04),
@@ -2780,6 +3299,32 @@ mod tests {
                 &[90.0, 96.0, 100.0, 80.0, 0.02, -0.001, 0.0001, -0.00001],
             )
             .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_THIN_PRISM_FISHEYE,
+                200,
+                160,
+                &[
+                    90.0, 96.0, 100.0, 80.0, 0.01, -0.0005, 0.0001, -0.0001, 0.00001, -0.00001,
+                    0.00002, -0.00002,
+                ],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(
+                COLMAP_RAD_TAN_THIN_PRISM_FISHEYE,
+                200,
+                160,
+                &[
+                    90.0, 96.0, 100.0, 80.0, 0.01, -0.0005, 0.00001, -0.000001, 0.0, 0.0, 0.0001,
+                    -0.0001, 0.00002, -0.00002, 0.00001, -0.00001,
+                ],
+            )
+            .unwrap(),
+            CameraModel::from_colmap(COLMAP_SIMPLE_DIVISION, 200, 160, &[95.0, 100.0, 80.0, 0.02])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_DIVISION, 200, 160, &[90.0, 96.0, 100.0, 80.0, 0.02])
+                .unwrap(),
+            CameraModel::from_colmap(COLMAP_EUCM, 200, 160, &[90.0, 96.0, 100.0, 80.0, 0.4, 1.2])
+                .unwrap(),
         ];
         let pose = SE3::from_quat_translation(
             Quat::from_rotation_y(0.12) * Quat::from_rotation_x(-0.04),
