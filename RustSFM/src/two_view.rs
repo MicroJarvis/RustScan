@@ -165,14 +165,17 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         active_indices.clone()
     };
 
-    let mut rng = Lcg::new(options.random_seed ^ 0x9e37_79b9_7f4a_7c15 ^ n as u64);
+    let mut sampler = ColmapRandomSampler::new(
+        options.random_seed ^ 0x9e37_79b9_7f4a_7c15 ^ n as u64,
+        &active_indices,
+    );
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
     let mut max_iterations = options.ransac_max_iterations.max(1);
     let mut iteration = 0u32;
     while iteration < max_iterations {
         iteration += 1;
         let (sample_size, models) = if options.use_five_point {
-            let sample = rng.sample_unique_from(&active_indices, 5);
+            let sample = sampler.sample(5);
             if sample.len() != 5 {
                 continue;
             }
@@ -181,7 +184,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
                 estimate_essential_five_point_indexed(&pts1, &pts2, &sample),
             )
         } else {
-            let sample = rng.sample_unique_from(&active_indices, 8);
+            let sample = sampler.sample(8);
             if sample.len() != 8 {
                 continue;
             }
@@ -730,13 +733,16 @@ fn estimate_fundamental_ransac(
     if active_indices.len() < 8 {
         return None;
     }
-    let mut rng = Lcg::new(random_seed ^ 0x517c_c1b7_2722_0a95 ^ active_indices.len() as u64);
+    let mut sampler = ColmapRandomSampler::new(
+        random_seed ^ 0x517c_c1b7_2722_0a95 ^ active_indices.len() as u64,
+        active_indices,
+    );
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
     let mut max_iterations = max_iterations.max(1);
     let mut iteration = 0u32;
     while iteration < max_iterations {
         iteration += 1;
-        let sample = rng.sample_unique_from(active_indices, 8);
+        let sample = sampler.sample(8);
         if sample.len() != 8 {
             continue;
         }
@@ -868,13 +874,16 @@ fn estimate_homography_ransac(
     if active_indices.len() < 4 {
         return None;
     }
-    let mut rng = Lcg::new(random_seed ^ 0x94d0_49bb_1331_11eb ^ active_indices.len() as u64);
+    let mut sampler = ColmapRandomSampler::new(
+        random_seed ^ 0x94d0_49bb_1331_11eb ^ active_indices.len() as u64,
+        active_indices,
+    );
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
     let mut max_iterations = max_iterations.max(1);
     let mut iteration = 0u32;
     while iteration < max_iterations {
         iteration += 1;
-        let sample = rng.sample_unique_from(active_indices, 4);
+        let sample = sampler.sample(4);
         if sample.len() != 4 {
             continue;
         }
@@ -1764,30 +1773,31 @@ impl Lcg {
             (self.next_u32() as usize) % max
         }
     }
+}
 
-    fn sample_unique(&mut self, n: usize, k: usize) -> Vec<usize> {
-        if k > n {
-            return Vec::new();
+struct ColmapRandomSampler {
+    rng: Lcg,
+    sample_indices: Vec<usize>,
+}
+
+impl ColmapRandomSampler {
+    fn new(seed: u64, indices: &[usize]) -> Self {
+        Self {
+            rng: Lcg::new(seed),
+            sample_indices: indices.to_vec(),
         }
-        let mut sample = Vec::with_capacity(k);
-        while sample.len() < k {
-            let idx = self.gen_range(n);
-            if !sample.contains(&idx) {
-                sample.push(idx);
-            }
-        }
-        sample
     }
 
-    fn sample_unique_from(&mut self, indices: &[usize], k: usize) -> Vec<usize> {
-        if k > indices.len() {
+    fn sample(&mut self, k: usize) -> Vec<usize> {
+        if k > self.sample_indices.len() {
             return Vec::new();
         }
-        let sampled_offsets = self.sample_unique(indices.len(), k);
-        sampled_offsets
-            .into_iter()
-            .filter_map(|idx| indices.get(idx).copied())
-            .collect()
+        let last = self.sample_indices.len() - 1;
+        for i in 0..k {
+            let j = i + self.rng.gen_range(last + 1 - i);
+            self.sample_indices.swap(i, j);
+        }
+        self.sample_indices[..k].to_vec()
     }
 }
 
@@ -1833,6 +1843,21 @@ mod tests {
         assert_eq!(adaptive_ransac_iterations(3, 100, 123, 0.999, 5), 123);
         assert_eq!(adaptive_ransac_iterations(10, 4, 123, 0.999, 5), 123);
         assert_eq!(adaptive_ransac_iterations(10, 10, 123, 0.999, 5), 1);
+    }
+
+    #[test]
+    fn colmap_random_sampler_uses_stateful_partial_shuffle() {
+        let mut sampler = ColmapRandomSampler::new(42, &[0, 1, 2, 3, 4, 5]);
+
+        assert_eq!(sampler.sample(3), vec![3, 4, 0]);
+        assert_eq!(sampler.sample(3), vec![4, 1, 2]);
+    }
+
+    #[test]
+    fn colmap_random_sampler_rejects_oversized_samples() {
+        let mut sampler = ColmapRandomSampler::new(1, &[10, 20]);
+
+        assert!(sampler.sample(3).is_empty());
     }
 
     #[test]

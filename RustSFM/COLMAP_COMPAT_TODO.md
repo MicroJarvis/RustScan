@@ -203,9 +203,12 @@ reconstruction parity.
     - Two-view E/F/H RANSAC dynamic stopping now uses COLMAP's current
       without-replacement success probability and 3x dynamic trial multiplier,
       replacing the older independent inlier-ratio power approximation.
+    - Two-view E/F/H random sampling now follows COLMAP `RandomSampler`'s
+      stateful partial Fisher-Yates shape over a persistent index pool instead
+      of repeatedly drawing unique indices by rejection.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
-      exact estimator stack, support-measure details, and official sampler
-      sequence.
+      exact estimator stack, support-measure details, and byte-for-byte
+      official PRNG / `uniform_int_distribution` sample sequence.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
