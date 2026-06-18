@@ -1,6 +1,6 @@
 use crate::types::{
     colmap_camera_model_focal_idxs, colmap_camera_model_principal_point_idxs, CameraModel, Frame,
-    ImageFrame, Reconstruction, Rigid3, SensorId, COLMAP_FULL_OPENCV, COLMAP_OPENCV,
+    ImageFrame, Reconstruction, Rig, Rigid3, SensorId, COLMAP_FULL_OPENCV, COLMAP_OPENCV,
     COLMAP_PINHOLE, COLMAP_RADIAL, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
 };
 use glam::{Quat, Vec3};
@@ -162,13 +162,20 @@ pub fn refine_bundle_adjustment(
         options.max_observation_error_px,
         point_filter.as_ref(),
     );
+    let sensor_pose_specs = sensor_pose_specs(
+        reconstruction,
+        &pose_blocks,
+        &options,
+        pose_blocks.blocks.len() * 6,
+    );
     let camera_param_specs = camera_param_specs(
         reconstruction,
         &observations,
         &options,
-        pose_blocks.blocks.len() * 6,
+        pose_blocks.blocks.len() * 6 + sensor_pose_specs.len() * 6,
     );
-    let nonpoint_dim = pose_blocks.blocks.len() * 6 + camera_param_specs.len();
+    let nonpoint_dim =
+        pose_blocks.blocks.len() * 6 + sensor_pose_specs.len() * 6 + camera_param_specs.len();
     if nonpoint_dim == 0 || observations.len() * 2 < nonpoint_dim {
         return None;
     }
@@ -176,6 +183,7 @@ pub fn refine_bundle_adjustment(
         reconstruction,
         &observations,
         &pose_blocks,
+        &sensor_pose_specs,
         &camera_param_specs,
         &constant_point_filter,
     );
@@ -212,6 +220,7 @@ pub fn refine_bundle_adjustment(
             reconstruction,
             &observations,
             &pose_blocks,
+            &sensor_pose_specs,
             &camera_param_specs,
             &constant_point_filter,
             options.huber_delta_px,
@@ -264,6 +273,7 @@ pub fn refine_bundle_adjustment(
 
         let base_poses = reconstruction.poses.clone();
         let base_frames = reconstruction.frames.clone();
+        let base_rigs = reconstruction.rigs.clone();
         let base_points = reconstruction
             .points
             .iter()
@@ -277,6 +287,7 @@ pub fn refine_bundle_adjustment(
                 reconstruction,
                 &observations,
                 &pose_blocks,
+                &sensor_pose_specs,
                 &camera_param_specs,
                 &system.point_blocks,
                 &delta,
@@ -301,6 +312,7 @@ pub fn refine_bundle_adjustment(
                 reconstruction,
                 &base_poses,
                 &base_frames,
+                &base_rigs,
                 &base_points,
                 base_camera,
                 &base_cameras,
@@ -380,9 +392,14 @@ fn count_variable_residuals(
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
     pose_blocks: &PoseBlockSet,
+    sensor_pose_specs: &[SensorPoseSpec],
     camera_param_specs: &[CameraParamSpec],
     constant_point_filter: &HashSet<usize>,
 ) -> usize {
+    let variable_sensors = sensor_pose_specs
+        .iter()
+        .map(|spec| spec.key.clone())
+        .collect::<HashSet<_>>();
     let variable_cameras = camera_param_specs
         .iter()
         .map(|spec| spec.camera)
@@ -395,6 +412,8 @@ fn count_variable_residuals(
                     .image_to_block
                     .get(obs.image)
                     .is_some_and(|block| block.is_some())
+                || frame_sensor_key_for_image(reconstruction, obs.image)
+                    .is_some_and(|key| variable_sensors.contains(&key))
                 || camera_index_for_image(reconstruction, obs.image)
                     .is_some_and(|camera| variable_cameras.contains(&camera))
         })
@@ -445,6 +464,18 @@ struct PoseBlock {
 enum PoseBlockKind {
     Image(usize),
     Frame(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SensorPoseKey {
+    rig_id: u32,
+    sensor_id: SensorId,
+}
+
+#[derive(Debug, Clone)]
+struct SensorPoseSpec {
+    key: SensorPoseKey,
+    offset: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -652,6 +683,51 @@ fn camera_param_specs(
     specs
 }
 
+fn sensor_pose_specs(
+    reconstruction: &Reconstruction,
+    pose_blocks: &PoseBlockSet,
+    options: &BundleAdjustmentOptions,
+    first_offset: usize,
+) -> Vec<SensorPoseSpec> {
+    let constant_sensors = options
+        .constant_sensor_from_rig
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut keys = BTreeMap::<SensorPoseKey, ()>::new();
+    for block in &pose_blocks.blocks {
+        let PoseBlockKind::Frame(_) = block.kind else {
+            continue;
+        };
+        for &image in &block.images {
+            let Some(key) = frame_sensor_key_for_image(reconstruction, image) else {
+                continue;
+            };
+            if constant_sensors.contains(&key.sensor_id) || ref_sensor_key(reconstruction, &key) {
+                continue;
+            }
+            keys.insert(key, ());
+        }
+    }
+    keys.keys()
+        .cloned()
+        .enumerate()
+        .map(|(idx, key)| SensorPoseSpec {
+            key,
+            offset: first_offset + idx * 6,
+        })
+        .collect()
+}
+
+fn ref_sensor_key(reconstruction: &Reconstruction, key: &SensorPoseKey) -> bool {
+    reconstruction
+        .rigs
+        .iter()
+        .find(|rig| rig.rig_id == key.rig_id)
+        .and_then(|rig| rig.ref_sensor_id.as_ref())
+        .is_some_and(|ref_sensor_id| ref_sensor_id == &key.sensor_id)
+}
+
 fn selected_camera_params(
     camera: CameraModel,
     refine_focal_length: bool,
@@ -707,6 +783,7 @@ fn build_schur_system(
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
     pose_blocks: &PoseBlockSet,
+    sensor_pose_specs: &[SensorPoseSpec],
     camera_param_specs: &[CameraParamSpec],
     constant_point_filter: &HashSet<usize>,
     huber_delta_px: f64,
@@ -724,8 +801,13 @@ fn build_schur_system(
     for (idx, spec) in camera_param_specs.iter().enumerate() {
         camera_param_lookup[spec.camera].push(idx);
     }
+    let sensor_pose_lookup = sensor_pose_specs
+        .iter()
+        .map(|spec| (spec.key.clone(), spec.offset))
+        .collect::<BTreeMap<_, _>>();
 
-    let nonpoint_dim = pose_blocks.blocks.len() * 6 + camera_param_specs.len();
+    let nonpoint_dim =
+        pose_blocks.blocks.len() * 6 + sensor_pose_specs.len() * 6 + camera_param_specs.len();
     let mut h_cc = DMatrix::<f64>::zeros(nonpoint_dim, nonpoint_dim);
     let mut g_c = DVector::<f64>::zeros(nonpoint_dim);
     let mut point_blocks = (0..reconstruction.points.len())
@@ -768,6 +850,17 @@ fn build_schur_system(
                 }
             };
             nonpoint_jacobians.push((block.offset, mat2x6_to_dmatrix(j_pose)));
+        }
+        if let Some(key) = frame_sensor_key_for_image(reconstruction, obs.image) {
+            if let Some(&offset) = sensor_pose_lookup.get(&key) {
+                let j_sensor = sensor_pose_jacobian(
+                    reconstruction,
+                    obs.image,
+                    reconstruction.camera_for_image(obs.image),
+                    point,
+                )? * sqrt_w;
+                nonpoint_jacobians.push((offset, mat2x6_to_dmatrix(j_sensor)));
+            }
         }
         if let Some(camera_idx) = camera_index_for_image(reconstruction, obs.image) {
             if camera_idx < camera_param_lookup.len() {
@@ -851,6 +944,7 @@ fn apply_schur_delta(
     reconstruction: &mut Reconstruction,
     observations: &[BaObservation],
     pose_blocks: &PoseBlockSet,
+    sensor_pose_specs: &[SensorPoseSpec],
     camera_param_specs: &[CameraParamSpec],
     point_blocks: &[PointBlock],
     nonpoint_delta: &DVector<f64>,
@@ -859,6 +953,17 @@ fn apply_schur_delta(
     for block in &pose_blocks.blocks {
         let delta = Vec6::from_iterator((0..6).map(|k| nonpoint_delta[block.offset + k] * step));
         apply_pose_block_delta(reconstruction, block, delta);
+    }
+
+    let changed_sensors = sensor_pose_specs
+        .iter()
+        .filter_map(|spec| {
+            let delta = Vec6::from_iterator((0..6).map(|k| nonpoint_delta[spec.offset + k] * step));
+            apply_sensor_pose_delta(reconstruction, &spec.key, delta).then_some(spec.key.clone())
+        })
+        .collect::<Vec<_>>();
+    if !changed_sensors.is_empty() {
+        sync_pose_blocks_for_sensor_changes(reconstruction, pose_blocks, &changed_sensors);
     }
 
     for spec in camera_param_specs {
@@ -972,6 +1077,21 @@ fn frame_sensor_from_rig(
     reconstruction.sensor_from_rig(frame.rig_id, sensor_id)
 }
 
+fn frame_sensor_key_for_image(
+    reconstruction: &Reconstruction,
+    image: usize,
+) -> Option<SensorPoseKey> {
+    let frame_idx = reconstruction.frame_index_for_image(image)?;
+    let frame = reconstruction.frames.get(frame_idx)?;
+    let sensor_id = reconstruction
+        .frame_sensor_id_for_image(frame_idx, image)?
+        .clone();
+    Some(SensorPoseKey {
+        rig_id: frame.rig_id,
+        sensor_id,
+    })
+}
+
 fn frame_pose_jacobian(
     reconstruction: &Reconstruction,
     frame_idx: usize,
@@ -1003,6 +1123,103 @@ fn frame_pose_jacobian(
         jacobian[(1, axis)] = (p_plus[1] - p_minus[1]) / (2.0 * eps[axis]);
     }
     Some(jacobian)
+}
+
+fn sensor_pose_jacobian(
+    reconstruction: &Reconstruction,
+    image: usize,
+    camera: CameraModel,
+    point: [f32; 3],
+) -> Option<Mat2x6> {
+    let frame_idx = reconstruction.frame_index_for_image(image)?;
+    let frame = reconstruction.frames.get(frame_idx)?;
+    let rig_from_world = frame.rig_from_world.to_se3();
+    let sensor_from_rig = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
+    let mut jacobian = Mat2x6::zeros();
+    let eps = [1.0e-4; 6];
+    for axis in 0..6 {
+        let mut plus = Vec6::zeros();
+        plus[axis] = eps[axis];
+        let mut minus = Vec6::zeros();
+        minus[axis] = -eps[axis];
+        let p_plus = project_point(
+            camera,
+            apply_pose_delta_f64(sensor_from_rig, plus).compose(&rig_from_world),
+            point,
+        )?;
+        let p_minus = project_point(
+            camera,
+            apply_pose_delta_f64(sensor_from_rig, minus).compose(&rig_from_world),
+            point,
+        )?;
+        jacobian[(0, axis)] = (p_plus[0] - p_minus[0]) / (2.0 * eps[axis]);
+        jacobian[(1, axis)] = (p_plus[1] - p_minus[1]) / (2.0 * eps[axis]);
+    }
+    Some(jacobian)
+}
+
+fn apply_sensor_pose_delta(
+    reconstruction: &mut Reconstruction,
+    key: &SensorPoseKey,
+    delta: Vec6,
+) -> bool {
+    let Some(rig) = reconstruction
+        .rigs
+        .iter_mut()
+        .find(|rig| rig.rig_id == key.rig_id)
+    else {
+        return false;
+    };
+    if rig
+        .ref_sensor_id
+        .as_ref()
+        .is_some_and(|ref_sensor_id| ref_sensor_id == &key.sensor_id)
+    {
+        return false;
+    }
+    let Some(sensor) = rig
+        .sensors
+        .iter_mut()
+        .find(|sensor| sensor.sensor_id == key.sensor_id)
+    else {
+        return false;
+    };
+    let current = sensor
+        .sensor_from_rig
+        .as_ref()
+        .map(Rigid3::to_se3)
+        .unwrap_or_else(SE3::identity);
+    sensor.sensor_from_rig = Some(Rigid3::from_se3(apply_pose_delta_f64(current, delta)));
+    true
+}
+
+fn sync_pose_blocks_for_sensor_changes(
+    reconstruction: &mut Reconstruction,
+    pose_blocks: &PoseBlockSet,
+    changed_sensors: &[SensorPoseKey],
+) {
+    let changed_sensors = changed_sensors.iter().collect::<HashSet<_>>();
+    for block in &pose_blocks.blocks {
+        let PoseBlockKind::Frame(frame_idx) = block.kind else {
+            continue;
+        };
+        let frame_uses_changed_sensor = block
+            .images
+            .iter()
+            .filter_map(|&image| frame_sensor_key_for_image(reconstruction, image))
+            .any(|key| changed_sensors.contains(&key));
+        if frame_uses_changed_sensor {
+            let Some(frame) = reconstruction.frames.get(frame_idx) else {
+                continue;
+            };
+            set_frame_pose_block(
+                reconstruction,
+                frame_idx,
+                &block.images,
+                frame.rig_from_world.to_se3(),
+            );
+        }
+    }
 }
 
 fn residual_and_jacobians(
@@ -1588,12 +1805,14 @@ fn restore_state(
     reconstruction: &mut Reconstruction,
     poses: &[Option<SE3>],
     frames: &[Frame],
+    rigs: &[Rig],
     points: &[[f32; 3]],
     camera: CameraModel,
     cameras: &[CameraModel],
 ) {
     reconstruction.poses.clone_from_slice(poses);
     reconstruction.frames.clone_from_slice(frames);
+    reconstruction.rigs.clone_from_slice(rigs);
     for (point, xyz) in reconstruction.points.iter_mut().zip(points.iter()) {
         point.xyz = *xyz;
     }
@@ -1966,7 +2185,7 @@ mod tests {
                     data_id: reconstruction.image_id(0) as u64,
                 },
                 DataId {
-                    sensor_id: aux_sensor,
+                    sensor_id: aux_sensor.clone(),
                     data_id: reconstruction.image_id(1) as u64,
                 },
             ],
@@ -2016,6 +2235,7 @@ mod tests {
                 max_observation_error_px: 200.0,
                 variable_images: Some(vec![0, 1]),
                 constant_images: vec![2],
+                constant_sensor_from_rig: vec![aux_sensor.clone()],
                 point_ids: Some((0..6).collect()),
                 ..BundleAdjustmentOptions::default()
             },
@@ -2030,6 +2250,75 @@ mod tests {
             rig_pose.translation()
         );
         assert!(translation_distance(reconstruction.poses[1].unwrap(), expected_aux_pose) < 1.0e-5);
+    }
+
+    #[test]
+    fn bundle_adjustment_refines_sensor_from_rig_when_not_constant() {
+        let SensorBaFixture {
+            frames,
+            mut reconstruction,
+            aux_sensor,
+            initial_sensor_from_rig,
+            true_sensor_from_rig,
+            ..
+        } = sensor_ba_fixture();
+        let initial_error = translation_distance(initial_sensor_from_rig, true_sensor_from_rig);
+
+        let report = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 8,
+                huber_delta_px: 4.0,
+                max_observation_error_px: 200.0,
+                variable_images: Some(vec![0, 1]),
+                constant_images: vec![2, 3],
+                point_ids: Some((0..8).collect()),
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .unwrap();
+
+        let refined_sensor_from_rig = sensor_from_rig_pose(&reconstruction, 3, &aux_sensor);
+        assert!(report.final_cost < report.initial_cost);
+        assert!(
+            translation_distance(refined_sensor_from_rig, true_sensor_from_rig) < initial_error
+        );
+    }
+
+    #[test]
+    fn bundle_adjustment_keeps_constant_sensor_from_rig_fixed() {
+        let SensorBaFixture {
+            frames,
+            mut reconstruction,
+            aux_sensor,
+            initial_sensor_from_rig,
+            ..
+        } = sensor_ba_fixture();
+
+        let report = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 4,
+                huber_delta_px: 4.0,
+                max_observation_error_px: 200.0,
+                variable_images: Some(vec![0, 1]),
+                constant_images: vec![2, 3],
+                constant_sensor_from_rig: vec![aux_sensor.clone()],
+                point_ids: Some((0..8).collect()),
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.is_solution_usable());
+        assert!(
+            translation_distance(
+                sensor_from_rig_pose(&reconstruction, 3, &aux_sensor),
+                initial_sensor_from_rig,
+            ) < 1.0e-6
+        );
     }
 
     #[test]
@@ -2404,6 +2693,167 @@ mod tests {
             point_ids: Vec::new(),
             points: Vec::new(),
         }
+    }
+
+    struct SensorBaFixture {
+        frames: Vec<ImageFrame>,
+        reconstruction: Reconstruction,
+        aux_sensor: SensorId,
+        initial_sensor_from_rig: SE3,
+        true_sensor_from_rig: SE3,
+    }
+
+    fn sensor_ba_fixture() -> SensorBaFixture {
+        let mut frames = vec![frame(0), frame(1), frame(2), frame(3)];
+        let camera = CameraModel::new_pinhole(160, 120, 90.0, 90.0, 80.0, 60.0);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        let true_sensor_from_rig =
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.35, 0.02, 0.0));
+        let initial_sensor_from_rig =
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.1, -0.04, 0.0));
+        let rig_poses = [
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.0, 0.0, 0.0)),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.18, 0.03, 0.0)),
+        ];
+        let outside_poses = [
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.75, 0.02, 0.0)),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(-0.65, 0.01, 0.0)),
+        ];
+        let poses = [
+            rig_poses[0],
+            true_sensor_from_rig.compose(&rig_poses[0]),
+            outside_poses[0],
+            outside_poses[1],
+        ];
+        let scene_points = vec![
+            [-0.35, -0.25, 2.5],
+            [-0.05, -0.2, 2.3],
+            [0.25, -0.15, 2.7],
+            [0.45, 0.05, 2.9],
+            [-0.25, 0.2, 2.4],
+            [0.05, 0.25, 2.6],
+            [0.35, 0.3, 3.0],
+            [0.0, 0.0, 3.2],
+        ];
+        for image in 0..frames.len() {
+            frames[image].keypoints = scene_points
+                .iter()
+                .map(|&point| {
+                    let xy = project_point(camera, poses[image], point).unwrap();
+                    rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
+                })
+                .collect();
+            frames[image].colors = vec![[0, 0, 0]; frames[image].keypoints.len()];
+        }
+
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3::from_se3(initial_sensor_from_rig)),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![
+            Frame {
+                frame_id: 9,
+                rig_id: 3,
+                rig_from_world: Rigid3::from_se3(rig_poses[0]),
+                data_ids: vec![
+                    DataId {
+                        sensor_id: ref_sensor.clone(),
+                        data_id: reconstruction.image_id(0) as u64,
+                    },
+                    DataId {
+                        sensor_id: aux_sensor.clone(),
+                        data_id: reconstruction.image_id(1) as u64,
+                    },
+                ],
+            },
+            Frame {
+                frame_id: 10,
+                rig_id: 3,
+                rig_from_world: Rigid3::from_se3(rig_poses[1]),
+                data_ids: Vec::new(),
+            },
+        ];
+        reconstruction.image_frame_indices = vec![Some(0), Some(0), None, None];
+        reconstruction.poses[0] = Some(rig_poses[0]);
+        reconstruction.poses[1] = Some(initial_sensor_from_rig.compose(&rig_poses[0]));
+        reconstruction.poses[2] = Some(outside_poses[0]);
+        reconstruction.poses[3] = Some(outside_poses[1]);
+        for (idx, xyz) in scene_points.into_iter().enumerate() {
+            for image in 0..frames.len() {
+                reconstruction.observations[image][idx] = Some(idx);
+            }
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![
+                    TrackObservation {
+                        image: 0,
+                        feature: idx,
+                    },
+                    TrackObservation {
+                        image: 1,
+                        feature: idx,
+                    },
+                    TrackObservation {
+                        image: 2,
+                        feature: idx,
+                    },
+                    TrackObservation {
+                        image: 3,
+                        feature: idx,
+                    },
+                ],
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+
+        SensorBaFixture {
+            frames,
+            reconstruction,
+            aux_sensor,
+            initial_sensor_from_rig,
+            true_sensor_from_rig,
+        }
+    }
+
+    fn sensor_from_rig_pose(
+        reconstruction: &Reconstruction,
+        rig_id: u32,
+        sensor_id: &SensorId,
+    ) -> SE3 {
+        reconstruction
+            .rigs
+            .iter()
+            .find(|rig| rig.rig_id == rig_id)
+            .and_then(|rig| {
+                rig.sensors
+                    .iter()
+                    .find(|sensor| &sensor.sensor_id == sensor_id)
+            })
+            .and_then(|sensor| sensor.sensor_from_rig.as_ref())
+            .map(Rigid3::to_se3)
+            .unwrap()
     }
 
     fn translation_distance(left: SE3, right: SE3) -> f32 {

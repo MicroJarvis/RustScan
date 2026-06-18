@@ -86,10 +86,12 @@ reconstruction parity.
      for registered multi-image COLMAP frames instead of optimizing each frame
      image as an independent pose, and propagates the optimized frame pose back
      through fixed `sensor_from_rig` transforms.
+   - Non-reference rig `sensor_from_rig` poses are now first-class BA parameter
+     blocks with COLMAP-style constant-sensor scheduling, while reference
+     sensors remain fixed to identity.
    - Remaining work: generalized pose registration for non-trivial rigs,
-     exact filtered-frame event counters in all mapper cleanup paths, and
-     treating rig sensor poses as first-class BA parameter blocks instead of
-     fixed transforms.
+     exact filtered-frame event counters in all mapper cleanup paths, exact
+     COLMAP gauge selection, and Ceres-equivalent rig/sensor solver behavior.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
@@ -431,8 +433,12 @@ reconstruction parity.
     - BA now uses shared frame pose blocks for registered COLMAP frames, keeping
       all images in the same frame tied to `sensor_from_rig * rig_from_world`
       during optimization instead of repairing frame consistency only after BA.
+    - Non-reference `sensor_from_rig` poses are optimized as dedicated BA
+      parameter blocks unless marked constant by COLMAP's constant-rig or
+      partial-rig local BA rules.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
-      strategies, and first-class `sensor_from_rig` BA parameter blocks.
+      strategies, analytic rig/sensor Jacobians, and Ceres-equivalent backend
+      behavior.
 21. Match COLMAP global BA scheduling, convergence settings, optional redundant
     point handling, pose priors, normalization, and iterative refinement loops.
     - Added COLMAP-style global BA scheduling after initialization, during
