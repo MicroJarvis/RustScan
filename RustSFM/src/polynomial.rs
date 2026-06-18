@@ -66,21 +66,30 @@ pub fn real_roots_durand_kerner(coeffs: &[f64], imag_eps: f64) -> Vec<f64> {
 }
 
 pub fn real_roots_companion_matrix(coeffs: &[f64], imag_eps: f64) -> Vec<f64> {
+    complex_roots_companion_matrix(coeffs)
+        .into_iter()
+        .filter(|root| root.im.abs() <= imag_eps)
+        .map(|root| root.re)
+        .filter(|value| value.is_finite())
+        .collect()
+}
+
+pub fn complex_roots_companion_matrix(coeffs: &[f64]) -> Vec<Complex64> {
     let coeffs = trim_leading_zeros(coeffs);
     if coeffs.len() < 2 {
         return Vec::new();
     }
     let degree = coeffs.len() - 1;
     if degree == 1 {
-        return vec![-coeffs[1] / coeffs[0]];
+        return vec![Complex64::new(-coeffs[1] / coeffs[0], 0.0)];
     }
     if degree == 2 {
-        return quadratic_roots(coeffs, imag_eps);
+        return quadratic_roots_complex(coeffs);
     }
 
     let coeffs = trim_trailing_zeros(coeffs);
     if coeffs.len() <= 1 {
-        return vec![0.0];
+        return vec![Complex64::ZERO];
     }
     let effective_degree = coeffs.len() - 1;
     let lead = coeffs[0];
@@ -99,12 +108,11 @@ pub fn real_roots_companion_matrix(coeffs: &[f64], imag_eps: f64) -> Vec<f64> {
     let mut roots = companion
         .complex_eigenvalues()
         .iter()
-        .filter(|root| root.im.abs() <= imag_eps)
-        .map(|root| root.re)
-        .filter(|value| value.is_finite())
+        .map(|root| Complex64::new(root.re, root.im))
+        .filter(|value| value.re.is_finite() && value.im.is_finite())
         .collect::<Vec<_>>();
     if effective_degree < degree {
-        roots.push(0.0);
+        roots.push(Complex64::ZERO);
     }
     roots
 }
@@ -179,19 +187,24 @@ fn trim_trailing_zeros(coeffs: &[f64]) -> &[f64] {
     }
 }
 
-fn quadratic_roots(coeffs: &[f64], imag_eps: f64) -> Vec<f64> {
+fn quadratic_roots_complex(coeffs: &[f64]) -> Vec<Complex64> {
     let a = coeffs[0];
     let b = coeffs[1];
     let c = coeffs[2];
     if a.abs() < 1.0e-15 {
-        return vec![-c / b];
+        return vec![Complex64::new(-c / b, 0.0)];
     }
     let disc = b * b - 4.0 * a * c;
-    if disc >= -imag_eps {
-        let sqrt_disc = disc.max(0.0).sqrt();
-        vec![(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)]
+    if disc >= 0.0 {
+        let sqrt_disc = disc.sqrt();
+        vec![
+            Complex64::new((-b - sqrt_disc) / (2.0 * a), 0.0),
+            Complex64::new((-b + sqrt_disc) / (2.0 * a), 0.0),
+        ]
     } else {
-        Vec::new()
+        let real = -b / (2.0 * a);
+        let imag = (-disc).sqrt() / (2.0 * a);
+        vec![Complex64::new(real, imag), Complex64::new(real, -imag)]
     }
 }
 
@@ -223,5 +236,15 @@ mod tests {
         for (actual, expected) in roots.iter().zip([1.0, 2.0, 3.0, 4.0]) {
             assert!((actual - expected).abs() < 1.0e-7, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn companion_returns_complex_roots_for_filtering() {
+        let roots = complex_roots_companion_matrix(&[1.0, 0.0, 1.0]);
+
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().all(|root| root.re.abs() < 1.0e-12));
+        assert!(roots.iter().any(|root| (root.im - 1.0).abs() < 1.0e-12));
+        assert!(roots.iter().any(|root| (root.im + 1.0).abs() < 1.0e-12));
     }
 }

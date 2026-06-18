@@ -22,15 +22,14 @@ pub fn estimate_five_point_essential(
 
     let b_data = build_determinant_matrix_data(&aa);
     let coeffs = five_point_generated::determinant_coeffs(&b_data);
-    let mut roots = real_polynomial_roots(&coeffs);
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    roots.dedup_by(|a, b| (*a - *b).abs() < 1.0e-8);
+    let roots = polynomial::complex_roots_companion_matrix(&coeffs);
 
     let mut models = Vec::new();
-    for z1 in roots {
-        if !z1.is_finite() {
+    for root in roots {
+        if root.im.abs() > 1.0e-10 {
             continue;
         }
+        let z1 = root.re;
         let z2 = z1 * z1;
         let z3 = z2 * z1;
         let z4 = z3 * z1;
@@ -160,22 +159,6 @@ fn build_determinant_matrix_data(aa: &DMatrix<f64>) -> [f64; 39] {
     b
 }
 
-fn real_polynomial_roots(coeffs: &[f64; 11]) -> Vec<f64> {
-    let scale = coeffs.iter().map(|v| v.abs()).fold(0.0, f64::max);
-    if !scale.is_finite() || scale <= 1.0e-15 {
-        return Vec::new();
-    }
-    let normalized = coeffs.iter().map(|c| c / scale).collect::<Vec<_>>();
-    polynomial::real_roots_companion_matrix(&normalized, 1.0e-8)
-        .into_iter()
-        .filter(|root| polynomial_residual(&normalized, *root).abs() < 1.0e-5)
-        .collect()
-}
-
-fn polynomial_residual(coeffs: &[f64], x: f64) -> f64 {
-    coeffs.iter().fold(0.0, |value, coeff| value * x + coeff)
-}
-
 fn b_at(b: &[f64; 39], row: usize, col: usize) -> f64 {
     b[col * 13 + row]
 }
@@ -250,6 +233,17 @@ mod tests {
             "best distance={best}, models={}",
             models.len()
         );
+    }
+
+    #[test]
+    fn five_point_root_filter_uses_colmap_imaginary_threshold() {
+        let roots = polynomial::complex_roots_companion_matrix(&[1.0, 0.0, 1.0]);
+        let accepted = roots
+            .into_iter()
+            .filter(|root| root.im.abs() <= 1.0e-10)
+            .collect::<Vec<_>>();
+
+        assert!(accepted.is_empty());
     }
 
     fn matrix_to_vec9(m: Matrix3<f64>) -> nalgebra::SVector<f64, 9> {

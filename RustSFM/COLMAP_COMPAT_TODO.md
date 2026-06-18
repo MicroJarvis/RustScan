@@ -231,10 +231,14 @@ reconstruction parity.
       point-normalization convention for F, COLMAP-shaped raw camera-ray
       estimation for E, and official COLMAP reference coverage for the
       eight-point F solver.
+    - Five-point essential estimation now keeps COLMAP's generated polynomial
+      expressions and filters companion-matrix roots with the official
+      imaginary-part threshold instead of Rust-only sorting/deduplication and
+      residual heuristics.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level official seven-point
       nullspace extraction, byte-level eight-point Householder-Q nullspace
-      extraction, and the generated official five-point essential estimator.
+      extraction, and byte-level five-point nullspace / companion root parity.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
