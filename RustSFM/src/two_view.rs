@@ -1,6 +1,5 @@
 use crate::five_point::estimate_five_point_essential;
 use crate::geometry::relative_rotation_deg;
-use crate::polynomial;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
 use nalgebra::{
@@ -784,25 +783,19 @@ fn estimate_fundamental_seven_point_indexed(
     if indices.len() != 7 {
         return Vec::new();
     }
-    let Some((norm1, t1)) = normalize_points_indexed(pts1, indices) else {
-        return Vec::new();
-    };
-    let Some((norm2, t2)) = normalize_points_indexed(pts2, indices) else {
-        return Vec::new();
-    };
     let mut rows = Vec::with_capacity(indices.len() * 9);
-    for (x1, x2) in norm1.iter().zip(norm2.iter()) {
-        rows.extend_from_slice(&[
-            x2.x * x1.x,
-            x2.x * x1.y,
-            x2.x * x1.z,
-            x2.y * x1.x,
-            x2.y * x1.y,
-            x2.y * x1.z,
-            x2.z * x1.x,
-            x2.z * x1.y,
-            x2.z * x1.z,
-        ]);
+    for &idx in indices {
+        let Some(x1) = pts1.get(idx) else {
+            return Vec::new();
+        };
+        let Some(x2) = pts2.get(idx) else {
+            return Vec::new();
+        };
+        let x = x1.x / x1.z;
+        let y = x1.y / x1.z;
+        let u = x2.x / x2.z;
+        let v = x2.y / x2.z;
+        rows.extend_from_slice(&[u * x, u * y, u, v * x, v * y, v, x, y, 1.0]);
     }
     let a = DMatrix::<f64>::from_row_slice(indices.len(), 9, &rows);
     let ata = a.transpose() * a;
@@ -830,24 +823,9 @@ fn estimate_fundamental_seven_point_indexed(
         *a -= *b;
     }
 
-    let f1_mat = Matrix3::from_row_slice(&f1);
-    let f2_mat = Matrix3::from_row_slice(&f2);
-    let p0 = f2_mat.determinant();
-    let p1 = (f2_mat + f1_mat).determinant();
-    let pm1 = (f2_mat - f1_mat).determinant();
-    let p2 = (f2_mat + f1_mat * 2.0).determinant();
-    let d = p0;
-    let s1 = p1 - d;
-    let sm1 = pm1 - d;
-    let s2 = p2 - d;
-    let b = 0.5 * (s1 + sm1);
-    let a_plus_c = 0.5 * (s1 - sm1);
-    let a = (s2 - 4.0 * b - 2.0 * a_plus_c) / 6.0;
-    let c = a_plus_c - a;
-
-    let mut roots = polynomial::real_roots_companion_matrix(&[a, b, c, d], 1.0e-8);
-    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    roots.dedup_by(|a, b| (*a - *b).abs() < 1.0e-8);
+    let Some(roots) = colmap_fundamental_cubic_roots(&f1, &f2) else {
+        return Vec::new();
+    };
 
     let mut models = Vec::with_capacity(roots.len());
     for root in roots {
@@ -862,15 +840,79 @@ fn estimate_fundamental_seven_point_indexed(
             f1[7] * root + f2[7],
             f1[8] * root + f2[8],
         ];
-        let f_norm =
-            Matrix3::from_row_slice(&f_vec) / f_vec.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let f = t2.transpose() * f_norm * t1;
-        let norm = f.norm();
+        let norm = f_vec.iter().map(|v| v * v).sum::<f64>().sqrt();
         if norm > 1.0e-12 && norm.is_finite() {
-            models.push(f / norm);
+            models.push(Matrix3::from_row_slice(&f_vec) / norm);
         }
     }
     models
+}
+
+fn colmap_fundamental_cubic_roots(f1: &[f64; 9], f2: &[f64; 9]) -> Option<Vec<f64>> {
+    let t0 = f1[4] * f1[8] - f1[5] * f1[7];
+    let t1 = f1[3] * f1[8] - f1[5] * f1[6];
+    let t2 = f1[3] * f1[7] - f1[4] * f1[6];
+    let t3 = f2[4] * f2[8] - f2[5] * f2[7];
+    let t4 = f2[3] * f2[8] - f2[5] * f2[6];
+    let t5 = f2[3] * f2[7] - f2[4] * f2[6];
+
+    let c3 = f1[0] * t0 - f1[1] * t1 + f1[2] * t2;
+    if c3.abs() < 1.0e-16 {
+        return None;
+    }
+
+    let c2 = f2[0] * t0 - f2[1] * t1 + f2[2] * t2 - f2[3] * (f1[1] * f1[8] - f1[2] * f1[7])
+        + f2[4] * (f1[0] * f1[8] - f1[2] * f1[6])
+        - f2[5] * (f1[0] * f1[7] - f1[1] * f1[6])
+        + f2[6] * (f1[1] * f1[5] - f1[2] * f1[4])
+        - f2[7] * (f1[0] * f1[5] - f1[2] * f1[3])
+        + f2[8] * (f1[0] * f1[4] - f1[1] * f1[3]);
+    let c1 = f1[0] * t3 - f1[1] * t4 + f1[2] * t5 - f1[3] * (f2[1] * f2[8] - f2[2] * f2[7])
+        + f1[4] * (f2[0] * f2[8] - f2[2] * f2[6])
+        - f1[5] * (f2[0] * f2[7] - f2[1] * f2[6])
+        + f1[6] * (f2[1] * f2[5] - f2[2] * f2[4])
+        - f1[7] * (f2[0] * f2[5] - f2[2] * f2[3])
+        + f1[8] * (f2[0] * f2[4] - f2[1] * f2[3]);
+    let c0 = f2[0] * t3 - f2[1] * t4 + f2[2] * t5;
+
+    Some(colmap_cubic_polynomial_roots(c2 / c3, c1 / c3, c0 / c3))
+}
+
+fn colmap_cubic_polynomial_roots(c2: f64, c1: f64, c0: f64) -> Vec<f64> {
+    const K2_PI_OVER_3: f64 = 2.09439510239319526263557236234192;
+    const K4_PI_OVER_3: f64 = 4.18879020478639052527114472468384;
+
+    let c2_over_3 = c2 / 3.0;
+    let a = c1 - c2 * c2_over_3;
+    let mut b = (2.0 * c2 * c2 * c2 - 9.0 * c2 * c1) / 27.0 + c0;
+    let mut c = b * b / 4.0 + a * a * a / 27.0;
+    let mut roots = Vec::with_capacity(3);
+    if c > 0.0 {
+        c = c.sqrt();
+        b *= -0.5;
+        roots.push((b + c).cbrt() + (b - c).cbrt() - c2_over_3);
+    } else if a.abs() > 1.0e-24 {
+        c = 3.0 * b / (2.0 * a) * (-3.0 / a).sqrt();
+        let d = 2.0 * (-a / 3.0).sqrt();
+        let acos_over_3 = c.clamp(-1.0, 1.0).acos() / 3.0;
+        roots.push(d * acos_over_3.cos() - c2_over_3);
+        roots.push(d * (acos_over_3 - K2_PI_OVER_3).cos() - c2_over_3);
+        roots.push(d * (acos_over_3 - K4_PI_OVER_3).cos() - c2_over_3);
+    } else {
+        roots.push(-c2_over_3);
+    }
+
+    for root in roots.iter_mut() {
+        let x = *root;
+        let x2 = x * x;
+        let x3 = x * x2;
+        let denom = 3.0 * x2 + 2.0 * c2 * x + c1;
+        if denom.abs() > 1.0e-24 {
+            *root += -(x3 + c2 * x2 + c1 * x + c0) / denom;
+        }
+    }
+    roots.retain(|root| root.is_finite());
+    roots
 }
 
 fn estimate_fundamental_eight_point_indexed(
@@ -2027,6 +2069,43 @@ mod tests {
                 3_348_747_335,
             ]
         );
+    }
+
+    #[test]
+    fn fundamental_seven_point_matches_colmap_reference() {
+        let points1_raw = [
+            0.4964, 1.0577, 0.3650, -0.0919, -0.5412, 0.0159, -0.5239, 0.9467, 0.3467, 0.5301,
+            0.2797, 0.0012, -0.1986, 0.0460,
+        ];
+        let points2_raw = [
+            0.7570, 2.7340, 0.3961, 0.6981, -0.6014, 0.7110, -0.7385, 2.2712, 0.4177, 1.2132,
+            0.3052, 0.4835, -0.2171, 0.5057,
+        ];
+        let pts1 = (0..7)
+            .map(|i| Vector3::new(points1_raw[2 * i], points1_raw[2 * i + 1], 1.0))
+            .collect::<Vec<_>>();
+        let pts2 = (0..7)
+            .map(|i| Vector3::new(points2_raw[2 * i], points2_raw[2 * i + 1], 1.0))
+            .collect::<Vec<_>>();
+
+        let models = estimate_fundamental_seven_point_indexed(&pts1, &pts2, &[0, 1, 2, 3, 4, 5, 6]);
+
+        assert_eq!(models.len(), 1);
+        let f = models[0] / models[0][(2, 2)];
+        let expected = Matrix3::new(
+            4.81441976,
+            -8.16978909,
+            6.73133404,
+            5.16247992,
+            0.19325606,
+            -2.87239381,
+            -9.92570126,
+            3.64159554,
+            1.0,
+        );
+        for (actual, expected) in f.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
     }
 
     #[test]

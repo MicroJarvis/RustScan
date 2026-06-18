@@ -223,9 +223,14 @@ reconstruction parity.
       larger inlier sets use the unnormalized 2N x 9 SVD nullspace with
       Eigen-style rank rejection, and singular homographies are rejected by
       the official determinant threshold.
+    - Fundamental seven-point minimal estimation now uses COLMAP's raw
+      unnormalized sample coordinates, explicit determinant cubic
+      coefficients, and COLMAP's cubic root polishing path; it is pinned by
+      COLMAP's official seven-point reference case.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
-      exact estimator stack, including byte-level official seven/eight-point
-      fundamental parity and official essential estimators.
+      exact estimator stack, including byte-level official seven-point
+      nullspace extraction, official eight-point fundamental parity, and
+      official essential estimators.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
