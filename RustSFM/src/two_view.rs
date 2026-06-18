@@ -46,8 +46,7 @@ pub struct TwoViewEstimate {
 struct ModelSupport {
     inlier_mask: Vec<bool>,
     inliers: usize,
-    mean_residual: f64,
-    median_residual: f64,
+    residual_sum: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -674,11 +673,7 @@ fn is_better_support(candidate: &ModelSupport, current: Option<&ModelSupport>) -
         return true;
     };
     candidate.inliers > current.inliers
-        || (candidate.inliers == current.inliers
-            && candidate.median_residual < current.median_residual)
-        || (candidate.inliers == current.inliers
-            && (candidate.median_residual - current.median_residual).abs() < 1.0e-12
-            && candidate.mean_residual < current.mean_residual)
+        || (candidate.inliers == current.inliers && candidate.residual_sum < current.residual_sum)
 }
 
 fn adaptive_ransac_iterations(
@@ -1149,7 +1144,8 @@ fn model_support_indexed(
     let threshold_sq = threshold.max(1.0e-12).powi(2);
     let n = pts1.len().min(pts2.len());
     let mut inlier_mask = vec![false; n];
-    let mut residuals = Vec::new();
+    let mut inliers = 0usize;
+    let mut residual_sum = 0.0f64;
     for &idx in indices {
         if idx >= n {
             continue;
@@ -1157,25 +1153,14 @@ fn model_support_indexed(
         let residual = squared_sampson_error(&pts1[idx], &pts2[idx], essential);
         if residual.is_finite() && residual <= threshold_sq {
             inlier_mask[idx] = true;
-            residuals.push(residual);
+            inliers += 1;
+            residual_sum += residual;
         }
     }
-    residuals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let inliers = residuals.len();
-    let mean_residual = if inliers > 0 {
-        residuals.iter().sum::<f64>() / inliers as f64
-    } else {
-        f64::INFINITY
-    };
-    let median_residual = residuals
-        .get(inliers.saturating_sub(1) / 2)
-        .copied()
-        .unwrap_or(f64::INFINITY);
     ModelSupport {
         inlier_mask,
         inliers,
-        mean_residual,
-        median_residual,
+        residual_sum,
     }
 }
 
@@ -1189,7 +1174,8 @@ fn homography_support_indexed(
     let threshold_sq = threshold.max(1.0e-12).powi(2);
     let n = pts1.len().min(pts2.len());
     let mut inlier_mask = vec![false; n];
-    let mut residuals = Vec::new();
+    let mut inliers = 0usize;
+    let mut residual_sum = 0.0f64;
     let inverse_h = homography.try_inverse();
     for &idx in indices {
         if idx >= n {
@@ -1199,25 +1185,14 @@ fn homography_support_indexed(
             symmetric_homography_error(&pts1[idx], &pts2[idx], homography, inverse_h.as_ref());
         if residual.is_finite() && residual <= threshold_sq {
             inlier_mask[idx] = true;
-            residuals.push(residual);
+            inliers += 1;
+            residual_sum += residual;
         }
     }
-    residuals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let inliers = residuals.len();
-    let mean_residual = if inliers > 0 {
-        residuals.iter().sum::<f64>() / inliers as f64
-    } else {
-        f64::INFINITY
-    };
-    let median_residual = residuals
-        .get(inliers.saturating_sub(1) / 2)
-        .copied()
-        .unwrap_or(f64::INFINITY);
     ModelSupport {
         inlier_mask,
         inliers,
-        mean_residual,
-        median_residual,
+        residual_sum,
     }
 }
 
@@ -1861,6 +1836,34 @@ mod tests {
     }
 
     #[test]
+    fn support_ordering_matches_colmap_inlier_residual_sum() {
+        let current = ModelSupport {
+            inlier_mask: vec![true, true, true],
+            inliers: 3,
+            residual_sum: 1.0,
+        };
+        let more_inliers = ModelSupport {
+            inlier_mask: vec![true, true, true, true],
+            inliers: 4,
+            residual_sum: 10.0,
+        };
+        let lower_residual_sum = ModelSupport {
+            inlier_mask: vec![true, true, true],
+            inliers: 3,
+            residual_sum: 0.9,
+        };
+        let higher_residual_sum = ModelSupport {
+            inlier_mask: vec![true, true, true],
+            inliers: 3,
+            residual_sum: 1.1,
+        };
+
+        assert!(is_better_support(&more_inliers, Some(&current)));
+        assert!(is_better_support(&lower_residual_sum, Some(&current)));
+        assert!(!is_better_support(&higher_residual_sum, Some(&current)));
+    }
+
+    #[test]
     fn pair_reprojection_error_uses_each_image_camera() {
         let camera1 = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
         let camera2 = CameraModel::new_pinhole(800, 600, 900.0, 700.0, 30.0, 40.0);
@@ -1929,20 +1932,17 @@ mod tests {
         let e_support = ModelSupport {
             inlier_mask: vec![true, true, false, false],
             inliers: 2,
-            mean_residual: 0.0,
-            median_residual: 0.0,
+            residual_sum: 0.0,
         };
         let f_support = ModelSupport {
             inlier_mask: vec![true, true, true, false],
             inliers: 3,
-            mean_residual: 0.0,
-            median_residual: 0.0,
+            residual_sum: 0.0,
         };
         let h_support = ModelSupport {
             inlier_mask: vec![true, true, true, true],
             inliers: 4,
-            mean_residual: 0.0,
-            median_residual: 0.0,
+            residual_sum: 0.0,
         };
         let mut options = default_test_options();
         options.min_inliers = 3;

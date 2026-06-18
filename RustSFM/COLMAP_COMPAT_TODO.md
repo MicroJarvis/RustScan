@@ -206,9 +206,12 @@ reconstruction parity.
     - Two-view E/F/H random sampling now follows COLMAP `RandomSampler`'s
       stateful partial Fisher-Yates shape over a persistent index pool instead
       of repeatedly drawing unique indices by rejection.
+    - Two-view E/F/H support ordering now matches COLMAP's default
+      `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
+      summed inlier residuals instead of median/mean residual heuristics.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
-      exact estimator stack, support-measure details, and byte-for-byte
-      official PRNG / `uniform_int_distribution` sample sequence.
+      exact estimator stack and byte-for-byte official PRNG /
+      `uniform_int_distribution` sample sequence.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
