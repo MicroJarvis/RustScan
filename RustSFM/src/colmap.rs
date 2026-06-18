@@ -107,6 +107,13 @@ pub struct ColmapFrame {
     pub data_ids: Vec<ColmapDataId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ColmapSparseModel {
+    pub reconstruction: Reconstruction,
+    pub rigs: Vec<ColmapRig>,
+    pub frames: Vec<ColmapFrame>,
+}
+
 pub fn read_camera_model(root: &Path) -> Result<CameraModel> {
     let sparse = resolve_sparse_dir(root)?;
     let bin = sparse.join("cameras.bin");
@@ -212,6 +219,14 @@ pub fn read_colmap_reconstruction(root: &Path) -> Result<Reconstruction> {
     reconstruction_from_colmap_parts(colmap_cameras, images, points3d)
 }
 
+pub fn read_colmap_sparse_model(root: &Path) -> Result<ColmapSparseModel> {
+    Ok(ColmapSparseModel {
+        reconstruction: read_colmap_reconstruction(root)?,
+        rigs: read_optional_colmap_rigs(root)?,
+        frames: read_optional_colmap_frames(root)?,
+    })
+}
+
 fn read_optional_colmap_points3d(root: &Path) -> Result<Vec<ColmapPoint3D>> {
     let sparse = resolve_sparse_dir(root)?;
     let bin = sparse.join("points3D.bin");
@@ -221,6 +236,32 @@ fn read_optional_colmap_points3d(root: &Path) -> Result<Vec<ColmapPoint3D>> {
     let txt = sparse.join("points3D.txt");
     if txt.exists() {
         return read_points3d_txt(&txt);
+    }
+    Ok(Vec::new())
+}
+
+fn read_optional_colmap_rigs(root: &Path) -> Result<Vec<ColmapRig>> {
+    let sparse = resolve_sparse_dir(root)?;
+    let bin = sparse.join("rigs.bin");
+    if bin.exists() {
+        return read_rigs_bin(&bin);
+    }
+    let txt = sparse.join("rigs.txt");
+    if txt.exists() {
+        return read_rigs_txt(&txt);
+    }
+    Ok(Vec::new())
+}
+
+fn read_optional_colmap_frames(root: &Path) -> Result<Vec<ColmapFrame>> {
+    let sparse = resolve_sparse_dir(root)?;
+    let bin = sparse.join("frames.bin");
+    if bin.exists() {
+        return read_frames_bin(&bin);
+    }
+    let txt = sparse.join("frames.txt");
+    if txt.exists() {
+        return read_frames_txt(&txt);
     }
     Ok(Vec::new())
 }
@@ -520,6 +561,18 @@ pub fn export_colmap(
     Ok(())
 }
 
+pub fn export_colmap_sparse_model(
+    root: &Path,
+    model: &ColmapSparseModel,
+    copy_images: bool,
+) -> Result<()> {
+    export_colmap(root, &model.reconstruction, copy_images)?;
+    let sparse_dir = root.join("sparse").join("0");
+    write_rigs_txt(&sparse_dir.join("rigs.txt"), &model.rigs)?;
+    write_frames_txt(&sparse_dir.join("frames.txt"), &model.frames)?;
+    Ok(())
+}
+
 fn write_cameras_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
     writeln!(w, "# Camera list with one line of data per camera:")?;
@@ -615,6 +668,93 @@ fn write_points3d_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()
         writeln!(w)?;
     }
     Ok(())
+}
+
+fn write_rigs_txt(path: &Path, rigs: &[ColmapRig]) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path)?);
+    writeln!(w, "# Rig calib list with one line of data per rig:")?;
+    writeln!(
+        w,
+        "# RIG_ID, NUM_SENSORS, REF_SENSOR_TYPE, REF_SENSOR_ID, SENSORS[]"
+    )?;
+    for rig in rigs {
+        write!(w, "{} {}", rig.rig_id, rig.num_sensors())?;
+        if let Some(ref_sensor_id) = &rig.ref_sensor_id {
+            write!(w, " {}", format_sensor_id(ref_sensor_id))?;
+        }
+        for sensor in &rig.sensors {
+            write!(w, " {}", format_sensor_id(&sensor.sensor_id))?;
+            if let Some(sensor_from_rig) = &sensor.sensor_from_rig {
+                write!(w, " 1 {}", format_rigid3(sensor_from_rig))?;
+            } else {
+                write!(w, " 0")?;
+            }
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+fn write_frames_txt(path: &Path, frames: &[ColmapFrame]) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path)?);
+    writeln!(w, "# Frame list with one line of data per frame:")?;
+    writeln!(
+        w,
+        "# FRAME_ID, RIG_ID, RIG_FROM_WORLD, NUM_DATA_IDS, DATA_IDS[]"
+    )?;
+    for frame in frames {
+        write!(
+            w,
+            "{} {} {} {}",
+            frame.frame_id,
+            frame.rig_id,
+            format_rigid3(&frame.rig_from_world),
+            frame.data_ids.len()
+        )?;
+        for data_id in &frame.data_ids {
+            write!(
+                w,
+                " {} {}",
+                format_sensor_id(&data_id.sensor_id),
+                data_id.data_id
+            )?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+impl ColmapRig {
+    fn num_sensors(&self) -> usize {
+        self.sensors.len() + usize::from(self.ref_sensor_id.is_some())
+    }
+}
+
+fn format_sensor_id(sensor_id: &ColmapSensorId) -> String {
+    format!(
+        "{} {}",
+        sensor_type_name(&sensor_id.sensor_type),
+        sensor_id.sensor_id
+    )
+}
+
+fn sensor_type_name(sensor_type: &ColmapSensorType) -> &str {
+    match sensor_type {
+        ColmapSensorType::Invalid => "INVALID",
+        ColmapSensorType::Camera => "CAMERA",
+        ColmapSensorType::Imu => "IMU",
+        ColmapSensorType::Other(value) => value.as_str(),
+    }
+}
+
+fn format_rigid3(rigid: &ColmapRigid3) -> String {
+    rigid
+        .qvec
+        .iter()
+        .chain(rigid.tvec.iter())
+        .map(|value| format!("{value:.17}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn read_images_txt(path: &Path) -> Result<Vec<ColmapImage>> {
@@ -1519,6 +1659,47 @@ mod tests {
         assert_eq!(roundtrip.point_ids, vec![99]);
         assert_eq!(roundtrip.observations, reconstruction.observations);
         assert_eq!(roundtrip.points[0].track, reconstruction.points[0].track);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_model_roundtrip_preserves_rigs_and_frames() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("cameras.txt"),
+            "# cameras\n11 PINHOLE 640 480 500 501 320 240\n",
+        )?;
+        fs::write(
+            sparse.join("images.txt"),
+            "# images\n7 1 0 0 0 0 0 0 11 left.jpg\n10 20 -1\n",
+        )?;
+        fs::write(sparse.join("points3D.txt"), "# points\n")?;
+        fs::write(
+            sparse.join("rigs.txt"),
+            "# rigs\n3 3 CAMERA 11 CAMERA 12 1 1 0 0 0 0.1 0.2 0.3 IMU 5 0\n",
+        )?;
+        fs::write(
+            sparse.join("frames.txt"),
+            "# frames\n9 3 1 0 0 0 0.4 0.5 0.6 2 CAMERA 11 7 IMU 5 99\n",
+        )?;
+
+        let model = read_colmap_sparse_model(dir.path())?;
+        let exported = dir.path().join("exported_model");
+        export_colmap_sparse_model(&exported, &model, false)?;
+        let roundtrip = read_colmap_sparse_model(&exported)?;
+
+        assert_eq!(
+            roundtrip.reconstruction.camera_ids,
+            model.reconstruction.camera_ids
+        );
+        assert_eq!(
+            roundtrip.reconstruction.image_ids,
+            model.reconstruction.image_ids
+        );
+        assert_eq!(roundtrip.rigs, model.rigs);
+        assert_eq!(roundtrip.frames, model.frames);
         Ok(())
     }
 

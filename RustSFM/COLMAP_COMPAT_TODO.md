@@ -56,8 +56,11 @@ reconstruction parity.
      camera ids, image ids, point3D ids, image camera ownership, keypoints,
      point observations, and point tracks, with text export/read round-trip
      coverage.
+   - Added a full sparse-model container that reads/writes `rigs` and `frames`
+     alongside the reconstruction, with text round-trip coverage for
+     rig/frame ownership data.
    - Remaining work: database ids and rig/frame ownership in the mapper's
-     mutable reconstruction, plus full sparse model round-trip for rigs/frames.
+     mutable reconstruction/state machine.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
