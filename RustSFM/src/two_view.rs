@@ -1274,13 +1274,11 @@ fn homography_support_indexed(
     let mut inlier_mask = vec![false; n];
     let mut inliers = 0usize;
     let mut residual_sum = 0.0f64;
-    let inverse_h = homography.try_inverse();
     for &idx in indices {
         if idx >= n {
             continue;
         }
-        let residual =
-            symmetric_homography_error(&pts1[idx], &pts2[idx], homography, inverse_h.as_ref());
+        let residual = homography_forward_error(&pts1[idx], &pts2[idx], homography);
         if residual.is_finite() && residual <= threshold_sq {
             inlier_mask[idx] = true;
             inliers += 1;
@@ -1306,29 +1304,17 @@ fn squared_sampson_error(x1: &Vector3<f64>, x2: &Vector3<f64>, essential: &Matri
     }
 }
 
-fn symmetric_homography_error(
+fn homography_forward_error(
     x1: &Vector3<f64>,
     x2: &Vector3<f64>,
     homography: &Matrix3<f64>,
-    inverse_homography: Option<&Matrix3<f64>>,
 ) -> f64 {
     let Some(p2) = dehomogeneous(&(homography * x1)) else {
         return f64::INFINITY;
     };
-    let Some(inv_h) = inverse_homography else {
-        return f64::INFINITY;
-    };
-    let Some(p1) = dehomogeneous(&(inv_h * x2)) else {
-        return f64::INFINITY;
-    };
-    let x1x = x1.x / x1.z;
-    let x1y = x1.y / x1.z;
     let x2x = x2.x / x2.z;
     let x2y = x2.y / x2.z;
-    0.5 * ((p2[0] - x2x).powi(2)
-        + (p2[1] - x2y).powi(2)
-        + (p1[0] - x1x).powi(2)
-        + (p1[1] - x1y).powi(2))
+    (p2[0] - x2x).powi(2) + (p2[1] - x2y).powi(2)
 }
 
 fn dehomogeneous(p: &Vector3<f64>) -> Option<[f64; 2]> {
@@ -2051,6 +2037,31 @@ mod tests {
                 .fold(0.0, f64::max);
             det < 1.0e-8 && max_residual < 1.0e-10
         }));
+    }
+
+    #[test]
+    fn homography_support_uses_colmap_forward_projection_error() {
+        let homography = Matrix3::new(0.01, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+        let pts1 = vec![Vector3::new(100.0, 0.0, 1.0), Vector3::new(0.0, 1.0, 1.0)];
+        let pts2 = vec![Vector3::new(2.0, 0.0, 1.0), Vector3::new(0.0, 1.0, 1.0)];
+
+        let support = homography_support_indexed(&pts1, &pts2, &[0, 1], &homography, 2.0);
+        let inverse_homography = homography.try_inverse().unwrap();
+        let forward_residual = homography_forward_error(&pts1[0], &pts2[0], &homography);
+        let symmetric_residual = {
+            let p2 = dehomogeneous(&(homography * pts1[0])).unwrap();
+            let p1 = dehomogeneous(&(inverse_homography * pts2[0])).unwrap();
+            0.5 * ((p2[0] - pts2[0].x / pts2[0].z).powi(2)
+                + (p2[1] - pts2[0].y / pts2[0].z).powi(2)
+                + (p1[0] - pts1[0].x / pts1[0].z).powi(2)
+                + (p1[1] - pts1[0].y / pts1[0].z).powi(2))
+        };
+
+        assert_eq!(support.inliers, 2);
+        assert_eq!(support.inlier_mask, vec![true, true]);
+        assert!((support.residual_sum - 1.0).abs() < 1.0e-12);
+        assert!(forward_residual <= 4.0);
+        assert!(symmetric_residual > 4.0);
     }
 
     #[test]

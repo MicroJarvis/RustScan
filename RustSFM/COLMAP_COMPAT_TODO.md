@@ -215,9 +215,14 @@ reconstruction parity.
     - Fundamental-matrix LORANSAC now uses a COLMAP-style seven-point minimal
       estimator with multiple rank-2 hypotheses, while keeping the eight-point
       estimator for local inlier refitting.
+    - Homography RANSAC support now uses COLMAP's one-way squared forward
+      projection residual (`H * x1 -> x2`) instead of the previous symmetric
+      bidirectional transfer error.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level official seven/eight-point
-      fundamental parity plus official essential and homography estimators.
+      fundamental parity, official essential estimators, and the official
+      homography 4-point LU / multi-point SVD estimator with determinant
+      rejection.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.
