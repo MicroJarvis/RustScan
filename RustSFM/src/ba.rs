@@ -1403,6 +1403,53 @@ fn frame_pose_jacobian(
     let frame = reconstruction.frames.get(frame_idx)?;
     let rig_from_world = frame.rig_from_world.to_se3();
     let sensor_from_rig = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
+    analytic_frame_pose_jacobian(camera, sensor_from_rig, rig_from_world, point)
+        .or_else(|| numerical_frame_pose_jacobian(camera, sensor_from_rig, rig_from_world, point))
+}
+
+fn sensor_pose_jacobian(
+    reconstruction: &Reconstruction,
+    image: usize,
+    camera: CameraModel,
+    point: [f32; 3],
+) -> Option<Mat2x6> {
+    let frame_idx = reconstruction.frame_index_for_image(image)?;
+    let frame = reconstruction.frames.get(frame_idx)?;
+    let rig_from_world = frame.rig_from_world.to_se3();
+    let sensor_from_rig = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
+    analytic_sensor_pose_jacobian(camera, sensor_from_rig, rig_from_world, point)
+        .or_else(|| numerical_sensor_pose_jacobian(camera, sensor_from_rig, rig_from_world, point))
+}
+
+fn analytic_frame_pose_jacobian(
+    camera: CameraModel,
+    sensor_from_rig: SE3,
+    rig_from_world: SE3,
+    point: [f32; 3],
+) -> Option<Mat2x6> {
+    let image_pose = sensor_from_rig.compose(&rig_from_world);
+    let (j_image_pose, _) = analytic_projection_jacobians(camera, image_pose, point)?;
+    let r_sensor = mat3_from_pose_rotation(sensor_from_rig);
+    let mut jacobian = Mat2x6::zeros();
+    for row in 0..2 {
+        for col in 0..3 {
+            jacobian[(row, col)] = j_image_pose[(row, 0)] * r_sensor[(0, col)]
+                + j_image_pose[(row, 1)] * r_sensor[(1, col)]
+                + j_image_pose[(row, 2)] * r_sensor[(2, col)];
+            jacobian[(row, col + 3)] = j_image_pose[(row, 3)] * r_sensor[(0, col)]
+                + j_image_pose[(row, 4)] * r_sensor[(1, col)]
+                + j_image_pose[(row, 5)] * r_sensor[(2, col)];
+        }
+    }
+    Some(jacobian)
+}
+
+fn numerical_frame_pose_jacobian(
+    camera: CameraModel,
+    sensor_from_rig: SE3,
+    rig_from_world: SE3,
+    point: [f32; 3],
+) -> Option<Mat2x6> {
     let mut jacobian = Mat2x6::zeros();
     let eps = [1.0e-4; 6];
     for axis in 0..6 {
@@ -1426,16 +1473,36 @@ fn frame_pose_jacobian(
     Some(jacobian)
 }
 
-fn sensor_pose_jacobian(
-    reconstruction: &Reconstruction,
-    image: usize,
+fn analytic_sensor_pose_jacobian(
     camera: CameraModel,
+    sensor_from_rig: SE3,
+    rig_from_world: SE3,
     point: [f32; 3],
 ) -> Option<Mat2x6> {
-    let frame_idx = reconstruction.frame_index_for_image(image)?;
-    let frame = reconstruction.frames.get(frame_idx)?;
-    let rig_from_world = frame.rig_from_world.to_se3();
-    let sensor_from_rig = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
+    let image_pose = sensor_from_rig.compose(&rig_from_world);
+    let (j_image_pose, _) = analytic_projection_jacobians(camera, image_pose, point)?;
+    let r_sensor = mat3_from_pose_rotation(sensor_from_rig);
+    let t_rig = vec3_from_pose_translation(rig_from_world);
+    let dt_domega = -cross_matrix(&(r_sensor * t_rig));
+    let mut jacobian = Mat2x6::zeros();
+    for row in 0..2 {
+        for col in 0..3 {
+            jacobian[(row, col)] = j_image_pose[(row, col)]
+                + j_image_pose[(row, 3)] * dt_domega[(0, col)]
+                + j_image_pose[(row, 4)] * dt_domega[(1, col)]
+                + j_image_pose[(row, 5)] * dt_domega[(2, col)];
+            jacobian[(row, col + 3)] = j_image_pose[(row, col + 3)];
+        }
+    }
+    Some(jacobian)
+}
+
+fn numerical_sensor_pose_jacobian(
+    camera: CameraModel,
+    sensor_from_rig: SE3,
+    rig_from_world: SE3,
+    point: [f32; 3],
+) -> Option<Mat2x6> {
     let mut jacobian = Mat2x6::zeros();
     let eps = [1.0e-4; 6];
     for axis in 0..6 {
@@ -1457,6 +1524,36 @@ fn sensor_pose_jacobian(
         jacobian[(1, axis)] = (p_plus[1] - p_minus[1]) / (2.0 * eps[axis]);
     }
     Some(jacobian)
+}
+
+fn mat3_from_pose_rotation(pose: SE3) -> Mat3 {
+    let rotation = pose.rotation_matrix();
+    Mat3::from_row_slice(&[
+        rotation[0][0] as f64,
+        rotation[0][1] as f64,
+        rotation[0][2] as f64,
+        rotation[1][0] as f64,
+        rotation[1][1] as f64,
+        rotation[1][2] as f64,
+        rotation[2][0] as f64,
+        rotation[2][1] as f64,
+        rotation[2][2] as f64,
+    ])
+}
+
+fn vec3_from_pose_translation(pose: SE3) -> Vec3d {
+    let translation = pose.translation();
+    Vec3d::new(
+        translation[0] as f64,
+        translation[1] as f64,
+        translation[2] as f64,
+    )
+}
+
+fn cross_matrix(vector: &Vec3d) -> Mat3 {
+    Mat3::new(
+        0.0, -vector[2], vector[1], vector[2], 0.0, -vector[0], -vector[1], vector[0], 0.0,
+    )
 }
 
 fn apply_sensor_pose_delta(
@@ -2249,6 +2346,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn analytic_frame_and_sensor_pose_jacobians_match_numerical_differences() {
+        let camera = CameraModel::from_colmap(
+            COLMAP_OPENCV,
+            220,
+            180,
+            &[96.0, 101.0, 110.0, 90.0, 0.01, -0.0008, 0.0004, -0.0002],
+        )
+        .unwrap();
+        let sensor_from_rig = SE3::from_quat_translation(
+            Quat::from_rotation_z(0.08) * Quat::from_rotation_y(-0.05),
+            Vec3::new(0.3, -0.04, 0.02),
+        );
+        let rig_from_world = SE3::from_quat_translation(
+            Quat::from_rotation_y(0.14) * Quat::from_rotation_x(-0.06),
+            Vec3::new(0.2, 0.1, -0.03),
+        );
+        let point = [0.4, -0.25, 3.4];
+
+        let analytic_frame =
+            analytic_frame_pose_jacobian(camera, sensor_from_rig, rig_from_world, point).unwrap();
+        let numerical_frame =
+            numerical_frame_pose_jacobian(camera, sensor_from_rig, rig_from_world, point).unwrap();
+        assert_jacobian_close(analytic_frame, numerical_frame, 5.0e-2);
+
+        let analytic_sensor =
+            analytic_sensor_pose_jacobian(camera, sensor_from_rig, rig_from_world, point).unwrap();
+        let numerical_sensor =
+            numerical_sensor_pose_jacobian(camera, sensor_from_rig, rig_from_world, point).unwrap();
+        assert_jacobian_close(analytic_sensor, numerical_sensor, 5.0e-2);
     }
 
     #[test]
@@ -3290,6 +3419,28 @@ mod tests {
         let right = right.translation();
         ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2) + (left[2] - right[2]).powi(2))
             .sqrt()
+    }
+
+    fn assert_jacobian_close(left: Mat2x6, right: Mat2x6, tolerance: f64) {
+        let mut max_error = 0.0f64;
+        let mut max_row = 0usize;
+        let mut max_col = 0usize;
+        for row in 0..2 {
+            for col in 0..6 {
+                let error = (left[(row, col)] - right[(row, col)]).abs();
+                if error > max_error {
+                    max_error = error;
+                    max_row = row;
+                    max_col = col;
+                }
+            }
+        }
+        assert!(
+            max_error < tolerance,
+            "row={max_row} col={max_col} left={} right={} max_error={max_error}",
+            left[(max_row, max_col)],
+            right[(max_row, max_col)]
+        );
     }
 
     fn frame(id: usize) -> ImageFrame {

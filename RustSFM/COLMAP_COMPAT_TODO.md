@@ -406,6 +406,10 @@ reconstruction parity.
       PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, and FULL_OPENCV focal/
       principal-point/distortion parameters, with more complex camera models
       still using numerical fallback.
+    - BA now uses analytic chain-rule Jacobians for COLMAP frame
+      `rig_from_world` and non-reference `sensor_from_rig` pose blocks,
+      replacing the finite-difference rig/sensor pose derivatives in the
+      active frame-aware BA path.
     - BA pose updates now follow COLMAP/Ceres parameter-block semantics:
       quaternion manifold updates for rotation and direct Euclidean updates for
       translation, instead of coupled SE(3) exponential updates.
@@ -447,8 +451,7 @@ reconstruction parity.
     - Local BA now uses a `THREE_POINTS` gauge policy that fixes three
       linearly independent observed 3D points when possible.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
-      strategies, analytic rig/sensor Jacobians, and Ceres-equivalent backend
-      behavior.
+      strategies, and Ceres-equivalent backend behavior.
 21. Match COLMAP global BA scheduling, convergence settings, optional redundant
     point handling, pose priors, normalization, and iterative refinement loops.
     - Added COLMAP-style global BA scheduling after initialization, during
