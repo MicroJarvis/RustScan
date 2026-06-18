@@ -28,6 +28,7 @@ pub struct BundleAdjustmentOptions {
     pub max_observation_error_px: f64,
     pub variable_images: Option<Vec<usize>>,
     pub constant_images: Vec<usize>,
+    pub gauge: BundleAdjustmentGauge,
     pub variable_cameras: Option<Vec<usize>>,
     pub constant_cameras: Vec<usize>,
     pub constant_rigs: Vec<u32>,
@@ -53,6 +54,7 @@ impl Default for BundleAdjustmentOptions {
             max_observation_error_px: 16.0,
             variable_images: None,
             constant_images: Vec::new(),
+            gauge: BundleAdjustmentGauge::Default,
             variable_cameras: None,
             constant_cameras: Vec::new(),
             constant_rigs: Vec::new(),
@@ -64,6 +66,12 @@ impl Default for BundleAdjustmentOptions {
             constant_point_ids: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleAdjustmentGauge {
+    Default,
+    ThreePoints,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +151,7 @@ pub fn refine_bundle_adjustment(
         options.point_ids.as_deref(),
         options.constant_point_ids.as_deref(),
     );
-    let constant_point_filter = options
+    let mut constant_point_filter = options
         .constant_point_ids
         .as_ref()
         .map(|ids| ids.iter().copied().collect::<HashSet<_>>())
@@ -189,6 +197,9 @@ pub fn refine_bundle_adjustment(
     );
     if residuals == 0 {
         return None;
+    }
+    if matches!(options.gauge, BundleAdjustmentGauge::ThreePoints) {
+        add_three_point_gauge(&mut constant_point_filter, reconstruction, &observations);
     }
 
     let initial_poses = reconstruction.poses.clone();
@@ -386,6 +397,86 @@ fn bundle_adjustment_point_filter(
             Some(filter)
         }
     }
+}
+
+fn add_three_point_gauge(
+    constant_point_filter: &mut HashSet<usize>,
+    reconstruction: &Reconstruction,
+    observations: &[BaObservation],
+) {
+    let mut fixed_points = Vec::<[f32; 3]>::new();
+    let mut observed_points = observations.iter().map(|obs| obs.point).collect::<Vec<_>>();
+    observed_points.sort_unstable();
+    observed_points.dedup();
+
+    for point_id in &observed_points {
+        if !constant_point_filter.contains(point_id) {
+            continue;
+        }
+        if let Some(point) = reconstruction.points.get(*point_id) {
+            maybe_add_gauge_point(&mut fixed_points, point.xyz);
+        }
+        if fixed_points.len() >= 3 {
+            return;
+        }
+    }
+
+    for point_id in observed_points {
+        if constant_point_filter.contains(&point_id) {
+            continue;
+        }
+        let Some(point) = reconstruction.points.get(point_id) else {
+            continue;
+        };
+        if maybe_add_gauge_point(&mut fixed_points, point.xyz) {
+            constant_point_filter.insert(point_id);
+            if fixed_points.len() >= 3 {
+                return;
+            }
+        }
+    }
+}
+
+fn maybe_add_gauge_point(points: &mut Vec<[f32; 3]>, candidate: [f32; 3]) -> bool {
+    if points.len() >= 3 || !candidate.iter().all(|value| value.is_finite()) {
+        return false;
+    }
+    let independent = match points.len() {
+        0 => true,
+        1 => distance3(points[0], candidate) > 1.0e-9,
+        2 => triangle_area2(points[0], points[1], candidate) > 1.0e-12,
+        _ => false,
+    };
+    if independent {
+        points.push(candidate);
+    }
+    independent
+}
+
+fn distance3(left: [f32; 3], right: [f32; 3]) -> f64 {
+    let dx = left[0] as f64 - right[0] as f64;
+    let dy = left[1] as f64 - right[1] as f64;
+    let dz = left[2] as f64 - right[2] as f64;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn triangle_area2(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f64 {
+    let ab = [
+        b[0] as f64 - a[0] as f64,
+        b[1] as f64 - a[1] as f64,
+        b[2] as f64 - a[2] as f64,
+    ];
+    let ac = [
+        c[0] as f64 - a[0] as f64,
+        c[1] as f64 - a[1] as f64,
+        c[2] as f64 - a[2] as f64,
+    ];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]
 }
 
 fn count_variable_residuals(
@@ -2117,6 +2208,41 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(variable_images, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn three_point_gauge_promotes_independent_points_to_constant() {
+        let frames = vec![frame(0), frame(1)];
+        let mut reconstruction = reconstruction(&frames);
+        for xyz in [
+            [0.0, 0.0, 2.0],
+            [1.0, 0.0, 2.0],
+            [2.0, 0.0, 2.0],
+            [0.0, 1.0, 2.0],
+        ] {
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: Vec::new(),
+            });
+        }
+        let observations = (0..4)
+            .map(|point| BaObservation {
+                image: 0,
+                point,
+                xy: [0.0, 0.0],
+            })
+            .collect::<Vec<_>>();
+        let mut constant_points = HashSet::new();
+
+        add_three_point_gauge(&mut constant_points, &reconstruction, &observations);
+
+        assert_eq!(constant_points.len(), 3);
+        assert!(constant_points.contains(&0));
+        assert!(constant_points.contains(&1));
+        assert!(!constant_points.contains(&2));
+        assert!(constant_points.contains(&3));
     }
 
     #[test]

@@ -1087,6 +1087,7 @@ fn mapper_local_ba_options(
     );
     options.constant_cameras = local_constant_cameras;
     options.constant_sensor_from_rig = local_constant_sensors;
+    options.gauge = crate::ba::BundleAdjustmentGauge::ThreePoints;
     options
 }
 
@@ -3253,13 +3254,24 @@ fn global_ba_enabled(config: &MapperConfig) -> bool {
 }
 
 fn global_ba_gauge_images(reconstruction: &Reconstruction) -> Vec<usize> {
-    reconstruction
-        .poses
-        .iter()
-        .enumerate()
-        .filter_map(|(image, pose)| pose.is_some().then_some(image))
-        .take(2)
-        .collect()
+    let mut gauge_images = Vec::new();
+    let mut frame_indices = HashSet::new();
+    for (image, pose) in reconstruction.poses.iter().enumerate() {
+        if pose.is_none() {
+            continue;
+        }
+        if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
+            if frame_indices.insert(frame_idx) {
+                gauge_images.push(image);
+            }
+        } else {
+            gauge_images.push(image);
+        }
+        if gauge_images.len() >= 2 {
+            break;
+        }
+    }
+    gauge_images
 }
 
 fn global_ba_size_tag(reconstruction: &Reconstruction, config: &MapperConfig) -> &'static str {
@@ -7407,6 +7419,7 @@ mod tests {
         assert_eq!(options.variable_images, Some(vec![1, 2, 3]));
         assert_eq!(options.constant_images, Vec::<usize>::new());
         assert_eq!(options.constant_cameras, vec![0]);
+        assert_eq!(options.gauge, crate::ba::BundleAdjustmentGauge::ThreePoints);
     }
 
     #[test]
@@ -8945,6 +8958,29 @@ mod tests {
         reconstruction.poses[3] = Some(SE3::identity());
 
         assert_eq!(global_ba_gauge_images(&reconstruction), vec![2, 3]);
+    }
+
+    #[test]
+    fn global_ba_gauge_images_use_distinct_registration_units() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+            minimal_frame(2, "next_frame.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: Vec::new(),
+        }];
+        reconstruction.image_frame_indices[0] = Some(0);
+        reconstruction.image_frame_indices[1] = Some(0);
+        for image in 0..3 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+
+        assert_eq!(global_ba_gauge_images(&reconstruction), vec![0, 2]);
     }
 
     #[test]

@@ -89,9 +89,14 @@ reconstruction parity.
    - Non-reference rig `sensor_from_rig` poses are now first-class BA parameter
      blocks with COLMAP-style constant-sensor scheduling, while reference
      sensors remain fixed to identity.
+   - Local BA now requests a COLMAP-style `THREE_POINTS` gauge, promoting up
+     to three linearly independent 3D points to constant point blocks, and
+     global BA gauge-image selection now counts distinct COLMAP registration
+     units instead of accidentally choosing two images from the same frame.
    - Remaining work: generalized pose registration for non-trivial rigs,
      exact filtered-frame event counters in all mapper cleanup paths, exact
-     COLMAP gauge selection, and Ceres-equivalent rig/sensor solver behavior.
+     global `TWO_CAMS_FROM_WORLD` partial translation gauge, and
+     Ceres-equivalent rig/sensor solver behavior.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
@@ -436,6 +441,8 @@ reconstruction parity.
     - Non-reference `sensor_from_rig` poses are optimized as dedicated BA
       parameter blocks unless marked constant by COLMAP's constant-rig or
       partial-rig local BA rules.
+    - Local BA now uses a `THREE_POINTS` gauge policy that fixes three
+      linearly independent observed 3D points when possible.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
       strategies, analytic rig/sensor Jacobians, and Ceres-equivalent backend
       behavior.
@@ -457,9 +464,13 @@ reconstruction parity.
     - Global BA options now preserve explicit constant rig ids and their
       non-reference `sensor_from_rig` constant set for the future
       rig-parameterized BA backend.
+    - Global BA gauge selection now chooses images from distinct registration
+      frames/units before fixing pose blocks, avoiding same-frame multi-camera
+      images as duplicate gauge anchors.
     - Remaining work: exact COLMAP `BundleAdjustmentConfig::FixGauge`
-      strategies, reconstruction normalization, pose priors, redundant 3D point
-      pruning, and Ceres-equivalent convergence settings.
+      `TWO_CAMS_FROM_WORLD` partial translation constraint, reconstruction
+      normalization, pose priors, redundant 3D point pruning, and
+      Ceres-equivalent convergence settings.
 
 ## P6 - I/O, Multi-Model Pipeline, And Parity Tests
 
