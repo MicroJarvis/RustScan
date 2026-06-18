@@ -200,6 +200,9 @@ reconstruction parity.
     solver selection.
     - Added configurable random seed, adaptive stopping, full-support scoring
       by default, and LORANSAC-style inlier refitting for E/F/H models.
+    - Two-view E/F/H RANSAC dynamic stopping now uses COLMAP's current
+      without-replacement success probability and 3x dynamic trial multiplier,
+      replacing the older independent inlier-ratio power approximation.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, support-measure details, and official sampler
       sequence.

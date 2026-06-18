@@ -58,6 +58,8 @@ struct PoseCandidateScore {
     median_angle_deg: f64,
 }
 
+const COLMAP_RANSAC_DYN_NUM_TRIALS_MULTIPLIER: f64 = 3.0;
+
 pub fn estimate_calibrated_two_view(
     pts1: &[[f32; 2]],
     pts2: &[[f32; 2]],
@@ -683,20 +685,36 @@ fn adaptive_ransac_iterations(
     confidence: f64,
     sample_size: usize,
 ) -> u32 {
-    if inliers == 0 || total == 0 || inliers >= total {
+    let max_iterations = max_iterations.max(1);
+    if sample_size == 0 || inliers >= total && total >= sample_size {
         return 1;
     }
-    let inlier_ratio = inliers as f64 / total as f64;
-    let success_prob = inlier_ratio
-        .powi(sample_size as i32)
-        .clamp(1.0e-12, 1.0 - 1.0e-12);
-    let denom = (1.0 - success_prob).ln();
-    if denom >= 0.0 {
+    if inliers < sample_size || total < sample_size {
         max_iterations
     } else {
-        ((1.0 - confidence).ln() / denom)
-            .ceil()
-            .clamp(1.0, max_iterations as f64) as u32
+        let prob_failure = 1.0 - confidence;
+        if prob_failure <= 0.0 {
+            return max_iterations;
+        }
+        let mut prob_inlier = 1.0;
+        for i in 0..sample_size {
+            prob_inlier *= (inliers - i) as f64 / (total - i) as f64;
+        }
+        let prob_outlier = 1.0 - prob_inlier;
+        if prob_outlier <= 0.0 {
+            return 1;
+        }
+        if prob_outlier >= 1.0 {
+            return max_iterations;
+        }
+        let num_trials = (prob_failure.ln() / prob_outlier.ln()
+            * COLMAP_RANSAC_DYN_NUM_TRIALS_MULTIPLIER)
+            .ceil();
+        if !num_trials.is_finite() {
+            max_iterations
+        } else {
+            num_trials.clamp(1.0, max_iterations as f64) as u32
+        }
     }
 }
 
@@ -1801,6 +1819,20 @@ mod tests {
             use_hartley_refinement: true,
             use_five_point: false,
         }
+    }
+
+    #[test]
+    fn adaptive_ransac_iterations_matches_colmap_trial_formula() {
+        assert_eq!(adaptive_ransac_iterations(50, 100, 10_000, 0.999, 5), 726);
+        assert_eq!(adaptive_ransac_iterations(50, 100, 10_000, 0.999, 8), 7173);
+        assert_eq!(adaptive_ransac_iterations(90, 100, 10_000, 0.999, 5), 24);
+    }
+
+    #[test]
+    fn adaptive_ransac_iterations_keeps_full_budget_for_invalid_support() {
+        assert_eq!(adaptive_ransac_iterations(3, 100, 123, 0.999, 5), 123);
+        assert_eq!(adaptive_ransac_iterations(10, 4, 123, 0.999, 5), 123);
+        assert_eq!(adaptive_ransac_iterations(10, 10, 123, 0.999, 5), 1);
     }
 
     #[test]
