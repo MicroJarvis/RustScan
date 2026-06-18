@@ -212,9 +212,12 @@ reconstruction parity.
     - Two-view E/F/H fixed-seed sampling now uses COLMAP's MT19937-32 random
       source plus the local libc++ `std::uniform_int_distribution<uint32_t>`
       bit-extraction behavior for `RandomSampler::Shuffle`.
+    - Fundamental-matrix LORANSAC now uses a COLMAP-style seven-point minimal
+      estimator with multiple rank-2 hypotheses, while keeping the eight-point
+      estimator for local inlier refitting.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
-      exact estimator stack, including the official seven/eight-point
-      fundamental, essential, and homography estimators.
+      exact estimator stack, including byte-level official seven/eight-point
+      fundamental parity plus official essential and homography estimators.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.

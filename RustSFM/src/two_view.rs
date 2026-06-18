@@ -1,8 +1,9 @@
 use crate::five_point::estimate_five_point_essential;
 use crate::geometry::relative_rotation_deg;
+use crate::polynomial;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
-use nalgebra::{DMatrix, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
+use nalgebra::{DMatrix, Matrix3, Matrix3x4, Rotation3, SymmetricEigen, UnitQuaternion, Vector3};
 use rustslam::SE3;
 
 #[derive(Debug, Clone)]
@@ -725,7 +726,7 @@ fn estimate_fundamental_ransac(
     random_seed: u64,
     lo_steps: usize,
 ) -> Option<(Matrix3<f64>, ModelSupport)> {
-    if active_indices.len() < 8 {
+    if active_indices.len() < 7 {
         return None;
     }
     let mut sampler = ColmapRandomSampler::new(
@@ -737,23 +738,23 @@ fn estimate_fundamental_ransac(
     let mut iteration = 0u32;
     while iteration < max_iterations {
         iteration += 1;
-        let sample = sampler.sample(8);
-        if sample.len() != 8 {
+        let sample = sampler.sample(7);
+        if sample.len() != 7 {
             continue;
         }
-        let Some(model) = estimate_fundamental_eight_point_indexed(pts1, pts2, &sample) else {
-            continue;
-        };
-        let support = model_support_indexed(pts1, pts2, active_indices, &model, threshold);
-        if support.inliers >= 8 && is_better_support(&support, best.as_ref().map(|(_, s)| s)) {
-            max_iterations = max_iterations.min(adaptive_ransac_iterations(
-                support.inliers,
-                active_indices.len(),
-                max_iterations,
-                0.999,
-                8,
-            ));
-            best = Some((model, support));
+        let models = estimate_fundamental_seven_point_indexed(pts1, pts2, &sample);
+        for model in models {
+            let support = model_support_indexed(pts1, pts2, active_indices, &model, threshold);
+            if support.inliers >= 7 && is_better_support(&support, best.as_ref().map(|(_, s)| s)) {
+                max_iterations = max_iterations.min(adaptive_ransac_iterations(
+                    support.inliers,
+                    active_indices.len(),
+                    max_iterations,
+                    0.999,
+                    7,
+                ));
+                best = Some((model, support));
+            }
         }
     }
     let (model, support) = best.or_else(|| {
@@ -771,6 +772,103 @@ fn estimate_fundamental_ransac(
         support,
         lo_steps,
     ))
+}
+
+fn estimate_fundamental_seven_point_indexed(
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    indices: &[usize],
+) -> Vec<Matrix3<f64>> {
+    if indices.len() != 7 {
+        return Vec::new();
+    }
+    let Some((norm1, t1)) = normalize_points_indexed(pts1, indices) else {
+        return Vec::new();
+    };
+    let Some((norm2, t2)) = normalize_points_indexed(pts2, indices) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::with_capacity(indices.len() * 9);
+    for (x1, x2) in norm1.iter().zip(norm2.iter()) {
+        rows.extend_from_slice(&[
+            x2.x * x1.x,
+            x2.x * x1.y,
+            x2.x * x1.z,
+            x2.y * x1.x,
+            x2.y * x1.y,
+            x2.y * x1.z,
+            x2.z * x1.x,
+            x2.z * x1.y,
+            x2.z * x1.z,
+        ]);
+    }
+    let a = DMatrix::<f64>::from_row_slice(indices.len(), 9, &rows);
+    let ata = a.transpose() * a;
+    let eigen = SymmetricEigen::new(ata);
+    let mut order = (0..eigen.eigenvalues.len()).collect::<Vec<_>>();
+    order.sort_by(|&lhs, &rhs| {
+        eigen.eigenvalues[lhs]
+            .partial_cmp(&eigen.eigenvalues[rhs])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if order.len() < 2 {
+        return Vec::new();
+    }
+    let f2_col = eigen.eigenvectors.column(order[0]);
+    let f1_col = eigen.eigenvectors.column(order[1]);
+    let f2 = [
+        f2_col[0], f2_col[1], f2_col[2], f2_col[3], f2_col[4], f2_col[5], f2_col[6], f2_col[7],
+        f2_col[8],
+    ];
+    let mut f1 = [
+        f1_col[0], f1_col[1], f1_col[2], f1_col[3], f1_col[4], f1_col[5], f1_col[6], f1_col[7],
+        f1_col[8],
+    ];
+    for (a, b) in f1.iter_mut().zip(f2.iter()) {
+        *a -= *b;
+    }
+
+    let f1_mat = Matrix3::from_row_slice(&f1);
+    let f2_mat = Matrix3::from_row_slice(&f2);
+    let p0 = f2_mat.determinant();
+    let p1 = (f2_mat + f1_mat).determinant();
+    let pm1 = (f2_mat - f1_mat).determinant();
+    let p2 = (f2_mat + f1_mat * 2.0).determinant();
+    let d = p0;
+    let s1 = p1 - d;
+    let sm1 = pm1 - d;
+    let s2 = p2 - d;
+    let b = 0.5 * (s1 + sm1);
+    let a_plus_c = 0.5 * (s1 - sm1);
+    let a = (s2 - 4.0 * b - 2.0 * a_plus_c) / 6.0;
+    let c = a_plus_c - a;
+
+    let mut roots = polynomial::real_roots_companion_matrix(&[a, b, c, d], 1.0e-8);
+    roots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    roots.dedup_by(|a, b| (*a - *b).abs() < 1.0e-8);
+
+    let mut models = Vec::with_capacity(roots.len());
+    for root in roots {
+        let f_vec = [
+            f1[0] * root + f2[0],
+            f1[1] * root + f2[1],
+            f1[2] * root + f2[2],
+            f1[3] * root + f2[3],
+            f1[4] * root + f2[4],
+            f1[5] * root + f2[5],
+            f1[6] * root + f2[6],
+            f1[7] * root + f2[7],
+            f1[8] * root + f2[8],
+        ];
+        let f_norm =
+            Matrix3::from_row_slice(&f_vec) / f_vec.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let f = t2.transpose() * f_norm * t1;
+        let norm = f.norm();
+        if norm > 1.0e-12 && norm.is_finite() {
+            models.push(f / norm);
+        }
+    }
+    models
 }
 
 fn estimate_fundamental_eight_point_indexed(
@@ -1918,6 +2016,41 @@ mod tests {
                 3_348_747_335,
             ]
         );
+    }
+
+    #[test]
+    fn fundamental_seven_point_solver_recovers_epipolar_models() {
+        let points_world = [
+            Vector3::new(-0.8, -0.5, 4.0),
+            Vector3::new(-0.2, 0.4, 4.6),
+            Vector3::new(0.5, -0.3, 5.2),
+            Vector3::new(0.9, 0.7, 5.8),
+            Vector3::new(-0.6, 0.9, 6.1),
+            Vector3::new(0.1, -0.8, 4.9),
+            Vector3::new(0.7, 0.1, 6.4),
+        ];
+        let translation = Vector3::new(0.6, -0.1, 0.2);
+        let rotation = Rotation3::from_euler_angles(0.04, -0.03, 0.02);
+        let mut pts1 = Vec::new();
+        let mut pts2 = Vec::new();
+        for point in points_world {
+            pts1.push(Vector3::new(point.x / point.z, point.y / point.z, 1.0));
+            let p2 = rotation * (point - translation);
+            pts2.push(Vector3::new(p2.x / p2.z, p2.y / p2.z, 1.0));
+        }
+
+        let models = estimate_fundamental_seven_point_indexed(&pts1, &pts2, &[0, 1, 2, 3, 4, 5, 6]);
+
+        assert!(!models.is_empty());
+        assert!(models.iter().any(|model| {
+            let det = model.determinant().abs();
+            let max_residual = pts1
+                .iter()
+                .zip(pts2.iter())
+                .map(|(x1, x2)| squared_sampson_error(x1, x2, model))
+                .fold(0.0, f64::max);
+            det < 1.0e-8 && max_residual < 1.0e-10
+        }));
     }
 
     #[test]
