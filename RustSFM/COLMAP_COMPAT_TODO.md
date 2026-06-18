@@ -71,6 +71,9 @@ reconstruction parity.
      rig, registered images per camera, total registration counts, and shared
      registration counts, plus parity reporting for frame ownership and
      `frame_data` coverage.
+   - Local BA option construction now expands selected images to their full
+     COLMAP registration frames, and global BA scheduling counts registered
+     frames rather than individual frame images.
    - Remaining work: generalized pose registration for non-trivial rigs,
      frame/rig-level BA parameter scheduling, exact filtered-frame event
      counters in all mapper cleanup paths, and full COLMAP frame pose export
@@ -403,8 +406,12 @@ reconstruction parity.
       to COLMAP's local BA post-processing order.
     - Long-track local points are now passed to local BA as constant points
       instead of being dropped from the local BA residual set.
+    - Local BA now adds all images belonging to selected local COLMAP frames and
+      fixes shared camera intrinsics when the local image set does not contain
+      every currently registered image for that camera, matching COLMAP's
+      per-camera local BA scheduling boundary.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
-      strategies, and rig parameter controls.
+      strategies, and rig/sensor parameter controls.
 21. Match COLMAP global BA scheduling, convergence settings, optional redundant
     point handling, pose priors, normalization, and iterative refinement loops.
     - Added COLMAP-style global BA scheduling after initialization, during
@@ -417,6 +424,9 @@ reconstruction parity.
     - CLI options now expose global BA enablement, iteration count, image/point
       frequency and ratio triggers, maximum refinements, and refinement-change
       threshold.
+    - Global BA image-growth scheduling now uses registered frame counts so
+      multi-camera frames do not prematurely trigger global BA merely because
+      they contain multiple images.
     - Remaining work: exact COLMAP `BundleAdjustmentConfig::FixGauge`
       strategies, reconstruction normalization, pose priors, redundant 3D point
       pruning, and Ceres-equivalent convergence settings.

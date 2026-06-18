@@ -1047,6 +1047,37 @@ fn mapper_ba_options(
     }
 }
 
+fn mapper_local_ba_options(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    registration_stats: &RegistrationStats,
+    iterations: usize,
+    variable_images: Vec<usize>,
+    constant_images: Vec<usize>,
+    point_ids: Option<Vec<usize>>,
+    constant_point_ids: Option<Vec<usize>>,
+) -> crate::ba::BundleAdjustmentOptions {
+    let variable_images = expand_images_to_registration_frames(reconstruction, &variable_images);
+    let constant_images = expand_images_to_registration_frames(reconstruction, &constant_images);
+    let local_constant_cameras = local_ba_constant_camera_indices(
+        config,
+        reconstruction,
+        registration_stats,
+        &variable_images,
+    );
+    let mut options = mapper_ba_options(
+        config,
+        reconstruction,
+        iterations,
+        Some(variable_images),
+        constant_images,
+        point_ids,
+        constant_point_ids,
+    );
+    options.constant_cameras = local_constant_cameras;
+    options
+}
+
 fn refine_bundle_adjustment_checked(
     frames: &[ImageFrame],
     reconstruction: &mut Reconstruction,
@@ -1116,6 +1147,73 @@ fn ba_constant_camera_indices(
         .enumerate()
         .filter_map(|(idx, camera_id)| constant_ids.contains(camera_id).then_some(idx))
         .collect()
+}
+
+fn local_ba_constant_camera_indices(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    registration_stats: &RegistrationStats,
+    variable_images: &[usize],
+) -> Vec<usize> {
+    let mut constant = ba_constant_camera_indices(config, reconstruction)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let local_camera_counts = variable_images
+        .iter()
+        .filter_map(|&image| {
+            let camera_idx = reconstruction.image_camera_indices.get(image).copied()?;
+            let camera_id = reconstruction
+                .camera_ids
+                .get(camera_idx)
+                .copied()
+                .unwrap_or(1);
+            Some((camera_idx, camera_id))
+        })
+        .fold(
+            HashMap::<usize, (u32, usize)>::new(),
+            |mut counts, (idx, id)| {
+                counts
+                    .entry(idx)
+                    .and_modify(|(_, count)| *count += 1)
+                    .or_insert((id, 1));
+                counts
+            },
+        );
+    for (camera_idx, (camera_id, local_count)) in local_camera_counts {
+        if local_count < registration_stats.registered_images_with_camera_id(camera_id) {
+            constant.insert(camera_idx);
+        }
+    }
+    constant.into_iter().collect()
+}
+
+fn expand_images_to_registration_frames(
+    reconstruction: &Reconstruction,
+    images: &[usize],
+) -> Vec<usize> {
+    let mut expanded = Vec::new();
+    for &image in images {
+        expanded.extend(reconstruction.image_indices_for_registration_unit(image));
+    }
+    expanded.sort_unstable();
+    expanded.dedup();
+    expanded
+}
+
+fn registered_frame_count(reconstruction: &Reconstruction) -> usize {
+    let mut frame_indices = HashSet::new();
+    let mut trivial_images = 0usize;
+    for (image, pose) in reconstruction.poses.iter().enumerate() {
+        if pose.is_none() {
+            continue;
+        }
+        if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
+            frame_indices.insert(frame_idx);
+        } else {
+            trivial_images += 1;
+        }
+    }
+    frame_indices.len() + trivial_images
 }
 
 fn bogus_registered_camera_indices(
@@ -2552,6 +2650,7 @@ fn incremental_map(
             gauge_image,
             &tri_options,
             config,
+            &registration_stats,
         );
         let mut local_ba_filter_removed = 0usize;
         if local_ba_report.is_some() {
@@ -2828,6 +2927,7 @@ struct LocalBundleReport {
 #[derive(Debug, Clone, Copy)]
 struct GlobalBaSchedule {
     prev_registered_images: usize,
+    prev_registered_frames: usize,
     prev_points: usize,
 }
 
@@ -2835,12 +2935,14 @@ impl GlobalBaSchedule {
     fn new(reconstruction: &Reconstruction) -> Self {
         Self {
             prev_registered_images: registered_image_count(reconstruction),
+            prev_registered_frames: registered_frame_count(reconstruction),
             prev_points: reconstruction.points.len(),
         }
     }
 
     fn mark(&mut self, reconstruction: &Reconstruction) {
         self.prev_registered_images = registered_image_count(reconstruction);
+        self.prev_registered_frames = registered_frame_count(reconstruction);
         self.prev_points = reconstruction.points.len();
     }
 }
@@ -2951,12 +3053,12 @@ fn should_run_global_ba(
     {
         return false;
     }
-    let registered = registered_image_count(reconstruction);
+    let registered = registered_frame_count(reconstruction);
     let points = reconstruction.points.len();
     let image_freq_hit = config.global_ba_images_freq > 0
         && registered
             >= schedule
-                .prev_registered_images
+                .prev_registered_frames
                 .saturating_add(config.global_ba_images_freq);
     let point_freq_hit = config.global_ba_points_freq > 0
         && points
@@ -2964,9 +3066,9 @@ fn should_run_global_ba(
                 .prev_points
                 .saturating_add(config.global_ba_points_freq);
     let image_ratio_hit = config.global_ba_images_ratio > 1.0
-        && schedule.prev_registered_images > 0
+        && schedule.prev_registered_frames > 0
         && registered as f32
-            >= schedule.prev_registered_images as f32 * config.global_ba_images_ratio;
+            >= schedule.prev_registered_frames as f32 * config.global_ba_images_ratio;
     let point_ratio_hit = config.global_ba_points_ratio > 1.0
         && schedule.prev_points > 0
         && points as f32 >= schedule.prev_points as f32 * config.global_ba_points_ratio;
@@ -2981,7 +3083,7 @@ fn should_run_final_global_ba(
     global_ba_enabled(config)
         && registered_image_count(reconstruction) >= 2
         && !reconstruction.points.is_empty()
-        && (registered_image_count(reconstruction) != schedule.prev_registered_images
+        && (registered_frame_count(reconstruction) != schedule.prev_registered_frames
             || reconstruction.points.len() != schedule.prev_points)
 }
 
@@ -3001,7 +3103,7 @@ fn global_ba_gauge_images(reconstruction: &Reconstruction) -> Vec<usize> {
 
 fn global_ba_size_tag(reconstruction: &Reconstruction, config: &MapperConfig) -> &'static str {
     if (config.global_ba_images_freq > 0
-        && registered_image_count(reconstruction) >= config.global_ba_images_freq)
+        && registered_frame_count(reconstruction) >= config.global_ba_images_freq)
         || (config.global_ba_points_freq > 0
             && reconstruction.points.len() >= config.global_ba_points_freq)
     {
@@ -3035,6 +3137,7 @@ fn refine_local_bundle_after_registration(
     gauge_image: usize,
     tri_options: &IncrementalTriangulatorOptions,
     config: &MapperConfig,
+    registration_stats: &RegistrationStats,
 ) -> Option<LocalBundleReport> {
     if !config.local_ba || config.local_ba_iterations == 0 {
         return None;
@@ -3046,11 +3149,12 @@ fn refine_local_bundle_after_registration(
         config.local_ba_num_images,
         config.local_ba_min_shared_points,
     )?;
-    let ba_options = mapper_ba_options(
+    let ba_options = mapper_local_ba_options(
         config,
         reconstruction,
+        registration_stats,
         config.local_ba_iterations,
-        Some(local_bundle.variable_images.clone()),
+        local_bundle.variable_images.clone(),
         vec![gauge_image],
         Some(local_bundle.point_ids.clone()),
         Some(local_bundle.constant_point_ids.clone()),
@@ -3073,9 +3177,11 @@ fn refine_local_bundle_after_registration(
         let image_report = triangulator.triangulate_image(tri_options, registered_image);
         (completed, image_report.total_observations())
     };
+    let variable_image_count =
+        expand_images_to_registration_frames(reconstruction, &local_bundle.variable_images).len();
     Some(LocalBundleReport {
         report,
-        variable_images: local_bundle.variable_images.len(),
+        variable_images: variable_image_count,
         local_images: local_bundle.local_images.len(),
         points: local_bundle.point_ids.len(),
         merged_observations,
@@ -7099,6 +7205,50 @@ mod tests {
     }
 
     #[test]
+    fn local_ba_options_expand_images_to_frames_and_fix_partial_shared_cameras() {
+        let frames = vec![
+            minimal_frame(0, "outside_shared_camera.jpg"),
+            minimal_frame(1, "registered_ref.jpg"),
+            minimal_frame(2, "registered_aux.jpg"),
+            minimal_frame(3, "local_neighbor.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![11, 12];
+        reconstruction.image_camera_indices = vec![0, 0, 1, 1];
+        for image in 0..4 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: Vec::new(),
+        }];
+        reconstruction.image_frame_indices[1] = Some(0);
+        reconstruction.image_frame_indices[2] = Some(0);
+        let stats = registration_stats(&reconstruction);
+
+        let options = mapper_local_ba_options(
+            &MapperConfig::default(),
+            &reconstruction,
+            &stats,
+            5,
+            vec![1, 3],
+            vec![],
+            None,
+            None,
+        );
+
+        assert_eq!(options.variable_images, Some(vec![1, 2, 3]));
+        assert_eq!(options.constant_images, Vec::<usize>::new());
+        assert_eq!(options.constant_cameras, vec![0]);
+    }
+
+    #[test]
     fn mapper_absolute_pose_defaults_match_colmap_thresholds() {
         let config = MapperConfig::default();
 
@@ -8370,6 +8520,55 @@ mod tests {
 
         schedule.mark(&reconstruction);
         assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+    }
+
+    #[test]
+    fn global_ba_schedule_counts_registered_frames_not_frame_images() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+            minimal_frame(2, "new_frame.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: Vec::new(),
+        }];
+        reconstruction.image_frame_indices[0] = Some(0);
+        reconstruction.image_frame_indices[1] = Some(0);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+        reconstruction.point_ids.push(1);
+        let schedule = GlobalBaSchedule::new(&reconstruction);
+        let config = MapperConfig {
+            global_ba_images_freq: 1,
+            global_ba_points_freq: 999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            ..MapperConfig::default()
+        };
+
+        assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+
+        reconstruction.poses[2] = Some(SE3::identity());
+        assert!(should_run_global_ba(&schedule, &reconstruction, &config));
     }
 
     #[test]
