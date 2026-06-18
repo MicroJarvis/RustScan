@@ -85,11 +85,6 @@ impl CameraModel {
         })
     }
 
-    pub fn normalize(&self, x: f32, y: f32) -> [f32; 2] {
-        self.cam_from_img_f32(x, y)
-            .unwrap_or([(x - self.cx) / self.fx, (y - self.cy) / self.fy])
-    }
-
     pub fn cam_from_img_f32(&self, x: f32, y: f32) -> Option<[f32; 2]> {
         let uv = self.cam_from_img(x as f64, y as f64)?;
         Some([uv[0] as f32, uv[1] as f32])
@@ -429,6 +424,75 @@ impl CameraModel {
             self.params[idx_y] = self.cy as f64;
         }
     }
+
+    pub fn sync_intrinsics_from_params(&mut self) {
+        if let Some((fx, fy)) = focal_lengths_from_params(self.model_id, &self.params) {
+            self.fx = fx as f32;
+            self.fy = fy as f32;
+        }
+        if let Some((cx, cy)) = principal_point_from_params(self.model_id, &self.params) {
+            self.cx = cx as f32;
+            self.cy = cy as f32;
+        }
+    }
+
+    pub fn has_bogus_params(
+        &self,
+        min_focal_length_ratio: f64,
+        max_focal_length_ratio: f64,
+        max_extra_param: f64,
+    ) -> bool {
+        self.has_bogus_focal_length(min_focal_length_ratio, max_focal_length_ratio)
+            || self.has_bogus_principal_point()
+            || self.has_bogus_extra_params(max_extra_param)
+    }
+
+    pub fn has_bogus_focal_length(
+        &self,
+        min_focal_length_ratio: f64,
+        max_focal_length_ratio: f64,
+    ) -> bool {
+        let max_dim = self.width.max(self.height).max(1) as f64;
+        let Some(focal_idxs) = colmap_camera_model_focal_idxs(self.model_id) else {
+            return true;
+        };
+        focal_idxs.iter().any(|&idx| {
+            idx >= self.num_params
+                || !self.params[idx].is_finite()
+                || self.params[idx] / max_dim < min_focal_length_ratio
+                || self.params[idx] / max_dim > max_focal_length_ratio
+        })
+    }
+
+    pub fn has_bogus_principal_point(&self) -> bool {
+        let Some([idx_x, idx_y]) = colmap_camera_model_principal_point_idxs(self.model_id) else {
+            return true;
+        };
+        if idx_x >= self.num_params || idx_y >= self.num_params {
+            return true;
+        }
+        let cx = self.params[idx_x];
+        let cy = self.params[idx_y];
+        !cx.is_finite()
+            || !cy.is_finite()
+            || cx < 0.0
+            || cx > self.width as f64
+            || cy < 0.0
+            || cy > self.height as f64
+    }
+
+    pub fn has_bogus_extra_params(&self, max_extra_param: f64) -> bool {
+        let max_extra_param = max_extra_param.abs();
+        colmap_camera_model_extra_idxs(self.model_id)
+            .map(|idxs| {
+                idxs.iter().any(|&idx| {
+                    idx >= self.num_params
+                        || !self.params[idx].is_finite()
+                        || self.params[idx].abs() > max_extra_param
+                })
+            })
+            .unwrap_or(true)
+    }
 }
 
 pub fn colmap_camera_model_id(model_name: &str) -> Option<i32> {
@@ -542,6 +606,21 @@ pub fn colmap_camera_model_principal_point_idxs(model_id: i32) -> Option<[usize;
         | COLMAP_DIVISION
         | COLMAP_FISHEYE
         | COLMAP_EUCM => Some([2, 3]),
+        _ => None,
+    }
+}
+
+pub fn colmap_camera_model_extra_idxs(model_id: i32) -> Option<&'static [usize]> {
+    match model_id {
+        COLMAP_SIMPLE_PINHOLE | COLMAP_PINHOLE | COLMAP_SIMPLE_FISHEYE | COLMAP_FISHEYE => {
+            Some(&[])
+        }
+        COLMAP_SIMPLE_RADIAL | COLMAP_SIMPLE_RADIAL_FISHEYE | COLMAP_SIMPLE_DIVISION => Some(&[3]),
+        COLMAP_RADIAL | COLMAP_RADIAL_FISHEYE | COLMAP_DIVISION | COLMAP_FOV => Some(&[3, 4]),
+        COLMAP_OPENCV | COLMAP_OPENCV_FISHEYE => Some(&[4, 5, 6, 7]),
+        COLMAP_FULL_OPENCV | COLMAP_THIN_PRISM_FISHEYE => Some(&[4, 5, 6, 7, 8, 9, 10, 11]),
+        COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => Some(&[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+        COLMAP_EUCM => Some(&[4, 5]),
         _ => None,
     }
 }
@@ -674,21 +753,180 @@ fn iterative_undistortion(model_id: i32, params: &[f64], u: &mut f64, v: &mut f6
 }
 
 fn distortion_jacobian(model_id: i32, params: &[f64], u: f64, v: f64) -> Option<[[f64; 2]; 2]> {
-    let eps = 1.0e-6_f64.max((u.abs() + v.abs()) * 1.0e-8);
-    let plus_u = distortion(model_id, params, u + eps, v)?;
-    let minus_u = distortion(model_id, params, u - eps, v)?;
-    let plus_v = distortion(model_id, params, u, v + eps)?;
-    let minus_v = distortion(model_id, params, u, v - eps)?;
-    Some([
+    let r2 = u * u + v * v;
+    let j = match model_id {
+        COLMAP_SIMPLE_RADIAL | COLMAP_SIMPLE_RADIAL_FISHEYE => {
+            let radial = params[0] * r2;
+            let radial_derivative = params[0];
+            radial_offset_jacobian(u, v, radial, radial_derivative)
+        }
+        COLMAP_RADIAL | COLMAP_RADIAL_FISHEYE | COLMAP_OPENCV_FISHEYE => {
+            let k1 = params[0];
+            let k2 = params[1];
+            let k3 = params.get(2).copied().unwrap_or(0.0);
+            let k4 = params.get(3).copied().unwrap_or(0.0);
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let r8 = r4 * r4;
+            let radial = k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+            let radial_derivative = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4 + 4.0 * k4 * r6;
+            radial_offset_jacobian(u, v, radial, radial_derivative)
+        }
+        COLMAP_OPENCV => {
+            let k1 = params[0];
+            let k2 = params[1];
+            let p1 = params[2];
+            let p2 = params[3];
+            let radial = k1 * r2 + k2 * r2 * r2;
+            let radial_derivative = k1 + 2.0 * k2 * r2;
+            radial_tangential_jacobian(u, v, radial, radial_derivative, p1, p2)
+        }
+        COLMAP_FULL_OPENCV => {
+            let k1 = params[0];
+            let k2 = params[1];
+            let p1 = params[2];
+            let p2 = params[3];
+            let k3 = params[4];
+            let k4 = params[5];
+            let k5 = params[6];
+            let k6 = params[7];
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let num = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+            let den = 1.0 + k4 * r2 + k5 * r4 + k6 * r6;
+            if den.abs() <= f64::EPSILON {
+                return None;
+            }
+            let dnum_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4;
+            let dden_dr2 = k4 + 2.0 * k5 * r2 + 3.0 * k6 * r4;
+            let radial = num / den;
+            let radial_derivative = (dnum_dr2 * den - num * dden_dr2) / (den * den);
+            radial_tangential_jacobian(u, v, radial - 1.0, radial_derivative, p1, p2)
+        }
+        COLMAP_THIN_PRISM_FISHEYE => {
+            let k1 = params[0];
+            let k2 = params[1];
+            let p1 = params[2];
+            let p2 = params[3];
+            let k3 = params[4];
+            let k4 = params[5];
+            let sx1 = params[6];
+            let sy1 = params[7];
+            let r4 = r2 * r2;
+            let r6 = r4 * r2;
+            let r8 = r4 * r4;
+            let radial = k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+            let radial_derivative = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4 + 4.0 * k4 * r6;
+            let mut j = radial_tangential_jacobian(u, v, radial, radial_derivative, p1, p2);
+            j[0][0] += 2.0 * sx1 * u;
+            j[0][1] += 2.0 * sx1 * v;
+            j[1][0] += 2.0 * sy1 * u;
+            j[1][1] += 2.0 * sy1 * v;
+            j
+        }
+        COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => {
+            let p0 = params[6];
+            let p1 = params[7];
+            let s0 = params[8];
+            let s1 = params[9];
+            let s2 = params[10];
+            let s3 = params[11];
+            let theta2 = r2;
+            let mut th_radial = 1.0;
+            let mut th_radial_derivative = 0.0;
+            let mut theta_power = 1.0;
+            for (idx, coeff) in params[..6].iter().enumerate() {
+                th_radial_derivative += (idx as f64 + 1.0) * coeff * theta_power;
+                theta_power *= theta2;
+                th_radial += coeff * theta_power;
+            }
+
+            let x = th_radial * u;
+            let y = th_radial * v;
+            let dx_du = th_radial + 2.0 * u * u * th_radial_derivative;
+            let dx_dv = 2.0 * u * v * th_radial_derivative;
+            let dy_du = dx_dv;
+            let dy_dv = th_radial + 2.0 * v * v * th_radial_derivative;
+
+            let x2 = x * x;
+            let y2 = y * y;
+            let r2_distorted = x2 + y2;
+            let dtx_dx = 2.0 * p1 * y + 6.0 * p0 * x + 2.0 * s0 * x + 4.0 * s1 * r2_distorted * x;
+            let dtx_dy = 2.0 * p1 * x + 2.0 * p0 * y + 2.0 * s0 * y + 4.0 * s1 * r2_distorted * y;
+            let dty_dx = 2.0 * p0 * y + 2.0 * p1 * x + 2.0 * s2 * x + 4.0 * s3 * r2_distorted * x;
+            let dty_dy = 2.0 * p0 * x + 6.0 * p1 * y + 2.0 * s2 * y + 4.0 * s3 * r2_distorted * y;
+
+            [
+                [
+                    (1.0 + dtx_dx) * dx_du + dtx_dy * dy_du - 1.0,
+                    (1.0 + dtx_dx) * dx_dv + dtx_dy * dy_dv,
+                ],
+                [
+                    dty_dx * dx_du + (1.0 + dty_dy) * dy_du,
+                    dty_dx * dx_dv + (1.0 + dty_dy) * dy_dv - 1.0,
+                ],
+            ]
+        }
+        COLMAP_SIMPLE_DIVISION | COLMAP_DIVISION => {
+            let k = params[0];
+            let den = 1.0 + k * r2;
+            if den.abs() <= f64::EPSILON {
+                return None;
+            }
+            let factor = k * r2 / den;
+            let factor_derivative = k / (den * den);
+            [
+                [
+                    -(factor + 2.0 * u * u * factor_derivative),
+                    -2.0 * u * v * factor_derivative,
+                ],
+                [
+                    -2.0 * u * v * factor_derivative,
+                    -(factor + 2.0 * v * v * factor_derivative),
+                ],
+            ]
+        }
+        _ => return None,
+    };
+    finite_jacobian(j).then_some(j)
+}
+
+fn radial_offset_jacobian(u: f64, v: f64, radial: f64, radial_derivative: f64) -> [[f64; 2]; 2] {
+    let uv_radial_derivative = 2.0 * u * v * radial_derivative;
+    [
         [
-            (plus_u[0] - minus_u[0]) / (2.0 * eps),
-            (plus_v[0] - minus_v[0]) / (2.0 * eps),
+            radial + 2.0 * u * u * radial_derivative,
+            uv_radial_derivative,
         ],
         [
-            (plus_u[1] - minus_u[1]) / (2.0 * eps),
-            (plus_v[1] - minus_v[1]) / (2.0 * eps),
+            uv_radial_derivative,
+            radial + 2.0 * v * v * radial_derivative,
         ],
-    ])
+    ]
+}
+
+fn radial_tangential_jacobian(
+    u: f64,
+    v: f64,
+    radial: f64,
+    radial_derivative: f64,
+    p1: f64,
+    p2: f64,
+) -> [[f64; 2]; 2] {
+    [
+        [
+            radial + 2.0 * u * u * radial_derivative + 2.0 * p1 * v + 6.0 * p2 * u,
+            2.0 * u * v * radial_derivative + 2.0 * p1 * u + 2.0 * p2 * v,
+        ],
+        [
+            2.0 * u * v * radial_derivative + 2.0 * p2 * v + 2.0 * p1 * u,
+            radial + 2.0 * v * v * radial_derivative + 6.0 * p1 * v + 2.0 * p2 * u,
+        ],
+    ]
+}
+
+fn finite_jacobian(j: [[f64; 2]; 2]) -> bool {
+    j.iter().flatten().all(|value| value.is_finite())
 }
 
 fn distortion(model_id: i32, params: &[f64], u: f64, v: f64) -> Option<[f64; 2]> {
@@ -932,6 +1170,29 @@ mod tests {
         );
     }
 
+    fn numerical_distortion_jacobian(
+        model_id: i32,
+        params: &[f64],
+        u: f64,
+        v: f64,
+    ) -> [[f64; 2]; 2] {
+        let eps = 1.0e-6_f64.max((u.abs() + v.abs()) * 1.0e-8);
+        let plus_u = distortion(model_id, params, u + eps, v).unwrap();
+        let minus_u = distortion(model_id, params, u - eps, v).unwrap();
+        let plus_v = distortion(model_id, params, u, v + eps).unwrap();
+        let minus_v = distortion(model_id, params, u, v - eps).unwrap();
+        [
+            [
+                (plus_u[0] - minus_u[0]) / (2.0 * eps),
+                (plus_v[0] - minus_v[0]) / (2.0 * eps),
+            ],
+            [
+                (plus_u[1] - minus_u[1]) / (2.0 * eps),
+                (plus_v[1] - minus_v[1]) / (2.0 * eps),
+            ],
+        ]
+    }
+
     fn assert_roundtrip(camera: CameraModel, uv: [f64; 2]) {
         let xy = camera.img_from_cam(uv[0], uv[1], 1.0).unwrap();
         let lifted = camera.cam_from_img(xy[0], xy[1]).unwrap();
@@ -958,6 +1219,97 @@ mod tests {
             1.0e-12,
         );
         assert!((camera.cam_from_img_threshold(2.0) - 2.0 / 505.0).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn cam_from_img_reports_undistortion_failure_without_pinhole_fallback() {
+        let camera =
+            CameraModel::from_colmap(COLMAP_RADIAL, 800, 600, &[700.0, 400.0, 300.0, -10.0, 0.0])
+                .unwrap();
+
+        assert!(camera.cam_from_img(1400.0, 300.0).is_none());
+        assert!(camera.cam_from_img_f32(1400.0, 300.0).is_none());
+    }
+
+    #[test]
+    fn distortion_jacobians_match_finite_differences() {
+        let cases = [
+            (COLMAP_SIMPLE_RADIAL, vec![0.02]),
+            (COLMAP_RADIAL, vec![0.02, -0.001]),
+            (COLMAP_OPENCV, vec![0.02, -0.001, 0.0005, -0.0003]),
+            (COLMAP_OPENCV_FISHEYE, vec![0.01, -0.001, 0.0001, -0.00001]),
+            (
+                COLMAP_FULL_OPENCV,
+                vec![
+                    0.02, -0.001, 0.0005, -0.0003, 0.00001, 0.00002, -0.00001, 0.000005,
+                ],
+            ),
+            (COLMAP_SIMPLE_RADIAL_FISHEYE, vec![0.01]),
+            (COLMAP_RADIAL_FISHEYE, vec![0.01, -0.0005]),
+            (
+                COLMAP_THIN_PRISM_FISHEYE,
+                vec![
+                    0.01, -0.0005, 0.0002, -0.0001, 0.00001, -0.000005, 0.0003, -0.0002,
+                ],
+            ),
+            (
+                COLMAP_RAD_TAN_THIN_PRISM_FISHEYE,
+                vec![
+                    0.01,
+                    -0.0005,
+                    0.00004,
+                    -0.000003,
+                    0.0000002,
+                    -0.00000001,
+                    0.0002,
+                    -0.0001,
+                    0.0003,
+                    -0.0002,
+                    0.00015,
+                    -0.00012,
+                ],
+            ),
+            (COLMAP_SIMPLE_DIVISION, vec![0.02]),
+            (COLMAP_DIVISION, vec![0.02]),
+        ];
+
+        for (model_id, params) in cases {
+            let analytic = distortion_jacobian(model_id, &params, 0.08, -0.05).unwrap();
+            let numerical = numerical_distortion_jacobian(model_id, &params, 0.08, -0.05);
+            for row in 0..2 {
+                for col in 0..2 {
+                    assert!(
+                        (analytic[row][col] - numerical[row][col]).abs() < 1.0e-8,
+                        "model={model_id} row={row} col={col} analytic={} numerical={}",
+                        analytic[row][col],
+                        numerical[row][col]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn camera_bogus_params_match_colmap_threshold_categories() {
+        let mut camera = CameraModel::from_colmap(
+            COLMAP_OPENCV,
+            1000,
+            800,
+            &[800.0, 810.0, 500.0, 400.0, 0.1, -0.05, 0.01, 0.0],
+        )
+        .unwrap();
+        assert!(!camera.has_bogus_params(0.1, 10.0, 1.0));
+
+        camera.params[0] = 50.0;
+        assert!(camera.has_bogus_focal_length(0.1, 10.0));
+        camera.params[0] = 800.0;
+
+        camera.params[2] = 1001.0;
+        assert!(camera.has_bogus_principal_point());
+        camera.params[2] = 500.0;
+
+        camera.params[4] = 1.25;
+        assert!(camera.has_bogus_extra_params(1.0));
     }
 
     #[test]

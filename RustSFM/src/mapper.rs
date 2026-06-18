@@ -4,13 +4,19 @@ use crate::colmap::{
 };
 use crate::correspondence_graph::ImagePairId;
 use crate::database::{ColmapDatabase, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions};
+use crate::generalized_pose::{
+    estimate_structureless_absolute_pose, GeneralizedPoseError,
+    StructureLessAbsolutePoseEstimationOptions, StructureLessAbsolutePoseProblem,
+};
 use crate::geometry::{
     camera_center, estimate_pair_geometry_with_cameras,
     estimate_pair_geometry_with_options_and_cameras, mean_pair_reprojection_error_with_cameras,
     pose_from_rotation_center, pose_rotation, pose_with_flipped_translation, relative_rotation_deg,
     PairEstimationOptions,
 };
-use crate::incremental_triangulator::{IncrementalTriangulator, IncrementalTriangulatorOptions};
+use crate::incremental_triangulator::{
+    IncrementalTriangulator, IncrementalTriangulatorOptions, TriangulationReport,
+};
 use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
 use crate::sift::{
@@ -18,7 +24,9 @@ use crate::sift::{
     SiftMatchingOptions,
 };
 use crate::types::{
-    CameraModel, ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation,
+    colmap_camera_model_extra_idxs, colmap_camera_model_focal_idxs,
+    colmap_camera_model_principal_point_idxs, CameraModel, ImageFrame, PairGeometry, Point3D,
+    Reconstruction, TrackObservation,
 };
 use crate::wide::{
     build_wide_descriptors, match_wide_mutual, match_wide_mutual_indices, rgb_to_gray,
@@ -31,9 +39,10 @@ use rustslam::features::HammingMatcher;
 use rustslam::tracker::{PnPProblem, PnPSolver};
 use rustslam::{FeatureExtractor, FeatureMatcher, OrbExtractor, SE3};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -81,7 +90,11 @@ pub struct MapperConfig {
     pub sift_extraction: SiftExtractionOptions,
     pub sift_matching: SiftMatchingOptions,
     pub max_hamming_distance: f32,
+    pub local_matching: bool,
     pub local_window: usize,
+    pub experimental_sequence_heuristics: bool,
+    pub experimental_ring_closure: bool,
+    pub experimental_structureless_pair_pose_fallback: bool,
     pub min_matches: usize,
     pub min_inliers: usize,
     pub min_triangulated: usize,
@@ -92,6 +105,29 @@ pub struct MapperConfig {
     pub essential_iterations: u32,
     pub pnp_threshold_px: f32,
     pub pnp_iterations: u32,
+    pub abs_pose_min_num_inliers: usize,
+    pub abs_pose_min_inlier_ratio: f32,
+    pub random_seed: i32,
+    pub max_reg_trials: usize,
+    pub local_ba: bool,
+    pub local_ba_num_images: usize,
+    pub local_ba_min_shared_points: usize,
+    pub local_ba_iterations: usize,
+    pub global_ba: bool,
+    pub global_ba_iterations: usize,
+    pub global_ba_images_ratio: f32,
+    pub global_ba_points_ratio: f32,
+    pub global_ba_images_freq: usize,
+    pub global_ba_points_freq: usize,
+    pub global_ba_max_refinements: usize,
+    pub global_ba_max_refinement_change: f32,
+    pub ba_refine_focal_length: bool,
+    pub ba_refine_principal_point: bool,
+    pub ba_refine_extra_params: bool,
+    pub ba_constant_camera_ids: Vec<u32>,
+    pub min_focal_length_ratio: f64,
+    pub max_focal_length_ratio: f64,
+    pub max_extra_param: f64,
     pub max_reprojection_error_px: f32,
     pub pose_graph: bool,
     pub copy_images: bool,
@@ -116,7 +152,11 @@ impl Default for MapperConfig {
             sift_extraction: SiftExtractionOptions::default(),
             sift_matching: SiftMatchingOptions::default(),
             max_hamming_distance: 160.0,
-            local_window: 3,
+            local_matching: false,
+            local_window: 0,
+            experimental_sequence_heuristics: false,
+            experimental_ring_closure: false,
+            experimental_structureless_pair_pose_fallback: false,
             min_matches: 15,
             min_inliers: 15,
             min_triangulated: 4,
@@ -125,10 +165,33 @@ impl Default for MapperConfig {
             init_max_forward_motion: 0.95,
             essential_threshold_px: 2.0,
             essential_iterations: 10000,
-            pnp_threshold_px: 8.0,
-            pnp_iterations: 2000,
+            pnp_threshold_px: 12.0,
+            pnp_iterations: 10000,
+            abs_pose_min_num_inliers: 30,
+            abs_pose_min_inlier_ratio: 0.25,
+            random_seed: -1,
+            max_reg_trials: 3,
+            local_ba: true,
+            local_ba_num_images: 6,
+            local_ba_min_shared_points: 15,
+            local_ba_iterations: 5,
+            global_ba: true,
+            global_ba_iterations: 8,
+            global_ba_images_ratio: 1.1,
+            global_ba_points_ratio: 1.1,
+            global_ba_images_freq: 500,
+            global_ba_points_freq: 250_000,
+            global_ba_max_refinements: 5,
+            global_ba_max_refinement_change: 0.0005,
+            ba_refine_focal_length: true,
+            ba_refine_principal_point: false,
+            ba_refine_extra_params: true,
+            ba_constant_camera_ids: Vec::new(),
+            min_focal_length_ratio: 0.1,
+            max_focal_length_ratio: 10.0,
+            max_extra_param: 1.0,
             max_reprojection_error_px: 8.0,
-            pose_graph: true,
+            pose_graph: false,
             copy_images: true,
             threads: None,
             fx: None,
@@ -218,8 +281,9 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         config.feature_type,
         &sift_extraction,
     )?;
+    let database_path = resolve_mapper_database_path(config)?;
     let mapper_database =
-        load_mapper_database(config.database.as_deref(), &frames, config.min_matches)?;
+        load_mapper_database(database_path.as_deref(), &frames, config.min_matches)?;
     if let Some(database) = mapper_database.as_ref() {
         apply_database_keypoints(&mut frames, &database.keypoints_by_name);
         if reference_camera_setup.is_none() {
@@ -245,6 +309,16 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
             }
         }
     }
+    if reference_camera_setup.is_none() && mapper_database.is_none() {
+        reference_camera_setup = Some(local_image_camera_setup(&frames, config));
+        if let Some(first) = reference_camera_setup
+            .as_ref()
+            .and_then(|setup| setup.cameras.first())
+            .copied()
+        {
+            camera = first;
+        }
+    }
     let frames_elapsed_ms = frames_start.elapsed().as_secs_f64() * 1000.0;
     if reference_camera_setup.is_none() {
         camera.width = frames[0].width;
@@ -261,6 +335,11 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
             config,
         )?
     } else {
+        if !config.local_matching {
+            bail!(
+                "COLMAP-style reconstruction requires a database. Provide --database, place database.db next to the image root, or pass --local-matching for the experimental image-only fallback."
+            );
+        }
         build_pair_graph(
             &frames,
             camera,
@@ -278,6 +357,11 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
         "timing_extract_ms={:.2} timing_pairs_ms={:.2}",
         frames_elapsed_ms, pair_elapsed_ms
     ));
+    if let Some(path) = database_path.as_ref() {
+        debug_log.push(format!("database_path={}", path.display()));
+    } else {
+        debug_log.push("database_path=<none> local_matching_fallback=true".to_string());
+    }
     debug_log.extend(pair_connectivity_summary(&pairs, &frames));
     debug_log.extend(pair_config_summary(&pairs));
     if let Some(reference) = &config.reference {
@@ -312,28 +396,45 @@ pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary
             .collect::<Vec<_>>();
         rebuild_tracks_from_pair_graph(&frames, &mapping_pairs, &mut reconstruction, config);
         if std::env::var_os("RUSTSFM_FILTER_TRACKS").is_some() {
-            filter_reprojection_tracks(&frames, &mut reconstruction, config);
+            filter_reprojection_tracks(&frames, &mapping_pairs, &mut reconstruction, config);
         }
         if std::env::var_os("RUSTSFM_SKIP_POSE_REFINE").is_none() {
             refine_registered_poses_pose_only(&frames, &mapping_pairs, &mut reconstruction, config);
         }
         if std::env::var_os("RUSTSFM_EXPERIMENTAL_BA").is_some() {
-            if let Some(report) = crate::ba::refine_bundle_adjustment(
-                &frames,
-                &mut reconstruction,
-                crate::ba::BundleAdjustmentOptions {
-                    iterations: global_ba_iterations(),
-                    huber_delta_px: global_ba_huber_delta_px(),
-                    max_observation_error_px: global_ba_max_observation_error_px(config),
-                },
-            ) {
+            let ba_iterations = global_ba_iterations(config);
+            let gauge_images = global_ba_gauge_images(&reconstruction);
+            let ba_options = mapper_ba_options(
+                config,
+                &reconstruction,
+                ba_iterations,
+                None,
+                gauge_images,
+                None,
+                None,
+            );
+            if let Some(report) =
+                refine_bundle_adjustment_checked(&frames, &mut reconstruction, config, ba_options)
+            {
                 debug_log.push(format!(
-                    "schur_ba iterations={} observations={} cost={:.6}->{:.6}",
-                    report.iterations, report.observations, report.initial_cost, report.final_cost
+                    "schur_ba termination={:?} reason={:?} iterations={}/{} observations={} residuals={} cost={:.6}->{:.6}",
+                    report.termination_type,
+                    report.termination_reason,
+                    report.iterations,
+                    report.attempted_iterations,
+                    report.observations,
+                    report.residuals,
+                    report.initial_cost,
+                    report.final_cost
                 ));
             }
             if std::env::var_os("RUSTSFM_FILTER_TRACKS").is_some() {
-                let removed = filter_reprojection_tracks(&frames, &mut reconstruction, config);
+                let removed = filter_reprojection_tracks(
+                    &frames,
+                    &mapping_pairs,
+                    &mut reconstruction,
+                    config,
+                );
                 debug_log.push(format!("track_filter removed_observations={removed}"));
             }
         }
@@ -373,10 +474,43 @@ fn collect_images(input: &Path, max_images: Option<usize>) -> Result<Vec<PathBuf
     Ok(paths)
 }
 
+fn resolve_mapper_database_path(config: &MapperConfig) -> Result<Option<PathBuf>> {
+    if let Some(database) = &config.database {
+        if !database.exists() {
+            bail!("database path does not exist: {}", database.display());
+        }
+        return Ok(Some(database.clone()));
+    }
+
+    for candidate in default_database_candidates(&config.input) {
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+fn default_database_candidates(input: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    push_unique_path(&mut candidates, input.join("database.db"));
+    if let Some(parent) = input.parent() {
+        push_unique_path(&mut candidates, parent.join("database.db"));
+    }
+    candidates
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReferenceCameraSetup {
     cameras: Vec<CameraModel>,
     camera_ids: Vec<u32>,
+    camera_has_prior_focal_length: Vec<bool>,
     image_ids: Vec<u32>,
     image_camera_indices: Vec<usize>,
 }
@@ -427,6 +561,7 @@ fn reference_camera_setup(
     Ok(ReferenceCameraSetup {
         cameras,
         camera_ids,
+        camera_has_prior_focal_length: vec![true; cameras_with_ids.len()],
         image_ids,
         image_camera_indices,
     })
@@ -480,6 +615,7 @@ fn database_camera_setup(
     }
     let mut camera_ids = Vec::with_capacity(cache.cameras.len());
     let mut cameras = Vec::with_capacity(cache.cameras.len());
+    let mut camera_has_prior_focal_length = Vec::with_capacity(cache.cameras.len());
     for (&camera_id, db_camera) in &cache.cameras {
         let camera = CameraModel::from_colmap(
             db_camera.camera.model_id,
@@ -490,6 +626,7 @@ fn database_camera_setup(
         .with_context(|| format!("unsupported database camera_id={camera_id}"))?;
         camera_ids.push(camera_id);
         cameras.push(camera);
+        camera_has_prior_focal_length.push(db_camera.has_prior_focal_length);
     }
     let camera_index_by_id = camera_ids
         .iter()
@@ -521,9 +658,51 @@ fn database_camera_setup(
     Ok(ReferenceCameraSetup {
         cameras,
         camera_ids,
+        camera_has_prior_focal_length,
         image_ids,
         image_camera_indices,
     })
+}
+
+fn local_image_camera_setup(frames: &[ImageFrame], config: &MapperConfig) -> ReferenceCameraSetup {
+    let mut cameras = Vec::with_capacity(frames.len());
+    let mut camera_ids = Vec::with_capacity(frames.len());
+    let mut image_ids = Vec::with_capacity(frames.len());
+    let mut image_camera_indices = Vec::with_capacity(frames.len());
+    for (idx, frame) in frames.iter().enumerate() {
+        let focal = frame.width.max(frame.height) as f32 * 1.2;
+        let mut camera = CameraModel::new_pinhole(
+            frame.width,
+            frame.height,
+            focal,
+            focal,
+            frame.width as f32 * 0.5,
+            frame.height as f32 * 0.5,
+        );
+        if let Some(fx) = config.fx {
+            camera.set_fx(fx);
+        }
+        if let Some(fy) = config.fy {
+            camera.set_fy(fy);
+        }
+        if let Some(cx) = config.cx {
+            camera.set_cx(cx);
+        }
+        if let Some(cy) = config.cy {
+            camera.set_cy(cy);
+        }
+        cameras.push(camera);
+        camera_ids.push(idx as u32 + 1);
+        image_ids.push(idx as u32 + 1);
+        image_camera_indices.push(idx);
+    }
+    ReferenceCameraSetup {
+        cameras,
+        camera_ids,
+        camera_has_prior_focal_length: vec![true; frames.len()],
+        image_ids,
+        image_camera_indices,
+    }
 }
 
 fn apply_database_keypoints(
@@ -589,12 +768,12 @@ fn fallback_camera(first_image: &Path) -> CameraModel {
     )
 }
 
-fn global_ba_iterations() -> usize {
+fn global_ba_iterations(config: &MapperConfig) -> usize {
     std::env::var("RUSTSFM_BA_ITERATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(8)
+        .unwrap_or(config.global_ba_iterations)
 }
 
 fn global_ba_huber_delta_px() -> f64 {
@@ -611,6 +790,141 @@ fn global_ba_max_observation_error_px(config: &MapperConfig) -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(config.max_reprojection_error_px as f64 * 2.0)
+}
+
+fn mapper_ba_options(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    iterations: usize,
+    variable_images: Option<Vec<usize>>,
+    constant_images: Vec<usize>,
+    point_ids: Option<Vec<usize>>,
+    constant_point_ids: Option<Vec<usize>>,
+) -> crate::ba::BundleAdjustmentOptions {
+    crate::ba::BundleAdjustmentOptions {
+        iterations,
+        huber_delta_px: global_ba_huber_delta_px(),
+        max_observation_error_px: global_ba_max_observation_error_px(config),
+        variable_images,
+        constant_images,
+        variable_cameras: None,
+        constant_cameras: ba_constant_camera_indices(config, reconstruction),
+        refine_focal_length: config.ba_refine_focal_length,
+        refine_principal_point: config.ba_refine_principal_point,
+        refine_extra_params: config.ba_refine_extra_params,
+        point_ids,
+        constant_point_ids,
+        ..crate::ba::BundleAdjustmentOptions::default()
+    }
+}
+
+fn refine_bundle_adjustment_checked(
+    frames: &[ImageFrame],
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+    options: crate::ba::BundleAdjustmentOptions,
+) -> Option<crate::ba::BundleAdjustmentReport> {
+    if !bogus_registered_camera_indices(reconstruction, config).is_empty() {
+        return None;
+    }
+    let base_camera = reconstruction.camera;
+    let base_cameras = reconstruction.cameras.clone();
+    let base_poses = reconstruction.poses.clone();
+    let base_points = reconstruction
+        .points
+        .iter()
+        .map(|point| point.xyz)
+        .collect::<Vec<_>>();
+
+    let report = crate::ba::refine_bundle_adjustment(frames, reconstruction, options);
+    if report
+        .as_ref()
+        .map_or(true, |report| !report.is_solution_usable())
+        || !bogus_registered_camera_indices(reconstruction, config).is_empty()
+    {
+        restore_ba_state(
+            reconstruction,
+            base_camera,
+            &base_cameras,
+            &base_poses,
+            &base_points,
+        );
+        return None;
+    }
+    report
+}
+
+fn restore_ba_state(
+    reconstruction: &mut Reconstruction,
+    camera: CameraModel,
+    cameras: &[CameraModel],
+    poses: &[Option<SE3>],
+    points: &[[f32; 3]],
+) {
+    reconstruction.camera = camera;
+    reconstruction.cameras.clone_from_slice(cameras);
+    reconstruction.poses.clone_from_slice(poses);
+    for (point, xyz) in reconstruction.points.iter_mut().zip(points.iter()) {
+        point.xyz = *xyz;
+    }
+}
+
+fn ba_constant_camera_indices(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+) -> Vec<usize> {
+    if config.ba_constant_camera_ids.is_empty() {
+        return Vec::new();
+    }
+    let constant_ids = config
+        .ba_constant_camera_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    reconstruction
+        .camera_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, camera_id)| constant_ids.contains(camera_id).then_some(idx))
+        .collect()
+}
+
+fn bogus_registered_camera_indices(
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> Vec<usize> {
+    let mut indices = BTreeSet::new();
+    for (image, pose) in reconstruction.poses.iter().enumerate() {
+        if pose.is_none() {
+            continue;
+        }
+        let camera = reconstruction.camera_for_image(image);
+        if camera_has_bogus_params(camera, config) {
+            let camera_idx = reconstruction
+                .image_camera_indices
+                .get(image)
+                .copied()
+                .unwrap_or(0);
+            indices.insert(camera_idx);
+        }
+    }
+    indices.into_iter().collect()
+}
+
+fn apply_image_camera(reconstruction: &mut Reconstruction, image: usize, camera: CameraModel) {
+    if let Some(&camera_idx) = reconstruction.image_camera_indices.get(image) {
+        if let Some(slot) = reconstruction.cameras.get_mut(camera_idx) {
+            *slot = camera;
+            if camera_idx == 0 {
+                reconstruction.camera = camera;
+            }
+            return;
+        }
+    }
+    reconstruction.camera = camera;
+    if let Some(first) = reconstruction.cameras.first_mut() {
+        *first = camera;
+    }
 }
 
 fn extract_frames(
@@ -696,13 +1010,11 @@ fn build_pair_graph(
     sift_matching: &SiftMatchingOptions,
 ) -> Result<Vec<PairGeometry>> {
     let matcher = HammingMatcher::new(2).with_ratio_threshold(config.match_ratio);
-    let mut candidates = Vec::new();
-    for offset in 1..=config.local_window.min(frames.len() - 1) {
-        for left in 0..frames.len() - offset {
-            candidates.push((left, left + offset));
-        }
-    }
-    add_segment_bridge_candidates(frames.len(), &mut candidates);
+    let candidates = local_pair_candidates(
+        frames.len(),
+        config.local_window,
+        config.experimental_sequence_heuristics,
+    );
     let mut pairs = candidates
         .par_iter()
         .filter_map(|&(left, right)| {
@@ -720,7 +1032,7 @@ fn build_pair_graph(
             )
         })
         .collect::<Vec<_>>();
-    if std::env::var_os("RUSTSFM_RING_CLOSURE").is_some() {
+    if config.experimental_ring_closure || std::env::var_os("RUSTSFM_RING_CLOSURE").is_some() {
         let mut closure_pairs = Vec::new();
         for (left, right) in intra_segment_ring_candidates(frames.len(), 192) {
             let left_camera = setup_camera_for_image(reference_camera_setup, left, camera);
@@ -741,10 +1053,32 @@ fn build_pair_graph(
         retain_best_ring_closures(&mut closure_pairs);
         pairs.extend(closure_pairs);
     }
-    enforce_adjacent_translation_continuity(&mut pairs);
-    regularize_low_parallax_adjacent_translations(&mut pairs);
-    filter_translation_outlier_pairs(&mut pairs);
+    if config.experimental_sequence_heuristics {
+        enforce_adjacent_translation_continuity(&mut pairs);
+        regularize_low_parallax_adjacent_translations(&mut pairs);
+        filter_translation_outlier_pairs(&mut pairs);
+    }
     Ok(pairs)
+}
+
+fn local_pair_candidates(
+    frame_count: usize,
+    local_window: usize,
+    experimental_sequence_heuristics: bool,
+) -> Vec<(usize, usize)> {
+    let mut candidates = Vec::new();
+    if frame_count < 2 || local_window == 0 {
+        return candidates;
+    }
+    for offset in 1..=local_window.min(frame_count - 1) {
+        for left in 0..frame_count - offset {
+            candidates.push((left, left + offset));
+        }
+    }
+    if experimental_sequence_heuristics {
+        add_segment_bridge_candidates(frame_count, &mut candidates);
+    }
+    candidates
 }
 
 pub fn database_pair_matches_for_frames(
@@ -940,8 +1274,12 @@ fn stored_pose_pair_metrics(
         }
         let lk = &left.keypoints[li];
         let rk = &right.keypoints[ri];
-        let left_xy = left_camera.normalize(lk.x(), lk.y());
-        let right_xy = right_camera.normalize(rk.x(), rk.y());
+        let Some(left_xy) = left_camera.cam_from_img_f32(lk.x(), lk.y()) else {
+            continue;
+        };
+        let Some(right_xy) = right_camera.cam_from_img_f32(rk.x(), rk.y()) else {
+            continue;
+        };
         let Some(xyz) =
             crate::two_view::triangulate_world_point(SE3::identity(), pose, left_xy, right_xy)
         else {
@@ -1106,6 +1444,15 @@ fn limited_indices(indices: &[usize], limit: usize) -> &[usize] {
 }
 
 fn keep_verified_pair(pair: &PairGeometry) -> bool {
+    if matches!(
+        pair.two_view_config,
+        crate::database::COLMAP_TWO_VIEW_UNDEFINED
+            | crate::database::COLMAP_TWO_VIEW_DEGENERATE
+            | crate::database::COLMAP_TWO_VIEW_WATERMARK
+            | crate::database::COLMAP_TWO_VIEW_MULTIPLE
+    ) {
+        return false;
+    }
     let offset = pair.right.abs_diff(pair.left);
     if offset <= 1 || is_ring_bridge_candidate(pair.left, pair.right) {
         if is_ring_bridge_candidate(pair.left, pair.right) {
@@ -1795,11 +2142,12 @@ fn incremental_map(
     config: &MapperConfig,
 ) -> Result<(Reconstruction, Vec<String>)> {
     let mut debug_log = Vec::new();
-    let (cameras, camera_ids, image_ids, image_camera_indices) =
+    let (cameras, camera_ids, camera_has_prior_focal_length, image_ids, image_camera_indices) =
         if let Some(setup) = reference_camera_setup {
             (
                 setup.cameras.clone(),
                 setup.camera_ids.clone(),
+                setup.camera_has_prior_focal_length.clone(),
                 setup.image_ids.clone(),
                 setup.image_camera_indices.clone(),
             )
@@ -1807,10 +2155,12 @@ fn incremental_map(
             (
                 vec![camera],
                 vec![1],
+                vec![true],
                 (0..frames.len()).map(|idx| idx as u32 + 1).collect(),
                 vec![0; frames.len()],
             )
         };
+    let camera_priors = cameras.clone();
     let mut reconstruction = Reconstruction {
         camera,
         cameras,
@@ -1842,8 +2192,24 @@ fn incremental_map(
         initial.inliers,
         initial.triangulated
     ));
-    reconstruction.poses[initial.left] = Some(SE3::identity());
-    reconstruction.poses[initial.right] = Some(initial.relative_pose);
+    {
+        let mut observation_manager = ObservationManager::new(frames, pairs, &reconstruction);
+        observation_manager.register_image(
+            frames,
+            pairs,
+            &mut reconstruction,
+            initial.left,
+            SE3::identity(),
+        );
+        observation_manager.register_image(
+            frames,
+            pairs,
+            &mut reconstruction,
+            initial.right,
+            initial.relative_pose,
+        );
+    }
+    let gauge_image = initial.left;
     let tri_options =
         IncrementalTriangulatorOptions::from_mapper_threshold(config.max_reprojection_error_px);
     {
@@ -1856,20 +2222,68 @@ fn incremental_map(
         triangulator.merge_tracks(&tri_options, &modified);
         triangulator.retriangulate(&tri_options);
     }
+    filter_reprojection_tracks(frames, pairs, &mut reconstruction, config);
+    let mut global_ba_schedule = GlobalBaSchedule::new(&reconstruction);
+    if refine_global_bundle_with_postprocessing(
+        frames,
+        pairs,
+        &mut reconstruction,
+        &tri_options,
+        config,
+        "initial",
+        &mut debug_log,
+    ) {
+        global_ba_schedule.mark(&reconstruction);
+    }
 
+    let mut reg_trials = vec![0usize; frames.len()];
     while reconstruction.poses.iter().any(|p| p.is_none()) {
-        let Some(choice) = choose_next_registration(frames, pairs, &reconstruction, config) else {
+        let Some(choice) = choose_next_registration(
+            frames,
+            pairs,
+            &reconstruction,
+            &reg_trials,
+            config,
+            &camera_priors,
+            &camera_has_prior_focal_length,
+        ) else {
             break;
         };
-        reconstruction.poses[choice.image] = Some(choice.pose);
-        debug_log.push(format!(
-            "register {} source={} pnp_inliers={} mean_error={:.3} pair_rot_error={:.3}",
+        let registration_snapshot = reconstruction.clone();
+        let registration_log = format!(
+            "register {} source={} pnp_inliers={} inlier_ratio={:.3} visible_points={} visible_ratio={:.3} mean_error={:.3} pair_rot_error={:.3}",
             frames[choice.image].name,
             choice.source,
             choice.pnp_inliers,
+            choice.inlier_ratio,
+            choice.visible_points,
+            choice.visible_points_ratio,
             choice.mean_error_px,
             choice.pair_rot_error
-        ));
+        );
+        apply_image_camera(&mut reconstruction, choice.image, choice.camera);
+        {
+            let mut observation_manager = ObservationManager::new(frames, pairs, &reconstruction);
+            observation_manager.register_image(
+                frames,
+                pairs,
+                &mut reconstruction,
+                choice.image,
+                choice.pose,
+            );
+        }
+        let structureless_track_report = if !choice.structureless_inliers.is_empty() {
+            continue_or_triangulate_structureless_tracks(
+                frames,
+                pairs,
+                &mut reconstruction,
+                &choice.structureless_inliers,
+                &tri_options,
+                config,
+            )
+        } else {
+            TriangulationReport::default()
+        };
         {
             let mut triangulator = IncrementalTriangulator::new(frames, pairs, &mut reconstruction);
             triangulator.triangulate_image(&tri_options, choice.image);
@@ -1879,25 +2293,134 @@ fn incremental_map(
             triangulator.merge_tracks(&tri_options, &modified);
             triangulator.retriangulate(&tri_options);
         }
+        filter_reprojection_tracks(frames, pairs, &mut reconstruction, config);
+        let local_ba_required =
+            local_bundle_refinement_required(&reconstruction, choice.image, gauge_image, config);
+        let local_ba_report = refine_local_bundle_after_registration(
+            frames,
+            pairs,
+            &mut reconstruction,
+            choice.image,
+            gauge_image,
+            &tri_options,
+            config,
+        );
+        let mut local_ba_filter_removed = 0usize;
+        if local_ba_report.is_some() {
+            local_ba_filter_removed =
+                filter_reprojection_tracks(frames, pairs, &mut reconstruction, config);
+        }
+        let rollback_reason = registration_rollback_reason(
+            &reconstruction,
+            choice.image,
+            local_ba_required,
+            local_ba_report.is_some(),
+            config,
+        );
+        if let Some(reason) = rollback_reason {
+            reconstruction = registration_snapshot;
+            reg_trials[choice.image] += 1;
+            debug_log.push(format!(
+                "registration_rollback {} reason={reason}",
+                frames[choice.image].name
+            ));
+            continue;
+        }
+        reg_trials[choice.image] = 0;
+        debug_log.push(registration_log);
+        if structureless_track_report.total_observations() > 0 {
+            debug_log.push(format!(
+                "structureless_tracks image={} created={} continued={}",
+                frames[choice.image].name,
+                structureless_track_report.created_points,
+                structureless_track_report.continued_observations
+            ));
+        }
+        if let Some(report) = local_ba_report {
+            debug_log.push(format!(
+                "local_ba image={} local_images={} variable_images={} points={} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} reason={:?} merged={} completed={} image_completed={}",
+                frames[choice.image].name,
+                report.local_images,
+                report.variable_images,
+                report.points,
+                report.report.observations,
+                report.report.residuals,
+                report.report.initial_cost,
+                report.report.final_cost,
+                report.report.iterations,
+                report.report.attempted_iterations,
+                report.report.termination_type,
+                report.report.termination_reason,
+                report.merged_observations,
+                report.completed_observations,
+                report.completed_image_observations
+            ));
+            if local_ba_filter_removed > 0 {
+                debug_log.push(format!(
+                    "local_ba_filter removed_observations={local_ba_filter_removed}"
+                ));
+            }
+        }
+        if should_run_global_ba(&global_ba_schedule, &reconstruction, config) {
+            if refine_global_bundle_with_postprocessing(
+                frames,
+                pairs,
+                &mut reconstruction,
+                &tri_options,
+                config,
+                "scheduled",
+                &mut debug_log,
+            ) {
+                global_ba_schedule.mark(&reconstruction);
+            }
+        }
+        mark_unregistered_images_with_no_absolute_pose(
+            frames,
+            pairs,
+            &reconstruction,
+            &mut reg_trials,
+            config,
+            &camera_priors,
+            &camera_has_prior_focal_length,
+        );
+    }
+    if should_run_final_global_ba(&global_ba_schedule, &reconstruction, config) {
+        refine_global_bundle_with_postprocessing(
+            frames,
+            pairs,
+            &mut reconstruction,
+            &tri_options,
+            config,
+            "final",
+            &mut debug_log,
+        );
     }
     Ok((reconstruction, debug_log))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RegistrationChoice {
     image: usize,
     pose: SE3,
+    camera: CameraModel,
     source: &'static str,
     pnp_inliers: usize,
+    inlier_ratio: f32,
+    visible_points: usize,
+    visible_points_ratio: f32,
     mean_error_px: f32,
     pair_rot_error: f32,
+    structureless_inliers: Vec<StructurelessInlier>,
 }
 
 fn choose_next_registration(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
+    reg_trials: &[usize],
     config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
 ) -> Option<RegistrationChoice> {
     let mut best = None::<(f32, RegistrationChoice)>;
     let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
@@ -1905,48 +2428,53 @@ fn choose_next_registration(
         if reconstruction.poses[image].is_some() {
             continue;
         }
-        let mut pose = relative_pose_candidate(image, pairs, &reconstruction.poses);
-        let mut source = "relative";
-        let mut pnp_inliers = 0usize;
-        let mut mean_error_px = f32::INFINITY;
-
-        if let Some(abs_pose) = solve_absolute_pose(image, frames, pairs, reconstruction, config) {
-            let accept_absolute = if let Some(relative_pose) = pose {
-                abs_pose.inliers >= 24
-                    && abs_pose.mean_error_px <= config.max_reprojection_error_px
-                    && registered_pair_rotation_error(image, abs_pose.pose, pairs, reconstruction)
-                        <= (registered_pair_rotation_error(
-                            image,
-                            relative_pose,
-                            pairs,
-                            reconstruction,
-                        ) + 5.0)
-                            .min(15.0)
-            } else {
-                abs_pose.inliers >= 15 && abs_pose.mean_error_px <= config.max_reprojection_error_px
+        if reg_trials.get(image).copied().unwrap_or(0) >= config.max_reg_trials {
+            continue;
+        }
+        let (abs_pose, source) = if let Some(abs_pose) = solve_absolute_pose(
+            image,
+            frames,
+            pairs,
+            reconstruction,
+            config,
+            camera_priors,
+            camera_has_prior_focal_length,
+        ) {
+            (abs_pose, "pnp")
+        } else {
+            let Some(abs_pose) = solve_structureless_absolute_pose(
+                image,
+                frames,
+                pairs,
+                reconstruction,
+                config,
+                &obs_manager,
+                camera_priors,
+            ) else {
+                continue;
             };
-            if accept_absolute {
-                pose = Some(abs_pose.pose);
-                source = "pnp";
-                pnp_inliers = abs_pose.inliers;
-                mean_error_px = abs_pose.mean_error_px;
-            }
-        }
-
-        let Some(pose) = pose else {
-            continue;
+            (abs_pose, "structureless")
         };
-        let pair_rot_error = registered_pair_rotation_error(image, pose, pairs, reconstruction);
-        if !pair_rot_error.is_finite() || pair_rot_error > 20.0 {
+        let pair_rot_error =
+            registered_pair_rotation_error(image, abs_pose.pose, pairs, reconstruction);
+        if !pair_rot_error.is_finite() || pair_rot_error > absolute_pose_pair_rotation_limit_deg() {
             continue;
         }
+        let visible_points = obs_manager.num_visible_points3d(image);
+        let num_observations = obs_manager.num_observations(image).max(1);
+        let visible_points_ratio = visible_points as f32 / num_observations as f32;
         let choice = RegistrationChoice {
             image,
-            pose,
+            pose: abs_pose.pose,
+            camera: abs_pose.camera,
             source,
-            pnp_inliers,
-            mean_error_px,
+            pnp_inliers: abs_pose.inliers,
+            inlier_ratio: abs_pose.inlier_ratio,
+            visible_points,
+            visible_points_ratio,
+            mean_error_px: abs_pose.mean_error_px,
             pair_rot_error,
+            structureless_inliers: abs_pose.structureless_inliers,
         };
         let score = registration_score(&choice, &obs_manager);
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
@@ -1954,6 +2482,627 @@ fn choose_next_registration(
         }
     }
     best.map(|(_, choice)| choice)
+}
+
+fn mark_unregistered_images_with_no_absolute_pose(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    reg_trials: &mut [usize],
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
+) {
+    let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
+    for image in 0..reconstruction.poses.len() {
+        if reconstruction.poses[image].is_some()
+            || reg_trials.get(image).copied().unwrap_or(0) >= config.max_reg_trials
+        {
+            continue;
+        }
+        let has_pose = solve_absolute_pose(
+            image,
+            frames,
+            pairs,
+            reconstruction,
+            config,
+            camera_priors,
+            camera_has_prior_focal_length,
+        )
+        .or_else(|| {
+            solve_structureless_absolute_pose(
+                image,
+                frames,
+                pairs,
+                reconstruction,
+                config,
+                &obs_manager,
+                camera_priors,
+            )
+        })
+        .map(|pose| {
+            let pair_rot_error =
+                registered_pair_rotation_error(image, pose.pose, pairs, reconstruction);
+            pair_rot_error.is_finite() && pair_rot_error <= absolute_pose_pair_rotation_limit_deg()
+        })
+        .unwrap_or(false);
+        if !has_pose {
+            reg_trials[image] += 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalBundleReport {
+    report: crate::ba::BundleAdjustmentReport,
+    variable_images: usize,
+    local_images: usize,
+    points: usize,
+    merged_observations: usize,
+    completed_observations: usize,
+    completed_image_observations: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GlobalBaSchedule {
+    prev_registered_images: usize,
+    prev_points: usize,
+}
+
+impl GlobalBaSchedule {
+    fn new(reconstruction: &Reconstruction) -> Self {
+        Self {
+            prev_registered_images: registered_image_count(reconstruction),
+            prev_points: reconstruction.points.len(),
+        }
+    }
+
+    fn mark(&mut self, reconstruction: &Reconstruction) {
+        self.prev_registered_images = registered_image_count(reconstruction);
+        self.prev_points = reconstruction.points.len();
+    }
+}
+
+fn refine_global_bundle_with_postprocessing(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    tri_options: &IncrementalTriangulatorOptions,
+    config: &MapperConfig,
+    reason: &str,
+    debug_log: &mut Vec<String>,
+) -> bool {
+    if !global_ba_enabled(config)
+        || registered_image_count(reconstruction) < 2
+        || reconstruction.points.is_empty()
+    {
+        return false;
+    }
+
+    let (pre_completed, pre_merged, retriangulated) = {
+        let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+        let completed = triangulator.complete_all_tracks(tri_options);
+        let merged = triangulator.merge_all_tracks(tri_options);
+        let retriangulated = triangulator.retriangulate(tri_options);
+        (completed, merged, retriangulated)
+    };
+    if pre_completed > 0 || pre_merged > 0 || retriangulated > 0 {
+        debug_log.push(format!(
+            "global_ba_prepare reason={reason} completed={} merged={} retriangulated={}",
+            pre_completed, pre_merged, retriangulated
+        ));
+    }
+
+    let mut attempted = false;
+    for round in 0..config.global_ba_max_refinements {
+        let observations_before = reconstruction_num_observations(reconstruction);
+        if observations_before == 0 {
+            break;
+        }
+        let gauge_images = global_ba_gauge_images(reconstruction);
+        if gauge_images.is_empty() {
+            break;
+        }
+        attempted = true;
+        let ba_options = mapper_ba_options(
+            config,
+            reconstruction,
+            global_ba_iterations(config),
+            None,
+            gauge_images.clone(),
+            None,
+            None,
+        );
+        let Some(report) =
+            refine_bundle_adjustment_checked(frames, reconstruction, config, ba_options)
+        else {
+            debug_log.push(format!(
+                "global_ba reason={reason} round={} skipped gauge_images={:?} observations={}",
+                round + 1,
+                gauge_images,
+                observations_before
+            ));
+            break;
+        };
+
+        let (completed, merged) = {
+            let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+            let completed = triangulator.complete_all_tracks(tri_options);
+            let merged = triangulator.merge_all_tracks(tri_options);
+            (completed, merged)
+        };
+        let filtered = filter_reprojection_tracks(frames, pairs, reconstruction, config);
+        let changed = (completed + merged + filtered) as f32 / observations_before.max(1) as f32;
+        debug_log.push(format!(
+            "global_ba reason={reason} round={} size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed={} merged={} filtered={} changed={:.6}",
+            round + 1,
+            global_ba_size_tag(reconstruction, config),
+            gauge_images,
+            report.observations,
+            report.residuals,
+            report.initial_cost,
+            report.final_cost,
+            report.iterations,
+            report.attempted_iterations,
+            report.termination_type,
+            report.termination_reason,
+            completed,
+            merged,
+            filtered,
+            changed
+        ));
+        if changed <= config.global_ba_max_refinement_change {
+            break;
+        }
+    }
+    attempted
+}
+
+fn should_run_global_ba(
+    schedule: &GlobalBaSchedule,
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> bool {
+    if !global_ba_enabled(config)
+        || registered_image_count(reconstruction) < 2
+        || reconstruction.points.is_empty()
+    {
+        return false;
+    }
+    let registered = registered_image_count(reconstruction);
+    let points = reconstruction.points.len();
+    let image_freq_hit = config.global_ba_images_freq > 0
+        && registered
+            >= schedule
+                .prev_registered_images
+                .saturating_add(config.global_ba_images_freq);
+    let point_freq_hit = config.global_ba_points_freq > 0
+        && points
+            >= schedule
+                .prev_points
+                .saturating_add(config.global_ba_points_freq);
+    let image_ratio_hit = config.global_ba_images_ratio > 1.0
+        && schedule.prev_registered_images > 0
+        && registered as f32
+            >= schedule.prev_registered_images as f32 * config.global_ba_images_ratio;
+    let point_ratio_hit = config.global_ba_points_ratio > 1.0
+        && schedule.prev_points > 0
+        && points as f32 >= schedule.prev_points as f32 * config.global_ba_points_ratio;
+    image_freq_hit || point_freq_hit || image_ratio_hit || point_ratio_hit
+}
+
+fn should_run_final_global_ba(
+    schedule: &GlobalBaSchedule,
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> bool {
+    global_ba_enabled(config)
+        && registered_image_count(reconstruction) >= 2
+        && !reconstruction.points.is_empty()
+        && (registered_image_count(reconstruction) != schedule.prev_registered_images
+            || reconstruction.points.len() != schedule.prev_points)
+}
+
+fn global_ba_enabled(config: &MapperConfig) -> bool {
+    config.global_ba && global_ba_iterations(config) > 0 && config.global_ba_max_refinements > 0
+}
+
+fn global_ba_gauge_images(reconstruction: &Reconstruction) -> Vec<usize> {
+    reconstruction
+        .poses
+        .iter()
+        .enumerate()
+        .filter_map(|(image, pose)| pose.is_some().then_some(image))
+        .take(2)
+        .collect()
+}
+
+fn global_ba_size_tag(reconstruction: &Reconstruction, config: &MapperConfig) -> &'static str {
+    if (config.global_ba_images_freq > 0
+        && registered_image_count(reconstruction) >= config.global_ba_images_freq)
+        || (config.global_ba_points_freq > 0
+            && reconstruction.points.len() >= config.global_ba_points_freq)
+    {
+        "large"
+    } else {
+        "small"
+    }
+}
+
+fn registered_image_count(reconstruction: &Reconstruction) -> usize {
+    reconstruction
+        .poses
+        .iter()
+        .filter(|pose| pose.is_some())
+        .count()
+}
+
+fn reconstruction_num_observations(reconstruction: &Reconstruction) -> usize {
+    reconstruction
+        .points
+        .iter()
+        .map(|point| point.track.len())
+        .sum()
+}
+
+fn refine_local_bundle_after_registration(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    registered_image: usize,
+    gauge_image: usize,
+    tri_options: &IncrementalTriangulatorOptions,
+    config: &MapperConfig,
+) -> Option<LocalBundleReport> {
+    if !config.local_ba || config.local_ba_iterations == 0 {
+        return None;
+    }
+    let local_bundle = select_local_bundle(
+        reconstruction,
+        registered_image,
+        gauge_image,
+        config.local_ba_num_images,
+        config.local_ba_min_shared_points,
+    )?;
+    let ba_options = mapper_ba_options(
+        config,
+        reconstruction,
+        config.local_ba_iterations,
+        Some(local_bundle.variable_images.clone()),
+        vec![gauge_image],
+        Some(local_bundle.point_ids.clone()),
+        Some(local_bundle.constant_point_ids.clone()),
+    );
+    let report = refine_bundle_adjustment_checked(frames, reconstruction, config, ba_options)?;
+    let stable_point_ids = local_bundle.stable_point_ids.clone();
+    let mut post_ba_point_ids =
+        point_indices_for_stable_point_ids(reconstruction, &stable_point_ids);
+    let (merged_observations, modified_after_merge) = {
+        let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+        let merged = triangulator.merge_tracks(tri_options, &post_ba_point_ids);
+        let modified = triangulator.get_modified_points3d().clone();
+        (merged, modified)
+    };
+    post_ba_point_ids = point_indices_for_stable_point_ids(reconstruction, &stable_point_ids);
+    post_ba_point_ids.extend(modified_after_merge);
+    let (completed_observations, completed_image_observations) = {
+        let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+        let completed = triangulator.complete_tracks(tri_options, &post_ba_point_ids);
+        let image_report = triangulator.triangulate_image(tri_options, registered_image);
+        (completed, image_report.total_observations())
+    };
+    Some(LocalBundleReport {
+        report,
+        variable_images: local_bundle.variable_images.len(),
+        local_images: local_bundle.local_images.len(),
+        points: local_bundle.point_ids.len(),
+        merged_observations,
+        completed_observations,
+        completed_image_observations,
+    })
+}
+
+fn local_bundle_refinement_required(
+    reconstruction: &Reconstruction,
+    registered_image: usize,
+    gauge_image: usize,
+    config: &MapperConfig,
+) -> bool {
+    if !config.local_ba || config.local_ba_iterations == 0 {
+        return false;
+    }
+    select_local_bundle(
+        reconstruction,
+        registered_image,
+        gauge_image,
+        config.local_ba_num_images,
+        config.local_ba_min_shared_points,
+    )
+    .is_some()
+}
+
+fn registration_state_has_bogus_camera(
+    reconstruction: &Reconstruction,
+    image: usize,
+    config: &MapperConfig,
+) -> bool {
+    reconstruction.poses.get(image).copied().flatten().is_some()
+        && camera_has_bogus_params(reconstruction.camera_for_image(image), config)
+}
+
+fn registration_rollback_reason(
+    reconstruction: &Reconstruction,
+    image: usize,
+    local_ba_required: bool,
+    local_ba_succeeded: bool,
+    config: &MapperConfig,
+) -> Option<&'static str> {
+    if local_ba_required && !local_ba_succeeded {
+        Some("local_ba_failed")
+    } else if registration_state_has_bogus_camera(reconstruction, image, config) {
+        Some("bogus_camera")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalBundleSelection {
+    variable_images: Vec<usize>,
+    point_ids: Vec<usize>,
+    constant_point_ids: Vec<usize>,
+    stable_point_ids: Vec<u64>,
+    local_images: Vec<usize>,
+}
+
+fn select_local_bundle(
+    reconstruction: &Reconstruction,
+    registered_image: usize,
+    gauge_image: usize,
+    max_num_images: usize,
+    min_shared_points: usize,
+) -> Option<LocalBundleSelection> {
+    if registered_image >= reconstruction.poses.len()
+        || reconstruction.poses[registered_image].is_none()
+        || max_num_images == 0
+    {
+        return None;
+    }
+
+    let query_point_ids = reconstruction
+        .points
+        .iter()
+        .enumerate()
+        .filter_map(|(point_id, point)| {
+            point
+                .track
+                .iter()
+                .any(|obs| obs.image == registered_image)
+                .then_some(point_id)
+        })
+        .collect::<Vec<_>>();
+    let mut query_point_ids = query_point_ids;
+    query_point_ids.sort_unstable();
+    query_point_ids.dedup();
+    if query_point_ids.len() < min_shared_points.max(2) {
+        return None;
+    }
+
+    let mut shared = HashMap::<usize, Vec<usize>>::new();
+    for &point_id in &query_point_ids {
+        let Some(point) = reconstruction.points.get(point_id) else {
+            continue;
+        };
+        for obs in &point.track {
+            if obs.image == registered_image
+                || obs.image == gauge_image
+                || reconstruction
+                    .poses
+                    .get(obs.image)
+                    .copied()
+                    .flatten()
+                    .is_none()
+            {
+                continue;
+            }
+            shared.entry(obs.image).or_default().push(point_id);
+        }
+    }
+
+    let mut variable_images = vec![registered_image];
+    let mut local_images = Vec::new();
+    let mut neighbors = shared.into_iter().collect::<Vec<_>>();
+    neighbors.sort_by(|(image_a, points_a), (image_b, points_b)| {
+        points_b
+            .len()
+            .cmp(&points_a.len())
+            .then_with(|| image_a.cmp(image_b))
+    });
+    let desired_neighbors = max_num_images.saturating_sub(1).min(neighbors.len());
+    let mut used_neighbors = vec![false; neighbors.len()];
+    if desired_neighbors > 0 {
+        for (angle_divisor, min_shared_ratio) in local_bundle_selection_thresholds() {
+            let min_angle = local_ba_min_tri_angle_deg() / angle_divisor;
+            let min_shared = ((query_point_ids.len() as f32) * min_shared_ratio)
+                .ceil()
+                .max(min_shared_points as f32) as usize;
+            for idx in 0..neighbors.len() {
+                if used_neighbors[idx] {
+                    continue;
+                }
+                let (image, shared_points) = &neighbors[idx];
+                if shared_points.len() < min_shared {
+                    break;
+                }
+                if shared_track_triangulation_percentile_deg(
+                    reconstruction,
+                    registered_image,
+                    *image,
+                    shared_points,
+                    75.0,
+                )
+                .is_some_and(|angle| angle >= min_angle)
+                {
+                    local_images.push(*image);
+                    variable_images.push(*image);
+                    used_neighbors[idx] = true;
+                    if local_images.len() >= desired_neighbors {
+                        break;
+                    }
+                }
+            }
+            if local_images.len() >= desired_neighbors {
+                break;
+            }
+        }
+        if local_images.len() < desired_neighbors {
+            for idx in 0..neighbors.len() {
+                if used_neighbors[idx] {
+                    continue;
+                }
+                let (image, _) = &neighbors[idx];
+                local_images.push(*image);
+                variable_images.push(*image);
+                used_neighbors[idx] = true;
+                if local_images.len() >= desired_neighbors {
+                    break;
+                }
+            }
+        }
+    }
+    variable_images.sort_unstable();
+    variable_images.dedup();
+    if local_images.is_empty() || (variable_images.len() == 1 && query_point_ids.len() < 6) {
+        return None;
+    }
+
+    let mut point_ids = query_point_ids
+        .iter()
+        .copied()
+        .filter(|&point_id| {
+            reconstruction
+                .points
+                .get(point_id)
+                .map(|point| {
+                    point.error <= 0.0 || point.track.len() <= local_ba_max_variable_track_length()
+                })
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if point_ids.len() < min_shared_points.max(2) {
+        point_ids = query_point_ids.clone();
+    }
+    let variable_point_set = point_ids.iter().copied().collect::<HashSet<_>>();
+    let mut constant_point_ids = query_point_ids
+        .iter()
+        .copied()
+        .filter(|point_id| !variable_point_set.contains(point_id))
+        .collect::<Vec<_>>();
+    constant_point_ids.sort_unstable();
+    let stable_point_ids = point_ids
+        .iter()
+        .chain(constant_point_ids.iter())
+        .map(|&point_id| reconstruction_point3d_id(reconstruction, point_id))
+        .collect::<Vec<_>>();
+
+    Some(LocalBundleSelection {
+        variable_images,
+        point_ids,
+        constant_point_ids,
+        stable_point_ids,
+        local_images,
+    })
+}
+
+fn point_indices_for_stable_point_ids(
+    reconstruction: &Reconstruction,
+    stable_point_ids: &[u64],
+) -> HashSet<usize> {
+    let ids = stable_point_ids.iter().copied().collect::<HashSet<_>>();
+    reconstruction
+        .points
+        .iter()
+        .enumerate()
+        .filter_map(|(point_id, _)| {
+            ids.contains(&reconstruction_point3d_id(reconstruction, point_id))
+                .then_some(point_id)
+        })
+        .collect()
+}
+
+fn reconstruction_point3d_id(reconstruction: &Reconstruction, point_id: usize) -> u64 {
+    reconstruction
+        .point_ids
+        .get(point_id)
+        .copied()
+        .unwrap_or(point_id as u64 + 1)
+}
+
+fn local_bundle_selection_thresholds() -> [(f32, f32); 8] {
+    [
+        (1.0, 0.6),
+        (1.5, 0.6),
+        (2.0, 0.5),
+        (2.5, 0.4),
+        (3.0, 0.3),
+        (4.0, 0.2),
+        (5.0, 0.1),
+        (6.0, 0.1),
+    ]
+}
+
+fn local_ba_min_tri_angle_deg() -> f32 {
+    std::env::var("RUSTSFM_LOCAL_BA_MIN_TRI_ANGLE_DEG")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(6.0)
+}
+
+fn local_ba_max_variable_track_length() -> usize {
+    std::env::var("RUSTSFM_LOCAL_BA_MAX_VARIABLE_TRACK_LENGTH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 2)
+        .unwrap_or(15)
+}
+
+fn shared_track_triangulation_percentile_deg(
+    reconstruction: &Reconstruction,
+    left_image: usize,
+    right_image: usize,
+    point_ids: &[usize],
+    percentile: f32,
+) -> Option<f32> {
+    let left_pose = reconstruction.poses.get(left_image).copied().flatten()?;
+    let right_pose = reconstruction.poses.get(right_image).copied().flatten()?;
+    let mut angles = point_ids
+        .iter()
+        .filter_map(|&point_id| {
+            let point = reconstruction.points.get(point_id)?;
+            pair_triangulation_angle_deg(left_pose, right_pose, point.xyz)
+        })
+        .filter(|angle| angle.is_finite())
+        .collect::<Vec<_>>();
+    percentile_f32(&mut angles, percentile)
+}
+
+fn percentile_f32(values: &mut [f32], percentile: f32) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p = percentile.clamp(0.0, 100.0) / 100.0;
+    let idx = ((values.len() - 1) as f32 * p).round() as usize;
+    values.get(idx).copied()
+}
+
+fn absolute_pose_pair_rotation_limit_deg() -> f32 {
+    std::env::var("RUSTSFM_ABS_POSE_PAIR_ROTATION_LIMIT_DEG")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(20.0)
 }
 
 fn choose_initial_pair<'a>(
@@ -1965,19 +3114,6 @@ fn choose_initial_pair<'a>(
         .iter()
         .filter(|p| is_colmap_style_initial_pair(p, config))
         .max_by(|a, b| compare_initial_pairs(a, b, &image_correspondences))
-        .or_else(|| {
-            pairs
-                .iter()
-                .filter(|p| {
-                    p.inliers >= config.min_inliers && p.triangulated >= config.min_triangulated
-                })
-                .max_by(|a, b| compare_initial_pairs(a, b, &image_correspondences))
-        })
-        .or_else(|| {
-            pairs
-                .iter()
-                .max_by(|a, b| compare_initial_pairs(a, b, &image_correspondences))
-        })
 }
 
 fn is_colmap_style_initial_pair(pair: &PairGeometry, config: &MapperConfig) -> bool {
@@ -2036,78 +3172,877 @@ fn registration_score(choice: &RegistrationChoice, obs_manager: &ObservationMana
     let visible_points = obs_manager.num_visible_points3d(choice.image) as f32;
     let visible_corrs = obs_manager.num_visible_correspondences(choice.image) as f32;
     let visibility_score = obs_manager.point3d_visibility_score(choice.image) as f32;
-    let observation_ratio = if obs_manager.num_observations(choice.image) == 0 {
-        0.0
-    } else {
-        visible_points / obs_manager.num_observations(choice.image) as f32
-    };
-    let support = visible_points * 8.0 + visible_corrs.sqrt() * 12.0 + visibility_score * 2.0;
-    let pnp_bonus = if choice.source == "pnp" {
-        choice.pnp_inliers as f32 * 2.0 - choice.mean_error_px.min(20.0) * 8.0
-    } else {
-        0.0
-    };
-    support + observation_ratio * 50.0 + pnp_bonus
-        - choice.pair_rot_error * 25.0
+    let support = visible_points * 1000.0
+        + choice.pnp_inliers as f32 * 200.0
+        + choice.visible_points_ratio * 500.0
+        + visible_corrs.sqrt() * 25.0
+        + visibility_score as f32 * 3.0;
+    support
+        - choice.mean_error_px.min(20.0) * 20.0
+        - choice.pair_rot_error.min(45.0) * 10.0
         - choice.image as f32 * 0.001
 }
 
-fn relative_pose_candidate(
-    image: usize,
-    pairs: &[PairGeometry],
-    poses: &[Option<SE3>],
-) -> Option<SE3> {
-    pairs
-        .iter()
-        .filter_map(|pair| {
-            if pair.right == image {
-                poses[pair.left].map(|pose| {
-                    (
-                        relative_candidate_score(pair, image),
-                        pair.relative_pose.compose(&pose),
-                    )
-                })
-            } else if pair.left == image {
-                poses[pair.right].map(|pose| {
-                    (
-                        relative_candidate_score(pair, image),
-                        pair.relative_pose.inverse().compose(&pose),
-                    )
-                })
-            } else {
-                None
-            }
-        })
-        .max_by_key(|(score, _)| *score)
-        .map(|(_, pose)| pose)
+#[derive(Debug, Clone)]
+struct AbsolutePose {
+    pose: SE3,
+    camera: CameraModel,
+    inliers: usize,
+    inlier_ratio: f32,
+    mean_error_px: f32,
+    structureless_inliers: Vec<StructurelessInlier>,
 }
 
-fn relative_candidate_score(pair: &PairGeometry, image: usize) -> usize {
-    let ring_bridge_bonus = if is_ring_bridge_candidate(pair.left, pair.right) {
-        4_000_000
-    } else {
-        0
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StructurelessInlier {
+    image: usize,
+    feature: usize,
+    other: usize,
+    other_feature: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ColmapStructurelessProblem {
+    query_points2d: Vec<[f64; 2]>,
+    world_points2d: Vec<[f64; 2]>,
+    world_camera_idxs: Vec<usize>,
+    world_cams_from_world: Vec<SE3>,
+    world_cameras: Vec<CameraModel>,
+    correspondences: Vec<StructurelessInlier>,
+}
+
+#[derive(Debug, Clone)]
+struct StructurelessPairConstraint {
+    other: usize,
+    image_is_left: bool,
+    other_pose: SE3,
+    relative_pose: SE3,
+    candidate_pose: SE3,
+    line_origin: glam::Vec3,
+    line_direction: glam::Vec3,
+    inliers: usize,
+    mean_error_px: f32,
+    matches: Vec<StructurelessInlier>,
+}
+
+fn solve_structureless_absolute_pose(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    obs_manager: &ObservationManager,
+    camera_priors: &[CameraModel],
+) -> Option<AbsolutePose> {
+    if let Some(abs_pose) = solve_colmap_structureless_absolute_pose(
+        image,
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        obs_manager,
+        camera_priors,
+    ) {
+        return Some(abs_pose);
+    }
+    if !config.experimental_structureless_pair_pose_fallback {
+        return None;
+    }
+    solve_experimental_structureless_pair_pose_fallback(
+        image,
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        obs_manager,
+        camera_priors,
+    )
+}
+
+fn solve_colmap_structureless_absolute_pose(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    obs_manager: &ObservationManager,
+    camera_priors: &[CameraModel],
+) -> Option<AbsolutePose> {
+    if registered_image_count(reconstruction) < 2 {
+        return None;
+    }
+    let camera = registration_camera_for_image(image, reconstruction, config, camera_priors);
+    if camera_has_bogus_params(camera, config) {
+        return None;
+    }
+    let min_num_inliers = structureless_min_num_inliers(config);
+    if obs_manager.num_visible_correspondences(image) < min_num_inliers {
+        return None;
+    }
+
+    let problem =
+        collect_colmap_structureless_problem(image, frames, pairs, reconstruction, config);
+    if problem.world_points2d.len() < min_num_inliers {
+        return None;
+    }
+
+    let mut options = StructureLessAbsolutePoseEstimationOptions::default();
+    options.ransac_options.max_error = 0.5 * config.pnp_threshold_px as f64;
+    options.ransac_options.min_inlier_ratio = config.abs_pose_min_inlier_ratio as f64;
+    options.ransac_options.random_seed = config.random_seed;
+    options.ransac_options.num_threads =
+        config.threads.map(|threads| threads as isize).unwrap_or(1);
+
+    let estimate = match estimate_structureless_absolute_pose(
+        &options,
+        StructureLessAbsolutePoseProblem {
+            query_points2d: &problem.query_points2d,
+            world_points2d: &problem.world_points2d,
+            world_camera_idxs: &problem.world_camera_idxs,
+            world_cams_from_world: &problem.world_cams_from_world,
+            world_cameras: &problem.world_cameras,
+            query_camera: camera,
+        },
+    ) {
+        Ok(Some(estimate)) => estimate,
+        Ok(None) => return None,
+        Err(GeneralizedPoseError::MissingGeneralizedRelativePoseSolver) => {
+            log::debug!(
+                "COLMAP structure-less registration skipped: GR6P/GR8P solver is not ported yet"
+            );
+            return None;
+        }
+        Err(err) => {
+            log::debug!("COLMAP structure-less registration skipped: {err}");
+            return None;
+        }
     };
-    let crosses_ring_break = pair.left <= 191 && pair.right >= 192;
-    let adjacent_bonus = if pair.left.abs_diff(pair.right) == 1 && !crosses_ring_break {
-        1_000_000
-    } else {
-        0
+
+    if estimate.num_inliers < min_num_inliers {
+        return None;
+    }
+    let structureless_inliers = estimate
+        .inlier_mask
+        .iter()
+        .zip(problem.correspondences.iter())
+        .filter_map(|(&is_inlier, &correspondence)| is_inlier.then_some(correspondence))
+        .collect::<Vec<_>>();
+    if structureless_inliers.len() < min_num_inliers {
+        return None;
+    }
+
+    Some(AbsolutePose {
+        pose: estimate.query_cam_from_world,
+        camera,
+        inliers: structureless_inliers.len(),
+        inlier_ratio: structureless_inliers.len() as f32 / problem.world_points2d.len() as f32,
+        mean_error_px: 0.0,
+        structureless_inliers,
+    })
+}
+
+fn collect_colmap_structureless_problem(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> ColmapStructurelessProblem {
+    let mut problem = ColmapStructurelessProblem {
+        query_points2d: Vec::new(),
+        world_points2d: Vec::new(),
+        world_camera_idxs: Vec::new(),
+        world_cams_from_world: Vec::new(),
+        world_cameras: Vec::new(),
+        correspondences: Vec::new(),
     };
-    let frontier_bonus =
-        if pair.right == image && pair.left + 1 == pair.right && !crosses_ring_break {
-            1_000_000
-        } else {
-            0
+    let mut world_image_to_camera_idx = HashMap::new();
+
+    for pair in pairs {
+        let Some((other, image_is_left)) = structureless_pair_side(image, pair) else {
+            continue;
         };
-    ring_bridge_bonus + adjacent_bonus + frontier_bonus + pair.inliers * 10 + pair.triangulated
+        let Some(other_pose) = reconstruction.poses.get(other).copied().flatten() else {
+            continue;
+        };
+        let other_camera = reconstruction.camera_for_image(other);
+        if camera_has_bogus_params(other_camera, config) {
+            continue;
+        }
+
+        let world_camera_idx = if let Some(&camera_idx) = world_image_to_camera_idx.get(&other) {
+            camera_idx
+        } else {
+            let camera_idx = problem.world_cameras.len();
+            world_image_to_camera_idx.insert(other, camera_idx);
+            problem.world_cams_from_world.push(other_pose);
+            problem.world_cameras.push(other_camera);
+            camera_idx
+        };
+
+        for m in &pair.inlier_matches {
+            let (feature, other_feature) = if image_is_left {
+                (m.query_idx as usize, m.train_idx as usize)
+            } else {
+                (m.train_idx as usize, m.query_idx as usize)
+            };
+            let Some(query_kp) = frames
+                .get(image)
+                .and_then(|frame| frame.keypoints.get(feature))
+            else {
+                continue;
+            };
+            let Some(world_kp) = frames
+                .get(other)
+                .and_then(|frame| frame.keypoints.get(other_feature))
+            else {
+                continue;
+            };
+            problem
+                .query_points2d
+                .push([query_kp.x() as f64, query_kp.y() as f64]);
+            problem
+                .world_points2d
+                .push([world_kp.x() as f64, world_kp.y() as f64]);
+            problem.world_camera_idxs.push(world_camera_idx);
+            problem.correspondences.push(StructurelessInlier {
+                image,
+                feature,
+                other,
+                other_feature,
+            });
+        }
+    }
+
+    problem
+}
+
+fn structureless_pair_side(image: usize, pair: &PairGeometry) -> Option<(usize, bool)> {
+    if pair.left == image {
+        Some((pair.right, true))
+    } else if pair.right == image {
+        Some((pair.left, false))
+    } else {
+        None
+    }
+}
+
+fn solve_experimental_structureless_pair_pose_fallback(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    obs_manager: &ObservationManager,
+    camera_priors: &[CameraModel],
+) -> Option<AbsolutePose> {
+    if registered_image_count(reconstruction) < 2 {
+        return None;
+    }
+    let camera = registration_camera_for_image(image, reconstruction, config, camera_priors);
+    if camera_has_bogus_params(camera, config) {
+        return None;
+    }
+    let min_num_inliers = structureless_min_num_inliers(config);
+    let visible_corrs = obs_manager.num_visible_correspondences(image);
+    if visible_corrs < min_num_inliers {
+        return None;
+    }
+
+    let constraints =
+        collect_structureless_pair_constraints(image, frames, pairs, reconstruction, config);
+    let valid_corrs = constraints.iter().map(|c| c.inliers).sum::<usize>();
+    if valid_corrs < min_num_inliers || distinct_structureless_neighbors(&constraints) < 2 {
+        return None;
+    }
+
+    let mut best = None::<(f32, AbsolutePose)>;
+    for hypothesis in &constraints {
+        let rotation = pose_rotation(hypothesis.candidate_pose);
+        let compatible = compatible_structureless_constraints(rotation, &constraints);
+        let inliers = compatible.iter().map(|c| c.inliers).sum::<usize>();
+        if inliers < min_num_inliers || distinct_structureless_neighbors(&compatible) < 2 {
+            continue;
+        }
+        let inlier_ratio = inliers as f32 / valid_corrs.max(1) as f32;
+        if inlier_ratio < config.abs_pose_min_inlier_ratio {
+            continue;
+        }
+        let pair_rot_error = weighted_structureless_rotation_error(rotation, &compatible)?;
+        if pair_rot_error > absolute_pose_pair_rotation_limit_deg() {
+            continue;
+        }
+        let center = estimate_structureless_camera_center(&compatible)
+            .unwrap_or_else(|| camera_center(hypothesis.candidate_pose));
+        let mut pose = pose_from_rotation_center(rotation, center);
+        let mut structureless_inliers = structureless_inliers_from_pose(
+            pose,
+            camera,
+            &compatible,
+            frames,
+            reconstruction,
+            config,
+        );
+        if let Some((refined_pose, refined_inliers)) = refine_structureless_pose_sampson(
+            pose,
+            camera,
+            &compatible,
+            &structureless_inliers,
+            frames,
+            reconstruction,
+            config,
+        ) {
+            pose = refined_pose;
+            structureless_inliers = refined_inliers;
+        }
+        let inliers = structureless_inliers.len();
+        if inliers < min_num_inliers
+            || distinct_structureless_inlier_neighbors(&structureless_inliers) < 2
+        {
+            continue;
+        }
+        let inlier_ratio = inliers as f32 / valid_corrs.max(1) as f32;
+        if inlier_ratio < config.abs_pose_min_inlier_ratio {
+            continue;
+        }
+        let mean_error_px = weighted_structureless_mean_error(&compatible);
+        let score = inliers as f32 * 100.0 + inlier_ratio * 500.0
+            - pair_rot_error.min(45.0) * 50.0
+            - mean_error_px.min(20.0) * 10.0
+            - image as f32 * 0.001;
+        let absolute_pose = AbsolutePose {
+            pose,
+            camera,
+            inliers,
+            inlier_ratio,
+            mean_error_px,
+            structureless_inliers,
+        };
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, absolute_pose));
+        }
+    }
+
+    best.map(|(_, pose)| pose)
+}
+
+fn structureless_min_num_inliers(config: &MapperConfig) -> usize {
+    2 * config.abs_pose_min_num_inliers
+}
+
+fn collect_structureless_pair_constraints(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> Vec<StructurelessPairConstraint> {
+    let mut constraints = Vec::new();
+    for pair in pairs {
+        if pair.pose_graph_only {
+            continue;
+        }
+        let other = if pair.left == image {
+            pair.right
+        } else if pair.right == image {
+            pair.left
+        } else {
+            continue;
+        };
+        let Some(other_pose) = reconstruction.poses.get(other).copied().flatten() else {
+            continue;
+        };
+        if camera_has_bogus_params(reconstruction.camera_for_image(other), config) {
+            continue;
+        }
+        let matches = valid_structureless_matches(image, other, frames, pair);
+        let inliers = matches.len();
+        if inliers == 0 {
+            continue;
+        }
+        let Some(candidate_pose) = structureless_pose_from_pair(image, pair, other_pose) else {
+            continue;
+        };
+        let line_origin = camera_center(other_pose);
+        let candidate_center = camera_center(candidate_pose);
+        let Some(line_direction) = (candidate_center - line_origin).try_normalize() else {
+            continue;
+        };
+        constraints.push(StructurelessPairConstraint {
+            other,
+            image_is_left: pair.left == image,
+            other_pose,
+            relative_pose: pair.relative_pose,
+            candidate_pose,
+            line_origin,
+            line_direction,
+            inliers,
+            mean_error_px: if pair.mean_reprojection_error_px.is_finite() {
+                pair.mean_reprojection_error_px
+            } else {
+                0.0
+            },
+            matches,
+        });
+    }
+    constraints
+}
+
+fn structureless_pose_from_pair(image: usize, pair: &PairGeometry, other_pose: SE3) -> Option<SE3> {
+    if pair.left == image {
+        Some(pair.relative_pose.inverse().compose(&other_pose))
+    } else if pair.right == image {
+        Some(pair.relative_pose.compose(&other_pose))
+    } else {
+        None
+    }
+}
+
+fn valid_structureless_matches(
+    image: usize,
+    other: usize,
+    frames: &[ImageFrame],
+    pair: &PairGeometry,
+) -> Vec<StructurelessInlier> {
+    let Some(image_frame) = frames.get(image) else {
+        return Vec::new();
+    };
+    let Some(other_frame) = frames.get(other) else {
+        return Vec::new();
+    };
+    pair.inlier_matches
+        .iter()
+        .filter_map(|m| {
+            let (feature, other_feature) = if pair.left == image {
+                (m.query_idx as usize, m.train_idx as usize)
+            } else {
+                (m.train_idx as usize, m.query_idx as usize)
+            };
+            (feature < image_frame.keypoints.len() && other_feature < other_frame.keypoints.len())
+                .then_some(StructurelessInlier {
+                    image,
+                    feature,
+                    other,
+                    other_feature,
+                })
+        })
+        .collect()
+}
+
+fn compatible_structureless_constraints(
+    rotation: glam::Quat,
+    constraints: &[StructurelessPairConstraint],
+) -> Vec<StructurelessPairConstraint> {
+    constraints
+        .iter()
+        .cloned()
+        .filter(|constraint| {
+            structureless_pair_rotation_error(rotation, constraint)
+                .is_some_and(|error| error <= absolute_pose_pair_rotation_limit_deg())
+        })
+        .collect()
+}
+
+fn structureless_inliers_from_pose(
+    pose: SE3,
+    camera: CameraModel,
+    constraints: &[StructurelessPairConstraint],
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> Vec<StructurelessInlier> {
+    let max_residual = structureless_sampson_threshold(camera, config);
+    let mut inliers = constraints
+        .iter()
+        .flat_map(|constraint| {
+            constraint.matches.iter().copied().filter(move |inlier| {
+                structureless_sampson_residual_for_inlier(
+                    pose,
+                    camera,
+                    *inlier,
+                    frames,
+                    reconstruction,
+                )
+                .is_some_and(|residual| residual <= max_residual)
+            })
+        })
+        .collect::<Vec<_>>();
+    inliers.sort_unstable();
+    inliers.dedup();
+    inliers
+}
+
+fn refine_structureless_pose_sampson(
+    initial_pose: SE3,
+    camera: CameraModel,
+    constraints: &[StructurelessPairConstraint],
+    initial_inliers: &[StructurelessInlier],
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> Option<(SE3, Vec<StructurelessInlier>)> {
+    if initial_inliers.len() < structureless_min_num_inliers(config) {
+        return None;
+    }
+    let mut pose = initial_pose;
+    let mut inliers = initial_inliers.to_vec();
+    let mut best_eval =
+        evaluate_structureless_pose_sampson(pose, camera, &inliers, frames, reconstruction)?;
+    let center = camera_center(initial_pose);
+    let mut best_pair_rot_error =
+        weighted_structureless_rotation_error(pose_rotation(pose), constraints)?;
+    let mut improved = false;
+    for _ in 0..6 {
+        let delta = structureless_rotation_sampson_step(
+            pose,
+            camera,
+            center,
+            &inliers,
+            frames,
+            reconstruction,
+        )?;
+        if delta.norm() < 1.0e-7 {
+            break;
+        }
+        let mut accepted = false;
+        for scale in [1.0f32, 0.5, 0.25, 0.125, 0.0625] {
+            let candidate_pose = apply_rotation_delta_fixed_center(pose, center, delta * scale);
+            let Some(candidate_pair_rot_error) =
+                weighted_structureless_rotation_error(pose_rotation(candidate_pose), constraints)
+            else {
+                continue;
+            };
+            if candidate_pair_rot_error > best_pair_rot_error + 0.05 {
+                continue;
+            }
+            let candidate_inliers = structureless_inliers_from_pose(
+                candidate_pose,
+                camera,
+                constraints,
+                frames,
+                reconstruction,
+                config,
+            );
+            if candidate_inliers.len() + 2 < inliers.len()
+                || candidate_inliers.len() < structureless_min_num_inliers(config)
+            {
+                continue;
+            }
+            let Some(candidate_eval) = evaluate_structureless_pose_sampson(
+                candidate_pose,
+                camera,
+                &candidate_inliers,
+                frames,
+                reconstruction,
+            ) else {
+                continue;
+            };
+            if candidate_eval + 1.0e-8 < best_eval {
+                pose = candidate_pose;
+                inliers = candidate_inliers;
+                best_eval = candidate_eval;
+                best_pair_rot_error = candidate_pair_rot_error;
+                improved = true;
+                accepted = true;
+                break;
+            }
+        }
+        if !accepted {
+            break;
+        }
+    }
+    improved.then_some((pose, inliers))
+}
+
+fn evaluate_structureless_pose_sampson(
+    pose: SE3,
+    camera: CameraModel,
+    inliers: &[StructurelessInlier],
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> Option<f32> {
+    let mut total = 0.0f32;
+    let mut count = 0usize;
+    for &inlier in inliers {
+        let residual = structureless_sampson_residual_for_inlier(
+            pose,
+            camera,
+            inlier,
+            frames,
+            reconstruction,
+        )?;
+        if !residual.is_finite() {
+            return None;
+        }
+        let robust = residual.min(1.0e-2);
+        total += robust * robust;
+        count += 1;
+    }
+    (count > 0).then_some(total / count as f32)
+}
+
+fn structureless_rotation_sampson_step(
+    pose: SE3,
+    camera: CameraModel,
+    center: glam::Vec3,
+    inliers: &[StructurelessInlier],
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> Option<SVector<f32, 3>> {
+    let mut h = SMatrix::<f32, 3, 3>::zeros();
+    let mut b = SVector::<f32, 3>::zeros();
+    let mut used = 0usize;
+    for &inlier in inliers {
+        let residual = structureless_signed_sampson_residual_for_inlier(
+            pose,
+            camera,
+            inlier,
+            frames,
+            reconstruction,
+        )?;
+        if !residual.is_finite() {
+            continue;
+        }
+        let jacobian = numerical_structureless_rotation_sampson_jacobian(
+            pose,
+            camera,
+            center,
+            inlier,
+            frames,
+            reconstruction,
+        )?;
+        let weight = huber_weight(residual.abs(), structureless_sampson_huber_delta());
+        h += jacobian.transpose() * jacobian * weight;
+        b += jacobian.transpose() * SVector::<f32, 1>::new(residual) * weight;
+        used += 1;
+    }
+    if used < 12 {
+        return None;
+    }
+    let lambda = 1.0e-3 * (h.trace() / 3.0).max(1.0e-8);
+    for i in 0..3 {
+        h[(i, i)] += lambda;
+    }
+    let delta = h.lu().solve(&(-b))?;
+    (delta.norm() < 0.05).then_some(delta)
+}
+
+fn structureless_sampson_huber_delta() -> f32 {
+    2.0e-3
+}
+
+fn numerical_structureless_rotation_sampson_jacobian(
+    pose: SE3,
+    camera: CameraModel,
+    center: glam::Vec3,
+    inlier: StructurelessInlier,
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> Option<SMatrix<f32, 1, 3>> {
+    let mut jacobian = SMatrix::<f32, 1, 3>::zeros();
+    let eps = [1.0e-5, 1.0e-5, 1.0e-5];
+    for axis in 0..3 {
+        let mut plus = SVector::<f32, 3>::zeros();
+        plus[axis] = eps[axis];
+        let mut minus = SVector::<f32, 3>::zeros();
+        minus[axis] = -eps[axis];
+        let r_plus = structureless_signed_sampson_residual_for_inlier(
+            apply_rotation_delta_fixed_center(pose, center, plus),
+            camera,
+            inlier,
+            frames,
+            reconstruction,
+        )?;
+        let r_minus = structureless_signed_sampson_residual_for_inlier(
+            apply_rotation_delta_fixed_center(pose, center, minus),
+            camera,
+            inlier,
+            frames,
+            reconstruction,
+        )?;
+        if !r_plus.is_finite() || !r_minus.is_finite() {
+            return None;
+        }
+        jacobian[(0, axis)] = (r_plus - r_minus) / (2.0 * eps[axis]);
+    }
+    Some(jacobian)
+}
+
+fn structureless_sampson_threshold(camera: CameraModel, config: &MapperConfig) -> f32 {
+    camera.cam_from_img_threshold((0.5 * config.pnp_threshold_px) as f64) as f32
+}
+
+fn structureless_sampson_residual_for_inlier(
+    pose: SE3,
+    camera: CameraModel,
+    inlier: StructurelessInlier,
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> Option<f32> {
+    structureless_signed_sampson_residual_for_inlier(pose, camera, inlier, frames, reconstruction)
+        .map(|residual| residual.abs())
+}
+
+fn structureless_signed_sampson_residual_for_inlier(
+    pose: SE3,
+    camera: CameraModel,
+    inlier: StructurelessInlier,
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> Option<f32> {
+    let other_pose = reconstruction.poses.get(inlier.other).copied().flatten()?;
+    let other_camera = reconstruction.camera_for_image(inlier.other);
+    let query_kp = frames.get(inlier.image)?.keypoints.get(inlier.feature)?;
+    let other_kp = frames
+        .get(inlier.other)?
+        .keypoints
+        .get(inlier.other_feature)?;
+    let query_xy = camera.cam_from_img_f32(query_kp.x(), query_kp.y())?;
+    let other_xy = other_camera.cam_from_img_f32(other_kp.x(), other_kp.y())?;
+    let relative_pose = other_pose.compose(&pose.inverse());
+    let residual = sampson_residual_normalized(relative_pose, query_xy, other_xy);
+    residual.is_finite().then_some(residual)
+}
+
+fn sampson_residual_normalized(pose: SE3, p1: [f32; 2], p2: [f32; 2]) -> f32 {
+    let r = pose.rotation_matrix();
+    let t = pose.translation();
+    let rotation = Matrix3::from_row_slice(&[
+        r[0][0], r[0][1], r[0][2], r[1][0], r[1][1], r[1][2], r[2][0], r[2][1], r[2][2],
+    ]);
+    let translation = Vector3::new(t[0], t[1], t[2]);
+    let essential = skew_matrix(translation) * rotation;
+    let x1 = Vector3::new(p1[0], p1[1], 1.0);
+    let x2 = Vector3::new(p2[0], p2[1], 1.0);
+    let ex1 = essential * x1;
+    let etx2 = essential.transpose() * x2;
+    let numerator = x2.dot(&(essential * x1));
+    let denom = (ex1[0] * ex1[0] + ex1[1] * ex1[1] + etx2[0] * etx2[0] + etx2[1] * etx2[1]).sqrt();
+    if denom <= 1.0e-12 {
+        f32::INFINITY
+    } else {
+        numerator / denom
+    }
+}
+
+fn skew_matrix(t: Vector3<f32>) -> Matrix3<f32> {
+    Matrix3::new(0.0, -t[2], t[1], t[2], 0.0, -t[0], -t[1], t[0], 0.0)
+}
+
+fn distinct_structureless_inlier_neighbors(inliers: &[StructurelessInlier]) -> usize {
+    inliers
+        .iter()
+        .map(|inlier| inlier.other)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn weighted_structureless_rotation_error(
+    rotation: glam::Quat,
+    constraints: &[StructurelessPairConstraint],
+) -> Option<f32> {
+    let mut total = 0.0f32;
+    let mut weight = 0usize;
+    for constraint in constraints {
+        let error = structureless_pair_rotation_error(rotation, constraint)?;
+        total += error * constraint.inliers as f32;
+        weight += constraint.inliers;
+    }
+    (weight > 0).then_some(total / weight as f32)
+}
+
+fn structureless_pair_rotation_error(
+    rotation: glam::Quat,
+    constraint: &StructurelessPairConstraint,
+) -> Option<f32> {
+    let pose = SE3::from_quat_translation(rotation, glam::Vec3::ZERO);
+    let predicted = if constraint
+        .other_pose
+        .translation()
+        .iter()
+        .any(|v| !v.is_finite())
+    {
+        return None;
+    } else if constraint
+        .relative_pose
+        .translation()
+        .iter()
+        .any(|v| !v.is_finite())
+    {
+        return None;
+    } else {
+        // The temporary translation is zero; relative_rotation_deg ignores it.
+        if constraint.image_is_left {
+            constraint.other_pose.compose(&pose.inverse())
+        } else {
+            pose.compose(&constraint.other_pose.inverse())
+        }
+    };
+    Some(crate::geometry::relative_rotation_deg(
+        predicted,
+        constraint.relative_pose,
+    ))
+}
+
+fn estimate_structureless_camera_center(
+    constraints: &[StructurelessPairConstraint],
+) -> Option<glam::Vec3> {
+    if constraints.len() < 2 {
+        return None;
+    }
+    let mut a = Matrix3::<f32>::zeros();
+    let mut b = Vector3::<f32>::zeros();
+    let identity = Matrix3::<f32>::identity();
+    for constraint in constraints {
+        let d = Vector3::new(
+            constraint.line_direction.x,
+            constraint.line_direction.y,
+            constraint.line_direction.z,
+        );
+        let origin = Vector3::new(
+            constraint.line_origin.x,
+            constraint.line_origin.y,
+            constraint.line_origin.z,
+        );
+        let projector = identity - d * d.transpose();
+        let weight = constraint.inliers.max(1) as f32;
+        a += projector * weight;
+        b += projector * origin * weight;
+    }
+    let center = a.lu().solve(&b)?;
+    let center = glam::Vec3::new(center.x, center.y, center.z);
+    center.is_finite().then_some(center)
+}
+
+fn weighted_structureless_mean_error(constraints: &[StructurelessPairConstraint]) -> f32 {
+    let mut total = 0.0f32;
+    let mut weight = 0usize;
+    for constraint in constraints {
+        if constraint.mean_error_px.is_finite() {
+            total += constraint.mean_error_px * constraint.inliers as f32;
+            weight += constraint.inliers;
+        }
+    }
+    if weight == 0 {
+        0.0
+    } else {
+        total / weight as f32
+    }
+}
+
+fn distinct_structureless_neighbors(constraints: &[StructurelessPairConstraint]) -> usize {
+    constraints
+        .iter()
+        .map(|constraint| constraint.other)
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AbsolutePose {
-    pose: SE3,
-    inliers: usize,
-    mean_error_px: f32,
+struct AbsolutePoseObservation {
+    feature: usize,
+    xy: [f32; 2],
+    xyz: [f32; 3],
 }
 
 fn solve_absolute_pose(
@@ -2116,16 +4051,14 @@ fn solve_absolute_pose(
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
     config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
 ) -> Option<AbsolutePose> {
-    let camera = reconstruction.camera_for_image(image);
-    let solver = PnPSolver {
-        ransac_threshold: camera.cam_from_img_threshold(config.pnp_threshold_px as f64) as f32,
-        ransac_confidence: 0.999,
-        ransac_max_iterations: config.pnp_iterations,
-        ..PnPSolver::new(1.0, 1.0, 0.0, 0.0)
-    };
-    let mut problem = PnPProblem::new();
-    let mut xy_and_points = Vec::new();
+    let camera = registration_camera_for_image(image, reconstruction, config, camera_priors);
+    if camera_has_bogus_params(camera, config) {
+        return None;
+    }
+    let mut pose_observations = Vec::new();
     let mut used_features = HashSet::new();
     let mut used_points = HashSet::new();
     for pair in pairs {
@@ -2137,6 +4070,9 @@ fn solve_absolute_pose(
             continue;
         };
         if reconstruction.poses[other].is_none() {
+            continue;
+        }
+        if camera_has_bogus_params(reconstruction.camera_for_image(other), config) {
             continue;
         }
         for m in &pair.inlier_matches {
@@ -2159,33 +4095,553 @@ fn solve_absolute_pose(
             }
             let kp = &frames[image].keypoints[feature];
             let xy = [kp.x(), kp.y()];
-            let norm_xy = camera.cam_from_img_f32(xy[0], xy[1])?;
             let xyz = reconstruction.points[point_id].xyz;
-            problem.add_correspondence(norm_xy, xyz);
-            xy_and_points.push((xy, xyz));
+            pose_observations.push(AbsolutePoseObservation { feature, xy, xyz });
         }
     }
-    if problem.image_points.len() < 15 {
+    let num_correspondences = pose_observations.len();
+    if num_correspondences < config.abs_pose_min_num_inliers.max(4) {
         return None;
     }
-    let (pose, inliers) = solver.solve(&problem)?;
+    let estimate_focal = absolute_pose_estimate_focal_length_enabled(
+        image,
+        camera,
+        reconstruction,
+        config,
+        camera_has_prior_focal_length,
+    );
+    let (pose, inliers, camera) = solve_absolute_pose_with_camera_hypotheses(
+        &pose_observations,
+        camera,
+        estimate_focal,
+        config,
+    )?;
+    let initial_eval =
+        evaluate_absolute_pose(pose, &pose_observations, Some(&inliers), camera, config)?;
+    if !accept_absolute_pose_eval(initial_eval, num_correspondences, config) {
+        return None;
+    }
+    let refinement_observations = inlier_absolute_pose_observations(&pose_observations, &inliers);
+    if refinement_observations.len() < config.abs_pose_min_num_inliers {
+        return None;
+    }
+    let (pose, camera) = refine_absolute_pose_reprojection(
+        pose,
+        image,
+        frames,
+        reconstruction,
+        &refinement_observations,
+        camera,
+        absolute_pose_refine_camera_params_enabled(image, camera, reconstruction, config),
+        config,
+    )?;
+    let final_eval = evaluate_absolute_pose(pose, &pose_observations, None, camera, config)?;
+    if !accept_absolute_pose_eval(final_eval, num_correspondences, config) {
+        return None;
+    }
+    Some(AbsolutePose {
+        pose,
+        camera,
+        inliers: final_eval.inliers,
+        inlier_ratio: final_eval.inliers as f32 / num_correspondences.max(1) as f32,
+        mean_error_px: final_eval.mean_error_px,
+        structureless_inliers: Vec::new(),
+    })
+}
+
+fn inlier_absolute_pose_observations(
+    observations: &[AbsolutePoseObservation],
+    inlier_mask: &[bool],
+) -> Vec<AbsolutePoseObservation> {
+    observations
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, observation)| {
+            inlier_mask
+                .get(idx)
+                .copied()
+                .unwrap_or(false)
+                .then_some(*observation)
+        })
+        .collect()
+}
+
+fn solve_absolute_pose_with_camera_hypotheses(
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    estimate_focal: bool,
+    config: &MapperConfig,
+) -> Option<(SE3, Vec<bool>, CameraModel)> {
+    if estimate_focal {
+        return solve_absolute_pose_with_focal_estimation(observations, camera, config);
+    }
+    let mut best = None::<(AbsolutePoseEval, SE3, Vec<bool>, CameraModel)>;
+    let Some((pose, inliers)) = solve_absolute_pose_for_camera(observations, camera, config) else {
+        return None;
+    };
+    let Some(eval) = evaluate_absolute_pose(pose, observations, Some(&inliers), camera, config)
+    else {
+        return None;
+    };
+    if accept_absolute_pose_eval(eval, observations.len(), config) {
+        best = Some((eval, pose, inliers, camera));
+    }
+    best.map(|(_, pose, inliers, camera)| (pose, inliers, camera))
+}
+
+fn solve_absolute_pose_with_focal_estimation(
+    observations: &[AbsolutePoseObservation],
+    initial_camera: CameraModel,
+    config: &MapperConfig,
+) -> Option<(SE3, Vec<bool>, CameraModel)> {
+    let Some(focal_idxs) = colmap_camera_model_focal_idxs(initial_camera.model_id) else {
+        return solve_absolute_pose_for_camera(observations, initial_camera, config)
+            .map(|(pose, inliers)| (pose, inliers, initial_camera));
+    };
+    if focal_idxs.is_empty() {
+        return solve_absolute_pose_for_camera(observations, initial_camera, config)
+            .map(|(pose, inliers)| (pose, inliers, initial_camera));
+    }
+
+    let initial_focal = average_camera_focal(initial_camera) as f32;
+    let solver = PnPSolver {
+        ransac_threshold: config.pnp_threshold_px,
+        ransac_confidence: 0.99999,
+        ransac_min_inlier_ratio: config.abs_pose_min_inlier_ratio,
+        ransac_min_iterations: 100,
+        ransac_max_iterations: config.pnp_iterations,
+        ransac_random_seed: Some(absolute_pose_ransac_seed(config)),
+        ..PnPSolver::new(
+            initial_focal,
+            initial_focal,
+            initial_camera.cx,
+            initial_camera.cy,
+        )
+    };
+    let mut problem = PnPProblem::new();
+    for observation in observations {
+        problem.add_correspondence(observation.xy, observation.xyz);
+    }
+    let result = solver.solve_with_estimated_focal(&problem)?;
+    let mut camera = initial_camera;
+    for &idx in focal_idxs {
+        if idx >= camera.num_params {
+            return None;
+        }
+        camera.params[idx] = result.focal as f64;
+    }
+    camera.sync_intrinsics_from_params();
+    if camera_has_bogus_params(camera, config) {
+        return None;
+    }
+    Some((result.pose, result.inliers, camera))
+}
+
+fn solve_absolute_pose_for_camera(
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    config: &MapperConfig,
+) -> Option<(SE3, Vec<bool>)> {
+    let solver = PnPSolver {
+        ransac_threshold: camera.cam_from_img_threshold(config.pnp_threshold_px as f64) as f32,
+        ransac_confidence: 0.99999,
+        ransac_min_inlier_ratio: config.abs_pose_min_inlier_ratio,
+        ransac_min_iterations: 100,
+        ransac_max_iterations: config.pnp_iterations,
+        ransac_random_seed: Some(absolute_pose_ransac_seed(config)),
+        ..PnPSolver::new(1.0, 1.0, 0.0, 0.0)
+    };
+    let mut problem = PnPProblem::new();
+    for observation in observations {
+        let norm_xy = camera.cam_from_img_f32(observation.xy[0], observation.xy[1])?;
+        problem.add_correspondence(norm_xy, observation.xyz);
+    }
+    solver.solve(&problem)
+}
+
+fn absolute_pose_ransac_seed(config: &MapperConfig) -> u64 {
+    if config.random_seed >= 0 {
+        config.random_seed as u64
+    } else {
+        next_absolute_pose_ransac_seed()
+    }
+}
+
+fn next_absolute_pose_ransac_seed() -> u64 {
+    static ABSOLUTE_POSE_RANSAC_SEED: AtomicU64 = AtomicU64::new(1);
+    ABSOLUTE_POSE_RANSAC_SEED.fetch_add(1, Ordering::Relaxed)
+}
+
+fn average_camera_focal(camera: CameraModel) -> f64 {
+    if let Some(focal_idxs) = colmap_camera_model_focal_idxs(camera.model_id) {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for &idx in focal_idxs {
+            if idx < camera.num_params {
+                sum += camera.params[idx];
+                count += 1;
+            }
+        }
+        if count > 0 && sum.is_finite() {
+            return (sum / count as f64).max(1.0);
+        }
+    }
+    camera.fx.max(camera.fy).max(1.0) as f64
+}
+
+fn absolute_pose_estimate_focal_length_enabled(
+    image: usize,
+    camera: CameraModel,
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    camera_has_prior_focal_length: &[bool],
+) -> bool {
+    if !config.ba_refine_focal_length {
+        return false;
+    }
+    let camera_idx = reconstruction
+        .image_camera_indices
+        .get(image)
+        .copied()
+        .unwrap_or(0);
+    let camera_id = reconstruction
+        .camera_ids
+        .get(camera_idx)
+        .copied()
+        .unwrap_or(1);
+    if config.ba_constant_camera_ids.contains(&camera_id) {
+        return false;
+    }
+    if camera_has_prior_focal_length
+        .get(camera_idx)
+        .copied()
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    registered_images_with_camera(reconstruction, image, camera_idx) == 0
+        || camera_has_bogus_params(camera, config)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AbsolutePoseEval {
+    inliers: usize,
+    mean_error_px: f32,
+}
+
+fn evaluate_absolute_pose(
+    pose: SE3,
+    observations: &[AbsolutePoseObservation],
+    inlier_mask: Option<&[bool]>,
+    camera: CameraModel,
+    config: &MapperConfig,
+) -> Option<AbsolutePoseEval> {
     let mut count = 0usize;
     let mut total_error = 0.0f32;
-    for (idx, &(xy, xyz)) in xy_and_points.iter().enumerate() {
-        if !inliers.get(idx).copied().unwrap_or(false) {
+    for (idx, observation) in observations.iter().enumerate() {
+        if inlier_mask
+            .and_then(|mask| mask.get(idx))
+            .copied()
+            .is_some_and(|is_inlier| !is_inlier)
+        {
             continue;
         }
-        let err = crate::geometry::reprojection_error_px(xyz, pose, xy, camera);
-        if err <= config.max_reprojection_error_px {
+        let err =
+            crate::geometry::reprojection_error_px(observation.xyz, pose, observation.xy, camera);
+        if err.is_finite() && err <= config.pnp_threshold_px {
             count += 1;
             total_error += err;
         }
     }
-    (count >= 15).then_some(AbsolutePose {
-        pose,
+    (count > 0).then_some(AbsolutePoseEval {
         inliers: count,
-        mean_error_px: total_error / count.max(1) as f32,
+        mean_error_px: total_error / count as f32,
     })
+}
+
+fn accept_absolute_pose_eval(
+    eval: AbsolutePoseEval,
+    _num_correspondences: usize,
+    config: &MapperConfig,
+) -> bool {
+    eval.inliers >= config.abs_pose_min_num_inliers && eval.mean_error_px <= config.pnp_threshold_px
+}
+
+fn refine_absolute_pose_reprojection(
+    initial_pose: SE3,
+    image: usize,
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    refine_camera_params: bool,
+    config: &MapperConfig,
+) -> Option<(SE3, CameraModel)> {
+    if observations.len() < config.abs_pose_min_num_inliers {
+        return None;
+    }
+    let mut pose = initial_pose;
+    let mut best_eval = evaluate_absolute_pose(pose, observations, None, camera, config)?;
+    let scratch_reconstruction =
+        absolute_pose_scratch_reconstruction(reconstruction, image, pose, observations);
+    let observations_by_image = observations_by_image(&scratch_reconstruction);
+    for _ in 0..8 {
+        let Some(delta) = pose_only_gauss_newton_step(
+            image,
+            pose,
+            frames,
+            &scratch_reconstruction,
+            &observations_by_image,
+            &[],
+            config,
+        ) else {
+            break;
+        };
+        let mut accepted = false;
+        for scale in [1.0f32, 0.5, 0.25, 0.125, 0.0625] {
+            let candidate = apply_pose_delta(pose, delta * scale);
+            let Some(candidate_eval) =
+                evaluate_absolute_pose(candidate, observations, None, camera, config)
+            else {
+                continue;
+            };
+            if candidate_eval.inliers >= best_eval.inliers.saturating_sub(1)
+                && candidate_eval.mean_error_px + 1.0e-4 < best_eval.mean_error_px
+            {
+                pose = candidate;
+                best_eval = candidate_eval;
+                accepted = true;
+                break;
+            }
+        }
+        if !accepted || delta.norm() < 1.0e-6 {
+            break;
+        }
+    }
+    let camera = if refine_camera_params {
+        let camera = refine_absolute_pose_camera_params(pose, observations, camera, config)?;
+        if camera_has_bogus_params(camera, config) {
+            return None;
+        }
+        camera
+    } else {
+        camera
+    };
+    Some((pose, camera))
+}
+
+fn absolute_pose_refine_camera_params_enabled(
+    image: usize,
+    camera: CameraModel,
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> bool {
+    let camera_idx = reconstruction
+        .image_camera_indices
+        .get(image)
+        .copied()
+        .unwrap_or(0);
+    let camera_id = reconstruction
+        .camera_ids
+        .get(camera_idx)
+        .copied()
+        .unwrap_or(1);
+    if config.ba_constant_camera_ids.contains(&camera_id) {
+        return false;
+    }
+    let registered_images_with_camera =
+        registered_images_with_camera(reconstruction, image, camera_idx);
+    if registered_images_with_camera > 0 && !camera_has_bogus_params(camera, config) {
+        return false;
+    }
+    config.ba_refine_focal_length
+        || config.ba_refine_principal_point
+        || config.ba_refine_extra_params
+}
+
+fn refine_absolute_pose_camera_params(
+    pose: SE3,
+    observations: &[AbsolutePoseObservation],
+    initial_camera: CameraModel,
+    config: &MapperConfig,
+) -> Option<CameraModel> {
+    let params = absolute_pose_camera_params(initial_camera, config);
+    if params.is_empty() || observations.len() < config.abs_pose_min_num_inliers {
+        return Some(initial_camera);
+    }
+    let mut camera = initial_camera;
+    let mut best_cost = absolute_pose_camera_cost(pose, observations, camera)?;
+    let mut damping = 1.0e-3;
+    for _ in 0..6 {
+        let mut h = DMatrix::<f64>::zeros(params.len(), params.len());
+        let mut g = DVector::<f64>::zeros(params.len());
+        for observation in observations {
+            let residual = absolute_pose_residual(pose, camera, observation)?;
+            let jacobians = params
+                .iter()
+                .map(|&param| {
+                    numerical_absolute_pose_camera_jacobian(pose, camera, observation, param)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            for (i, j_i) in jacobians.iter().enumerate() {
+                g[i] += j_i[0] * residual[0] + j_i[1] * residual[1];
+                for (j, j_j) in jacobians.iter().enumerate() {
+                    h[(i, j)] += j_i[0] * j_j[0] + j_i[1] * j_j[1];
+                }
+            }
+        }
+        for idx in 0..params.len() {
+            h[(idx, idx)] += damping;
+        }
+        let Some(delta) = h.lu().solve(&(-g)) else {
+            damping *= 10.0;
+            continue;
+        };
+        if !delta.iter().all(|value| value.is_finite()) || delta.norm() > 100.0 {
+            damping *= 10.0;
+            continue;
+        }
+        let mut accepted = false;
+        for step in [1.0, 0.5, 0.25, 0.125, 0.0625] {
+            let mut candidate = camera;
+            for (idx, &param) in params.iter().enumerate() {
+                candidate.params[param] += delta[idx] * step;
+            }
+            candidate.sync_intrinsics_from_params();
+            if camera_has_bogus_params(candidate, config) {
+                continue;
+            }
+            let Some(cost) = absolute_pose_camera_cost(pose, observations, candidate) else {
+                continue;
+            };
+            if cost + 1.0e-8 < best_cost {
+                camera = candidate;
+                best_cost = cost;
+                damping = (damping * 0.5).max(1.0e-8);
+                accepted = true;
+                break;
+            }
+        }
+        if !accepted {
+            damping *= 4.0;
+        }
+        if delta.norm() < 1.0e-8 {
+            break;
+        }
+    }
+    Some(camera)
+}
+
+fn absolute_pose_camera_params(camera: CameraModel, config: &MapperConfig) -> Vec<usize> {
+    let mut params = Vec::new();
+    if config.ba_refine_focal_length {
+        if let Some(idxs) = colmap_camera_model_focal_idxs(camera.model_id) {
+            params.extend(idxs.iter().copied());
+        }
+    }
+    if config.ba_refine_principal_point {
+        if let Some([idx_x, idx_y]) = colmap_camera_model_principal_point_idxs(camera.model_id) {
+            params.extend([idx_x, idx_y]);
+        }
+    }
+    if config.ba_refine_extra_params {
+        if let Some(idxs) = colmap_camera_model_extra_idxs(camera.model_id) {
+            params.extend(idxs.iter().copied());
+        }
+    }
+    params.retain(|&idx| idx < camera.num_params);
+    params.sort_unstable();
+    params.dedup();
+    params
+}
+
+fn absolute_pose_camera_cost(
+    pose: SE3,
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+) -> Option<f64> {
+    let mut cost = 0.0;
+    let mut count = 0usize;
+    for observation in observations {
+        let residual = absolute_pose_residual(pose, camera, observation)?;
+        cost += residual[0] * residual[0] + residual[1] * residual[1];
+        count += 1;
+    }
+    (count > 0).then_some(cost / count as f64)
+}
+
+fn absolute_pose_residual(
+    pose: SE3,
+    camera: CameraModel,
+    observation: &AbsolutePoseObservation,
+) -> Option<[f64; 2]> {
+    let p = pose.transform_point(&observation.xyz);
+    let predicted = camera.img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)?;
+    Some([
+        predicted[0] - observation.xy[0] as f64,
+        predicted[1] - observation.xy[1] as f64,
+    ])
+}
+
+fn numerical_absolute_pose_camera_jacobian(
+    pose: SE3,
+    camera: CameraModel,
+    observation: &AbsolutePoseObservation,
+    param: usize,
+) -> Option<[f64; 2]> {
+    if param >= camera.num_params {
+        return None;
+    }
+    let eps = camera.params[param].abs().max(1.0) * 1.0e-6;
+    let mut plus = camera;
+    let mut minus = camera;
+    plus.params[param] += eps;
+    minus.params[param] -= eps;
+    plus.sync_intrinsics_from_params();
+    minus.sync_intrinsics_from_params();
+    let r_plus = absolute_pose_residual(pose, plus, observation)?;
+    let r_minus = absolute_pose_residual(pose, minus, observation)?;
+    Some([
+        (r_plus[0] - r_minus[0]) / (2.0 * eps),
+        (r_plus[1] - r_minus[1]) / (2.0 * eps),
+    ])
+}
+
+fn absolute_pose_scratch_reconstruction(
+    base: &Reconstruction,
+    image: usize,
+    pose: SE3,
+    observations: &[AbsolutePoseObservation],
+) -> Reconstruction {
+    let mut reconstruction = base.clone();
+    if image < reconstruction.poses.len() {
+        reconstruction.poses[image] = Some(pose);
+    }
+    reconstruction.points.clear();
+    reconstruction.point_ids.clear();
+    reconstruction.observations = reconstruction
+        .keypoints
+        .iter()
+        .map(|keypoints| vec![None; keypoints.len()])
+        .collect();
+    for (point_id, observation) in observations.iter().enumerate() {
+        let feature = observation.feature;
+        if feature >= reconstruction.observations[image].len() {
+            continue;
+        }
+        if reconstruction.observations[image][feature].is_some() {
+            continue;
+        }
+        reconstruction.observations[image][feature] = Some(point_id);
+        reconstruction.point_ids.push(point_id as u64 + 1);
+        reconstruction.points.push(Point3D {
+            xyz: observation.xyz,
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation { image, feature }],
+        });
+    }
+    reconstruction
 }
 
 fn registered_pair_rotation_error(
@@ -2207,9 +4663,6 @@ fn registered_pair_rotation_error(
         let Some(other_pose) = reconstruction.poses[other] else {
             continue;
         };
-        if pair.left.abs_diff(pair.right) > 2 && !is_ring_bridge_candidate(pair.left, pair.right) {
-            continue;
-        }
         let predicted = if pair.left == image {
             other_pose.compose(&pose.inverse())
         } else {
@@ -2225,6 +4678,194 @@ fn registered_pair_rotation_error(
     }
 }
 
+fn continue_or_triangulate_structureless_tracks(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    inliers: &[StructurelessInlier],
+    tri_options: &IncrementalTriangulatorOptions,
+    config: &MapperConfig,
+) -> TriangulationReport {
+    let mut report = TriangulationReport::default();
+    let mut by_query_feature = BTreeMap::<(usize, usize), Vec<StructurelessInlier>>::new();
+    for inlier in inliers {
+        if !structureless_inlier_is_registered_and_valid(*inlier, frames, reconstruction) {
+            continue;
+        }
+        by_query_feature
+            .entry((inlier.image, inlier.feature))
+            .or_default()
+            .push(*inlier);
+    }
+
+    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
+    for ((image, feature), mut group) in by_query_feature {
+        if reconstruction.observations[image][feature].is_some() {
+            continue;
+        }
+        group.sort_unstable();
+        group.dedup();
+
+        if let Some(point_id) = first_continueable_structureless_point(
+            image,
+            feature,
+            &group,
+            frames,
+            reconstruction,
+            config,
+        ) {
+            if observation_manager.add_observation(
+                frames,
+                pairs,
+                reconstruction,
+                point_id,
+                TrackObservation { image, feature },
+            ) {
+                if let Some((xyz, error)) = triangulate_track(
+                    &reconstruction.points[point_id].track.clone(),
+                    frames,
+                    reconstruction,
+                    config,
+                ) {
+                    reconstruction.points[point_id].xyz = xyz;
+                    reconstruction.points[point_id].error = error;
+                }
+                observation_manager.mark_point3d_modified(point_id);
+                report.continued_observations += 1;
+            }
+            continue;
+        }
+
+        let mut observations = Vec::with_capacity(group.len() + 1);
+        observations.push(TrackObservation { image, feature });
+        observations.extend(group.iter().map(|inlier| TrackObservation {
+            image: inlier.other,
+            feature: inlier.other_feature,
+        }));
+        let Some(observations) = unique_track_observations(observations) else {
+            continue;
+        };
+        if observations.len() < 2
+            || observations.iter().any(|obs| {
+                reconstruction
+                    .observations
+                    .get(obs.image)
+                    .and_then(|features| features.get(obs.feature))
+                    .copied()
+                    .flatten()
+                    .is_some()
+            })
+        {
+            continue;
+        }
+        let Some((xyz, error)) = triangulate_track(&observations, frames, reconstruction, config)
+        else {
+            continue;
+        };
+        if !track_has_positive_depth(xyz, &observations, reconstruction)
+            || !track_has_min_triangulation_angle(
+                xyz,
+                &observations,
+                reconstruction,
+                tri_options.min_angle_deg,
+            )
+        {
+            continue;
+        }
+        if observation_manager
+            .add_point3d(
+                frames,
+                pairs,
+                reconstruction,
+                Point3D {
+                    xyz,
+                    color: average_track_color(&observations, frames),
+                    error,
+                    track: observations,
+                },
+            )
+            .is_some()
+        {
+            report.created_points += 1;
+        }
+    }
+    report
+}
+
+fn structureless_inlier_is_registered_and_valid(
+    inlier: StructurelessInlier,
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> bool {
+    reconstruction
+        .poses
+        .get(inlier.image)
+        .copied()
+        .flatten()
+        .is_some()
+        && reconstruction
+            .poses
+            .get(inlier.other)
+            .copied()
+            .flatten()
+            .is_some()
+        && frames
+            .get(inlier.image)
+            .is_some_and(|frame| inlier.feature < frame.keypoints.len())
+        && frames
+            .get(inlier.other)
+            .is_some_and(|frame| inlier.other_feature < frame.keypoints.len())
+        && reconstruction
+            .observations
+            .get(inlier.image)
+            .is_some_and(|features| inlier.feature < features.len())
+        && reconstruction
+            .observations
+            .get(inlier.other)
+            .is_some_and(|features| inlier.other_feature < features.len())
+}
+
+fn first_continueable_structureless_point(
+    image: usize,
+    feature: usize,
+    group: &[StructurelessInlier],
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> Option<usize> {
+    let pose = reconstruction.poses[image]?;
+    let keypoint = frames.get(image)?.keypoints.get(feature)?;
+    group.iter().find_map(|inlier| {
+        let point_id = reconstruction.observations[inlier.other][inlier.other_feature]?;
+        let point = reconstruction.points.get(point_id)?;
+        if point.track.iter().any(|obs| obs.image == image) {
+            return None;
+        }
+        let error = crate::geometry::reprojection_error_px(
+            point.xyz,
+            pose,
+            [keypoint.x(), keypoint.y()],
+            reconstruction.camera_for_image(image),
+        );
+        if !error.is_finite() || error > config.max_reprojection_error_px {
+            return None;
+        }
+        let mut track = point.track.clone();
+        track.push(TrackObservation { image, feature });
+        if !track_has_positive_depth(point.xyz, &track, reconstruction)
+            || !track_has_min_triangulation_angle(
+                point.xyz,
+                &track,
+                reconstruction,
+                track_filter_min_tri_angle_deg(config),
+            )
+        {
+            return None;
+        }
+        Some(point_id)
+    })
+}
+
 #[allow(dead_code)]
 fn add_existing_observations(
     image: usize,
@@ -2235,6 +4876,7 @@ fn add_existing_observations(
 ) {
     let pose = reconstruction.poses[image].unwrap();
     let mut used_features = HashSet::new();
+    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
     for pair in pairs {
         let other = if pair.left == image {
             pair.right
@@ -2270,10 +4912,13 @@ fn add_existing_observations(
                 reconstruction.camera_for_image(image),
             );
             if err <= config.max_reprojection_error_px {
-                reconstruction.observations[image][feature] = Some(point_id);
-                reconstruction.points[point_id]
-                    .track
-                    .push(TrackObservation { image, feature });
+                observation_manager.add_observation(
+                    frames,
+                    pairs,
+                    reconstruction,
+                    point_id,
+                    TrackObservation { image, feature },
+                );
             }
         }
     }
@@ -2330,6 +4975,7 @@ fn rebuild_tracks_from_pair_graph(
         }
     }
 
+    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
     for observations in grouped.into_values() {
         let Some(observations) = unique_track_observations(observations) else {
             continue;
@@ -2341,71 +4987,152 @@ fn rebuild_tracks_from_pair_graph(
         else {
             continue;
         };
-        let id = reconstruction.points.len();
-        for obs in &observations {
-            if reconstruction.observations[obs.image][obs.feature].is_none() {
-                reconstruction.observations[obs.image][obs.feature] = Some(id);
-            }
-        }
         let color = average_track_color(&observations, frames);
-        reconstruction.point_ids.push(id as u64 + 1);
-        reconstruction.points.push(Point3D {
-            xyz,
-            color,
-            error,
-            track: observations,
-        });
+        observation_manager.add_point3d(
+            frames,
+            pairs,
+            reconstruction,
+            Point3D {
+                xyz,
+                color,
+                error,
+                track: observations,
+            },
+        );
     }
 }
 
 fn filter_reprojection_tracks(
     frames: &[ImageFrame],
+    pairs: &[PairGeometry],
     reconstruction: &mut Reconstruction,
     config: &MapperConfig,
 ) -> usize {
-    let max_error = track_filter_max_error_px(config);
+    filter_reprojection_tracks_with_policy(
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        track_filter_max_error_px(config),
+        track_filter_min_tri_angle_deg(config),
+        track_filter_min_track_length(),
+    )
+}
+
+fn filter_reprojection_tracks_with_policy(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+    max_error: f32,
+    min_tri_angle: f32,
+    min_track_length: usize,
+) -> usize {
     let image_cameras = (0..reconstruction.poses.len())
         .map(|image| reconstruction.camera_for_image(image))
         .collect::<Vec<_>>();
     let mut removed = 0usize;
-    let mut filtered_points = Vec::with_capacity(reconstruction.points.len());
-    let old_point_ids = std::mem::take(&mut reconstruction.point_ids);
-    let mut filtered_point_ids = Vec::with_capacity(reconstruction.points.len());
-    for (idx, mut point) in reconstruction.points.drain(..).enumerate() {
-        let point3d_id = old_point_ids
-            .get(idx)
-            .copied()
-            .unwrap_or_else(|| idx as u64 + 1);
-        let before = point.track.len();
-        point.track.retain(|obs| {
-            let Some(pose) = reconstruction.poses.get(obs.image).copied().flatten() else {
-                return false;
-            };
-            let Some(kp) = frames
-                .get(obs.image)
-                .and_then(|frame| frame.keypoints.get(obs.feature))
-            else {
-                return false;
-            };
-            let err = crate::geometry::reprojection_error_px(
-                point.xyz,
-                pose,
-                [kp.x(), kp.y()],
-                image_cameras[obs.image],
-            );
-            err.is_finite() && err <= max_error
-        });
-        removed += before.saturating_sub(point.track.len());
-        if point.track.len() >= 2 {
-            filtered_points.push(point);
-            filtered_point_ids.push(point3d_id);
-        } else {
-            removed += point.track.len();
+    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
+    let mut point_id = 0usize;
+    while point_id < reconstruction.points.len() {
+        let point_xyz = reconstruction.points[point_id].xyz;
+        let track = reconstruction.points[point_id].track.clone();
+        let observations_to_delete = track
+            .iter()
+            .filter(|obs| {
+                let Some(pose) = reconstruction.poses.get(obs.image).copied().flatten() else {
+                    return true;
+                };
+                let Some(kp) = frames
+                    .get(obs.image)
+                    .and_then(|frame| frame.keypoints.get(obs.feature))
+                else {
+                    return true;
+                };
+                if !point_has_positive_depth(point_xyz, pose) {
+                    return true;
+                }
+                let Some(camera) = image_cameras.get(obs.image).copied() else {
+                    return true;
+                };
+                if camera_has_bogus_params(camera, config) {
+                    return true;
+                }
+                let err = crate::geometry::reprojection_error_px(
+                    point_xyz,
+                    pose,
+                    [kp.x(), kp.y()],
+                    camera,
+                );
+                !err.is_finite() || err > max_error
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if observations_to_delete.len() >= track.len().saturating_sub(1) {
+            removed += reconstruction.points[point_id].track.len();
+            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+            continue;
         }
+
+        for obs in observations_to_delete {
+            if observation_manager.delete_observation(
+                frames,
+                pairs,
+                reconstruction,
+                obs.image,
+                obs.feature,
+            ) {
+                removed += 1;
+            }
+        }
+
+        if point_id >= reconstruction.points.len() {
+            continue;
+        }
+        let track = reconstruction.points[point_id].track.clone();
+        if track.len() < min_track_length {
+            removed += track.len();
+            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+            continue;
+        }
+        if !track_has_min_triangulation_angle(
+            reconstruction.points[point_id].xyz,
+            &track,
+            reconstruction,
+            min_tri_angle,
+        ) {
+            removed += track.len();
+            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+            continue;
+        }
+        if let Some((xyz, error)) = triangulate_track(&track, frames, reconstruction, config)
+            .filter(|(xyz, _)| {
+                track_has_positive_depth(*xyz, &track, reconstruction)
+                    && track_has_min_triangulation_angle(
+                        *xyz,
+                        &track,
+                        reconstruction,
+                        min_tri_angle,
+                    )
+            })
+        {
+            reconstruction.points[point_id].xyz = xyz;
+            reconstruction.points[point_id].error = error;
+        } else if let Some(error) = mean_track_reprojection_error(
+            reconstruction.points[point_id].xyz,
+            &track,
+            frames,
+            reconstruction,
+        ) {
+            reconstruction.points[point_id].error = error;
+        } else {
+            removed += track.len();
+            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+            continue;
+        }
+        point_id += 1;
     }
-    reconstruction.points = filtered_points;
-    reconstruction.point_ids = filtered_point_ids;
-    rebuild_observation_index(reconstruction);
     removed
 }
 
@@ -2417,25 +5144,83 @@ fn track_filter_max_error_px(config: &MapperConfig) -> f32 {
         .unwrap_or(config.max_reprojection_error_px)
 }
 
-fn rebuild_observation_index(reconstruction: &mut Reconstruction) {
-    for (image, observations) in reconstruction.observations.iter_mut().enumerate() {
-        let len = reconstruction
-            .keypoints
-            .get(image)
-            .map(|keypoints| keypoints.len())
-            .unwrap_or(observations.len());
-        observations.clear();
-        observations.resize(len, None);
-    }
-    for (point_id, point) in reconstruction.points.iter().enumerate() {
-        for obs in &point.track {
-            if let Some(image_observations) = reconstruction.observations.get_mut(obs.image) {
-                if obs.feature < image_observations.len() {
-                    image_observations[obs.feature] = Some(point_id);
-                }
-            }
+fn track_filter_min_tri_angle_deg(config: &MapperConfig) -> f32 {
+    std::env::var("RUSTSFM_TRACK_FILTER_MIN_TRI_ANGLE_DEG")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(
+            IncrementalTriangulatorOptions::from_mapper_threshold(config.max_reprojection_error_px)
+                .min_angle_deg,
+        )
+}
+
+fn track_filter_min_track_length() -> usize {
+    std::env::var("RUSTSFM_TRACK_FILTER_MIN_TRACK_LENGTH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 2)
+        .unwrap_or(2)
+}
+
+fn camera_has_bogus_params(camera: CameraModel, config: &MapperConfig) -> bool {
+    camera.has_bogus_params(
+        config.min_focal_length_ratio,
+        config.max_focal_length_ratio,
+        config.max_extra_param,
+    )
+}
+
+fn registration_camera_for_image(
+    image: usize,
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+) -> CameraModel {
+    let camera = reconstruction.camera_for_image(image);
+    let Some(camera_idx) = reconstruction.image_camera_indices.get(image).copied() else {
+        return camera;
+    };
+    if registered_images_with_camera(reconstruction, image, camera_idx) == 0 {
+        if let Some(prior) = healthy_camera_prior(camera_idx, config, camera_priors) {
+            return prior;
         }
     }
+    if !camera_has_bogus_params(camera, config) {
+        return camera;
+    }
+    healthy_camera_prior(camera_idx, config, camera_priors).unwrap_or(camera)
+}
+
+fn healthy_camera_prior(
+    camera_idx: usize,
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+) -> Option<CameraModel> {
+    let prior = camera_priors.get(camera_idx).copied()?;
+    (!camera_has_bogus_params(prior, config)).then_some(prior)
+}
+
+fn registered_images_with_camera(
+    reconstruction: &Reconstruction,
+    image: usize,
+    camera_idx: usize,
+) -> usize {
+    reconstruction
+        .poses
+        .iter()
+        .enumerate()
+        .filter(|&(other_image, pose)| {
+            other_image != image
+                && pose.is_some()
+                && reconstruction
+                    .image_camera_indices
+                    .get(other_image)
+                    .copied()
+                    .unwrap_or(0)
+                    == camera_idx
+        })
+        .count()
 }
 
 fn unique_track_observations(observations: Vec<TrackObservation>) -> Option<Vec<TrackObservation>> {
@@ -2463,7 +5248,7 @@ fn triangulate_track(
         let kp = &frames[obs.image].keypoints[obs.feature];
         let [x, y] = reconstruction
             .camera_for_image(obs.image)
-            .normalize(kp.x(), kp.y());
+            .cam_from_img_f32(kp.x(), kp.y())?;
         for col in 0..4 {
             rows.push(x * p[(2, col)] - p[(0, col)]);
         }
@@ -2502,6 +5287,79 @@ fn triangulate_track(
         valid += 1;
     }
     (valid >= 2).then_some((xyz, total_error / valid as f32))
+}
+
+fn mean_track_reprojection_error(
+    xyz: [f32; 3],
+    observations: &[TrackObservation],
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+) -> Option<f32> {
+    let mut total_error = 0.0f32;
+    let mut valid = 0usize;
+    for obs in observations {
+        let pose = reconstruction.poses[obs.image]?;
+        let kp = frames.get(obs.image)?.keypoints.get(obs.feature)?;
+        let err = crate::geometry::reprojection_error_px(
+            xyz,
+            pose,
+            [kp.x(), kp.y()],
+            reconstruction.camera_for_image(obs.image),
+        );
+        if !err.is_finite() {
+            return None;
+        }
+        total_error += err;
+        valid += 1;
+    }
+    (valid > 0).then_some(total_error / valid as f32)
+}
+
+fn point_has_positive_depth(point: [f32; 3], pose: SE3) -> bool {
+    let cam_point = pose.transform_point(&point);
+    cam_point[2].is_finite() && cam_point[2] > 1.0e-12
+}
+
+fn track_has_positive_depth(
+    point: [f32; 3],
+    observations: &[TrackObservation],
+    reconstruction: &Reconstruction,
+) -> bool {
+    observations.iter().all(|obs| {
+        reconstruction
+            .poses
+            .get(obs.image)
+            .copied()
+            .flatten()
+            .map(|pose| point_has_positive_depth(point, pose))
+            .unwrap_or(false)
+    })
+}
+
+fn track_has_min_triangulation_angle(
+    point: [f32; 3],
+    observations: &[TrackObservation],
+    reconstruction: &Reconstruction,
+    min_angle_deg: f32,
+) -> bool {
+    if min_angle_deg <= 0.0 {
+        return observations.len() >= 2;
+    }
+    let mut best = 0.0f32;
+    for i in 0..observations.len() {
+        for j in 0..i {
+            let Some(pose_i) = reconstruction.poses[observations[i].image] else {
+                continue;
+            };
+            let Some(pose_j) = reconstruction.poses[observations[j].image] else {
+                continue;
+            };
+            if let Some(angle) = pair_triangulation_angle_deg(pose_i, pose_j, point) {
+                best = best.max(angle);
+            }
+        }
+    }
+    best >= min_angle_deg
 }
 
 fn projection_matrix(pose: SE3) -> Matrix3x4<f32> {
@@ -3447,6 +6305,8 @@ fn triangulate_pair(
     let Some(right_pose) = reconstruction.poses[pair.right] else {
         return;
     };
+    let pairs = std::slice::from_ref(pair);
+    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
     let mut norm_left = Vec::new();
     let mut norm_right = Vec::new();
     let mut matches = Vec::new();
@@ -3462,16 +6322,20 @@ fn triangulate_pair(
         }
         let lk = &frames[pair.left].keypoints[li];
         let rk = &frames[pair.right].keypoints[ri];
-        norm_left.push(
-            reconstruction
-                .camera_for_image(pair.left)
-                .normalize(lk.x(), lk.y()),
-        );
-        norm_right.push(
-            reconstruction
-                .camera_for_image(pair.right)
-                .normalize(rk.x(), rk.y()),
-        );
+        let Some(left_xy) = reconstruction
+            .camera_for_image(pair.left)
+            .cam_from_img_f32(lk.x(), lk.y())
+        else {
+            continue;
+        };
+        let Some(right_xy) = reconstruction
+            .camera_for_image(pair.right)
+            .cam_from_img_f32(rk.x(), rk.y())
+        else {
+            continue;
+        };
+        norm_left.push(left_xy);
+        norm_right.push(right_xy);
         matches.push(m.clone());
     }
     for (idx, (&left_xy, &right_xy)) in norm_left.iter().zip(norm_right.iter()).enumerate() {
@@ -3497,25 +6361,26 @@ fn triangulate_pair(
         if !err.is_finite() || err > config.max_reprojection_error_px {
             continue;
         }
-        let id = reconstruction.points.len();
-        reconstruction.observations[pair.left][li] = Some(id);
-        reconstruction.observations[pair.right][ri] = Some(id);
-        reconstruction.point_ids.push(id as u64 + 1);
-        reconstruction.points.push(Point3D {
-            xyz,
-            color: frames[pair.left].colors[li],
-            error: err,
-            track: vec![
-                TrackObservation {
-                    image: pair.left,
-                    feature: li,
-                },
-                TrackObservation {
-                    image: pair.right,
-                    feature: ri,
-                },
-            ],
-        });
+        observation_manager.add_point3d(
+            frames,
+            pairs,
+            reconstruction,
+            Point3D {
+                xyz,
+                color: frames[pair.left].colors[li],
+                error: err,
+                track: vec![
+                    TrackObservation {
+                        image: pair.left,
+                        feature: li,
+                    },
+                    TrackObservation {
+                        image: pair.right,
+                        feature: ri,
+                    },
+                ],
+            },
+        );
     }
 }
 
@@ -3529,6 +6394,13 @@ mod tests {
     };
     use std::fs;
     use tempfile::tempdir;
+
+    fn experimental_structureless_config() -> MapperConfig {
+        MapperConfig {
+            experimental_structureless_pair_pose_fallback: true,
+            ..MapperConfig::default()
+        }
+    }
 
     #[test]
     fn reference_camera_setup_maps_images_to_shared_cameras() -> Result<()> {
@@ -3595,7 +6467,10 @@ mod tests {
                 ..ColmapTwoViewGeometry::default()
             },
         )?;
-        let cache = db.load_cache(&DatabaseCacheOptions::default())?;
+        let cache = db.load_cache(&DatabaseCacheOptions {
+            load_all_images: true,
+            ..DatabaseCacheOptions::default()
+        })?;
         let frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
 
         let pairs = database_pair_matches_for_frames(&frames, &cache)?;
@@ -3680,8 +6555,1384 @@ mod tests {
         assert_eq!(setup.camera_ids, vec![5]);
         assert_eq!(setup.image_ids, vec![11, 12]);
         assert_eq!(setup.image_camera_indices, vec![0, 0]);
+        assert_eq!(setup.camera_has_prior_focal_length, vec![true]);
         assert_eq!(setup.cameras[0].fx, 80.0);
         Ok(())
+    }
+
+    #[test]
+    fn database_camera_setup_preserves_prior_focal_flags() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        for (camera_id, prior) in [(3, true), (4, false)] {
+            db.write_camera(
+                &ColmapDatabaseCamera {
+                    camera: crate::colmap::ColmapCamera {
+                        camera_id,
+                        model_id: crate::types::COLMAP_PINHOLE,
+                        width: 100,
+                        height: 100,
+                        params: vec![50.0, 50.0, 50.0, 50.0],
+                    },
+                    has_prior_focal_length: prior,
+                },
+                true,
+            )?;
+        }
+        for (image_id, name, camera_id) in [(10, "a.jpg", 3), (11, "b.jpg", 4)] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id,
+                    frame_id: None,
+                },
+                true,
+            )?;
+        }
+        let cache = db.load_cache(&DatabaseCacheOptions {
+            load_all_images: true,
+            ..DatabaseCacheOptions::default()
+        })?;
+        let setup =
+            database_camera_setup(&cache, &[PathBuf::from("a.jpg"), PathBuf::from("b.jpg")])?;
+
+        assert_eq!(setup.camera_ids, vec![3, 4]);
+        assert_eq!(setup.camera_has_prior_focal_length, vec![true, false]);
+        assert_eq!(setup.image_camera_indices, vec![0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_default_database_next_to_input_or_parent() -> Result<()> {
+        let dir = tempdir()?;
+        let images_dir = dir.path().join("images");
+        fs::create_dir_all(&images_dir)?;
+        let root_db = dir.path().join("database.db");
+        fs::write(&root_db, [])?;
+
+        let resolved = resolve_mapper_database_path(&MapperConfig {
+            input: images_dir.clone(),
+            ..MapperConfig::default()
+        })?;
+        assert_eq!(resolved.as_deref(), Some(root_db.as_path()));
+
+        let image_db = images_dir.join("database.db");
+        fs::write(&image_db, [])?;
+        let resolved = resolve_mapper_database_path(&MapperConfig {
+            input: images_dir,
+            ..MapperConfig::default()
+        })?;
+        assert_eq!(resolved.as_deref(), Some(image_db.as_path()));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_missing_database_is_an_error() {
+        let dir = tempdir().unwrap();
+        let err = resolve_mapper_database_path(&MapperConfig {
+            input: dir.path().join("images"),
+            database: Some(dir.path().join("missing.db")),
+            ..MapperConfig::default()
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("database path does not exist"));
+    }
+
+    #[test]
+    fn default_database_candidates_are_deduplicated_for_relative_input() {
+        let candidates = default_database_candidates(Path::new("images"));
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("images/database.db"),
+                PathBuf::from("database.db")
+            ]
+        );
+    }
+
+    #[test]
+    fn local_matching_requires_explicit_opt_in() {
+        assert!(!MapperConfig::default().local_matching);
+        assert_eq!(MapperConfig::default().local_window, 0);
+        assert!(!MapperConfig::default().pose_graph);
+        assert!(!MapperConfig::default().experimental_sequence_heuristics);
+    }
+
+    #[test]
+    fn mapper_ba_defaults_match_colmap_intrinsic_refinement_policy() {
+        let frames = vec![minimal_frame(0, "a.jpg")];
+        let reconstruction = test_reconstruction(&frames);
+
+        let options = mapper_ba_options(
+            &MapperConfig::default(),
+            &reconstruction,
+            3,
+            Some(vec![0]),
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(options.refine_focal_length);
+        assert!(!options.refine_principal_point);
+        assert!(options.refine_extra_params);
+        assert!(options.constant_cameras.is_empty());
+    }
+
+    #[test]
+    fn mapper_absolute_pose_defaults_match_colmap_thresholds() {
+        let config = MapperConfig::default();
+
+        assert_eq!(config.pnp_threshold_px, 12.0);
+        assert_eq!(config.pnp_iterations, 10000);
+        assert_eq!(config.abs_pose_min_num_inliers, 30);
+        assert_eq!(config.abs_pose_min_inlier_ratio, 0.25);
+        assert_eq!(config.random_seed, -1);
+        let default_seed_a = absolute_pose_ransac_seed(&config);
+        let default_seed_b = absolute_pose_ransac_seed(&config);
+        assert_ne!(default_seed_a, default_seed_b);
+        assert_eq!(
+            absolute_pose_ransac_seed(&MapperConfig {
+                random_seed: 42,
+                ..MapperConfig::default()
+            }),
+            42
+        );
+    }
+
+    #[test]
+    fn registration_rollback_reason_rejects_failed_refinement_or_bogus_camera() {
+        let frames = vec![minimal_frame(0, "registered.jpg")];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        let config = MapperConfig::default();
+
+        assert_eq!(
+            registration_rollback_reason(&reconstruction, 0, true, false, &config),
+            Some("local_ba_failed")
+        );
+        assert_eq!(
+            registration_rollback_reason(&reconstruction, 0, true, true, &config),
+            None
+        );
+
+        reconstruction.cameras[0].params[0] = 1.0;
+        reconstruction.cameras[0].sync_intrinsics_from_params();
+        assert_eq!(
+            registration_rollback_reason(&reconstruction, 0, false, false, &config),
+            Some("bogus_camera")
+        );
+    }
+
+    #[test]
+    fn absolute_pose_camera_refinement_follows_colmap_shared_camera_schedule() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+            minimal_frame(2, "other_camera.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![11, 42];
+        reconstruction.image_camera_indices = vec![0, 0, 1];
+        reconstruction.poses[0] = Some(SE3::identity());
+
+        assert!(!absolute_pose_refine_camera_params_enabled(
+            1,
+            reconstruction.camera_for_image(1),
+            &reconstruction,
+            &MapperConfig::default()
+        ));
+        assert!(absolute_pose_refine_camera_params_enabled(
+            2,
+            reconstruction.camera_for_image(2),
+            &reconstruction,
+            &MapperConfig::default()
+        ));
+
+        let constant_config = MapperConfig {
+            ba_constant_camera_ids: vec![42],
+            ..MapperConfig::default()
+        };
+        assert!(!absolute_pose_refine_camera_params_enabled(
+            2,
+            reconstruction.camera_for_image(2),
+            &reconstruction,
+            &constant_config
+        ));
+
+        reconstruction.cameras[0].params[0] = 1.0;
+        reconstruction.cameras[0].sync_intrinsics_from_params();
+        assert!(absolute_pose_refine_camera_params_enabled(
+            1,
+            reconstruction.camera_for_image(1),
+            &reconstruction,
+            &MapperConfig::default()
+        ));
+    }
+
+    #[test]
+    fn registration_camera_resets_unused_shared_camera_to_prior() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let prior = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let drifted = CameraModel::new_pinhole(100, 100, 70.0, 70.0, 50.0, 50.0);
+        reconstruction.cameras = vec![prior, drifted];
+        reconstruction.camera_ids = vec![11, 42];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.poses[0] = Some(SE3::identity());
+        let priors = vec![prior, prior];
+
+        let camera =
+            registration_camera_for_image(1, &reconstruction, &MapperConfig::default(), &priors);
+
+        assert_eq!(camera.fx, prior.fx);
+        assert_eq!(camera.fy, prior.fy);
+    }
+
+    #[test]
+    fn registration_camera_keeps_registered_healthy_shared_camera() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let prior = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let refined = CameraModel::new_pinhole(100, 100, 65.0, 65.0, 50.0, 50.0);
+        reconstruction.cameras = vec![refined];
+        reconstruction.camera_ids = vec![11];
+        reconstruction.image_camera_indices = vec![0, 0];
+        reconstruction.poses[0] = Some(SE3::identity());
+        let priors = vec![prior];
+
+        let camera =
+            registration_camera_for_image(1, &reconstruction, &MapperConfig::default(), &priors);
+
+        assert_eq!(camera.fx, refined.fx);
+        assert_eq!(camera.fy, refined.fy);
+    }
+
+    #[test]
+    fn absolute_pose_focal_estimation_follows_prior_focal_schedule() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 40.0, 40.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![1, 2];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.poses[0] = Some(SE3::identity());
+        let camera = reconstruction.camera_for_image(1);
+
+        assert!(absolute_pose_estimate_focal_length_enabled(
+            1,
+            camera,
+            &reconstruction,
+            &MapperConfig::default(),
+            &[true, false],
+        ));
+        assert!(!absolute_pose_estimate_focal_length_enabled(
+            1,
+            camera,
+            &reconstruction,
+            &MapperConfig::default(),
+            &[true, true],
+        ));
+    }
+
+    #[test]
+    fn absolute_pose_unknown_focal_estimation_updates_camera() {
+        let true_camera = CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0);
+        let initial_camera = CameraModel::new_pinhole(100, 100, 40.0, 40.0, 50.0, 50.0);
+        let pose = SE3::from_axis_angle(&[0.01, -0.015, 0.005], &[0.15, -0.05, 0.35]);
+        let points: Vec<[f32; 3]> = (0..36)
+            .map(|idx| {
+                let x = ((idx % 6) as f32 - 2.5) * 0.25;
+                let y = (((idx / 6) % 6) as f32 - 2.5) * 0.22;
+                let z = 3.0 + (idx % 5) as f32 * 0.25;
+                [x, y, z]
+            })
+            .collect();
+        let observations = points
+            .iter()
+            .enumerate()
+            .map(|(feature, &xyz)| {
+                let p = pose.transform_point(&xyz);
+                let xy = true_camera
+                    .img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
+                    .unwrap();
+                AbsolutePoseObservation {
+                    feature,
+                    xy: [xy[0] as f32, xy[1] as f32],
+                    xyz,
+                }
+            })
+            .collect::<Vec<_>>();
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            pnp_iterations: 10000,
+            ..MapperConfig::default()
+        };
+
+        let (_estimated_pose, inliers, estimated_camera) =
+            solve_absolute_pose_with_camera_hypotheses(
+                &observations,
+                initial_camera,
+                true,
+                &config,
+            )
+            .expect("absolute pose with focal estimation");
+
+        assert!(inliers.iter().filter(|&&x| x).count() >= 20);
+        assert!(
+            (estimated_camera.fx as f64 - true_camera.fx as f64).abs()
+                < (initial_camera.fx as f64 - true_camera.fx as f64).abs(),
+            "estimated_fx={} true_fx={}",
+            estimated_camera.fx,
+            true_camera.fx
+        );
+    }
+
+    #[test]
+    fn mapper_ba_constant_camera_ids_map_to_camera_indices() {
+        let frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 55.0, 55.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![11, 42];
+        reconstruction.image_camera_indices = vec![0, 1];
+        let config = MapperConfig {
+            ba_constant_camera_ids: vec![42, 99],
+            ..MapperConfig::default()
+        };
+
+        let options = mapper_ba_options(&config, &reconstruction, 3, None, Vec::new(), None, None);
+
+        assert_eq!(options.constant_cameras, vec![1]);
+    }
+
+    #[test]
+    fn checked_bundle_adjustment_rejects_bogus_registered_camera() {
+        let mut frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+        frames[0].keypoints = vec![
+            rustslam::KeyPoint::new(50.0, 50.0),
+            rustslam::KeyPoint::new(55.0, 50.0),
+            rustslam::KeyPoint::new(50.0, 55.0),
+            rustslam::KeyPoint::new(55.0, 55.0),
+        ];
+        frames[1].keypoints = vec![
+            rustslam::KeyPoint::new(75.0, 50.0),
+            rustslam::KeyPoint::new(80.0, 50.0),
+            rustslam::KeyPoint::new(75.0, 55.0),
+            rustslam::KeyPoint::new(80.0, 55.0),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        for (idx, xyz) in [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [0.0, 0.2, 2.0],
+            [0.2, 0.2, 2.0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.observations[1][idx] = Some(idx);
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![
+                    TrackObservation {
+                        image: 0,
+                        feature: idx,
+                    },
+                    TrackObservation {
+                        image: 1,
+                        feature: idx,
+                    },
+                ],
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+        let original_camera = reconstruction.cameras[0];
+        let report = refine_bundle_adjustment_checked(
+            &frames,
+            &mut reconstruction,
+            &MapperConfig {
+                max_focal_length_ratio: 0.4,
+                ..MapperConfig::default()
+            },
+            crate::ba::BundleAdjustmentOptions {
+                iterations: 2,
+                huber_delta_px: 4.0,
+                max_observation_error_px: 50.0,
+                variable_images: Some(vec![1]),
+                constant_images: vec![0],
+                point_ids: Some((0..4).collect()),
+                ..crate::ba::BundleAdjustmentOptions::default()
+            },
+        );
+
+        assert!(report.is_none());
+        assert_eq!(reconstruction.cameras[0].fx, original_camera.fx);
+        assert_eq!(
+            reconstruction.poses[1].unwrap().translation(),
+            [1.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn absolute_pose_skips_correspondences_from_bogus_provider_cameras() {
+        let mut frames = vec![
+            minimal_frame(0, "provider.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let good_camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let provider_pose = SE3::identity();
+        let candidate_pose = SE3::from_quat_translation(
+            glam::Quat::from_rotation_y(0.08),
+            glam::Vec3::new(-0.15, 0.02, 0.05),
+        );
+        let points = (0..30)
+            .map(|idx| {
+                let col = (idx % 6) as f32;
+                let row = (idx / 6) as f32;
+                [
+                    -0.45 + col * 0.18,
+                    -0.35 + row * 0.2,
+                    3.0 + idx as f32 * 0.03,
+                ]
+            })
+            .collect::<Vec<_>>();
+        frames[0].keypoints = points
+            .iter()
+            .map(|&point| {
+                let p = provider_pose.transform_point(&point);
+                let xy = good_camera
+                    .img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
+                    .unwrap();
+                rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
+            })
+            .collect();
+        frames[1].keypoints = points
+            .iter()
+            .map(|&point| {
+                let p = candidate_pose.transform_point(&point);
+                let xy = good_camera
+                    .img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
+                    .unwrap();
+                rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
+            })
+            .collect();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 1.0, 1.0, 50.0, 50.0),
+            good_camera,
+        ];
+        reconstruction.camera_ids = vec![1, 2];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.poses[0] = Some(provider_pose);
+        for (idx, &xyz) in points.iter().enumerate() {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: idx,
+                }],
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+        let matches = (0..points.len() as u32)
+            .map(|idx| (idx, idx))
+            .collect::<Vec<_>>();
+        let pair = pair_with_inliers(0, 1, &matches);
+
+        assert!(solve_absolute_pose(
+            1,
+            &frames,
+            &[pair],
+            &reconstruction,
+            &MapperConfig::default(),
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn absolute_pose_rejects_bogus_camera_before_pnp() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 1.0, 1.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![1, 2];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.poses[0] = Some(SE3::identity());
+
+        assert!(solve_absolute_pose(
+            1,
+            &frames,
+            &[],
+            &reconstruction,
+            &MapperConfig::default(),
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn absolute_pose_resets_bogus_candidate_camera_from_prior() {
+        let mut frames = vec![
+            minimal_frame(0, "provider.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let good_camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let provider_pose = SE3::identity();
+        let candidate_pose = SE3::from_quat_translation(
+            glam::Quat::from_rotation_y(0.06),
+            glam::Vec3::new(-0.2, 0.03, 0.02),
+        );
+        let points = (0..32)
+            .map(|idx| {
+                let col = (idx % 8) as f32;
+                let row = (idx / 8) as f32;
+                [-0.5 + col * 0.15, -0.3 + row * 0.2, 3.0 + idx as f32 * 0.02]
+            })
+            .collect::<Vec<_>>();
+        frames[0].keypoints = points
+            .iter()
+            .map(|&point| {
+                let p = provider_pose.transform_point(&point);
+                let xy = good_camera
+                    .img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
+                    .unwrap();
+                rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
+            })
+            .collect();
+        frames[1].keypoints = points
+            .iter()
+            .map(|&point| {
+                let p = candidate_pose.transform_point(&point);
+                let xy = good_camera
+                    .img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
+                    .unwrap();
+                rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
+            })
+            .collect();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            good_camera,
+            CameraModel::new_pinhole(100, 100, 1.0, 1.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![1, 2];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.poses[0] = Some(provider_pose);
+        for (idx, &xyz) in points.iter().enumerate() {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: idx,
+                }],
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+        let matches = (0..points.len() as u32)
+            .map(|idx| (idx, idx))
+            .collect::<Vec<_>>();
+        let pair = pair_with_inliers(0, 1, &matches);
+        let camera_priors = vec![good_camera, good_camera];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 24,
+            ..MapperConfig::default()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &[pair],
+            &reconstruction,
+            &[0; 2],
+            &config,
+            &camera_priors,
+            &[true, false],
+        )
+        .unwrap();
+
+        assert_eq!(choice.source, "pnp");
+        assert!(
+            (choice.camera.fx - good_camera.fx).abs() < 1.0e-3,
+            "fx={} expected={}",
+            choice.camera.fx,
+            good_camera.fx
+        );
+        assert!(
+            (choice.camera.fy - good_camera.fy).abs() < 1.0e-3,
+            "fy={} expected={}",
+            choice.camera.fy,
+            good_camera.fy
+        );
+        assert!(crate::geometry::relative_rotation_deg(choice.pose, candidate_pose) < 5.0);
+    }
+
+    #[test]
+    fn absolute_pose_refinement_uses_ransac_inliers_only() {
+        let pose = SE3::identity();
+        let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let good = AbsolutePoseObservation {
+            feature: 0,
+            xy: [50.0, 50.0],
+            xyz: [0.0, 0.0, 3.0],
+        };
+        let outlier = AbsolutePoseObservation {
+            feature: 1,
+            xy: [95.0, 95.0],
+            xyz: [0.0, 0.0, 3.0],
+        };
+        let observations = vec![good, outlier];
+        let inliers = inlier_absolute_pose_observations(&observations, &[true, false]);
+
+        assert_eq!(inliers.len(), 1);
+        assert_eq!(inliers[0].feature, 0);
+        assert!(
+            evaluate_absolute_pose(
+                pose,
+                &inliers,
+                None,
+                camera,
+                &MapperConfig {
+                    abs_pose_min_num_inliers: 1,
+                    ..MapperConfig::default()
+                },
+            )
+            .unwrap()
+            .mean_error_px
+                < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn structureless_tracks_continue_existing_point_after_registration() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.04),
+                glam::Vec3::new(-0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.03),
+                glam::Vec3::new(0.35, 0.0, 0.0),
+            ),
+        ];
+        let point = [0.0, 0.0, 3.0];
+        let mut frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+            minimal_frame(2, "registered_b.jpg"),
+        ];
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = vec![project_test_point(camera, pose, point)];
+            frames[image].colors = vec![[image as u8, 0, 0]];
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[1] = Some(poses[1]);
+        reconstruction.poses[2] = Some(poses[2]);
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[2][0] = Some(0);
+        reconstruction.point_ids.push(1);
+        reconstruction.points.push(Point3D {
+            xyz: point,
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 2,
+                    feature: 0,
+                },
+            ],
+        });
+        let inliers = vec![
+            StructurelessInlier {
+                image: 1,
+                feature: 0,
+                other: 0,
+                other_feature: 0,
+            },
+            StructurelessInlier {
+                image: 1,
+                feature: 0,
+                other: 2,
+                other_feature: 0,
+            },
+        ];
+
+        let report = continue_or_triangulate_structureless_tracks(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &inliers,
+            &IncrementalTriangulatorOptions::from_mapper_threshold(4.0),
+            &MapperConfig {
+                max_reprojection_error_px: 4.0,
+                ..MapperConfig::default()
+            },
+        );
+
+        assert_eq!(report.continued_observations, 1);
+        assert_eq!(report.created_points, 0);
+        assert_eq!(reconstruction.observations[1][0], Some(0));
+        assert!(reconstruction.points[0]
+            .track
+            .iter()
+            .any(|obs| obs.image == 1 && obs.feature == 0));
+    }
+
+    #[test]
+    fn structureless_tracks_triangulate_new_point_from_inlier_group() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.04),
+                glam::Vec3::new(-0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.03),
+                glam::Vec3::new(0.35, 0.0, 0.0),
+            ),
+        ];
+        let point = [0.05, -0.02, 3.2];
+        let mut frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+            minimal_frame(2, "registered_b.jpg"),
+        ];
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = vec![project_test_point(camera, pose, point)];
+            frames[image].colors = vec![[image as u8, 0, 0]];
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[1] = Some(poses[1]);
+        reconstruction.poses[2] = Some(poses[2]);
+        let inliers = vec![
+            StructurelessInlier {
+                image: 1,
+                feature: 0,
+                other: 0,
+                other_feature: 0,
+            },
+            StructurelessInlier {
+                image: 1,
+                feature: 0,
+                other: 2,
+                other_feature: 0,
+            },
+        ];
+
+        let report = continue_or_triangulate_structureless_tracks(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &inliers,
+            &IncrementalTriangulatorOptions::from_mapper_threshold(4.0),
+            &MapperConfig {
+                max_reprojection_error_px: 4.0,
+                ..MapperConfig::default()
+            },
+        );
+
+        assert_eq!(report.created_points, 1);
+        assert_eq!(report.continued_observations, 0);
+        assert_eq!(reconstruction.points.len(), 1);
+        assert_eq!(reconstruction.points[0].track.len(), 3);
+        assert_eq!(reconstruction.observations[1][0], Some(0));
+        let xyz = glam::Vec3::from_array(reconstruction.points[0].xyz);
+        assert!((xyz - glam::Vec3::from_array(point)).length() < 1.0e-3);
+    }
+
+    #[test]
+    fn default_structureless_path_does_not_use_pair_pose_fallback() {
+        let frames = structureless_frames(4);
+        let poses = structureless_world_poses();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[2] = Some(poses[2]);
+        let pairs = vec![
+            structureless_pair_from_poses(1, 0, poses[1], poses[0], 30),
+            structureless_pair_from_poses(1, 2, poses[1], poses[2], 30),
+        ];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            ..MapperConfig::default()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &[0; 4],
+            &config,
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        );
+
+        assert!(choice.is_none());
+    }
+
+    #[test]
+    fn structureless_fallback_registers_candidate_without_points3d() {
+        let frames = structureless_frames(4);
+        let poses = structureless_world_poses();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[2] = Some(poses[2]);
+        let pairs = vec![
+            structureless_pair_from_poses(1, 0, poses[1], poses[0], 30),
+            structureless_pair_from_poses(1, 2, poses[1], poses[2], 30),
+        ];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            ..experimental_structureless_config()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &[0; 4],
+            &config,
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        )
+        .unwrap();
+
+        assert_eq!(choice.image, 1);
+        assert_eq!(choice.source, "structureless");
+        assert_eq!(choice.pnp_inliers, 60);
+        let actual_t = glam::Vec3::from_array(choice.pose.translation());
+        let expected_t = glam::Vec3::from_array(poses[1].translation());
+        assert!((actual_t - expected_t).length() < 1.0e-3);
+        assert!(crate::geometry::relative_rotation_deg(choice.pose, poses[1]) < 1.0e-4);
+    }
+
+    #[test]
+    fn structureless_fallback_filters_matches_by_final_pose_sampson_error() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.04),
+                glam::Vec3::new(-0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.03),
+                glam::Vec3::new(0.35, 0.0, 0.0),
+            ),
+        ];
+        let points = (0..48)
+            .map(|idx| {
+                let col = (idx % 8) as f32;
+                let row = (idx / 8) as f32;
+                [
+                    -0.45 + col * 0.13,
+                    -0.3 + row * 0.12,
+                    3.0 + idx as f32 * 0.01,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+            minimal_frame(2, "registered_b.jpg"),
+        ];
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+            frames[image].colors = vec![[image as u8, 0, 0]; points.len()];
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[2] = Some(poses[2]);
+        let mut pair_a = structureless_pair_from_poses(1, 0, poses[1], poses[0], 24);
+        let mut pair_b = structureless_pair_from_poses(1, 2, poses[1], poses[2], 24);
+        pair_a.inlier_matches[23].train_idx = 0;
+        pair_b.inlier_matches[23].train_idx = 0;
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            pnp_threshold_px: 4.0,
+            ..experimental_structureless_config()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &[pair_a, pair_b],
+            &reconstruction,
+            &[0; 3],
+            &config,
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        )
+        .unwrap();
+
+        assert_eq!(choice.source, "structureless");
+        assert_eq!(choice.pnp_inliers, 46);
+        assert_eq!(choice.structureless_inliers.len(), 46);
+        assert!(!choice
+            .structureless_inliers
+            .iter()
+            .any(|inlier| inlier.feature == 23));
+    }
+
+    #[test]
+    fn structureless_sampson_refinement_improves_perturbed_rotation() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.04),
+                glam::Vec3::new(-0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.03),
+                glam::Vec3::new(0.35, 0.0, 0.0),
+            ),
+        ];
+        let points = (0..64)
+            .map(|idx| {
+                let col = (idx % 8) as f32;
+                let row = (idx / 8) as f32;
+                [
+                    -0.45 + col * 0.13,
+                    -0.35 + row * 0.1,
+                    3.0 + idx as f32 * 0.01,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+            minimal_frame(2, "registered_b.jpg"),
+        ];
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+            frames[image].colors = vec![[image as u8, 0, 0]; points.len()];
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[2] = Some(poses[2]);
+        let pairs = vec![
+            structureless_pair_from_poses(1, 0, poses[1], poses[0], points.len()),
+            structureless_pair_from_poses(1, 2, poses[1], poses[2], points.len()),
+        ];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            pnp_threshold_px: 4.0,
+            ..MapperConfig::default()
+        };
+        let constraints =
+            collect_structureless_pair_constraints(1, &frames, &pairs, &reconstruction, &config);
+        let center = camera_center(poses[1]);
+        let initial_pose = pose_from_rotation_center(
+            (glam::Quat::from_rotation_x(0.015) * pose_rotation(poses[1])).normalize(),
+            center,
+        );
+        let initial_inliers = structureless_inliers_from_pose(
+            initial_pose,
+            camera,
+            &constraints,
+            &frames,
+            &reconstruction,
+            &config,
+        );
+        let initial_cost = evaluate_structureless_pose_sampson(
+            initial_pose,
+            camera,
+            &initial_inliers,
+            &frames,
+            &reconstruction,
+        )
+        .unwrap();
+
+        let (refined_pose, refined_inliers) = refine_structureless_pose_sampson(
+            initial_pose,
+            camera,
+            &constraints,
+            &initial_inliers,
+            &frames,
+            &reconstruction,
+            &config,
+        )
+        .unwrap();
+        let refined_cost = evaluate_structureless_pose_sampson(
+            refined_pose,
+            camera,
+            &refined_inliers,
+            &frames,
+            &reconstruction,
+        )
+        .unwrap();
+
+        assert!(refined_cost < initial_cost);
+        assert!(
+            crate::geometry::relative_rotation_deg(refined_pose, poses[1])
+                < crate::geometry::relative_rotation_deg(initial_pose, poses[1])
+        );
+    }
+
+    #[test]
+    fn structureless_fallback_requires_colmap_visible_correspondence_threshold() {
+        let frames = structureless_frames(3);
+        let poses = structureless_world_poses();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[2] = Some(poses[2]);
+        let pairs = vec![
+            structureless_pair_from_poses(1, 0, poses[1], poses[0], 19),
+            structureless_pair_from_poses(1, 2, poses[1], poses[2], 20),
+        ];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            ..experimental_structureless_config()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &[0; 3],
+            &config,
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        );
+
+        assert!(choice.is_none());
+    }
+
+    #[test]
+    fn structureless_fallback_requires_two_registered_neighbors() {
+        let frames = structureless_frames(3);
+        let poses = structureless_world_poses();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(poses[0]);
+        let pairs = vec![structureless_pair_from_poses(1, 0, poses[1], poses[0], 40)];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            ..experimental_structureless_config()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &[0; 3],
+            &config,
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        );
+
+        assert!(choice.is_none());
+    }
+
+    #[test]
+    fn structureless_fallback_skips_bogus_registered_neighbor_camera() {
+        let frames = structureless_frames(4);
+        let poses = structureless_world_poses();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 1.0, 1.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![1, 2];
+        reconstruction.image_camera_indices = vec![0, 0, 1, 0];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[2] = Some(poses[2]);
+        reconstruction.poses[3] = Some(poses[3]);
+        let pairs = vec![
+            structureless_pair_from_poses(1, 0, poses[1], poses[0], 20),
+            structureless_pair_from_poses(1, 2, poses[1], poses[2], 20),
+            structureless_pair_from_poses(1, 3, poses[1], poses[3], 20),
+        ];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            ..experimental_structureless_config()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &[0; 4],
+            &config,
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        )
+        .unwrap();
+
+        assert_eq!(choice.source, "structureless");
+        assert_eq!(choice.pnp_inliers, 40);
+        assert!(crate::geometry::relative_rotation_deg(choice.pose, poses[1]) < 1.0e-4);
+    }
+
+    #[test]
+    fn mark_unregistered_images_keeps_structureless_candidate_retryable() {
+        let frames = structureless_frames(3);
+        let poses = structureless_world_poses();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[2] = Some(poses[2]);
+        let pairs = vec![
+            structureless_pair_from_poses(1, 0, poses[1], poses[0], 20),
+            structureless_pair_from_poses(1, 2, poses[1], poses[2], 20),
+        ];
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            ..experimental_structureless_config()
+        };
+        let mut reg_trials = vec![0; 3];
+
+        mark_unregistered_images_with_no_absolute_pose(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &mut reg_trials,
+            &config,
+            &camera_priors(&reconstruction),
+            &camera_prior_focal_flags(&reconstruction, true),
+        );
+
+        assert_eq!(reg_trials[1], 0);
+    }
+
+    #[test]
+    fn absolute_pose_camera_refinement_improves_focal_length() {
+        let true_camera = CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0);
+        let initial_camera = CameraModel::new_pinhole(100, 100, 45.0, 45.0, 50.0, 50.0);
+        let pose = SE3::identity();
+        let points: [[f32; 3]; 8] = [
+            [-0.5, -0.4, 3.0],
+            [-0.1, -0.3, 3.2],
+            [0.3, -0.35, 3.1],
+            [-0.4, 0.0, 3.3],
+            [0.0, 0.0, 3.0],
+            [0.4, 0.1, 3.4],
+            [-0.25, 0.45, 3.5],
+            [0.2, 0.4, 3.2],
+        ];
+        let observations = points
+            .iter()
+            .enumerate()
+            .map(|(feature, &xyz)| {
+                let p = pose.transform_point(&xyz);
+                let xy = true_camera
+                    .img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
+                    .unwrap();
+                AbsolutePoseObservation {
+                    feature,
+                    xy: [xy[0] as f32, xy[1] as f32],
+                    xyz,
+                }
+            })
+            .collect::<Vec<_>>();
+        let initial_cost = absolute_pose_camera_cost(pose, &observations, initial_camera).unwrap();
+
+        let refined = refine_absolute_pose_camera_params(
+            pose,
+            &observations,
+            initial_camera,
+            &MapperConfig {
+                abs_pose_min_num_inliers: 4,
+                ..MapperConfig::default()
+            },
+        )
+        .unwrap();
+        let refined_cost = absolute_pose_camera_cost(pose, &observations, refined).unwrap();
+
+        assert!(refined_cost < initial_cost);
+        assert!(
+            (60.0 - refined.fx as f64).abs() < (60.0 - initial_camera.fx as f64).abs(),
+            "refined_fx={}",
+            refined.fx
+        );
+    }
+
+    #[test]
+    fn global_ba_schedule_triggers_on_image_or_point_growth() {
+        let frames = vec![
+            minimal_frame(0, "a.jpg"),
+            minimal_frame(1, "b.jpg"),
+            minimal_frame(2, "c.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+        reconstruction.point_ids.push(1);
+        let mut schedule = GlobalBaSchedule::new(&reconstruction);
+        let config = MapperConfig {
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999,
+            global_ba_images_ratio: 1.1,
+            global_ba_points_ratio: 1.1,
+            ..MapperConfig::default()
+        };
+
+        assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+
+        reconstruction.poses[2] = Some(SE3::identity());
+        reconstruction.points.push(Point3D {
+            xyz: [0.1, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 1,
+                },
+                TrackObservation {
+                    image: 2,
+                    feature: 1,
+                },
+            ],
+        });
+        reconstruction.point_ids.push(2);
+
+        assert!(should_run_global_ba(&schedule, &reconstruction, &config));
+
+        schedule.mark(&reconstruction);
+        assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+    }
+
+    #[test]
+    fn global_ba_gauge_images_use_registered_images_not_zero_index() {
+        let frames = vec![
+            minimal_frame(0, "a.jpg"),
+            minimal_frame(1, "b.jpg"),
+            minimal_frame(2, "c.jpg"),
+            minimal_frame(3, "d.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[2] = Some(SE3::identity());
+        reconstruction.poses[3] = Some(SE3::identity());
+
+        assert_eq!(global_ba_gauge_images(&reconstruction), vec![2, 3]);
+    }
+
+    #[test]
+    fn local_image_fallback_uses_per_image_camera_ownership() {
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        frames[0].width = 120;
+        frames[0].height = 80;
+        frames[1].width = 200;
+        frames[1].height = 150;
+
+        let setup = local_image_camera_setup(
+            &frames,
+            &MapperConfig {
+                fx: Some(90.0),
+                ..MapperConfig::default()
+            },
+        );
+
+        assert_eq!(setup.camera_ids, vec![1, 2]);
+        assert_eq!(setup.image_ids, vec![1, 2]);
+        assert_eq!(setup.image_camera_indices, vec![0, 1]);
+        assert_eq!(setup.cameras[0].width, 120);
+        assert_eq!(setup.cameras[1].height, 150);
+        assert_eq!(setup.cameras[0].fx, 90.0);
+        assert_eq!(setup.cameras[1].cx, 100.0);
+    }
+
+    #[test]
+    fn local_pair_candidates_do_not_include_segment_bridges_by_default() {
+        let candidates = local_pair_candidates(194, 3, false);
+
+        assert!(candidates.contains(&(0, 1)));
+        assert!(candidates.contains(&(0, 3)));
+        assert!(!candidates.contains(&(0, 192)));
+        assert!(!candidates.contains(&(188, 192)));
+    }
+
+    #[test]
+    fn segment_bridge_candidates_require_experimental_sequence_heuristics() {
+        let candidates = local_pair_candidates(194, 3, true);
+
+        assert!(candidates.contains(&(0, 192)));
+        assert!(candidates.contains(&(191, 192)));
     }
 
     #[test]
@@ -3805,6 +8056,16 @@ mod tests {
     }
 
     #[test]
+    fn initial_pair_returns_none_when_no_pair_passes_colmap_checks() {
+        let forward_motion = test_pair(0, 1, 300, 200, 30.0, [0.0, 0.0, 1.0]);
+        let low_angle = test_pair(0, 2, 260, 180, 2.0, [1.0, 0.0, 0.0]);
+        let low_inliers = test_pair(1, 3, 50, 90, 18.0, [1.0, 0.0, 0.1]);
+        let pairs = vec![forward_motion, low_angle, low_inliers];
+
+        assert!(choose_initial_pair(&pairs, &MapperConfig::default()).is_none());
+    }
+
+    #[test]
     fn registration_score_prefers_more_visible_points3d() {
         let frames = vec![
             minimal_frame(0, "seed.jpg"),
@@ -3841,21 +8102,317 @@ mod tests {
         let weak = RegistrationChoice {
             image: 1,
             pose: SE3::identity(),
-            source: "relative",
+            camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            source: "pnp",
             pnp_inliers: 0,
+            inlier_ratio: 0.0,
+            visible_points: 1,
+            visible_points_ratio: 0.5,
             mean_error_px: f32::INFINITY,
             pair_rot_error: 0.0,
+            structureless_inliers: Vec::new(),
         };
         let strong = RegistrationChoice {
             image: 2,
             pose: SE3::identity(),
-            source: "relative",
+            camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            source: "pnp",
             pnp_inliers: 0,
+            inlier_ratio: 0.0,
+            visible_points: 2,
+            visible_points_ratio: 1.0,
             mean_error_px: f32::INFINITY,
             pair_rot_error: 0.0,
+            structureless_inliers: Vec::new(),
         };
 
         assert!(registration_score(&strong, &manager) > registration_score(&weak, &manager));
+    }
+
+    #[test]
+    fn local_bundle_selection_uses_shared_points_and_excludes_gauge_image() {
+        let frames = vec![
+            minimal_frame(0, "gauge.jpg"),
+            minimal_frame(1, "registered.jpg"),
+            minimal_frame(2, "neighbor.jpg"),
+            minimal_frame(3, "weak.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        for image in 0..4 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        reconstruction.poses[2] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        reconstruction.poses[3] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(0.01, 0.0, 0.0),
+        ));
+        for point_id in 0..4 {
+            reconstruction.points.push(Point3D {
+                xyz: [point_id as f32 * 0.1, 0.0, 2.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![
+                    TrackObservation {
+                        image: 1,
+                        feature: 0,
+                    },
+                    TrackObservation {
+                        image: 2,
+                        feature: 0,
+                    },
+                    TrackObservation {
+                        image: 0,
+                        feature: 0,
+                    },
+                ],
+            });
+            reconstruction.point_ids.push(point_id as u64 + 1);
+        }
+        reconstruction.points.push(Point3D {
+            xyz: [1.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 1,
+                    feature: 1,
+                },
+                TrackObservation {
+                    image: 3,
+                    feature: 1,
+                },
+            ],
+        });
+        reconstruction.point_ids.push(5);
+        reconstruction.points.push(Point3D {
+            xyz: [0.5, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 1.0,
+            track: (0..16)
+                .map(|idx| TrackObservation {
+                    image: if idx == 0 { 1 } else { 2 },
+                    feature: 1,
+                })
+                .collect(),
+        });
+        reconstruction.point_ids.push(6);
+
+        let selection = select_local_bundle(&reconstruction, 1, 0, 2, 2).unwrap();
+
+        assert_eq!(selection.variable_images, vec![1, 2]);
+        assert_eq!(selection.local_images, vec![2]);
+        assert_eq!(selection.point_ids, vec![0, 1, 2, 3, 4]);
+        assert_eq!(selection.constant_point_ids, vec![5]);
+        assert_eq!(selection.stable_point_ids, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn track_filter_removes_negative_depth_observation_and_keeps_valid_track() {
+        let mut frames = vec![
+            minimal_frame(0, "front.jpg"),
+            minimal_frame(1, "behind.jpg"),
+            minimal_frame(2, "side.jpg"),
+        ];
+        frames[0].keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        frames[2].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(0.0, 0.0, -4.0),
+        ));
+        reconstruction.poses[2] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.observations[2][0] = Some(0);
+        reconstruction.point_ids.push(7);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 2,
+                    feature: 0,
+                },
+            ],
+        });
+
+        let removed = filter_reprojection_tracks(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &MapperConfig {
+                max_reprojection_error_px: 1.0,
+                ..MapperConfig::default()
+            },
+        );
+
+        assert_eq!(removed, 1);
+        assert_eq!(reconstruction.points.len(), 1);
+        assert_eq!(
+            reconstruction.points[0]
+                .track
+                .iter()
+                .map(|obs| obs.image)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(reconstruction.observations[1][0], None);
+        assert_eq!(reconstruction.point_ids, vec![7]);
+    }
+
+    #[test]
+    fn track_filter_removes_tracks_observed_by_bogus_camera() {
+        let mut frames = vec![minimal_frame(0, "good.jpg"), minimal_frame(1, "bogus.jpg")];
+        frames[0].keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 1.0, 1.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![1, 2];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.point_ids.push(13);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+
+        let removed =
+            filter_reprojection_tracks(&frames, &[], &mut reconstruction, &MapperConfig::default());
+
+        assert_eq!(removed, 2);
+        assert!(reconstruction.points.is_empty());
+        assert_eq!(reconstruction.observations[0][0], None);
+        assert_eq!(reconstruction.observations[1][0], None);
+    }
+
+    #[test]
+    fn track_filter_removes_small_triangulation_angle_track() {
+        let mut frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+        frames[0].keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(50.0025, 50.0);
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(0.001, 0.0, 0.0),
+        ));
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.point_ids.push(9);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 20.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+
+        let removed = filter_reprojection_tracks(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &MapperConfig {
+                max_reprojection_error_px: 1.0,
+                ..MapperConfig::default()
+            },
+        );
+
+        assert_eq!(removed, 2);
+        assert!(reconstruction.points.is_empty());
+        assert_eq!(reconstruction.observations[0][0], None);
+        assert_eq!(reconstruction.observations[1][0], None);
+    }
+
+    #[test]
+    fn track_filter_prunes_short_tracks_when_min_length_is_raised() {
+        let mut frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+        frames[0].keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.point_ids.push(11);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+
+        let removed = filter_reprojection_tracks_with_policy(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &MapperConfig {
+                max_reprojection_error_px: 1.0,
+                ..MapperConfig::default()
+            },
+            1.0,
+            0.1,
+            3,
+        );
+
+        assert_eq!(removed, 2);
+        assert!(reconstruction.points.is_empty());
     }
 
     fn test_pair(
@@ -3898,6 +8455,82 @@ mod tests {
         pair
     }
 
+    fn structureless_frames(count: usize) -> Vec<ImageFrame> {
+        (0..count)
+            .map(|idx| {
+                let mut frame = minimal_frame(idx, &format!("image_{idx}.jpg"));
+                frame.keypoints = (0..64)
+                    .map(|feature| {
+                        let col = (feature % 8) as f32;
+                        let row = (feature / 8) as f32;
+                        rustslam::KeyPoint::new(10.0 + col * 8.0, 12.0 + row * 7.0)
+                    })
+                    .collect();
+                frame.colors = vec![[0, 0, 0]; frame.keypoints.len()];
+                frame
+            })
+            .collect()
+    }
+
+    fn structureless_world_poses() -> [SE3; 4] {
+        [
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.02),
+                glam::Vec3::new(0.0, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.11),
+                glam::Vec3::new(-0.45, 0.02, 0.04),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.05),
+                glam::Vec3::new(0.75, -0.01, 0.02),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.04),
+                glam::Vec3::new(1.4, 0.03, -0.03),
+            ),
+        ]
+    }
+
+    fn structureless_pair_from_poses(
+        left: usize,
+        right: usize,
+        left_pose: SE3,
+        right_pose: SE3,
+        inliers: usize,
+    ) -> PairGeometry {
+        let matches = (0..inliers as u32)
+            .map(|idx| rustslam::Match {
+                query_idx: idx,
+                train_idx: idx,
+                distance: 0.0,
+            })
+            .collect::<Vec<_>>();
+        PairGeometry {
+            left,
+            right,
+            two_view_config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+            matches: matches.clone(),
+            inlier_matches: matches,
+            relative_pose: right_pose.compose(&left_pose.inverse()),
+            inliers,
+            triangulated: 0,
+            mean_reprojection_error_px: 0.25,
+            rotation_deg: 0.0,
+            median_triangulation_angle_deg: 2.0,
+            pose_graph_only: false,
+        }
+    }
+
+    fn camera_priors(reconstruction: &Reconstruction) -> Vec<CameraModel> {
+        reconstruction.cameras.clone()
+    }
+
+    fn camera_prior_focal_flags(reconstruction: &Reconstruction, value: bool) -> Vec<bool> {
+        vec![value; reconstruction.cameras.len()]
+    }
+
     fn test_reconstruction(frames: &[ImageFrame]) -> Reconstruction {
         Reconstruction {
             camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
@@ -3916,6 +8549,14 @@ mod tests {
             point_ids: Vec::new(),
             points: Vec::new(),
         }
+    }
+
+    fn project_test_point(camera: CameraModel, pose: SE3, point: [f32; 3]) -> rustslam::KeyPoint {
+        let p = pose.transform_point(&point);
+        let xy = camera
+            .img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
+            .unwrap();
+        rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
     }
 
     fn minimal_frame(id: usize, name: &str) -> ImageFrame {

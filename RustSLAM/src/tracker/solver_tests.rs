@@ -6,7 +6,8 @@
 mod tests {
     use crate::core::SE3;
     use crate::tracker::solver::{
-        EssentialSolver, PnPProblem, PnPSolver, Sim3Solver, Triangulator,
+        compute_ransac_num_trials, ColmapRng, EssentialSolver, PnPProblem, PnPSolver, Sim3Solver,
+        Triangulator,
     };
     use glam::{Mat3, Vec3};
 
@@ -21,6 +22,315 @@ mod tests {
         assert_eq!(solver.fy, 500.0);
         assert_eq!(solver.cx, 320.0);
         assert_eq!(solver.cy, 240.0);
+        assert_eq!(solver.ransac_confidence, 0.99);
+        assert_eq!(solver.ransac_min_inlier_ratio, 0.0);
+        assert_eq!(solver.ransac_dyn_num_trials_multiplier, 3.0);
+        assert_eq!(solver.ransac_min_iterations, 0);
+        assert_eq!(solver.ransac_random_seed, None);
+    }
+
+    #[test]
+    fn test_ransac_num_trials_matches_colmap_formula_examples() {
+        assert_eq!(compute_ransac_num_trials(1, 100, 3, 0.99, 1.0), u32::MAX);
+        assert_eq!(compute_ransac_num_trials(10, 100, 3, 0.99, 1.0), 6204);
+        assert_eq!(compute_ransac_num_trials(10, 100, 3, 0.999, 1.0), 9305);
+        assert_eq!(compute_ransac_num_trials(10, 100, 3, 0.999, 2.0), 18610);
+        assert_eq!(compute_ransac_num_trials(50, 100, 3, 0.99, 1.0), 36);
+    }
+
+    #[test]
+    fn test_colmap_rng_matches_mt19937_reference_outputs() {
+        let mut rng = ColmapRng::new(0);
+        let outputs = [
+            rng.next_u32(),
+            rng.next_u32(),
+            rng.next_u32(),
+            rng.next_u32(),
+            rng.next_u32(),
+        ];
+        assert_eq!(
+            outputs,
+            [
+                2_357_136_044,
+                2_546_248_239,
+                3_071_714_933,
+                3_626_093_760,
+                2_588_848_963,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_epnp_matches_colmap_absolute_pose_examples() {
+        let solver = PnPSolver::new(1.0, 1.0, 0.0, 0.0);
+        let points3d = vec![
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [3.0, 1.0, 4.0],
+            [3.0, 1.1, 4.0],
+            [3.0, 1.2, 4.0],
+            [3.0, 1.3, 4.0],
+            [3.0, 1.4, 4.0],
+            [2.0, 1.0, 7.0],
+        ];
+
+        for qx_idx in 0..5 {
+            for tx_idx in 0..10 {
+                let qx = qx_idx as f32 * 0.2;
+                let tx = tx_idx as f32 * 0.1;
+                let q_norm = (1.0 + qx * qx).sqrt();
+                let expected = SE3::new(&[qx / q_norm, 0.0, 0.0, 1.0 / q_norm], &[tx, 0.0, 0.0]);
+
+                let mut image_points = Vec::with_capacity(points3d.len());
+                for point_world in &points3d {
+                    let point_camera = expected.transform_point(point_world);
+                    image_points.push([
+                        point_camera[0] / point_camera[2],
+                        point_camera[1] / point_camera[2],
+                    ]);
+                }
+
+                let estimated = solver
+                    .estimate_pose_epnp(&image_points, &points3d)
+                    .expect("epnp pose");
+                let matrix_error = pose_matrix_3x4_error(&expected, &estimated);
+                assert!(
+                    matrix_error < 2.0e-3,
+                    "qx={qx}, tx={tx}, matrix_error={matrix_error}, expected={:?}, estimated={:?}",
+                    expected.to_matrix(),
+                    estimated.to_matrix()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_epnp_colmap_broken_solve_sign_case() {
+        let solver = PnPSolver::new(1.0, 1.0, 0.0, 0.0);
+        let image_points = vec![
+            [-2.6783007931074532e-01, 5.3457197430746251e-01],
+            [-4.2629907287470264e-01, 7.5623350319519789e-01],
+            [-1.6767413005963930e-01, -1.3387172544910089e-01],
+            [-5.6616329720373559e-02, 2.3621156497739373e-01],
+            [-1.7721225948969935e-01, 2.3395366792735982e-02],
+            [-5.1836259886632222e-02, -4.4380694271927049e-02],
+            [-3.5897765845560037e-01, 1.6252721078589397e-01],
+            [2.7057324473684058e-01, -1.4067450104631887e-01],
+            [-2.5811166424334520e-01, 8.0167171300227366e-02],
+            [2.0239567448222310e-02, -3.2845953375344145e-01],
+            [4.2571014715170657e-01, -2.8321173570154773e-01],
+            [-5.4597596412987237e-01, 9.1431935871671977e-02],
+        ];
+        let points3d = vec![
+            [4.4276865308679305, -1.3384364366019632, -3.5997423085253892],
+            [2.7278555252512309, -0.3815299618723123, -2.6558518399902824],
+            [4.8548566083054894, -1.4756197433631739, -0.682749460224905],
+            [3.152301352799845, -1.3377020437938025, -1.6443269301929087],
+            [3.8551679771512073, -1.055770054588555, -1.1695994508851486],
+            [5.957137315035381, -2.6120646101684555, -1.0841441206050342],
+            [6.328708849935889, -1.1761274755817175, -2.5951879774151583],
+            [2.300530599012125, -1.4019796626800123, -0.4448546445507232],
+            [5.981685993458735, -1.4211814511691452, -2.028592388929345],
+            [5.254334469066546, -2.3389255564264144, 0.4370817318552405],
+            [3.218159924599169, -2.89066719884451, 0.2682571815006435],
+            [4.4592895306946758, -0.00912352416415799, -1.655523711797087],
+        ];
+
+        let estimated = solver
+            .estimate_pose_epnp(&image_points, &points3d)
+            .expect("epnp pose");
+        let mut reprojection_error = 0.0;
+        for (image_point, point_world) in image_points.iter().zip(points3d.iter()) {
+            let point_camera = estimated.transform_point(point_world);
+            let projected = [
+                point_camera[0] / point_camera[2],
+                point_camera[1] / point_camera[2],
+            ];
+            reprojection_error += ((projected[0] - image_point[0]).powi(2)
+                + (projected[1] - image_point[1]).powi(2))
+            .sqrt();
+        }
+
+        assert!(
+            reprojection_error < 0.2,
+            "reprojection_error={reprojection_error}"
+        );
+    }
+
+    #[test]
+    fn test_pnp_estimated_focal_improves_unknown_focal_initialization() {
+        let points3d = vec![
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [3.0, 1.0, 4.0],
+            [3.0, 1.1, 4.0],
+            [3.0, 1.2, 4.0],
+            [3.0, 1.3, 4.0],
+            [3.0, 1.4, 4.0],
+            [2.0, 1.0, 7.0],
+        ];
+
+        for (qx, tx, focal) in [(0.0f32, 0.0f32, 4.5f32), (0.2, 0.3, 12.5)] {
+            let q_norm = (1.0 + qx * qx).sqrt();
+            let expected = SE3::new(&[qx / q_norm, 0.0, 0.0, 1.0 / q_norm], &[tx, 0.0, 0.0]);
+            let mut problem = PnPProblem::new();
+            for point_world in &points3d {
+                let point_camera = expected.transform_point(point_world);
+                problem.add_correspondence(
+                    [
+                        focal * point_camera[0] / point_camera[2],
+                        focal * point_camera[1] / point_camera[2],
+                    ],
+                    *point_world,
+                );
+            }
+
+            let initial_focal = 3.0f32;
+            let mut solver = PnPSolver::new(initial_focal, initial_focal, 0.0, 0.0);
+            solver.ransac_threshold = 2.0e-1;
+            solver.ransac_max_iterations = 20;
+            solver.ransac_random_seed = Some(7);
+            let result = solver
+                .solve_with_estimated_focal(&problem)
+                .expect("estimated focal pose");
+
+            assert!(
+                (result.focal - focal).abs() < (initial_focal - focal).abs(),
+                "qx={qx}, tx={tx}, focal={} expected={focal}, initial={initial_focal}",
+                result.focal
+            );
+            assert!(result.inliers.iter().filter(|&&x| x).count() >= points3d.len() - 1);
+            let mut reprojection_error = 0.0f32;
+            for (image_point, point_world) in problem.image_points.iter().zip(points3d.iter()) {
+                let point_camera = result.pose.transform_point(point_world);
+                let projected = [
+                    result.focal * point_camera[0] / point_camera[2],
+                    result.focal * point_camera[1] / point_camera[2],
+                ];
+                reprojection_error += ((projected[0] - image_point[0]).powi(2)
+                    + (projected[1] - image_point[1]).powi(2))
+                .sqrt();
+            }
+            assert!(
+                reprojection_error / points3d.len() as f32 <= solver.ransac_threshold,
+                "qx={qx}, tx={tx}, focal={focal}, reprojection_error={reprojection_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pnp_estimated_focal_accepts_four_point_minimal_samples() {
+        let points3d = vec![
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [3.0, 1.0, 4.0],
+            [2.0, 1.0, 7.0],
+        ];
+        let expected = SE3::new(
+            &[
+                0.2 / (1.0f32 + 0.2 * 0.2).sqrt(),
+                0.0,
+                0.0,
+                1.0 / (1.0f32 + 0.2 * 0.2).sqrt(),
+            ],
+            &[0.3, 0.0, 0.0],
+        );
+        let focal = 8.0f32;
+        let mut problem = PnPProblem::new();
+        for point_world in &points3d {
+            let point_camera = expected.transform_point(point_world);
+            problem.add_correspondence(
+                [
+                    focal * point_camera[0] / point_camera[2],
+                    focal * point_camera[1] / point_camera[2],
+                ],
+                *point_world,
+            );
+        }
+
+        let mut solver = PnPSolver::new(3.0, 3.0, 0.0, 0.0);
+        solver.ransac_threshold = 1.0e-1;
+        solver.ransac_max_iterations = 1;
+        solver.ransac_random_seed = Some(11);
+        let result = solver
+            .solve_with_estimated_focal(&problem)
+            .expect("four-point estimated focal pose");
+
+        assert_eq!(
+            result.inliers.iter().filter(|&&x| x).count(),
+            points3d.len()
+        );
+        let mean_error =
+            mean_centered_pixel_error(&problem.image_points, &points3d, result.focal, result.pose);
+        assert!(
+            mean_error <= solver.ransac_threshold,
+            "mean_error={mean_error}, focal={}",
+            result.focal
+        );
+        assert!(
+            (result.focal - focal).abs() < (3.0 - focal).abs(),
+            "focal={} expected={focal}",
+            result.focal
+        );
+    }
+
+    #[test]
+    fn test_pnp_estimated_focal_matches_colmap_p4pf_examples() {
+        let points3d = vec![
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [3.0, 1.0, 4.0],
+            [3.0, 1.1, 4.0],
+            [3.0, 1.2, 4.0],
+            [3.0, 1.3, 4.0],
+            [3.0, 1.4, 4.0],
+            [2.0, 1.0, 7.0],
+        ];
+
+        for (qx, tx, focal) in [(0.0f32, 0.0f32, 4.5f32), (0.2, 0.3, 12.5)] {
+            let q_norm = (1.0 + qx * qx).sqrt();
+            let expected = SE3::new(&[qx / q_norm, 0.0, 0.0, 1.0 / q_norm], &[tx, 0.0, 0.0]);
+            let mut problem = PnPProblem::new();
+            for point_world in &points3d {
+                let point_camera = expected.transform_point(point_world);
+                problem.add_correspondence(
+                    [
+                        focal * point_camera[0] / point_camera[2],
+                        focal * point_camera[1] / point_camera[2],
+                    ],
+                    *point_world,
+                );
+            }
+
+            let mut solver = PnPSolver::new(3.0, 3.0, 0.0, 0.0);
+            solver.ransac_threshold = 1.0e-5;
+            solver.ransac_max_iterations = 100;
+            solver.ransac_random_seed = Some(3);
+            let result = solver
+                .solve_with_estimated_focal(&problem)
+                .expect("p4pf-style estimated focal pose");
+
+            assert!(
+                (result.focal - focal).abs() < 1.0e-3,
+                "focal={} expected={focal}",
+                result.focal
+            );
+            let matrix_error = pose_matrix_3x4_error(&expected, &result.pose);
+            assert!(
+                matrix_error < 1.0e-3,
+                "qx={qx}, tx={tx}, focal={focal}, matrix_error={matrix_error}"
+            );
+            let mean_error = mean_centered_pixel_error(
+                &problem.image_points,
+                &points3d,
+                result.focal,
+                result.pose,
+            );
+            assert!(
+                mean_error < 1.0e-3,
+                "qx={qx}, tx={tx}, focal={focal}, mean_error={mean_error}"
+            );
+        }
     }
 
     #[test]
@@ -195,6 +505,39 @@ mod tests {
             !inliers[object_points.len() - 1],
             "20px error must be outside an 8px high-focal PnP threshold"
         );
+    }
+
+    fn pose_matrix_3x4_error(expected: &SE3, estimated: &SE3) -> f32 {
+        let expected = expected.to_matrix();
+        let estimated = estimated.to_matrix();
+        let mut sum = 0.0;
+        for row in 0..3 {
+            for col in 0..4 {
+                let diff = expected[row][col] - estimated[row][col];
+                sum += diff * diff;
+            }
+        }
+        sum.sqrt()
+    }
+
+    fn mean_centered_pixel_error(
+        image_points: &[[f32; 2]],
+        points3d: &[[f32; 3]],
+        focal: f32,
+        pose: SE3,
+    ) -> f32 {
+        let mut total = 0.0;
+        for (image_point, point_world) in image_points.iter().zip(points3d.iter()) {
+            let point_camera = pose.transform_point(point_world);
+            let projected = [
+                focal * point_camera[0] / point_camera[2],
+                focal * point_camera[1] / point_camera[2],
+            ];
+            total += ((projected[0] - image_point[0]).powi(2)
+                + (projected[1] - image_point[1]).powi(2))
+            .sqrt();
+        }
+        total / image_points.len().max(1) as f32
     }
 
     // =========================================================================

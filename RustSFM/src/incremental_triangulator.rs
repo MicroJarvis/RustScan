@@ -1,4 +1,5 @@
 use crate::geometry::{camera_center, mean_pair_reprojection_error_with_cameras};
+use crate::observation_manager::ObservationManager;
 use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
 use rustslam::SE3;
 use std::collections::{HashSet, VecDeque};
@@ -41,6 +42,7 @@ impl IncrementalTriangulatorOptions {
         Self {
             merge_max_reproj_error_px: max_reprojection_error_px,
             complete_max_reproj_error_px: max_reprojection_error_px,
+            ignore_two_view_tracks: false,
             ..Self::default()
         }
     }
@@ -63,7 +65,7 @@ pub struct IncrementalTriangulator<'a> {
     frames: &'a [ImageFrame],
     pairs: &'a [PairGeometry],
     reconstruction: &'a mut Reconstruction,
-    modified_point3d_ids: HashSet<usize>,
+    observation_manager: ObservationManager,
     merge_trials: HashSet<(usize, usize)>,
     retriangulation_trials: HashSet<(usize, usize)>,
 }
@@ -74,11 +76,12 @@ impl<'a> IncrementalTriangulator<'a> {
         pairs: &'a [PairGeometry],
         reconstruction: &'a mut Reconstruction,
     ) -> Self {
+        let observation_manager = ObservationManager::new(frames, pairs, reconstruction);
         Self {
             frames,
             pairs,
             reconstruction,
-            modified_point3d_ids: HashSet::new(),
+            observation_manager,
             merge_trials: HashSet::new(),
             retriangulation_trials: HashSet::new(),
         }
@@ -144,6 +147,7 @@ impl<'a> IncrementalTriangulator<'a> {
                             image,
                             feature,
                             options.complete_max_reproj_error_px,
+                            options.continue_max_angle_error_deg,
                         ) {
                             report.continued_observations += 1;
                         }
@@ -155,6 +159,7 @@ impl<'a> IncrementalTriangulator<'a> {
                             other,
                             other_feature,
                             options.complete_max_reproj_error_px,
+                            options.continue_max_angle_error_deg,
                         ) {
                             report.continued_observations += 1;
                         }
@@ -172,7 +177,7 @@ impl<'a> IncrementalTriangulator<'a> {
     }
 
     pub fn get_modified_points3d(&self) -> &HashSet<usize> {
-        &self.modified_point3d_ids
+        self.observation_manager.modified_point3d_ids()
     }
 
     pub fn complete_tracks(
@@ -197,9 +202,10 @@ impl<'a> IncrementalTriangulator<'a> {
         options: &IncrementalTriangulatorOptions,
         point_ids: &HashSet<usize>,
     ) -> usize {
+        let mut point_ids = point_ids.iter().copied().collect::<Vec<_>>();
+        point_ids.sort_unstable_by(|a, b| b.cmp(a));
         point_ids
-            .iter()
-            .copied()
+            .into_iter()
             .map(|point_id| self.merge_track(options, point_id))
             .sum()
     }
@@ -260,6 +266,7 @@ impl<'a> IncrementalTriangulator<'a> {
                             pair.right,
                             right_feature,
                             options.complete_max_reproj_error_px,
+                            options.re_max_angle_error_deg,
                         ) {
                             total += 1;
                         }
@@ -271,6 +278,7 @@ impl<'a> IncrementalTriangulator<'a> {
                             pair.left,
                             left_feature,
                             options.complete_max_reproj_error_px,
+                            options.re_max_angle_error_deg,
                         ) {
                             total += 1;
                         }
@@ -293,7 +301,7 @@ impl<'a> IncrementalTriangulator<'a> {
     }
 
     pub fn clear_modified_points3d(&mut self) {
-        self.modified_point3d_ids.clear();
+        self.observation_manager.clear_modified_point3d_ids();
     }
 
     fn valid_observation(&self, image: usize, feature: usize) -> bool {
@@ -311,11 +319,12 @@ impl<'a> IncrementalTriangulator<'a> {
 
     fn continue_track(
         &mut self,
-        _options: &IncrementalTriangulatorOptions,
+        options: &IncrementalTriangulatorOptions,
         point_id: usize,
         image: usize,
         feature: usize,
         max_reproj_error_px: f32,
+        max_angle_error_deg: f32,
     ) -> bool {
         if point_id >= self.reconstruction.points.len()
             || self.reconstruction.observations[image][feature].is_some()
@@ -339,11 +348,30 @@ impl<'a> IncrementalTriangulator<'a> {
         if !error.is_finite() || error > max_reproj_error_px {
             return false;
         }
-        self.reconstruction.observations[image][feature] = Some(point_id);
-        self.reconstruction.points[point_id]
-            .track
-            .push(TrackObservation { image, feature });
-        self.modified_point3d_ids.insert(point_id);
+        if !self.track_observation_angles_consistent(point_id, image, feature, max_angle_error_deg)
+        {
+            return false;
+        }
+        if !self.observation_manager.add_observation(
+            self.frames,
+            self.pairs,
+            self.reconstruction,
+            point_id,
+            TrackObservation { image, feature },
+        ) {
+            return false;
+        }
+        if !self.refine_point_from_track(point_id, options, max_reproj_error_px) {
+            self.observation_manager.delete_observation(
+                self.frames,
+                self.pairs,
+                self.reconstruction,
+                image,
+                feature,
+            );
+            return false;
+        }
+        self.observation_manager.mark_point3d_modified(point_id);
         true
     }
 
@@ -376,17 +404,34 @@ impl<'a> IncrementalTriangulator<'a> {
         {
             return false;
         }
+        if options.ignore_two_view_tracks
+            && !self.pair_observation_has_registered_transitive_context(
+                pair.left,
+                left_feature,
+                pair.right,
+                right_feature,
+                options.max_transitivity,
+            )
+        {
+            return false;
+        }
 
         let left_kp = &self.frames[pair.left].keypoints[left_feature];
         let right_kp = &self.frames[pair.right].keypoints[right_feature];
-        let left_xy = self
+        let Some(left_xy) = self
             .reconstruction
             .camera_for_image(pair.left)
-            .normalize(left_kp.x(), left_kp.y());
-        let right_xy = self
+            .cam_from_img_f32(left_kp.x(), left_kp.y())
+        else {
+            return false;
+        };
+        let Some(right_xy) = self
             .reconstruction
             .camera_for_image(pair.right)
-            .normalize(right_kp.x(), right_kp.y());
+            .cam_from_img_f32(right_kp.x(), right_kp.y())
+        else {
+            return false;
+        };
         let Some(xyz) =
             crate::two_view::triangulate_world_point(left_pose, right_pose, left_xy, right_xy)
         else {
@@ -396,6 +441,16 @@ impl<'a> IncrementalTriangulator<'a> {
             return false;
         };
         if angle < options.min_angle_deg {
+            return false;
+        }
+        if !pair_angle_consistent(
+            left_pose,
+            right_pose,
+            left_xy,
+            right_xy,
+            xyz,
+            options.create_max_angle_error_deg,
+        ) {
             return false;
         }
         let error = mean_pair_reprojection_error_with_cameras(
@@ -411,11 +466,7 @@ impl<'a> IncrementalTriangulator<'a> {
             return false;
         }
 
-        let point_id = self.reconstruction.points.len();
-        self.reconstruction.observations[pair.left][left_feature] = Some(point_id);
-        self.reconstruction.observations[pair.right][right_feature] = Some(point_id);
-        self.reconstruction.point_ids.push(point_id as u64 + 1);
-        self.reconstruction.points.push(Point3D {
+        let point = Point3D {
             xyz,
             color: average_color(
                 &[
@@ -441,9 +492,10 @@ impl<'a> IncrementalTriangulator<'a> {
                     feature: right_feature,
                 },
             ],
-        });
-        self.modified_point3d_ids.insert(point_id);
-        true
+        };
+        self.observation_manager
+            .add_point3d(self.frames, self.pairs, self.reconstruction, point)
+            .is_some()
     }
 
     fn complete_track(
@@ -494,6 +546,7 @@ impl<'a> IncrementalTriangulator<'a> {
                         corr_image,
                         corr_feature,
                         options.complete_max_reproj_error_px,
+                        options.continue_max_angle_error_deg,
                     ) {
                         completed += 1;
                         next.push_back((corr_image, corr_feature));
@@ -521,6 +574,47 @@ impl<'a> IncrementalTriangulator<'a> {
             }
         }
         correspondences
+    }
+
+    fn pair_observation_has_registered_transitive_context(
+        &self,
+        left: usize,
+        left_feature: usize,
+        right: usize,
+        right_feature: usize,
+        max_transitivity: usize,
+    ) -> bool {
+        if max_transitivity == 0 {
+            return false;
+        }
+        let mut visited = HashSet::from([(left, left_feature), (right, right_feature)]);
+        let mut current = VecDeque::from([(left, left_feature), (right, right_feature)]);
+        for _ in 0..max_transitivity {
+            let mut next = VecDeque::new();
+            while let Some((image, feature)) = current.pop_front() {
+                for (corr_image, corr_feature) in self.corresponding_features(image, feature) {
+                    if !visited.insert((corr_image, corr_feature)) {
+                        continue;
+                    }
+                    if self
+                        .reconstruction
+                        .poses
+                        .get(corr_image)
+                        .copied()
+                        .flatten()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    next.push_back((corr_image, corr_feature));
+                }
+            }
+            current = next;
+            if current.is_empty() {
+                break;
+            }
+        }
+        false
     }
 
     fn merge_track(&mut self, options: &IncrementalTriangulatorOptions, point_id: usize) -> usize {
@@ -596,10 +690,19 @@ impl<'a> IncrementalTriangulator<'a> {
         if tracks_conflict_by_image(&keep.track, &remove.track) {
             return false;
         }
-        let merged_xyz =
-            weighted_average_xyz(keep.xyz, keep.track.len(), remove.xyz, remove.track.len());
         let mut merged_track = keep.track.clone();
         merged_track.extend(remove.track.iter().cloned());
+        let Some(merged_xyz) = self.triangulate_track_observations(&merged_track) else {
+            return false;
+        };
+        if !track_has_min_triangulation_angle(
+            merged_xyz,
+            &merged_track,
+            self.reconstruction,
+            options.min_angle_deg,
+        ) {
+            return false;
+        }
         if !self.track_reprojects(merged_xyz, &merged_track, options.merge_max_reproj_error_px) {
             return false;
         }
@@ -612,18 +715,21 @@ impl<'a> IncrementalTriangulator<'a> {
             self.reconstruction,
         )
         .unwrap_or(0.0);
-        self.reconstruction.points[keep_id].xyz = merged_xyz;
-        self.reconstruction.points[keep_id].color = merged_color;
-        self.reconstruction.points[keep_id].error = merged_error;
-        self.reconstruction.points[keep_id].track = merged_track;
-        for obs in &self.reconstruction.points[keep_id].track {
-            self.reconstruction.observations[obs.image][obs.feature] = Some(keep_id);
-        }
-        self.remove_point(remove_id);
-        self.modified_point3d_ids.remove(&point_id1);
-        self.modified_point3d_ids.remove(&point_id2);
-        self.modified_point3d_ids.insert(keep_id);
-        true
+        self.observation_manager
+            .merge_points3d(
+                self.frames,
+                self.pairs,
+                self.reconstruction,
+                keep_id,
+                remove_id,
+                Point3D {
+                    xyz: merged_xyz,
+                    color: merged_color,
+                    error: merged_error,
+                    track: merged_track,
+                },
+            )
+            .is_some()
     }
 
     fn track_reprojects(
@@ -647,41 +753,109 @@ impl<'a> IncrementalTriangulator<'a> {
         })
     }
 
-    fn remove_point(&mut self, point_id: usize) {
+    fn track_observation_angles_consistent(
+        &self,
+        point_id: usize,
+        image: usize,
+        feature: usize,
+        max_angle_error_deg: f32,
+    ) -> bool {
+        if max_angle_error_deg <= 0.0 {
+            return true;
+        }
+        let Some(pose) = self.reconstruction.poses[image] else {
+            return false;
+        };
+        let keypoint = &self.frames[image].keypoints[feature];
+        let Some(xy) = self
+            .reconstruction
+            .camera_for_image(image)
+            .cam_from_img_f32(keypoint.x(), keypoint.y())
+        else {
+            return false;
+        };
+        let point = self.reconstruction.points[point_id].xyz;
+        let center = camera_center(pose);
+        let ray_to_point = (glam::Vec3::from_array(point) - center).try_normalize();
+        let ray_from_obs = observation_world_ray(pose, xy);
+        match (ray_to_point, ray_from_obs) {
+            (Some(a), Some(b)) => angular_error_deg(a, b) <= max_angle_error_deg,
+            _ => false,
+        }
+    }
+
+    fn refine_point_from_track(
+        &mut self,
+        point_id: usize,
+        options: &IncrementalTriangulatorOptions,
+        max_reproj_error_px: f32,
+    ) -> bool {
         if point_id >= self.reconstruction.points.len() {
-            return;
+            return false;
         }
-        let removed = self.reconstruction.points.remove(point_id);
-        if point_id < self.reconstruction.point_ids.len() {
-            self.reconstruction.point_ids.remove(point_id);
+        let track = self.reconstruction.points[point_id].track.clone();
+        let Some(xyz) = self.triangulate_track_observations(&track) else {
+            return false;
+        };
+        if !track_has_min_triangulation_angle(
+            xyz,
+            &track,
+            self.reconstruction,
+            options.min_angle_deg,
+        ) {
+            return false;
         }
-        for obs in removed.track {
-            if self.reconstruction.observations[obs.image][obs.feature] == Some(point_id) {
-                self.reconstruction.observations[obs.image][obs.feature] = None;
-            }
+        if !self.track_reprojects(xyz, &track, max_reproj_error_px) {
+            return false;
         }
-        for point in &mut self.reconstruction.points {
-            for obs in &point.track {
-                if let Some(id) = self.reconstruction.observations[obs.image][obs.feature] {
-                    if id > point_id {
-                        self.reconstruction.observations[obs.image][obs.feature] = Some(id - 1);
-                    }
+        let Some(error) =
+            mean_track_reprojection_error(xyz, &track, self.frames, self.reconstruction)
+        else {
+            return false;
+        };
+        self.reconstruction.points[point_id].xyz = xyz;
+        self.reconstruction.points[point_id].error = error;
+        true
+    }
+
+    fn triangulate_track_observations(&self, track: &[TrackObservation]) -> Option<[f32; 3]> {
+        let mut best = None::<(f32, [f32; 3])>;
+        for i in 0..track.len() {
+            for j in i + 1..track.len() {
+                let obs1 = &track[i];
+                let obs2 = &track[j];
+                if obs1.image == obs2.image {
+                    continue;
+                }
+                let pose1 = self.reconstruction.poses[obs1.image]?;
+                let pose2 = self.reconstruction.poses[obs2.image]?;
+                let kp1 = self.frames[obs1.image].keypoints.get(obs1.feature)?;
+                let kp2 = self.frames[obs2.image].keypoints.get(obs2.feature)?;
+                let xy1 = self
+                    .reconstruction
+                    .camera_for_image(obs1.image)
+                    .cam_from_img_f32(kp1.x(), kp1.y())?;
+                let xy2 = self
+                    .reconstruction
+                    .camera_for_image(obs2.image)
+                    .cam_from_img_f32(kp2.x(), kp2.y())?;
+                let Some(xyz) = crate::two_view::triangulate_world_point(pose1, pose2, xy1, xy2)
+                else {
+                    continue;
+                };
+                let Some(angle) = triangulation_angle_deg(pose1, pose2, xyz) else {
+                    continue;
+                };
+                if best
+                    .as_ref()
+                    .map(|(best_angle, _)| angle > *best_angle)
+                    .unwrap_or(true)
+                {
+                    best = Some((angle, xyz));
                 }
             }
         }
-        self.modified_point3d_ids = self
-            .modified_point3d_ids
-            .iter()
-            .filter_map(|&id| {
-                if id == point_id {
-                    None
-                } else if id > point_id {
-                    Some(id - 1)
-                } else {
-                    Some(id)
-                }
-            })
-            .collect();
+        best.map(|(_, xyz)| xyz)
     }
 }
 
@@ -696,22 +870,6 @@ fn ordered_point_pair(a: usize, b: usize) -> (usize, usize) {
 fn tracks_conflict_by_image(left: &[TrackObservation], right: &[TrackObservation]) -> bool {
     let mut images = left.iter().map(|obs| obs.image).collect::<HashSet<_>>();
     right.iter().any(|obs| !images.insert(obs.image))
-}
-
-fn weighted_average_xyz(
-    left_xyz: [f32; 3],
-    left_len: usize,
-    right_xyz: [f32; 3],
-    right_len: usize,
-) -> [f32; 3] {
-    let left_weight = left_len as f32;
-    let right_weight = right_len as f32;
-    let denom = (left_weight + right_weight).max(1.0);
-    [
-        (left_xyz[0] * left_weight + right_xyz[0] * right_weight) / denom,
-        (left_xyz[1] * left_weight + right_xyz[1] * right_weight) / denom,
-        (left_xyz[2] * left_weight + right_xyz[2] * right_weight) / denom,
-    ]
 }
 
 fn mean_track_reprojection_error(
@@ -747,6 +905,70 @@ fn triangulation_angle_deg(left_pose: SE3, right_pose: SE3, point: [f32; 3]) -> 
     let v1 = (p - c1).try_normalize()?;
     let v2 = (p - c2).try_normalize()?;
     Some(v1.dot(v2).abs().clamp(-1.0, 1.0).acos().to_degrees())
+}
+
+fn pair_angle_consistent(
+    left_pose: SE3,
+    right_pose: SE3,
+    left_xy: [f32; 2],
+    right_xy: [f32; 2],
+    point: [f32; 3],
+    max_angle_error_deg: f32,
+) -> bool {
+    if max_angle_error_deg <= 0.0 {
+        return true;
+    }
+    let Some(left_ray) = observation_world_ray(left_pose, left_xy) else {
+        return false;
+    };
+    let Some(right_ray) = observation_world_ray(right_pose, right_xy) else {
+        return false;
+    };
+    let p = glam::Vec3::from_array(point);
+    let Some(left_to_point) = (p - camera_center(left_pose)).try_normalize() else {
+        return false;
+    };
+    let Some(right_to_point) = (p - camera_center(right_pose)).try_normalize() else {
+        return false;
+    };
+    angular_error_deg(left_ray, left_to_point).max(angular_error_deg(right_ray, right_to_point))
+        <= max_angle_error_deg
+}
+
+fn track_has_min_triangulation_angle(
+    point: [f32; 3],
+    track: &[TrackObservation],
+    reconstruction: &Reconstruction,
+    min_angle_deg: f32,
+) -> bool {
+    if min_angle_deg <= 0.0 {
+        return true;
+    }
+    let mut best = 0.0f32;
+    for i in 0..track.len() {
+        for j in i + 1..track.len() {
+            let Some(pose_i) = reconstruction.poses[track[i].image] else {
+                continue;
+            };
+            let Some(pose_j) = reconstruction.poses[track[j].image] else {
+                continue;
+            };
+            if let Some(angle) = triangulation_angle_deg(pose_i, pose_j, point) {
+                best = best.max(angle);
+            }
+        }
+    }
+    best >= min_angle_deg
+}
+
+fn observation_world_ray(pose: SE3, xy: [f32; 2]) -> Option<glam::Vec3> {
+    let q = pose.quaternion();
+    let rotation = glam::Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
+    (rotation.inverse() * glam::Vec3::new(xy[0], xy[1], 1.0)).try_normalize()
+}
+
+fn angular_error_deg(a: glam::Vec3, b: glam::Vec3) -> f32 {
+    a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 fn average_color(observations: &[TrackObservation], frames: &[ImageFrame]) -> [u8; 3] {
@@ -792,6 +1014,7 @@ mod tests {
             &IncrementalTriangulatorOptions {
                 min_angle_deg: 0.1,
                 merge_max_reproj_error_px: 10.0,
+                ignore_two_view_tracks: false,
                 ..IncrementalTriangulatorOptions::default()
             },
             0,
@@ -803,16 +1026,43 @@ mod tests {
     }
 
     #[test]
-    fn triangulate_image_continues_existing_track() {
-        let frames = vec![frame(0), frame(1)];
+    fn triangulate_image_ignores_two_view_tracks_by_default() {
+        let mut frames = vec![frame(0), frame(1)];
+        frames[1].keypoints = vec![rustslam::KeyPoint::new(55.0, 50.0)];
         let pairs = vec![pair(0, 1, &[(0, 0)])];
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
-        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+
+        let mut triangulator = IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction);
+        let report = triangulator.triangulate_image(
+            &IncrementalTriangulatorOptions {
+                min_angle_deg: 0.1,
+                merge_max_reproj_error_px: 10.0,
+                ..IncrementalTriangulatorOptions::default()
+            },
+            0,
+        );
+
+        assert_eq!(report.created_points, 0);
+        assert!(triangulator.reconstruction.points.is_empty());
+    }
+
+    #[test]
+    fn triangulate_image_continues_existing_track() {
+        let mut frames = vec![frame(0), frame(1)];
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
+        let pairs = vec![pair(0, 1, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(baseline_pose());
         reconstruction.observations[0][0] = Some(0);
         reconstruction.point_ids.push(1);
         reconstruction.points.push(Point3D {
-            xyz: [0.0, 0.0, 1.0],
+            xyz: [0.0, 0.0, 2.0],
             color: [0, 0, 0],
             error: 0.0,
             track: vec![TrackObservation {
@@ -825,6 +1075,7 @@ mod tests {
         let report = triangulator.triangulate_image(
             &IncrementalTriangulatorOptions {
                 complete_max_reproj_error_px: 10.0,
+                min_angle_deg: 0.1,
                 ..IncrementalTriangulatorOptions::default()
             },
             1,
@@ -837,17 +1088,22 @@ mod tests {
 
     #[test]
     fn complete_tracks_adds_transitive_observations() {
-        let frames = vec![frame(0), frame(1), frame(2)];
+        let mut frames = vec![frame(0), frame(1), frame(2)];
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
+        frames[2].keypoints[0] = rustslam::KeyPoint::new(100.0, 50.0);
         let pairs = vec![pair(0, 1, &[(0, 0)]), pair(1, 2, &[(0, 0)])];
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
-        reconstruction.poses[1] = Some(SE3::identity());
-        reconstruction.poses[2] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(baseline_pose());
+        reconstruction.poses[2] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(2.0, 0.0, 0.0),
+        ));
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(0);
         reconstruction.point_ids.push(1);
         reconstruction.points.push(Point3D {
-            xyz: [0.0, 0.0, 1.0],
+            xyz: [0.0, 0.0, 2.0],
             color: [0, 0, 0],
             error: 0.0,
             track: vec![
@@ -867,6 +1123,7 @@ mod tests {
             &IncrementalTriangulatorOptions {
                 complete_max_transitivity: 2,
                 complete_max_reproj_error_px: 10.0,
+                min_angle_deg: 0.1,
                 ..IncrementalTriangulatorOptions::default()
             },
             &HashSet::from([0]),
@@ -879,16 +1136,17 @@ mod tests {
 
     #[test]
     fn merge_tracks_combines_corresponding_points() {
-        let frames = vec![frame(0), frame(1)];
+        let mut frames = vec![frame(0), frame(1)];
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
         let pairs = vec![pair(0, 1, &[(0, 0)])];
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
-        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(baseline_pose());
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(1);
         reconstruction.point_ids.extend([1, 2]);
         reconstruction.points.push(Point3D {
-            xyz: [0.0, 0.0, 1.0],
+            xyz: [0.0, 0.0, 2.0],
             color: [10, 0, 0],
             error: 0.0,
             track: vec![TrackObservation {
@@ -897,7 +1155,7 @@ mod tests {
             }],
         });
         reconstruction.points.push(Point3D {
-            xyz: [0.0, 0.0, 1.0],
+            xyz: [0.0, 0.0, 2.0],
             color: [0, 10, 0],
             error: 0.0,
             track: vec![TrackObservation {
@@ -910,6 +1168,7 @@ mod tests {
         let merged = triangulator.merge_tracks(
             &IncrementalTriangulatorOptions {
                 merge_max_reproj_error_px: 10.0,
+                min_angle_deg: 0.1,
                 ..IncrementalTriangulatorOptions::default()
             },
             &HashSet::from([0]),
@@ -991,6 +1250,7 @@ mod tests {
             re_min_ratio: 0.5,
             min_angle_deg: 0.1,
             merge_max_reproj_error_px: 10.0,
+            ignore_two_view_tracks: false,
             ..IncrementalTriangulatorOptions::default()
         });
 
@@ -1040,6 +1300,10 @@ mod tests {
             median_triangulation_angle_deg: 0.0,
             pose_graph_only: false,
         }
+    }
+
+    fn baseline_pose() -> SE3 {
+        SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0))
     }
 
     fn frame(id: usize) -> ImageFrame {

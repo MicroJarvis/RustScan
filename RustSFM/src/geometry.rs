@@ -184,8 +184,14 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         }
         let lk = &left.keypoints[li];
         let rk = &right.keypoints[ri];
-        norm_left.push(left_camera.normalize(lk.x(), lk.y()));
-        norm_right.push(right_camera.normalize(rk.x(), rk.y()));
+        let Some(left_xy) = left_camera.cam_from_img_f32(lk.x(), lk.y()) else {
+            continue;
+        };
+        let Some(right_xy) = right_camera.cam_from_img_f32(rk.x(), rk.y()) else {
+            continue;
+        };
+        norm_left.push(left_xy);
+        norm_right.push(right_xy);
         obs_left_px.push([lk.x(), lk.y()]);
         obs_right_px.push([rk.x(), rk.y()]);
         valid_matches.push(m.clone());
@@ -206,11 +212,16 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
             ransac_max_error_px: essential_threshold as f64,
             ransac_threshold: normalized_threshold,
             ransac_max_iterations: essential_iterations,
+            random_seed: ((left_idx as u64) << 32) ^ right_idx as u64 ^ 0x243f_6a88_85a3_08d3,
+            loransac_num_lo_steps: 6,
             min_inliers,
             min_inlier_ratio: 0.0,
             min_triangulated,
             min_e_f_inlier_ratio: 0.95,
             max_h_inlier_ratio: 0.8,
+            force_h_use: false,
+            multiple_models: false,
+            multiple_ignore_watermark: true,
             detect_watermark: true,
             watermark_min_inlier_ratio: 0.7,
             watermark_border_size: 0.1,
@@ -388,8 +399,12 @@ fn collect_pose_consistent_matches(
         }
         let lk = &left.keypoints[li];
         let rk = &right.keypoints[ri];
-        let left_xy = left_camera.normalize(lk.x(), lk.y());
-        let right_xy = right_camera.normalize(rk.x(), rk.y());
+        let Some(left_xy) = left_camera.cam_from_img_f32(lk.x(), lk.y()) else {
+            continue;
+        };
+        let Some(right_xy) = right_camera.cam_from_img_f32(rk.x(), rk.y()) else {
+            continue;
+        };
         let residual = sampson_residual(relative_pose, left_xy, right_xy);
         if !residual.is_finite() || residual.abs() > max_sampson {
             continue;

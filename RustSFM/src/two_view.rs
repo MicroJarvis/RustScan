@@ -10,11 +10,16 @@ pub struct TwoViewOptions {
     pub ransac_max_error_px: f64,
     pub ransac_threshold: f64,
     pub ransac_max_iterations: u32,
+    pub random_seed: u64,
+    pub loransac_num_lo_steps: usize,
     pub min_inliers: usize,
     pub min_inlier_ratio: f64,
     pub min_triangulated: usize,
     pub min_e_f_inlier_ratio: f64,
     pub max_h_inlier_ratio: f64,
+    pub force_h_use: bool,
+    pub multiple_models: bool,
+    pub multiple_ignore_watermark: bool,
     pub detect_watermark: bool,
     pub watermark_min_inlier_ratio: f64,
     pub watermark_border_size: f64,
@@ -102,6 +107,18 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
     if active_indices.len() < options.min_inliers.max(5) {
         return None;
     }
+    if options.multiple_models {
+        return estimate_multiple_calibrated_two_view_with_observations_and_cameras(
+            pts1,
+            pts2,
+            obs1_px,
+            obs2_px,
+            camera1,
+            camera2,
+            &active_indices,
+            options,
+        );
+    }
 
     let pts1 = pts1
         .iter()
@@ -123,6 +140,20 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         .take(n)
         .map(|p| Vector3::new(p[0] as f64, p[1] as f64, 1.0))
         .collect::<Vec<_>>();
+    if options.force_h_use {
+        return estimate_force_h_two_view(
+            &pts1,
+            &pts2,
+            &img_pts1,
+            &img_pts2,
+            obs1_px,
+            obs2_px,
+            &active_indices,
+            camera1,
+            camera2,
+            options,
+        );
+    }
     let support_limit = ransac_support_limit();
     let support_indices = if active_indices.len() > support_limit {
         (0..support_limit)
@@ -132,7 +163,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         active_indices.clone()
     };
 
-    let mut rng = Lcg::new(0x9e37_79b9_7f4a_7c15 ^ n as u64);
+    let mut rng = Lcg::new(options.random_seed ^ 0x9e37_79b9_7f4a_7c15 ^ n as u64);
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
     let mut max_iterations = options.ransac_max_iterations.max(1);
     let mut iteration = 0u32;
@@ -205,7 +236,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         options.ransac_threshold,
     );
 
-    for _ in 0..6 {
+    for _ in 0..options.loransac_num_lo_steps {
         if support.inliers < 8 {
             break;
         }
@@ -243,6 +274,8 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         &active_indices,
         options.ransac_max_error_px,
         options.ransac_max_iterations,
+        options.random_seed,
+        options.loransac_num_lo_steps,
     );
     let h_support = estimate_homography_ransac(
         &img_pts1,
@@ -250,8 +283,10 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         &active_indices,
         options.ransac_max_error_px,
         options.ransac_max_iterations,
+        options.random_seed,
+        options.loransac_num_lo_steps,
     );
-    let Some((two_view_config, selected_mask, selected_inliers)) = classify_calibrated_two_view(
+    let Some((mut two_view_config, selected_mask, selected_inliers)) = classify_calibrated_two_view(
         &support,
         f_support.as_ref().map(|(_, support)| support),
         h_support.as_ref().map(|(_, support)| support),
@@ -264,6 +299,11 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
     {
         return None;
     }
+    if two_view_config == crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC {
+        if let Some((homography, _)) = h_support.as_ref() {
+            two_view_config = classify_homography_motion(homography, camera1, camera2);
+        }
+    }
     if options.detect_watermark
         && detect_watermark_matches(
             camera1,
@@ -275,16 +315,30 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
             options,
         )
     {
-        return None;
+        two_view_config = crate::database::COLMAP_TWO_VIEW_WATERMARK;
     }
 
+    let (pose_essential, pose_mask) = pose_essential_and_mask(
+        essential,
+        f_support.as_ref().map(|(model, _)| model),
+        &support,
+        &selected_mask,
+        selected_inliers,
+        two_view_config,
+        &pts1,
+        &pts2,
+        &active_indices,
+        camera1,
+        camera2,
+        options,
+    );
     let pose_score = choose_pose_from_essential(
-        &essential,
+        &pose_essential,
         &pts1,
         &pts2,
         obs1_px,
         obs2_px,
-        &support.inlier_mask,
+        &pose_mask,
         camera1,
         camera2,
     )?;
@@ -293,7 +347,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
     }
 
     Some(TwoViewEstimate {
-        essential,
+        essential: pose_essential,
         two_view_config,
         inlier_mask: selected_mask,
         pose: pose_score.pose,
@@ -304,12 +358,225 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn estimate_force_h_two_view(
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    img_pts1: &[Vector3<f64>],
+    img_pts2: &[Vector3<f64>],
+    obs1_px: &[[f32; 2]],
+    obs2_px: &[[f32; 2]],
+    active_indices: &[usize],
+    camera1: CameraModel,
+    camera2: CameraModel,
+    options: &TwoViewOptions,
+) -> Option<TwoViewEstimate> {
+    let (homography, h_support) = estimate_homography_ransac(
+        img_pts1,
+        img_pts2,
+        active_indices,
+        options.ransac_max_error_px,
+        options.ransac_max_iterations,
+        options.random_seed,
+        options.loransac_num_lo_steps,
+    )?;
+    if h_support.inliers < options.min_inliers {
+        return None;
+    }
+    if options.min_inlier_ratio > 0.0
+        && h_support.inliers as f64 / (active_indices.len().max(1) as f64)
+            < options.min_inlier_ratio
+    {
+        return None;
+    }
+
+    let mut two_view_config = classify_homography_motion(&homography, camera1, camera2);
+    if options.detect_watermark
+        && detect_watermark_matches(
+            camera1,
+            camera2,
+            obs1_px,
+            obs2_px,
+            &h_support.inlier_mask,
+            h_support.inliers,
+            options,
+        )
+    {
+        two_view_config = crate::database::COLMAP_TWO_VIEW_WATERMARK;
+    }
+
+    let inlier_indices = h_support
+        .inlier_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &is_inlier)| is_inlier.then_some(idx))
+        .collect::<Vec<_>>();
+    let essential = estimate_essential_eight_point_indexed(pts1, pts2, &inlier_indices)
+        .or_else(|| estimate_essential_eight_point_indexed(pts1, pts2, active_indices))?;
+    let essential_support = model_support_indexed(
+        pts1,
+        pts2,
+        active_indices,
+        &essential,
+        options.ransac_threshold,
+    );
+    let pose_mask = if essential_support.inliers >= options.min_inliers {
+        essential_support.inlier_mask
+    } else {
+        h_support.inlier_mask.clone()
+    };
+    let pose_score = choose_pose_from_essential(
+        &essential, pts1, pts2, obs1_px, obs2_px, &pose_mask, camera1, camera2,
+    )?;
+    if pose_score.triangulated < options.min_triangulated {
+        return None;
+    }
+
+    Some(TwoViewEstimate {
+        essential,
+        two_view_config,
+        inlier_mask: h_support.inlier_mask,
+        pose: pose_score.pose,
+        triangulated: pose_score.triangulated,
+        mean_reprojection_error_px: pose_score.mean_reprojection_error_px,
+        rotation_deg: relative_rotation_deg(pose_score.pose, SE3::identity()),
+        median_triangulation_angle_deg: pose_score.median_angle_deg as f32,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_multiple_calibrated_two_view_with_observations_and_cameras(
+    pts1: &[[f32; 2]],
+    pts2: &[[f32; 2]],
+    obs1_px: &[[f32; 2]],
+    obs2_px: &[[f32; 2]],
+    camera1: CameraModel,
+    camera2: CameraModel,
+    active_indices: &[usize],
+    options: &TwoViewOptions,
+) -> Option<TwoViewEstimate> {
+    let n = pts1.len().min(pts2.len());
+    let mut remaining = active_indices.to_vec();
+    let mut models = Vec::<TwoViewEstimate>::new();
+    let max_models = multiple_model_limit();
+
+    for model_idx in 0..max_models {
+        if remaining.len() < options.min_inliers.max(5) {
+            break;
+        }
+
+        let sub_pts1 = remaining.iter().map(|&idx| pts1[idx]).collect::<Vec<_>>();
+        let sub_pts2 = remaining.iter().map(|&idx| pts2[idx]).collect::<Vec<_>>();
+        let sub_obs1 = remaining
+            .iter()
+            .map(|&idx| obs1_px[idx])
+            .collect::<Vec<_>>();
+        let sub_obs2 = remaining
+            .iter()
+            .map(|&idx| obs2_px[idx])
+            .collect::<Vec<_>>();
+
+        let mut sub_options = options.clone();
+        sub_options.multiple_models = false;
+        sub_options.filter_stationary_matches = false;
+        sub_options.random_seed = options.random_seed
+            ^ 0x6a09_e667_f3bc_c909
+            ^ ((model_idx as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+
+        let mut estimate = match estimate_calibrated_two_view_with_observations_and_cameras(
+            &sub_pts1,
+            &sub_pts2,
+            &sub_obs1,
+            &sub_obs2,
+            camera1,
+            camera2,
+            &sub_options,
+        ) {
+            Some(estimate) => estimate,
+            None => break,
+        };
+
+        let mut full_mask = vec![false; n];
+        let mut inlier_count = 0usize;
+        for (sub_idx, &is_inlier) in estimate.inlier_mask.iter().enumerate() {
+            if !is_inlier {
+                continue;
+            }
+            let Some(&global_idx) = remaining.get(sub_idx) else {
+                continue;
+            };
+            full_mask[global_idx] = true;
+            inlier_count += 1;
+        }
+        if inlier_count < options.min_inliers {
+            break;
+        }
+
+        remaining.retain(|&idx| !full_mask[idx]);
+        estimate.inlier_mask = full_mask;
+        if options.multiple_ignore_watermark
+            && estimate.two_view_config == crate::database::COLMAP_TWO_VIEW_WATERMARK
+        {
+            continue;
+        }
+        models.push(estimate);
+    }
+
+    if models.is_empty() {
+        return None;
+    }
+    if models.len() == 1 {
+        return models.into_iter().next();
+    }
+
+    let best_idx = models
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| compare_multiple_model_estimates(a, b))
+        .map(|(idx, _)| idx)?;
+    let mut best = models.swap_remove(best_idx);
+    let mut union_mask = best.inlier_mask.clone();
+    for model in &models {
+        for (idx, &is_inlier) in model.inlier_mask.iter().enumerate() {
+            union_mask[idx] |= is_inlier;
+        }
+    }
+    best.two_view_config = crate::database::COLMAP_TWO_VIEW_MULTIPLE;
+    best.inlier_mask = union_mask;
+    Some(best)
+}
+
+fn multiple_model_limit() -> usize {
+    std::env::var("RUSTSFM_MULTIPLE_MODEL_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+fn compare_multiple_model_estimates(
+    a: &TwoViewEstimate,
+    b: &TwoViewEstimate,
+) -> std::cmp::Ordering {
+    a.inlier_mask
+        .iter()
+        .filter(|&&is_inlier| is_inlier)
+        .count()
+        .cmp(&b.inlier_mask.iter().filter(|&&is_inlier| is_inlier).count())
+        .then_with(|| a.triangulated.cmp(&b.triangulated))
+        .then_with(|| {
+            b.mean_reprojection_error_px
+                .partial_cmp(&a.mean_reprojection_error_px)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
 fn ransac_support_limit() -> usize {
     std::env::var("RUSTSFM_RANSAC_SUPPORT_LIMIT")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value >= 32)
-        .unwrap_or(512)
+        .unwrap_or(usize::MAX)
 }
 
 fn active_match_indices(
@@ -439,14 +706,17 @@ fn estimate_fundamental_ransac(
     active_indices: &[usize],
     threshold: f64,
     max_iterations: u32,
+    random_seed: u64,
+    lo_steps: usize,
 ) -> Option<(Matrix3<f64>, ModelSupport)> {
     if active_indices.len() < 8 {
         return None;
     }
-    let mut rng = Lcg::new(0x517c_c1b7_2722_0a95 ^ active_indices.len() as u64);
+    let mut rng = Lcg::new(random_seed ^ 0x517c_c1b7_2722_0a95 ^ active_indices.len() as u64);
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let mut max_iterations = max_iterations.max(1);
     let mut iteration = 0u32;
-    while iteration < max_iterations.max(1) {
+    while iteration < max_iterations {
         iteration += 1;
         let sample = rng.sample_unique_from(active_indices, 8);
         if sample.len() != 8 {
@@ -457,15 +727,31 @@ fn estimate_fundamental_ransac(
         };
         let support = model_support_indexed(pts1, pts2, active_indices, &model, threshold);
         if support.inliers >= 8 && is_better_support(&support, best.as_ref().map(|(_, s)| s)) {
+            max_iterations = max_iterations.min(adaptive_ransac_iterations(
+                support.inliers,
+                active_indices.len(),
+                max_iterations,
+                0.999,
+                8,
+            ));
             best = Some((model, support));
         }
     }
-    best.or_else(|| {
+    let (model, support) = best.or_else(|| {
         estimate_fundamental_eight_point_indexed(pts1, pts2, active_indices).map(|model| {
             let support = model_support_indexed(pts1, pts2, active_indices, &model, threshold);
             (model, support)
         })
-    })
+    })?;
+    Some(refine_fundamental_support(
+        pts1,
+        pts2,
+        active_indices,
+        threshold,
+        model,
+        support,
+        lo_steps,
+    ))
 }
 
 fn estimate_fundamental_eight_point_indexed(
@@ -508,20 +794,67 @@ fn estimate_fundamental_eight_point_indexed(
     (norm > 1.0e-12 && norm.is_finite()).then_some(f / norm)
 }
 
+fn refine_fundamental_support(
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    threshold: f64,
+    mut model: Matrix3<f64>,
+    mut support: ModelSupport,
+    lo_steps: usize,
+) -> (Matrix3<f64>, ModelSupport) {
+    for _ in 0..lo_steps {
+        if support.inliers < 8 {
+            break;
+        }
+        let inliers = support
+            .inlier_mask
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &is_inlier)| is_inlier.then_some(idx))
+            .collect::<Vec<_>>();
+        let sampled_inliers = sample_indices_evenly(&inliers, fundamental_refit_inlier_limit());
+        let Some(refined) = estimate_fundamental_eight_point_indexed(pts1, pts2, &sampled_inliers)
+        else {
+            break;
+        };
+        let refined_support =
+            model_support_indexed(pts1, pts2, active_indices, &refined, threshold);
+        if is_better_support(&refined_support, Some(&support)) {
+            model = refined;
+            support = refined_support;
+        } else {
+            break;
+        }
+    }
+    (model, support)
+}
+
+fn fundamental_refit_inlier_limit() -> usize {
+    std::env::var("RUSTSFM_FUNDAMENTAL_REFIT_INLIERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 8)
+        .unwrap_or(usize::MAX)
+}
+
 fn estimate_homography_ransac(
     pts1: &[Vector3<f64>],
     pts2: &[Vector3<f64>],
     active_indices: &[usize],
     threshold: f64,
     max_iterations: u32,
+    random_seed: u64,
+    lo_steps: usize,
 ) -> Option<(Matrix3<f64>, ModelSupport)> {
     if active_indices.len() < 4 {
         return None;
     }
-    let mut rng = Lcg::new(0x94d0_49bb_1331_11eb ^ active_indices.len() as u64);
+    let mut rng = Lcg::new(random_seed ^ 0x94d0_49bb_1331_11eb ^ active_indices.len() as u64);
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let mut max_iterations = max_iterations.max(1);
     let mut iteration = 0u32;
-    while iteration < max_iterations.max(1) {
+    while iteration < max_iterations {
         iteration += 1;
         let sample = rng.sample_unique_from(active_indices, 4);
         if sample.len() != 4 {
@@ -532,15 +865,31 @@ fn estimate_homography_ransac(
         };
         let support = homography_support_indexed(pts1, pts2, active_indices, &model, threshold);
         if support.inliers >= 4 && is_better_support(&support, best.as_ref().map(|(_, s)| s)) {
+            max_iterations = max_iterations.min(adaptive_ransac_iterations(
+                support.inliers,
+                active_indices.len(),
+                max_iterations,
+                0.999,
+                4,
+            ));
             best = Some((model, support));
         }
     }
-    best.or_else(|| {
+    let (model, support) = best.or_else(|| {
         estimate_homography_dlt_indexed(pts1, pts2, active_indices).map(|model| {
             let support = homography_support_indexed(pts1, pts2, active_indices, &model, threshold);
             (model, support)
         })
-    })
+    })?;
+    Some(refine_homography_support(
+        pts1,
+        pts2,
+        active_indices,
+        threshold,
+        model,
+        support,
+        lo_steps,
+    ))
 }
 
 fn estimate_homography_dlt_indexed(
@@ -570,6 +919,49 @@ fn estimate_homography_dlt_indexed(
     let h = t2.try_inverse()? * h_norm * t1;
     let norm = h.norm();
     (norm > 1.0e-12 && norm.is_finite()).then_some(h / norm)
+}
+
+fn refine_homography_support(
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    threshold: f64,
+    mut model: Matrix3<f64>,
+    mut support: ModelSupport,
+    lo_steps: usize,
+) -> (Matrix3<f64>, ModelSupport) {
+    for _ in 0..lo_steps {
+        if support.inliers < 4 {
+            break;
+        }
+        let inliers = support
+            .inlier_mask
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &is_inlier)| is_inlier.then_some(idx))
+            .collect::<Vec<_>>();
+        let sampled_inliers = sample_indices_evenly(&inliers, homography_refit_inlier_limit());
+        let Some(refined) = estimate_homography_dlt_indexed(pts1, pts2, &sampled_inliers) else {
+            break;
+        };
+        let refined_support =
+            homography_support_indexed(pts1, pts2, active_indices, &refined, threshold);
+        if is_better_support(&refined_support, Some(&support)) {
+            model = refined;
+            support = refined_support;
+        } else {
+            break;
+        }
+    }
+    (model, support)
+}
+
+fn homography_refit_inlier_limit() -> usize {
+    std::env::var("RUSTSFM_HOMOGRAPHY_REFIT_INLIERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 4)
+        .unwrap_or(usize::MAX)
 }
 
 fn estimate_essential_five_point_indexed(
@@ -858,6 +1250,15 @@ fn classify_calibrated_two_view(
     {
         return None;
     }
+    if options.force_h_use {
+        return h_support.filter(|s| s.inliers >= min_num_inliers).map(|s| {
+            (
+                crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC,
+                s.inlier_mask.clone(),
+                s.inliers,
+            )
+        });
+    }
 
     let e_f_ratio = ratio(e_support.inliers, f_inliers);
     let h_f_ratio = ratio(h_inliers, f_inliers);
@@ -906,6 +1307,140 @@ fn classify_calibrated_two_view(
             )
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pose_essential_and_mask(
+    essential: Matrix3<f64>,
+    fundamental: Option<&Matrix3<f64>>,
+    e_support: &ModelSupport,
+    selected_mask: &[bool],
+    selected_inliers: usize,
+    two_view_config: i32,
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    camera1: CameraModel,
+    camera2: CameraModel,
+    options: &TwoViewOptions,
+) -> (Matrix3<f64>, Vec<bool>) {
+    let use_fundamental_pose = matches!(
+        two_view_config,
+        crate::database::COLMAP_TWO_VIEW_UNCALIBRATED
+            | crate::database::COLMAP_TWO_VIEW_PLANAR
+            | crate::database::COLMAP_TWO_VIEW_PANORAMIC
+            | crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC
+    ) && selected_inliers > e_support.inliers;
+    let pose_essential = if use_fundamental_pose {
+        fundamental
+            .and_then(|f| fundamental_to_essential(f, camera1, camera2))
+            .unwrap_or(essential)
+    } else {
+        essential
+    };
+    let pose_mask = if use_fundamental_pose {
+        selected_mask.to_vec()
+    } else if e_support.inliers >= options.min_inliers {
+        e_support.inlier_mask.clone()
+    } else {
+        selected_mask.to_vec()
+    };
+    let support = model_support_indexed(
+        pts1,
+        pts2,
+        active_indices,
+        &pose_essential,
+        options.ransac_threshold,
+    );
+    if support.inliers >= options.min_inliers
+        && support.inliers >= pose_mask.iter().filter(|&&v| v).count()
+    {
+        (pose_essential, support.inlier_mask)
+    } else {
+        (pose_essential, pose_mask)
+    }
+}
+
+fn fundamental_to_essential(
+    fundamental: &Matrix3<f64>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+) -> Option<Matrix3<f64>> {
+    let k1 = camera_intrinsic_matrix(camera1);
+    let k2 = camera_intrinsic_matrix(camera2);
+    enforce_essential_constraints(k2.transpose() * fundamental * k1)
+}
+
+fn classify_homography_motion(
+    homography: &Matrix3<f64>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+) -> i32 {
+    let Some(h_norm) = normalize_pixel_homography(homography, camera1, camera2) else {
+        return crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC;
+    };
+    let Some(rotation) = closest_rotation(&h_norm) else {
+        return crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC;
+    };
+    let rotation_residual = (h_norm - rotation).norm() / 3.0f64.sqrt();
+    if rotation_residual <= homography_panoramic_residual_threshold() {
+        crate::database::COLMAP_TWO_VIEW_PANORAMIC
+    } else {
+        crate::database::COLMAP_TWO_VIEW_PLANAR
+    }
+}
+
+fn normalize_pixel_homography(
+    homography: &Matrix3<f64>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+) -> Option<Matrix3<f64>> {
+    let k1 = camera_intrinsic_matrix(camera1);
+    let k2_inv = camera_intrinsic_matrix(camera2).try_inverse()?;
+    let mut h_norm = k2_inv * homography * k1;
+    let scale = h_norm.determinant().abs().powf(1.0 / 3.0);
+    if !scale.is_finite() || scale <= 1.0e-12 {
+        return None;
+    }
+    h_norm /= scale;
+    if h_norm.determinant() < 0.0 {
+        h_norm *= -1.0;
+    }
+    h_norm.iter().all(|v| v.is_finite()).then_some(h_norm)
+}
+
+fn camera_intrinsic_matrix(camera: CameraModel) -> Matrix3<f64> {
+    Matrix3::new(
+        camera.fx as f64,
+        0.0,
+        camera.cx as f64,
+        0.0,
+        camera.fy as f64,
+        camera.cy as f64,
+        0.0,
+        0.0,
+        1.0,
+    )
+}
+
+fn closest_rotation(matrix: &Matrix3<f64>) -> Option<Matrix3<f64>> {
+    let svd = matrix.svd(true, true);
+    let mut u = svd.u?;
+    let vt = svd.v_t?;
+    let mut rotation = u * vt;
+    if rotation.determinant() < 0.0 {
+        u.column_mut(2).scale_mut(-1.0);
+        rotation = u * vt;
+    }
+    rotation.iter().all(|v| v.is_finite()).then_some(rotation)
+}
+
+fn homography_panoramic_residual_threshold() -> f64 {
+    std::env::var("RUSTSFM_HOMOGRAPHY_PANORAMIC_RESIDUAL")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(0.05)
 }
 
 fn ratio(num: usize, denom: usize) -> f64 {
@@ -1247,11 +1782,16 @@ mod tests {
             ransac_max_error_px: 4.0,
             ransac_threshold: 0.01,
             ransac_max_iterations: 128,
+            random_seed: 42,
+            loransac_num_lo_steps: 6,
             min_inliers: 15,
             min_inlier_ratio: 0.0,
             min_triangulated: 1,
             min_e_f_inlier_ratio: 0.95,
             max_h_inlier_ratio: 0.8,
+            force_h_use: false,
+            multiple_models: false,
+            multiple_ignore_watermark: true,
             detect_watermark: true,
             watermark_min_inlier_ratio: 0.7,
             watermark_border_size: 0.1,
@@ -1357,5 +1897,49 @@ mod tests {
         assert_eq!(config, crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC);
         assert_eq!(inliers, 4);
         assert_eq!(mask, h_support.inlier_mask);
+    }
+
+    #[test]
+    fn watermark_detection_preserves_geometry_with_watermark_config() {
+        let camera = CameraModel::new_pinhole(1000, 800, 700.0, 700.0, 500.0, 400.0);
+        let mut pts1 = Vec::new();
+        let mut pts2 = Vec::new();
+        let mut obs1 = Vec::new();
+        let mut obs2 = Vec::new();
+        let pose = SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0));
+        for i in 0..40 {
+            let x = 20.0 + i as f32 * 11.0;
+            let y = if i % 2 == 0 {
+                18.0 + (i % 7) as f32 * 8.0
+            } else {
+                780.0 - (i % 7) as f32 * 8.0
+            };
+            let p1 = camera.cam_from_img_f32(x, y).unwrap();
+            let z = 4.0 + (i % 5) as f32 * 0.01;
+            let point = [p1[0] * z, p1[1] * z, z];
+            let p2_norm = pose.transform_point(&point);
+            let p2_px = camera
+                .img_from_cam_f32(p2_norm[0], p2_norm[1], p2_norm[2])
+                .unwrap();
+            pts1.push(p1);
+            pts2.push([p2_norm[0] / p2_norm[2], p2_norm[1] / p2_norm[2]]);
+            obs1.push([x, y]);
+            obs2.push(p2_px);
+        }
+        let mut options = default_test_options();
+        options.min_inliers = 20;
+        options.min_triangulated = 8;
+        options.ransac_threshold = 0.01;
+        options.ransac_max_iterations = 1024;
+
+        let estimate = estimate_calibrated_two_view_with_observations_and_cameras(
+            &pts1, &pts2, &obs1, &obs2, camera, camera, &options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            estimate.two_view_config,
+            crate::database::COLMAP_TWO_VIEW_WATERMARK
+        );
     }
 }
