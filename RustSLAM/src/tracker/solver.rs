@@ -2,6 +2,7 @@
 //!
 //! Implements PnP, Essential Matrix, Triangulation, and Sim3 solvers with proper algorithms.
 
+use crate::colmap_rng::{sample_unique_indices, ColmapMt19937};
 use crate::core::SE3;
 use crate::features::base::Match;
 use glam::{Mat3, Vec3};
@@ -153,7 +154,7 @@ impl PnPSolver {
         let seed = self
             .ransac_random_seed
             .unwrap_or_else(|| deterministic_pnp_seed(&normalized_pts, &problem.object_points));
-        let mut rng = ColmapRng::new(seed);
+        let mut rng = ColmapMt19937::new(seed);
 
         // RANSAC loop
         let mut best_inliers: Vec<bool> = vec![false; n];
@@ -254,7 +255,7 @@ impl PnPSolver {
         let seed = self
             .ransac_random_seed
             .unwrap_or_else(|| deterministic_pnp_seed(&centered_pts, &problem.object_points));
-        let mut rng = ColmapRng::new(seed);
+        let mut rng = ColmapMt19937::new(seed);
 
         let sample_size = 4usize;
         let max_iterations = self.initial_max_iterations(sample_size);
@@ -482,16 +483,8 @@ impl PnPSolver {
         PoseEvaluation { inliers, support }
     }
 
-    /// Randomly select k indices using COLMAP's partial Fisher-Yates shape.
-    fn random_indices(&self, rng: &mut ColmapRng, n: usize, k: usize) -> Vec<usize> {
-        let target = k.min(n);
-        let mut indices: Vec<usize> = (0..n).collect();
-        for i in 0..target {
-            let j = i + rng.gen_range(n - i);
-            indices.swap(i, j);
-        }
-        indices.truncate(target);
-        indices
+    fn random_indices(&self, rng: &mut ColmapMt19937, n: usize, k: usize) -> Vec<usize> {
+        sample_unique_indices(rng, n, k)
     }
 
     /// Solve P3P - Perspective-Three-Point Problem
@@ -3144,14 +3137,14 @@ impl EssentialSolver {
         }
 
         let n = pts1.len().min(pts2.len());
-        let mut rng = ColmapRng::new(n as u64 + (self.ransac_max_iterations as u64));
+        let mut rng = ColmapMt19937::new(n as u64 + (self.ransac_max_iterations as u64));
         let mut best_inliers = Vec::new();
         let mut best_e = None;
         let mut best_inlier_count = 0usize;
         let mut best_error = f32::INFINITY;
 
         for _ in 0..self.ransac_max_iterations {
-            let sample = rng.sample_unique(n, 8);
+            let sample = sample_unique_indices(&mut rng, n, 8);
             if sample.len() < 8 {
                 continue;
             }
@@ -3415,90 +3408,6 @@ impl EssentialSolver {
         let e_norm = self.solve_8point(&a)?;
         let e = t2.transpose() * e_norm * t1;
         Some(self.enforce_rank2(e))
-    }
-}
-
-pub(super) struct ColmapRng {
-    mt: [u32; 624],
-    index: usize,
-}
-
-impl ColmapRng {
-    pub(super) fn new(seed: u64) -> Self {
-        let mut rng = Self {
-            mt: [0; 624],
-            index: 624,
-        };
-        rng.mt[0] = seed as u32;
-        for i in 1..624 {
-            rng.mt[i] = 1812433253u32
-                .wrapping_mul(rng.mt[i - 1] ^ (rng.mt[i - 1] >> 30))
-                .wrapping_add(i as u32);
-        }
-        rng
-    }
-
-    pub(super) fn next_u32(&mut self) -> u32 {
-        if self.index >= 624 {
-            self.twist();
-        }
-        let mut y = self.mt[self.index];
-        self.index += 1;
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c_5680;
-        y ^= (y << 15) & 0xefc6_0000;
-        y ^ (y >> 18)
-    }
-
-    fn twist(&mut self) {
-        const UPPER_MASK: u32 = 0x8000_0000;
-        const LOWER_MASK: u32 = 0x7fff_ffff;
-        const MATRIX_A: u32 = 0x9908_b0df;
-
-        for i in 0..624 {
-            let x = (self.mt[i] & UPPER_MASK) | (self.mt[(i + 1) % 624] & LOWER_MASK);
-            let mut xa = x >> 1;
-            if x & 1 != 0 {
-                xa ^= MATRIX_A;
-            }
-            self.mt[i] = self.mt[(i + 397) % 624] ^ xa;
-        }
-        self.index = 0;
-    }
-
-    fn gen_range(&mut self, max: usize) -> usize {
-        if max == 0 {
-            return 0;
-        }
-        self.uniform_usize(0, max - 1)
-    }
-
-    fn uniform_usize(&mut self, min: usize, max: usize) -> usize {
-        if min >= max {
-            return min;
-        }
-        let range = max - min + 1;
-        let zone = (u32::MAX as usize / range) * range;
-        loop {
-            let value = self.next_u32() as usize;
-            if value < zone {
-                return min + value % range;
-            }
-        }
-    }
-
-    fn sample_unique(&mut self, max: usize, count: usize) -> Vec<usize> {
-        if max == 0 || count == 0 {
-            return Vec::new();
-        }
-        let target = count.min(max);
-        let mut indices: Vec<usize> = (0..max).collect();
-        for i in 0..target {
-            let j = self.uniform_usize(i, max - 1);
-            indices.swap(i, j);
-        }
-        indices.truncate(target);
-        indices
     }
 }
 

@@ -2,7 +2,7 @@ use crate::geometry::{camera_center, mean_pair_reprojection_error_with_cameras};
 use crate::observation_manager::ObservationManager;
 use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
 use rustslam::SE3;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy)]
 pub struct IncrementalTriangulatorOptions {
@@ -67,7 +67,7 @@ pub struct IncrementalTriangulator<'a> {
     reconstruction: &'a mut Reconstruction,
     observation_manager: ObservationManager,
     merge_trials: HashSet<(usize, usize)>,
-    retriangulation_trials: HashSet<(usize, usize)>,
+    retriangulation_trials: HashMap<(usize, usize), usize>,
 }
 
 impl<'a> IncrementalTriangulator<'a> {
@@ -83,7 +83,7 @@ impl<'a> IncrementalTriangulator<'a> {
             reconstruction,
             observation_manager,
             merge_trials: HashSet::new(),
-            retriangulation_trials: HashSet::new(),
+            retriangulation_trials: HashMap::new(),
         }
     }
 
@@ -236,17 +236,18 @@ impl<'a> IncrementalTriangulator<'a> {
                 continue;
             }
             let pair_key = ordered_point_pair(pair.left, pair.right);
-            if self.retriangulation_trials.contains(&pair_key) {
+            if options.re_max_trials == 0 {
+                continue;
+            }
+            let trials = self.retriangulation_trials.get(&pair_key).copied().unwrap_or(0);
+            if trials >= options.re_max_trials {
                 continue;
             }
             let (tri_corrs, total_corrs) = self.pair_triangulation_counts(pair);
             if total_corrs == 0 || tri_corrs as f32 / total_corrs as f32 >= options.re_min_ratio {
                 continue;
             }
-            if options.re_max_trials == 0 {
-                continue;
-            }
-            self.retriangulation_trials.insert(pair_key);
+            self.retriangulation_trials.insert(pair_key, trials + 1);
             for match_ in &pair.inlier_matches {
                 let left_feature = match_.query_idx as usize;
                 let right_feature = match_.train_idx as usize;
@@ -807,44 +808,52 @@ impl<'a> IncrementalTriangulator<'a> {
     }
 
     fn triangulate_track_observations(&self, track: &[TrackObservation]) -> Option<[f32; 3]> {
-        let mut best = None::<(f32, [f32; 3])>;
-        for i in 0..track.len() {
-            for j in i + 1..track.len() {
-                let obs1 = &track[i];
-                let obs2 = &track[j];
-                if obs1.image == obs2.image {
-                    continue;
-                }
-                let pose1 = self.reconstruction.poses[obs1.image]?;
-                let pose2 = self.reconstruction.poses[obs2.image]?;
-                let kp1 = self.frames[obs1.image].keypoints.get(obs1.feature)?;
-                let kp2 = self.frames[obs2.image].keypoints.get(obs2.feature)?;
-                let xy1 = self
-                    .reconstruction
-                    .camera_for_image(obs1.image)
-                    .cam_from_img_f32(kp1.x(), kp1.y())?;
-                let xy2 = self
-                    .reconstruction
-                    .camera_for_image(obs2.image)
-                    .cam_from_img_f32(kp2.x(), kp2.y())?;
-                let Some(xyz) = crate::two_view::triangulate_world_point(pose1, pose2, xy1, xy2)
-                else {
-                    continue;
-                };
-                let Some(angle) = triangulation_angle_deg(pose1, pose2, xyz) else {
-                    continue;
-                };
-                if best
-                    .as_ref()
-                    .map(|(best_angle, _)| angle > *best_angle)
-                    .unwrap_or(true)
-                {
-                    best = Some((angle, xyz));
-                }
+        // Gather one normalized observation per distinct image and run COLMAP's
+        // multi-view DLT (`TriangulateMultiViewPoint`) over all of them, instead
+        // of triangulating only the widest-baseline pair.
+        let mut cams_from_world = Vec::with_capacity(track.len());
+        let mut cam_points = Vec::with_capacity(track.len());
+        let mut seen_images = HashSet::new();
+        for obs in track {
+            if !seen_images.insert(obs.image) {
+                continue;
             }
+            let pose = self.reconstruction.poses[obs.image]?;
+            let kp = self.frames[obs.image].keypoints.get(obs.feature)?;
+            let xy = self
+                .reconstruction
+                .camera_for_image(obs.image)
+                .cam_from_img_f32(kp.x(), kp.y())?;
+            cams_from_world.push(se3_to_matrix3x4(pose));
+            cam_points.push(nalgebra::Vector2::new(xy[0] as f64, xy[1] as f64));
         }
-        best.map(|(_, xyz)| xyz)
+        if cam_points.len() < 2 {
+            return None;
+        }
+        let xyz = crate::triangulation::triangulate_multi_view_point(&cams_from_world, &cam_points)?;
+        xyz.iter()
+            .all(|v| v.is_finite())
+            .then_some([xyz[0] as f32, xyz[1] as f32, xyz[2] as f32])
     }
+}
+
+fn se3_to_matrix3x4(pose: SE3) -> nalgebra::Matrix3x4<f64> {
+    let r = pose.rotation_matrix();
+    let t = pose.translation();
+    nalgebra::Matrix3x4::new(
+        r[0][0] as f64,
+        r[0][1] as f64,
+        r[0][2] as f64,
+        t[0] as f64,
+        r[1][0] as f64,
+        r[1][1] as f64,
+        r[1][2] as f64,
+        t[1] as f64,
+        r[2][0] as f64,
+        r[2][1] as f64,
+        r[2][2] as f64,
+        t[2] as f64,
+    )
 }
 
 fn ordered_point_pair(a: usize, b: usize) -> (usize, usize) {
@@ -1244,6 +1253,55 @@ mod tests {
 
         assert_eq!(added, 4);
         assert_eq!(triangulator.reconstruction.points.len(), 2);
+    }
+
+    #[test]
+    fn retriangulate_limits_trials_per_pair_to_re_max_trials() {
+        let mut frames = vec![frame(0), frame(1)];
+        frames[1].keypoints = vec![
+            rustslam::KeyPoint::new(55.0, 50.0),
+            rustslam::KeyPoint::new(60.0, 50.0),
+        ];
+        let pairs = vec![pair(0, 1, &[(0, 0), (1, 1)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+
+        let mut triangulator = IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction);
+        let options = IncrementalTriangulatorOptions {
+            re_min_ratio: 0.5,
+            re_max_trials: 2,
+            min_angle_deg: 0.1,
+            merge_max_reproj_error_px: 10.0,
+            ignore_two_view_tracks: false,
+            ..IncrementalTriangulatorOptions::default()
+        };
+
+        let first = triangulator.retriangulate(&options);
+        assert_eq!(first, 4);
+        assert_eq!(
+            triangulator
+                .retriangulation_trials
+                .get(&ordered_point_pair(0, 1))
+                .copied(),
+            Some(1)
+        );
+
+        // The pair is now fully triangulated, so a second pass records no new
+        // trial because the ratio gate is satisfied before the trial counter
+        // is incremented.
+        let second = triangulator.retriangulate(&options);
+        assert_eq!(second, 0);
+        assert_eq!(
+            triangulator
+                .retriangulation_trials
+                .get(&ordered_point_pair(0, 1))
+                .copied(),
+            Some(1)
+        );
     }
 
     fn reconstruction(frames: &[ImageFrame]) -> Reconstruction {

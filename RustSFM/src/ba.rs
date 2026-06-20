@@ -19,6 +19,77 @@ type Vec2 = SVector<f64, 2>;
 type Vec3d = SVector<f64, 3>;
 type Vec6 = SVector<f64, 6>;
 
+/// Ceres-equivalent robust loss functions for bundle adjustment.
+///
+/// Each variant maps to a Ceres `LossFunction` with a robustification scale.
+/// The methods operate on `s`, the squared residual norm `||r||^2`, mirroring
+/// Ceres' `rho(s)` convention. `weight` returns the IRLS weight `rho'(s)` that
+/// scales the residual/Jacobian rows (applied as `sqrt(weight)`), and `cost`
+/// returns `0.5 * rho(s)` so the reported objective matches Ceres' cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BundleAdjustmentLoss {
+    /// `rho(s) = s` (plain squared error, no robustification).
+    Trivial,
+    /// Ceres `HuberLoss(scale)`.
+    Huber { scale: f64 },
+    /// Ceres `SoftLOneLoss(scale)`.
+    SoftL1 { scale: f64 },
+    /// Ceres `CauchyLoss(scale)` (COLMAP incremental mapper default).
+    Cauchy { scale: f64 },
+}
+
+impl BundleAdjustmentLoss {
+    /// IRLS weight `rho'(s)` for a squared residual `s = ||r||^2`.
+    #[inline]
+    pub fn weight(self, s: f64) -> f64 {
+        let s = s.max(0.0);
+        match self {
+            Self::Trivial => 1.0,
+            Self::Huber { scale } => {
+                let b2 = scale * scale;
+                if s <= b2 {
+                    1.0
+                } else {
+                    (scale / s.max(1.0e-24).sqrt()).max(0.0)
+                }
+            }
+            Self::SoftL1 { scale } => {
+                let a2 = (scale * scale).max(1.0e-24);
+                1.0 / (1.0 + s / a2).sqrt()
+            }
+            Self::Cauchy { scale } => {
+                let a2 = (scale * scale).max(1.0e-24);
+                1.0 / (1.0 + s / a2)
+            }
+        }
+    }
+
+    /// Ceres objective contribution `0.5 * rho(s)` for `s = ||r||^2`.
+    #[inline]
+    pub fn cost(self, s: f64) -> f64 {
+        let s = s.max(0.0);
+        match self {
+            Self::Trivial => 0.5 * s,
+            Self::Huber { scale } => {
+                let b2 = scale * scale;
+                if s <= b2 {
+                    0.5 * s
+                } else {
+                    scale * s.sqrt() - 0.5 * b2
+                }
+            }
+            Self::SoftL1 { scale } => {
+                let a2 = (scale * scale).max(1.0e-24);
+                a2 * ((1.0 + s / a2).sqrt() - 1.0)
+            }
+            Self::Cauchy { scale } => {
+                let a2 = (scale * scale).max(1.0e-24);
+                0.5 * a2 * (1.0 + s / a2).ln()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BundleAdjustmentOptions {
     pub iterations: usize,
@@ -28,7 +99,7 @@ pub struct BundleAdjustmentOptions {
     pub max_linear_solver_iterations: usize,
     pub max_num_consecutive_invalid_steps: usize,
     pub max_consecutive_nonmonotonic_steps: usize,
-    pub huber_delta_px: f64,
+    pub loss_function: BundleAdjustmentLoss,
     pub max_observation_error_px: f64,
     pub variable_images: Option<Vec<usize>>,
     pub constant_images: Vec<usize>,
@@ -55,7 +126,7 @@ impl Default for BundleAdjustmentOptions {
             max_linear_solver_iterations: 200,
             max_num_consecutive_invalid_steps: 10,
             max_consecutive_nonmonotonic_steps: 10,
-            huber_delta_px: 4.0,
+            loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
             max_observation_error_px: 16.0,
             variable_images: None,
             constant_images: Vec::new(),
@@ -230,7 +301,7 @@ pub fn refine_bundle_adjustment(
     let initial_poses = reconstruction.poses.clone();
     let initial_frames = reconstruction.frames.clone();
     sync_frame_pose_blocks_from_images(reconstruction, &pose_blocks);
-    let initial_cost = total_cost(reconstruction, &observations, options.huber_delta_px);
+    let initial_cost = total_cost(reconstruction, &observations, options.loss_function);
     if !initial_cost.is_finite() {
         reconstruction.poses.clone_from_slice(&initial_poses);
         reconstruction.frames.clone_from_slice(&initial_frames);
@@ -263,7 +334,7 @@ pub fn refine_bundle_adjustment(
             &sensor_pose_specs,
             &camera_param_specs,
             &constant_point_filter,
-            options.huber_delta_px,
+            options.loss_function,
             damping,
         ) else {
             linearization_failures += 1;
@@ -344,7 +415,7 @@ pub fn refine_bundle_adjustment(
                 &delta,
                 step,
             );
-            let candidate_cost = total_cost(reconstruction, &observations, options.huber_delta_px);
+            let candidate_cost = total_cost(reconstruction, &observations, options.loss_function);
             let actual_decrease = final_cost - candidate_cost;
             step_quality = step_quality_ratio(actual_decrease, predicted_decrease);
             if candidate_cost.is_finite()
@@ -610,8 +681,19 @@ fn solve_linear_system(
             iterations: 0,
         };
     }
+    let rhs = -gradient;
+    // The LM-damped reduced camera matrix (Schur complement) is symmetric
+    // positive definite, so prefer a Cholesky factorization like Ceres'
+    // DENSE_SCHUR / SPARSE_SCHUR linear solvers. Fall back to LU only when the
+    // factorization fails on an ill-conditioned or indefinite system.
+    if let Some(cholesky) = hessian.clone().cholesky() {
+        return LinearSolveResult {
+            delta: Some(cholesky.solve(&rhs)),
+            iterations: 1,
+        };
+    }
     LinearSolveResult {
-        delta: hessian.clone().lu().solve(&(-gradient)),
+        delta: hessian.clone().lu().solve(&rhs),
         iterations: 1,
     }
 }
@@ -1190,7 +1272,7 @@ fn build_schur_system(
     sensor_pose_specs: &[SensorPoseSpec],
     camera_param_specs: &[CameraParamSpec],
     constant_point_filter: &HashSet<usize>,
-    huber_delta_px: f64,
+    loss_function: BundleAdjustmentLoss,
     damping: f64,
 ) -> Option<SchurSystem> {
     let mut camera_param_lookup = vec![
@@ -1231,7 +1313,7 @@ fn build_schur_system(
             obs.xy,
         )?;
         let err = residual.norm();
-        let weight = huber_weight(err, huber_delta_px);
+        let weight = loss_function.weight(err * err);
         let sqrt_w = weight.sqrt();
         let residual = residual * sqrt_w;
         let j_pose = j_pose * sqrt_w;
@@ -3057,7 +3139,7 @@ fn apply_pose_delta_f64(pose: SE3, delta: Vec6) -> SE3 {
 fn total_cost(
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
-    huber_delta_px: f64,
+    loss_function: BundleAdjustmentLoss,
 ) -> f64 {
     let mut total = 0.0;
     let mut count = 0usize;
@@ -3073,9 +3155,9 @@ fn total_cost(
         else {
             continue;
         };
-        let err = ((predicted[0] - obs.xy[0]).powi(2) + (predicted[1] - obs.xy[1]).powi(2)).sqrt();
-        if err.is_finite() {
-            total += huber_cost(err, huber_delta_px);
+        let s = (predicted[0] - obs.xy[0]).powi(2) + (predicted[1] - obs.xy[1]).powi(2);
+        if s.is_finite() {
+            total += loss_function.cost(s);
             count += 1;
         }
     }
@@ -3083,22 +3165,6 @@ fn total_cost(
         f64::INFINITY
     } else {
         total / count as f64
-    }
-}
-
-fn huber_weight(err: f64, delta: f64) -> f64 {
-    if err <= delta {
-        1.0
-    } else {
-        delta / err.max(1.0e-12)
-    }
-}
-
-fn huber_cost(err: f64, delta: f64) -> f64 {
-    if err <= delta {
-        0.5 * err * err
-    } else {
-        delta * (err - 0.5 * delta)
     }
 }
 
@@ -3188,11 +3254,72 @@ mod tests {
     }
 
     #[test]
+    fn loss_functions_match_ceres_rho_and_weight_formulas() {
+        let scale = 2.0;
+        let a2 = scale * scale;
+
+        // Inlier region: s <= scale^2 → all robust losses behave near-quadratic
+        // and Huber matches trivial exactly.
+        let s_in = 1.0;
+        assert!((BundleAdjustmentLoss::Trivial.weight(s_in) - 1.0).abs() < 1e-12);
+        assert!((BundleAdjustmentLoss::Huber { scale }.weight(s_in) - 1.0).abs() < 1e-12);
+        assert!((BundleAdjustmentLoss::Trivial.cost(s_in) - 0.5 * s_in).abs() < 1e-12);
+        assert!(
+            (BundleAdjustmentLoss::Huber { scale }.cost(s_in) - 0.5 * s_in).abs() < 1e-12
+        );
+
+        // Outlier region: s > scale^2.
+        let s_out = 16.0; // err = 4, scale = 2
+        let huber_w = BundleAdjustmentLoss::Huber { scale }.weight(s_out);
+        assert!((huber_w - scale / s_out.sqrt()).abs() < 1e-12);
+        let huber_c = BundleAdjustmentLoss::Huber { scale }.cost(s_out);
+        assert!((huber_c - (scale * s_out.sqrt() - 0.5 * a2)).abs() < 1e-12);
+
+        let cauchy_w = BundleAdjustmentLoss::Cauchy { scale }.weight(s_out);
+        assert!((cauchy_w - 1.0 / (1.0 + s_out / a2)).abs() < 1e-12);
+        let cauchy_c = BundleAdjustmentLoss::Cauchy { scale }.cost(s_out);
+        assert!((cauchy_c - 0.5 * a2 * (1.0 + s_out / a2).ln()).abs() < 1e-12);
+
+        let soft_w = BundleAdjustmentLoss::SoftL1 { scale }.weight(s_out);
+        assert!((soft_w - 1.0 / (1.0 + s_out / a2).sqrt()).abs() < 1e-12);
+        let soft_c = BundleAdjustmentLoss::SoftL1 { scale }.cost(s_out);
+        assert!((soft_c - a2 * ((1.0 + s_out / a2).sqrt() - 1.0)).abs() < 1e-12);
+
+        // Robust losses must down-weight large residuals more aggressively than
+        // Huber, and all weights are in (0, 1].
+        assert!(cauchy_w < soft_w);
+        assert!(soft_w < huber_w);
+        assert!(cauchy_w > 0.0 && huber_w <= 1.0);
+    }
+
+    #[test]
     fn trust_region_quality_updates_damping() {
         assert_eq!(update_damping_after_step(1.0e-3, 0.9), 5.0e-4);
         assert_eq!(update_damping_after_step(1.0e-3, 0.5), 1.0e-3);
         assert_eq!(update_damping_after_step(1.0e-3, 0.1), 2.0e-3);
         assert_eq!(update_damping_after_step(1.0e-10, 0.9), 1.0e-8);
+    }
+
+    #[test]
+    fn solve_linear_system_uses_cholesky_for_spd_reduced_camera_matrix() {
+        // A symmetric positive definite reduced camera matrix solves the same
+        // via Ceres-style Cholesky as via the LU fallback.
+        let hessian = DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0]);
+        let expected = DVector::from_column_slice(&[1.0, -2.0, 0.5]);
+        let gradient = -(&hessian * &expected);
+
+        let result = solve_linear_system(&hessian, &gradient, 1);
+        let delta = result.delta.expect("SPD system must solve");
+        assert_eq!(result.iterations, 1);
+        for i in 0..3 {
+            assert!((delta[i] - expected[i]).abs() < 1e-9);
+        }
+
+        // A zero iteration budget yields no step, matching Ceres' zero
+        // linear-solver iteration guard.
+        let none = solve_linear_system(&hessian, &gradient, 0);
+        assert!(none.delta.is_none());
+        assert_eq!(none.iterations, 0);
     }
 
     #[test]
@@ -3531,7 +3658,7 @@ mod tests {
             &mut reconstruction,
             BundleAdjustmentOptions {
                 iterations: 2,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(vec![1]),
                 constant_images: vec![0],
@@ -3801,7 +3928,7 @@ mod tests {
             &mut reconstruction,
             BundleAdjustmentOptions {
                 iterations: 4,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 200.0,
                 variable_images: Some(vec![0, 1]),
                 constant_images: vec![2],
@@ -3839,7 +3966,7 @@ mod tests {
             &mut reconstruction,
             BundleAdjustmentOptions {
                 iterations: 8,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 200.0,
                 variable_images: Some(vec![0, 1]),
                 constant_images: vec![2, 3],
@@ -3871,7 +3998,7 @@ mod tests {
             &mut reconstruction,
             BundleAdjustmentOptions {
                 iterations: 4,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 200.0,
                 variable_images: Some(vec![0, 1]),
                 constant_images: vec![2, 3],
@@ -3957,7 +4084,7 @@ mod tests {
             &mut reconstruction,
             BundleAdjustmentOptions {
                 iterations: 3,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(vec![1]),
                 constant_images: vec![0],
@@ -4124,7 +4251,7 @@ mod tests {
             &mut reconstruction,
             BundleAdjustmentOptions {
                 iterations: 8,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(Vec::new()),
                 variable_cameras: Some(vec![0]),
@@ -4218,7 +4345,7 @@ mod tests {
                 iterations: 8,
                 function_tolerance: 1.0,
                 gradient_tolerance: 0.0,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(Vec::new()),
                 variable_cameras: Some(vec![0]),
@@ -4302,7 +4429,7 @@ mod tests {
                 iterations: 8,
                 gradient_tolerance: 0.0,
                 parameter_tolerance: 1.0e6,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(Vec::new()),
                 variable_cameras: Some(vec![0]),
@@ -4389,7 +4516,7 @@ mod tests {
                 gradient_tolerance: 0.0,
                 max_linear_solver_iterations: 0,
                 max_num_consecutive_invalid_steps: 1,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(Vec::new()),
                 variable_cameras: Some(vec![0]),
@@ -4473,7 +4600,7 @@ mod tests {
             &mut reconstruction,
             BundleAdjustmentOptions {
                 iterations: 0,
-                huber_delta_px: 4.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(vec![1]),
                 constant_images: vec![0],

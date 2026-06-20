@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rustsfm::{
-    compare_colmap, compare_database_parity, run_reconstruction, FeatureType, MapperConfig,
-};
+use rustsfm::feature_matching::MatchingPairStrategy;
+use rustsfm::{compare_colmap, compare_database_parity, run_reconstruction, FeatureType, MapperConfig};
+use rustsfm::sift::SiftMatchingOptions;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -31,6 +31,8 @@ struct ReconstructArgs {
     database: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     write_two_view_geometries: bool,
+    #[arg(long, default_value_t = false)]
+    write_database: bool,
     #[arg(long)]
     max_images: Option<usize>,
     #[arg(long, default_value_t = false)]
@@ -57,6 +59,20 @@ struct ReconstructArgs {
     local_matching: bool,
     #[arg(long, default_value = "3")]
     local_window: usize,
+    #[arg(long, default_value = "sequential")]
+    matching_strategy: String,
+    #[arg(long, default_value = "10")]
+    sequential_overlap: usize,
+    #[arg(long, default_value_t = true)]
+    sequential_quadratic_overlap: bool,
+    #[arg(long, default_value_t = false)]
+    sequential_loop_detection: bool,
+    #[arg(long, default_value = "10")]
+    sequential_loop_detection_period: usize,
+    #[arg(long, default_value_t = false)]
+    guided_matching: bool,
+    #[arg(long, default_value = "2.0")]
+    guided_max_epipolar_error_px: f32,
     #[arg(long, default_value_t = false)]
     experimental_sequence_heuristics: bool,
     #[arg(long, default_value_t = false)]
@@ -202,12 +218,26 @@ fn main() -> Result<()> {
             env_logger::Builder::new()
                 .parse_filters(&args.log_level)
                 .init();
+            let matching_pair_strategy = match args.matching_strategy.to_ascii_lowercase().as_str()
+            {
+                "exhaustive" => MatchingPairStrategy::Exhaustive,
+                "local-window" | "local_window" => MatchingPairStrategy::LocalWindow {
+                    window: args.local_window.max(1),
+                },
+                _ => MatchingPairStrategy::Sequential {
+                    overlap: args.sequential_overlap.max(1),
+                    quadratic_overlap: args.sequential_quadratic_overlap,
+                    loop_detection: args.sequential_loop_detection,
+                    loop_detection_period: args.sequential_loop_detection_period.max(1),
+                },
+            };
             let config = MapperConfig {
                 input: args.input,
                 output: args.output,
                 reference: args.reference,
                 database: args.database,
                 write_two_view_geometries: args.write_two_view_geometries,
+                write_database: args.write_database,
                 max_images: args.max_images,
                 multiple_models: !args.single_model,
                 max_num_models: args.max_num_models,
@@ -223,6 +253,12 @@ fn main() -> Result<()> {
                 max_hamming_distance: args.max_hamming_distance,
                 local_matching: args.local_matching,
                 local_window: args.local_window,
+                matching_pair_strategy,
+                sift_matching: SiftMatchingOptions {
+                    guided_matching: args.guided_matching,
+                    max_guided_epipolar_error_px: args.guided_max_epipolar_error_px,
+                    ..Default::default()
+                },
                 experimental_sequence_heuristics: args.experimental_sequence_heuristics,
                 experimental_ring_closure: args.experimental_ring_closure,
                 experimental_structureless_pair_pose_fallback: args

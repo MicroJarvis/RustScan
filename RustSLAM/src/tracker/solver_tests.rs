@@ -5,8 +5,9 @@
 #[cfg(test)]
 mod tests {
     use crate::core::SE3;
+    use crate::colmap_rng::ColmapMt19937;
     use crate::tracker::solver::{
-        compute_ransac_num_trials, ColmapRng, EssentialSolver, PnPProblem, PnPSolver, Sim3Solver,
+        compute_ransac_num_trials, EssentialSolver, PnPProblem, PnPSolver, Sim3Solver,
         Triangulator,
     };
     use glam::{Mat3, Vec3};
@@ -40,7 +41,7 @@ mod tests {
 
     #[test]
     fn test_colmap_rng_matches_mt19937_reference_outputs() {
-        let mut rng = ColmapRng::new(0);
+        let mut rng = ColmapMt19937::new(0);
         let outputs = [
             rng.next_u32(),
             rng.next_u32(),

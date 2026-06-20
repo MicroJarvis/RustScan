@@ -5,7 +5,14 @@ use crate::colmap::{
     ColmapSensorId, ColmapSensorType,
 };
 use crate::correspondence_graph::{image_pair_to_pair_id, ImagePairId};
-use crate::database::{ColmapDatabase, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions};
+use crate::correspondence_graph::FeatureMatch;
+use crate::database::{
+    ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors,
+    ColmapKeypoint, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions,
+    COLMAP_FEATURE_SIFT,
+};
+use crate::colmap::ColmapCamera;
+use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::generalized_pose::{
     estimate_generalized_absolute_pose, estimate_structureless_absolute_pose,
     GeneralizedAbsolutePoseEstimationOptions, GeneralizedAbsolutePoseProblem, GeneralizedPoseError,
@@ -23,7 +30,8 @@ use crate::incremental_triangulator::{
 use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
 use crate::sift::{
-    extract_sift_features_with_options, match_sift_with_options, SiftExtractionOptions,
+    extract_sift_features_with_options, match_sift_guided_with_options, match_sift_with_options,
+    SiftExtractionOptions,
     SiftMatchingOptions,
 };
 use crate::types::{
@@ -492,6 +500,7 @@ pub struct MapperConfig {
     pub reference: Option<PathBuf>,
     pub database: Option<PathBuf>,
     pub write_two_view_geometries: bool,
+    pub write_database: bool,
     pub max_images: Option<usize>,
     pub multiple_models: bool,
     pub max_num_models: usize,
@@ -509,6 +518,7 @@ pub struct MapperConfig {
     pub max_hamming_distance: f32,
     pub local_matching: bool,
     pub local_window: usize,
+    pub matching_pair_strategy: MatchingPairStrategy,
     pub experimental_sequence_heuristics: bool,
     pub experimental_ring_closure: bool,
     pub experimental_structureless_pair_pose_fallback: bool,
@@ -567,6 +577,7 @@ impl Default for MapperConfig {
             reference: None,
             database: None,
             write_two_view_geometries: false,
+            write_database: false,
             max_images: None,
             multiple_models: true,
             max_num_models: 50,
@@ -584,6 +595,7 @@ impl Default for MapperConfig {
             max_hamming_distance: 160.0,
             local_matching: false,
             local_window: 0,
+            matching_pair_strategy: MatchingPairStrategy::default(),
             experimental_sequence_heuristics: false,
             experimental_ring_closure: false,
             experimental_structureless_pair_pose_fallback: false,
@@ -731,8 +743,11 @@ fn run_reconstruction_impl(
         &sift_extraction,
     )?;
     let database_path = resolve_mapper_database_path(config)?;
-    let mapper_database =
-        load_mapper_database(database_path.as_deref(), &frames, config.min_matches)?;
+    let mapper_database = if database_path.as_ref().is_some_and(|path| path.exists()) {
+        load_mapper_database(database_path.as_deref(), &frames, config.min_matches)?
+    } else {
+        None
+    };
     if let Some(database) = mapper_database.as_ref() {
         apply_database_keypoints(&mut frames, &database.keypoints_by_name);
         if reference_camera_setup.is_none() {
@@ -823,6 +838,18 @@ fn run_reconstruction_impl(
         } else {
             debug_log
                 .push("database_two_view_geometries_written=0 database_path=<none>".to_string());
+        }
+    }
+    if config.write_database && config.local_matching {
+        if let Some(path) = database_path.as_ref() {
+            let setup = reference_camera_setup.as_ref().with_context(|| {
+                "local matching database write requires per-image camera setup".to_string()
+            })?;
+            let written =
+                populate_local_matching_database(path, &frames, setup, &pairs, config.feature_type)?;
+            debug_log.push(format!("database_populated_entries={written}"));
+        } else {
+            debug_log.push("database_populated_entries=0 database_path=<none>".to_string());
         }
     }
     if let Some(reference) = &config.reference {
@@ -965,6 +992,9 @@ fn collect_images(input: &Path, max_images: Option<usize>) -> Result<Vec<PathBuf
 fn resolve_mapper_database_path(config: &MapperConfig) -> Result<Option<PathBuf>> {
     if let Some(database) = &config.database {
         if !database.exists() {
+            if config.write_database && config.local_matching {
+                return Ok(Some(database.clone()));
+            }
             bail!("database path does not exist: {}", database.display());
         }
         return Ok(Some(database.clone()));
@@ -974,6 +1004,10 @@ fn resolve_mapper_database_path(config: &MapperConfig) -> Result<Option<PathBuf>
         if candidate.exists() {
             return Ok(Some(candidate));
         }
+    }
+
+    if config.write_database && config.local_matching {
+        return Ok(Some(config.input.join("database.db")));
     }
 
     Ok(None)
@@ -1541,6 +1575,37 @@ fn global_ba_huber_delta_px() -> f64 {
         .unwrap_or(4.0)
 }
 
+/// COLMAP's incremental mapper uses a Cauchy robust loss with scale 1.0 for both
+/// local and global bundle adjustment. The loss type and scale can be overridden
+/// via `RUSTSFM_BA_LOSS` (`trivial|huber|softl1|cauchy`) and
+/// `RUSTSFM_BA_LOSS_SCALE`; for backward compatibility a `huber` selection still
+/// honors `RUSTSFM_BA_HUBER_PX` when no explicit scale is provided.
+fn mapper_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
+    use crate::ba::BundleAdjustmentLoss;
+    let kind = std::env::var("RUSTSFM_BA_LOSS")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let scale_override = std::env::var("RUSTSFM_BA_LOSS_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    match kind.as_deref() {
+        Some("trivial") => BundleAdjustmentLoss::Trivial,
+        Some("huber") => BundleAdjustmentLoss::Huber {
+            scale: scale_override.unwrap_or_else(global_ba_huber_delta_px),
+        },
+        Some("softl1") | Some("soft_l1") => BundleAdjustmentLoss::SoftL1 {
+            scale: scale_override.unwrap_or(1.0),
+        },
+        Some("cauchy") | None => BundleAdjustmentLoss::Cauchy {
+            scale: scale_override.unwrap_or(1.0),
+        },
+        Some(_) => BundleAdjustmentLoss::Cauchy {
+            scale: scale_override.unwrap_or(1.0),
+        },
+    }
+}
+
 fn global_ba_max_observation_error_px(config: &MapperConfig) -> f64 {
     std::env::var("RUSTSFM_BA_MAX_OBS_ERROR_PX")
         .ok()
@@ -1561,7 +1626,7 @@ fn mapper_ba_options(
     let constant_images = expanded_constant_images(reconstruction, constant_images);
     let mut options = crate::ba::BundleAdjustmentOptions {
         iterations,
-        huber_delta_px: global_ba_huber_delta_px(),
+        loss_function: mapper_ba_loss_function(),
         max_observation_error_px: global_ba_max_observation_error_px(config),
         variable_images,
         constant_images,
@@ -2101,11 +2166,10 @@ fn build_pair_graph(
     sift_matching: &SiftMatchingOptions,
 ) -> Result<Vec<PairGeometry>> {
     let matcher = HammingMatcher::new(2).with_ratio_threshold(config.match_ratio);
-    let candidates = local_pair_candidates(
-        frames.len(),
-        config.local_window,
-        config.experimental_sequence_heuristics,
-    );
+    let mut candidates = generate_matching_pairs(frames.len(), config.matching_pair_strategy);
+    if config.experimental_sequence_heuristics {
+        add_segment_bridge_candidates(frames.len(), &mut candidates);
+    }
     let mut pairs = candidates
         .par_iter()
         .filter_map(|&(left, right)| {
@@ -2157,15 +2221,12 @@ fn local_pair_candidates(
     local_window: usize,
     experimental_sequence_heuristics: bool,
 ) -> Vec<(usize, usize)> {
-    let mut candidates = Vec::new();
-    if frame_count < 2 || local_window == 0 {
-        return candidates;
-    }
-    for offset in 1..=local_window.min(frame_count - 1) {
-        for left in 0..frame_count - offset {
-            candidates.push((left, left + offset));
-        }
-    }
+    let mut candidates = generate_matching_pairs(
+        frame_count,
+        MatchingPairStrategy::LocalWindow {
+            window: local_window,
+        },
+    );
     if experimental_sequence_heuristics {
         add_segment_bridge_candidates(frame_count, &mut candidates);
     }
@@ -2258,6 +2319,126 @@ fn write_pair_geometries_to_database(
         written += 1;
     }
     Ok(written)
+}
+
+fn populate_local_matching_database(
+    database_path: &Path,
+    frames: &[ImageFrame],
+    setup: &ReferenceCameraSetup,
+    pairs: &[PairGeometry],
+    feature_type: FeatureType,
+) -> Result<usize> {
+    if let Some(parent) = database_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let db = ColmapDatabase::open(database_path)?;
+    let mut written = 0usize;
+    for (camera_idx, camera) in setup.cameras.iter().enumerate() {
+        let camera_id = setup.camera_ids[camera_idx];
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id,
+                    model_id: camera.model_id,
+                    width: camera.width,
+                    height: camera.height,
+                    params: camera.params[..camera.num_params].to_vec(),
+                },
+                has_prior_focal_length: setup
+                    .camera_has_prior_focal_length
+                    .get(camera_idx)
+                    .copied()
+                    .unwrap_or(true),
+            },
+            true,
+        )?;
+        written += 1;
+    }
+    for (frame_idx, frame) in frames.iter().enumerate() {
+        let image_id = setup.image_ids[frame_idx];
+        let camera_id = setup.camera_ids[setup.image_camera_indices[frame_idx]];
+        db.write_image(
+            &ColmapDatabaseImage {
+                image_id,
+                name: frame.name.clone(),
+                camera_id,
+                frame_id: None,
+            },
+            true,
+        )?;
+        written += 1;
+        let keypoints = frame_keypoints_for_database(frame, feature_type);
+        db.write_keypoints(image_id, &keypoints)?;
+        written += 1;
+        let descriptors = frame_descriptors_for_database(frame, feature_type)?;
+        db.write_descriptors(image_id, &descriptors)?;
+        written += 1;
+    }
+    for pair in pairs {
+        let left_image_id = setup.image_ids[pair.left];
+        let right_image_id = setup.image_ids[pair.right];
+        let matches = pair
+            .matches
+            .iter()
+            .map(|match_| FeatureMatch {
+                point2d_idx1: match_.query_idx,
+                point2d_idx2: match_.train_idx,
+            })
+            .collect::<Vec<_>>();
+        if db.exists_matches(left_image_id, right_image_id)? {
+            db.delete_matches(left_image_id, right_image_id)?;
+        }
+        if !matches.is_empty() {
+            db.write_matches(left_image_id, right_image_id, &matches)?;
+            written += 1;
+        }
+        let geometry = pair_geometry_to_colmap_two_view_geometry(pair);
+        if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+            db.update_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+        } else {
+            db.write_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+        }
+        written += 1;
+    }
+    Ok(written)
+}
+
+fn frame_keypoints_for_database(frame: &ImageFrame, feature_type: FeatureType) -> Vec<ColmapKeypoint> {
+    match feature_type {
+        FeatureType::Sift => frame
+            .sift
+            .keypoints
+            .iter()
+            .map(ColmapKeypoint::from)
+            .collect(),
+        FeatureType::Orb => frame.keypoints.iter().map(ColmapKeypoint::from).collect(),
+    }
+}
+
+fn frame_descriptors_for_database(
+    frame: &ImageFrame,
+    feature_type: FeatureType,
+) -> Result<ColmapDescriptors> {
+    match feature_type {
+        FeatureType::Sift => {
+            let rows = frame.sift.descriptors.len();
+            const DESCRIPTOR_LEN: usize = 128;
+            let cols = DESCRIPTOR_LEN;
+            let mut data = Vec::with_capacity(rows.saturating_mul(cols));
+            for descriptor in &frame.sift.descriptors {
+                for value in descriptor.as_slice() {
+                    data.push((value.clamp(0.0, 1.0) * 512.0).round() as u8);
+                }
+            }
+            ColmapDescriptors::new(COLMAP_FEATURE_SIFT, rows, cols, data)
+        }
+        FeatureType::Orb => Ok(ColmapDescriptors::from_rustslam(
+            COLMAP_FEATURE_SIFT,
+            &frame.descriptors,
+        )),
+    }
 }
 
 #[allow(dead_code)]
@@ -2586,6 +2767,38 @@ fn estimate_candidate_pair(
             config.min_triangulated,
         )
     }?;
+    if config.feature_type == FeatureType::Sift
+        && sift_matching.guided_matching
+        && !is_ring_bridge_candidate(left, right)
+    {
+        if let Some(f_matrix) = pair.f_matrix {
+            let guided = match_sift_guided_with_options(
+                &frames[left].sift,
+                &frames[right].sift,
+                &f_matrix,
+                sift_matching,
+            );
+            if guided.len() >= config.min_matches {
+                if let Some(refined) = estimate_pair_geometry_with_cameras(
+                    left,
+                    right,
+                    &frames[left],
+                    &frames[right],
+                    &guided,
+                    left_camera,
+                    right_camera,
+                    config.essential_threshold_px,
+                    config.essential_iterations,
+                    config.min_inliers,
+                    config.min_triangulated,
+                ) {
+                    if refined.inliers >= pair.inliers {
+                        pair = refined;
+                    }
+                }
+            }
+        }
+    }
     if is_ring_bridge_candidate(left, right) {
         pair.pose_graph_only = true;
     }
@@ -4415,6 +4628,30 @@ fn structureless_registration_enabled(config: &MapperConfig) -> bool {
     config.experimental_structureless_pair_pose_fallback || cfg!(feature = "poselib")
 }
 
+fn registration_unit_num_visible_points3d(
+    reconstruction: &Reconstruction,
+    image: usize,
+    obs_manager: &ObservationManager,
+) -> usize {
+    reconstruction
+        .image_indices_for_registration_unit(image)
+        .iter()
+        .map(|&frame_image| obs_manager.num_visible_points3d(frame_image))
+        .sum()
+}
+
+fn registration_unit_num_visible_correspondences(
+    reconstruction: &Reconstruction,
+    image: usize,
+    obs_manager: &ObservationManager,
+) -> usize {
+    reconstruction
+        .image_indices_for_registration_unit(image)
+        .iter()
+        .map(|&frame_image| obs_manager.num_visible_correspondences(frame_image))
+        .sum()
+}
+
 fn find_next_registration_images(
     reconstruction: &Reconstruction,
     reg_trials: &[usize],
@@ -4425,7 +4662,12 @@ fn find_next_registration_images(
 ) -> Vec<usize> {
     let mut image_ranks = Vec::<(usize, f32)>::new();
     let mut other_image_ranks = Vec::<(usize, f32)>::new();
+    let mut seen_units = HashSet::new();
     for image in 0..reconstruction.poses.len() {
+        let unit_key = registration_unit_key(reconstruction, image);
+        if !seen_units.insert(unit_key) {
+            continue;
+        }
         if registration_unit_is_registered(reconstruction, image) {
             continue;
         }
@@ -4435,18 +4677,21 @@ fn find_next_registration_images(
         }
         let rank = match mode {
             NextImageRegistrationMode::StructureBased => {
-                if obs_manager.num_visible_points3d(image) < config.abs_pose_min_num_inliers {
+                if registration_unit_num_visible_points3d(reconstruction, image, obs_manager)
+                    < config.abs_pose_min_num_inliers
+                {
                     continue;
                 }
-                next_image_rank(image, obs_manager, config)
+                next_image_rank(reconstruction, image, obs_manager, config)
             }
             NextImageRegistrationMode::StructureLess => {
-                if obs_manager.num_visible_correspondences(image)
+                if registration_unit_num_visible_correspondences(reconstruction, image, obs_manager)
                     < structureless_min_num_inliers(config)
                 {
                     continue;
                 }
-                obs_manager.num_visible_correspondences(image) as f32
+                registration_unit_num_visible_correspondences(reconstruction, image, obs_manager)
+                    as f32
             }
         };
         if filtered_units.contains(&registration_unit_key(reconstruction, image)) || num_trials > 0
@@ -4560,27 +4805,52 @@ fn registration_choice_for_image(
     })
 }
 
-fn next_image_rank(image: usize, obs_manager: &ObservationManager, config: &MapperConfig) -> f32 {
+fn next_image_rank(
+    reconstruction: &Reconstruction,
+    image: usize,
+    obs_manager: &ObservationManager,
+    config: &MapperConfig,
+) -> f32 {
+    let unit_images = reconstruction.image_indices_for_registration_unit(image);
     match config.image_selection_method {
-        ImageSelectionMethod::MaxVisiblePointsNum => obs_manager.num_visible_points3d(image) as f32,
+        ImageSelectionMethod::MaxVisiblePointsNum => unit_images
+            .iter()
+            .map(|&frame_image| obs_manager.num_visible_points3d(frame_image))
+            .sum::<usize>() as f32,
         ImageSelectionMethod::MaxVisiblePointsRatio => {
-            let observations = obs_manager.num_observations(image).max(1) as f32;
-            obs_manager.num_visible_points3d(image) as f32 / observations
+            let visible = unit_images
+                .iter()
+                .map(|&frame_image| obs_manager.num_visible_points3d(frame_image))
+                .sum::<usize>() as f32;
+            let observations = unit_images
+                .iter()
+                .map(|&frame_image| obs_manager.num_observations(frame_image))
+                .sum::<usize>()
+                .max(1) as f32;
+            visible / observations
         }
-        ImageSelectionMethod::MinUncertainty => obs_manager.point3d_visibility_score(image) as f32,
+        ImageSelectionMethod::MinUncertainty => unit_images
+            .iter()
+            .map(|&frame_image| obs_manager.point3d_visibility_score(frame_image))
+            .sum::<usize>() as f32,
     }
 }
 
 #[cfg(test)]
 fn registration_rank(
     choice: &RegistrationChoice,
+    reconstruction: &Reconstruction,
     obs_manager: &ObservationManager,
     config: &MapperConfig,
 ) -> f32 {
     if choice.source == "structureless" {
-        return obs_manager.num_visible_correspondences(choice.image) as f32;
+        return registration_unit_num_visible_correspondences(
+            reconstruction,
+            choice.image,
+            obs_manager,
+        ) as f32;
     }
-    next_image_rank(choice.image, obs_manager, config)
+    next_image_rank(reconstruction, choice.image, obs_manager, config)
 }
 
 fn mark_unregistered_images_with_no_absolute_pose(
@@ -5938,7 +6208,7 @@ fn refine_generalized_frame_absolute_pose(
         parameter_tolerance: 0.0,
         max_linear_solver_iterations: 100,
         max_observation_error_px: f64::INFINITY,
-        huber_delta_px: 1.0,
+        loss_function: crate::ba::BundleAdjustmentLoss::Huber { scale: 1.0 },
         variable_images: Some(variable_images),
         constant_cameras: (0..scratch.cameras.len()).collect(),
         point_ids: Some(constant_points.clone()),
@@ -6356,22 +6626,21 @@ fn solve_structureless_absolute_pose(
     camera_priors: &[CameraModel],
     registration_stats: &RegistrationStats,
 ) -> Option<AbsolutePose> {
-    if let Some(abs_pose) = solve_colmap_structureless_absolute_pose(
-        image,
-        frames,
-        pairs,
-        reconstruction,
-        config,
-        obs_manager,
-        camera_priors,
-        registration_stats,
-    ) {
-        return Some(abs_pose);
+    if config.experimental_structureless_pair_pose_fallback {
+        if let Some(abs_pose) = solve_experimental_structureless_pair_pose_fallback(
+            image,
+            frames,
+            pairs,
+            reconstruction,
+            config,
+            obs_manager,
+            camera_priors,
+            registration_stats,
+        ) {
+            return Some(abs_pose);
+        }
     }
-    if !config.experimental_structureless_pair_pose_fallback {
-        return None;
-    }
-    solve_experimental_structureless_pair_pose_fallback(
+    solve_colmap_structureless_absolute_pose(
         image,
         frames,
         pairs,
@@ -10280,6 +10549,22 @@ mod tests {
     }
 
     #[test]
+    fn mapper_ba_defaults_to_colmap_cauchy_loss() {
+        // COLMAP's incremental mapper uses a Cauchy robust loss with scale 1.0
+        // for both local and global bundle adjustment. Only assert when the
+        // environment overrides are unset so the test stays deterministic.
+        if std::env::var_os("RUSTSFM_BA_LOSS").is_some()
+            || std::env::var_os("RUSTSFM_BA_LOSS_SCALE").is_some()
+        {
+            return;
+        }
+        assert_eq!(
+            mapper_ba_loss_function(),
+            crate::ba::BundleAdjustmentLoss::Cauchy { scale: 1.0 }
+        );
+    }
+
+    #[test]
     fn mapper_absolute_pose_defaults_match_colmap_thresholds() {
         let config = MapperConfig::default();
 
@@ -11240,7 +11525,7 @@ mod tests {
             },
             crate::ba::BundleAdjustmentOptions {
                 iterations: 2,
-                huber_delta_px: 4.0,
+                loss_function: crate::ba::BundleAdjustmentLoss::Huber { scale: 4.0 },
                 max_observation_error_px: 50.0,
                 variable_images: Some(vec![1]),
                 constant_images: vec![0],
@@ -12702,6 +12987,64 @@ mod tests {
         assert_eq!(setup.cameras[1].height, 150);
         assert_eq!(setup.cameras[0].fx, 90.0);
         assert_eq!(setup.cameras[1].cx, 100.0);
+    }
+
+    #[test]
+    fn populate_local_matching_database_writes_features_matches_and_geometries() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        frames[0].sift.keypoints = frames[0].keypoints.clone();
+        frames[1].sift.keypoints = frames[1].keypoints.clone();
+        frames[0].sift.descriptors = vec![
+            lowe_sift::Descriptor::new([1.0; lowe_sift::DESCRIPTOR_LEN]),
+            lowe_sift::Descriptor::new([0.5; lowe_sift::DESCRIPTOR_LEN]),
+        ];
+        frames[1].sift.descriptors = vec![
+            lowe_sift::Descriptor::new([0.9; lowe_sift::DESCRIPTOR_LEN]),
+            lowe_sift::Descriptor::new([0.4; lowe_sift::DESCRIPTOR_LEN]),
+        ];
+        let setup = local_image_camera_setup(&frames, &MapperConfig::default());
+        let mut pair = pair_with_inliers(0, 1, &[(0, 1)]);
+        pair.matches = pair.inlier_matches.clone();
+        pair.two_view_config = crate::database::COLMAP_TWO_VIEW_CALIBRATED;
+        pair.qvec = Some([1.0, 0.0, 0.0, 0.0]);
+        pair.tvec = Some([0.0, 0.0, 1.0]);
+
+        let written = populate_local_matching_database(
+            &db_path,
+            &frames,
+            &setup,
+            std::slice::from_ref(&pair),
+            FeatureType::Sift,
+        )?;
+        assert!(written >= 7);
+
+        let db = ColmapDatabase::open(&db_path)?;
+        assert_eq!(db.read_all_cameras()?.len(), 2);
+        assert_eq!(db.read_all_images()?.len(), 2);
+        assert_eq!(db.read_keypoints(1)?.len(), 2);
+        assert_eq!(db.read_descriptors(1)?.rows, 2);
+        assert_eq!(db.read_matches(1, 2)?.len(), 1);
+        let geometry = db.read_two_view_geometry(1, 2)?;
+        assert_eq!(geometry.config, crate::database::COLMAP_TWO_VIEW_CALIBRATED);
+        assert_eq!(geometry.inlier_matches.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_mapper_database_path_allows_missing_output_for_local_write() -> Result<()> {
+        let dir = tempdir()?;
+        let missing = dir.path().join("new.db");
+        let config = MapperConfig {
+            input: dir.path().to_path_buf(),
+            database: Some(missing.clone()),
+            local_matching: true,
+            write_database: true,
+            ..MapperConfig::default()
+        };
+        assert_eq!(resolve_mapper_database_path(&config)?, Some(missing));
+        Ok(())
     }
 
     #[test]
@@ -14551,6 +14894,7 @@ mod tests {
         assert!(
             registration_rank(
                 &many_visible,
+                &reconstruction,
                 &manager,
                 &MapperConfig {
                     image_selection_method: ImageSelectionMethod::MaxVisiblePointsNum,
@@ -14558,6 +14902,7 @@ mod tests {
                 }
             ) > registration_rank(
                 &high_ratio,
+                &reconstruction,
                 &manager,
                 &MapperConfig {
                     image_selection_method: ImageSelectionMethod::MaxVisiblePointsNum,
@@ -14568,6 +14913,7 @@ mod tests {
         assert!(
             registration_rank(
                 &high_ratio,
+                &reconstruction,
                 &manager,
                 &MapperConfig {
                     image_selection_method: ImageSelectionMethod::MaxVisiblePointsRatio,
@@ -14575,6 +14921,7 @@ mod tests {
                 }
             ) > registration_rank(
                 &many_visible,
+                &reconstruction,
                 &manager,
                 &MapperConfig {
                     image_selection_method: ImageSelectionMethod::MaxVisiblePointsRatio,
@@ -14583,7 +14930,7 @@ mod tests {
             )
         );
         assert_eq!(
-            registration_rank(&many_visible, &manager, &MapperConfig::default()),
+            registration_rank(&many_visible, &reconstruction, &manager, &MapperConfig::default()),
             manager.point3d_visibility_score(1) as f32
         );
     }
@@ -14665,6 +15012,64 @@ mod tests {
         );
 
         assert_eq!(ranked, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn find_next_registration_images_deduplicates_rig_frame_siblings() {
+        let camera = CameraModel::new_pinhole(160, 120, 70.0, 70.0, 80.0, 60.0);
+        let mut frames = vec![
+            minimal_frame(0, "seed.jpg"),
+            minimal_frame(1, "rig_ref.jpg"),
+            minimal_frame(2, "rig_aux.jpg"),
+        ];
+        for frame in &mut frames {
+            frame.width = camera.width;
+            frame.height = camera.height;
+            frame.keypoints = (0..12)
+                .map(|idx| rustslam::KeyPoint::new(10.0 + idx as f32 * 4.0, 12.0))
+                .collect();
+            frame.colors = vec![[0, 0, 0]; frame.keypoints.len()];
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera, camera];
+        reconstruction.poses[0] = Some(SE3::identity());
+        attach_two_image_rig_frame(&mut reconstruction, 1, 2);
+        for idx in 0..12 {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.point_ids.push(idx as u64 + 1);
+            reconstruction.points.push(Point3D {
+                xyz: [idx as f32 * 0.05, 0.0, 2.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: idx,
+                }],
+            });
+        }
+        let matches = (0..12).map(|idx| (idx, idx)).collect::<Vec<_>>();
+        let pairs = vec![
+            pair_with_inliers(0, 1, &matches),
+            pair_with_inliers(0, 2, &matches),
+        ];
+        let obs_manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 20,
+            image_selection_method: ImageSelectionMethod::MaxVisiblePointsNum,
+            ..MapperConfig::default()
+        };
+
+        let ranked = find_next_registration_images(
+            &reconstruction,
+            &[0; 3],
+            &HashSet::new(),
+            &config,
+            &obs_manager,
+            NextImageRegistrationMode::StructureBased,
+        );
+
+        assert_eq!(ranked, vec![1]);
     }
 
     #[test]

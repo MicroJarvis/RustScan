@@ -3,7 +3,7 @@ use crate::geometry::relative_rotation_deg;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
-use rustslam::SE3;
+use rustslam::{ColmapRandomSampler, SE3};
 
 #[derive(Debug, Clone)]
 pub struct TwoViewOptions {
@@ -2359,6 +2359,8 @@ fn triangulate_normalized_pair(
     x1: &Vector3<f64>,
     x2: &Vector3<f64>,
 ) -> Option<Vector3<f64>> {
+    // First camera at the origin (`[I | 0]`), second at the relative pose
+    // `[R | t]`. Delegate the DLT to the COLMAP-faithful triangulation module.
     let p1 = Matrix3x4::<f64>::new(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0);
     let p2 = Matrix3x4::<f64>::new(
         r[(0, 0)],
@@ -2374,27 +2376,12 @@ fn triangulate_normalized_pair(
         r[(2, 2)],
         t.z,
     );
-    let mut rows = Vec::with_capacity(16);
-    for col in 0..4 {
-        rows.push(x1.x * p1[(2, col)] - p1[(0, col)]);
-    }
-    for col in 0..4 {
-        rows.push(x1.y * p1[(2, col)] - p1[(1, col)]);
-    }
-    for col in 0..4 {
-        rows.push(x2.x * p2[(2, col)] - p2[(0, col)]);
-    }
-    for col in 0..4 {
-        rows.push(x2.y * p2[(2, col)] - p2[(1, col)]);
-    }
-    let a = nalgebra::Matrix4::<f64>::from_row_slice(&rows);
-    let svd = a.svd(false, true);
-    let vt = svd.v_t?;
-    let x = vt.row(3);
-    if x[3].abs() <= 1.0e-12 || !x[3].is_finite() {
-        return None;
-    }
-    let point = Vector3::new(x[0] / x[3], x[1] / x[3], x[2] / x[3]);
+    let point = crate::triangulation::triangulate_point(
+        &p1,
+        &p2,
+        &nalgebra::Vector2::new(x1.x, x1.y),
+        &nalgebra::Vector2::new(x2.x, x2.y),
+    )?;
     point.iter().all(|v| v.is_finite()).then_some(point)
 }
 
@@ -2471,116 +2458,10 @@ fn matrix3_to_row_array(matrix: Matrix3<f64>) -> [f64; 9] {
     ]
 }
 
-struct ColmapMt19937 {
-    state: [u32; 624],
-    index: usize,
-}
-
-impl ColmapMt19937 {
-    fn new(seed: u64) -> Self {
-        let mut rng = Self {
-            state: [0; 624],
-            index: 624,
-        };
-        rng.state[0] = seed as u32;
-        for i in 1..624 {
-            rng.state[i] = 1_812_433_253u32
-                .wrapping_mul(rng.state[i - 1] ^ (rng.state[i - 1] >> 30))
-                .wrapping_add(i as u32);
-        }
-        rng
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        if self.index >= 624 {
-            self.twist();
-        }
-        let mut y = self.state[self.index];
-        self.index += 1;
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c_5680;
-        y ^= (y << 15) & 0xefc6_0000;
-        y ^ (y >> 18)
-    }
-
-    fn twist(&mut self) {
-        const UPPER_MASK: u32 = 0x8000_0000;
-        const LOWER_MASK: u32 = 0x7fff_ffff;
-        const MATRIX_A: u32 = 0x9908_b0df;
-
-        for i in 0..624 {
-            let x = (self.state[i] & UPPER_MASK) | (self.state[(i + 1) % 624] & LOWER_MASK);
-            let mut xa = x >> 1;
-            if x & 1 != 0 {
-                xa ^= MATRIX_A;
-            }
-            self.state[i] = self.state[(i + 397) % 624] ^ xa;
-        }
-        self.index = 0;
-    }
-
-    fn uniform_u32(&mut self, min: u32, max: u32) -> u32 {
-        let range = max.wrapping_sub(min).wrapping_add(1);
-        if range == 1 {
-            return min;
-        }
-        let width = if range == 0 {
-            u32::BITS
-        } else {
-            let floor_log2 = u32::BITS - range.leading_zeros() - 1;
-            let is_power_of_two = range & ((u32::MAX) >> (u32::BITS - floor_log2)) == 0;
-            floor_log2 + u32::from(!is_power_of_two)
-        };
-        loop {
-            let sample = self.independent_bits(width);
-            if range == 0 || sample < range {
-                return sample.wrapping_add(min);
-            }
-        }
-    }
-
-    fn independent_bits(&mut self, width: u32) -> u32 {
-        if width == 0 {
-            return 0;
-        }
-        let mask = if width < u32::BITS {
-            u32::MAX >> (u32::BITS - width)
-        } else {
-            u32::MAX
-        };
-        self.next_u32() & mask
-    }
-}
-
-struct ColmapRandomSampler {
-    rng: ColmapMt19937,
-    sample_indices: Vec<usize>,
-}
-
-impl ColmapRandomSampler {
-    fn new(seed: u64, indices: &[usize]) -> Self {
-        Self {
-            rng: ColmapMt19937::new(seed),
-            sample_indices: indices.to_vec(),
-        }
-    }
-
-    fn sample(&mut self, k: usize) -> Vec<usize> {
-        if k > self.sample_indices.len() {
-            return Vec::new();
-        }
-        let last = self.sample_indices.len() - 1;
-        for i in 0..k {
-            let j = self.rng.uniform_u32(i as u32, last as u32) as usize;
-            self.sample_indices.swap(i, j);
-        }
-        self.sample_indices[..k].to_vec()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustslam::{ColmapMt19937, ColmapRandomSampler};
 
     fn default_test_options() -> TwoViewOptions {
         TwoViewOptions {

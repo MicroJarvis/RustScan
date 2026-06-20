@@ -17,17 +17,21 @@ graph.
 Rust-estimated verified pair geometry can be written back to the COLMAP
 `two_view_geometries` table with `--write-two-view-geometries`; this is opt-in
 so the default reconstruction path does not mutate the input database.
+The local-matching fallback can also create a full COLMAP-style SQLite database
+(cameras, images, keypoints, descriptors, matches, two-view geometries) with
+`--local-matching --write-database [--database path/to/database.db]`.
 Generalized rig relative/absolute pose now follows COLMAP's panoramic-rig
 branches and can optionally use PoseLib's GR6P/GP3P minimal solvers plus a
 COLMAP-derived GR8P local refit bridge for non-panoramic rigs, with
 BA-backed pose-only generalized absolute-pose refinement for rig frames and
 COLMAP-style fallback to central PnP when a rig camera still needs focal-length
-estimation, by building with `--features poselib` and setting
-`POSELIB_ROOT=/path/to/PoseLib-2.0.5` (or placing PoseLib at
-`third_party/PoseLib`). This is a step toward COLMAP `CALIBRATED_RIG` parity;
-remaining compatibility work includes exact bit-level solver/random semantics,
-Ceres-equivalent generalized refinement behavior, and full mapper camera
-reset/refinement scheduling.
+estimation, by building with `--features poselib`. PoseLib v2.0.5 is fetched
+automatically from `third_party/PoseLib` when present, or via:
+
+```bash
+./scripts/setup_rustsfm_deps.sh
+cargo test -p rustsfm --features poselib --lib
+```
 Incremental registration is absolute-pose driven with COLMAP-style next-image
 ranking methods, registration trial bookkeeping, inlier-ratio checks, and
 pose-only reprojection refinement before accepting new images. Filtered or

@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use lowe_sift::{BbfConfig, Descriptor, Feature, GrayImage, Sift, SiftConfig};
 use rustslam::{KeyPoint, Match};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
 pub struct SiftFeatures {
@@ -88,6 +88,13 @@ impl SiftExtractionOptions {
         config.double_image = self.first_octave < 0;
         config.contrast_threshold = self.peak_threshold as f32;
         config.edge_threshold = self.edge_threshold as f32;
+        if self.upright || self.max_num_orientations <= 1 {
+            config.orientation_peak_ratio = 1.0;
+        } else if self.max_num_orientations == 2 {
+            config.orientation_peak_ratio = 0.8;
+        } else {
+            config.orientation_peak_ratio = 0.8;
+        }
         config
     }
 }
@@ -99,6 +106,7 @@ pub struct SiftMatchingOptions {
     pub cross_check: bool,
     pub max_num_matches: usize,
     pub guided_matching: bool,
+    pub max_guided_epipolar_error_px: f32,
 }
 
 impl Default for SiftMatchingOptions {
@@ -109,6 +117,7 @@ impl Default for SiftMatchingOptions {
             cross_check: true,
             max_num_matches: 32768,
             guided_matching: false,
+            max_guided_epipolar_error_px: 2.0,
         }
     }
 }
@@ -148,13 +157,18 @@ pub fn extract_sift_features_with_options(
     let gray = rgb_to_sift_gray(rgb, width, height)?;
     let mut features = Sift::new(options.to_lowe_config())?.detect_and_compute(&gray);
     features.sort_by(|a, b| {
-        b.keypoint
-            .response
-            .partial_cmp(&a.keypoint.response)
+        feature_scale(b)
+            .partial_cmp(&feature_scale(a))
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.keypoint
+                    .response
+                    .partial_cmp(&a.keypoint.response)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     features.truncate(options.max_num_features.min(features.len()));
-    Ok(features_from_lowe(features))
+    Ok(features_from_lowe(features, options))
 }
 
 pub fn match_sift_mutual(
@@ -233,10 +247,167 @@ pub fn match_sift_with_options(
     matches
 }
 
-fn features_from_lowe(features: Vec<Feature>) -> SiftFeatures {
+pub fn match_sift_guided_with_options(
+    left: &SiftFeatures,
+    right: &SiftFeatures,
+    f_matrix: &[f64; 9],
+    options: &SiftMatchingOptions,
+) -> Vec<Match> {
+    if options.check().is_err() {
+        return Vec::new();
+    }
+    if left.descriptors.is_empty() || right.descriptors.is_empty() {
+        return Vec::new();
+    }
+    let f = nalgebra::Matrix3::from_row_slice(f_matrix);
+    let max_epipolar_error = options.max_guided_epipolar_error_px.max(0.0);
+
+    let mut forward = Vec::new();
+    for (left_idx, (left_kp, left_desc)) in left
+        .keypoints
+        .iter()
+        .zip(left.descriptors.iter())
+        .enumerate()
+    {
+        let x1 = nalgebra::Vector3::new(left_kp.x() as f64, left_kp.y() as f64, 1.0);
+        let line2 = f * x1;
+        let mut best = None::<(u32, f32, f32)>;
+        let mut second_best = f32::INFINITY;
+        for (right_idx, right_kp) in right.keypoints.iter().enumerate() {
+            let err = epipolar_line_distance_px(
+                (right_kp.x(), right_kp.y()),
+                (line2.x, line2.y, line2.z),
+            );
+            if err > max_epipolar_error {
+                continue;
+            }
+            let distance2 = left_desc.distance2(&right.descriptors[right_idx]);
+            let distance = distance2.sqrt();
+            if distance > options.max_distance {
+                continue;
+            }
+            match best {
+                Some((_, best_distance, _)) if distance >= best_distance => {
+                    if distance < second_best {
+                        second_best = distance;
+                    }
+                }
+                Some((_, best_distance, _)) => {
+                    second_best = best_distance;
+                    best = Some((right_idx as u32, distance, err));
+                }
+                None => best = Some((right_idx as u32, distance, err)),
+            }
+        }
+        let Some((train_idx, best_distance, _)) = best else {
+            continue;
+        };
+        if second_best.is_finite() && best_distance >= options.max_ratio * second_best {
+            continue;
+        }
+        forward.push(Match {
+            query_idx: left_idx as u32,
+            train_idx,
+            distance: best_distance,
+        });
+    }
+
+    if !options.cross_check {
+        forward.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if options.max_num_matches > 0 && forward.len() > options.max_num_matches {
+            forward.truncate(options.max_num_matches);
+        }
+        return forward;
+    }
+
+    let mut reverse = Vec::new();
+    let f_t = f.transpose();
+    for (right_idx, (right_kp, right_desc)) in right
+        .keypoints
+        .iter()
+        .zip(right.descriptors.iter())
+        .enumerate()
+    {
+        let x2 = nalgebra::Vector3::new(right_kp.x() as f64, right_kp.y() as f64, 1.0);
+        let line1 = f_t * x2;
+        let mut best = None::<(u32, f32)>;
+        let mut second_best = f32::INFINITY;
+        for (left_idx, left_kp) in left.keypoints.iter().enumerate() {
+            let err = epipolar_line_distance_px(
+                (left_kp.x(), left_kp.y()),
+                (line1.x, line1.y, line1.z),
+            );
+            if err > max_epipolar_error {
+                continue;
+            }
+            let distance2 = right_desc.distance2(&left.descriptors[left_idx]);
+            let distance = distance2.sqrt();
+            if distance > options.max_distance {
+                continue;
+            }
+            match best {
+                Some((_, best_distance)) if distance >= best_distance => {
+                    if distance < second_best {
+                        second_best = distance;
+                    }
+                }
+                Some((_, best_distance)) => {
+                    second_best = best_distance;
+                    best = Some((left_idx as u32, distance));
+                }
+                None => best = Some((left_idx as u32, distance)),
+            }
+        }
+        let Some((query_idx, best_distance)) = best else {
+            continue;
+        };
+        if second_best.is_finite() && best_distance >= options.max_ratio * second_best {
+            continue;
+        }
+        reverse.push((query_idx, right_idx as u32));
+    }
+
+    let reverse_set: HashSet<(u32, u32)> = reverse.into_iter().collect();
+    let mut matches = forward
+        .into_iter()
+        .filter(|m| reverse_set.contains(&(m.query_idx, m.train_idx)))
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if options.max_num_matches > 0 && matches.len() > options.max_num_matches {
+        matches.truncate(options.max_num_matches);
+    }
+    matches
+}
+
+fn epipolar_line_distance_px(point: (f32, f32), line: (f64, f64, f64)) -> f32 {
+    let (a, b, c) = line;
+    let numerator = (a * point.0 as f64 + b * point.1 as f64 + c).abs();
+    let denominator = (a * a + b * b).sqrt();
+    if denominator <= 1.0e-12 || !denominator.is_finite() {
+        return f32::INFINITY;
+    }
+    (numerator / denominator) as f32
+}
+
+fn feature_scale(feature: &Feature) -> f32 {
+    feature.keypoint.size * 2.0f32.powi(feature.keypoint.octave)
+}
+
+fn features_from_lowe(features: Vec<Feature>, options: &SiftExtractionOptions) -> SiftFeatures {
     let mut keypoints = Vec::with_capacity(features.len());
     let mut descriptors = Vec::with_capacity(features.len());
-    for feature in features {
+    for mut feature in features {
+        if options.upright {
+            feature.keypoint.angle = 0.0;
+        }
         keypoints.push(KeyPoint {
             pt: (feature.keypoint.x, feature.keypoint.y),
             size: feature.keypoint.size,
@@ -244,12 +415,48 @@ fn features_from_lowe(features: Vec<Feature>) -> SiftFeatures {
             response: feature.keypoint.response,
             octave: feature.keypoint.octave,
         });
-        descriptors.push(feature.descriptor);
+        descriptors.push(normalize_descriptor(
+            feature.descriptor,
+            options.normalization,
+        ));
     }
     SiftFeatures {
         keypoints,
         descriptors,
     }
+}
+
+fn normalize_descriptor(
+    descriptor: Descriptor,
+    normalization: SiftDescriptorNormalization,
+) -> Descriptor {
+    let mut values = *descriptor.as_slice();
+    match normalization {
+        SiftDescriptorNormalization::L1Root => {
+            let l1_norm: f32 = values.iter().map(|v| v.abs()).sum();
+            if l1_norm > f32::EPSILON {
+                for value in &mut values {
+                    *value /= l1_norm;
+                    *value = value.max(0.0).sqrt();
+                }
+            }
+            let l2_norm: f32 = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if l2_norm > f32::EPSILON {
+                for value in &mut values {
+                    *value /= l2_norm;
+                }
+            }
+        }
+        SiftDescriptorNormalization::L2 => {
+            let l2_norm: f32 = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if l2_norm > f32::EPSILON {
+                for value in &mut values {
+                    *value /= l2_norm;
+                }
+            }
+        }
+    }
+    Descriptor::new(values)
 }
 
 fn rgb_to_sift_gray(rgb: &[u8], width: u32, height: u32) -> Result<GrayImage> {
@@ -289,6 +496,60 @@ mod tests {
     }
 
     #[test]
+    fn l1_root_normalization_matches_colmap_shape() {
+        let descriptor = normalize_descriptor(
+            descriptor_with_first(4.0),
+            SiftDescriptorNormalization::L1Root,
+        );
+        let values = descriptor.as_slice();
+        let l2_norm: f32 = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((l2_norm - 1.0).abs() <= 1.0e-5);
+        assert!(values[0] > 0.99);
+        assert!(values[1..].iter().all(|&v| v.abs() <= 1.0e-5));
+    }
+
+    #[test]
+    fn feature_scale_prefers_larger_octave_scale_when_limiting_features() {
+        assert!(10.0 * 2.0f32.powi(2) > 5.0 * 2.0f32.powi(0));
+    }
+
+    #[test]
+    fn guided_matching_filters_by_epipolar_line_before_ratio_test() {
+        let left = SiftFeatures {
+            keypoints: vec![rustslam::KeyPoint::new(100.0, 120.0)],
+            descriptors: vec![descriptor_with_first(0.0)],
+        };
+        let right = SiftFeatures {
+            keypoints: vec![
+                rustslam::KeyPoint::new(140.0, 120.0),
+                rustslam::KeyPoint::new(500.0, 400.0),
+            ],
+            descriptors: vec![descriptor_with_first(0.05), descriptor_with_first(0.9)],
+        };
+        // Pure translation: epipolar lines are horizontal in image 2.
+        let f = [
+            0.0, 0.0, 0.0, //
+            0.0, 0.0, -1.0, //
+            0.0, 1.0, 0.0,
+        ];
+        let matches = match_sift_guided_with_options(
+            &left,
+            &right,
+            &f,
+            &SiftMatchingOptions {
+                max_ratio: 0.8,
+                max_distance: 0.3,
+                cross_check: false,
+                max_num_matches: 32,
+                guided_matching: true,
+                max_guided_epipolar_error_px: 2.0,
+            },
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].train_idx, 0);
+    }
+
+    #[test]
     fn sift_matching_applies_max_distance() {
         let left = SiftFeatures {
             keypoints: Vec::new(),
@@ -307,6 +568,7 @@ mod tests {
                 cross_check: false,
                 max_num_matches: 32768,
                 guided_matching: false,
+                max_guided_epipolar_error_px: 2.0,
             },
         );
         let rejected = match_sift_with_options(
@@ -318,6 +580,7 @@ mod tests {
                 cross_check: false,
                 max_num_matches: 32768,
                 guided_matching: false,
+                max_guided_epipolar_error_px: 2.0,
             },
         );
 

@@ -4,6 +4,8 @@ use crate::types::CameraModel;
 use crate::types::Rigid3;
 use glam::Vec3;
 use rustslam::SE3;
+#[cfg(feature = "poselib")]
+use rustslam::ColmapRandomSampler;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -713,7 +715,7 @@ fn estimate_generalized_absolute_pose_ransac(
     } else {
         0x510e_527f_ade6_82d1
     };
-    let mut sampler = GeneralizedRandomSampler::new(seed, &active_indices);
+    let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
     let threshold_sq = observations.normalized_max_error * observations.normalized_max_error;
     let max_num_trials = options.ransac_options.max_num_trials.max(1);
     let mut dynamic_max_trials = ransac_trials_from_counts(
@@ -876,7 +878,7 @@ fn estimate_generalized_relative_pose_ransac(
     } else {
         0x6a09_e667_f3bc_c909
     };
-    let mut sampler = GeneralizedRandomSampler::new(seed, &active_indices);
+    let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
     let threshold_sq = observations.normalized_max_error * observations.normalized_max_error;
     let max_num_trials = options.ransac_options.max_num_trials.max(1);
     let mut dynamic_max_trials = ransac_trials_from_counts(
@@ -1351,117 +1353,6 @@ impl Mat3d {
 
     fn col(self, idx: usize) -> Vec3d {
         Vec3d::new(self.m[0][idx], self.m[1][idx], self.m[2][idx])
-    }
-}
-
-#[cfg(feature = "poselib")]
-struct GeneralizedRandomSampler {
-    rng: ColmapMt19937,
-    sample_indices: Vec<usize>,
-}
-
-#[cfg(feature = "poselib")]
-impl GeneralizedRandomSampler {
-    fn new(seed: u64, indices: &[usize]) -> Self {
-        Self {
-            rng: ColmapMt19937::new(seed),
-            sample_indices: indices.to_vec(),
-        }
-    }
-
-    fn sample(&mut self, k: usize) -> Vec<usize> {
-        if k > self.sample_indices.len() {
-            return Vec::new();
-        }
-        let last = self.sample_indices.len() - 1;
-        for i in 0..k {
-            let j = self.rng.uniform_u32(i as u32, last as u32) as usize;
-            self.sample_indices.swap(i, j);
-        }
-        self.sample_indices[..k].to_vec()
-    }
-}
-
-#[cfg(feature = "poselib")]
-struct ColmapMt19937 {
-    state: [u32; 624],
-    index: usize,
-}
-
-#[cfg(feature = "poselib")]
-impl ColmapMt19937 {
-    fn new(seed: u64) -> Self {
-        let mut rng = Self {
-            state: [0; 624],
-            index: 624,
-        };
-        rng.state[0] = seed as u32;
-        for i in 1..624 {
-            rng.state[i] = 1_812_433_253u32
-                .wrapping_mul(rng.state[i - 1] ^ (rng.state[i - 1] >> 30))
-                .wrapping_add(i as u32);
-        }
-        rng
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        if self.index >= 624 {
-            self.twist();
-        }
-        let mut y = self.state[self.index];
-        self.index += 1;
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c_5680;
-        y ^= (y << 15) & 0xefc6_0000;
-        y ^ (y >> 18)
-    }
-
-    fn twist(&mut self) {
-        const UPPER_MASK: u32 = 0x8000_0000;
-        const LOWER_MASK: u32 = 0x7fff_ffff;
-        const MATRIX_A: u32 = 0x9908_b0df;
-
-        for i in 0..624 {
-            let x = (self.state[i] & UPPER_MASK) | (self.state[(i + 1) % 624] & LOWER_MASK);
-            let mut xa = x >> 1;
-            if x & 1 != 0 {
-                xa ^= MATRIX_A;
-            }
-            self.state[i] = self.state[(i + 397) % 624] ^ xa;
-        }
-        self.index = 0;
-    }
-
-    fn uniform_u32(&mut self, min: u32, max: u32) -> u32 {
-        let range = max.wrapping_sub(min).wrapping_add(1);
-        if range == 1 {
-            return min;
-        }
-        let width = if range == 0 {
-            u32::BITS
-        } else {
-            let floor_log2 = u32::BITS - range.leading_zeros() - 1;
-            let is_power_of_two = range & ((u32::MAX) >> (u32::BITS - floor_log2)) == 0;
-            floor_log2 + u32::from(!is_power_of_two)
-        };
-        loop {
-            let sample = self.independent_bits(width);
-            if range == 0 || sample < range {
-                return sample.wrapping_add(min);
-            }
-        }
-    }
-
-    fn independent_bits(&mut self, width: u32) -> u32 {
-        if width == 0 {
-            return 0;
-        }
-        let mask = if width < u32::BITS {
-            u32::MAX >> (u32::BITS - width)
-        } else {
-            u32::MAX
-        };
-        self.next_u32() & mask
     }
 }
 

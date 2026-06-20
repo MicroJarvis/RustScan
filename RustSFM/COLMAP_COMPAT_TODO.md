@@ -175,8 +175,16 @@ reconstruction parity.
    geometric verification persistence.
    - Added COLMAP-style SIFT matching defaults and wired max ratio, max
      distance, cross check, and max matches into the current matcher.
-   - Remaining work: guided matching, full matching strategy selection,
-     COLMAP database persistence, and exact FAISS/GPU matcher parity.
+   - Added guided SIFT matching with epipolar-line filtering and
+     post-estimation geometry refinement when more inliers are recovered.
+   - Added COLMAP-style matching pair strategies: exhaustive, sequential
+     (overlap/quadratic overlap/loop detection), and local window, wired
+     through mapper pair-graph construction and CLI flags.
+   - Added `--write-database` for local-matching fallback: creates/populates
+     a COLMAP SQLite database with cameras, images, keypoints, descriptors,
+     raw matches, and verified two-view geometries.
+   - Remaining work: vocab-tree pairing, exact FAISS/GPU matcher parity, and
+     camera sharing heuristics for image-only local matching.
 7. [done] Build a persistent COLMAP-style database/cache layer with
    keypoints, descriptors, matches, two-view geometries, and correspondence
    graph.
@@ -649,6 +657,26 @@ reconstruction parity.
 
 ## P4 - Triangulation And Observation Management
 
+15b. [done] Port COLMAP's `geometry/triangulation` primitive module
+    (`triangulation.rs`).
+   - Faithful `f64` port of `TriangulatePoint` (two-view DLT via SVD),
+     `TriangulateMidPoint` (with cheirality guard), `TriangulateMultiViewPoint`
+     (smallest-eigenvector DLT), `TriangulateOptimalPoint` (Lindstrom optimal
+     correction), and `CalculateTriangulationAngle(s)` /
+     `CalculateAngleBetweenVectors`, plus the `EssentialMatrixFromPose` and
+     `FindOptimalImageObservations` helpers from `essential_matrix.cc` that the
+     optimal path depends on.
+   - Covered by synthetic recovery/consistency unit tests (exact noise-free
+     recovery, multi-view vs two-view agreement, optimal-vs-DLT under noise,
+     midpoint recovery, and triangulation-angle min/supplement behavior).
+   - Wired as the shared backend: `two_view.rs::triangulate_normalized_pair`
+     delegates the two-view DLT, and
+     `incremental_triangulator.rs::triangulate_track_observations` now runs the
+     multi-view DLT over all track observations.
+   - This is the triangulation primitive boundary marked 100% in
+     `COLMAP_MODULE_PARITY.md`; the `estimators/triangulation.cc` RANSAC
+     `EstimateTriangulation` wrapper remains to be ported (see item 17).
+
 16. [partial] Port `ObservationManager` for adding/removing/merging observations and
     tracking modified points.
    - Added visible-point/correspondence statistics used by the mapper
@@ -677,14 +705,27 @@ reconstruction parity.
     behavior, transitivity, angular/reprojection thresholds, and two-view-track
     handling.
    - Added create/continue angular error gates, explicit two-view-track
-     suppression in default triangulator options, track re-triangulation after
-     continue/merge, and best-baseline track re-estimation instead of
-     averaging merged points.
+     suppression in default triangulator options, and track re-triangulation
+     after continue/merge. Track point estimation now uses the COLMAP multi-view
+     DLT (`TriangulateMultiViewPoint`) over all observations instead of the
+     earlier widest-baseline pair / averaged-merge heuristics.
    - The mapper now filters reprojection outliers after each incremental
      triangulation step.
-   - Remaining work: exact COLMAP transitivity queues, retriangulation trial
-     limits per image pair, and official point creation/continuation option
-     defaults.
+   - Retriangulation now tracks a per-image-pair trial counter and skips pairs
+     once `re_max_trials` is reached, matching COLMAP's `re_num_trials_` map
+     behavior instead of the previous one-shot boolean guard.
+   - Ported the `estimators/triangulation.cc` `TriangulationEstimator` and
+     `EstimateTriangulation` LORANSAC entry point (`triangulation_estimator.rs`):
+     two-view/multi-view model estimation with cheirality + triangulation-angle
+     gating, angular and squared-reprojection residuals (matching
+     `scene/projection.cc`), `InlierSupportMeasurer` support comparison, the
+     COLMAP dynamic-stopping trial count, and a final inlier multi-view refit.
+     The 2-view sampling enumerates combinations deterministically; exact
+     `CombinationSampler` RNG/shuffle and bit-level LORANSAC parity remain under
+     the `optim` RANSAC item.
+   - Remaining work: wire `estimate_triangulation` into the mapper track-creation
+     path, plus exact COLMAP transitivity queues and official point
+     creation/continuation option defaults.
 18. [partial] Port filtering by negative depth, reprojection error, triangulation angle,
     short tracks, and bogus camera parameters.
    - Reprojection filtering is now part of the default incremental loop.
@@ -759,9 +800,23 @@ reconstruction parity.
       incremental-pipeline Ceres convergence settings: local BA uses gradient
       tolerance 10 and global BA uses gradient tolerance 1, both with 100
       linear-solver iterations and zero parameter tolerance.
-    - Remaining work: replace hand-rolled LM with Ceres-equivalent solver
-      behavior, robust trust-region/linear-solver behavior, and full backend
-      solver-summary parity.
+    - BA now provides a Ceres-equivalent robust loss family
+      (`BundleAdjustmentLoss`: Trivial, Huber, SoftL1, Cauchy) whose `rho(s)`
+      cost and `rho'(s)` IRLS weight match Ceres' `LossFunction` formulas for
+      the squared residual `s = ||r||^2`, replacing the previous Huber-only
+      scalar. The mapper local/global BA now defaults to COLMAP's Cauchy loss
+      with scale 1.0 (overridable via `RUSTSFM_BA_LOSS` /
+      `RUSTSFM_BA_LOSS_SCALE`), matching COLMAP's incremental mapper default.
+    - The reduced camera matrix (Schur complement) is now solved with a
+      Cholesky factorization and an LU fallback (`ba.rs::solve_linear_system`),
+      matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers that rely on
+      the damped reduced system being symmetric positive definite.
+    - Remaining work: switch LM damping from a fixed `mu*I` to Ceres'
+      jacobian-scaled `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with
+      Ceres' radius-based trust-region update (a naive switch under the current
+      `damping*=10` recovery regressed the generalized-rig refinement test, so
+      both must land together); then true sparse Schur storage, covariance,
+      threading, and full backend solver-summary parity.
 20. Match COLMAP local BA image selection, gauge fixing, robust losses,
     constant camera/rig controls, and short-track point selection.
     - Added a first COLMAP-style local BA pass after each successful

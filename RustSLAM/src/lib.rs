@@ -12,11 +12,13 @@ pub use features::{
     Descriptors, DistanceMetric, FeatureExtractor, FeatureMatcher, KeyPoint, KnnMatcher, Match,
     OrbExtractor,
 };
+pub use colmap_rng::{sample_unique_indices, ColmapMt19937, ColmapRandomSampler};
 pub use tracker::{VOResult, VOState, VisualOdometry};
 
 // Modules
 #[cfg(feature = "slam-pipeline")]
 pub mod cli;
+pub mod colmap_rng;
 pub mod config;
 pub mod core;
 pub mod depth;

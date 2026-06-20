@@ -9,17 +9,11 @@ fn main() {
         return;
     }
 
-    let poselib_root = env::var_os("POSELIB_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("third_party/PoseLib"));
-    if !poselib_root
-        .join("PoseLib/solvers/gen_relpose_6pt.cc")
-        .exists()
-    {
+    let poselib_root = resolve_poselib_root().unwrap_or_else(|| {
         panic!(
-            "RustSFM poselib feature requires PoseLib v2.0.5 source. Set POSELIB_ROOT=/path/to/PoseLib-2.0.5 or place it at third_party/PoseLib"
+            "RustSFM poselib feature requires PoseLib v2.0.5 source. Set POSELIB_ROOT=/path/to/PoseLib-2.0.5, place it at RustSFM/third_party/PoseLib, or at the workspace root third_party/PoseLib"
         );
-    }
+    });
 
     let eigen_include = eigen_include_dir().unwrap_or_else(|| {
         panic!(
@@ -59,6 +53,23 @@ fn main() {
     }
 
     build.compile("rustsfm_poselib_bridge");
+}
+
+fn resolve_poselib_root() -> Option<PathBuf> {
+    let marker = Path::new("PoseLib/solvers/gen_relpose_6pt.cc");
+    let candidates = env::var_os("POSELIB_ROOT")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([
+            PathBuf::from("third_party/PoseLib"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third_party/PoseLib"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("third_party/PoseLib"),
+        ]);
+    candidates
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .find(|path| path.join(marker).exists())
 }
 
 fn eigen_include_dir() -> Option<PathBuf> {
