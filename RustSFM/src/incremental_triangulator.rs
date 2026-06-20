@@ -1,14 +1,14 @@
 use crate::correspondence_graph::{
-    CorrespondenceGraph, FeatureMatch, ImageId, Point2DIdx, TwoViewGeometryRecord,
+    build_correspondence_graph_from_pairs, CorrespondenceGraph, ImageId, Point2DIdx,
 };
 use crate::geometry::camera_center;
 use crate::triangulation_estimator::{
-    calculate_angular_reprojection_error, estimate_triangulation, EstimateTriangulationOptions,
-    ResidualType,
+    calculate_angular_reprojection_error, calculate_squared_reprojection_error,
+    estimate_triangulation, EstimateTriangulationOptions, ResidualType,
 };
 use crate::observation_manager::ObservationManager;
 use crate::types::{CameraModel, ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
-use nalgebra::{Matrix3x4, Vector3};
+use nalgebra::{Matrix3x4, Vector2, Vector3};
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -103,7 +103,6 @@ impl TriangulationReport {
 /// attempt, matching COLMAP's long-lived `IncrementalTriangulator`.
 pub struct IncrementalTriangulatorState {
     observation_manager: ObservationManager,
-    correspondence_graph: CorrespondenceGraph,
     merge_trials: HashSet<(usize, usize)>,
     retriangulation_trials: HashMap<(usize, usize), usize>,
     camera_has_bogus_params: HashMap<usize, bool>,
@@ -117,7 +116,6 @@ impl IncrementalTriangulatorState {
     ) -> Self {
         Self {
             observation_manager: ObservationManager::new(frames, pairs, reconstruction),
-            correspondence_graph: build_correspondence_graph_from_pairs(frames, pairs),
             merge_trials: HashSet::new(),
             retriangulation_trials: HashMap::new(),
             camera_has_bogus_params: HashMap::new(),
@@ -132,10 +130,17 @@ impl IncrementalTriangulatorState {
     ) {
         self.observation_manager
             .rebuild(frames, pairs, reconstruction);
-        self.correspondence_graph = build_correspondence_graph_from_pairs(frames, pairs);
+        self.observation_manager
+            .install_correspondence_graph(build_correspondence_graph_from_pairs(frames, pairs));
         self.merge_trials.clear();
         self.retriangulation_trials.clear();
         self.camera_has_bogus_params.clear();
+    }
+
+    pub fn correspondence_graph(&self) -> &CorrespondenceGraph {
+        self.observation_manager
+            .correspondence_graph()
+            .expect("correspondence graph must be installed")
     }
 
     pub fn observation_manager(&self) -> &ObservationManager {
@@ -231,6 +236,88 @@ impl<'a> IncrementalTriangulator<'a> {
                 }
                 corrs_data.push((image, feature));
                 if self.create_from_correspondences(options, &corrs_data) {
+                    report.created_points += 1;
+                }
+            }
+        }
+        report
+    }
+
+    /// COLMAP `CompleteImage`: complete existing tracks on the image and create
+    /// new points for untriangulated observations whose correspondences are all
+    /// still untriangulated.
+    pub fn complete_image(
+        &mut self,
+        options: &IncrementalTriangulatorOptions,
+        image: usize,
+    ) -> TriangulationReport {
+        if self
+            .reconstruction
+            .poses
+            .get(image)
+            .copied()
+            .flatten()
+            .is_none()
+        {
+            return TriangulationReport::default();
+        }
+
+        let camera_index = self
+            .reconstruction
+            .image_camera_indices
+            .get(image)
+            .copied()
+            .unwrap_or(0);
+        if self.has_camera_bogus_params(camera_index, options) {
+            return TriangulationReport::default();
+        }
+
+        self.clear_triangulate_caches();
+
+        let mut report = TriangulationReport::default();
+        let num_features = self
+            .frames
+            .get(image)
+            .map(|frame| frame.keypoints.len())
+            .unwrap_or(0);
+        let mut corrs_data = Vec::new();
+        let complete_est_options = complete_estimate_options(options);
+
+        for feature in 0..num_features {
+            if !self.valid_observation(image, feature) {
+                continue;
+            }
+
+            if let Some(point_id) = self.reconstruction.observations[image][feature] {
+                report.completed_observations += self.complete_track(options, point_id);
+                continue;
+            }
+
+            if options.ignore_two_view_tracks
+                && self
+                    .state
+                    .correspondence_graph()
+                    .is_two_view_observation(image as ImageId, feature as Point2DIdx)
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let num_triangulated =
+                self.find_correspondences(options, image, feature, &mut corrs_data);
+            if num_triangulated > 0 || corrs_data.is_empty() {
+                continue;
+            }
+
+            corrs_data.push((image, feature));
+            let mut est_options = complete_est_options;
+            if corrs_data.len() <= EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD {
+                est_options.min_num_trials = n_choose_k(corrs_data.len(), 2);
+            }
+            if let Some((inlier_mask, xyz)) =
+                self.estimate_point_from_correspondences(&corrs_data, &est_options)
+            {
+                if self.add_point_from_inliers(&corrs_data, &inlier_mask, xyz) {
                     report.created_points += 1;
                 }
             }
@@ -423,7 +510,7 @@ impl<'a> IncrementalTriangulator<'a> {
         corrs_data.clear();
         let graph_corrs = self
             .state
-            .correspondence_graph
+            .correspondence_graph()
             .extract_transitive_correspondences(
                 image as ImageId,
                 feature as Point2DIdx,
@@ -545,7 +632,7 @@ impl<'a> IncrementalTriangulator<'a> {
             let (image, feature) = create_corrs[0];
             if self
                 .state
-                .correspondence_graph
+                .correspondence_graph()
                 .is_two_view_observation(image as ImageId, feature as Point2DIdx)
                 .unwrap_or(false)
             {
@@ -553,30 +640,55 @@ impl<'a> IncrementalTriangulator<'a> {
             }
         }
 
-        let mut points = Vec::with_capacity(create_corrs.len());
-        let mut cams_from_world = Vec::with_capacity(create_corrs.len());
-        let mut cameras = Vec::with_capacity(create_corrs.len());
-        for &(obs_image, obs_feature) in &create_corrs {
-            let Some(pose) = self.reconstruction.poses[obs_image] else {
-                return false;
-            };
-            let kp = &self.frames[obs_image].keypoints[obs_feature];
-            points.push(nalgebra::Vector2::new(kp.x() as f64, kp.y() as f64));
-            cams_from_world.push(se3_to_matrix3x4(pose));
-            cameras.push(self.reconstruction.camera_for_image(obs_image));
-        }
-
         let mut est_options = create_estimate_options(options);
-        if points.len() <= EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD {
-            est_options.min_num_trials = n_choose_k(points.len(), 2);
+        if create_corrs.len() <= EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD {
+            est_options.min_num_trials = n_choose_k(create_corrs.len(), 2);
         }
         let Some((inlier_mask, xyz)) =
-            estimate_triangulation(&est_options, &points, &cams_from_world, &cameras)
+            self.estimate_point_from_correspondences(&create_corrs, &est_options)
         else {
             return false;
         };
 
-        let track: Vec<TrackObservation> = create_corrs
+        let track_length = inlier_mask.iter().filter(|&&is_inlier| is_inlier).count();
+        if track_length < 2 {
+            return false;
+        }
+        if !self.add_point_from_inliers(&create_corrs, &inlier_mask, xyz) {
+            return false;
+        }
+
+        if create_corrs.len().saturating_sub(track_length) >= MIN_RECURSIVE_CREATE_TRACK_LENGTH {
+            let _ = self.create_from_correspondences(options, corrs_data);
+        }
+        true
+    }
+
+    fn estimate_point_from_correspondences(
+        &self,
+        corrs: &[(usize, usize)],
+        est_options: &EstimateTriangulationOptions,
+    ) -> Option<(Vec<bool>, Vector3<f64>)> {
+        let mut points = Vec::with_capacity(corrs.len());
+        let mut cams_from_world = Vec::with_capacity(corrs.len());
+        let mut cameras = Vec::with_capacity(corrs.len());
+        for &(obs_image, obs_feature) in corrs {
+            let pose = self.reconstruction.poses[obs_image]?;
+            let kp = &self.frames[obs_image].keypoints[obs_feature];
+            points.push(Vector2::new(kp.x() as f64, kp.y() as f64));
+            cams_from_world.push(se3_to_matrix3x4(pose));
+            cameras.push(self.reconstruction.camera_for_image(obs_image));
+        }
+        estimate_triangulation(est_options, &points, &cams_from_world, &cameras)
+    }
+
+    fn add_point_from_inliers(
+        &mut self,
+        corrs: &[(usize, usize)],
+        inlier_mask: &[bool],
+        xyz: Vector3<f64>,
+    ) -> bool {
+        let track: Vec<TrackObservation> = corrs
             .iter()
             .zip(inlier_mask.iter())
             .filter_map(|(&(obs_image, obs_feature), &is_inlier)| {
@@ -586,8 +698,7 @@ impl<'a> IncrementalTriangulator<'a> {
                 })
             })
             .collect();
-        let track_length = track.len();
-        if track_length < 2 {
+        if track.len() < 2 {
             return false;
         }
 
@@ -598,26 +709,16 @@ impl<'a> IncrementalTriangulator<'a> {
         let error =
             mean_track_reprojection_error(xyz_f32, &track, self.frames, self.reconstruction)
                 .unwrap_or(0.0);
-
         let point = Point3D {
             xyz: xyz_f32,
             color: [0, 0, 0],
             error,
             track,
         };
-        if self
-            .state
+        self.state
             .observation_manager_mut()
             .add_point3d(self.frames, self.pairs, self.reconstruction, point)
-            .is_none()
-        {
-            return false;
-        }
-
-        if create_corrs.len().saturating_sub(track_length) >= MIN_RECURSIVE_CREATE_TRACK_LENGTH {
-            let _ = self.create_from_correspondences(options, corrs_data);
-        }
-        true
+            .is_some()
     }
 
     fn continue_track(
@@ -776,25 +877,34 @@ impl<'a> IncrementalTriangulator<'a> {
         if point_id >= self.reconstruction.points.len() {
             return 0;
         }
-        let mut completed = 0usize;
-        let mut visited = self.reconstruction.points[point_id]
-            .track
-            .iter()
-            .map(|obs| (obs.image, obs.feature))
-            .collect::<HashSet<_>>();
-        let mut current = self.reconstruction.points[point_id]
-            .track
-            .iter()
-            .map(|obs| (obs.image, obs.feature))
-            .collect::<VecDeque<_>>();
 
-        for _ in 0..options.complete_max_transitivity {
-            if current.is_empty() {
-                break;
-            }
-            let mut next = VecDeque::new();
-            while let Some((image, feature)) = current.pop_front() {
-                for (corr_image, corr_feature) in self.corresponding_features(image, feature) {
+        let max_squared_reproj_error =
+            (options.complete_max_reproj_error_px as f64).powi(2);
+        let point_xyz = Vector3::from(
+            self.reconstruction.points[point_id]
+                .xyz
+                .map(f64::from),
+        );
+
+        let mut curr_queue = self.reconstruction.points[point_id]
+            .track
+            .iter()
+            .map(|obs| (obs.image, obs.feature))
+            .collect::<Vec<_>>();
+        let mut next_queue = Vec::new();
+        let mut visited = curr_queue.iter().copied().collect::<HashSet<_>>();
+        let mut completed = 0usize;
+
+        for transitivity in 1..=options.complete_max_transitivity {
+            while let Some((image, feature)) = curr_queue.pop() {
+                let direct_corrs = self
+                    .state
+                    .correspondence_graph()
+                    .extract_correspondences(image as ImageId, feature as Point2DIdx)
+                    .unwrap_or_default();
+                for corr in direct_corrs {
+                    let corr_image = corr.image_id as usize;
+                    let corr_feature = corr.point2d_idx as usize;
                     if !visited.insert((corr_image, corr_feature)) {
                         continue;
                     }
@@ -810,20 +920,55 @@ impl<'a> IncrementalTriangulator<'a> {
                     {
                         continue;
                     }
-                    if self.continue_track(
-                        options,
+                    let camera_index = self
+                        .reconstruction
+                        .image_camera_indices
+                        .get(corr_image)
+                        .copied()
+                        .unwrap_or(0);
+                    if self.has_camera_bogus_params(camera_index, options) {
+                        continue;
+                    }
+                    let Some(pose) = self.reconstruction.poses[corr_image] else {
+                        continue;
+                    };
+                    let keypoint = &self.frames[corr_image].keypoints[corr_feature];
+                    let camera = self.reconstruction.camera_for_image(corr_image);
+                    let squared_error = calculate_squared_reprojection_error(
+                        &Vector2::new(keypoint.x() as f64, keypoint.y() as f64),
+                        &point_xyz,
+                        &se3_to_matrix3x4(pose),
+                        &camera,
+                    );
+                    if squared_error > max_squared_reproj_error {
+                        continue;
+                    }
+                    if !self.state.observation_manager_mut().add_observation(
+                        self.frames,
+                        self.pairs,
+                        self.reconstruction,
                         point_id,
-                        corr_image,
-                        corr_feature,
-                        options.complete_max_reproj_error_px,
-                        options.continue_max_angle_error_deg,
+                        TrackObservation {
+                            image: corr_image,
+                            feature: corr_feature,
+                        },
                     ) {
-                        completed += 1;
-                        next.push_back((corr_image, corr_feature));
+                        continue;
+                    }
+                    self.state
+                        .observation_manager_mut()
+                        .mark_point3d_modified(point_id);
+                    completed += 1;
+                    if transitivity < options.complete_max_transitivity {
+                        next_queue.push((corr_image, corr_feature));
                     }
                 }
             }
-            current = next;
+            if next_queue.is_empty() {
+                break;
+            }
+            curr_queue = next_queue;
+            next_queue = Vec::new();
         }
         completed
     }
@@ -1077,33 +1222,6 @@ impl<'a> IncrementalTriangulator<'a> {
     }
 }
 
-fn build_correspondence_graph_from_pairs(
-    frames: &[ImageFrame],
-    pairs: &[PairGeometry],
-) -> CorrespondenceGraph {
-    let mut graph = CorrespondenceGraph::new();
-    for (idx, frame) in frames.iter().enumerate() {
-        let _ = graph.add_image(idx as ImageId, frame.keypoints.len());
-    }
-    for pair in pairs {
-        if pair.left >= frames.len() || pair.right >= frames.len() {
-            continue;
-        }
-        let matches = pair
-            .inlier_matches
-            .iter()
-            .map(FeatureMatch::from)
-            .collect::<Vec<_>>();
-        let _ = graph.add_two_view_geometry(
-            pair.left as ImageId,
-            pair.right as ImageId,
-            TwoViewGeometryRecord::with_inlier_matches(matches),
-        );
-    }
-    let _ = graph.finalize();
-    graph
-}
-
 fn camera_has_bogus_params_for_triangulation(
     camera: CameraModel,
     options: &IncrementalTriangulatorOptions,
@@ -1215,6 +1333,22 @@ fn create_estimate_options(options: &IncrementalTriangulatorOptions) -> Estimate
         min_inlier_ratio: 0.02,
         min_num_trials: 0,
         max_num_trials: 10000,
+        random_seed: options.random_seed,
+    }
+}
+
+fn complete_estimate_options(
+    options: &IncrementalTriangulatorOptions,
+) -> EstimateTriangulationOptions {
+    EstimateTriangulationOptions {
+        min_tri_angle: (options.min_angle_deg as f64).to_radians(),
+        residual_type: ResidualType::ReprojectionError,
+        max_error: options.complete_max_reproj_error_px as f64,
+        confidence: 0.9999,
+        min_inlier_ratio: 0.02,
+        min_num_trials: 0,
+        max_num_trials: 10000,
+        random_seed: options.random_seed,
     }
 }
 
@@ -1470,6 +1604,38 @@ mod tests {
         assert_eq!(completed, 1);
         assert_eq!(triangulator.reconstruction.observations[2][0], Some(0));
         assert_eq!(reconstruction.points[0].track.len(), 3);
+    }
+
+    #[test]
+    fn complete_image_creates_track_for_untriangulated_two_view_cluster() {
+        let mut frames = vec![frame(0), frame(1), frame(2)];
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
+        frames[2].keypoints[0] = rustslam::KeyPoint::new(100.0, 50.0);
+        let pairs = vec![pair(0, 1, &[(0, 0)]), pair(1, 2, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(baseline_pose());
+        reconstruction.poses[2] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(2.0, 0.0, 0.0),
+        ));
+
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        let mut triangulator =
+            IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction, &mut tri_state);
+        let report = triangulator.complete_image(
+            &IncrementalTriangulatorOptions {
+                complete_max_reproj_error_px: 10.0,
+                min_angle_deg: 0.1,
+                ignore_two_view_tracks: false,
+                ..IncrementalTriangulatorOptions::default()
+            },
+            2,
+        );
+
+        assert_eq!(report.created_points, 1);
+        assert_eq!(reconstruction.observations[2][0], Some(0));
+        assert!(reconstruction.points[0].track.iter().any(|obs| obs.image == 2));
     }
 
     #[test]

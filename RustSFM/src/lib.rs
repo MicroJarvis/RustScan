@@ -17,6 +17,7 @@ pub mod pose_graph;
 pub mod sift;
 pub mod triangulation;
 pub mod triangulation_estimator;
+pub mod visibility_pyramid;
 pub mod two_view;
 pub mod types;
 pub mod wide;

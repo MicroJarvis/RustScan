@@ -543,6 +543,33 @@ impl CorrespondenceGraph {
     }
 }
 
+pub fn build_correspondence_graph_from_pairs(
+    frames: &[crate::types::ImageFrame],
+    pairs: &[crate::types::PairGeometry],
+) -> CorrespondenceGraph {
+    let mut graph = CorrespondenceGraph::new();
+    for (idx, frame) in frames.iter().enumerate() {
+        let _ = graph.add_image(idx as ImageId, frame.keypoints.len());
+    }
+    for pair in pairs {
+        if pair.left >= frames.len() || pair.right >= frames.len() {
+            continue;
+        }
+        let matches = pair
+            .inlier_matches
+            .iter()
+            .map(FeatureMatch::from)
+            .collect::<Vec<_>>();
+        let _ = graph.add_two_view_geometry(
+            pair.left as ImageId,
+            pair.right as ImageId,
+            TwoViewGeometryRecord::with_inlier_matches(matches),
+        );
+    }
+    let _ = graph.finalize();
+    graph
+}
+
 fn saturating_point2d_len(len: usize) -> Point2DIdx {
     len.min(Point2DIdx::MAX as usize) as Point2DIdx
 }

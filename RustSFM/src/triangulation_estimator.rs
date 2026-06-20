@@ -12,14 +12,15 @@
 //! scores each candidate by inlier support, applies the COLMAP dynamic
 //! stopping criterion, and performs a final local-optimization refit over all
 //! inliers via the multi-view DLT. Exact RANSAC RNG / sampler-shuffle parity is
-//! tracked separately under the `optim` RANSAC module (it is not bit-identical
-//! here); the estimator, residual, cheirality, and angle logic match COLMAP.
+//! tracked separately under the `optim` RANSAC module when `random_seed < 0`;
+//! fixed seeds reproduce the COLMAP `CombinationSampler` shuffle order.
 
 use crate::triangulation::{
     calculate_triangulation_angle, triangulate_multi_view_point, triangulate_point,
 };
 use crate::types::CameraModel;
 use nalgebra::{Matrix3, Matrix3x4, Vector2, Vector3};
+use rustslam::ColmapMt19937;
 
 /// COLMAP `TriangulationEstimator::ResidualType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +220,8 @@ pub struct EstimateTriangulationOptions {
     pub min_inlier_ratio: f64,
     pub min_num_trials: usize,
     pub max_num_trials: usize,
+    /// COLMAP `random_seed`; values >= 0 fix the combination-shuffle order.
+    pub random_seed: i32,
 }
 
 impl Default for EstimateTriangulationOptions {
@@ -232,6 +235,7 @@ impl Default for EstimateTriangulationOptions {
             min_inlier_ratio: 0.02,
             min_num_trials: 0,
             max_num_trials: 10000,
+            random_seed: -1,
         }
     }
 }
@@ -288,6 +292,28 @@ fn support_is_better(candidate: &Support, best: &Support) -> bool {
             && candidate.residual_sum < best.residual_sum)
 }
 
+const EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD: usize = 15;
+
+pub(crate) fn triangulation_sample_pairs(num_samples: usize, random_seed: i32) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for i in 0..num_samples {
+        for j in (i + 1)..num_samples {
+            pairs.push((i, j));
+        }
+    }
+    if num_samples > EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD && random_seed >= 0 {
+        let mut rng = ColmapMt19937::new(random_seed as u64);
+        if !pairs.is_empty() {
+            let last = pairs.len() - 1;
+            for i in 0..pairs.len() {
+                let j = rng.uniform_usize(i, last);
+                pairs.swap(i, j);
+            }
+        }
+    }
+    pairs
+}
+
 /// COLMAP `EstimateTriangulation`: robustly estimate a 3D point from
 /// observations in multiple views via LORANSAC plus a final inlier refit.
 ///
@@ -338,33 +364,32 @@ pub fn estimate_triangulation(
     };
     let mut dynamic_max_trials = options.max_num_trials;
     let mut trial = 0usize;
+    let sample_pairs = triangulation_sample_pairs(num_samples, options.random_seed);
 
-    'outer: for i in 0..num_samples {
-        for j in (i + 1)..num_samples {
-            if trial >= dynamic_max_trials && trial >= options.min_num_trials {
-                break 'outer;
-            }
-            trial += 1;
+    for (i, j) in sample_pairs {
+        if trial >= dynamic_max_trials && trial >= options.min_num_trials {
+            break;
+        }
+        trial += 1;
 
-            let sample_points = [point_data[i], point_data[j]];
-            let sample_poses = [pose_data[i], pose_data[j]];
-            let Some(xyz) = estimator.estimate(&sample_points, &sample_poses) else {
-                continue;
-            };
+        let sample_points = [point_data[i], point_data[j]];
+        let sample_poses = [pose_data[i], pose_data[j]];
+        let Some(xyz) = estimator.estimate(&sample_points, &sample_poses) else {
+            continue;
+        };
 
-            let residuals = estimator.residuals(&point_data, &pose_data, &xyz);
-            let support = evaluate_support(&residuals, max_residual);
-            if support_is_better(&support, &best_support) {
-                dynamic_max_trials = compute_num_trials(
-                    support.num_inliers,
-                    num_samples,
-                    options.confidence,
-                    options.min_num_trials,
-                    options.max_num_trials,
-                );
-                best_support = support;
-                best_model = Some(xyz);
-            }
+        let residuals = estimator.residuals(&point_data, &pose_data, &xyz);
+        let support = evaluate_support(&residuals, max_residual);
+        if support_is_better(&support, &best_support) {
+            dynamic_max_trials = compute_num_trials(
+                support.num_inliers,
+                num_samples,
+                options.confidence,
+                options.min_num_trials,
+                options.max_num_trials,
+            );
+            best_support = support;
+            best_model = Some(xyz);
         }
     }
 
@@ -548,5 +573,16 @@ mod tests {
         let cam = pose_from_center(&Matrix3::identity(), &Vector3::new(0.0, 0.0, 0.0));
         assert!(has_point_positive_depth(&cam, &Vector3::new(0.0, 0.0, 5.0)));
         assert!(!has_point_positive_depth(&cam, &Vector3::new(0.0, 0.0, -5.0)));
+    }
+
+    #[test]
+    fn triangulation_sample_pairs_shuffles_with_fixed_seed() {
+        let exhaustive = super::triangulation_sample_pairs(10, -1);
+        let seeded_a = super::triangulation_sample_pairs(16, 42);
+        let seeded_b = super::triangulation_sample_pairs(16, 42);
+        assert_eq!(exhaustive.len(), 45);
+        assert_eq!(seeded_a.len(), 120);
+        assert_ne!(seeded_a, exhaustive);
+        assert_eq!(seeded_a, seeded_b);
     }
 }

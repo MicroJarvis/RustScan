@@ -1,4 +1,6 @@
+use crate::correspondence_graph::{build_correspondence_graph_from_pairs, CorrespondenceGraph};
 use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
+use crate::visibility_pyramid::VisibilityPyramid;
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
 
@@ -8,13 +10,41 @@ pub struct ImagePairStat {
     pub num_total_corrs: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ImageStat {
     pub num_observations: usize,
     pub num_correspondences: usize,
     pub num_visible_correspondences: usize,
     pub num_visible_points3d: usize,
-    pub point3d_visibility_score: usize,
+    visibility_pyramid: VisibilityPyramid,
+}
+
+impl Default for ImageStat {
+    fn default() -> Self {
+        Self {
+            num_observations: 0,
+            num_correspondences: 0,
+            num_visible_correspondences: 0,
+            num_visible_points3d: 0,
+            visibility_pyramid: VisibilityPyramid::default(),
+        }
+    }
+}
+
+impl ImageStat {
+    pub fn point3d_visibility_score(&self) -> usize {
+        self.visibility_pyramid.score()
+    }
+
+    fn init_for_frame(frame: Option<&ImageFrame>) -> Self {
+        let (width, height) = frame
+            .map(|image| (image.width as usize, image.height as usize))
+            .unwrap_or((0, 0));
+        Self {
+            visibility_pyramid: VisibilityPyramid::new(width, height),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -23,6 +53,7 @@ pub struct ObservationManager {
     image_pair_stats: HashMap<(usize, usize), ImagePairStat>,
     point3d_correspondence_counts: Vec<Vec<usize>>,
     modified_point3d_ids: HashSet<usize>,
+    correspondence_graph: Option<CorrespondenceGraph>,
 }
 
 impl ObservationManager {
@@ -32,8 +63,17 @@ impl ObservationManager {
         reconstruction: &Reconstruction,
     ) -> Self {
         let mut manager = Self::default();
+        manager.install_correspondence_graph(build_correspondence_graph_from_pairs(frames, pairs));
         manager.rebuild(frames, pairs, reconstruction);
         manager
+    }
+
+    pub fn install_correspondence_graph(&mut self, graph: CorrespondenceGraph) {
+        self.correspondence_graph = Some(graph);
+    }
+
+    pub fn correspondence_graph(&self) -> Option<&CorrespondenceGraph> {
+        self.correspondence_graph.as_ref()
     }
 
     pub fn rebuild(
@@ -43,7 +83,10 @@ impl ObservationManager {
         reconstruction: &Reconstruction,
     ) {
         let modified_point3d_ids = std::mem::take(&mut self.modified_point3d_ids);
-        let mut image_stats = vec![ImageStat::default(); frames.len()];
+        let mut image_stats = frames
+            .iter()
+            .map(|frame| ImageStat::init_for_frame(Some(frame)))
+            .collect::<Vec<_>>();
         let mut observed_features = frames
             .iter()
             .map(|frame| vec![false; frame.keypoints.len()])
@@ -120,6 +163,7 @@ impl ObservationManager {
                     increment_correspondence_has_point3d(
                         &mut image_stats,
                         &mut point3d_correspondence_counts,
+                        frames,
                         pair.right,
                         right_feature,
                     );
@@ -128,6 +172,7 @@ impl ObservationManager {
                     increment_correspondence_has_point3d(
                         &mut image_stats,
                         &mut point3d_correspondence_counts,
+                        frames,
                         pair.left,
                         left_feature,
                     );
@@ -137,21 +182,6 @@ impl ObservationManager {
                 }
             }
             image_pair_stats.insert(key, stat);
-        }
-
-        for image in 0..frames.len() {
-            let positions = point3d_correspondence_counts[image]
-                .iter()
-                .enumerate()
-                .filter_map(|(feature, &count)| {
-                    (count > 0).then(|| {
-                        let keypoint = &frames[image].keypoints[feature];
-                        (keypoint.x(), keypoint.y())
-                    })
-                })
-                .collect::<Vec<_>>();
-            image_stats[image].point3d_visibility_score =
-                visibility_pyramid_score(frames.get(image), &positions);
         }
 
         self.image_stats = image_stats;
@@ -182,7 +212,7 @@ impl ObservationManager {
         if image >= reconstruction.poses.len() {
             return false;
         }
-        if let Some(frame_registration) =
+        let frame_images = if let Some(frame_registration) =
             reconstruction.frame_registration_poses_for_image(image, pose)
         {
             if frame_registration.image_poses.is_empty() {
@@ -197,12 +227,24 @@ impl ObservationManager {
                 frame.rig_from_world =
                     crate::types::Rigid3::from_se3(frame_registration.rig_from_world);
             }
+            reconstruction.image_indices_for_registration_unit(image)
         } else if let Some(slot) = reconstruction.poses.get_mut(image) {
             *slot = Some(pose);
+            vec![image]
         } else {
             return false;
+        };
+
+        if let Some(graph) = self.correspondence_graph.clone() {
+            self.propagate_visible_correspondences_on_register(
+                frames,
+                &graph,
+                reconstruction,
+                &frame_images,
+            );
+        } else {
+            self.rebuild(frames, pairs, reconstruction);
         }
-        self.rebuild(frames, pairs, reconstruction);
         true
     }
 
@@ -235,21 +277,59 @@ impl ObservationManager {
         }) {
             return false;
         }
-        for frame_image in frame_images {
-            let features = reconstruction
-                .observations
-                .get(frame_image)
-                .map(|observations| {
-                    observations
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(feature, point_id)| point_id.is_some().then_some(feature))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            for feature in features {
-                self.delete_observation(frames, pairs, reconstruction, frame_image, feature);
+
+        if let Some(graph) = self.correspondence_graph.clone() {
+            for &frame_image in &frame_images {
+                let num_features = frames
+                    .get(frame_image)
+                    .map(|frame| frame.keypoints.len())
+                    .unwrap_or(0);
+                for feature in 0..num_features {
+                    for (corr_image, _corr_feature) in
+                        correspondences_for(&graph, frame_image, feature)
+                    {
+                        let stats = &mut self.image_stats[corr_image];
+                        debug_assert!(stats.num_visible_correspondences > 0);
+                        stats.num_visible_correspondences =
+                            stats.num_visible_correspondences.saturating_sub(1);
+                    }
+                    if reconstruction.observations[frame_image][feature].is_some() {
+                        self.delete_observation_internal(
+                            frames,
+                            pairs,
+                            reconstruction,
+                            frame_image,
+                            feature,
+                        );
+                    }
+                }
             }
+        } else {
+            for frame_image in frame_images.clone() {
+                let features = reconstruction
+                    .observations
+                    .get(frame_image)
+                    .map(|observations| {
+                        observations
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(feature, point_id)| point_id.is_some().then_some(feature))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                for feature in features {
+                    self.delete_observation_internal(
+                        frames,
+                        pairs,
+                        reconstruction,
+                        frame_image,
+                        feature,
+                    );
+                }
+            }
+        }
+
+        for frame_image in frame_images {
             if let Some(slot) = reconstruction.poses.get_mut(frame_image) {
                 *slot = None;
             }
@@ -259,7 +339,9 @@ impl ObservationManager {
                 frame.rig_from_world = crate::types::Rigid3::identity();
             }
         }
-        self.rebuild(frames, pairs, reconstruction);
+        if self.correspondence_graph.is_none() {
+            self.rebuild(frames, pairs, reconstruction);
+        }
         true
     }
 
@@ -290,7 +372,22 @@ impl ObservationManager {
             .push(next_point3d_id(reconstruction));
         reconstruction.points.push(point);
         self.mark_point3d_modified(point_id);
-        self.rebuild(frames, pairs, reconstruction);
+
+        if let Some(graph) = self.correspondence_graph.clone() {
+            let track = reconstruction.points[point_id].track.clone();
+            for obs in track {
+                self.set_observation_as_triangulated(
+                    &graph,
+                    frames,
+                    reconstruction,
+                    obs.image,
+                    obs.feature,
+                    false,
+                );
+            }
+        } else {
+            self.rebuild(frames, pairs, reconstruction);
+        }
         Some(point_id)
     }
 
@@ -314,9 +411,23 @@ impl ObservationManager {
         }
 
         reconstruction.observations[observation.image][observation.feature] = Some(point_id);
+        let obs_image = observation.image;
+        let obs_feature = observation.feature;
         reconstruction.points[point_id].track.push(observation);
         self.mark_point3d_modified(point_id);
-        self.rebuild(frames, pairs, reconstruction);
+
+        if let Some(graph) = self.correspondence_graph.clone() {
+            self.set_observation_as_triangulated(
+                &graph,
+                frames,
+                reconstruction,
+                obs_image,
+                obs_feature,
+                true,
+            );
+        } else {
+            self.rebuild(frames, pairs, reconstruction);
+        }
         true
     }
 
@@ -327,14 +438,46 @@ impl ObservationManager {
         reconstruction: &mut Reconstruction,
         point_id: usize,
     ) -> bool {
-        if !self.delete_point3d_internal(reconstruction, point_id) {
+        if point_id >= reconstruction.points.len() {
             return false;
         }
-        self.rebuild(frames, pairs, reconstruction);
+
+        if let Some(graph) = self.correspondence_graph.clone() {
+            let track = reconstruction.points[point_id].track.clone();
+            for obs in track {
+                self.reset_tri_observations(
+                    &graph,
+                    frames,
+                    reconstruction,
+                    obs.image,
+                    obs.feature,
+                    true,
+                );
+            }
+            if !self.delete_point3d_internal(reconstruction, point_id) {
+                return false;
+            }
+        } else if !self.delete_point3d_internal(reconstruction, point_id) {
+            return false;
+        } else {
+            self.rebuild(frames, pairs, reconstruction);
+            return true;
+        }
         true
     }
 
     pub fn delete_observation(
+        &mut self,
+        frames: &[ImageFrame],
+        pairs: &[PairGeometry],
+        reconstruction: &mut Reconstruction,
+        image: usize,
+        feature: usize,
+    ) -> bool {
+        self.delete_observation_internal(frames, pairs, reconstruction, image, feature)
+    }
+
+    fn delete_observation_internal(
         &mut self,
         frames: &[ImageFrame],
         pairs: &[PairGeometry],
@@ -357,12 +500,18 @@ impl ObservationManager {
                     *observation = None;
                 }
             }
-            self.rebuild(frames, pairs, reconstruction);
+            if self.correspondence_graph.is_none() {
+                self.rebuild(frames, pairs, reconstruction);
+            }
             return true;
         }
 
         if reconstruction.points[point_id].track.len() <= 2 {
             return self.delete_point3d(frames, pairs, reconstruction, point_id);
+        }
+
+        if let Some(graph) = self.correspondence_graph.clone() {
+            self.reset_tri_observations(&graph, frames, reconstruction, image, feature, false);
         }
 
         reconstruction.observations[image][feature] = None;
@@ -374,7 +523,9 @@ impl ObservationManager {
             reconstruction.points[point_id].track.remove(pos);
         }
         self.mark_point3d_modified(point_id);
-        self.rebuild(frames, pairs, reconstruction);
+        if self.correspondence_graph.is_none() {
+            self.rebuild(frames, pairs, reconstruction);
+        }
         true
     }
 
@@ -395,7 +546,6 @@ impl ObservationManager {
             return None;
         }
 
-        let (keep_id, remove_id) = ordered_pair(point_id1, point_id2);
         for obs in &merged_point.track {
             let assigned = reconstruction.observations[obs.image][obs.feature];
             if assigned.is_some_and(|point_id| point_id != point_id1 && point_id != point_id2) {
@@ -403,6 +553,32 @@ impl ObservationManager {
             }
         }
 
+        if let Some(graph) = self.correspondence_graph.clone() {
+            let track1 = reconstruction.points[point_id1].track.clone();
+            for obs in track1 {
+                self.reset_tri_observations(
+                    &graph,
+                    frames,
+                    reconstruction,
+                    obs.image,
+                    obs.feature,
+                    true,
+                );
+            }
+            let track2 = reconstruction.points[point_id2].track.clone();
+            for obs in track2 {
+                self.reset_tri_observations(
+                    &graph,
+                    frames,
+                    reconstruction,
+                    obs.image,
+                    obs.feature,
+                    true,
+                );
+            }
+        }
+
+        let (keep_id, remove_id) = ordered_pair(point_id1, point_id2);
         ensure_point_id_table(reconstruction);
         reconstruction.points[keep_id] = merged_point;
         for obs in &reconstruction.points[keep_id].track {
@@ -412,8 +588,139 @@ impl ObservationManager {
             return None;
         }
         self.mark_point3d_modified(keep_id);
-        self.rebuild(frames, pairs, reconstruction);
+
+        if let Some(graph) = self.correspondence_graph.clone() {
+            let track = reconstruction.points[keep_id].track.clone();
+            for obs in track {
+                self.set_observation_as_triangulated(
+                    &graph,
+                    frames,
+                    reconstruction,
+                    obs.image,
+                    obs.feature,
+                    false,
+                );
+            }
+        } else {
+            self.rebuild(frames, pairs, reconstruction);
+        }
         Some(keep_id)
+    }
+
+    fn propagate_visible_correspondences_on_register(
+        &mut self,
+        frames: &[ImageFrame],
+        graph: &CorrespondenceGraph,
+        reconstruction: &Reconstruction,
+        frame_images: &[usize],
+    ) {
+        for &image in frame_images {
+            let num_features = frames
+                .get(image)
+                .map(|frame| frame.keypoints.len())
+                .unwrap_or(0);
+            for feature in 0..num_features {
+                for (corr_image, corr_feature) in correspondences_for(graph, image, feature) {
+                    if corr_image < self.image_stats.len() {
+                        self.image_stats[corr_image].num_visible_correspondences += 1;
+                    }
+                    if reconstruction.poses.get(corr_image).copied().flatten().is_some()
+                        && reconstruction.observations[corr_image][corr_feature].is_some()
+                    {
+                        increment_correspondence_has_point3d(
+                            &mut self.image_stats,
+                            &mut self.point3d_correspondence_counts,
+                            frames,
+                            image,
+                            feature,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_observation_as_triangulated(
+        &mut self,
+        graph: &CorrespondenceGraph,
+        frames: &[ImageFrame],
+        reconstruction: &Reconstruction,
+        image: usize,
+        feature: usize,
+        is_continued_point3d: bool,
+    ) {
+        if reconstruction.poses.get(image).copied().flatten().is_none() {
+            return;
+        }
+        let Some(point_id) = reconstruction.observations[image][feature] else {
+            return;
+        };
+
+        for (corr_image, corr_feature) in correspondences_for(graph, image, feature) {
+            increment_correspondence_has_point3d(
+                &mut self.image_stats,
+                &mut self.point3d_correspondence_counts,
+                frames,
+                corr_image,
+                corr_feature,
+            );
+
+            let corr_point = reconstruction.observations[corr_image][corr_feature];
+            if corr_point == Some(point_id)
+                && (is_continued_point3d || image < corr_image)
+            {
+                let key = ordered_pair(image, corr_image);
+                let num_total = graph
+                    .num_matches_between_images(image as u32, corr_image as u32)
+                    .unwrap_or(0) as usize;
+                let stat = self
+                    .image_pair_stats
+                    .entry(key)
+                    .or_insert(ImagePairStat {
+                        num_total_corrs: num_total,
+                        num_tri_corrs: 0,
+                    });
+                stat.num_tri_corrs += 1;
+            }
+        }
+    }
+
+    fn reset_tri_observations(
+        &mut self,
+        graph: &CorrespondenceGraph,
+        frames: &[ImageFrame],
+        reconstruction: &Reconstruction,
+        image: usize,
+        feature: usize,
+        is_deleted_point3d: bool,
+    ) {
+        if reconstruction.poses.get(image).copied().flatten().is_none() {
+            return;
+        }
+        let Some(point_id) = reconstruction.observations[image][feature] else {
+            return;
+        };
+
+        for (corr_image, corr_feature) in correspondences_for(graph, image, feature) {
+            decrement_correspondence_has_point3d(
+                &mut self.image_stats,
+                &mut self.point3d_correspondence_counts,
+                frames,
+                corr_image,
+                corr_feature,
+            );
+
+            let corr_point = reconstruction.observations[corr_image][corr_feature];
+            if corr_point == Some(point_id)
+                && (!is_deleted_point3d || image < corr_image)
+            {
+                let key = ordered_pair(image, corr_image);
+                if let Some(stat) = self.image_pair_stats.get_mut(&key) {
+                    debug_assert!(stat.num_tri_corrs > 0);
+                    stat.num_tri_corrs = stat.num_tri_corrs.saturating_sub(1);
+                }
+            }
+        }
     }
 
     pub fn mark_point3d_modified(&mut self, point_id: usize) {
@@ -463,7 +770,7 @@ impl ObservationManager {
     pub fn point3d_visibility_score(&self, image: usize) -> usize {
         self.image_stats
             .get(image)
-            .map(|stat| stat.point3d_visibility_score)
+            .map(ImageStat::point3d_visibility_score)
             .unwrap_or(0)
     }
 
@@ -544,34 +851,61 @@ fn mark_observation(
 fn increment_correspondence_has_point3d(
     image_stats: &mut [ImageStat],
     point3d_correspondence_counts: &mut [Vec<usize>],
+    frames: &[ImageFrame],
     image: usize,
     feature: usize,
 ) {
     point3d_correspondence_counts[image][feature] += 1;
     if point3d_correspondence_counts[image][feature] == 1 {
         image_stats[image].num_visible_points3d += 1;
+        if let Some(keypoint) = frames
+            .get(image)
+            .and_then(|frame| frame.keypoints.get(feature))
+        {
+            image_stats[image]
+                .visibility_pyramid
+                .set_point(keypoint.x(), keypoint.y());
+        }
     }
 }
 
-fn visibility_pyramid_score(frame: Option<&ImageFrame>, positions: &[(f32, f32)]) -> usize {
-    let Some(frame) = frame else {
-        return 0;
-    };
-    if frame.width == 0 || frame.height == 0 || positions.is_empty() {
-        return 0;
-    }
-    let mut score = 0usize;
-    for level in 0..6 {
-        let bins = 1usize << level;
-        let mut occupied = HashSet::new();
-        for &(x, y) in positions {
-            let bx = ((x.max(0.0) / frame.width as f32) * bins as f32).floor() as usize;
-            let by = ((y.max(0.0) / frame.height as f32) * bins as f32).floor() as usize;
-            occupied.insert((bx.min(bins - 1), by.min(bins - 1)));
+fn decrement_correspondence_has_point3d(
+    image_stats: &mut [ImageStat],
+    point3d_correspondence_counts: &mut [Vec<usize>],
+    frames: &[ImageFrame],
+    image: usize,
+    feature: usize,
+) {
+    debug_assert!(point3d_correspondence_counts[image][feature] > 0);
+    point3d_correspondence_counts[image][feature] -= 1;
+    if point3d_correspondence_counts[image][feature] == 0 {
+        image_stats[image].num_visible_points3d =
+            image_stats[image].num_visible_points3d.saturating_sub(1);
+        if let Some(keypoint) = frames
+            .get(image)
+            .and_then(|frame| frame.keypoints.get(feature))
+        {
+            image_stats[image]
+                .visibility_pyramid
+                .reset_point(keypoint.x(), keypoint.y());
         }
-        score += occupied.len();
     }
-    score
+}
+
+fn correspondences_for(
+    graph: &CorrespondenceGraph,
+    image: usize,
+    feature: usize,
+) -> Vec<(usize, usize)> {
+    graph
+        .find_correspondences(image as u32, feature as u32)
+        .map(|corrs| {
+            corrs
+                .iter()
+                .map(|corr| (corr.image_id as usize, corr.point2d_idx as usize))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn track_observation_is_valid(
@@ -1073,6 +1407,90 @@ mod tests {
         assert_eq!(manager.image_pairs().get(&(1, 2)).unwrap().num_tri_corrs, 1);
         assert_eq!(manager.image_pairs().get(&(2, 3)).unwrap().num_tri_corrs, 1);
         assert!(manager.modified_point3d_ids().contains(&0));
+    }
+
+    #[test]
+    fn incremental_event_paths_match_rebuild_stats() {
+        let frames = vec![frame(0, 100, 100), frame(1, 100, 100), frame(2, 100, 100)];
+        let pairs = vec![pair(0, 1, &[(0, 0)]), pair(1, 2, &[(0, 0)])];
+        let mut incremental_recon = reconstruction(&frames);
+        incremental_recon.poses[0] = Some(SE3::identity());
+        incremental_recon.poses[1] = Some(SE3::identity());
+        let mut incremental = ObservationManager::new(&frames, &pairs, &incremental_recon);
+        incremental
+            .add_point3d(
+                &frames,
+                &pairs,
+                &mut incremental_recon,
+                Point3D {
+                    xyz: [0.0, 0.0, 1.0],
+                    color: [0, 0, 0],
+                    error: 0.0,
+                    track: vec![
+                        TrackObservation {
+                            image: 0,
+                            feature: 0,
+                        },
+                        TrackObservation {
+                            image: 1,
+                            feature: 0,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        assert!(incremental.register_image(
+            &frames,
+            &pairs,
+            &mut incremental_recon,
+            2,
+            SE3::identity()
+        ));
+
+        let mut rebuild_recon = reconstruction(&frames);
+        rebuild_recon.poses[0] = Some(SE3::identity());
+        rebuild_recon.poses[1] = Some(SE3::identity());
+        rebuild_recon.poses[2] = Some(SE3::identity());
+        rebuild_recon.observations[0][0] = Some(0);
+        rebuild_recon.observations[1][0] = Some(0);
+        rebuild_recon.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+        let rebuild = ObservationManager::new(&frames, &pairs, &rebuild_recon);
+
+        for image in 0..frames.len() {
+            assert_eq!(
+                incremental.num_visible_correspondences(image),
+                rebuild.num_visible_correspondences(image),
+                "visible corrs image {image}"
+            );
+            assert_eq!(
+                incremental.num_visible_points3d(image),
+                rebuild.num_visible_points3d(image),
+                "visible points3d image {image}"
+            );
+            assert_eq!(
+                incremental.point3d_visibility_score(image),
+                rebuild.point3d_visibility_score(image),
+                "visibility score image {image}"
+            );
+        }
+        assert_eq!(
+            incremental.image_pairs().get(&(0, 1)).unwrap().num_tri_corrs,
+            rebuild.image_pairs().get(&(0, 1)).unwrap().num_tri_corrs
+        );
     }
 
     fn reconstruction(frames: &[ImageFrame]) -> Reconstruction {

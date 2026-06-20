@@ -4033,7 +4033,9 @@ fn incremental_map_single_attempt(
                 &mut triangulation_state,
             );
             triangulator.triangulate_image(&tri_options, initial.left);
+            triangulator.complete_image(&tri_options, initial.left);
             triangulator.triangulate_image(&tri_options, initial.right);
+            triangulator.complete_image(&tri_options, initial.right);
             let modified = triangulator.get_modified_points3d().clone();
             triangulator.complete_tracks(&tri_options, &modified);
             let modified = triangulator.get_modified_points3d().clone();
@@ -4197,6 +4199,7 @@ fn incremental_map_single_attempt(
                 &mut triangulation_state,
             );
             triangulator.triangulate_image(&tri_options, choice.image);
+            triangulator.complete_image(&tri_options, choice.image);
             let modified = triangulator.get_modified_points3d().clone();
             triangulator.complete_tracks(&tri_options, &modified);
             let modified = triangulator.get_modified_points3d().clone();
@@ -5452,7 +5455,10 @@ fn refine_local_bundle_after_registration(
             triangulation_state,
         );
         let completed = triangulator.complete_tracks(tri_options, &post_ba_point_ids);
-        let image_report = triangulator.triangulate_image(tri_options, registered_image);
+        let mut image_report = triangulator.triangulate_image(tri_options, registered_image);
+        let complete_report = triangulator.complete_image(tri_options, registered_image);
+        image_report.completed_observations += complete_report.completed_observations;
+        image_report.created_points += complete_report.created_points;
         (completed, image_report.total_observations())
     };
     let variable_image_count =

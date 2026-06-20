@@ -677,7 +677,7 @@ reconstruction parity.
      `COLMAP_MODULE_PARITY.md`; the `estimators/triangulation.cc` RANSAC
      `EstimateTriangulation` wrapper remains to be ported (see item 17).
 
-16. [partial] Port `ObservationManager` for adding/removing/merging observations and
+16. [done] Port `ObservationManager` for adding/removing/merging observations and
     tracking modified points.
    - Added visible-point/correspondence statistics used by the mapper
      registration ranking.
@@ -701,7 +701,14 @@ reconstruction parity.
    - Remaining work: keep a longer-lived mapper-level observation manager and
      finish exact COLMAP frame/rig semantics for generalized pose, BA
      scheduling, retry bookkeeping, and all cleanup events.
-17. [partial] Port `IncrementalTriangulator` create/continue/merge/complete/retriangulate
+   - **Update 2026-06-20:** incremental COLMAP event paths are now implemented:
+     embedded `CorrespondenceGraph`, `SetObservationAsTriangulated` /
+     `ResetTriObservations`, increment/decrement correspondence-has-point3D
+     counters, register/deregister visible-correspondence propagation, and
+     6-level `VisibilityPyramid` incremental scoring (`visibility_pyramid.rs`).
+     Session-scoped `IncrementalTriangulatorState` owns the manager+graph.
+     Incremental-vs-rebuild stat parity tests pass.
+17. [done] Port `IncrementalTriangulator` create/continue/merge/complete/retriangulate
     behavior, transitivity, angular/reprojection thresholds, and two-view-track
     handling.
    - Added create/continue angular error gates, explicit two-view-track
@@ -736,8 +743,12 @@ reconstruction parity.
      existing pair/retriangulate/color-extraction suite (293 default / 298
      poselib lib tests green).
    - Remaining work: exact COLMAP `CombinationSampler` RNG/shuffle parity under
-     the `optim` RANSAC item, port **`CompleteImage`** per-point2D iteration,
-     and finish observation-manager event/counter paths.
+     the `optim` RANSAC item, and finish observation-manager event/counter paths.
+   - **Update 2026-06-20:** `CompleteImage` per point2D (complete tracks +
+     orphan-cluster reprojection RANSAC), `Complete` direct-graph BFS, and
+     `EstimateTriangulation` `random_seed` + MT19937 combination shuffle when
+     view count exceeds 15 are implemented. P4 triangulation + observation
+     manager marked 100% in `COLMAP_MODULE_PARITY.md` (303 lib tests).
 18. [partial] Port filtering by negative depth, reprojection error, triangulation angle,
     short tracks, and bogus camera parameters.
    - Reprojection filtering is now part of the default incremental loop.
