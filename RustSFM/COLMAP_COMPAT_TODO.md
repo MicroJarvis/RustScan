@@ -357,6 +357,10 @@ reconstruction parity.
     - Two-view E/F/H random sampling now follows COLMAP `RandomSampler`'s
       stateful partial Fisher-Yates shape over a persistent index pool instead
       of repeatedly drawing unique indices by rejection.
+    - Shared `ColmapRandomSampler` now exposes the official COLMAP
+      constructor/`Initialize`/`MaxNumSamples`/`Sample` shape in addition to
+      the existing RustSFM indexed-pool helper API, with official less-samples
+      and equal-samples uniqueness tests plus oversized-initialize rejection.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.

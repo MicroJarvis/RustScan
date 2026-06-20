@@ -98,6 +98,7 @@ impl ColmapMt19937 {
 pub struct ColmapRandomSampler {
     rng: ColmapMt19937,
     sample_indices: Vec<usize>,
+    configured_num_samples: Option<usize>,
 }
 
 impl ColmapRandomSampler {
@@ -105,6 +106,38 @@ impl ColmapRandomSampler {
         Self {
             rng: ColmapMt19937::new(seed),
             sample_indices: indices.to_vec(),
+            configured_num_samples: None,
+        }
+    }
+
+    pub fn with_num_samples(seed: u64, num_samples: usize) -> Self {
+        Self {
+            rng: ColmapMt19937::new(seed),
+            sample_indices: Vec::new(),
+            configured_num_samples: Some(num_samples),
+        }
+    }
+
+    pub fn initialize(&mut self, total_num_samples: usize) -> bool {
+        let Some(num_samples) = self.configured_num_samples else {
+            return false;
+        };
+        if num_samples > total_num_samples {
+            self.sample_indices.clear();
+            return false;
+        }
+        self.sample_indices = (0..total_num_samples).collect();
+        true
+    }
+
+    pub fn max_num_samples(&self) -> usize {
+        usize::MAX
+    }
+
+    pub fn sample_configured(&mut self) -> Vec<usize> {
+        match self.configured_num_samples {
+            Some(num_samples) => self.sample(num_samples),
+            None => Vec::new(),
         }
     }
 
@@ -337,6 +370,47 @@ mod tests {
         let mut sampler = ColmapRandomSampler::new(1, &[0, 1, 2, 3, 4, 5]);
         assert_eq!(sampler.sample(3), vec![5, 4, 2]);
         assert_eq!(sampler.sample(3), vec![5, 2, 0]);
+    }
+
+    #[test]
+    fn colmap_random_sampler_official_less_samples_shape() {
+        let mut sampler = ColmapRandomSampler::with_num_samples(42, 2);
+        assert!(sampler.initialize(5));
+        assert_eq!(sampler.max_num_samples(), usize::MAX);
+
+        for _ in 0..100 {
+            let samples = sampler.sample_configured();
+            assert_eq!(samples.len(), 2);
+            let mut unique = samples.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), 2);
+            assert!(samples.iter().all(|&idx| idx < 5));
+        }
+    }
+
+    #[test]
+    fn colmap_random_sampler_official_equal_samples_shape() {
+        let mut sampler = ColmapRandomSampler::with_num_samples(42, 5);
+        assert!(sampler.initialize(5));
+        assert_eq!(sampler.max_num_samples(), usize::MAX);
+
+        for _ in 0..100 {
+            let samples = sampler.sample_configured();
+            assert_eq!(samples.len(), 5);
+            let mut unique = samples.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), 5);
+            assert_eq!(unique, vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn colmap_random_sampler_initialize_rejects_oversized_requests() {
+        let mut sampler = ColmapRandomSampler::with_num_samples(1, 3);
+        assert!(!sampler.initialize(2));
+        assert!(sampler.sample_configured().is_empty());
     }
 
     #[test]
