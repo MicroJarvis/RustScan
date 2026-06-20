@@ -275,6 +275,62 @@ impl ColmapRansacOptions {
             self.dyn_num_trials_multiplier,
         ))
     }
+
+    pub fn with_initial_max_num_trials(
+        mut self,
+        min_num_samples: usize,
+    ) -> Result<Self, &'static str> {
+        self.check()?;
+        self.max_num_trials = self.initial_max_num_trials(min_num_samples);
+        Ok(self)
+    }
+}
+
+/// COLMAP `RANSAC::Report` / `LORANSAC::Report` shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColmapRansacReport<Support, Model> {
+    pub success: bool,
+    pub num_trials: usize,
+    pub support: Support,
+    pub inlier_mask: Vec<bool>,
+    pub model: Option<Model>,
+}
+
+impl<Support: Default, Model> Default for ColmapRansacReport<Support, Model> {
+    fn default() -> Self {
+        Self {
+            success: false,
+            num_trials: 0,
+            support: Support::default(),
+            inlier_mask: Vec::new(),
+            model: None,
+        }
+    }
+}
+
+impl<Support, Model> ColmapRansacReport<Support, Model> {
+    pub fn from_success(
+        num_trials: usize,
+        support: Support,
+        inlier_mask: Vec<bool>,
+        model: Model,
+    ) -> Self {
+        Self {
+            success: true,
+            num_trials,
+            support,
+            inlier_mask,
+            model: Some(model),
+        }
+    }
+
+    pub fn inlier_mask_from_residuals(residuals: &[f64], max_error: f64) -> Vec<bool> {
+        let max_residual = max_error * max_error;
+        residuals
+            .iter()
+            .map(|&residual| residual <= max_residual)
+            .collect()
+    }
 }
 
 /// COLMAP `CombinationSampler`, which enumerates unique sorted combinations.
@@ -395,8 +451,7 @@ impl ColmapProgressiveSampler {
         self.t_n = NUM_PROGRESSIVE_ITERATIONS;
         self.t_n_p = 1.0;
         for i in 0..self.num_samples {
-            self.t_n *=
-                (self.num_samples - i) as f64 / (self.total_num_samples - i) as f64;
+            self.t_n *= (self.num_samples - i) as f64 / (self.total_num_samples - i) as f64;
         }
         true
     }
@@ -413,8 +468,8 @@ impl ColmapProgressiveSampler {
         self.t += 1;
 
         if self.t as f64 == self.t_n_p && self.n < self.total_num_samples {
-            let t_n_plus_1 = self.t_n * (self.n as f64 + 1.0)
-                / (self.n as f64 + 1.0 - self.num_samples as f64);
+            let t_n_plus_1 =
+                self.t_n * (self.n as f64 + 1.0) / (self.n as f64 + 1.0 - self.num_samples as f64);
             self.t_n_p += (t_n_plus_1 - self.t_n).ceil();
             self.t_n = t_n_plus_1;
             self.n += 1;
@@ -579,24 +634,12 @@ mod tests {
     fn colmap_ransac_num_trials_matches_official_examples() {
         assert_eq!(colmap_ransac_num_trials(1, 100, 3, 0.99, 1.0), usize::MAX);
         assert_eq!(colmap_ransac_num_trials(10, 100, 3, 0.99, 1.0), 6204);
-        assert_eq!(
-            colmap_ransac_num_trials(10, 100, 3, 0.999, 1.0),
-            9305
-        );
-        assert_eq!(
-            colmap_ransac_num_trials(10, 100, 3, 0.999, 2.0),
-            18610
-        );
+        assert_eq!(colmap_ransac_num_trials(10, 100, 3, 0.999, 1.0), 9305);
+        assert_eq!(colmap_ransac_num_trials(10, 100, 3, 0.999, 2.0), 18610);
         assert_eq!(colmap_ransac_num_trials(50, 100, 3, 0.99, 1.0), 36);
-        assert_eq!(
-            colmap_ransac_num_trials(50, 100, 3, 0.999, 1.0),
-            54
-        );
+        assert_eq!(colmap_ransac_num_trials(50, 100, 3, 0.999, 1.0), 54);
         assert_eq!(colmap_ransac_num_trials(100, 100, 3, 0.99, 1.0), 1);
-        assert_eq!(
-            colmap_ransac_num_trials(100, 100, 3, 0.999, 1.0),
-            1
-        );
+        assert_eq!(colmap_ransac_num_trials(100, 100, 3, 0.999, 1.0), 1);
         assert_eq!(colmap_ransac_num_trials(100, 100, 3, 0.0, 1.0), 1);
     }
 
@@ -642,6 +685,60 @@ mod tests {
         assert!(options.check().is_err());
         options.num_threads = -2;
         assert!(options.check().is_err());
+    }
+
+    #[test]
+    fn colmap_ransac_options_constructor_clamps_initial_trials() {
+        let options = ColmapRansacOptions {
+            max_error: 1.0,
+            min_inlier_ratio: 0.5,
+            confidence: 0.999,
+            dyn_num_trials_multiplier: 1.0,
+            max_num_trials: 10_000,
+            ..ColmapRansacOptions::default()
+        };
+        let checked = options.with_initial_max_num_trials(3).unwrap();
+        assert_eq!(checked.max_num_trials, 52);
+
+        let options = ColmapRansacOptions {
+            max_error: 1.0,
+            min_inlier_ratio: 0.1,
+            confidence: 0.99,
+            dyn_num_trials_multiplier: 3.0,
+            max_num_trials: 25,
+            ..ColmapRansacOptions::default()
+        };
+        let checked = options.with_initial_max_num_trials(3).unwrap();
+        assert_eq!(checked.max_num_trials, 25);
+
+        let invalid = ColmapRansacOptions::default();
+        assert!(invalid.with_initial_max_num_trials(3).is_err());
+    }
+
+    #[test]
+    fn colmap_ransac_report_matches_official_default_shape() {
+        let report = ColmapRansacReport::<usize, [f64; 3]>::default();
+        assert!(!report.success);
+        assert_eq!(report.num_trials, 0);
+        assert_eq!(report.support, 0);
+        assert!(report.inlier_mask.is_empty());
+        assert!(report.model.is_none());
+    }
+
+    #[test]
+    fn colmap_ransac_report_builds_success_and_mask_from_residuals() {
+        let mask = ColmapRansacReport::<usize, [f64; 3]>::inlier_mask_from_residuals(
+            &[0.0, 1.0, 4.0, 4.01],
+            2.0,
+        );
+        assert_eq!(mask, vec![true, true, true, false]);
+
+        let report = ColmapRansacReport::from_success(7, 3usize, mask, [1.0, 2.0, 3.0]);
+        assert!(report.success);
+        assert_eq!(report.num_trials, 7);
+        assert_eq!(report.support, 3);
+        assert_eq!(report.inlier_mask, vec![true, true, true, false]);
+        assert_eq!(report.model, Some([1.0, 2.0, 3.0]));
     }
 
     #[test]

@@ -71,6 +71,20 @@ impl RansacOptions {
         }
         Ok(())
     }
+
+    #[cfg(feature = "poselib")]
+    fn as_colmap_options(&self) -> ColmapRansacOptions {
+        ColmapRansacOptions {
+            max_error: self.max_error,
+            min_inlier_ratio: self.min_inlier_ratio,
+            confidence: self.confidence,
+            dyn_num_trials_multiplier: self.dyn_num_trials_multiplier,
+            min_num_trials: self.min_num_trials,
+            max_num_trials: self.max_num_trials,
+            random_seed: self.random_seed,
+            num_threads: self.num_threads,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -718,16 +732,13 @@ fn estimate_generalized_absolute_pose_ransac(
     };
     let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
     let threshold_sq = observations.normalized_max_error * observations.normalized_max_error;
-    let max_num_trials = options.ransac_options.max_num_trials.max(1);
-    let mut dynamic_max_trials = ransac_trials_from_counts(
-        (options.ransac_options.min_inlier_ratio * 100_000.0) as usize,
-        100_000,
-        SAMPLE_SIZE,
-        options.ransac_options.confidence,
-        options.ransac_options.dyn_num_trials_multiplier,
-    )
-    .min(max_num_trials)
-    .max(options.ransac_options.min_num_trials.max(1));
+    let ransac_options = options
+        .ransac_options
+        .as_colmap_options()
+        .with_initial_max_num_trials(SAMPLE_SIZE)
+        .map_err(GeneralizedPoseError::InvalidOptions)?;
+    let max_num_trials = ransac_options.max_num_trials;
+    let mut dynamic_max_trials = max_num_trials;
 
     let mut best = None::<GeneralizedAbsoluteModelSupport>;
     let mut trial = 0usize;
@@ -760,11 +771,11 @@ fn estimate_generalized_absolute_pose_ransac(
                         support.num_inliers,
                         num_points,
                         SAMPLE_SIZE,
-                        options.ransac_options.confidence,
-                        options.ransac_options.dyn_num_trials_multiplier,
+                        ransac_options.confidence,
+                        ransac_options.dyn_num_trials_multiplier,
                     )
                     .min(max_num_trials)
-                    .max(options.ransac_options.min_num_trials.max(1)),
+                    .max(ransac_options.min_num_trials.max(1)),
                 );
                 best = Some(support);
             }
@@ -881,16 +892,13 @@ fn estimate_generalized_relative_pose_ransac(
     };
     let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
     let threshold_sq = observations.normalized_max_error * observations.normalized_max_error;
-    let max_num_trials = options.ransac_options.max_num_trials.max(1);
-    let mut dynamic_max_trials = ransac_trials_from_counts(
-        (options.ransac_options.min_inlier_ratio * 100_000.0) as usize,
-        100_000,
-        SAMPLE_SIZE,
-        options.ransac_options.confidence,
-        options.ransac_options.dyn_num_trials_multiplier,
-    )
-    .min(max_num_trials)
-    .max(options.ransac_options.min_num_trials.max(1));
+    let ransac_options = options
+        .ransac_options
+        .as_colmap_options()
+        .with_initial_max_num_trials(SAMPLE_SIZE)
+        .map_err(GeneralizedPoseError::InvalidOptions)?;
+    let max_num_trials = ransac_options.max_num_trials;
+    let mut dynamic_max_trials = max_num_trials;
 
     let mut best: Option<GeneralizedRelativeModelSupport> = None;
     let mut trial = 0usize;
@@ -931,11 +939,11 @@ fn estimate_generalized_relative_pose_ransac(
                         support.num_inliers,
                         num_points,
                         SAMPLE_SIZE,
-                        options.ransac_options.confidence,
-                        options.ransac_options.dyn_num_trials_multiplier,
+                        ransac_options.confidence,
+                        ransac_options.dyn_num_trials_multiplier,
                     )
                     .min(max_num_trials)
-                    .max(options.ransac_options.min_num_trials.max(1)),
+                    .max(ransac_options.min_num_trials.max(1)),
                 );
                 best = Some(support);
             }
@@ -1254,7 +1262,13 @@ fn ransac_trials_from_counts(
     confidence: f64,
     multiplier: f64,
 ) -> usize {
-    colmap_ransac_num_trials(num_inliers, num_samples, sample_size, confidence, multiplier)
+    colmap_ransac_num_trials(
+        num_inliers,
+        num_samples,
+        sample_size,
+        confidence,
+        multiplier,
+    )
 }
 
 #[cfg(feature = "poselib")]

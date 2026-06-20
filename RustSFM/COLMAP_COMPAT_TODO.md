@@ -373,6 +373,9 @@ reconstruction parity.
       RANSAC options now derive their defaults from the shared COLMAP surface.
       The shared default `max_num_trials` now follows COLMAP's signed
       `int` default (`2147483647`) rather than Rust's platform `usize` max.
+    - Added shared `ColmapRansacReport` and the COLMAP constructor-time
+      `max_num_trials` clamp from `min_inlier_ratio`; generalized absolute and
+      generalized relative pose RANSAC now use that shared initialization path.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.

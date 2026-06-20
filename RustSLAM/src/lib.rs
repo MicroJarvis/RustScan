@@ -10,7 +10,7 @@
 pub use colmap_rng::{
     colmap_ransac_num_trials, n_choose_k, sample_unique_indices, ColmapCombinationSampler,
     ColmapMt19937, ColmapProgressiveSampler, ColmapRandomSampler, ColmapRansacOptions,
-    COLMAP_RANSAC_DEFAULT_MAX_NUM_TRIALS,
+    ColmapRansacReport, COLMAP_RANSAC_DEFAULT_MAX_NUM_TRIALS,
 };
 pub use core::{Camera, Frame, FrameFeatures, KeyFrame, Map, MapPoint, SE3};
 pub use features::{
