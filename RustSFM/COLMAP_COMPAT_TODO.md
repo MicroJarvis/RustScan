@@ -387,6 +387,10 @@ reconstruction parity.
       post-best-model dynamic trial cap (`ComputeNumTrials`, min-trial floor,
       max-trial ceiling); two-view E/F/H and the ray relative-pose fallback use
       that shared COLMAP option path instead of local count wrappers.
+      Two-view E/F/H dynamic stopping now honors COLMAP's
+      `TwoViewGeometryOptions` `ransac_options.min_num_trials = 100` floor,
+      clamped to the configured maximum trial budget, so high-support samples
+      cannot collapse the loop below COLMAP's default minimum trial count.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
