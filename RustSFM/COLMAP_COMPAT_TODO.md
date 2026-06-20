@@ -736,10 +736,8 @@ reconstruction parity.
      existing pair/retriangulate/color-extraction suite (293 default / 298
      poselib lib tests green).
    - Remaining work: exact COLMAP `CombinationSampler` RNG/shuffle parity under
-     the `optim` RANSAC item, restructuring `triangulate_image` to iterate
-     per-point2D like COLMAP's `TriangulateImage` instead of the current pairwise
-     loop, plus exact COLMAP transitivity queues and official point
-     creation/continuation option defaults.
+     the `optim` RANSAC item, port **`CompleteImage`** per-point2D iteration,
+     and finish observation-manager event/counter paths.
 18. [partial] Port filtering by negative depth, reprojection error, triangulation angle,
     short tracks, and bogus camera parameters.
    - Reprojection filtering is now part of the default incremental loop.
@@ -832,9 +830,14 @@ reconstruction parity.
       `refine_bundle_adjustment` always uses Ceres with **no fallback** to
       native. Unsupported configs return `None`. Native BA remains for
       `--no-default-features` builds and native-specific unit tests.
-    - Remaining work: extend Ceres path to rig/sensor/intrinsics (needs
-      quaternion/manifold support in the Rust Ceres binding), switch native LM
-      damping from a fixed `mu*I` to Ceres' jacobian-scaled
+    - Ceres backend (`ceres_problem.rs`) now builds full problems with
+      image/frame/sensor pose blocks, intrinsics refinement, fixed poses, and
+      gauge policies (`THREE_POINTS`, `TWO_CAMS_FROM_WORLD`). Ceres cost
+      callbacks reuse native analytic projection/frame/sensor/camera
+      Jacobians with numeric fallback.
+    - Remaining work: quaternion manifold parameterization in the Rust Ceres
+      binding, populate Ceres solver summary fields in BA reports, switch native
+      LM damping from a fixed `mu*I` to Ceres' jacobian-scaled
       `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with Ceres'
       radius-based trust-region update (a naive switch under the current
       `damping*=10` recovery regressed the generalized-rig refinement test, so

@@ -1259,7 +1259,7 @@ fn sensor_pose_jacobian(
         .or_else(|| numerical_sensor_pose_jacobian(camera, sensor_from_rig, rig_from_world, point))
 }
 
-fn analytic_frame_pose_jacobian(
+pub(crate) fn analytic_frame_pose_jacobian(
     camera: CameraModel,
     sensor_from_rig: SE3,
     rig_from_world: SE3,
@@ -1311,7 +1311,7 @@ fn numerical_frame_pose_jacobian(
     Some(jacobian)
 }
 
-fn analytic_sensor_pose_jacobian(
+pub(crate) fn analytic_sensor_pose_jacobian(
     camera: CameraModel,
     sensor_from_rig: SE3,
     rig_from_world: SE3,
@@ -1456,6 +1456,19 @@ pub(crate) fn sync_pose_blocks_for_sensor_changes(
             );
         }
     }
+}
+
+pub(crate) fn projection_jacobians(
+    camera: CameraModel,
+    pose: SE3,
+    point: [f32; 3],
+) -> Option<(Mat2x6, Mat2x3)> {
+    analytic_projection_jacobians(camera, pose, point).or_else(|| {
+        Some((
+            numerical_pose_jacobian(camera, pose, point)?,
+            numerical_point_jacobian(camera, pose, point)?,
+        ))
+    })
 }
 
 fn residual_and_jacobians(
@@ -1753,7 +1766,7 @@ fn numerical_point_jacobian(camera: CameraModel, pose: SE3, point: [f32; 3]) -> 
     Some(jacobian)
 }
 
-fn camera_param_jacobian(
+pub(crate) fn camera_param_jacobian(
     camera: CameraModel,
     param: usize,
     pose: SE3,

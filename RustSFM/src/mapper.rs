@@ -25,7 +25,8 @@ use crate::geometry::{
     PairEstimationOptions,
 };
 use crate::incremental_triangulator::{
-    IncrementalTriangulator, IncrementalTriangulatorOptions, TriangulationReport,
+    IncrementalTriangulator, IncrementalTriangulatorOptions, IncrementalTriangulatorState,
+    TriangulationReport,
 };
 use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
@@ -3968,8 +3969,15 @@ fn incremental_map_single_attempt(
     if config.fix_existing_frames {
         registration_stats.set_existing_registration_units_from_reconstruction(&reconstruction);
     }
-    let tri_options =
-        IncrementalTriangulatorOptions::from_mapper_threshold(config.max_reprojection_error_px);
+    let tri_options = IncrementalTriangulatorOptions::from_mapper_config_values(
+        config.max_reprojection_error_px,
+        config.min_focal_length_ratio,
+        config.max_focal_length_ratio,
+        config.max_extra_param,
+        config.random_seed,
+    );
+    let mut triangulation_state =
+        IncrementalTriangulatorState::new(frames, pairs, &reconstruction);
     let mut initial_color_images = Vec::new();
     let gauge_image = if let Some(image) = reconstruction.poses.iter().position(Option::is_some) {
         debug_log.push(format!(
@@ -3998,15 +4006,16 @@ fn incremental_map_single_attempt(
             initial.triangulated
         ));
         {
-            let mut observation_manager = ObservationManager::new(frames, pairs, &reconstruction);
-            observation_manager.register_image(
+            triangulation_state
+                .observation_manager_mut()
+                .register_image(
                 frames,
                 pairs,
                 &mut reconstruction,
                 initial.left,
                 SE3::identity(),
             );
-            observation_manager.register_image(
+            triangulation_state.observation_manager_mut().register_image(
                 frames,
                 pairs,
                 &mut reconstruction,
@@ -4017,7 +4026,12 @@ fn incremental_map_single_attempt(
         registration_stats = RegistrationStats::from_reconstruction(&reconstruction);
         registration_stats.set_initial_pair_selection_state(initial_pair_state);
         {
-            let mut triangulator = IncrementalTriangulator::new(frames, pairs, &mut reconstruction);
+            let mut triangulator = IncrementalTriangulator::new(
+                frames,
+                pairs,
+                &mut reconstruction,
+                &mut triangulation_state,
+            );
             triangulator.triangulate_image(&tri_options, initial.left);
             triangulator.triangulate_image(&tri_options, initial.right);
             let modified = triangulator.get_modified_points3d().clone();
@@ -4043,6 +4057,7 @@ fn incremental_map_single_attempt(
         &mut debug_log,
         Some(&mut registration_stats),
         Some(&mut filtered_units),
+        &mut triangulation_state,
     ) {
         global_ba_schedule.mark(&reconstruction);
     }
@@ -4088,6 +4103,7 @@ fn incremental_map_single_attempt(
             &camera_priors,
             &camera_has_prior_focal_length,
             &registration_stats,
+            triangulation_state.observation_manager(),
         );
         for failed_image in failed_images {
             increment_registration_unit_trials(&reconstruction, failed_image, &mut reg_trials);
@@ -4119,8 +4135,9 @@ fn incremental_map_single_attempt(
             &camera_priors,
         );
         {
-            let mut observation_manager = ObservationManager::new(frames, pairs, &reconstruction);
-            observation_manager.register_image(
+            triangulation_state
+                .observation_manager_mut()
+                .register_image(
                 frames,
                 pairs,
                 &mut reconstruction,
@@ -4147,7 +4164,7 @@ fn incremental_map_single_attempt(
                 }
             }
             for inlier in &choice.generalized_inliers {
-                observation_manager.add_observation(
+                triangulation_state.observation_manager_mut().add_observation(
                     frames,
                     pairs,
                     &mut reconstruction,
@@ -4167,12 +4184,18 @@ fn incremental_map_single_attempt(
                 &choice.structureless_inliers,
                 &tri_options,
                 config,
+                triangulation_state.observation_manager_mut(),
             )
         } else {
             TriangulationReport::default()
         };
         {
-            let mut triangulator = IncrementalTriangulator::new(frames, pairs, &mut reconstruction);
+            let mut triangulator = IncrementalTriangulator::new(
+                frames,
+                pairs,
+                &mut reconstruction,
+                &mut triangulation_state,
+            );
             triangulator.triangulate_image(&tri_options, choice.image);
             let modified = triangulator.get_modified_points3d().clone();
             triangulator.complete_tracks(&tri_options, &modified);
@@ -4194,6 +4217,7 @@ fn incremental_map_single_attempt(
             &tri_options,
             config,
             &local_registration_stats,
+            &mut triangulation_state,
         );
         let mut local_ba_filter_removed = 0usize;
         if local_ba_report.is_some() {
@@ -4209,6 +4233,7 @@ fn incremental_map_single_attempt(
         );
         if let Some(reason) = rollback_reason {
             reconstruction = registration_snapshot;
+            triangulation_state.rebuild(frames, pairs, &reconstruction);
             increment_registration_unit_trials(&reconstruction, choice.image, &mut reg_trials);
             debug_log.push(format!(
                 "registration_rollback {} reason={reason}",
@@ -4226,6 +4251,7 @@ fn incremental_map_single_attempt(
             config,
             &mut registration_stats,
             Some(&mut filtered_units),
+            &mut triangulation_state,
         );
         debug_log.push(registration_log);
         if structureless_track_report.total_observations() > 0 {
@@ -4275,6 +4301,7 @@ fn incremental_map_single_attempt(
                 &mut debug_log,
                 Some(&mut registration_stats),
                 Some(&mut filtered_units),
+                &mut triangulation_state,
             ) {
                 global_ba_schedule.mark(&reconstruction);
             }
@@ -4313,6 +4340,7 @@ fn incremental_map_single_attempt(
             &camera_priors,
             &camera_has_prior_focal_length,
             &registration_stats,
+            triangulation_state.observation_manager(),
         );
     }
     if should_run_final_global_ba(&global_ba_schedule, &reconstruction, config) {
@@ -4326,6 +4354,7 @@ fn incremental_map_single_attempt(
             &mut debug_log,
             Some(&mut registration_stats),
             Some(&mut filtered_units),
+            &mut triangulation_state,
         );
     }
     let final_color_report =
@@ -4552,6 +4581,7 @@ fn choose_next_registration(
     camera_has_prior_focal_length: &[bool],
     registration_stats: &RegistrationStats,
 ) -> Option<RegistrationChoice> {
+    let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
     choose_next_registration_with_failures(
         frames,
         pairs,
@@ -4562,6 +4592,7 @@ fn choose_next_registration(
         camera_priors,
         camera_has_prior_focal_length,
         registration_stats,
+        &obs_manager,
     )
     .choice
 }
@@ -4576,8 +4607,8 @@ fn choose_next_registration_with_failures(
     camera_priors: &[CameraModel],
     camera_has_prior_focal_length: &[bool],
     registration_stats: &RegistrationStats,
+    obs_manager: &ObservationManager,
 ) -> NextRegistrationSelection {
-    let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
     let mut failed_images = Vec::new();
     for mode in next_registration_modes(config) {
         let next_images = find_next_registration_images(
@@ -4862,8 +4893,8 @@ fn mark_unregistered_images_with_no_absolute_pose(
     camera_priors: &[CameraModel],
     camera_has_prior_focal_length: &[bool],
     registration_stats: &RegistrationStats,
+    obs_manager: &ObservationManager,
 ) {
-    let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
     let mut marked_units = HashSet::new();
     for image in 0..reconstruction.poses.len() {
         if registration_unit_is_registered(reconstruction, image)
@@ -4930,6 +4961,31 @@ fn mark_unregistered_images_with_no_absolute_pose(
             increment_registration_unit_trials(reconstruction, image, reg_trials);
         }
     }
+}
+
+#[cfg(test)]
+fn mark_unregistered_images_with_no_absolute_pose_for_test(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    reg_trials: &mut [usize],
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
+) {
+    let obs_manager = ObservationManager::new(frames, pairs, reconstruction);
+    mark_unregistered_images_with_no_absolute_pose(
+        frames,
+        pairs,
+        reconstruction,
+        reg_trials,
+        config,
+        camera_priors,
+        camera_has_prior_focal_length,
+        registration_stats,
+        &obs_manager,
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5040,6 +5096,7 @@ fn refine_global_bundle_with_postprocessing(
     debug_log: &mut Vec<String>,
     mut registration_stats: Option<&mut RegistrationStats>,
     mut filtered_units: Option<&mut HashSet<RegistrationUnitKey>>,
+    triangulation_state: &mut IncrementalTriangulatorState,
 ) -> bool {
     if !global_ba_enabled(config)
         || registered_image_count(reconstruction) < 2
@@ -5049,7 +5106,12 @@ fn refine_global_bundle_with_postprocessing(
     }
 
     let (pre_completed, pre_merged, retriangulated) = {
-        let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+        let mut triangulator = IncrementalTriangulator::new(
+            frames,
+            pairs,
+            reconstruction,
+            triangulation_state,
+        );
         let completed = triangulator.complete_all_tracks(tri_options);
         let merged = triangulator.merge_all_tracks(tri_options);
         let retriangulated = triangulator.retriangulate(tri_options);
@@ -5103,7 +5165,12 @@ fn refine_global_bundle_with_postprocessing(
         };
 
         let (completed, merged) = {
-            let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+            let mut triangulator = IncrementalTriangulator::new(
+                frames,
+                pairs,
+                reconstruction,
+                triangulation_state,
+            );
             let completed = triangulator.complete_all_tracks(tri_options);
             let merged = triangulator.merge_all_tracks(tri_options);
             (completed, merged)
@@ -5117,6 +5184,7 @@ fn refine_global_bundle_with_postprocessing(
                 config,
                 stats,
                 filtered_units.as_deref_mut(),
+                triangulation_state,
             )
         } else {
             0
@@ -5253,6 +5321,7 @@ fn filter_registered_frames(
     config: &MapperConfig,
     registration_stats: &mut RegistrationStats,
     mut filtered_units: Option<&mut HashSet<RegistrationUnitKey>>,
+    triangulation_state: &mut IncrementalTriangulatorState,
 ) -> usize {
     const MIN_NUM_REGISTERED_FRAMES_FOR_FILTERING: usize = 20;
     if registered_frame_count(reconstruction) < MIN_NUM_REGISTERED_FRAMES_FOR_FILTERING {
@@ -5277,7 +5346,7 @@ fn filter_registered_frames(
     }
 
     let mut filtered = 0usize;
-    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
+    let observation_manager = triangulation_state.observation_manager_mut();
     for image in candidates {
         if !registration_unit_is_registered(reconstruction, image) {
             continue;
@@ -5336,6 +5405,7 @@ fn refine_local_bundle_after_registration(
     tri_options: &IncrementalTriangulatorOptions,
     config: &MapperConfig,
     registration_stats: &RegistrationStats,
+    triangulation_state: &mut IncrementalTriangulatorState,
 ) -> Option<LocalBundleReport> {
     if !config.local_ba || config.local_ba_iterations == 0 {
         return None;
@@ -5362,7 +5432,12 @@ fn refine_local_bundle_after_registration(
     let mut post_ba_point_ids =
         point_indices_for_stable_point_ids(reconstruction, &stable_point_ids);
     let (merged_observations, modified_after_merge) = {
-        let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+        let mut triangulator = IncrementalTriangulator::new(
+            frames,
+            pairs,
+            reconstruction,
+            triangulation_state,
+        );
         let merged = triangulator.merge_tracks(tri_options, &post_ba_point_ids);
         let modified = triangulator.get_modified_points3d().clone();
         (merged, modified)
@@ -5370,7 +5445,12 @@ fn refine_local_bundle_after_registration(
     post_ba_point_ids = point_indices_for_stable_point_ids(reconstruction, &stable_point_ids);
     post_ba_point_ids.extend(modified_after_merge);
     let (completed_observations, completed_image_observations) = {
-        let mut triangulator = IncrementalTriangulator::new(frames, pairs, reconstruction);
+        let mut triangulator = IncrementalTriangulator::new(
+            frames,
+            pairs,
+            reconstruction,
+            triangulation_state,
+        );
         let completed = triangulator.complete_tracks(tri_options, &post_ba_point_ids);
         let image_report = triangulator.triangulate_image(tri_options, registered_image);
         (completed, image_report.total_observations())
@@ -8114,6 +8194,7 @@ fn continue_or_triangulate_structureless_tracks(
     inliers: &[StructurelessInlier],
     tri_options: &IncrementalTriangulatorOptions,
     config: &MapperConfig,
+    observation_manager: &mut ObservationManager,
 ) -> TriangulationReport {
     let mut report = TriangulationReport::default();
     let mut by_query_feature = BTreeMap::<(usize, usize), Vec<StructurelessInlier>>::new();
@@ -8127,7 +8208,6 @@ fn continue_or_triangulate_structureless_tracks(
             .push(*inlier);
     }
 
-    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
     for ((image, feature), mut group) in by_query_feature {
         if reconstruction.observations[image][feature].is_some() {
             continue;
@@ -10845,6 +10925,7 @@ mod tests {
             *pose = Some(SE3::identity());
         }
         let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
 
         let filtered = filter_registered_frames(
             &frames,
@@ -10853,6 +10934,7 @@ mod tests {
             &MapperConfig::default(),
             &mut stats,
             None,
+            &mut tri_state,
         );
 
         assert_eq!(filtered, 0);
@@ -10897,6 +10979,7 @@ mod tests {
         assert_eq!(stats.num_total_reg_images, 21);
 
         let mut filtered_units = HashSet::new();
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
         let filtered = filter_registered_frames(
             &frames,
             &[],
@@ -10904,6 +10987,7 @@ mod tests {
             &MapperConfig::default(),
             &mut stats,
             Some(&mut filtered_units),
+            &mut tri_state,
         );
 
         assert_eq!(filtered, 1);
@@ -10945,6 +11029,7 @@ mod tests {
             fix_existing_frames: true,
             ..MapperConfig::default()
         };
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
 
         let filtered = filter_registered_frames(
             &frames,
@@ -10953,6 +11038,7 @@ mod tests {
             &config,
             &mut stats,
             Some(&mut filtered_units),
+            &mut tri_state,
         );
 
         assert_eq!(filtered, 19);
@@ -10982,6 +11068,7 @@ mod tests {
             fix_existing_frames: true,
             ..MapperConfig::default()
         };
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
 
         let filtered = filter_registered_frames(
             &frames,
@@ -10990,6 +11077,7 @@ mod tests {
             &config,
             &mut stats,
             Some(&mut filtered_units),
+            &mut tri_state,
         );
 
         assert_eq!(filtered, 19);
@@ -12198,6 +12286,7 @@ mod tests {
             },
         ];
 
+        let mut obs_manager = ObservationManager::new(&frames, &[], &reconstruction);
         let report = continue_or_triangulate_structureless_tracks(
             &frames,
             &[],
@@ -12208,6 +12297,7 @@ mod tests {
                 max_reprojection_error_px: 4.0,
                 ..MapperConfig::default()
             },
+            &mut obs_manager,
         );
 
         assert_eq!(report.continued_observations, 1);
@@ -12266,6 +12356,7 @@ mod tests {
             },
         ];
 
+        let mut obs_manager = ObservationManager::new(&frames, &[], &reconstruction);
         let report = continue_or_triangulate_structureless_tracks(
             &frames,
             &[],
@@ -12276,6 +12367,7 @@ mod tests {
                 max_reprojection_error_px: 4.0,
                 ..MapperConfig::default()
             },
+            &mut obs_manager,
         );
 
         assert_eq!(report.created_points, 1);
@@ -12652,7 +12744,7 @@ mod tests {
         };
         let mut reg_trials = vec![0; 3];
 
-        mark_unregistered_images_with_no_absolute_pose(
+        mark_unregistered_images_with_no_absolute_pose_for_test(
             &frames,
             &pairs,
             &reconstruction,
@@ -12719,7 +12811,7 @@ mod tests {
             ..MapperConfig::default()
         };
 
-        mark_unregistered_images_with_no_absolute_pose(
+        mark_unregistered_images_with_no_absolute_pose_for_test(
             &frames,
             &[],
             &reconstruction,
@@ -12750,7 +12842,7 @@ mod tests {
             ..MapperConfig::default()
         };
 
-        mark_unregistered_images_with_no_absolute_pose(
+        mark_unregistered_images_with_no_absolute_pose_for_test(
             &frames,
             &[],
             &reconstruction,
@@ -14524,6 +14616,7 @@ mod tests {
             None,
         );
         let mut filtered_units = HashSet::new();
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
 
         let filtered = filter_registered_frames(
             &frames,
@@ -14532,6 +14625,7 @@ mod tests {
             &config,
             &mut stats,
             Some(&mut filtered_units),
+            &mut tri_state,
         );
 
         assert_eq!(options.constant_images, vec![0, 1]);
@@ -15246,6 +15340,7 @@ mod tests {
             ..MapperConfig::default()
         };
 
+        let obs_manager = ObservationManager::new(&frames, &[bad_pair.clone(), good_pair.clone()], &reconstruction);
         let selection = choose_next_registration_with_failures(
             &frames,
             &[bad_pair, good_pair],
@@ -15256,6 +15351,7 @@ mod tests {
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
             &registration_stats(&reconstruction),
+            &obs_manager,
         );
 
         assert_eq!(selection.failed_images, vec![1]);

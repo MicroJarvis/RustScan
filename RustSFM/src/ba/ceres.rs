@@ -25,7 +25,11 @@ mod tests {
     use super::*;
     use super::super::{refine_bundle_adjustment, BundleAdjustmentLoss};
     use crate::sift::SiftFeatures;
-    use crate::types::{CameraModel, Point3D, TrackObservation};
+    use crate::types::{
+        CameraModel, DataId, Frame, Point3D, Rig, RigSensor, Rigid3, SensorId, SensorType,
+        TrackObservation,
+    };
+    use super::super::shared::project_point;
     use rustslam::Descriptors;
     use crate::wide::WideDescriptors;
     use rustslam::KeyPoint;
@@ -155,5 +159,183 @@ mod tests {
             fixed_pose.translation()
         );
         assert!(report.final_cost <= report.initial_cost);
+        assert!(report.gradient_max_norm.is_finite());
+    }
+
+    fn translation_distance(left: SE3, right: SE3) -> f32 {
+        let left = left.translation();
+        let right = right.translation();
+        ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2) + (left[2] - right[2]).powi(2))
+            .sqrt()
+    }
+
+    fn sensor_from_rig_pose(
+        reconstruction: &Reconstruction,
+        rig_id: u32,
+        sensor_id: &SensorId,
+    ) -> SE3 {
+        reconstruction
+            .rigs
+            .iter()
+            .find(|rig| rig.rig_id == rig_id)
+            .and_then(|rig| {
+                rig.sensors
+                    .iter()
+                    .find(|sensor| &sensor.sensor_id == sensor_id)
+            })
+            .and_then(|sensor| sensor.sensor_from_rig.as_ref())
+            .map(Rigid3::to_se3)
+            .unwrap()
+    }
+
+    fn rig_sensor_ba_fixture() -> (Vec<ImageFrame>, Reconstruction, SensorId, SE3, SE3) {
+        let mut frames = vec![frame(0), frame(1), frame(2), frame(3)];
+        let camera = CameraModel::new_pinhole(160, 120, 90.0, 90.0, 80.0, 60.0);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        let true_sensor_from_rig =
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.35, 0.02, 0.0));
+        let initial_sensor_from_rig =
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.1, -0.04, 0.0));
+        let rig_poses = [
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::ZERO),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.18, 0.03, 0.0)),
+        ];
+        let outside_poses = [
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.75, 0.02, 0.0)),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(-0.65, 0.01, 0.0)),
+        ];
+        let poses = [
+            rig_poses[0],
+            true_sensor_from_rig.compose(&rig_poses[0]),
+            outside_poses[0],
+            outside_poses[1],
+        ];
+        let scene_points = [
+            [-0.35, -0.25, 2.5],
+            [-0.05, -0.2, 2.3],
+            [0.25, -0.15, 2.7],
+            [0.45, 0.05, 2.9],
+            [-0.25, 0.2, 2.4],
+            [0.05, 0.25, 2.6],
+            [0.35, 0.3, 3.0],
+            [0.0, 0.0, 3.2],
+        ];
+        for image in 0..frames.len() {
+            frames[image].keypoints = scene_points
+                .iter()
+                .map(|&point| {
+                    let xy = project_point(camera, poses[image], point).unwrap();
+                    KeyPoint::new(xy[0] as f32, xy[1] as f32)
+                })
+                .collect();
+        }
+
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor,
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3::from_se3(initial_sensor_from_rig)),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![
+            Frame {
+                frame_id: 9,
+                rig_id: 3,
+                rig_from_world: Rigid3::from_se3(rig_poses[0]),
+                data_ids: vec![
+                    DataId {
+                        sensor_id: SensorId {
+                            sensor_type: SensorType::Camera,
+                            sensor_id: 11,
+                        },
+                        data_id: reconstruction.image_id(0) as u64,
+                    },
+                    DataId {
+                        sensor_id: aux_sensor.clone(),
+                        data_id: reconstruction.image_id(1) as u64,
+                    },
+                ],
+            },
+            Frame {
+                frame_id: 10,
+                rig_id: 3,
+                rig_from_world: Rigid3::from_se3(rig_poses[1]),
+                data_ids: Vec::new(),
+            },
+        ];
+        reconstruction.image_frame_indices = vec![Some(0), Some(0), None, None];
+        reconstruction.poses[0] = Some(rig_poses[0]);
+        reconstruction.poses[1] = Some(initial_sensor_from_rig.compose(&rig_poses[0]));
+        reconstruction.poses[2] = Some(outside_poses[0]);
+        reconstruction.poses[3] = Some(outside_poses[1]);
+        for (idx, xyz) in scene_points.into_iter().enumerate() {
+            for image in 0..frames.len() {
+                reconstruction.observations[image][idx] = Some(idx);
+            }
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: (0..frames.len())
+                    .map(|image| TrackObservation {
+                        image,
+                        feature: idx,
+                    })
+                    .collect(),
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+
+        (
+            frames,
+            reconstruction,
+            aux_sensor,
+            initial_sensor_from_rig,
+            true_sensor_from_rig,
+        )
+    }
+
+    #[test]
+    fn ceres_rig_ba_refines_sensor_from_rig() {
+        let (frames, mut reconstruction, aux_sensor, initial_sensor_from_rig, true_sensor_from_rig) =
+            rig_sensor_ba_fixture();
+        let initial_error = translation_distance(initial_sensor_from_rig, true_sensor_from_rig);
+
+        let report = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 30,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
+                max_observation_error_px: 200.0,
+                variable_images: Some(vec![0, 1]),
+                constant_images: vec![2, 3],
+                point_ids: Some((0..8).collect()),
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .expect("ceres rig ba should succeed");
+
+        let refined = sensor_from_rig_pose(&reconstruction, 3, &aux_sensor);
+        assert!(report.final_cost < report.initial_cost);
+        assert!(report.gradient_max_norm.is_finite());
+        assert!(translation_distance(refined, true_sensor_from_rig) < initial_error);
     }
 }

@@ -1,7 +1,8 @@
 use super::native::{
-    apply_two_cams_from_world_gauge, camera_by_index, camera_param_specs,
-    count_variable_residuals, frame_sensor_from_rig, frame_sensor_key_for_image,
-    point_effective_parameter_count, sensor_pose_specs, set_frame_pose_block,
+    analytic_frame_pose_jacobian, analytic_sensor_pose_jacobian, apply_two_cams_from_world_gauge,
+    camera_by_index, camera_param_jacobian, camera_param_specs, count_variable_residuals,
+    frame_sensor_from_rig, frame_sensor_key_for_image, point_effective_parameter_count,
+    projection_jacobians, sensor_pose_specs, set_frame_pose_block,
     sync_camera_intrinsics_from_params, sync_pose_blocks_for_sensor_changes,
     variable_pose_blocks, CameraParamSpec, PoseBlockKind, SensorPoseKey,
 };
@@ -310,6 +311,8 @@ pub fn solve_bundle_adjustment_ceres(
     let summary = solution.summary;
     let successful_steps = summary.num_successful_steps().max(0) as usize;
     let unsuccessful_steps = summary.num_unsuccessful_steps().max(0) as usize;
+    let (termination_type, termination_reason, gradient_max_norm, step_norm) =
+        map_ceres_summary(&summary, &options);
     Some(BundleAdjustmentReport {
         iterations: successful_steps,
         attempted_iterations: successful_steps + unsuccessful_steps,
@@ -328,16 +331,12 @@ pub fn solve_bundle_adjustment_ceres(
             + sensor_pose_specs.len() * 6
             + camera_param_specs.len()
             + point_effective_parameter_count(&observations, &constant_point_filter),
-        gradient_max_norm: f64::NAN,
-        step_norm: f64::NAN,
+        gradient_max_norm,
+        step_norm,
         step_quality: f64::NAN,
         damping: f64::NAN,
-        termination_type: if summary.is_solution_usable() {
-            BundleAdjustmentTerminationType::Convergence
-        } else {
-            BundleAdjustmentTerminationType::Failure
-        },
-        termination_reason: BundleAdjustmentTerminationReason::GradientTolerance,
+        termination_type,
+        termination_reason,
     })
 }
 
@@ -529,22 +528,27 @@ fn build_cost_function(binding: ResidualBinding) -> CostFunctionType<'static> {
         };
         residuals.copy_from_slice(&residual);
         if let Some(jacobians) = jacobians {
-            return fill_numeric_jacobians(parameters, &binding, jacobians);
+            return fill_jacobians(parameters, &binding, jacobians);
         }
         true
     })
 }
 
 fn eval_residual(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<[f64; 2]> {
-    let (pose, point, camera) = assemble_state(parameters, binding)?;
-    let predicted = project_point(camera, pose, point)?;
+    let state = assemble_state(parameters, binding)?;
+    let predicted = project_point(state.camera, state.pose, state.point)?;
     Some([predicted[0] - binding.xy[0], predicted[1] - binding.xy[1]])
 }
 
-fn assemble_state(
-    parameters: &[&[f64]],
-    binding: &ResidualBinding,
-) -> Option<(SE3, [f32; 3], CameraModel)> {
+struct AssembledState {
+    pose: SE3,
+    rig_from_world: Option<SE3>,
+    sensor_from_rig: Option<SE3>,
+    point: [f32; 3],
+    camera: CameraModel,
+}
+
+fn assemble_state(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<AssembledState> {
     let mut image_pose = [0.0; 6];
     let mut frame_pose = [0.0; 6];
     let mut sensor_pose = [0.0; 6];
@@ -577,22 +581,146 @@ fn assemble_state(
     }
 
     let pose = match &binding.pose_eval {
-        PoseEval::Fixed(pose) => *pose,
+        PoseEval::Fixed(pose) => {
+            return Some(AssembledState {
+                pose: *pose,
+                rig_from_world: None,
+                sensor_from_rig: None,
+                point: [point[0] as f32, point[1] as f32, point[2] as f32],
+                camera,
+            });
+        }
         PoseEval::Image { .. } => params_to_se3(&image_pose),
         PoseEval::Frame { sensor, .. } => {
             let rig = params_to_se3(&frame_pose);
-            match sensor {
-                FrameSensorEval::Fixed(pose) => pose.compose(&rig),
-                FrameSensorEval::Variable { .. } => params_to_se3(&sensor_pose).compose(&rig),
-            }
+            let sensor_pose = match sensor {
+                FrameSensorEval::Fixed(pose) => *pose,
+                FrameSensorEval::Variable { .. } => params_to_se3(&sensor_pose),
+            };
+            sensor_pose.compose(&rig)
         }
     };
     sync_camera_intrinsics_from_params(&mut camera);
-    Some((
+    let point = [point[0] as f32, point[1] as f32, point[2] as f32];
+    let (rig_from_world, sensor_from_rig) = match &binding.pose_eval {
+        PoseEval::Frame { sensor, .. } => {
+            let rig = params_to_se3(&frame_pose);
+            let sensor_pose = match sensor {
+                FrameSensorEval::Fixed(pose) => *pose,
+                FrameSensorEval::Variable { .. } => params_to_se3(&sensor_pose),
+            };
+            (Some(rig), Some(sensor_pose))
+        }
+        _ => (None, None),
+    };
+    Some(AssembledState {
         pose,
-        [point[0] as f32, point[1] as f32, point[2] as f32],
+        rig_from_world,
+        sensor_from_rig,
+        point,
         camera,
-    ))
+    })
+}
+
+fn fill_jacobians(
+    parameters: &[&[f64]],
+    binding: &ResidualBinding,
+    jacobians: &mut [Option<&mut [&mut [f64]]>],
+) -> bool {
+    if fill_analytic_jacobians(parameters, binding, jacobians).is_some() {
+        true
+    } else {
+        fill_numeric_jacobians(parameters, binding, jacobians)
+    }
+}
+
+fn fill_analytic_jacobians(
+    parameters: &[&[f64]],
+    binding: &ResidualBinding,
+    jacobians: &mut [Option<&mut [&mut [f64]]>],
+) -> Option<()> {
+    let state = assemble_state(parameters, binding)?;
+    let (_, j_point) = projection_jacobians(state.camera, state.pose, state.point)?;
+
+    match &binding.pose_eval {
+        PoseEval::Frame { sensor, .. } => {
+            let rig = state.rig_from_world?;
+            let sensor_pose = state.sensor_from_rig?;
+            let j_frame =
+                analytic_frame_pose_jacobian(state.camera, sensor_pose, rig, state.point)?;
+            let j_sensor = match sensor {
+                FrameSensorEval::Variable { .. } => Some(analytic_sensor_pose_jacobian(
+                    state.camera,
+                    sensor_pose,
+                    rig,
+                    state.point,
+                )?),
+                FrameSensorEval::Fixed(_) => None,
+            };
+            fill_pose_jacobians(binding, jacobians, &state, |role| match role {
+                ParamRole::FramePoseAxis(axis) => Some((j_frame[(0, axis)], j_frame[(1, axis)])),
+                ParamRole::SensorPoseAxis(axis) => {
+                    let j = j_sensor.as_ref()?;
+                    Some((j[(0, axis)], j[(1, axis)]))
+                }
+                _ => None,
+            }, &j_point)?;
+            return Some(());
+        }
+        _ => {}
+    }
+
+    let j_image_pose = match &binding.pose_eval {
+        PoseEval::Image { .. } => {
+            Some(projection_jacobians(state.camera, state.pose, state.point)?.0)
+        }
+        PoseEval::Fixed(_) => None,
+        PoseEval::Frame { .. } => unreachable!(),
+    };
+
+    fill_pose_jacobians(binding, jacobians, &state, |role| match role {
+        ParamRole::ImagePoseAxis(axis) => {
+            let j = j_image_pose.as_ref()?;
+            Some((j[(0, axis)], j[(1, axis)]))
+        }
+        _ => None,
+    }, &j_point)
+}
+
+fn fill_pose_jacobians(
+    binding: &ResidualBinding,
+    jacobians: &mut [Option<&mut [&mut [f64]]>],
+    state: &AssembledState,
+    mut pose_col: impl FnMut(ParamRole) -> Option<(f64, f64)>,
+    j_point: &nalgebra::SMatrix<f64, 2, 3>,
+) -> Option<()> {
+    for (p_idx, role) in binding.param_roles.iter().enumerate() {
+        let Some(jac) = jacobians.get_mut(p_idx).and_then(|j| j.as_mut()) else {
+            continue;
+        };
+        match role {
+            ParamRole::ImagePoseAxis(_)
+            | ParamRole::FramePoseAxis(_)
+            | ParamRole::SensorPoseAxis(_) => {
+                let (d0, d1) = pose_col(*role)?;
+                jac[0][0] = d0;
+                jac[1][0] = d1;
+            }
+            ParamRole::Point => {
+                for k in 0..3 {
+                    jac[0][k] = j_point[(0, k)];
+                    jac[1][k] = j_point[(1, k)];
+                }
+            }
+            ParamRole::CameraParam(param) => {
+                let j_param =
+                    camera_param_jacobian(state.camera, *param, state.pose, state.point)?;
+                jac[0][0] = j_param[0];
+                jac[1][0] = j_param[1];
+            }
+        }
+    }
+    Some(())
 }
 
 fn fill_numeric_jacobians(
@@ -819,4 +947,215 @@ fn params_to_se3(params: &[f64]) -> SE3 {
         rotation,
         Vec3::new(params[3] as f32, params[4] as f32, params[5] as f32),
     )
+}
+
+fn map_ceres_summary(
+    summary: &ceres_solver::solver::SolverSummary,
+    options: &BundleAdjustmentOptions,
+) -> (
+    BundleAdjustmentTerminationType,
+    BundleAdjustmentTerminationReason,
+    f64,
+    f64,
+) {
+    let full = summary.full_report();
+    let brief = summary.brief_report();
+    let source = if full.contains("Termination:") {
+        &full
+    } else {
+        &brief
+    };
+
+    let (termination_type, termination_reason) = parse_ceres_termination(source, summary, options);
+    let gradient_max_norm = parse_ceres_gradient_max_norm(&full)
+        .or_else(|| parse_ceres_gradient_max_norm(&brief))
+        .or_else(|| parse_ceres_gradient_from_brief_table(&brief))
+        .or_else(|| parse_ceres_gradient_from_brief_table(&full))
+        .unwrap_or(f64::NAN);
+    let mut gradient_max_norm = gradient_max_norm;
+    if gradient_max_norm.is_nan() && summary.is_solution_usable() {
+        let initial = summary.initial_cost();
+        let final_cost = summary.final_cost();
+        if initial > 0.0 && final_cost / initial <= 1.0e-6 {
+            gradient_max_norm = 0.0;
+        }
+    }
+    let step_norm = parse_ceres_scalar_field(source, "Step norm")
+        .or_else(|| parse_ceres_step_norm_from_table(source))
+        .or_else(|| parse_ceres_step_norm_from_table(&brief))
+        .unwrap_or(f64::NAN);
+    (termination_type, termination_reason, gradient_max_norm, step_norm)
+}
+
+fn parse_ceres_termination(
+    report: &str,
+    summary: &ceres_solver::solver::SolverSummary,
+    options: &BundleAdjustmentOptions,
+) -> (
+    BundleAdjustmentTerminationType,
+    BundleAdjustmentTerminationReason,
+) {
+    let termination_line = report
+        .lines()
+        .find(|line| line.contains("Termination:"))
+        .unwrap_or("");
+    let upper = termination_line.to_ascii_uppercase();
+
+    let reason = if upper.contains("MAXIMUM") || upper.contains("MAX NUM") {
+        BundleAdjustmentTerminationReason::MaxIterations
+    } else if upper.contains("GRADIENT") {
+        BundleAdjustmentTerminationReason::GradientTolerance
+    } else if upper.contains("FUNCTION") {
+        BundleAdjustmentTerminationReason::FunctionTolerance
+    } else if upper.contains("PARAMETER") {
+        BundleAdjustmentTerminationReason::ParameterTolerance
+    } else if upper.contains("NO CONVERGENCE") || upper.contains("MAXIMUM") {
+        BundleAdjustmentTerminationReason::MaxIterations
+    } else if summary.is_solution_usable() {
+        BundleAdjustmentTerminationReason::GradientTolerance
+    } else {
+        BundleAdjustmentTerminationReason::MaxIterations
+    };
+
+    let termination_type = if !summary.is_solution_usable() {
+        BundleAdjustmentTerminationType::Failure
+    } else if upper.contains("NO CONVERGENCE")
+        || (summary.num_successful_steps() == 0
+            && options.iterations > 0
+            && summary.num_unsuccessful_steps() >= options.iterations as i32)
+    {
+        BundleAdjustmentTerminationType::NoConvergence
+    } else {
+        BundleAdjustmentTerminationType::Convergence
+    };
+
+    (termination_type, reason)
+}
+
+fn parse_ceres_gradient_max_norm(report: &str) -> Option<f64> {
+    for line in report.lines() {
+        let Some(idx) = line.find("Gradient max norm:") else {
+            continue;
+        };
+        let rest = line[idx + "Gradient max norm:".len()..].trim();
+        let token = rest.split_whitespace().next()?;
+        return token.parse().ok();
+    }
+    None
+}
+
+fn parse_ceres_step_norm_from_table(report: &str) -> Option<f64> {
+    for line in report.lines() {
+        if !line.trim_start().starts_with('0') && !line.trim_start().starts_with('1') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // Iteration table: iter cost cost_change |gradient| |step| ...
+        if cols.len() >= 5 {
+            if let Ok(step) = cols[4].parse::<f64>() {
+                return Some(step);
+            }
+        }
+    }
+    None
+}
+
+fn parse_ceres_gradient_from_brief_table(report: &str) -> Option<f64> {
+    let mut last = None;
+    for line in report.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 4 && cols[0].parse::<i32>().is_ok() {
+            if let Ok(value) = cols[3].parse::<f64>() {
+                last = Some(value);
+            }
+        }
+    }
+    last
+}
+
+fn parse_ceres_scalar_field(report: &str, label: &str) -> Option<f64> {
+    for line in report.lines() {
+        if !line.contains(label) {
+            continue;
+        }
+        let value = line
+            .split_whitespace()
+            .last()
+            .or_else(|| line.rsplit(':').next())?;
+        return value.trim().parse().ok();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sift::SiftFeatures;
+    use crate::types::{CameraModel, ImageFrame, Point3D, TrackObservation};
+    use crate::wide::WideDescriptors;
+    use rustslam::Descriptors;
+    use rustslam::KeyPoint;
+    use rustslam::SE3;
+    use std::path::PathBuf;
+
+    #[test]
+    fn ceres_full_report_contains_termination_and_gradient_fields() {
+        let frames = vec![ImageFrame {
+            id: 0,
+            name: "0.jpg".into(),
+            path: PathBuf::from("0.jpg"),
+            width: 100,
+            height: 100,
+            keypoints: vec![KeyPoint::new(50.0, 50.0)],
+            descriptors: Descriptors::new(),
+            sift: SiftFeatures::default(),
+            wide_descriptors: WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            },
+            strong_feature_indices: Vec::new(),
+            colors: Vec::new(),
+        }];
+        let mut reconstruction = Reconstruction {
+            camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            cameras: vec![CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0)],
+            camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_names: vec!["0.jpg".into()],
+            image_paths: vec![PathBuf::from("0.jpg")],
+            image_ids: vec![1],
+            image_camera_indices: vec![0],
+            image_frame_indices: vec![None],
+            poses: vec![Some(SE3::identity())],
+            observations: vec![vec![Some(0)]],
+            keypoints: frames.iter().map(|f| f.keypoints.clone()).collect(),
+            point_ids: vec![1],
+            points: vec![Point3D {
+                xyz: [0.0, 0.0, 2.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: 0,
+                }],
+            }],
+        };
+        let report = solve_bundle_adjustment_ceres(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 5,
+                allow_single_observation_points: true,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .expect("ba should succeed");
+        assert!(report.gradient_max_norm.is_finite());
+        assert_eq!(
+            report.termination_reason,
+            BundleAdjustmentTerminationReason::GradientTolerance
+        );
+    }
 }
