@@ -1,3 +1,11 @@
+use super::shared::{
+    add_three_point_gauge, bundle_adjustment_point_filter, collect_observations, project_point,
+    refresh_point_errors, BaObservation,
+};
+use super::{
+    BundleAdjustmentGauge, BundleAdjustmentLoss, BundleAdjustmentOptions, BundleAdjustmentReport,
+    BundleAdjustmentTerminationReason, BundleAdjustmentTerminationType,
+};
 use crate::types::{
     colmap_camera_model_focal_idxs, colmap_camera_model_principal_point_idxs, CameraModel, Frame,
     ImageFrame, Reconstruction, Rig, Rigid3, SensorId, COLMAP_DIVISION, COLMAP_EUCM,
@@ -18,230 +26,6 @@ type Mat3 = SMatrix<f64, 3, 3>;
 type Vec2 = SVector<f64, 2>;
 type Vec3d = SVector<f64, 3>;
 type Vec6 = SVector<f64, 6>;
-
-/// Ceres-equivalent robust loss functions for bundle adjustment.
-///
-/// Each variant maps to a Ceres `LossFunction` with a robustification scale.
-/// The methods operate on `s`, the squared residual norm `||r||^2`, mirroring
-/// Ceres' `rho(s)` convention. `weight` returns the IRLS weight `rho'(s)` that
-/// scales the residual/Jacobian rows (applied as `sqrt(weight)`), and `cost`
-/// returns `0.5 * rho(s)` so the reported objective matches Ceres' cost.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BundleAdjustmentLoss {
-    /// `rho(s) = s` (plain squared error, no robustification).
-    Trivial,
-    /// Ceres `HuberLoss(scale)`.
-    Huber { scale: f64 },
-    /// Ceres `SoftLOneLoss(scale)`.
-    SoftL1 { scale: f64 },
-    /// Ceres `CauchyLoss(scale)` (COLMAP incremental mapper default).
-    Cauchy { scale: f64 },
-}
-
-impl BundleAdjustmentLoss {
-    /// IRLS weight `rho'(s)` for a squared residual `s = ||r||^2`.
-    #[inline]
-    pub fn weight(self, s: f64) -> f64 {
-        let s = s.max(0.0);
-        match self {
-            Self::Trivial => 1.0,
-            Self::Huber { scale } => {
-                let b2 = scale * scale;
-                if s <= b2 {
-                    1.0
-                } else {
-                    (scale / s.max(1.0e-24).sqrt()).max(0.0)
-                }
-            }
-            Self::SoftL1 { scale } => {
-                let a2 = (scale * scale).max(1.0e-24);
-                1.0 / (1.0 + s / a2).sqrt()
-            }
-            Self::Cauchy { scale } => {
-                let a2 = (scale * scale).max(1.0e-24);
-                1.0 / (1.0 + s / a2)
-            }
-        }
-    }
-
-    /// Ceres objective contribution `0.5 * rho(s)` for `s = ||r||^2`.
-    #[inline]
-    pub fn cost(self, s: f64) -> f64 {
-        let s = s.max(0.0);
-        match self {
-            Self::Trivial => 0.5 * s,
-            Self::Huber { scale } => {
-                let b2 = scale * scale;
-                if s <= b2 {
-                    0.5 * s
-                } else {
-                    scale * s.sqrt() - 0.5 * b2
-                }
-            }
-            Self::SoftL1 { scale } => {
-                let a2 = (scale * scale).max(1.0e-24);
-                a2 * ((1.0 + s / a2).sqrt() - 1.0)
-            }
-            Self::Cauchy { scale } => {
-                let a2 = (scale * scale).max(1.0e-24);
-                0.5 * a2 * (1.0 + s / a2).ln()
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BundleAdjustmentOptions {
-    pub iterations: usize,
-    pub function_tolerance: f64,
-    pub gradient_tolerance: f64,
-    pub parameter_tolerance: f64,
-    pub max_linear_solver_iterations: usize,
-    pub max_num_consecutive_invalid_steps: usize,
-    pub max_consecutive_nonmonotonic_steps: usize,
-    pub loss_function: BundleAdjustmentLoss,
-    pub max_observation_error_px: f64,
-    pub variable_images: Option<Vec<usize>>,
-    pub constant_images: Vec<usize>,
-    pub gauge: BundleAdjustmentGauge,
-    pub variable_cameras: Option<Vec<usize>>,
-    pub constant_cameras: Vec<usize>,
-    pub constant_rigs: Vec<u32>,
-    pub constant_sensor_from_rig: Vec<SensorId>,
-    pub refine_focal_length: bool,
-    pub refine_principal_point: bool,
-    pub refine_extra_params: bool,
-    pub point_ids: Option<Vec<usize>>,
-    pub constant_point_ids: Option<Vec<usize>>,
-    pub allow_single_observation_points: bool,
-}
-
-impl Default for BundleAdjustmentOptions {
-    fn default() -> Self {
-        Self {
-            iterations: 100,
-            function_tolerance: 0.0,
-            gradient_tolerance: 1.0e-4,
-            parameter_tolerance: 0.0,
-            max_linear_solver_iterations: 200,
-            max_num_consecutive_invalid_steps: 10,
-            max_consecutive_nonmonotonic_steps: 10,
-            loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
-            max_observation_error_px: 16.0,
-            variable_images: None,
-            constant_images: Vec::new(),
-            gauge: BundleAdjustmentGauge::Default,
-            variable_cameras: None,
-            constant_cameras: Vec::new(),
-            constant_rigs: Vec::new(),
-            constant_sensor_from_rig: Vec::new(),
-            refine_focal_length: false,
-            refine_principal_point: false,
-            refine_extra_params: false,
-            point_ids: None,
-            constant_point_ids: None,
-            allow_single_observation_points: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BundleAdjustmentGauge {
-    Default,
-    ThreePoints,
-    TwoCamsFromWorld,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BundleAdjustmentTerminationType {
-    Convergence,
-    NoConvergence,
-    Failure,
-    UserSuccess,
-    UserFailure,
-}
-
-impl BundleAdjustmentTerminationType {
-    pub fn is_solution_usable(self) -> bool {
-        matches!(
-            self,
-            Self::Convergence | Self::NoConvergence | Self::UserSuccess
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BundleAdjustmentTerminationReason {
-    GradientTolerance,
-    FunctionTolerance,
-    ParameterTolerance,
-    MaxIterations,
-    LinearizationFailure,
-    LinearSolveFailure,
-    InvalidStep,
-    NoAcceptedStep,
-    MaxConsecutiveInvalidSteps,
-    MaxConsecutiveNonmonotonicSteps,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct BundleAdjustmentReport {
-    pub iterations: usize,
-    pub attempted_iterations: usize,
-    pub successful_steps: usize,
-    pub unsuccessful_steps: usize,
-    pub linear_solver_iterations: usize,
-    pub linearization_failures: usize,
-    pub linear_solve_failures: usize,
-    pub invalid_steps: usize,
-    pub rejected_steps: usize,
-    pub initial_cost: f64,
-    pub final_cost: f64,
-    pub observations: usize,
-    pub residuals: usize,
-    pub effective_parameters: usize,
-    pub gradient_max_norm: f64,
-    pub step_norm: f64,
-    pub step_quality: f64,
-    pub damping: f64,
-    pub termination_type: BundleAdjustmentTerminationType,
-    pub termination_reason: BundleAdjustmentTerminationReason,
-}
-
-impl BundleAdjustmentReport {
-    pub fn is_solution_usable(&self) -> bool {
-        self.termination_type.is_solution_usable()
-    }
-
-    pub fn brief_report(&self) -> String {
-        format!(
-            "termination={:?} reason={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6}",
-            self.termination_type,
-            self.termination_reason,
-            self.residuals,
-            self.effective_parameters,
-            self.iterations,
-            self.attempted_iterations,
-            self.linear_solver_iterations,
-            self.initial_cost,
-            self.final_cost,
-            self.step_quality
-        )
-    }
-}
-
-pub fn refine_bundle_adjustment(
-    frames: &[ImageFrame],
-    reconstruction: &mut Reconstruction,
-    options: BundleAdjustmentOptions,
-) -> Option<BundleAdjustmentReport> {
-    #[cfg(feature = "ceres-ba")]
-    {
-        return crate::ba_ceres::refine_bundle_adjustment_ceres(frames, reconstruction, options);
-    }
-    #[cfg(not(feature = "ceres-ba"))]
-    refine_bundle_adjustment_native(frames, reconstruction, options)
-}
 
 pub(crate) fn refine_bundle_adjustment_native(
     frames: &[ImageFrame],
@@ -517,105 +301,6 @@ pub(crate) fn refine_bundle_adjustment_native(
     })
 }
 
-pub(crate) fn bundle_adjustment_point_filter(
-    variable_points: Option<&[usize]>,
-    constant_points: Option<&[usize]>,
-) -> Option<HashSet<usize>> {
-    match (variable_points, constant_points) {
-        (None, None) => None,
-        (variable_points, constant_points) => {
-            let mut filter = HashSet::new();
-            if let Some(points) = variable_points {
-                filter.extend(points.iter().copied());
-            }
-            if let Some(points) = constant_points {
-                filter.extend(points.iter().copied());
-            }
-            Some(filter)
-        }
-    }
-}
-
-pub(crate) fn add_three_point_gauge(
-    constant_point_filter: &mut HashSet<usize>,
-    reconstruction: &Reconstruction,
-    observations: &[BaObservation],
-) {
-    let mut fixed_points = Vec::<[f32; 3]>::new();
-    let mut observed_points = observations.iter().map(|obs| obs.point).collect::<Vec<_>>();
-    observed_points.sort_unstable();
-    observed_points.dedup();
-
-    for point_id in &observed_points {
-        if !constant_point_filter.contains(point_id) {
-            continue;
-        }
-        if let Some(point) = reconstruction.points.get(*point_id) {
-            maybe_add_gauge_point(&mut fixed_points, point.xyz);
-        }
-        if fixed_points.len() >= 3 {
-            return;
-        }
-    }
-
-    for point_id in observed_points {
-        if constant_point_filter.contains(&point_id) {
-            continue;
-        }
-        let Some(point) = reconstruction.points.get(point_id) else {
-            continue;
-        };
-        if maybe_add_gauge_point(&mut fixed_points, point.xyz) {
-            constant_point_filter.insert(point_id);
-            if fixed_points.len() >= 3 {
-                return;
-            }
-        }
-    }
-}
-
-fn maybe_add_gauge_point(points: &mut Vec<[f32; 3]>, candidate: [f32; 3]) -> bool {
-    if points.len() >= 3 || !candidate.iter().all(|value| value.is_finite()) {
-        return false;
-    }
-    let independent = match points.len() {
-        0 => true,
-        1 => distance3(points[0], candidate) > 1.0e-9,
-        2 => triangle_area2(points[0], points[1], candidate) > 1.0e-12,
-        _ => false,
-    };
-    if independent {
-        points.push(candidate);
-    }
-    independent
-}
-
-fn distance3(left: [f32; 3], right: [f32; 3]) -> f64 {
-    let dx = left[0] as f64 - right[0] as f64;
-    let dy = left[1] as f64 - right[1] as f64;
-    let dz = left[2] as f64 - right[2] as f64;
-    (dx * dx + dy * dy + dz * dz).sqrt()
-}
-
-fn triangle_area2(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f64 {
-    let ab = [
-        b[0] as f64 - a[0] as f64,
-        b[1] as f64 - a[1] as f64,
-        b[2] as f64 - a[2] as f64,
-    ];
-    let ac = [
-        c[0] as f64 - a[0] as f64,
-        c[1] as f64 - a[1] as f64,
-        c[2] as f64 - a[2] as f64,
-    ];
-    let cross = [
-        ab[1] * ac[2] - ab[2] * ac[1],
-        ab[2] * ac[0] - ab[0] * ac[2],
-        ab[0] * ac[1] - ab[1] * ac[0],
-    ];
-    cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]
-}
-
 fn count_variable_residuals(
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
@@ -665,12 +350,6 @@ fn point_effective_parameter_count(
     points.len() * 3
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BaObservation {
-    pub(crate) image: usize,
-    pub(crate) point: usize,
-    pub(crate) xy: [f64; 2],
-}
 
 struct SchurSystem {
     h: DMatrix<f64>,
@@ -1081,53 +760,6 @@ fn frame_registered_images_with_sensors(
     } else {
         Some(images)
     }
-}
-
-pub(crate) fn collect_observations(
-    frames: &[ImageFrame],
-    reconstruction: &Reconstruction,
-    max_error_px: f64,
-    point_filter: Option<&HashSet<usize>>,
-    allow_single_observation_points: bool,
-) -> Vec<BaObservation> {
-    let mut observations = Vec::new();
-    for (point_id, point) in reconstruction.points.iter().enumerate() {
-        if point_filter.is_some_and(|filter| !filter.contains(&point_id)) {
-            continue;
-        }
-        if !allow_single_observation_points && point.track.len() < 2 {
-            continue;
-        }
-        for obs in &point.track {
-            if obs.image >= reconstruction.poses.len()
-                || obs.image >= frames.len()
-                || reconstruction.poses[obs.image].is_none()
-                || obs.feature >= frames[obs.image].keypoints.len()
-            {
-                continue;
-            }
-            let kp = &frames[obs.image].keypoints[obs.feature];
-            let Some(pose) = reconstruction.poses[obs.image] else {
-                continue;
-            };
-            let Some(predicted) =
-                project_point(reconstruction.camera_for_image(obs.image), pose, point.xyz)
-            else {
-                continue;
-            };
-            let err = ((predicted[0] - kp.x() as f64).powi(2)
-                + (predicted[1] - kp.y() as f64).powi(2))
-            .sqrt();
-            if err.is_finite() && err <= max_error_px {
-                observations.push(BaObservation {
-                    image: obs.image,
-                    point: point_id,
-                    xy: [kp.x() as f64, kp.y() as f64],
-                });
-            }
-        }
-    }
-    observations
 }
 
 fn camera_param_specs(
@@ -3125,11 +2757,6 @@ fn sync_camera_intrinsics_from_params(camera: &mut CameraModel) {
     }
 }
 
-fn project_point(camera: CameraModel, pose: SE3, point: [f32; 3]) -> Option<[f64; 2]> {
-    let p = pose.transform_point(&point);
-    camera.img_from_cam(p[0] as f64, p[1] as f64, p[2] as f64)
-}
-
 fn apply_pose_delta_f64(pose: SE3, delta: Vec6) -> SE3 {
     let q = pose.quaternion();
     let base_rotation = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
@@ -3207,37 +2834,6 @@ fn restore_state(
     reconstruction.cameras.clone_from_slice(cameras);
 }
 
-pub(crate) fn refresh_point_errors(frames: &[ImageFrame], reconstruction: &mut Reconstruction) {
-    let image_cameras = (0..reconstruction.poses.len())
-        .map(|image| reconstruction.camera_for_image(image))
-        .collect::<Vec<_>>();
-    for point in &mut reconstruction.points {
-        let mut total = 0.0f32;
-        let mut count = 0usize;
-        for obs in &point.track {
-            let Some(pose) = reconstruction.poses.get(obs.image).copied().flatten() else {
-                continue;
-            };
-            if obs.image >= frames.len() || obs.feature >= frames[obs.image].keypoints.len() {
-                continue;
-            }
-            let kp = &frames[obs.image].keypoints[obs.feature];
-            if let Some(predicted) = project_point(image_cameras[obs.image], pose, point.xyz) {
-                let err = ((predicted[0] - kp.x() as f64).powi(2)
-                    + (predicted[1] - kp.y() as f64).powi(2))
-                .sqrt();
-                if err.is_finite() {
-                    total += err as f32;
-                    count += 1;
-                }
-            }
-        }
-        if count > 0 {
-            point.error = total / count as f32;
-        }
-    }
-}
-
 #[allow(dead_code)]
 fn pose_from_parts(rotation: Quat, translation: Vec3) -> SE3 {
     SE3::from_quat_translation(rotation.normalize(), translation)
@@ -3245,7 +2841,13 @@ fn pose_from_parts(rotation: Quat, translation: Vec3) -> SE3 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        refine_bundle_adjustment, BundleAdjustmentGauge, BundleAdjustmentLoss,
+        BundleAdjustmentOptions, BundleAdjustmentReport, BundleAdjustmentTerminationReason,
+        BundleAdjustmentTerminationType,
+    };
     use super::*;
+    use crate::ba::shared::project_point;
     use crate::types::{
         CameraModel, DataId, ImageFrame, Point3D, Reconstruction, Rig, RigSensor, SensorType,
         TrackObservation,

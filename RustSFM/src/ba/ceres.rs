@@ -4,11 +4,13 @@
 //! (rig/frame pose blocks, sensor extrinsics refinement, camera intrinsics
 //! refinement, and `TWO_CAMS_FROM_WORLD` gauge partial axes) return `None`.
 
-use crate::ba::{
+use super::shared::{
     add_three_point_gauge, bundle_adjustment_point_filter, collect_observations,
-    refresh_point_errors, BaObservation, BundleAdjustmentGauge, BundleAdjustmentLoss,
-    BundleAdjustmentOptions, BundleAdjustmentReport, BundleAdjustmentTerminationReason,
-    BundleAdjustmentTerminationType,
+    refresh_point_errors, BaObservation,
+};
+use super::{
+    BundleAdjustmentGauge, BundleAdjustmentLoss, BundleAdjustmentOptions, BundleAdjustmentReport,
+    BundleAdjustmentTerminationReason, BundleAdjustmentTerminationType,
 };
 use crate::types::{CameraModel, ImageFrame, Reconstruction};
 use ceres_solver::loss::LossFunction;
@@ -451,7 +453,7 @@ fn count_variable_residuals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ba::{refine_bundle_adjustment, BundleAdjustmentOptions};
+    use super::super::{refine_bundle_adjustment, BundleAdjustmentOptions, BundleAdjustmentLoss};
     use crate::sift::SiftFeatures;
     use crate::types::{Point3D, TrackObservation};
     use rustslam::Descriptors;

@@ -1,6 +1,4 @@
 pub mod ba;
-#[cfg(feature = "ceres-ba")]
-mod ba_ceres;
 pub mod colmap;
 pub mod compare;
 pub mod correspondence_graph;

@@ -826,11 +826,12 @@ reconstruction parity.
       matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers that rely on
       the damped reduced system being symmetric positive definite.
     - Added `ceres-ba` feature (`ceres-solver` 0.5 with bundled source build),
-      **enabled by default**. New module `ba_ceres.rs` implements Ceres-backed
-      BA; `refine_bundle_adjustment` always uses Ceres with **no fallback** to
-      the native solver. Unsupported configs return `None`. Native BA remains in
-      `ba.rs` for `--no-default-features` builds and native-specific unit tests.
-      Build native-only: `cargo test -p rustsfm --no-default-features --lib`.
+      **enabled by default**. The `ba/` module splits types/dispatch (`mod.rs`),
+      shared observation/gauge helpers (`shared.rs`), the hand-rolled native LM
+      reference backend (`native.rs`), and the Ceres backend (`ceres.rs`).
+      `refine_bundle_adjustment` always uses Ceres with **no fallback** to
+      native. Unsupported configs return `None`. Native BA remains for
+      `--no-default-features` builds and native-specific unit tests.
     - Remaining work: extend Ceres path to rig/sensor/intrinsics (needs
       quaternion/manifold support in the Rust Ceres binding), switch native LM
       damping from a fixed `mu*I` to Ceres' jacobian-scaled
