@@ -19,7 +19,7 @@ use crate::triangulation::{
 };
 use crate::types::CameraModel;
 use nalgebra::{Matrix3, Matrix3x4, Vector2, Vector3};
-use rustslam::{colmap_ransac_num_trials, ColmapCombinationSampler};
+use rustslam::{colmap_ransac_num_trials, ColmapCombinationSampler, ColmapRansacOptions};
 
 /// COLMAP `TriangulationEstimator::ResidualType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +245,21 @@ impl Default for EstimateTriangulationOptions {
     }
 }
 
+impl EstimateTriangulationOptions {
+    fn colmap_ransac_options(&self) -> ColmapRansacOptions {
+        ColmapRansacOptions {
+            max_error: self.max_error,
+            min_inlier_ratio: self.min_inlier_ratio,
+            confidence: self.confidence,
+            dyn_num_trials_multiplier: self.dyn_num_trials_multiplier,
+            min_num_trials: self.min_num_trials,
+            max_num_trials: self.max_num_trials,
+            random_seed: self.random_seed,
+            num_threads: 1,
+        }
+    }
+}
+
 /// COLMAP `RANSAC::ComputeNumTrials` with `min_num_samples = 2`.
 fn compute_num_trials(
     num_inliers: usize,
@@ -265,19 +280,11 @@ fn initial_max_num_trials(
     options: &EstimateTriangulationOptions,
     max_sampler_samples: usize,
 ) -> usize {
-    let assumed_samples = 100_000usize;
-    let assumed_inliers =
-        (options.min_inlier_ratio.clamp(0.0, 1.0) * assumed_samples as f64) as usize;
-    let dyn_max_num_trials = compute_num_trials(
-        assumed_inliers,
-        assumed_samples,
-        options.confidence,
-        options.dyn_num_trials_multiplier,
-    );
     options
-        .max_num_trials
-        .min(dyn_max_num_trials)
-        .min(max_sampler_samples)
+        .colmap_ransac_options()
+        .with_initial_max_num_trials(TriangulationEstimator::MIN_NUM_SAMPLES)
+        .map(|options| options.max_num_trials.min(max_sampler_samples))
+        .unwrap_or(0)
 }
 
 pub(crate) fn triangulation_sample_pairs(
@@ -608,5 +615,27 @@ mod tests {
         };
         assert_eq!(super::initial_max_num_trials(&options, 45), 45);
         assert_eq!(super::initial_max_num_trials(&options, 50_000), 10_000);
+    }
+
+    #[test]
+    fn invalid_ransac_options_fail_like_colmap_check() {
+        let (cams, cameras, truth) = three_view_setup();
+        let points: Vec<Vector2<f64>> = cams
+            .iter()
+            .zip(cameras.iter())
+            .map(|(cam, camera)| project_pixel(camera, cam, &truth))
+            .collect();
+        let options = EstimateTriangulationOptions {
+            max_error: 0.0,
+            ..EstimateTriangulationOptions::default()
+        };
+        assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());
+
+        let options = EstimateTriangulationOptions {
+            min_num_trials: 2,
+            max_num_trials: 1,
+            ..EstimateTriangulationOptions::default()
+        };
+        assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());
     }
 }

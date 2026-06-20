@@ -376,6 +376,9 @@ reconstruction parity.
     - Added shared `ColmapRansacReport` and the COLMAP constructor-time
       `max_num_trials` clamp from `min_inlier_ratio`; generalized absolute and
       generalized relative pose RANSAC now use that shared initialization path.
+      `EstimateTriangulation` also maps its flattened options through the
+      shared COLMAP `RANSACOptions` initialization before enumerating
+      `CombinationSampler` trials.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
