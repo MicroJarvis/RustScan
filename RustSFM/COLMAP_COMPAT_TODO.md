@@ -739,8 +739,8 @@ reconstruction parity.
      `scene/projection.cc`), `InlierSupportMeasurer` support comparison, the
      COLMAP dynamic-stopping trial count, and a final inlier multi-view refit.
      The 2-view sampling uses a shared Rust port of COLMAP's deterministic
-     `CombinationSampler`; random-sampler and bit-level LORANSAC parity remain
-     under the broader `optim` RANSAC item.
+     `CombinationSampler`; broader random/progressive sampler infrastructure is
+     tracked under the `optim` RANSAC item.
    - Wired `estimate_triangulation` into the incremental triangulator's
      track-creation path: `IncrementalTriangulator::create_pair_track` now
      gathers the seed observation pair plus transitively-corresponding
@@ -753,7 +753,7 @@ reconstruction parity.
      matching COLMAP. Verified by a three-view track-creation test plus the
      existing pair/retriangulate/color-extraction suite (293 default / 298
      poselib lib tests green).
-   - Remaining work: finish broader random/progressive sampler and bit-level
+   - Remaining work: finish SPRT, parallel random seeding, and bit-level
      LORANSAC parity under the `optim` RANSAC item.
    - **Update 2026-06-20:** `CompleteImage` per point2D (complete tracks +
      orphan-cluster reprojection RANSAC), `Complete` direct-graph BFS, and

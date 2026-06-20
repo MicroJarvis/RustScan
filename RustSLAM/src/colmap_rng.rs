@@ -1,7 +1,7 @@
 //! COLMAP-compatible MT19937 and random sampling.
 //!
-//! Matches COLMAP `RandomSampler` / `CombinationSampler` behavior used by
-//! RANSAC-based estimators.
+//! Matches COLMAP `RandomSampler` / `CombinationSampler` /
+//! `ProgressiveSampler` behavior used by RANSAC-based estimators.
 
 /// COLMAP-compatible MT19937-32 generator.
 #[derive(Debug, Clone)]
@@ -207,6 +207,106 @@ fn next_combination(values: &mut [usize], middle: usize) -> bool {
     true
 }
 
+/// COLMAP `ProgressiveSampler` (PROSAC).
+///
+/// The returned values are raw sample indices, just like COLMAP's
+/// `Sampler::Sample`. Callers are expected to apply these indices to
+/// quality-sorted data.
+#[derive(Debug, Clone)]
+pub struct ColmapProgressiveSampler {
+    rng: ColmapMt19937,
+    num_samples: usize,
+    total_num_samples: usize,
+    initialized: bool,
+    t: usize,
+    n: usize,
+    t_n: f64,
+    t_n_p: f64,
+}
+
+impl ColmapProgressiveSampler {
+    pub fn new(seed: u64, num_samples: usize) -> Self {
+        Self {
+            rng: ColmapMt19937::new(seed),
+            num_samples,
+            total_num_samples: 0,
+            initialized: false,
+            t: 0,
+            n: 0,
+            t_n: 0.0,
+            t_n_p: 0.0,
+        }
+    }
+
+    pub fn initialize(&mut self, total_num_samples: usize) -> bool {
+        if self.num_samples > total_num_samples {
+            self.total_num_samples = 0;
+            self.initialized = false;
+            return false;
+        }
+
+        self.total_num_samples = total_num_samples;
+        self.initialized = true;
+        self.t = 0;
+        self.n = self.num_samples;
+
+        // COLMAP uses the PROSAC paper's recommended progressive iteration
+        // count before the sampler behaves like ordinary RANSAC.
+        const NUM_PROGRESSIVE_ITERATIONS: f64 = 200_000.0;
+        self.t_n = NUM_PROGRESSIVE_ITERATIONS;
+        self.t_n_p = 1.0;
+        for i in 0..self.num_samples {
+            self.t_n *=
+                (self.num_samples - i) as f64 / (self.total_num_samples - i) as f64;
+        }
+        true
+    }
+
+    pub fn max_num_samples(&self) -> usize {
+        usize::MAX
+    }
+
+    pub fn sample(&mut self) -> Vec<usize> {
+        if !self.initialized || self.num_samples > self.total_num_samples {
+            return Vec::new();
+        }
+
+        self.t += 1;
+
+        if self.t as f64 == self.t_n_p && self.n < self.total_num_samples {
+            let t_n_plus_1 = self.t_n * (self.n as f64 + 1.0)
+                / (self.n as f64 + 1.0 - self.num_samples as f64);
+            self.t_n_p += (t_n_plus_1 - self.t_n).ceil();
+            self.t_n = t_n_plus_1;
+            self.n += 1;
+        }
+
+        let mut num_random_samples = self.num_samples;
+        let mut max_random_sample_idx = self.n - 1;
+        if self.t_n_p >= self.t as f64 {
+            num_random_samples -= 1;
+            max_random_sample_idx = max_random_sample_idx.wrapping_sub(1);
+        }
+
+        let mut sampled_idxs = Vec::with_capacity(self.num_samples);
+        for _ in 0..num_random_samples {
+            loop {
+                let random_idx = self.rng.uniform_u32(0, max_random_sample_idx as u32) as usize;
+                if !sampled_idxs.contains(&random_idx) {
+                    sampled_idxs.push(random_idx);
+                    break;
+                }
+            }
+        }
+
+        if self.t_n_p >= self.t as f64 {
+            sampled_idxs.push(self.n);
+        }
+
+        sampled_idxs
+    }
+}
+
 /// Draw `k` unique indices from `[0, n)` using COLMAP's per-iteration sampling shape.
 pub fn sample_unique_indices(rng: &mut ColmapMt19937, n: usize, k: usize) -> Vec<usize> {
     if n == 0 || k == 0 {
@@ -326,6 +426,63 @@ mod tests {
         assert_eq!(sampler.max_num_samples(), 1);
         for _ in 0..10 {
             assert_eq!(sampler.sample(), vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn colmap_progressive_sampler_matches_reference_seeded_sequence() {
+        let mut sampler = ColmapProgressiveSampler::new(42, 5);
+        assert!(sampler.initialize(50));
+        assert_eq!(sampler.max_num_samples(), usize::MAX);
+
+        let expected = [
+            vec![3, 4, 2, 1, 6],
+            vec![2, 4, 3, 5, 7],
+            vec![4, 1, 3, 5, 7],
+            vec![5, 1, 3, 4, 8],
+            vec![0, 3, 1, 5, 8],
+            vec![4, 3, 0, 2, 8],
+            vec![2, 6, 1, 3, 8],
+            vec![3, 7, 6, 5, 9],
+        ];
+        for sample in expected {
+            assert_eq!(sampler.sample(), sample);
+        }
+    }
+
+    #[test]
+    fn colmap_progressive_sampler_preserves_prosac_invariants() {
+        let mut sampler = ColmapProgressiveSampler::new(1, 5);
+        assert!(sampler.initialize(50));
+        let mut prev_last_sample = 5;
+        for _ in 0..100 {
+            let sample = sampler.sample();
+            assert_eq!(sample.len(), 5);
+            let mut sorted = sample.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 5);
+
+            let last = *sample.last().unwrap();
+            assert!(last >= prev_last_sample);
+            for &idx in &sample[..sample.len() - 1] {
+                assert!(idx < last);
+            }
+            prev_last_sample = last;
+        }
+    }
+
+    #[test]
+    fn colmap_progressive_sampler_handles_equal_samples_like_colmap() {
+        let mut sampler = ColmapProgressiveSampler::new(42, 5);
+        assert!(sampler.initialize(5));
+        for _ in 0..100 {
+            let sample = sampler.sample();
+            assert_eq!(sample.len(), 5);
+            let mut sorted = sample.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 5);
         }
     }
 }
