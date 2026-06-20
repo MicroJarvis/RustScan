@@ -3,7 +3,7 @@ use crate::geometry::relative_rotation_deg;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
-use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler, ColmapRansacOptions, SE3};
+use rustslam::{ColmapRandomSampler, ColmapRansacOptions, SE3};
 
 #[derive(Debug, Clone)]
 pub struct TwoViewOptions {
@@ -61,8 +61,6 @@ struct PoseCandidateScore {
     mean_reprojection_error_px: f32,
     median_angle_deg: f64,
 }
-
-const COLMAP_RANSAC_DYN_NUM_TRIALS_MULTIPLIER: f64 = 3.0;
 
 pub fn estimate_calibrated_two_view(
     pts1: &[[f32; 2]],
@@ -787,7 +785,6 @@ pub(crate) fn estimate_relative_pose_from_rays(
         SAMPLE_SIZE,
     )?;
     let mut max_iterations = ransac_options.max_num_trials;
-    let min_iterations = ransac_options.min_num_trials;
 
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
     let mut iteration = 0usize;
@@ -839,17 +836,11 @@ pub(crate) fn estimate_relative_pose_from_rays(
                     }
                 }
 
-                max_iterations = max_iterations.min(
-                    ransac_num_trials_from_counts(
-                        support.inliers,
-                        n,
-                        SAMPLE_SIZE,
-                        ransac_options.confidence,
-                        ransac_options.dyn_num_trials_multiplier,
-                    )
-                    .max(min_iterations)
-                    .min(ransac_options.max_num_trials),
-                );
+                max_iterations = max_iterations.min(ransac_options.dynamic_max_num_trials(
+                    support.inliers,
+                    n,
+                    SAMPLE_SIZE,
+                ));
                 best = Some((local_model, support));
             }
         }
@@ -922,28 +913,14 @@ fn adaptive_ransac_iterations(
     sample_size: usize,
 ) -> u32 {
     let max_iterations = max_iterations.max(1);
-    let num_trials = colmap_ransac_num_trials(
-        inliers,
-        total,
-        sample_size,
+    let options = ColmapRansacOptions {
+        max_error: 1.0,
         confidence,
-        COLMAP_RANSAC_DYN_NUM_TRIALS_MULTIPLIER,
-    );
-    if num_trials == usize::MAX {
-        max_iterations
-    } else {
-        num_trials.clamp(1, max_iterations as usize) as u32
-    }
-}
-
-fn ransac_num_trials_from_counts(
-    inliers: usize,
-    total: usize,
-    sample_size: usize,
-    confidence: f64,
-    multiplier: f64,
-) -> usize {
-    colmap_ransac_num_trials(inliers, total, sample_size, confidence, multiplier)
+        max_num_trials: max_iterations as usize,
+        ..ColmapRansacOptions::default()
+    };
+    let num_trials = options.dynamic_max_num_trials(inliers, total, sample_size);
+    num_trials.clamp(1, max_iterations as usize) as u32
 }
 
 fn estimate_fundamental_ransac(
@@ -2439,7 +2416,7 @@ fn matrix3_to_row_array(matrix: Matrix3<f64>) -> [f64; 9] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustslam::{ColmapMt19937, ColmapRandomSampler};
+    use rustslam::{colmap_ransac_num_trials, ColmapMt19937, ColmapRandomSampler};
 
     fn default_test_options() -> TwoViewOptions {
         TwoViewOptions {
@@ -2506,6 +2483,15 @@ mod tests {
         let zero_prior =
             relative_pose_ransac_options(0.01, 0.0, 0, 10_000, 0.999, 1.0, -1, 5).unwrap();
         assert_eq!(zero_prior.max_num_trials, 10_000);
+    }
+
+    #[test]
+    fn ray_relative_pose_uses_shared_dynamic_trial_bounds() {
+        let options =
+            relative_pose_ransac_options(0.01, 0.25, 100, 10_000, 0.999, 3.0, 42, 5).unwrap();
+        assert_eq!(options.dynamic_max_num_trials(50, 100, 5), 726);
+        assert_eq!(options.dynamic_max_num_trials(100, 100, 5), 100);
+        assert_eq!(options.dynamic_max_num_trials(3, 100, 5), 10_000);
     }
 
     #[test]

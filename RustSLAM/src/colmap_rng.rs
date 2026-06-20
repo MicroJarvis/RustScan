@@ -276,6 +276,24 @@ impl ColmapRansacOptions {
         ))
     }
 
+    /// Effective COLMAP dynamic RANSAC trial cap after a better model is found.
+    pub fn dynamic_max_num_trials(
+        &self,
+        num_inliers: usize,
+        num_samples: usize,
+        min_num_samples: usize,
+    ) -> usize {
+        colmap_ransac_num_trials(
+            num_inliers,
+            num_samples,
+            min_num_samples,
+            self.confidence,
+            self.dyn_num_trials_multiplier,
+        )
+        .max(self.min_num_trials)
+        .min(self.max_num_trials)
+    }
+
     pub fn with_initial_max_num_trials(
         mut self,
         min_num_samples: usize,
@@ -713,6 +731,36 @@ mod tests {
 
         let invalid = ColmapRansacOptions::default();
         assert!(invalid.with_initial_max_num_trials(3).is_err());
+    }
+
+    #[test]
+    fn colmap_ransac_options_dynamic_trials_apply_bounds() {
+        let options = ColmapRansacOptions {
+            max_error: 1.0,
+            confidence: 0.999,
+            dyn_num_trials_multiplier: 3.0,
+            min_num_trials: 100,
+            max_num_trials: 10_000,
+            ..ColmapRansacOptions::default()
+        };
+
+        assert_eq!(options.dynamic_max_num_trials(50, 100, 5), 726);
+
+        let bounded_min = ColmapRansacOptions {
+            min_num_trials: 800,
+            ..options
+        };
+        assert_eq!(bounded_min.dynamic_max_num_trials(50, 100, 5), 800);
+
+        let bounded_max = ColmapRansacOptions {
+            min_num_trials: 0,
+            max_num_trials: 25,
+            ..options
+        };
+        assert_eq!(bounded_max.dynamic_max_num_trials(50, 100, 5), 25);
+
+        assert_eq!(options.dynamic_max_num_trials(3, 100, 5), 10_000);
+        assert_eq!(options.dynamic_max_num_trials(100, 100, 5), 100);
     }
 
     #[test]
