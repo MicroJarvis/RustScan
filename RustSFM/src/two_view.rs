@@ -3,7 +3,7 @@ use crate::geometry::relative_rotation_deg;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
-use rustslam::{ColmapRandomSampler, SE3};
+use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler, SE3};
 
 #[derive(Debug, Clone)]
 pub struct TwoViewOptions {
@@ -900,35 +900,17 @@ fn adaptive_ransac_iterations(
     sample_size: usize,
 ) -> u32 {
     let max_iterations = max_iterations.max(1);
-    if sample_size == 0 || inliers >= total && total >= sample_size {
-        return 1;
-    }
-    if inliers < sample_size || total < sample_size {
+    let num_trials = colmap_ransac_num_trials(
+        inliers,
+        total,
+        sample_size,
+        confidence,
+        COLMAP_RANSAC_DYN_NUM_TRIALS_MULTIPLIER,
+    );
+    if num_trials == usize::MAX {
         max_iterations
     } else {
-        let prob_failure = 1.0 - confidence;
-        if prob_failure <= 0.0 {
-            return max_iterations;
-        }
-        let mut prob_inlier = 1.0;
-        for i in 0..sample_size {
-            prob_inlier *= (inliers - i) as f64 / (total - i) as f64;
-        }
-        let prob_outlier = 1.0 - prob_inlier;
-        if prob_outlier <= 0.0 {
-            return 1;
-        }
-        if prob_outlier >= 1.0 {
-            return max_iterations;
-        }
-        let num_trials = (prob_failure.ln() / prob_outlier.ln()
-            * COLMAP_RANSAC_DYN_NUM_TRIALS_MULTIPLIER)
-            .ceil();
-        if !num_trials.is_finite() {
-            max_iterations
-        } else {
-            num_trials.clamp(1.0, max_iterations as f64) as u32
-        }
+        num_trials.clamp(1, max_iterations as usize) as u32
     }
 }
 
@@ -939,33 +921,7 @@ fn ransac_num_trials_from_counts(
     confidence: f64,
     multiplier: f64,
 ) -> usize {
-    if sample_size == 0 || total >= sample_size && inliers >= total {
-        return 1;
-    }
-    if inliers < sample_size || total < sample_size {
-        return usize::MAX;
-    }
-    let prob_failure = 1.0 - confidence;
-    if prob_failure <= 0.0 {
-        return usize::MAX;
-    }
-    let mut prob_inlier = 1.0;
-    for idx in 0..sample_size {
-        prob_inlier *= (inliers - idx) as f64 / (total - idx) as f64;
-    }
-    let prob_outlier = 1.0 - prob_inlier;
-    if prob_outlier <= 0.0 {
-        return 1;
-    }
-    if prob_outlier >= 1.0 {
-        return usize::MAX;
-    }
-    let trials = (prob_failure.ln() / prob_outlier.ln() * multiplier).ceil();
-    if trials.is_finite() && trials > 0.0 {
-        trials as usize
-    } else {
-        usize::MAX
-    }
+    colmap_ransac_num_trials(inliers, total, sample_size, confidence, multiplier)
 }
 
 fn estimate_fundamental_ransac(

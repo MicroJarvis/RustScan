@@ -364,9 +364,9 @@ reconstruction parity.
     - Shared `colmap_ransac_num_trials` now ports COLMAP
       `RANSAC::ComputeNumTrials` with explicit minimal sample size and the full
       official `ransac_test.cc` numeric examples. RustSLAM's PnP/essential
-      solver wrapper plus RustSFM's triangulation estimator and generalized
-      pose RANSAC paths now use this shared helper instead of separate local
-      formulas.
+      solver wrapper plus RustSFM's two-view, triangulation-estimator, and
+      generalized-pose RANSAC paths now use this shared helper instead of
+      separate local formulas.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
