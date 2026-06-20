@@ -13,6 +13,7 @@
 //! stopping criterion, and performs a final local-optimization refit over all
 //! inliers via the multi-view DLT.
 
+use crate::support_measurement::{InlierSupport, InlierSupportMeasurer};
 use crate::triangulation::{
     calculate_triangulation_angle, triangulate_multi_view_point, triangulate_point,
 };
@@ -301,33 +302,6 @@ fn initial_max_num_trials(
         .min(max_sampler_samples)
 }
 
-/// Inlier support under COLMAP's `InlierSupportMeasurer`: more inliers is
-/// better; ties broken by smaller summed inlier residual.
-struct Support {
-    num_inliers: usize,
-    residual_sum: f64,
-}
-
-fn evaluate_support(residuals: &[f64], max_residual: f64) -> Support {
-    let mut num_inliers = 0;
-    let mut residual_sum = 0.0;
-    for &r in residuals {
-        if r <= max_residual {
-            num_inliers += 1;
-            residual_sum += r;
-        }
-    }
-    Support {
-        num_inliers,
-        residual_sum,
-    }
-}
-
-fn support_is_better(candidate: &Support, best: &Support) -> bool {
-    candidate.num_inliers > best.num_inliers
-        || (candidate.num_inliers == best.num_inliers && candidate.residual_sum < best.residual_sum)
-}
-
 pub(crate) fn triangulation_sample_pairs(
     num_samples: usize,
     random_seed: i32,
@@ -392,10 +366,8 @@ pub fn estimate_triangulation(
     // Robust estimation over the 2-view combinations (CombinationSampler order),
     // scored by inlier support with COLMAP's dynamic stopping criterion.
     let mut best_model: Option<Vector3<f64>> = None;
-    let mut best_support = Support {
-        num_inliers: 0,
-        residual_sum: f64::MAX,
-    };
+    let support_measurer = InlierSupportMeasurer;
+    let mut best_support = InlierSupport::default();
     let sample_pairs = triangulation_sample_pairs(num_samples, options.random_seed);
     let max_num_trials = initial_max_num_trials(options, sample_pairs.len());
     let mut dynamic_max_trials = max_num_trials;
@@ -413,8 +385,8 @@ pub fn estimate_triangulation(
         };
 
         let residuals = estimator.residuals(&point_data, &pose_data, &xyz);
-        let support = evaluate_support(&residuals, max_residual);
-        if support_is_better(&support, &best_support) {
+        let support = support_measurer.evaluate(&residuals, max_residual);
+        if support_measurer.is_left_better(&support, &best_support) {
             dynamic_max_trials = compute_num_trials(
                 support.num_inliers,
                 num_samples,
@@ -441,8 +413,8 @@ pub fn estimate_triangulation(
         let lo_poses: Vec<PoseData> = inlier_indices.iter().map(|&k| pose_data[k]).collect();
         if let Some(refit) = estimator.estimate(&lo_points, &lo_poses) {
             let residuals = estimator.residuals(&point_data, &pose_data, &refit);
-            let support = evaluate_support(&residuals, max_residual);
-            if !support_is_better(&best_support, &support) {
+            let support = support_measurer.evaluate(&residuals, max_residual);
+            if !support_measurer.is_left_better(&best_support, &support) {
                 best_support = support;
                 best_xyz = refit;
             }
