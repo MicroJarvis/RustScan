@@ -15,6 +15,7 @@ pub mod parity;
 pub mod polynomial;
 pub mod pose_graph;
 pub mod sift;
+pub mod sprt;
 pub mod support_measurement;
 pub mod triangulation;
 pub mod triangulation_estimator;

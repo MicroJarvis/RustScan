@@ -364,6 +364,9 @@ reconstruction parity.
       `InlierSupportMeasurer`, `UniqueInlierSupportMeasurer`, and
       `MEstimatorSupportMeasurer` now have COLMAP nominal tests, and
       `EstimateTriangulation` uses the shared inlier support measurer.
+    - Ported COLMAP `optim/sprt` as `sprt.rs`: options, decision-threshold
+      recurrence, absolute-residual early rejection, inlier/evaluation counters,
+      and official all-inlier/all-outlier/mixed/empty tests are covered.
     - Two-view E/F/H fixed-seed sampling now uses COLMAP's MT19937-32 random
       source plus the local libc++ `std::uniform_int_distribution<uint32_t>`
       bit-extraction behavior for `RandomSampler::Shuffle`.
@@ -757,8 +760,8 @@ reconstruction parity.
      matching COLMAP. Verified by a three-view track-creation test plus the
      existing pair/retriangulate/color-extraction suite (293 default / 298
      poselib lib tests green).
-   - Remaining work: finish SPRT, parallel random seeding, and bit-level
-     LORANSAC parity under the `optim` RANSAC item.
+   - Remaining work: finish parallel random seeding and bit-level LORANSAC
+     parity under the `optim` RANSAC item.
    - **Update 2026-06-20:** `CompleteImage` per point2D (complete tracks +
      orphan-cluster reprojection RANSAC), `Complete` direct-graph BFS, and
      `EstimateTriangulation` deterministic `CombinationSampler` order are
