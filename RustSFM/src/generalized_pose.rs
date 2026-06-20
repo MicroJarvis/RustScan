@@ -3,9 +3,9 @@ use crate::types::CameraModel;
 #[cfg(feature = "poselib")]
 use crate::types::Rigid3;
 use glam::Vec3;
-use rustslam::SE3;
 #[cfg(feature = "poselib")]
-use rustslam::ColmapRandomSampler;
+use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler};
+use rustslam::SE3;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -1253,32 +1253,7 @@ fn ransac_trials_from_counts(
     confidence: f64,
     multiplier: f64,
 ) -> usize {
-    let prob_failure = 1.0 - confidence;
-    if prob_failure <= 0.0 {
-        return usize::MAX;
-    }
-    if num_samples < sample_size || num_inliers < sample_size {
-        return usize::MAX;
-    }
-
-    let mut prob_inlier = 1.0;
-    for idx in 0..sample_size {
-        prob_inlier *= (num_inliers - idx) as f64 / (num_samples - idx) as f64;
-    }
-    let prob_outlier = 1.0 - prob_inlier;
-    if prob_outlier <= 0.0 {
-        return 1;
-    }
-    if prob_outlier == 1.0 {
-        return usize::MAX;
-    }
-
-    let trials = (prob_failure.ln() / prob_outlier.ln()) * multiplier;
-    if trials.is_finite() && trials > 0.0 {
-        trials.ceil() as usize
-    } else {
-        usize::MAX
-    }
+    colmap_ransac_num_trials(num_inliers, num_samples, sample_size, confidence, multiplier)
 }
 
 #[cfg(feature = "poselib")]
