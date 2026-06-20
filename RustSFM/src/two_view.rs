@@ -9,6 +9,7 @@ use rustslam::{ColmapRandomSampler, ColmapRansacOptions, SE3};
 pub struct TwoViewOptions {
     pub ransac_max_error_px: f64,
     pub ransac_threshold: f64,
+    pub ransac_min_inlier_ratio: f64,
     pub ransac_min_iterations: u32,
     pub ransac_max_iterations: u32,
     pub random_seed: u64,
@@ -172,8 +173,11 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         options.random_seed ^ 0x9e37_79b9_7f4a_7c15 ^ n as u64,
         &active_indices,
     );
+    let essential_sample_size = if options.use_five_point { 5 } else { 8 };
+    let essential_ransac_options =
+        two_view_ransac_options(options.ransac_threshold, options, essential_sample_size)?;
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
-    let mut max_iterations = options.ransac_max_iterations.max(1);
+    let mut max_iterations = essential_ransac_options.max_num_trials.max(1) as u32;
     let mut iteration = 0u32;
     while iteration < max_iterations {
         iteration += 1;
@@ -215,9 +219,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
                 max_iterations = max_iterations.min(adaptive_ransac_iterations(
                     estimated_inliers,
                     active_indices.len(),
-                    options.ransac_min_iterations,
-                    options.ransac_max_iterations,
-                    0.999,
+                    &essential_ransac_options,
                     sample_size,
                 ));
                 best = Some((model, support));
@@ -281,9 +283,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         &img_pts1,
         &img_pts2,
         &active_indices,
-        options.ransac_max_error_px,
-        options.ransac_min_iterations,
-        options.ransac_max_iterations,
+        two_view_ransac_options(options.ransac_max_error_px, options, 7)?,
         options.random_seed,
         options.loransac_num_lo_steps,
     );
@@ -291,9 +291,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         &img_pts1,
         &img_pts2,
         &active_indices,
-        options.ransac_max_error_px,
-        options.ransac_min_iterations,
-        options.ransac_max_iterations,
+        two_view_ransac_options(options.ransac_max_error_px, options, 4)?,
         options.random_seed,
         options.loransac_num_lo_steps,
     );
@@ -421,9 +419,7 @@ fn estimate_force_h_two_view(
         img_pts1,
         img_pts2,
         active_indices,
-        options.ransac_max_error_px,
-        options.ransac_min_iterations,
-        options.ransac_max_iterations,
+        two_view_ransac_options(options.ransac_max_error_px, options, 4)?,
         options.random_seed,
         options.loransac_num_lo_steps,
     )?;
@@ -892,6 +888,30 @@ fn relative_pose_ransac_options(
     .ok()
 }
 
+fn two_view_ransac_options(
+    max_error: f64,
+    options: &TwoViewOptions,
+    sample_size: usize,
+) -> Option<ColmapRansacOptions> {
+    let min_inlier_ratio = if options.min_inlier_ratio > 0.0 {
+        options.min_inlier_ratio
+    } else {
+        options.ransac_min_inlier_ratio
+    };
+    let max_num_trials = options.ransac_max_iterations.max(1) as usize;
+    let min_num_trials = (options.ransac_min_iterations as usize).min(max_num_trials);
+    ColmapRansacOptions {
+        max_error,
+        min_inlier_ratio,
+        confidence: 0.999,
+        min_num_trials,
+        max_num_trials,
+        ..ColmapRansacOptions::default()
+    }
+    .with_initial_max_num_trials(sample_size)
+    .ok()
+}
+
 fn rays_to_pixel_like_observations(rays: &[[f64; 3]], n: usize) -> Vec<[f32; 2]> {
     rays.iter()
         .take(n)
@@ -913,31 +933,19 @@ fn is_better_support(candidate: &ModelSupport, current: Option<&ModelSupport>) -
 fn adaptive_ransac_iterations(
     inliers: usize,
     total: usize,
-    min_iterations: u32,
-    max_iterations: u32,
-    confidence: f64,
+    options: &ColmapRansacOptions,
     sample_size: usize,
 ) -> u32 {
-    let max_iterations = max_iterations.max(1);
-    let min_iterations = min_iterations.min(max_iterations);
-    let options = ColmapRansacOptions {
-        max_error: 1.0,
-        confidence,
-        min_num_trials: min_iterations as usize,
-        max_num_trials: max_iterations as usize,
-        ..ColmapRansacOptions::default()
-    };
+    let max_iterations = options.max_num_trials.max(1);
     let num_trials = options.dynamic_max_num_trials(inliers, total, sample_size);
-    num_trials.clamp(1, max_iterations as usize) as u32
+    num_trials.clamp(1, max_iterations) as u32
 }
 
 fn estimate_fundamental_ransac(
     pts1: &[Vector3<f64>],
     pts2: &[Vector3<f64>],
     active_indices: &[usize],
-    threshold: f64,
-    min_iterations: u32,
-    max_iterations: u32,
+    ransac_options: ColmapRansacOptions,
     random_seed: u64,
     lo_steps: usize,
 ) -> Option<(Matrix3<f64>, ModelSupport)> {
@@ -949,7 +957,7 @@ fn estimate_fundamental_ransac(
         active_indices,
     );
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
-    let mut max_iterations = max_iterations.max(1);
+    let mut max_iterations = ransac_options.max_num_trials.max(1) as u32;
     let mut iteration = 0u32;
     while iteration < max_iterations {
         iteration += 1;
@@ -959,14 +967,13 @@ fn estimate_fundamental_ransac(
         }
         let models = estimate_fundamental_seven_point_indexed(pts1, pts2, &sample);
         for model in models {
-            let support = model_support_indexed(pts1, pts2, active_indices, &model, threshold);
+            let support =
+                model_support_indexed(pts1, pts2, active_indices, &model, ransac_options.max_error);
             if support.inliers >= 7 && is_better_support(&support, best.as_ref().map(|(_, s)| s)) {
                 max_iterations = max_iterations.min(adaptive_ransac_iterations(
                     support.inliers,
                     active_indices.len(),
-                    min_iterations,
-                    max_iterations,
-                    0.999,
+                    &ransac_options,
                     7,
                 ));
                 best = Some((model, support));
@@ -975,7 +982,8 @@ fn estimate_fundamental_ransac(
     }
     let (model, support) = best.or_else(|| {
         estimate_fundamental_eight_point_indexed(pts1, pts2, active_indices).map(|model| {
-            let support = model_support_indexed(pts1, pts2, active_indices, &model, threshold);
+            let support =
+                model_support_indexed(pts1, pts2, active_indices, &model, ransac_options.max_error);
             (model, support)
         })
     })?;
@@ -983,7 +991,7 @@ fn estimate_fundamental_ransac(
         pts1,
         pts2,
         active_indices,
-        threshold,
+        ransac_options.max_error,
         model,
         support,
         lo_steps,
@@ -1246,9 +1254,7 @@ fn estimate_homography_ransac(
     pts1: &[Vector3<f64>],
     pts2: &[Vector3<f64>],
     active_indices: &[usize],
-    threshold: f64,
-    min_iterations: u32,
-    max_iterations: u32,
+    ransac_options: ColmapRansacOptions,
     random_seed: u64,
     lo_steps: usize,
 ) -> Option<(Matrix3<f64>, ModelSupport)> {
@@ -1260,7 +1266,7 @@ fn estimate_homography_ransac(
         active_indices,
     );
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
-    let mut max_iterations = max_iterations.max(1);
+    let mut max_iterations = ransac_options.max_num_trials.max(1) as u32;
     let mut iteration = 0u32;
     while iteration < max_iterations {
         iteration += 1;
@@ -1271,14 +1277,18 @@ fn estimate_homography_ransac(
         let Some(model) = estimate_homography_dlt_indexed(pts1, pts2, &sample) else {
             continue;
         };
-        let support = homography_support_indexed(pts1, pts2, active_indices, &model, threshold);
+        let support = homography_support_indexed(
+            pts1,
+            pts2,
+            active_indices,
+            &model,
+            ransac_options.max_error,
+        );
         if support.inliers >= 4 && is_better_support(&support, best.as_ref().map(|(_, s)| s)) {
             max_iterations = max_iterations.min(adaptive_ransac_iterations(
                 support.inliers,
                 active_indices.len(),
-                min_iterations,
-                max_iterations,
-                0.999,
+                &ransac_options,
                 4,
             ));
             best = Some((model, support));
@@ -1286,7 +1296,13 @@ fn estimate_homography_ransac(
     }
     let (model, support) = best.or_else(|| {
         estimate_homography_dlt_indexed(pts1, pts2, active_indices).map(|model| {
-            let support = homography_support_indexed(pts1, pts2, active_indices, &model, threshold);
+            let support = homography_support_indexed(
+                pts1,
+                pts2,
+                active_indices,
+                &model,
+                ransac_options.max_error,
+            );
             (model, support)
         })
     })?;
@@ -1294,7 +1310,7 @@ fn estimate_homography_ransac(
         pts1,
         pts2,
         active_indices,
-        threshold,
+        ransac_options.max_error,
         model,
         support,
         lo_steps,
@@ -2434,6 +2450,7 @@ mod tests {
         TwoViewOptions {
             ransac_max_error_px: 4.0,
             ransac_threshold: 0.01,
+            ransac_min_inlier_ratio: 0.25,
             ransac_min_iterations: 100,
             ransac_max_iterations: 128,
             random_seed: 42,
@@ -2467,33 +2484,78 @@ mod tests {
         (a - b).norm().min((a + b).norm())
     }
 
+    fn test_ransac_options(
+        min_iterations: u32,
+        max_iterations: u32,
+        confidence: f64,
+    ) -> ColmapRansacOptions {
+        ColmapRansacOptions {
+            max_error: 1.0,
+            confidence,
+            min_num_trials: min_iterations as usize,
+            max_num_trials: max_iterations as usize,
+            ..ColmapRansacOptions::default()
+        }
+    }
+
     #[test]
     fn adaptive_ransac_iterations_matches_colmap_trial_formula() {
-        assert_eq!(
-            adaptive_ransac_iterations(50, 100, 0, 10_000, 0.999, 5),
-            726
-        );
-        assert_eq!(
-            adaptive_ransac_iterations(50, 100, 0, 10_000, 0.999, 8),
-            7173
-        );
-        assert_eq!(adaptive_ransac_iterations(90, 100, 0, 10_000, 0.999, 5), 24);
+        let options = test_ransac_options(0, 10_000, 0.999);
+        assert_eq!(adaptive_ransac_iterations(50, 100, &options, 5), 726);
+        assert_eq!(adaptive_ransac_iterations(50, 100, &options, 8), 7173);
+        assert_eq!(adaptive_ransac_iterations(90, 100, &options, 5), 24);
     }
 
     #[test]
     fn adaptive_ransac_iterations_respects_colmap_min_trial_floor() {
-        assert_eq!(
-            adaptive_ransac_iterations(90, 100, 100, 10_000, 0.999, 5),
-            100
-        );
-        assert_eq!(adaptive_ransac_iterations(90, 100, 200, 128, 0.999, 5), 128);
+        let options = test_ransac_options(100, 10_000, 0.999);
+        assert_eq!(adaptive_ransac_iterations(90, 100, &options, 5), 100);
+        let options = test_ransac_options(128, 128, 0.999);
+        assert_eq!(adaptive_ransac_iterations(90, 100, &options, 5), 128);
     }
 
     #[test]
     fn adaptive_ransac_iterations_keeps_full_budget_for_invalid_support() {
-        assert_eq!(adaptive_ransac_iterations(3, 100, 0, 123, 0.999, 5), 123);
-        assert_eq!(adaptive_ransac_iterations(10, 4, 0, 123, 0.999, 5), 123);
-        assert_eq!(adaptive_ransac_iterations(10, 10, 0, 123, 0.999, 5), 1);
+        let options = test_ransac_options(0, 123, 0.999);
+        assert_eq!(adaptive_ransac_iterations(3, 100, &options, 5), 123);
+        assert_eq!(adaptive_ransac_iterations(10, 4, &options, 5), 123);
+        assert_eq!(adaptive_ransac_iterations(10, 10, &options, 5), 1);
+    }
+
+    #[test]
+    fn two_view_ransac_options_use_colmap_prior_inlier_initial_clamp() {
+        let options = default_test_options();
+
+        let essential_options = two_view_ransac_options(0.01, &options, 5).unwrap();
+        assert_eq!(essential_options.min_inlier_ratio, 0.25);
+        assert_eq!(essential_options.min_num_trials, 100);
+        assert_eq!(essential_options.max_num_trials, 128);
+
+        let mut full_budget_options = options.clone();
+        full_budget_options.ransac_max_iterations = 10_000;
+        let essential_options = two_view_ransac_options(0.01, &full_budget_options, 5).unwrap();
+        assert_eq!(essential_options.max_num_trials, 10_000);
+
+        let homography_options = two_view_ransac_options(4.0, &full_budget_options, 4).unwrap();
+        assert_eq!(
+            homography_options.max_num_trials,
+            colmap_ransac_num_trials(25_000, 100_000, 4, 0.999, 3.0)
+        );
+
+        let mut filtered_options = full_budget_options.clone();
+        filtered_options.min_inlier_ratio = 0.5;
+        let filtered = two_view_ransac_options(0.01, &filtered_options, 5).unwrap();
+        assert_eq!(filtered.min_inlier_ratio, 0.5);
+        assert_eq!(
+            filtered.max_num_trials,
+            colmap_ransac_num_trials(50_000, 100_000, 5, 0.999, 3.0).min(10_000)
+        );
+
+        let mut tiny_budget_options = options.clone();
+        tiny_budget_options.ransac_max_iterations = 50;
+        let tiny = two_view_ransac_options(0.01, &tiny_budget_options, 5).unwrap();
+        assert_eq!(tiny.min_num_trials, 50);
+        assert_eq!(tiny.max_num_trials, 50);
     }
 
     #[test]

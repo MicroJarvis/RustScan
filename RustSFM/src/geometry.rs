@@ -211,6 +211,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         &TwoViewOptions {
             ransac_max_error_px: essential_threshold as f64,
             ransac_threshold: normalized_threshold,
+            ransac_min_inlier_ratio: 0.25,
             ransac_min_iterations: 100,
             ransac_max_iterations: essential_iterations,
             random_seed: ((left_idx as u64) << 32) ^ right_idx as u64 ^ 0x243f_6a88_85a3_08d3,

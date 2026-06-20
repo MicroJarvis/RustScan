@@ -383,6 +383,10 @@ reconstruction parity.
       the same shared initialization instead of a local pre-clamp formula.
       RustSLAM's PnP/PnPF RANSAC initial trial budget now maps through the
       shared COLMAP options initialization as well.
+      Two-view E/F/H RANSAC now maps the COLMAP
+      `TwoViewGeometryOptions` inlier prior (`ransac_options.min_inlier_ratio`
+      default 0.25, overridden by top-level `min_inlier_ratio` when enabled)
+      through the same constructor-time initial trial clamp.
       Shared `ColmapRansacOptions::dynamic_max_num_trials` now centralizes the
       post-best-model dynamic trial cap (`ComputeNumTrials`, min-trial floor,
       max-trial ceiling); two-view E/F/H and the ray relative-pose fallback use
