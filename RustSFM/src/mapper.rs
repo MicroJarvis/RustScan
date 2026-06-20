@@ -4,7 +4,7 @@ use crate::colmap::{
     world_to_camera_rotation, ColmapDataId, ColmapRig, ColmapRigSensor, ColmapRigid3,
     ColmapSensorId, ColmapSensorType,
 };
-use crate::correspondence_graph::{image_pair_to_pair_id, ImagePairId};
+use crate::correspondence_graph::{image_pair_to_pair_id, CorrespondenceGraph, ImagePairId};
 use crate::correspondence_graph::FeatureMatch;
 use crate::database::{
     ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors,
@@ -4091,15 +4091,17 @@ fn incremental_map_single_attempt(
 
     let mut snapshot_state = PipelineSnapshotState::new(&reconstruction);
     let mut reg_trials = vec![0usize; frames.len()];
+    let mut structureless_reg_trials = vec![0usize; frames.len()];
     while reconstruction.poses.iter().any(|p| p.is_none()) {
         let NextRegistrationSelection {
             choice,
-            failed_images,
+            failed_attempts,
         } = choose_next_registration_with_failures(
             frames,
             pairs,
             &reconstruction,
             &reg_trials,
+            &structureless_reg_trials,
             &filtered_units,
             config,
             &camera_priors,
@@ -4107,11 +4109,17 @@ fn incremental_map_single_attempt(
             &registration_stats,
             triangulation_state.observation_manager(),
         );
-        for failed_image in failed_images {
-            increment_registration_unit_trials(&reconstruction, failed_image, &mut reg_trials);
+        for (failed_image, mode) in failed_attempts {
+            increment_registration_unit_trials_for_mode(
+                &reconstruction,
+                failed_image,
+                mode,
+                &mut reg_trials,
+                &mut structureless_reg_trials,
+            );
             debug_log.push(format!(
-                "registration_attempt_failed {}",
-                frames[failed_image].name
+                "registration_attempt_failed {} mode={:?}",
+                frames[failed_image].name, mode
             ));
         }
         let Some(choice) = choice else {
@@ -4237,7 +4245,13 @@ fn incremental_map_single_attempt(
         if let Some(reason) = rollback_reason {
             reconstruction = registration_snapshot;
             triangulation_state.rebuild(frames, pairs, &reconstruction);
-            increment_registration_unit_trials(&reconstruction, choice.image, &mut reg_trials);
+            increment_registration_unit_trials_for_mode(
+                &reconstruction,
+                choice.image,
+                registration_mode_for_choice(&choice),
+                &mut reg_trials,
+                &mut structureless_reg_trials,
+            );
             debug_log.push(format!(
                 "registration_rollback {} reason={reason}",
                 frames[choice.image].name
@@ -4245,7 +4259,13 @@ fn incremental_map_single_attempt(
             continue;
         }
         registration_stats.register_frame_for_image_event(&reconstruction, choice.image);
-        reset_registration_unit_trials(&reconstruction, choice.image, &mut reg_trials);
+        reset_registration_unit_trials_for_mode(
+            &reconstruction,
+            choice.image,
+            registration_mode_for_choice(&choice),
+            &mut reg_trials,
+            &mut structureless_reg_trials,
+        );
         filtered_units.remove(&registration_unit_key(&reconstruction, choice.image));
         let filtered_frames = filter_registered_frames(
             frames,
@@ -4569,7 +4589,7 @@ enum NextImageRegistrationMode {
 #[derive(Debug, Clone)]
 struct NextRegistrationSelection {
     choice: Option<RegistrationChoice>,
-    failed_images: Vec<usize>,
+    failed_attempts: Vec<(usize, NextImageRegistrationMode)>,
 }
 
 #[cfg(test)]
@@ -4578,6 +4598,7 @@ fn choose_next_registration(
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
     reg_trials: &[usize],
+    structureless_reg_trials: &[usize],
     filtered_units: &HashSet<RegistrationUnitKey>,
     config: &MapperConfig,
     camera_priors: &[CameraModel],
@@ -4590,6 +4611,7 @@ fn choose_next_registration(
         pairs,
         reconstruction,
         reg_trials,
+        structureless_reg_trials,
         filtered_units,
         config,
         camera_priors,
@@ -4605,6 +4627,7 @@ fn choose_next_registration_with_failures(
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
     reg_trials: &[usize],
+    structureless_reg_trials: &[usize],
     filtered_units: &HashSet<RegistrationUnitKey>,
     config: &MapperConfig,
     camera_priors: &[CameraModel],
@@ -4612,14 +4635,16 @@ fn choose_next_registration_with_failures(
     registration_stats: &RegistrationStats,
     obs_manager: &ObservationManager,
 ) -> NextRegistrationSelection {
-    let mut failed_images = Vec::new();
+    let correspondence_graph = obs_manager.correspondence_graph();
+    let mut failed_attempts = Vec::new();
     for mode in next_registration_modes(config) {
         let next_images = find_next_registration_images(
             reconstruction,
             reg_trials,
+            structureless_reg_trials,
             filtered_units,
             config,
-            &obs_manager,
+            obs_manager,
             mode,
         );
         for image in next_images {
@@ -4632,21 +4657,22 @@ fn choose_next_registration_with_failures(
                 camera_priors,
                 camera_has_prior_focal_length,
                 registration_stats,
-                &obs_manager,
+                obs_manager,
+                correspondence_graph,
                 mode,
             ) {
                 return NextRegistrationSelection {
                     choice: Some(choice),
-                    failed_images,
+                    failed_attempts,
                 };
             } else {
-                failed_images.push(image);
+                failed_attempts.push((image, mode));
             }
         }
     }
     NextRegistrationSelection {
         choice: None,
-        failed_images,
+        failed_attempts,
     }
 }
 
@@ -4689,6 +4715,7 @@ fn registration_unit_num_visible_correspondences(
 fn find_next_registration_images(
     reconstruction: &Reconstruction,
     reg_trials: &[usize],
+    structureless_reg_trials: &[usize],
     filtered_units: &HashSet<RegistrationUnitKey>,
     config: &MapperConfig,
     obs_manager: &ObservationManager,
@@ -4705,7 +4732,13 @@ fn find_next_registration_images(
         if registration_unit_is_registered(reconstruction, image) {
             continue;
         }
-        let num_trials = registration_unit_num_trials(reconstruction, image, reg_trials);
+        let num_trials = registration_unit_num_trials_for_mode(
+            reconstruction,
+            image,
+            reg_trials,
+            structureless_reg_trials,
+            mode,
+        );
         if num_trials >= config.max_reg_trials {
             continue;
         }
@@ -4762,6 +4795,7 @@ fn registration_choice_for_image(
     camera_has_prior_focal_length: &[bool],
     registration_stats: &RegistrationStats,
     obs_manager: &ObservationManager,
+    correspondence_graph: Option<&CorrespondenceGraph>,
     mode: NextImageRegistrationMode,
 ) -> Option<RegistrationChoice> {
     let (abs_pose, source) = match mode {
@@ -4783,6 +4817,7 @@ fn registration_choice_for_image(
                     obs_manager,
                     camera_has_prior_focal_length,
                     registration_stats,
+                    correspondence_graph,
                 )?;
                 (abs_pose, "generalized_frame")
             } else if let Some(abs_pose) = solve_absolute_pose(
@@ -4794,6 +4829,7 @@ fn registration_choice_for_image(
                 camera_priors,
                 camera_has_prior_focal_length,
                 registration_stats,
+                correspondence_graph,
             ) {
                 (abs_pose, "pnp")
             } else {
@@ -4810,6 +4846,7 @@ fn registration_choice_for_image(
                 obs_manager,
                 camera_priors,
                 registration_stats,
+                correspondence_graph,
             )?;
             (abs_pose, "structureless")
         }
@@ -4866,7 +4903,16 @@ fn next_image_rank(
         ImageSelectionMethod::MinUncertainty => unit_images
             .iter()
             .map(|&frame_image| obs_manager.point3d_visibility_score(frame_image))
-            .sum::<usize>() as f32,
+            .max()
+            .unwrap_or(0) as f32,
+    }
+}
+
+fn registration_mode_for_choice(choice: &RegistrationChoice) -> NextImageRegistrationMode {
+    if choice.source == "structureless" {
+        NextImageRegistrationMode::StructureLess
+    } else {
+        NextImageRegistrationMode::StructureBased
     }
 }
 
@@ -4927,6 +4973,7 @@ fn mark_unregistered_images_with_no_absolute_pose(
                 &obs_manager,
                 camera_has_prior_focal_length,
                 registration_stats,
+                obs_manager.correspondence_graph(),
             )
         } else {
             solve_absolute_pose(
@@ -4938,6 +4985,7 @@ fn mark_unregistered_images_with_no_absolute_pose(
                 camera_priors,
                 camera_has_prior_focal_length,
                 registration_stats,
+                obs_manager.correspondence_graph(),
             )
         };
         let has_pose = structure_based_pose
@@ -4951,6 +4999,7 @@ fn mark_unregistered_images_with_no_absolute_pose(
                     &obs_manager,
                     camera_priors,
                     registration_stats,
+                    obs_manager.correspondence_graph(),
                 )
             })
             .map(|pose| {
@@ -5053,6 +5102,63 @@ fn registration_unit_num_trials(
         .filter_map(|frame_image| reg_trials.get(frame_image).copied())
         .max()
         .unwrap_or_else(|| reg_trials.get(image).copied().unwrap_or(0))
+}
+
+fn registration_unit_num_trials_for_mode(
+    reconstruction: &Reconstruction,
+    image: usize,
+    reg_trials: &[usize],
+    structureless_reg_trials: &[usize],
+    mode: NextImageRegistrationMode,
+) -> usize {
+    match mode {
+        NextImageRegistrationMode::StructureBased => {
+            registration_unit_num_trials(reconstruction, image, reg_trials)
+        }
+        NextImageRegistrationMode::StructureLess => registration_unit_num_trials(
+            reconstruction,
+            image,
+            structureless_reg_trials,
+        ),
+    }
+}
+
+fn increment_registration_unit_trials_for_mode(
+    reconstruction: &Reconstruction,
+    image: usize,
+    mode: NextImageRegistrationMode,
+    reg_trials: &mut [usize],
+    structureless_reg_trials: &mut [usize],
+) {
+    match mode {
+        NextImageRegistrationMode::StructureBased => {
+            increment_registration_unit_trials(reconstruction, image, reg_trials)
+        }
+        NextImageRegistrationMode::StructureLess => increment_registration_unit_trials(
+            reconstruction,
+            image,
+            structureless_reg_trials,
+        ),
+    }
+}
+
+fn reset_registration_unit_trials_for_mode(
+    reconstruction: &Reconstruction,
+    image: usize,
+    mode: NextImageRegistrationMode,
+    reg_trials: &mut [usize],
+    structureless_reg_trials: &mut [usize],
+) {
+    match mode {
+        NextImageRegistrationMode::StructureBased => {
+            reset_registration_unit_trials(reconstruction, image, reg_trials)
+        }
+        NextImageRegistrationMode::StructureLess => reset_registration_unit_trials(
+            reconstruction,
+            image,
+            structureless_reg_trials,
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6161,6 +6267,7 @@ fn solve_generalized_frame_absolute_pose(
     obs_manager: &ObservationManager,
     camera_has_prior_focal_length: &[bool],
     registration_stats: &RegistrationStats,
+    graph: Option<&CorrespondenceGraph>,
 ) -> Option<AbsolutePose> {
     if !generalized_frame_registration_applicable(
         image,
@@ -6180,6 +6287,7 @@ fn solve_generalized_frame_absolute_pose(
         pairs,
         reconstruction,
         config,
+        graph,
     )?;
     if problem.points2d.len() < config.abs_pose_min_num_inliers {
         return None;
@@ -6554,6 +6662,7 @@ fn collect_generalized_frame_absolute_pose_problem(
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
     config: &MapperConfig,
+    graph: Option<&CorrespondenceGraph>,
 ) -> Option<GeneralizedFrameAbsolutePoseProblem> {
     let frame = reconstruction.frames.get(frame_idx)?;
     let frame_images = reconstruction.image_indices_for_frame_index(frame_idx);
@@ -6574,77 +6683,144 @@ fn collect_generalized_frame_absolute_pose_problem(
         cameras.push(reconstruction.camera_for_image(frame_image));
     }
 
-    let frame_image_set = frame_images.iter().copied().collect::<HashSet<_>>();
     let mut points2d = Vec::new();
     let mut points3d = Vec::new();
     let mut camera_idxs = Vec::new();
     let mut correspondences = Vec::new();
     let mut seen = HashSet::<(usize, usize, usize)>::new();
 
-    for pair in pairs {
-        let (query_image, other_image, image_is_left) = match (
-            frame_image_set.contains(&pair.left),
-            frame_image_set.contains(&pair.right),
-        ) {
-            (true, false) => (pair.left, pair.right, true),
-            (false, true) => (pair.right, pair.left, false),
-            _ => continue,
-        };
-        if reconstruction
-            .poses
-            .get(other_image)
-            .copied()
-            .flatten()
-            .is_none()
-        {
-            continue;
-        }
-        if camera_has_bogus_params(reconstruction.camera_for_image(other_image), config) {
-            continue;
-        }
-        let Some(&camera_idx) = local_camera_idx_by_image.get(&query_image) else {
-            continue;
-        };
-
-        for m in &pair.inlier_matches {
-            let (feature, other_feature) = if image_is_left {
-                (m.query_idx as usize, m.train_idx as usize)
-            } else {
-                (m.train_idx as usize, m.query_idx as usize)
+    if let Some(graph) = graph {
+        for &query_image in &frame_images {
+            let Some(&camera_idx) = local_camera_idx_by_image.get(&query_image) else {
+                continue;
             };
-            let Some(point_id) = reconstruction
-                .observations
+            let num_features = frames
+                .get(query_image)
+                .map(|frame| frame.keypoints.len())
+                .unwrap_or(0);
+            for feature in 0..num_features {
+                let Ok(corrs) = graph.find_correspondences(query_image as u32, feature as u32) else {
+                    continue;
+                };
+                for corr in corrs {
+                    let other_image = corr.image_id as usize;
+                    let other_feature = corr.point2d_idx as usize;
+                    if reconstruction
+                        .poses
+                        .get(other_image)
+                        .copied()
+                        .flatten()
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    if camera_has_bogus_params(reconstruction.camera_for_image(other_image), config)
+                    {
+                        continue;
+                    }
+                    let Some(point_id) = reconstruction
+                        .observations
+                        .get(other_image)
+                        .and_then(|obs| obs.get(other_feature))
+                        .copied()
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    if !seen.insert((query_image, feature, point_id)) {
+                        continue;
+                    }
+                    let Some(kp) = frames
+                        .get(query_image)
+                        .and_then(|frame| frame.keypoints.get(feature))
+                    else {
+                        continue;
+                    };
+                    let Some(point) = reconstruction.points.get(point_id) else {
+                        continue;
+                    };
+                    points2d.push([kp.x() as f64, kp.y() as f64]);
+                    points3d.push([
+                        point.xyz[0] as f64,
+                        point.xyz[1] as f64,
+                        point.xyz[2] as f64,
+                    ]);
+                    camera_idxs.push(camera_idx);
+                    correspondences.push(GeneralizedFrameInlier {
+                        image: query_image,
+                        feature,
+                        point_id,
+                    });
+                }
+            }
+        }
+    } else {
+        let frame_image_set = frame_images.iter().copied().collect::<HashSet<_>>();
+        for pair in pairs {
+            let (query_image, other_image, image_is_left) = match (
+                frame_image_set.contains(&pair.left),
+                frame_image_set.contains(&pair.right),
+            ) {
+                (true, false) => (pair.left, pair.right, true),
+                (false, true) => (pair.right, pair.left, false),
+                _ => continue,
+            };
+            if reconstruction
+                .poses
                 .get(other_image)
-                .and_then(|obs| obs.get(other_feature))
                 .copied()
                 .flatten()
-            else {
-                continue;
-            };
-            if !seen.insert((query_image, feature, point_id)) {
+                .is_none()
+            {
                 continue;
             }
-            let Some(kp) = frames
-                .get(query_image)
-                .and_then(|frame| frame.keypoints.get(feature))
-            else {
+            if camera_has_bogus_params(reconstruction.camera_for_image(other_image), config) {
+                continue;
+            }
+            let Some(&camera_idx) = local_camera_idx_by_image.get(&query_image) else {
                 continue;
             };
-            let Some(point) = reconstruction.points.get(point_id) else {
-                continue;
-            };
-            points2d.push([kp.x() as f64, kp.y() as f64]);
-            points3d.push([
-                point.xyz[0] as f64,
-                point.xyz[1] as f64,
-                point.xyz[2] as f64,
-            ]);
-            camera_idxs.push(camera_idx);
-            correspondences.push(GeneralizedFrameInlier {
-                image: query_image,
-                feature,
-                point_id,
-            });
+
+            for m in &pair.inlier_matches {
+                let (feature, other_feature) = if image_is_left {
+                    (m.query_idx as usize, m.train_idx as usize)
+                } else {
+                    (m.train_idx as usize, m.query_idx as usize)
+                };
+                let Some(point_id) = reconstruction
+                    .observations
+                    .get(other_image)
+                    .and_then(|obs| obs.get(other_feature))
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                if !seen.insert((query_image, feature, point_id)) {
+                    continue;
+                }
+                let Some(kp) = frames
+                    .get(query_image)
+                    .and_then(|frame| frame.keypoints.get(feature))
+                else {
+                    continue;
+                };
+                let Some(point) = reconstruction.points.get(point_id) else {
+                    continue;
+                };
+                points2d.push([kp.x() as f64, kp.y() as f64]);
+                points3d.push([
+                    point.xyz[0] as f64,
+                    point.xyz[1] as f64,
+                    point.xyz[2] as f64,
+                ]);
+                camera_idxs.push(camera_idx);
+                correspondences.push(GeneralizedFrameInlier {
+                    image: query_image,
+                    feature,
+                    point_id,
+                });
+            }
         }
     }
 
@@ -6711,6 +6887,7 @@ fn solve_structureless_absolute_pose(
     obs_manager: &ObservationManager,
     camera_priors: &[CameraModel],
     registration_stats: &RegistrationStats,
+    graph: Option<&CorrespondenceGraph>,
 ) -> Option<AbsolutePose> {
     if config.experimental_structureless_pair_pose_fallback {
         if let Some(abs_pose) = solve_experimental_structureless_pair_pose_fallback(
@@ -6735,6 +6912,7 @@ fn solve_structureless_absolute_pose(
         obs_manager,
         camera_priors,
         registration_stats,
+        graph,
     )
 }
 
@@ -6747,6 +6925,7 @@ fn solve_colmap_structureless_absolute_pose(
     obs_manager: &ObservationManager,
     camera_priors: &[CameraModel],
     registration_stats: &RegistrationStats,
+    graph: Option<&CorrespondenceGraph>,
 ) -> Option<AbsolutePose> {
     if registered_image_count(reconstruction) < 2 {
         return None;
@@ -6766,8 +6945,14 @@ fn solve_colmap_structureless_absolute_pose(
         return None;
     }
 
-    let problem =
-        collect_colmap_structureless_problem(image, frames, pairs, reconstruction, config);
+    let problem = collect_colmap_structureless_problem(
+        image,
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        graph,
+    );
     if problem.world_points2d.len() < min_num_inliers {
         return None;
     }
@@ -6835,6 +7020,7 @@ fn collect_colmap_structureless_problem(
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
     config: &MapperConfig,
+    graph: Option<&CorrespondenceGraph>,
 ) -> ColmapStructurelessProblem {
     let mut problem = ColmapStructurelessProblem {
         query_points2d: Vec::new(),
@@ -6846,45 +7032,36 @@ fn collect_colmap_structureless_problem(
     };
     let mut world_image_to_camera_idx = HashMap::new();
 
-    for pair in pairs {
-        let Some((other, image_is_left)) = structureless_pair_side(image, pair) else {
-            continue;
-        };
-        let Some(other_pose) = reconstruction.poses.get(other).copied().flatten() else {
-            continue;
-        };
-        let other_camera = reconstruction.camera_for_image(other);
-        if camera_has_bogus_params(other_camera, config) {
-            continue;
-        }
-
-        let world_camera_idx = if let Some(&camera_idx) = world_image_to_camera_idx.get(&other) {
-            camera_idx
-        } else {
-            let camera_idx = problem.world_cameras.len();
-            world_image_to_camera_idx.insert(other, camera_idx);
-            problem.world_cams_from_world.push(other_pose);
-            problem.world_cameras.push(other_camera);
-            camera_idx
-        };
-
-        for m in &pair.inlier_matches {
-            let (feature, other_feature) = if image_is_left {
-                (m.query_idx as usize, m.train_idx as usize)
-            } else {
-                (m.train_idx as usize, m.query_idx as usize)
+    let mut append_correspondence =
+        |other: usize, feature: usize, other_feature: usize, problem: &mut ColmapStructurelessProblem| {
+            let Some(other_pose) = reconstruction.poses.get(other).copied().flatten() else {
+                return;
             };
+            let other_camera = reconstruction.camera_for_image(other);
+            if camera_has_bogus_params(other_camera, config) {
+                return;
+            }
             let Some(query_kp) = frames
                 .get(image)
                 .and_then(|frame| frame.keypoints.get(feature))
             else {
-                continue;
+                return;
             };
             let Some(world_kp) = frames
                 .get(other)
                 .and_then(|frame| frame.keypoints.get(other_feature))
             else {
-                continue;
+                return;
+            };
+            let world_camera_idx = if let Some(&camera_idx) = world_image_to_camera_idx.get(&other)
+            {
+                camera_idx
+            } else {
+                let camera_idx = problem.world_cameras.len();
+                world_image_to_camera_idx.insert(other, camera_idx);
+                problem.world_cams_from_world.push(other_pose);
+                problem.world_cameras.push(other_camera);
+                camera_idx
             };
             problem
                 .query_points2d
@@ -6899,6 +7076,39 @@ fn collect_colmap_structureless_problem(
                 other,
                 other_feature,
             });
+        };
+
+    if let Some(graph) = graph {
+        let num_features = frames
+            .get(image)
+            .map(|frame| frame.keypoints.len())
+            .unwrap_or(0);
+        for feature in 0..num_features {
+            let Ok(corrs) = graph.find_correspondences(image as u32, feature as u32) else {
+                continue;
+            };
+            for corr in corrs {
+                append_correspondence(
+                    corr.image_id as usize,
+                    feature,
+                    corr.point2d_idx as usize,
+                    &mut problem,
+                );
+            }
+        }
+    } else {
+        for pair in pairs {
+            let Some((other, image_is_left)) = structureless_pair_side(image, pair) else {
+                continue;
+            };
+            for m in &pair.inlier_matches {
+                let (feature, other_feature) = if image_is_left {
+                    (m.query_idx as usize, m.train_idx as usize)
+                } else {
+                    (m.train_idx as usize, m.query_idx as usize)
+                };
+                append_correspondence(other, feature, other_feature, &mut problem);
+            }
         }
     }
 
@@ -7542,26 +7752,79 @@ struct AbsolutePoseObservation {
     xyz: [f32; 3],
 }
 
-fn solve_absolute_pose(
+fn collect_absolute_pose_observations(
     image: usize,
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
     config: &MapperConfig,
-    camera_priors: &[CameraModel],
-    camera_has_prior_focal_length: &[bool],
-    registration_stats: &RegistrationStats,
-) -> Option<AbsolutePose> {
-    let camera = registration_camera_for_image(
-        image,
-        reconstruction,
-        config,
-        camera_priors,
-        registration_stats,
-    );
-    if camera_has_bogus_params(camera, config) {
-        return None;
+    graph: Option<&CorrespondenceGraph>,
+) -> Vec<AbsolutePoseObservation> {
+    if let Some(graph) = graph {
+        collect_absolute_pose_observations_from_graph(image, frames, reconstruction, config, graph)
+    } else {
+        collect_absolute_pose_observations_from_pairs(image, frames, pairs, reconstruction, config)
     }
+}
+
+fn collect_absolute_pose_observations_from_graph(
+    image: usize,
+    frames: &[ImageFrame],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    graph: &CorrespondenceGraph,
+) -> Vec<AbsolutePoseObservation> {
+    let mut pose_observations = Vec::new();
+    let mut used_features = HashSet::new();
+    let mut used_points = HashSet::new();
+    let num_features = frames
+        .get(image)
+        .map(|frame| frame.keypoints.len())
+        .unwrap_or(0);
+    for feature in 0..num_features {
+        let Ok(corrs) = graph.find_correspondences(image as u32, feature as u32) else {
+            continue;
+        };
+        for corr in corrs {
+            let other = corr.image_id as usize;
+            let other_feature = corr.point2d_idx as usize;
+            if reconstruction.poses.get(other).copied().flatten().is_none() {
+                continue;
+            }
+            if camera_has_bogus_params(reconstruction.camera_for_image(other), config) {
+                continue;
+            }
+            let Some(point_id) = reconstruction
+                .observations
+                .get(other)
+                .and_then(|obs| obs.get(other_feature))
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            if !used_features.insert(feature) || !used_points.insert(point_id) {
+                continue;
+            }
+            let kp = &frames[image].keypoints[feature];
+            pose_observations.push(AbsolutePoseObservation {
+                feature,
+                xy: [kp.x(), kp.y()],
+                xyz: reconstruction.points[point_id].xyz,
+            });
+            break;
+        }
+    }
+    pose_observations
+}
+
+fn collect_absolute_pose_observations_from_pairs(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> Vec<AbsolutePoseObservation> {
     let mut pose_observations = Vec::new();
     let mut used_features = HashSet::new();
     let mut used_points = HashSet::new();
@@ -7598,11 +7861,45 @@ fn solve_absolute_pose(
                 continue;
             }
             let kp = &frames[image].keypoints[feature];
-            let xy = [kp.x(), kp.y()];
-            let xyz = reconstruction.points[point_id].xyz;
-            pose_observations.push(AbsolutePoseObservation { feature, xy, xyz });
+            pose_observations.push(AbsolutePoseObservation {
+                feature,
+                xy: [kp.x(), kp.y()],
+                xyz: reconstruction.points[point_id].xyz,
+            });
         }
     }
+    pose_observations
+}
+
+fn solve_absolute_pose(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
+    graph: Option<&CorrespondenceGraph>,
+) -> Option<AbsolutePose> {
+    let camera = registration_camera_for_image(
+        image,
+        reconstruction,
+        config,
+        camera_priors,
+        registration_stats,
+    );
+    if camera_has_bogus_params(camera, config) {
+        return None;
+    }
+    let pose_observations = collect_absolute_pose_observations(
+        image,
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        graph,
+    );
     let num_correspondences = pose_observations.len();
     if num_correspondences < config.abs_pose_min_num_inliers.max(4) {
         return None;
@@ -11474,6 +11771,7 @@ mod tests {
             &[pair],
             &reconstruction,
             &[0; 3],
+            &[0; 3],
             &HashSet::new(),
             &config,
             &camera_priors(&reconstruction),
@@ -11714,6 +12012,7 @@ mod tests {
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
             &registration_stats(&reconstruction),
+            None,
         )
         .is_none());
     }
@@ -11742,6 +12041,7 @@ mod tests {
             &camera_priors(&reconstruction),
             &camera_prior_focal_flags(&reconstruction, true),
             &registration_stats(&reconstruction),
+            None,
         )
         .is_none());
     }
@@ -11820,6 +12120,7 @@ mod tests {
             &frames,
             &[pair],
             &reconstruction,
+            &[0; 2],
             &[0; 2],
             &HashSet::new(),
             &config,
@@ -11980,6 +12281,7 @@ mod tests {
             &frames,
             &pairs,
             &reconstruction,
+            &[0; 3],
             &[0; 3],
             &HashSet::new(),
             &config,
@@ -12406,6 +12708,7 @@ mod tests {
             &pairs,
             &reconstruction,
             &[0; 4],
+            &[0; 4],
             &HashSet::new(),
             &config,
             &camera_priors(&reconstruction),
@@ -12413,7 +12716,16 @@ mod tests {
             &registration_stats(&reconstruction),
         );
 
-        assert!(choice.is_none());
+        if cfg!(feature = "poselib") {
+            let choice = choice.expect(
+                "COLMAP structureless should register via correspondence graph + PoseLib",
+            );
+            assert_eq!(choice.image, 1);
+            assert_eq!(choice.source, "structureless");
+            assert!(!config.experimental_structureless_pair_pose_fallback);
+        } else {
+            assert!(choice.is_none());
+        }
     }
 
     #[test]
@@ -12436,6 +12748,7 @@ mod tests {
             &frames,
             &pairs,
             &reconstruction,
+            &[0; 4],
             &[0; 4],
             &HashSet::new(),
             &config,
@@ -12512,6 +12825,7 @@ mod tests {
             &frames,
             &[pair_a, pair_b],
             &reconstruction,
+            &[0; 3],
             &[0; 3],
             &HashSet::new(),
             &config,
@@ -12654,6 +12968,7 @@ mod tests {
             &pairs,
             &reconstruction,
             &[0; 3],
+            &[0; 3],
             &HashSet::new(),
             &config,
             &camera_priors(&reconstruction),
@@ -12680,6 +12995,7 @@ mod tests {
             &frames,
             &pairs,
             &reconstruction,
+            &[0; 3],
             &[0; 3],
             &HashSet::new(),
             &config,
@@ -12719,6 +13035,7 @@ mod tests {
             &frames,
             &pairs,
             &reconstruction,
+            &[0; 4],
             &[0; 4],
             &HashSet::new(),
             &config,
@@ -12798,6 +13115,57 @@ mod tests {
         assert_eq!(
             registration_unit_num_trials(&reconstruction, 2, &reg_trials),
             3
+        );
+    }
+
+    #[test]
+    fn structureless_registration_trials_are_tracked_separately() {
+        let frames = vec![
+            minimal_frame(0, "provider.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let reconstruction = test_reconstruction(&frames);
+        let mut reg_trials = vec![0; 2];
+        let mut structureless_reg_trials = vec![0; 2];
+
+        increment_registration_unit_trials_for_mode(
+            &reconstruction,
+            1,
+            NextImageRegistrationMode::StructureBased,
+            &mut reg_trials,
+            &mut structureless_reg_trials,
+        );
+        assert_eq!(reg_trials, vec![0, 1]);
+        assert_eq!(structureless_reg_trials, vec![0, 0]);
+
+        increment_registration_unit_trials_for_mode(
+            &reconstruction,
+            1,
+            NextImageRegistrationMode::StructureLess,
+            &mut reg_trials,
+            &mut structureless_reg_trials,
+        );
+        assert_eq!(reg_trials, vec![0, 1]);
+        assert_eq!(structureless_reg_trials, vec![0, 1]);
+        assert_eq!(
+            registration_unit_num_trials_for_mode(
+                &reconstruction,
+                1,
+                &reg_trials,
+                &structureless_reg_trials,
+                NextImageRegistrationMode::StructureBased,
+            ),
+            1
+        );
+        assert_eq!(
+            registration_unit_num_trials_for_mode(
+                &reconstruction,
+                1,
+                &reg_trials,
+                &structureless_reg_trials,
+                NextImageRegistrationMode::StructureLess,
+            ),
+            1
         );
     }
 
@@ -15105,6 +15473,7 @@ mod tests {
         let ranked = find_next_registration_images(
             &reconstruction,
             &reg_trials,
+            &reg_trials,
             &filtered_units,
             &config,
             &obs_manager,
@@ -15162,6 +15531,7 @@ mod tests {
 
         let ranked = find_next_registration_images(
             &reconstruction,
+            &[0; 3],
             &[0; 3],
             &HashSet::new(),
             &config,
@@ -15249,6 +15619,7 @@ mod tests {
             &[high_score_pair.clone(), lower_score_pair.clone()],
             &reconstruction,
             &[0; 3],
+            &[0; 3],
             &HashSet::new(),
             &config,
             &camera_priors(&reconstruction),
@@ -15264,6 +15635,7 @@ mod tests {
             &frames,
             &[high_score_pair, lower_score_pair],
             &reconstruction,
+            &[0; 3],
             &[0; 3],
             &filtered_units,
             &config,
@@ -15352,6 +15724,7 @@ mod tests {
             &[bad_pair, good_pair],
             &reconstruction,
             &[0; 3],
+            &[0; 3],
             &HashSet::new(),
             &config,
             &camera_priors(&reconstruction),
@@ -15360,7 +15733,7 @@ mod tests {
             &obs_manager,
         );
 
-        assert_eq!(selection.failed_images, vec![1]);
+        assert_eq!(selection.failed_attempts, vec![(1, NextImageRegistrationMode::StructureBased)]);
         let choice = selection
             .choice
             .expect("second queue candidate should register");

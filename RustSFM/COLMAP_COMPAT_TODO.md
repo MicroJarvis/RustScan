@@ -534,6 +534,11 @@ reconstruction parity.
      PnP inliers, visible-points ratio, and image coverage score.
    - Remaining work: exact uncertainty score and COLMAP's registration queue
      ordering.
+   - **Update 2026-06-20:** `FindNextImages` now uses separate
+     `structureless_reg_trials` (COLMAP `num_structure_less_reg_trials`), ranks
+     rig frames with max sibling `MinUncertainty` score, and collects PnP/GP3P/
+     structureless correspondences from the embedded `CorrespondenceGraph` when
+     available (not only verified pair inliers).
 14. [partial] Port absolute pose estimation and refinement, including focal/extra
     parameter estimation, bogus camera reset, RANSAC scheduling, and
     generalized absolute pose for rigs.
@@ -651,6 +656,11 @@ reconstruction parity.
      participate like COLMAP correspondences.
    - `EstimateStructureLessAbsolutePose` now reuses the generalized
      relative-pose GR6P/GR8P path for non-panoramic world rigs.
+   - **Update 2026-06-20:** structure-less 2D-2D correspondences are now
+     collected from the embedded `CorrespondenceGraph` (via
+     `ObservationManager`) when available, not only from verified pair inlier
+     matches; poselib builds exercise this COLMAP path without the experimental
+     pair-pose fallback flag.
    - Remaining work: finish exact control-flow/random sampler semantics and
      the official absolute-pose camera reset/refinement schedule around
      registered non-trivial rigs.

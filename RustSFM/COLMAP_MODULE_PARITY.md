@@ -8,9 +8,9 @@ evidence that all relevant COLMAP behavior is implemented and covered by parity
 tests.
 
 Last re-evaluated: 2026-06-20, with `cargo test -p rustsfm --lib`
-passing 303 tests (Ceres BA enabled by default via `ceres-ba` feature),
-`cargo test -p rustsfm --features poselib --lib` passing 308 tests, and
-`cargo test -p rustsfm --no-default-features --lib` passing 300 tests (native
+passing 304 tests (Ceres BA enabled by default via `ceres-ba` feature),
+`cargo test -p rustsfm --features poselib --lib` passing 309 tests, and
+`cargo test -p rustsfm --no-default-features --lib` passing 301 tests (native
 BA only). Ceres BA (`ceres_problem.rs`) now supports rig/frame/sensor pose
 blocks, intrinsics refinement, and gauge policies, and reuses native analytic
 reprojection Jacobians in the Ceres cost callback (numeric fallback retained).
@@ -55,7 +55,7 @@ graph behavior.
 | P2 | `geometry` triangulation primitives | `triangulation.rs` | 100% | Yes | Faithful port of COLMAP `geometry/triangulation.{h,cc}`: `TriangulatePoint` (two-view DLT via SVD), `TriangulateMidPoint` (with cheirality guard), `TriangulateMultiViewPoint` (smallest-eigenvector DLT), `TriangulateOptimalPoint` (Lindstrom optimal correction using `EssentialMatrixFromPose` + `FindOptimalImageObservations` from `essential_matrix.cc`), and `CalculateTriangulationAngle(s)` / `CalculateAngleBetweenVectors`, all in `f64` to match COLMAP's `double`. Covered by synthetic recovery/consistency tests, and wired as the shared backend for `two_view.rs` two-view DLT and `incremental_triangulator.rs` multi-view track triangulation. This 100% mark is for the triangulation primitive boundary; the `estimators/triangulation.cc` RANSAC `EstimateTriangulation` wrapper is tracked separately under P4. |
 | P2 | `optim` RANSAC/LORANSAC | `two_view.rs`, `mapper.rs`, `generalized_pose.rs`, `RustSLAM/src/colmap_rng.rs` | 62% | No | Sampling shape, support ordering, dynamic stopping, MT19937, without-replacement trial counts, and E/F/H local refit are aligned for covered paths. A shared COLMAP-compatible MT19937 + libc++ `uniform_int_distribution` fixed-seed sampler now backs PnP/essential/two-view/generalized paths across crates. COLMAP's full sampler family, SPRT/progressive behavior, parallel random seeding, and bit-level LORANSAC behavior are not complete. |
 | P2/P3 | Absolute/generalized pose solvers | `mapper.rs`, `generalized_pose.rs`, `geometry.rs` | 63% | No | Central absolute-pose paths are COLMAP/PoseLib-shaped for covered mapper cases, including P3P/EPNP/unknown-focal scheduling and inlier-only refinement. Generalized relative/absolute pose input preparation and scoring exist, and the GR6P/GR8P/GP3P solver paths now build and pass tests under the optional `poselib` feature (vendored `third_party/PoseLib`). Exact RANSAC/LORANSAC parity, covariance, Ceres-equivalent refinement, and full camera reset/refinement scheduling remain missing. |
-| P3 | `sfm` incremental mapper state machine | `mapper.rs`, `parity.rs` | 71% | No | Database-first flow, COLMAP-style initial-image/second-image ordering, initial-pair gates, initialization trials/relaxation, bad-initial-pair retry, first multi-model keep/discard behavior, current-submodel overlap accounting, snapshot-frequency sparse exports, COLMAP-style per-registration and final all-image `extract_colors` behavior, callback timing for initial/next/last registration events, reference sparse-model seed continuation without initial-pair reselection, covered reconstruction-manager index-0 continuation semantics, covered `fix_existing_frames` behavior for local/global BA and registered-frame filtering including non-trivial rig-frame sparse fixtures, registration rollback, BA scheduling hooks, structure-less boundaries, COLMAP-shaped `FindNextImages` two-bucket candidate queue/ranking, failed-candidate continuation and trial recording for the covered next-image path, frame-aware trial gating, and 20-frame registered-frame filtering are implemented for covered paths. Official COLMAP-output / real-dataset rig-frame continuation fixtures, exact generalized-rig retry/reset semantics, and Ceres-equivalent solver summaries remain partial. |
+| P3 | `sfm` incremental mapper state machine | `mapper.rs`, `parity.rs` | **~85%** ↑ | No | Database-first flow, COLMAP-style initial/next-image ordering, initialization trials/relaxation, multi-model control, snapshots, color extraction, callbacks, reference-model continuation, `fix_existing_frames`, registration rollback, structure-based/structure-less two-bucket **`FindNextImages`** queue with **separate `structureless_reg_trials`**, **`CorrespondenceGraph`-based 2D-3D/2D-2D registration collection** (PnP/GP3P/structureless), and rig **`MinUncertainty` max-sibling scoring. Remaining: parallel initial-pair probing, full controller API, real-dataset rig continuation fixtures, generalized rig camera reset/refinement schedule parity. |
 | P3/P6 | `sfm` global mapper / rotation averaging / pose graph | `pose_graph.rs`, `mapper.rs` | 12% | No | `pose_graph.rs` is a RustSFM-specific pose-graph initializer with rotation/translation averaging heuristics and periodic-scene regularization. It is not yet a COLMAP `GlobalMapper` reproduction. COLMAP's global mapper orchestration, pose graph ownership, track establishment, rotation averaging pipeline, global positioning, iterative BA/retriangulation stages, options, and tests are largely missing. |
 | P4 | `sfm` observation management | `observation_manager.rs`, `visibility_pyramid.rs`, `mapper.rs` | 100% | Yes | COLMAP-style **`ObservationManager`** with embedded **`CorrespondenceGraph`**, incremental **`SetObservationAsTriangulated`** / **`ResetTriObservations`**, **`IncrementCorrespondenceHasPoint3D`** / **`DecrementCorrespondenceHasPoint3D`**, register/deregister visible-correspondence propagation, add/delete/merge point3D ownership, 6-level **`VisibilityPyramid`** (`SetPoint`/`ResetPoint`), modified-point tracking, and frame/rig register/deregister hooks. Session-scoped state lives in **`IncrementalTriangulatorState`**. Covered by incremental-vs-rebuild stat parity tests. |
 | P4 | `sfm` triangulation and filtering | `incremental_triangulator.rs`, `mapper.rs`, `geometry.rs`, `triangulation.rs`, `triangulation_estimator.rs`, `correspondence_graph.rs` | 100% | Yes | **`TriangulateImage`** per point2D (`Find`/`Continue`/`Create`) and **`CompleteImage`** per point2D (complete existing tracks + create orphan clusters with reprojection RANSAC) use **`CorrespondenceGraph::extract_transitive_correspondences`**. **`Complete`** uses direct-graph BFS with squared reprojection gating. Session-scoped trial counters persist. **`EstimateTriangulation`** wires **`random_seed`** + COLMAP MT19937 combination shuffle when view count exceeds 15. Covered by triangulation/complete-image and seeded-sampler tests. |
@@ -100,9 +100,10 @@ The official COLMAP source tree is organized roughly as follows:
   BA orchestration all have partial implementations.
 - The PoseLib solver bridge now builds. PoseLib v2.0.5 is vendored under
   `third_party/PoseLib` and `build.rs` resolves it automatically, so the
-  `--features poselib` GR6P/GR8P/GP3P paths are test-verified (280 tests). The
-  default build still excludes PoseLib, so generalized rig solver claims remain
-  optional-but-buildable rather than default-on parity.
+  `--features poselib` GR6P/GR8P/GP3P paths are test-verified (309 tests).
+  PoseLib remains an optional feature (not in default build), but when enabled
+  COLMAP structureless registration is active via `cfg!(feature = "poselib")`
+  without requiring the experimental pair-pose fallback flag.
 - The highest-confidence completed areas are file/database compatibility
   boundaries, not numerical reconstruction behavior. Mapper, solver, and BA
   percentages should stay conservative until they are backed by COLMAP parity
@@ -151,27 +152,24 @@ as complete for now:
 
 ## Highest-Priority Replication Targets (ROI-ordered, 2026-06-20 PM)
 
-1. Bundle adjustment / Ceres layer (`P5`, ~47%) — largest numerical-parity
+1. Bundle adjustment / Ceres layer (`P5`, ~72%) — largest numerical-parity
    bottleneck; caps final reconstruction accuracy.
    - Done: Ceres robust loss family (Trivial/Huber/SoftL1/Cauchy) with COLMAP's
-     Cauchy default, and a Cholesky reduced-camera-matrix solve (LU fallback)
-     matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers.
-   - Next: switch LM damping from `mu*I` to Ceres' jacobian-scaled
-     `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` together with Ceres' radius-based
-     trust-region update (needed so weakly-constrained rig poses stay robust;
-     a naive switch under the current `damping*=10` recovery regressed the
-     generalized-rig refinement test).
-   - Then: true sparse Schur storage, covariance, normalization, and exact
-     Ceres solver summaries.
-2. `sfm` triangulation + observation management lifecycle (`P4`, ~88% / ~65%)
-   - Done: long-lived state + **`TriangulateImage`** + **`CompleteImage`** per-point2D
-     paths, COLMAP **`Complete`** BFS with squared reprojection error, mapper wiring.
-   - Next: observation-manager event/counter parity and exact RANSAC sampler/RNG
-     in `optim`.
-3. `sfm` incremental mapper (`P3`, ~71%)
-   - Official COLMAP-output / real-dataset rig-frame continuation fixtures.
-   - Exact initial-image and next-image priority queues.
-   - Registration retry/reset semantics around generalized rig registration.
+     Cauchy default; Cholesky reduced-camera-matrix solve (LU fallback)
+     matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers; `ba/` split
+     with Ceres default path, rig/frame/sensor/intrinsics blocks, gauges, and
+     analytic Jacobians reused from native projection code.
+   - Next: quaternion manifold parameterization, jacobian-scaled LM damping /
+     Ceres trust-region update, true sparse Schur storage, covariance,
+     normalization, and exact Ceres solver summaries.
+2. `sfm` triangulation + observation management lifecycle (`P4`, 100%)
+   - Done: **`ObservationManager`** incremental event paths,
+     **`VisibilityPyramid`**, **`TriangulateImage`** / **`CompleteImage`**
+     per-point2D paths, COLMAP **`Complete`** BFS, **`EstimateTriangulation`**
+     seeded combination shuffle, mapper wiring.
+3. `sfm` incremental mapper (`P3`, ~85%)
+   - Done: separate structureless trial counters, correspondence-graph registration collection.
+   - Next: parallel initial-pair probing, real-dataset rig continuation fixtures, generalized rig camera scheduling.
 4. `estimators`/`geometry` two-view geometry on the PoseLib bridge (`P2`, ~80%)
    - Finish COLMAP's exact `CALIBRATED_RIG` LORANSAC behavior now that the
      PoseLib GR6P/GR8P/GP3P bridge builds.
@@ -186,5 +184,6 @@ as complete for now:
 ## Next Implementation Choice
 
 Starting with the highest-ROI target: P5 Bundle Adjustment toward
-Ceres-equivalent behavior. P4's next slice is **`CompleteImage`** per-point2D
-iteration and observation-manager event/counter parity.
+Ceres-equivalent behavior (trust-region damping, sparse Schur, solver summary
+parity). P3's next slice is parallel initial-pair probing and generalized rig
+camera reset/refinement scheduling.
