@@ -109,6 +109,7 @@ pub struct PairEstimationOptions {
     pub use_hartley_refinement: bool,
     pub use_five_point: bool,
     pub refine_sampson: bool,
+    pub ransac_random_seed: i32,
 }
 
 impl Default for PairEstimationOptions {
@@ -118,6 +119,7 @@ impl Default for PairEstimationOptions {
             use_hartley_refinement: true,
             use_five_point: true,
             refine_sampson: true,
+            ransac_random_seed: -1,
         }
     }
 }
@@ -214,6 +216,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
             ransac_min_inlier_ratio: 0.25,
             ransac_min_iterations: 100,
             ransac_max_iterations: essential_iterations,
+            ransac_random_seed: options.ransac_random_seed,
             random_seed: ((left_idx as u64) << 32) ^ right_idx as u64 ^ 0x243f_6a88_85a3_08d3,
             loransac_num_lo_steps: 6,
             min_inliers,
@@ -859,4 +862,14 @@ pub fn mean_pair_reprojection_error_with_cameras(
 ) -> f32 {
     0.5 * (reprojection_error_px(point, left_pose, left_xy, left_camera)
         + reprojection_error_px(point, right_pose, right_xy, right_camera))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_estimation_options_default_to_colmap_nondeterministic_seed() {
+        assert_eq!(PairEstimationOptions::default().ransac_random_seed, -1);
+    }
 }

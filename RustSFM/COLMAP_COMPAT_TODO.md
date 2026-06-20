@@ -395,6 +395,10 @@ reconstruction parity.
       `TwoViewGeometryOptions` `ransac_options.min_num_trials = 100` floor,
       clamped to the configured maximum trial budget, so high-support samples
       cannot collapse the loop below COLMAP's default minimum trial count.
+      Two-view pair estimation now accepts and propagates COLMAP's signed
+      `RANSACOptions::random_seed` semantics from the mapper config: `-1`
+      keeps the default non-fixed sampling behavior, while non-negative seeds
+      use a reproducible fixed sampler seed for the covered E/F/H paths.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.

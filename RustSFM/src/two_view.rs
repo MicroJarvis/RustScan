@@ -4,6 +4,7 @@ use crate::types::CameraModel;
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
 use rustslam::{ColmapRandomSampler, ColmapRansacOptions, SE3};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct TwoViewOptions {
@@ -12,6 +13,7 @@ pub struct TwoViewOptions {
     pub ransac_min_inlier_ratio: f64,
     pub ransac_min_iterations: u32,
     pub ransac_max_iterations: u32,
+    pub ransac_random_seed: i32,
     pub random_seed: u64,
     pub loransac_num_lo_steps: usize,
     pub min_inliers: usize,
@@ -63,6 +65,8 @@ struct PoseCandidateScore {
     mean_reprojection_error_px: f32,
     median_angle_deg: f64,
 }
+
+static TWO_VIEW_RANSAC_SEED: AtomicU64 = AtomicU64::new(1);
 
 pub fn estimate_calibrated_two_view(
     pts1: &[[f32; 2]],
@@ -169,8 +173,9 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         active_indices.clone()
     };
 
+    let sampler_seed = two_view_sampler_seed(options);
     let mut sampler = ColmapRandomSampler::new(
-        options.random_seed ^ 0x9e37_79b9_7f4a_7c15 ^ n as u64,
+        sampler_seed ^ 0x9e37_79b9_7f4a_7c15 ^ n as u64,
         &active_indices,
     );
     let essential_sample_size = if options.use_five_point { 5 } else { 8 };
@@ -284,7 +289,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         &img_pts2,
         &active_indices,
         two_view_ransac_options(options.ransac_max_error_px, options, 7)?,
-        options.random_seed,
+        sampler_seed,
         options.loransac_num_lo_steps,
     );
     let h_support = estimate_homography_ransac(
@@ -292,7 +297,7 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
         &img_pts2,
         &active_indices,
         two_view_ransac_options(options.ransac_max_error_px, options, 4)?,
-        options.random_seed,
+        sampler_seed,
         options.loransac_num_lo_steps,
     );
     let Some((mut two_view_config, selected_mask, selected_inliers)) = classify_calibrated_two_view(
@@ -420,7 +425,7 @@ fn estimate_force_h_two_view(
         img_pts2,
         active_indices,
         two_view_ransac_options(options.ransac_max_error_px, options, 4)?,
-        options.random_seed,
+        two_view_sampler_seed(options),
         options.loransac_num_lo_steps,
     )?;
     if h_support.inliers < options.min_inliers {
@@ -906,10 +911,23 @@ fn two_view_ransac_options(
         confidence: 0.999,
         min_num_trials,
         max_num_trials,
+        random_seed: options.ransac_random_seed,
         ..ColmapRansacOptions::default()
     }
     .with_initial_max_num_trials(sample_size)
     .ok()
+}
+
+fn two_view_sampler_seed(options: &TwoViewOptions) -> u64 {
+    if options.ransac_random_seed >= 0 {
+        options.ransac_random_seed as u64
+    } else {
+        options.random_seed ^ next_two_view_ransac_seed()
+    }
+}
+
+fn next_two_view_ransac_seed() -> u64 {
+    TWO_VIEW_RANSAC_SEED.fetch_add(1, Ordering::Relaxed)
 }
 
 fn rays_to_pixel_like_observations(rays: &[[f64; 3]], n: usize) -> Vec<[f32; 2]> {
@@ -2453,6 +2471,7 @@ mod tests {
             ransac_min_inlier_ratio: 0.25,
             ransac_min_iterations: 100,
             ransac_max_iterations: 128,
+            ransac_random_seed: -1,
             random_seed: 42,
             loransac_num_lo_steps: 6,
             min_inliers: 15,
@@ -2530,6 +2549,7 @@ mod tests {
         assert_eq!(essential_options.min_inlier_ratio, 0.25);
         assert_eq!(essential_options.min_num_trials, 100);
         assert_eq!(essential_options.max_num_trials, 128);
+        assert_eq!(essential_options.random_seed, -1);
 
         let mut full_budget_options = options.clone();
         full_budget_options.ransac_max_iterations = 10_000;
@@ -2556,6 +2576,35 @@ mod tests {
         let tiny = two_view_ransac_options(0.01, &tiny_budget_options, 5).unwrap();
         assert_eq!(tiny.min_num_trials, 50);
         assert_eq!(tiny.max_num_trials, 50);
+    }
+
+    #[test]
+    fn two_view_ransac_options_preserve_colmap_signed_seed() {
+        let mut options = default_test_options();
+        options.ransac_random_seed = 17;
+
+        let ransac_options = two_view_ransac_options(0.01, &options, 5).unwrap();
+
+        assert_eq!(ransac_options.random_seed, 17);
+    }
+
+    #[test]
+    fn two_view_sampler_seed_honors_fixed_colmap_seed() {
+        let mut options = default_test_options();
+        options.ransac_random_seed = 23;
+
+        assert_eq!(two_view_sampler_seed(&options), 23);
+        assert_eq!(two_view_sampler_seed(&options), 23);
+    }
+
+    #[test]
+    fn two_view_sampler_seed_changes_for_colmap_default_seed() {
+        let options = default_test_options();
+
+        let first = two_view_sampler_seed(&options);
+        let second = two_view_sampler_seed(&options);
+
+        assert_ne!(first, second);
     }
 
     #[test]
