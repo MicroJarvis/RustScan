@@ -19,7 +19,7 @@ use crate::triangulation::{
 };
 use crate::types::CameraModel;
 use nalgebra::{Matrix3, Matrix3x4, Vector2, Vector3};
-use rustslam::ColmapCombinationSampler;
+use rustslam::{colmap_ransac_num_trials, ColmapCombinationSampler};
 
 /// COLMAP `TriangulationEstimator::ResidualType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,35 +252,13 @@ fn compute_num_trials(
     confidence: f64,
     dyn_num_trials_multiplier: f64,
 ) -> usize {
-    let prob_failure = 1.0 - confidence;
-    if prob_failure <= 0.0 {
-        return usize::MAX;
-    }
-
-    if num_inliers < TriangulationEstimator::MIN_NUM_SAMPLES
-        || num_samples < TriangulationEstimator::MIN_NUM_SAMPLES
-    {
-        return usize::MAX;
-    }
-
-    let mut prob_inlier = 1.0;
-    for idx in 0..TriangulationEstimator::MIN_NUM_SAMPLES {
-        prob_inlier *= (num_inliers - idx) as f64 / (num_samples - idx) as f64;
-    }
-
-    let prob_outlier = 1.0 - prob_inlier;
-    if prob_outlier <= 0.0 {
-        return 1;
-    }
-    if prob_outlier == 1.0 {
-        return usize::MAX;
-    }
-
-    let num_trials = (prob_failure.ln() / prob_outlier.ln() * dyn_num_trials_multiplier).ceil();
-    if !num_trials.is_finite() {
-        return usize::MAX;
-    }
-    num_trials.max(1.0) as usize
+    colmap_ransac_num_trials(
+        num_inliers,
+        num_samples,
+        TriangulationEstimator::MIN_NUM_SAMPLES,
+        confidence,
+        dyn_num_trials_multiplier,
+    )
 }
 
 fn initial_max_num_trials(

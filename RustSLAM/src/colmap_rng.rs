@@ -171,6 +171,44 @@ pub fn n_choose_k(mut n: u64, k: u64) -> u64 {
     r
 }
 
+/// COLMAP `RANSAC::ComputeNumTrials` with an explicit minimal sample size.
+pub fn colmap_ransac_num_trials(
+    num_inliers: usize,
+    num_samples: usize,
+    min_num_samples: usize,
+    confidence: f64,
+    num_trials_multiplier: f64,
+) -> usize {
+    let prob_failure = 1.0 - confidence;
+    if prob_failure <= 0.0 {
+        return usize::MAX;
+    }
+
+    if num_samples < min_num_samples || num_inliers < min_num_samples {
+        return usize::MAX;
+    }
+
+    let mut prob_inlier = 1.0;
+    for i in 0..min_num_samples {
+        prob_inlier *= (num_inliers - i) as f64 / (num_samples - i) as f64;
+    }
+
+    let prob_outlier = 1.0 - prob_inlier;
+    if prob_outlier <= 0.0 {
+        return 1;
+    }
+    if prob_outlier == 1.0 {
+        return usize::MAX;
+    }
+
+    let trials = (prob_failure.ln() / prob_outlier.ln() * num_trials_multiplier).ceil();
+    if trials.is_finite() && trials > 0.0 {
+        trials as usize
+    } else {
+        usize::MAX
+    }
+}
+
 /// COLMAP `CombinationSampler`, which enumerates unique sorted combinations.
 #[derive(Debug, Clone)]
 pub struct ColmapCombinationSampler {
@@ -467,6 +505,31 @@ mod tests {
         assert_eq!(n_choose_k(500, 3), 20_708_500);
         assert_eq!(n_choose_k(500, 7), 1_486_071_034_734_000);
         assert_eq!(n_choose_k(10_000, 5), 832_500_291_625_002_000);
+    }
+
+    #[test]
+    fn colmap_ransac_num_trials_matches_official_examples() {
+        assert_eq!(colmap_ransac_num_trials(1, 100, 3, 0.99, 1.0), usize::MAX);
+        assert_eq!(colmap_ransac_num_trials(10, 100, 3, 0.99, 1.0), 6204);
+        assert_eq!(
+            colmap_ransac_num_trials(10, 100, 3, 0.999, 1.0),
+            9305
+        );
+        assert_eq!(
+            colmap_ransac_num_trials(10, 100, 3, 0.999, 2.0),
+            18610
+        );
+        assert_eq!(colmap_ransac_num_trials(50, 100, 3, 0.99, 1.0), 36);
+        assert_eq!(
+            colmap_ransac_num_trials(50, 100, 3, 0.999, 1.0),
+            54
+        );
+        assert_eq!(colmap_ransac_num_trials(100, 100, 3, 0.99, 1.0), 1);
+        assert_eq!(
+            colmap_ransac_num_trials(100, 100, 3, 0.999, 1.0),
+            1
+        );
+        assert_eq!(colmap_ransac_num_trials(100, 100, 3, 0.0, 1.0), 1);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! Implements PnP, Essential Matrix, Triangulation, and Sim3 solvers with proper algorithms.
 
-use crate::colmap_rng::{sample_unique_indices, ColmapMt19937};
+use crate::colmap_rng::{colmap_ransac_num_trials, sample_unique_indices, ColmapMt19937};
 use crate::core::SE3;
 use crate::features::base::Match;
 use glam::{Mat3, Vec3};
@@ -3458,36 +3458,17 @@ pub fn compute_ransac_num_trials(
     confidence: f32,
     num_trials_multiplier: f32,
 ) -> u32 {
-    if num_samples < sample_size || num_inliers < sample_size {
-        return u32::MAX;
-    }
-    let prob_failure = 1.0f64 - confidence as f64;
-    if prob_failure <= 0.0 {
-        return u32::MAX;
-    }
-
-    let mut prob_inlier = 1.0f64;
-    for i in 0..sample_size {
-        let denominator = num_samples - i;
-        if denominator == 0 || num_inliers < i {
-            return u32::MAX;
-        }
-        prob_inlier *= (num_inliers - i) as f64 / denominator as f64;
-    }
-
-    let prob_outlier = 1.0 - prob_inlier;
-    if prob_outlier <= 0.0 {
-        return 1;
-    }
-    if prob_outlier >= 1.0 {
-        return u32::MAX;
-    }
-
-    let trials = (prob_failure.ln() / prob_outlier.ln() * num_trials_multiplier as f64).ceil();
-    if !trials.is_finite() || trials >= u32::MAX as f64 {
+    let trials = colmap_ransac_num_trials(
+        num_inliers,
+        num_samples,
+        sample_size,
+        confidence as f64,
+        num_trials_multiplier as f64,
+    );
+    if trials >= u32::MAX as usize {
         u32::MAX
     } else {
-        trials.max(1.0) as u32
+        trials as u32
     }
 }
 

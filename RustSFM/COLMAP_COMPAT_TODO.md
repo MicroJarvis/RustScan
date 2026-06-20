@@ -361,6 +361,11 @@ reconstruction parity.
       constructor/`Initialize`/`MaxNumSamples`/`Sample` shape in addition to
       the existing RustSFM indexed-pool helper API, with official less-samples
       and equal-samples uniqueness tests plus oversized-initialize rejection.
+    - Shared `colmap_ransac_num_trials` now ports COLMAP
+      `RANSAC::ComputeNumTrials` with explicit minimal sample size and the full
+      official `ransac_test.cc` numeric examples. RustSLAM's PnP/essential
+      solver wrapper and RustSFM's triangulation estimator now use this shared
+      helper instead of separate local formulas.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
