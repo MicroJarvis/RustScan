@@ -825,9 +825,17 @@ reconstruction parity.
       Cholesky factorization and an LU fallback (`ba.rs::solve_linear_system`),
       matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers that rely on
       the damped reduced system being symmetric positive definite.
-    - Remaining work: switch LM damping from a fixed `mu*I` to Ceres'
-      jacobian-scaled `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with
-      Ceres' radius-based trust-region update (a naive switch under the current
+    - Added `ceres-ba` feature (`ceres-solver` 0.5 with bundled source build),
+      **enabled by default**. New module `ba_ceres.rs` implements Ceres-backed
+      BA; `refine_bundle_adjustment` always uses Ceres with **no fallback** to
+      the native solver. Unsupported configs return `None`. Native BA remains in
+      `ba.rs` for `--no-default-features` builds and native-specific unit tests.
+      Build native-only: `cargo test -p rustsfm --no-default-features --lib`.
+    - Remaining work: extend Ceres path to rig/sensor/intrinsics (needs
+      quaternion/manifold support in the Rust Ceres binding), switch native LM
+      damping from a fixed `mu*I` to Ceres' jacobian-scaled
+      `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with Ceres'
+      radius-based trust-region update (a naive switch under the current
       `damping*=10` recovery regressed the generalized-rig refinement test, so
       both must land together); then true sparse Schur storage, covariance,
       threading, and full backend solver-summary parity.

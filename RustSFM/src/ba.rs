@@ -235,6 +235,19 @@ pub fn refine_bundle_adjustment(
     reconstruction: &mut Reconstruction,
     options: BundleAdjustmentOptions,
 ) -> Option<BundleAdjustmentReport> {
+    #[cfg(feature = "ceres-ba")]
+    {
+        return crate::ba_ceres::refine_bundle_adjustment_ceres(frames, reconstruction, options);
+    }
+    #[cfg(not(feature = "ceres-ba"))]
+    refine_bundle_adjustment_native(frames, reconstruction, options)
+}
+
+pub(crate) fn refine_bundle_adjustment_native(
+    frames: &[ImageFrame],
+    reconstruction: &mut Reconstruction,
+    options: BundleAdjustmentOptions,
+) -> Option<BundleAdjustmentReport> {
     let point_filter = bundle_adjustment_point_filter(
         options.point_ids.as_deref(),
         options.constant_point_ids.as_deref(),
@@ -504,7 +517,7 @@ pub fn refine_bundle_adjustment(
     })
 }
 
-fn bundle_adjustment_point_filter(
+pub(crate) fn bundle_adjustment_point_filter(
     variable_points: Option<&[usize]>,
     constant_points: Option<&[usize]>,
 ) -> Option<HashSet<usize>> {
@@ -523,7 +536,7 @@ fn bundle_adjustment_point_filter(
     }
 }
 
-fn add_three_point_gauge(
+pub(crate) fn add_three_point_gauge(
     constant_point_filter: &mut HashSet<usize>,
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
@@ -653,10 +666,10 @@ fn point_effective_parameter_count(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BaObservation {
-    image: usize,
-    point: usize,
-    xy: [f64; 2],
+pub(crate) struct BaObservation {
+    pub(crate) image: usize,
+    pub(crate) point: usize,
+    pub(crate) xy: [f64; 2],
 }
 
 struct SchurSystem {
@@ -1070,7 +1083,7 @@ fn frame_registered_images_with_sensors(
     }
 }
 
-fn collect_observations(
+pub(crate) fn collect_observations(
     frames: &[ImageFrame],
     reconstruction: &Reconstruction,
     max_error_px: f64,
@@ -3194,7 +3207,7 @@ fn restore_state(
     reconstruction.cameras.clone_from_slice(cameras);
 }
 
-fn refresh_point_errors(frames: &[ImageFrame], reconstruction: &mut Reconstruction) {
+pub(crate) fn refresh_point_errors(frames: &[ImageFrame], reconstruction: &mut Reconstruction) {
     let image_cameras = (0..reconstruction.poses.len())
         .map(|image| reconstruction.camera_for_image(image))
         .collect::<Vec<_>>();
@@ -3923,7 +3936,7 @@ mod tests {
             reconstruction.point_ids.push(idx as u64 + 1);
         }
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -3961,7 +3974,7 @@ mod tests {
         } = sensor_ba_fixture();
         let initial_error = translation_distance(initial_sensor_from_rig, true_sensor_from_rig);
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -3993,7 +4006,7 @@ mod tests {
             ..
         } = sensor_ba_fixture();
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -4079,7 +4092,7 @@ mod tests {
             .map(|point| point.xyz)
             .collect::<Vec<_>>();
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -4246,7 +4259,7 @@ mod tests {
             reconstruction.point_ids.push(idx as u64 + 1);
         }
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -4338,7 +4351,7 @@ mod tests {
             reconstruction.point_ids.push(idx as u64 + 1);
         }
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -4422,7 +4435,7 @@ mod tests {
             reconstruction.point_ids.push(idx as u64 + 1);
         }
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -4508,7 +4521,7 @@ mod tests {
             reconstruction.point_ids.push(idx as u64 + 1);
         }
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {
@@ -4595,7 +4608,7 @@ mod tests {
             reconstruction.point_ids.push(idx as u64 + 1);
         }
 
-        let report = refine_bundle_adjustment(
+        let report = refine_bundle_adjustment_native(
             &frames,
             &mut reconstruction,
             BundleAdjustmentOptions {

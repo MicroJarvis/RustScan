@@ -5,10 +5,12 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = []
+default = ["ceres-ba"]
 poselib = []
+ceres-ba = ["dep:ceres-solver"]
 
 [dependencies]
+ceres-solver = { version = "0.5", optional = true, features = ["source"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
