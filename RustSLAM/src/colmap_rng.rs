@@ -209,6 +209,71 @@ pub fn colmap_ransac_num_trials(
     }
 }
 
+/// COLMAP `RANSACOptions` default surface and validation rules.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColmapRansacOptions {
+    pub max_error: f64,
+    pub min_inlier_ratio: f64,
+    pub confidence: f64,
+    pub dyn_num_trials_multiplier: f64,
+    pub min_num_trials: usize,
+    pub max_num_trials: usize,
+    pub random_seed: i32,
+    pub num_threads: isize,
+}
+
+impl Default for ColmapRansacOptions {
+    fn default() -> Self {
+        Self {
+            max_error: 0.0,
+            min_inlier_ratio: 0.1,
+            confidence: 0.99,
+            dyn_num_trials_multiplier: 3.0,
+            min_num_trials: 0,
+            max_num_trials: usize::MAX,
+            random_seed: -1,
+            num_threads: 1,
+        }
+    }
+}
+
+impl ColmapRansacOptions {
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.max_error <= 0.0 {
+            return Err("max_error must be positive");
+        }
+        if !(0.0..=1.0).contains(&self.min_inlier_ratio) {
+            return Err("min_inlier_ratio must be in [0, 1]");
+        }
+        if !(0.0..=1.0).contains(&self.confidence) {
+            return Err("confidence must be in [0, 1]");
+        }
+        if self.min_num_trials > self.max_num_trials {
+            return Err("min_num_trials must not exceed max_num_trials");
+        }
+        if self.random_seed < -1 {
+            return Err("random_seed must be >= -1");
+        }
+        if self.num_threads == 0 || self.num_threads < -1 {
+            return Err("num_threads must be -1 or positive");
+        }
+        Ok(())
+    }
+
+    pub fn initial_max_num_trials(&self, min_num_samples: usize) -> usize {
+        let assumed_samples = 100_000usize;
+        let assumed_inliers =
+            (self.min_inlier_ratio.clamp(0.0, 1.0) * assumed_samples as f64) as usize;
+        self.max_num_trials.min(colmap_ransac_num_trials(
+            assumed_inliers,
+            assumed_samples,
+            min_num_samples,
+            self.confidence,
+            self.dyn_num_trials_multiplier,
+        ))
+    }
+}
+
 /// COLMAP `CombinationSampler`, which enumerates unique sorted combinations.
 #[derive(Debug, Clone)]
 pub struct ColmapCombinationSampler {
@@ -530,6 +595,50 @@ mod tests {
             1
         );
         assert_eq!(colmap_ransac_num_trials(100, 100, 3, 0.0, 1.0), 1);
+    }
+
+    #[test]
+    fn colmap_ransac_options_match_official_defaults() {
+        let options = ColmapRansacOptions::default();
+        assert_eq!(options.max_error, 0.0);
+        assert_eq!(options.min_inlier_ratio, 0.1);
+        assert_eq!(options.confidence, 0.99);
+        assert_eq!(options.dyn_num_trials_multiplier, 3.0);
+        assert_eq!(options.min_num_trials, 0);
+        assert_eq!(options.max_num_trials, usize::MAX);
+        assert_eq!(options.random_seed, -1);
+        assert_eq!(options.num_threads, 1);
+    }
+
+    #[test]
+    fn colmap_ransac_options_check_matches_official_bounds() {
+        let mut options = ColmapRansacOptions {
+            max_error: 1.0,
+            ..ColmapRansacOptions::default()
+        };
+        assert!(options.check().is_ok());
+
+        options.max_error = 0.0;
+        assert!(options.check().is_err());
+        options.max_error = 1.0;
+        options.min_inlier_ratio = -1.0e-6;
+        assert!(options.check().is_err());
+        options.min_inlier_ratio = 0.1;
+        options.confidence = 1.0 + 1.0e-6;
+        assert!(options.check().is_err());
+        options.confidence = 0.99;
+        options.min_num_trials = 2;
+        options.max_num_trials = 1;
+        assert!(options.check().is_err());
+        options.min_num_trials = 0;
+        options.max_num_trials = usize::MAX;
+        options.random_seed = -2;
+        assert!(options.check().is_err());
+        options.random_seed = -1;
+        options.num_threads = 0;
+        assert!(options.check().is_err());
+        options.num_threads = -2;
+        assert!(options.check().is_err());
     }
 
     #[test]

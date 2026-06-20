@@ -5,7 +5,7 @@ use crate::types::Rigid3;
 use glam::Vec3;
 #[cfg(feature = "poselib")]
 use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler};
-use rustslam::SE3;
+use rustslam::{ColmapRansacOptions, SE3};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -23,15 +23,16 @@ pub struct RansacOptions {
 
 impl Default for RansacOptions {
     fn default() -> Self {
+        let options = ColmapRansacOptions::default();
         Self {
-            max_error: 0.0,
-            min_inlier_ratio: 0.1,
-            confidence: 0.99,
-            dyn_num_trials_multiplier: 3.0,
-            min_num_trials: 0,
-            max_num_trials: usize::MAX,
-            random_seed: -1,
-            num_threads: 1,
+            max_error: options.max_error,
+            min_inlier_ratio: options.min_inlier_ratio,
+            confidence: options.confidence,
+            dyn_num_trials_multiplier: options.dyn_num_trials_multiplier,
+            min_num_trials: options.min_num_trials,
+            max_num_trials: options.max_num_trials,
+            random_seed: options.random_seed,
+            num_threads: options.num_threads,
         }
     }
 }

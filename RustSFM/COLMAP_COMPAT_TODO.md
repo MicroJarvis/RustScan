@@ -367,6 +367,10 @@ reconstruction parity.
       solver wrapper plus RustSFM's two-view, triangulation-estimator, and
       generalized-pose RANSAC paths now use this shared helper instead of
       separate local formulas.
+    - Added shared `ColmapRansacOptions` with COLMAP's default surface and
+      validation bounds (`max_error`, inlier ratio, confidence,
+      min/max trials, random seed, and thread count). Generalized pose
+      RANSAC options now derive their defaults from the shared COLMAP surface.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
