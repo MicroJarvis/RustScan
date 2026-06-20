@@ -715,7 +715,8 @@ reconstruction parity.
      embedded `CorrespondenceGraph`, `SetObservationAsTriangulated` /
      `ResetTriObservations`, increment/decrement correspondence-has-point3D
      counters, register/deregister visible-correspondence propagation, and
-     6-level `VisibilityPyramid` incremental scoring (`visibility_pyramid.rs`).
+     6-level `VisibilityPyramid` incremental scoring (`visibility_pyramid.rs`)
+     with COLMAP's weighted `Score`, `MaxScore`, and metadata accessors.
      Session-scoped `IncrementalTriangulatorState` owns the manager+graph.
      Incremental-vs-rebuild stat parity tests pass.
 17. [done] Port `IncrementalTriangulator` create/continue/merge/complete/retriangulate
