@@ -7,9 +7,9 @@ claim of bit-for-bit parity. A module is only marked 100% when there is direct
 evidence that all relevant COLMAP behavior is implemented and covered by parity
 tests.
 
-Last re-evaluated: 2026-06-20 (night), with `cargo test -p rustsfm --lib`
-passing 292 tests and `cargo test -p rustsfm --features poselib --lib` passing
-297 tests. A new `geometry/triangulation` primitive module (`triangulation.rs`)
+Last re-evaluated: 2026-06-20 (late night), with `cargo test -p rustsfm --lib`
+passing 293 tests and `cargo test -p rustsfm --features poselib --lib` passing
+298 tests. A new `geometry/triangulation` primitive module (`triangulation.rs`)
 faithfully ports COLMAP's `geometry/triangulation.{h,cc}` (two-view DLT,
 midpoint, multi-view DLT, Lindstrom optimal triangulation, and triangulation
 angles), and is now the shared backend for two-view DLT (`two_view.rs`) and
@@ -19,6 +19,11 @@ multi-view track triangulation (`incremental_triangulator.rs`). A new
 + triangulation-angle gating and angular/reprojection residuals) and the
 `EstimateTriangulation` LORANSAC entry point (structurally faithful; exact
 RANSAC RNG/sampler-shuffle parity remains under the `optim` RANSAC item).
+`EstimateTriangulation` is now wired into the incremental triangulator's
+track-creation path (`IncrementalTriangulator::create_pair_track`), which
+gathers the seed pair plus transitively-corresponding registered observations
+(bounded by `max_transitivity`, COLMAP `Create`-style) and triangulates them in
+one robust multi-view step using angular residuals.
 PoseLib v2.0.5 is now vendored under `third_party/PoseLib` and the
 `poselib` feature builds and is test-verified locally, so GR6P/GR8P/GP3P solver
 paths are now optional-but-default-buildable rather than unbuildable. This pass
@@ -48,7 +53,7 @@ graph behavior.
 | P3 | `sfm` incremental mapper state machine | `mapper.rs`, `parity.rs` | 71% | No | Database-first flow, COLMAP-style initial-image/second-image ordering, initial-pair gates, initialization trials/relaxation, bad-initial-pair retry, first multi-model keep/discard behavior, current-submodel overlap accounting, snapshot-frequency sparse exports, COLMAP-style per-registration and final all-image `extract_colors` behavior, callback timing for initial/next/last registration events, reference sparse-model seed continuation without initial-pair reselection, covered reconstruction-manager index-0 continuation semantics, covered `fix_existing_frames` behavior for local/global BA and registered-frame filtering including non-trivial rig-frame sparse fixtures, registration rollback, BA scheduling hooks, structure-less boundaries, COLMAP-shaped `FindNextImages` two-bucket candidate queue/ranking, failed-candidate continuation and trial recording for the covered next-image path, frame-aware trial gating, and 20-frame registered-frame filtering are implemented for covered paths. Official COLMAP-output / real-dataset rig-frame continuation fixtures, exact generalized-rig retry/reset semantics, and Ceres-equivalent solver summaries remain partial. |
 | P3/P6 | `sfm` global mapper / rotation averaging / pose graph | `pose_graph.rs`, `mapper.rs` | 12% | No | `pose_graph.rs` is a RustSFM-specific pose-graph initializer with rotation/translation averaging heuristics and periodic-scene regularization. It is not yet a COLMAP `GlobalMapper` reproduction. COLMAP's global mapper orchestration, pose graph ownership, track establishment, rotation averaging pipeline, global positioning, iterative BA/retriangulation stages, options, and tests are largely missing. |
 | P4 | `sfm` observation management | `observation_manager.rs`, `mapper.rs` | 55% | No | Add/delete/merge ownership, visible correspondence stats, modified points, frame-aware hooks, and filtering-time deregistration event rollback exist. Long-lived mapper-owned manager semantics, every cleanup event path, and exact frame/rig counter behavior remain incomplete. |
-| P4 | `sfm` triangulation and filtering | `incremental_triangulator.rs`, `mapper.rs`, `geometry.rs`, `triangulation.rs`, `triangulation_estimator.rs` | 60% | No | Create/continue/merge/complete/retriangulate and filtering are partially reproduced, including COLMAP-style deregistration of registered frames with bogus cameras or zero point3D observations after the 20-frame threshold. Retriangulation now tracks a per-image-pair trial counter limited by `re_max_trials` (matching COLMAP's `re_num_trials_` map). Track point estimation uses the COLMAP-faithful multi-view DLT (`TriangulateMultiViewPoint`). The `estimators/triangulation.cc` `TriangulationEstimator` + `EstimateTriangulation` LORANSAC path is now ported (`triangulation_estimator.rs`) with faithful estimate/residual/cheirality/angle logic; exact RANSAC RNG/sampler-shuffle parity is still pending (tracked under `optim` RANSAC). Exact transitivity queues, official defaults, and a long-lived mapper-owned triangulator (the mapper currently rebuilds a triangulator per registration step, resetting merge/retriangulation trial state across steps) still differ. |
+| P4 | `sfm` triangulation and filtering | `incremental_triangulator.rs`, `mapper.rs`, `geometry.rs`, `triangulation.rs`, `triangulation_estimator.rs` | 64% | No | Create/continue/merge/complete/retriangulate and filtering are partially reproduced, including COLMAP-style deregistration of registered frames with bogus cameras or zero point3D observations after the 20-frame threshold. Retriangulation now tracks a per-image-pair trial counter limited by `re_max_trials` (matching COLMAP's `re_num_trials_` map). Track point estimation uses the COLMAP-faithful multi-view DLT (`TriangulateMultiViewPoint`). Track creation now runs the ported `estimators/triangulation` `EstimateTriangulation` LORANSAC path: `create_pair_track` gathers the seed pair plus transitively-corresponding registered observations (`max_transitivity`-bounded, COLMAP `Create`-style) and robustly triangulates them in one multi-view step with angular residuals + cheirality + `min_angle` gating, emitting a multi-view track from the inlier set (newly created points are left uncolored for the separate color-extraction stage). Exact RANSAC RNG/sampler-shuffle parity is still pending (tracked under `optim` RANSAC). Exact transitivity queues, official defaults, and a long-lived mapper-owned triangulator (the mapper currently rebuilds a triangulator per registration step, resetting merge/retriangulation trial state across steps) still differ. |
 | P5 | Bundle adjustment / `optim` Ceres layer | `ba.rs`, `mapper.rs` | 47% | No | Parameter block scheduling, analytic Jacobians, gauges, reports, convergence knobs, and a Ceres-equivalent robust loss family (Trivial/Huber/SoftL1/Cauchy with Ceres `rho(s)`/`rho'(s)` formulas, defaulting local/global mapper BA to COLMAP's Cauchy scale 1.0) are substantial. The reduced camera matrix (Schur complement) is now solved with a Cholesky factorization (LU fallback) like Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers. The backend remains a Rust hand-rolled LM implementation, not Ceres-equivalent; the LM damping is still a fixed `mu*I` rather than Ceres' jacobian-scaled `mu*clamp(diag(JᵀJ), min, max)` diagonal (a faithful switch needs Ceres' radius-based trust-region update to stay robust on weakly-constrained rig poses), and covariance, true sparse Schur storage, threading, and exact solver summaries are not COLMAP-complete. |
 | P5 | Local/global BA orchestration | `mapper.rs`, `ba.rs`, `observation_manager.rs` | 48% | No | Local/global BA scheduling, gauge handling, frame-aware options, post-registration constant-camera decisions, and post-BA filtering are partial. Exact image/point selection, robust losses, normalization, pose priors, covariance, and Ceres behavior remain incomplete. |
 | P6 | Controllers / end-to-end pipeline | `main.rs`, `mapper.rs`, `parity.rs` | 42% | No | RustSFM has a reconstruction entry point, reports, a first COLMAP-shaped multi-model pipeline slice, current-submodel overlap accounting, snapshot-frequency sparse exports, an `extract_colors` controller switch with per-registration and final all-image timing, COLMAP-shaped initial/next/last registration callback event boundaries in the pipeline log, and a lightweight public callback sink API exposed through `run_reconstruction_with_callbacks` with payload tests. It also has `fix_existing_frames` and reference-model continuation into the mapper with index-0 seed reuse only on the first continuation trial, including non-trivial rig-frame coverage through a COLMAP sparse-text fixture. Full controller-level orchestration, deterministic parallel initial-pair probing, and full parity harness are not complete. |
@@ -153,15 +158,17 @@ as complete for now:
      generalized-rig refinement test).
    - Then: true sparse Schur storage, covariance, normalization, and exact
      Ceres solver summaries.
-2. `sfm` triangulation + observation management lifecycle (`P4`, ~60% / ~55%)
+2. `sfm` triangulation + observation management lifecycle (`P4`, ~64% / ~55%)
    - Done: the `geometry/triangulation` primitive module is fully ported
      (`triangulation.rs`, 100%) and now backs two-view + multi-view track
      triangulation; the `estimators/triangulation` `TriangulationEstimator` +
      `EstimateTriangulation` LORANSAC path is ported (`triangulation_estimator.rs`,
-     pending only exact RANSAC RNG parity).
-   - Next: wire `estimate_triangulation` into the mapper/incremental triangulator
-     track-creation path (currently the mapper uses its own pairwise logic), and
-     finish exact RANSAC sampler/RNG parity in `optim`.
+     pending only exact RANSAC RNG parity) and is now wired into the incremental
+     triangulator's `create_pair_track` track-creation path (COLMAP `Create`-style
+     transitive correspondence gather + robust multi-view triangulation).
+   - Next: finish exact RANSAC sampler/RNG parity in `optim`, and restructure
+     `triangulate_image` to iterate per-point2D like COLMAP's `TriangulateImage`
+     instead of the current pairwise loop.
    - Introduce a long-lived mapper-owned triangulator + observation manager so
      merge/retriangulation trial state and visibility stats persist across
      registration steps (6 creation sites in `mapper.rs` today).

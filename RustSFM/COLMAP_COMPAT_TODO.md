@@ -723,8 +723,22 @@ reconstruction parity.
      The 2-view sampling enumerates combinations deterministically; exact
      `CombinationSampler` RNG/shuffle and bit-level LORANSAC parity remain under
      the `optim` RANSAC item.
-   - Remaining work: wire `estimate_triangulation` into the mapper track-creation
-     path, plus exact COLMAP transitivity queues and official point
+   - Wired `estimate_triangulation` into the incremental triangulator's
+     track-creation path: `IncrementalTriangulator::create_pair_track` now
+     gathers the seed observation pair plus transitively-corresponding
+     observations in registered images (bounded by `max_transitivity`, one
+     observation per image, COLMAP `Create`-style), maps the
+     `create_max_angle_error`/`min_angle` options into
+     `EstimateTriangulationOptions` (angular residual), and emits a multi-view
+     track from the inlier set in one robust step. Newly created points are left
+     uncolored ([0,0,0]) so the dedicated color-extraction stage assigns colors,
+     matching COLMAP. Verified by a three-view track-creation test plus the
+     existing pair/retriangulate/color-extraction suite (293 default / 298
+     poselib lib tests green).
+   - Remaining work: exact COLMAP `CombinationSampler` RNG/shuffle parity under
+     the `optim` RANSAC item, restructuring `triangulate_image` to iterate
+     per-point2D like COLMAP's `TriangulateImage` instead of the current pairwise
+     loop, plus exact COLMAP transitivity queues and official point
      creation/continuation option defaults.
 18. [partial] Port filtering by negative depth, reprojection error, triangulation angle,
     short tracks, and bogus camera parameters.

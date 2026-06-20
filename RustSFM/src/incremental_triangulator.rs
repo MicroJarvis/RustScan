@@ -1,4 +1,7 @@
-use crate::geometry::{camera_center, mean_pair_reprojection_error_with_cameras};
+use crate::geometry::camera_center;
+use crate::triangulation_estimator::{
+    estimate_triangulation, EstimateTriangulationOptions, ResidualType,
+};
 use crate::observation_manager::ObservationManager;
 use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
 use rustslam::SE3;
@@ -384,12 +387,11 @@ impl<'a> IncrementalTriangulator<'a> {
         feature: usize,
         other_feature: usize,
     ) -> bool {
-        let Some(left_pose) = self.reconstruction.poses[pair.left] else {
+        if self.reconstruction.poses[pair.left].is_none()
+            || self.reconstruction.poses[pair.right].is_none()
+        {
             return false;
-        };
-        let Some(right_pose) = self.reconstruction.poses[pair.right] else {
-            return false;
-        };
+        }
         let left_feature = if pair.left == image {
             feature
         } else {
@@ -405,7 +407,24 @@ impl<'a> IncrementalTriangulator<'a> {
         {
             return false;
         }
+
+        // Gather the seed pair plus all transitively-corresponding observations
+        // in registered images that are not yet part of a 3D point, mirroring
+        // COLMAP's `IncrementalTriangulator::Create` correspondence collection
+        // (bounded by `max_transitivity`, one observation per image). The seed
+        // left/right observations are guaranteed to be the first two entries.
+        let corrs = self.gather_create_observations(
+            pair.left,
+            left_feature,
+            pair.right,
+            right_feature,
+            options.max_transitivity,
+        );
+
+        // Honor `ignore_two_view_tracks`: a bare two-view track is only created
+        // when one of its observations has registered transitive context.
         if options.ignore_two_view_tracks
+            && corrs.len() < 3
             && !self.pair_observation_has_registered_transitive_context(
                 pair.left,
                 left_feature,
@@ -417,74 +436,120 @@ impl<'a> IncrementalTriangulator<'a> {
             return false;
         }
 
-        let left_kp = &self.frames[pair.left].keypoints[left_feature];
-        let right_kp = &self.frames[pair.right].keypoints[right_feature];
-        let Some(left_xy) = self
-            .reconstruction
-            .camera_for_image(pair.left)
-            .cam_from_img_f32(left_kp.x(), left_kp.y())
-        else {
-            return false;
-        };
-        let Some(right_xy) = self
-            .reconstruction
-            .camera_for_image(pair.right)
-            .cam_from_img_f32(right_kp.x(), right_kp.y())
-        else {
-            return false;
-        };
-        let Some(xyz) =
-            crate::two_view::triangulate_world_point(left_pose, right_pose, left_xy, right_xy)
-        else {
-            return false;
-        };
-        let Some(angle) = triangulation_angle_deg(left_pose, right_pose, xyz) else {
-            return false;
-        };
-        if angle < options.min_angle_deg {
-            return false;
+        // Build COLMAP `EstimateTriangulation` inputs (pixel observations + pose
+        // matrices + per-observation camera models).
+        let mut points = Vec::with_capacity(corrs.len());
+        let mut cams_from_world = Vec::with_capacity(corrs.len());
+        let mut cameras = Vec::with_capacity(corrs.len());
+        for &(obs_image, obs_feature) in &corrs {
+            let Some(pose) = self.reconstruction.poses[obs_image] else {
+                return false;
+            };
+            let kp = &self.frames[obs_image].keypoints[obs_feature];
+            points.push(nalgebra::Vector2::new(kp.x() as f64, kp.y() as f64));
+            cams_from_world.push(se3_to_matrix3x4(pose));
+            cameras.push(self.reconstruction.camera_for_image(obs_image));
         }
-        if !pair_angle_consistent(
-            left_pose,
-            right_pose,
-            left_xy,
-            right_xy,
-            xyz,
-            options.create_max_angle_error_deg,
-        ) {
+
+        let est_options = create_estimate_options(options);
+        let Some((inlier_mask, xyz)) =
+            estimate_triangulation(&est_options, &points, &cams_from_world, &cameras)
+        else {
             return false;
-        }
-        let error = mean_pair_reprojection_error_with_cameras(
-            xyz,
-            left_pose,
-            right_pose,
-            [left_kp.x(), left_kp.y()],
-            [right_kp.x(), right_kp.y()],
-            self.reconstruction.camera_for_image(pair.left),
-            self.reconstruction.camera_for_image(pair.right),
-        );
-        if !error.is_finite() || error > options.merge_max_reproj_error_px {
+        };
+
+        // The seed pair (indices 0 and 1) must both survive as inliers for this
+        // pairwise creation step, so the processed correspondence is realized.
+        if !inlier_mask.first().copied().unwrap_or(false)
+            || !inlier_mask.get(1).copied().unwrap_or(false)
+        {
             return false;
         }
 
+        let track: Vec<TrackObservation> = corrs
+            .iter()
+            .zip(inlier_mask.iter())
+            .filter_map(|(&(obs_image, obs_feature), &is_inlier)| {
+                is_inlier.then_some(TrackObservation {
+                    image: obs_image,
+                    feature: obs_feature,
+                })
+            })
+            .collect();
+        if track.len() < 2 {
+            return false;
+        }
+
+        let xyz_f32 = [xyz[0] as f32, xyz[1] as f32, xyz[2] as f32];
+        if !xyz_f32.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let error =
+            mean_track_reprojection_error(xyz_f32, &track, self.frames, self.reconstruction)
+                .unwrap_or(0.0);
+
+        // Newly triangulated points are left uncolored ([0, 0, 0]); the dedicated
+        // color-extraction stage assigns colors afterwards, matching COLMAP.
         let point = Point3D {
-            xyz,
+            xyz: xyz_f32,
             color: [0, 0, 0],
             error,
-            track: vec![
-                TrackObservation {
-                    image: pair.left,
-                    feature: left_feature,
-                },
-                TrackObservation {
-                    image: pair.right,
-                    feature: right_feature,
-                },
-            ],
+            track,
         };
         self.observation_manager
             .add_point3d(self.frames, self.pairs, self.reconstruction, point)
             .is_some()
+    }
+
+    /// Collect the seed observation pair plus transitively-corresponding
+    /// observations in registered images that are not yet assigned to a 3D
+    /// point, bounded by `max_transitivity`. One observation per image; the seed
+    /// left/right observations are always the first two returned entries.
+    fn gather_create_observations(
+        &self,
+        left: usize,
+        left_feature: usize,
+        right: usize,
+        right_feature: usize,
+        max_transitivity: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut result = vec![(left, left_feature), (right, right_feature)];
+        let mut images_used: HashSet<usize> = HashSet::from([left, right]);
+        let mut visited: HashSet<(usize, usize)> =
+            HashSet::from([(left, left_feature), (right, right_feature)]);
+        let mut current: VecDeque<(usize, usize)> =
+            VecDeque::from([(left, left_feature), (right, right_feature)]);
+        for _ in 0..max_transitivity {
+            if current.is_empty() {
+                break;
+            }
+            let mut next = VecDeque::new();
+            while let Some((image, feature)) = current.pop_front() {
+                for (corr_image, corr_feature) in self.corresponding_features(image, feature) {
+                    if !visited.insert((corr_image, corr_feature)) {
+                        continue;
+                    }
+                    next.push_back((corr_image, corr_feature));
+                    if images_used.contains(&corr_image)
+                        || self
+                            .reconstruction
+                            .poses
+                            .get(corr_image)
+                            .copied()
+                            .flatten()
+                            .is_none()
+                        || !self.valid_observation(corr_image, corr_feature)
+                        || self.reconstruction.observations[corr_image][corr_feature].is_some()
+                    {
+                        continue;
+                    }
+                    images_used.insert(corr_image);
+                    result.push((corr_image, corr_feature));
+                }
+            }
+            current = next;
+        }
+        result
     }
 
     fn complete_track(
@@ -904,32 +969,20 @@ fn triangulation_angle_deg(left_pose: SE3, right_pose: SE3, point: [f32; 3]) -> 
     Some(v1.dot(v2).abs().clamp(-1.0, 1.0).acos().to_degrees())
 }
 
-fn pair_angle_consistent(
-    left_pose: SE3,
-    right_pose: SE3,
-    left_xy: [f32; 2],
-    right_xy: [f32; 2],
-    point: [f32; 3],
-    max_angle_error_deg: f32,
-) -> bool {
-    if max_angle_error_deg <= 0.0 {
-        return true;
+/// Build COLMAP `EstimateTriangulationOptions` from the incremental
+/// triangulator options, matching `IncrementalTriangulator::Create`'s
+/// configuration (angular residual; `create_max_angle_error` as the inlier
+/// threshold; `min_angle` as the minimum triangulation angle).
+fn create_estimate_options(options: &IncrementalTriangulatorOptions) -> EstimateTriangulationOptions {
+    EstimateTriangulationOptions {
+        min_tri_angle: (options.min_angle_deg as f64).to_radians(),
+        residual_type: ResidualType::AngularError,
+        max_error: (options.create_max_angle_error_deg as f64).to_radians(),
+        confidence: 0.9999,
+        min_inlier_ratio: 0.02,
+        min_num_trials: 0,
+        max_num_trials: 10000,
     }
-    let Some(left_ray) = observation_world_ray(left_pose, left_xy) else {
-        return false;
-    };
-    let Some(right_ray) = observation_world_ray(right_pose, right_xy) else {
-        return false;
-    };
-    let p = glam::Vec3::from_array(point);
-    let Some(left_to_point) = (p - camera_center(left_pose)).try_normalize() else {
-        return false;
-    };
-    let Some(right_to_point) = (p - camera_center(right_pose)).try_normalize() else {
-        return false;
-    };
-    angular_error_deg(left_ray, left_to_point).max(angular_error_deg(right_ray, right_to_point))
-        <= max_angle_error_deg
 }
 
 fn track_has_min_triangulation_angle(
@@ -1046,6 +1099,51 @@ mod tests {
 
         assert_eq!(report.created_points, 0);
         assert!(triangulator.reconstruction.points.is_empty());
+    }
+
+    #[test]
+    fn create_pair_track_builds_multiview_track_via_estimator() {
+        // Three registered views observing one world point. Creating from the
+        // (0,1) seed should transitively gather image 2 and emit a single
+        // three-view track through `estimate_triangulation`.
+        let mut frames = vec![frame(0), frame(1), frame(2)];
+        frames[0].keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(62.5, 50.0);
+        frames[2].keypoints[0] = rustslam::KeyPoint::new(50.0, 62.5);
+        let pairs = vec![
+            pair(0, 1, &[(0, 0)]),
+            pair(0, 2, &[(0, 0)]),
+            pair(1, 2, &[(0, 0)]),
+        ];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        reconstruction.poses[2] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(0.0, 1.0, 0.0),
+        ));
+
+        let mut triangulator = IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction);
+        let report = triangulator.triangulate_image(
+            &IncrementalTriangulatorOptions {
+                min_angle_deg: 0.5,
+                ignore_two_view_tracks: false,
+                ..IncrementalTriangulatorOptions::default()
+            },
+            0,
+        );
+
+        assert_eq!(report.created_points, 1);
+        assert_eq!(triangulator.reconstruction.points.len(), 1);
+        assert_eq!(triangulator.reconstruction.points[0].track.len(), 3);
+        let xyz = triangulator.reconstruction.points[0].xyz;
+        assert!(
+            xyz[0].abs() < 1e-2 && xyz[1].abs() < 1e-2 && (xyz[2] - 4.0).abs() < 1e-2,
+            "{xyz:?}"
+        );
     }
 
     #[test]
