@@ -2,7 +2,9 @@
 //!
 //! Implements PnP, Essential Matrix, Triangulation, and Sim3 solvers with proper algorithms.
 
-use crate::colmap_rng::{colmap_ransac_num_trials, sample_unique_indices, ColmapMt19937};
+use crate::colmap_rng::{
+    colmap_ransac_num_trials, sample_unique_indices, ColmapMt19937, ColmapRansacOptions,
+};
 use crate::core::SE3;
 use crate::features::base::Match;
 use glam::{Mat3, Vec3};
@@ -336,20 +338,26 @@ impl PnPSolver {
     }
 
     fn initial_max_iterations(&self, sample_size: usize) -> u32 {
-        if self.ransac_min_inlier_ratio <= 0.0 {
-            return self.ransac_max_iterations.max(self.ransac_min_iterations);
+        self.colmap_ransac_options()
+            .with_initial_max_num_trials(sample_size)
+            .map(|options| options.max_num_trials.min(u32::MAX as usize) as u32)
+            .unwrap_or(0)
+    }
+
+    fn colmap_ransac_options(&self) -> ColmapRansacOptions {
+        ColmapRansacOptions {
+            max_error: self.ransac_threshold as f64,
+            min_inlier_ratio: self.ransac_min_inlier_ratio as f64,
+            confidence: self.ransac_confidence as f64,
+            dyn_num_trials_multiplier: self.ransac_dyn_num_trials_multiplier as f64,
+            min_num_trials: self.ransac_min_iterations as usize,
+            max_num_trials: self.ransac_max_iterations as usize,
+            random_seed: self
+                .ransac_random_seed
+                .and_then(|seed| i32::try_from(seed).ok())
+                .unwrap_or(-1),
+            num_threads: 1,
         }
-        let assumed_samples = 100_000usize;
-        let assumed_inliers =
-            (self.ransac_min_inlier_ratio.clamp(0.0, 1.0) * assumed_samples as f32) as usize;
-        let dyn_max = compute_ransac_num_trials(
-            assumed_inliers,
-            assumed_samples,
-            sample_size,
-            self.ransac_confidence,
-            self.ransac_dyn_num_trials_multiplier,
-        );
-        self.ransac_max_iterations.min(dyn_max)
     }
 
     fn update_adaptive_max_iterations(
@@ -3831,5 +3839,40 @@ impl Sim3Solver {
 impl Default for Sim3Solver {
     fn default() -> Self {
         Self::new(0.01)
+    }
+}
+
+#[cfg(test)]
+mod colmap_ransac_tests {
+    use super::*;
+    use crate::colmap_rng::colmap_ransac_num_trials;
+
+    #[test]
+    fn pnp_initial_iterations_use_shared_colmap_options() {
+        let mut solver = PnPSolver::new(500.0, 500.0, 320.0, 240.0);
+        solver.ransac_max_iterations = 10_000;
+        solver.ransac_min_inlier_ratio = 0.5;
+        solver.ransac_confidence = 0.999;
+        solver.ransac_dyn_num_trials_multiplier = 1.0;
+
+        assert_eq!(
+            solver.initial_max_iterations(3),
+            colmap_ransac_num_trials(50_000, 100_000, 3, 0.999, 1.0) as u32
+        );
+
+        solver.ransac_min_inlier_ratio = 0.0;
+        assert_eq!(solver.initial_max_iterations(3), 10_000);
+    }
+
+    #[test]
+    fn pnp_initial_iterations_reject_invalid_colmap_options() {
+        let mut solver = PnPSolver::new(500.0, 500.0, 320.0, 240.0);
+        solver.ransac_threshold = 0.0;
+        assert_eq!(solver.initial_max_iterations(3), 0);
+
+        let mut solver = PnPSolver::new(500.0, 500.0, 320.0, 240.0);
+        solver.ransac_min_iterations = 2;
+        solver.ransac_max_iterations = 1;
+        assert_eq!(solver.initial_max_iterations(3), 0);
     }
 }
