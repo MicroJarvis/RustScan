@@ -301,7 +301,7 @@ pub(crate) fn refine_bundle_adjustment_native(
     })
 }
 
-fn count_variable_residuals(
+pub(crate) fn count_variable_residuals(
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
     pose_blocks: &PoseBlockSet,
@@ -337,7 +337,7 @@ fn count_variable_residuals(
     variable_observations * 2
 }
 
-fn point_effective_parameter_count(
+pub(crate) fn point_effective_parameter_count(
     observations: &[BaObservation],
     constant_point_filter: &HashSet<usize>,
 ) -> usize {
@@ -434,46 +434,46 @@ struct NonPointBlock {
 }
 
 #[derive(Debug, Clone)]
-struct PoseBlockSet {
-    blocks: Vec<PoseBlock>,
-    image_to_block: Vec<Option<usize>>,
-    dim: usize,
+pub(crate) struct PoseBlockSet {
+    pub(crate) blocks: Vec<PoseBlock>,
+    pub(crate) image_to_block: Vec<Option<usize>>,
+    pub(crate) dim: usize,
 }
 
 #[derive(Debug, Clone)]
-struct PoseBlock {
-    kind: PoseBlockKind,
-    images: Vec<usize>,
-    offset: usize,
-    free_axes: [bool; 6],
+pub(crate) struct PoseBlock {
+    pub(crate) kind: PoseBlockKind,
+    pub(crate) images: Vec<usize>,
+    pub(crate) offset: usize,
+    pub(crate) free_axes: [bool; 6],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PoseBlockKind {
+pub(crate) enum PoseBlockKind {
     Image(usize),
     Frame(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct SensorPoseKey {
-    rig_id: u32,
-    sensor_id: SensorId,
+pub(crate) struct SensorPoseKey {
+    pub(crate) rig_id: u32,
+    pub(crate) sensor_id: SensorId,
 }
 
 #[derive(Debug, Clone)]
-struct SensorPoseSpec {
-    key: SensorPoseKey,
-    offset: usize,
+pub(crate) struct SensorPoseSpec {
+    pub(crate) key: SensorPoseKey,
+    pub(crate) offset: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CameraParamSpec {
-    camera: usize,
-    param: usize,
-    offset: usize,
+pub(crate) struct CameraParamSpec {
+    pub(crate) camera: usize,
+    pub(crate) param: usize,
+    pub(crate) offset: usize,
 }
 
-fn variable_pose_blocks(
+pub(crate) fn variable_pose_blocks(
     reconstruction: &Reconstruction,
     variable_images: Option<&[usize]>,
     constant_images: &[usize],
@@ -579,7 +579,7 @@ fn reindex_pose_blocks(pose_blocks: &mut PoseBlockSet) {
     pose_blocks.dim = offset;
 }
 
-fn pose_block_dim(block: &PoseBlock) -> usize {
+pub(crate) fn pose_block_dim(block: &PoseBlock) -> usize {
     block.free_axes.iter().filter(|&&free| free).count()
 }
 
@@ -605,7 +605,7 @@ struct GaugePoseUnit {
     pose: SE3,
 }
 
-fn apply_two_cams_from_world_gauge(
+pub(crate) fn apply_two_cams_from_world_gauge(
     pose_blocks: &mut PoseBlockSet,
     reconstruction: &Reconstruction,
     options: &BundleAdjustmentOptions,
@@ -762,7 +762,7 @@ fn frame_registered_images_with_sensors(
     }
 }
 
-fn camera_param_specs(
+pub(crate) fn camera_param_specs(
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
     options: &BundleAdjustmentOptions,
@@ -815,7 +815,7 @@ fn camera_param_specs(
     specs
 }
 
-fn sensor_pose_specs(
+pub(crate) fn sensor_pose_specs(
     reconstruction: &Reconstruction,
     pose_blocks: &PoseBlockSet,
     options: &BundleAdjustmentOptions,
@@ -887,7 +887,7 @@ fn selected_camera_params(
     selected
 }
 
-fn camera_index_for_image(reconstruction: &Reconstruction, image: usize) -> Option<usize> {
+pub(crate) fn camera_index_for_image(reconstruction: &Reconstruction, image: usize) -> Option<usize> {
     match reconstruction.image_camera_indices.get(image).copied() {
         Some(camera_idx) if camera_idx < reconstruction.cameras.len() => Some(camera_idx),
         Some(0) if reconstruction.cameras.is_empty() => Some(0),
@@ -902,7 +902,7 @@ fn camera_index_for_image(reconstruction: &Reconstruction, image: usize) -> Opti
     }
 }
 
-fn camera_by_index(reconstruction: &Reconstruction, camera_idx: usize) -> Option<CameraModel> {
+pub(crate) fn camera_by_index(reconstruction: &Reconstruction, camera_idx: usize) -> Option<CameraModel> {
     reconstruction
         .cameras
         .get(camera_idx)
@@ -1173,7 +1173,7 @@ fn apply_pose_block_delta(reconstruction: &mut Reconstruction, block: &PoseBlock
     }
 }
 
-fn set_frame_pose_block(
+pub(crate) fn set_frame_pose_block(
     reconstruction: &mut Reconstruction,
     frame_idx: usize,
     images: &[usize],
@@ -1206,7 +1206,7 @@ fn frame_rig_from_world_from_image(
     Some(sensor_from_rig.inverse().compose(&image_pose))
 }
 
-fn frame_sensor_from_rig(
+pub(crate) fn frame_sensor_from_rig(
     reconstruction: &Reconstruction,
     frame_idx: usize,
     image: usize,
@@ -1216,7 +1216,7 @@ fn frame_sensor_from_rig(
     reconstruction.sensor_from_rig(frame.rig_id, sensor_id)
 }
 
-fn frame_sensor_key_for_image(
+pub(crate) fn frame_sensor_key_for_image(
     reconstruction: &Reconstruction,
     image: usize,
 ) -> Option<SensorPoseKey> {
@@ -1394,7 +1394,7 @@ fn cross_matrix(vector: &Vec3d) -> Mat3 {
     )
 }
 
-fn apply_sensor_pose_delta(
+pub(crate) fn apply_sensor_pose_delta(
     reconstruction: &mut Reconstruction,
     key: &SensorPoseKey,
     delta: Vec6,
@@ -1429,7 +1429,7 @@ fn apply_sensor_pose_delta(
     true
 }
 
-fn sync_pose_blocks_for_sensor_changes(
+pub(crate) fn sync_pose_blocks_for_sensor_changes(
     reconstruction: &mut Reconstruction,
     pose_blocks: &PoseBlockSet,
     changed_sensors: &[SensorPoseKey],
@@ -2715,7 +2715,7 @@ fn point_nonpoint_cross(j_point: Mat2x3, j_nonpoint: &DMatrix<f64>) -> DMatrix<f
     })
 }
 
-fn apply_camera_param_delta(
+pub(crate) fn apply_camera_param_delta(
     reconstruction: &mut Reconstruction,
     spec: CameraParamSpec,
     delta: f64,
@@ -2735,7 +2735,7 @@ fn apply_camera_param_delta(
     }
 }
 
-fn sync_camera_intrinsics_from_params(camera: &mut CameraModel) {
+pub(crate) fn sync_camera_intrinsics_from_params(camera: &mut CameraModel) {
     if let Some(focal_idxs) = colmap_camera_model_focal_idxs(camera.model_id) {
         match focal_idxs {
             [idx] if *idx < camera.num_params => {
@@ -2757,7 +2757,7 @@ fn sync_camera_intrinsics_from_params(camera: &mut CameraModel) {
     }
 }
 
-fn apply_pose_delta_f64(pose: SE3, delta: Vec6) -> SE3 {
+pub(crate) fn apply_pose_delta_f64(pose: SE3, delta: Vec6) -> SE3 {
     let q = pose.quaternion();
     let base_rotation = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
     let omega = Vec3::new(delta[0] as f32, delta[1] as f32, delta[2] as f32);

@@ -5,6 +5,8 @@ mod shared;
 
 #[cfg(feature = "ceres-ba")]
 mod ceres;
+#[cfg(feature = "ceres-ba")]
+mod ceres_problem;
 
 /// Ceres-equivalent robust loss functions for bundle adjustment.
 ///
