@@ -367,6 +367,13 @@ reconstruction parity.
     - Ported COLMAP `optim/sprt` as `sprt.rs`: options, decision-threshold
       recurrence, absolute-residual early rejection, inlier/evaluation counters,
       and official all-inlier/all-outlier/mixed/empty tests are covered.
+    - Ported COLMAP `optim/least_absolute_deviations` as
+      `least_absolute_deviations.rs`: LAD ADMM options, validity checks,
+      shrinkage update, primal/dual convergence thresholds, ridge
+      regularization behavior, and the official overdetermined,
+      well-determined, underdetermined, diagonal, identity, outlier, and ridge
+      tests are covered. The Rust implementation currently uses a dense
+      `nalgebra` Cholesky backend for both COLMAP solver-type variants.
     - Two-view E/F/H fixed-seed sampling now uses COLMAP's MT19937-32 random
       source plus the local libc++ `std::uniform_int_distribution<uint32_t>`
       bit-extraction behavior for `RandomSampler::Shuffle`.
@@ -407,8 +414,9 @@ reconstruction parity.
       instead of the previous `A^T A` eigenvector basis.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level full-pivot Householder
-      parity for minimal nullspaces and byte-level Eigen JacobiSVD /
-      companion root parity.
+      parity for minimal nullspaces, byte-level Eigen JacobiSVD / companion
+      root parity, and the sparse-matrix / sparse-Cholesky / CHOLMOD fallback
+      backend behind LAD and `optim/sparse_cholesky`.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.

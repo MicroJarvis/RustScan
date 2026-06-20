@@ -9,6 +9,7 @@ mod five_point_generated;
 pub mod generalized_pose;
 pub mod geometry;
 pub mod incremental_triangulator;
+pub mod least_absolute_deviations;
 pub mod mapper;
 pub mod observation_manager;
 pub mod parity;
