@@ -3,7 +3,7 @@ use crate::geometry::relative_rotation_deg;
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
-use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler, SE3};
+use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler, ColmapRansacOptions, SE3};
 
 #[derive(Debug, Clone)]
 pub struct TwoViewOptions {
@@ -776,20 +776,18 @@ pub(crate) fn estimate_relative_pose_from_rays(
         0x6a09_e667_f3bc_c909
     };
     let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
-    let mut max_iterations = max_num_trials.max(1);
-    let min_iterations = min_num_trials.max(1);
-    let assumed_inliers =
-        ((min_inlier_ratio.clamp(0.0, 1.0) * 100_000.0) as usize).max(SAMPLE_SIZE);
-    max_iterations = max_iterations.min(
-        ransac_num_trials_from_counts(
-            assumed_inliers,
-            100_000,
-            SAMPLE_SIZE,
-            confidence,
-            dyn_num_trials_multiplier,
-        )
-        .max(min_iterations),
-    );
+    let ransac_options = relative_pose_ransac_options(
+        max_error,
+        min_inlier_ratio,
+        min_num_trials,
+        max_num_trials,
+        confidence,
+        dyn_num_trials_multiplier,
+        random_seed,
+        SAMPLE_SIZE,
+    )?;
+    let mut max_iterations = ransac_options.max_num_trials;
+    let min_iterations = ransac_options.min_num_trials;
 
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
     let mut iteration = 0usize;
@@ -846,11 +844,11 @@ pub(crate) fn estimate_relative_pose_from_rays(
                         support.inliers,
                         n,
                         SAMPLE_SIZE,
-                        confidence,
-                        dyn_num_trials_multiplier,
+                        ransac_options.confidence,
+                        ransac_options.dyn_num_trials_multiplier,
                     )
                     .max(min_iterations)
-                    .min(max_num_trials.max(1)),
+                    .min(ransac_options.max_num_trials),
                 );
                 best = Some((local_model, support));
             }
@@ -872,6 +870,30 @@ pub(crate) fn estimate_relative_pose_from_rays(
         CameraModel::new_pinhole(1, 1, 1.0, 1.0, 0.0, 0.0),
     )?;
     Some((pose_score.pose, support.inliers, support.inlier_mask))
+}
+
+fn relative_pose_ransac_options(
+    max_error: f64,
+    min_inlier_ratio: f64,
+    min_num_trials: usize,
+    max_num_trials: usize,
+    confidence: f64,
+    dyn_num_trials_multiplier: f64,
+    random_seed: i32,
+    sample_size: usize,
+) -> Option<ColmapRansacOptions> {
+    ColmapRansacOptions {
+        max_error,
+        min_inlier_ratio,
+        confidence,
+        dyn_num_trials_multiplier,
+        min_num_trials,
+        max_num_trials,
+        random_seed,
+        num_threads: 1,
+    }
+    .with_initial_max_num_trials(sample_size)
+    .ok()
 }
 
 fn rays_to_pixel_like_observations(rays: &[[f64; 3]], n: usize) -> Vec<[f32; 2]> {
@@ -2467,6 +2489,23 @@ mod tests {
         assert_eq!(adaptive_ransac_iterations(3, 100, 123, 0.999, 5), 123);
         assert_eq!(adaptive_ransac_iterations(10, 4, 123, 0.999, 5), 123);
         assert_eq!(adaptive_ransac_iterations(10, 10, 123, 0.999, 5), 1);
+    }
+
+    #[test]
+    fn ray_relative_pose_ransac_options_use_shared_colmap_initialization() {
+        let options =
+            relative_pose_ransac_options(0.01, 0.5, 3, 10_000, 0.999, 1.0, 42, 5).unwrap();
+        assert_eq!(
+            options.max_num_trials,
+            colmap_ransac_num_trials(50_000, 100_000, 5, 0.999, 1.0)
+        );
+        assert_eq!(options.min_num_trials, 3);
+        assert_eq!(options.random_seed, 42);
+
+        assert!(relative_pose_ransac_options(0.0, 0.5, 0, 10_000, 0.999, 1.0, -1, 5).is_none());
+        let zero_prior =
+            relative_pose_ransac_options(0.01, 0.0, 0, 10_000, 0.999, 1.0, -1, 5).unwrap();
+        assert_eq!(zero_prior.max_num_trials, 10_000);
     }
 
     #[test]

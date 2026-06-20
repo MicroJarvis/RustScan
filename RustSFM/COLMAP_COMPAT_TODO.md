@@ -379,6 +379,8 @@ reconstruction parity.
       `EstimateTriangulation` also maps its flattened options through the
       shared COLMAP `RANSACOptions` initialization before enumerating
       `CombinationSampler` trials.
+      The panoramic/generalized two-view ray relative-pose fallback now uses
+      the same shared initialization instead of a local pre-clamp formula.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
