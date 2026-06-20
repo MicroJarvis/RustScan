@@ -6820,6 +6820,7 @@ name = "rustsfm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "env_logger",
  "glam",
@@ -6827,6 +6828,7 @@ dependencies = [
  "log",
  "lowe-sift",
  "nalgebra",
+ "rand 0.8.5",
  "rayon",
  "rusqlite",
  "rustslam",

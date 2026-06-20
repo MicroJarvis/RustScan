@@ -468,19 +468,7 @@ impl<'a> IncrementalTriangulator<'a> {
 
         let point = Point3D {
             xyz,
-            color: average_color(
-                &[
-                    TrackObservation {
-                        image: pair.left,
-                        feature: left_feature,
-                    },
-                    TrackObservation {
-                        image: pair.right,
-                        feature: right_feature,
-                    },
-                ],
-                self.frames,
-            ),
+            color: [0, 0, 0],
             error,
             track: vec![
                 TrackObservation {
@@ -1286,6 +1274,11 @@ mod tests {
             left,
             right,
             two_view_config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+            f_matrix: None,
+            e_matrix: None,
+            h_matrix: None,
+            qvec: None,
+            tvec: None,
             matches: Vec::new(),
             inlier_matches: matches
                 .iter()

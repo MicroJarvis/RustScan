@@ -19,5 +19,9 @@ pub mod types;
 pub mod wide;
 
 pub use compare::{compare_colmap, CompareReport};
-pub use mapper::{run_reconstruction, FeatureType, MapperConfig, ReconstructionSummary};
+pub use mapper::{
+    run_reconstruction, run_reconstruction_with_callbacks, FeatureType,
+    IncrementalPipelineCallback, MapperConfig, PipelineCallbackEvent, PipelineCallbackSink,
+    ReconstructionSummary,
+};
 pub use parity::{compare_database_parity, ParityReport};

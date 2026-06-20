@@ -337,6 +337,11 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         left: left_idx,
         right: right_idx,
         two_view_config: estimate.two_view_config,
+        f_matrix: estimate.fundamental.map(matrix3_to_row_array),
+        e_matrix: estimate.e_matrix,
+        h_matrix: estimate.homography.map(matrix3_to_row_array),
+        qvec: estimate.qvec,
+        tvec: estimate.tvec,
         matches: valid_matches,
         inlier_matches: output_inlier_matches,
         relative_pose,
@@ -347,6 +352,20 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         median_triangulation_angle_deg: estimate.median_triangulation_angle_deg,
         pose_graph_only: false,
     })
+}
+
+fn matrix3_to_row_array(matrix: nalgebra::Matrix3<f64>) -> [f64; 9] {
+    [
+        matrix[(0, 0)],
+        matrix[(0, 1)],
+        matrix[(0, 2)],
+        matrix[(1, 0)],
+        matrix[(1, 1)],
+        matrix[(1, 2)],
+        matrix[(2, 0)],
+        matrix[(2, 1)],
+        matrix[(2, 2)],
+    ]
 }
 
 fn mean_cam_from_img_threshold(

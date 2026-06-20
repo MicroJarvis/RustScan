@@ -8,6 +8,17 @@ reconstruction parity.
 
 1. [done] Parse and preserve COLMAP camera model ids, names, parameter counts,
    and parameter ordering for text/binary sparse models.
+   - Added a raw COLMAP sparse file codec for `cameras/images/points3D` plus
+     optional `rigs/frames` in both text and binary formats, matching COLMAP
+     file-selection precedence, little-endian field layouts, 17-digit text
+     precision, invalid point3D sentinels, image names through end-of-line,
+     deterministic id-based write ordering, empty rig/frame sidecar files, and
+     text/binary round-trip coverage.
+   - This is the first explicitly marked 100% parity boundary:
+     `Sparse model I/O codec`. It does not imply full `scene`/`sensor`
+     semantic parity, because exporting through RustSFM's internal
+     `Reconstruction` still inherits existing `f32` pose/keypoint/point
+     precision limits.
 2. [partial] Replace pinhole-only normalization/projection with
    COLMAP-equivalent `CamFromImg`, `CamRayFromImg`, `ImgFromCam`, and
    pixel-threshold conversion for every official camera model.
@@ -97,9 +108,56 @@ reconstruction parity.
      the first observed registration unit is fixed fully, the second fixes only
      the largest-baseline translation coordinate, and degenerate cases fall
      back to `THREE_POINTS`.
-   - Remaining work: generalized pose registration for non-trivial rigs,
-     exact filtered-frame event counters in all mapper cleanup paths, and
-     Ceres-equivalent rig/sensor solver behavior.
+   - Added generalized absolute-pose registration for non-trivial COLMAP rig
+     frames with known `sensor_from_rig` poses: mapper candidates now collect
+     whole-frame 2D-3D correspondences, estimate `rig_from_world`, expand the
+     pose back to every frame image, and continue inlier 3D tracks.
+   - Generalized frame registration now runs a BA-backed pose-only refinement
+     after GP3P, using the RANSAC inlier mask with fixed 3D points, fixed
+     cameras, and fixed `sensor_from_rig` poses before expanding the refined
+     `rig_from_world` back to all frame images.
+   - Generalized frame registration now follows COLMAP's good-focal gate: a
+     non-trivial rig only uses generalized absolute pose when every frame
+     camera has prior focal length or has already been registered through the
+     same shared camera. Otherwise the mapper falls back to central absolute
+     pose so unknown focal length can be estimated first.
+   - Central registration now resets bogus cameras in the same COLMAP frame
+     from healthy database/reference priors, matching COLMAP's recovery path
+     for non-trivial rigs with bad sibling camera parameters.
+   - Mapper filtering now follows COLMAP's registered-frame filtering gate for
+     the covered cleanup path: once at least 20 registration units are
+     registered, frames/images with bogus cameras or zero point3D observations
+     are deregistered at full-frame granularity and the registered-frame,
+     per-camera, total-registration, and shared-registration counters are
+     rolled back through the same event path.
+   - Next-image selection now follows COLMAP's two-bucket retry ordering for
+     the covered mapper path: clean never-tried registration units are ranked
+     first, while filtered or previously failed units are ranked only after the
+     clean bucket.
+   - Candidate ranking now exposes COLMAP's next-image selection methods
+     internally and defaults to `MIN_UNCERTAINTY`, i.e. the mapper ranks by
+     `Point3DVisibilityScore`; the `MAX_VISIBLE_POINTS_NUM` and
+     `MAX_VISIBLE_POINTS_RATIO` formulas are also implemented.
+   - The covered next-image path now has a COLMAP-shaped `FindNextImages`
+     queue split: structure-based candidates are selected by visible 3D-point
+     threshold, sorted into clean and filtered/failed buckets, and only then
+     consumed by the registration solver; structure-less candidates use the
+     visible-correspondence ranking path when that fallback is enabled.
+     A parity test verifies the bucketed queue independently of PnP success.
+   - The covered next-image queue consumer now matches COLMAP's core
+     "could not register, trying another image" behavior: when a queued
+     candidate reaches the registration solver but fails pose estimation, the
+     candidate is recorded as a failed attempt, its full registration unit
+     trial count is incremented by the pipeline, and later candidates in the
+     same ranked queue can still register successfully.
+   - Frame-level retry gating now reads the maximum trial count over the full
+     registration unit, so any sibling image in a non-trivial frame reaching
+     `max_reg_trials` blocks the whole frame consistently.
+   - Remaining work: exact generalized absolute-pose reset/refinement
+     scheduling, full priority-queue orchestration and COLMAP
+     initialization/reconstruction retry bookkeeping, event-counter coverage
+     for every failed-refinement cleanup path, and Ceres-equivalent rig/sensor
+     solver behavior.
 
 ## P1 - Feature Extraction, Matching, And Database Graph
 
@@ -119,7 +177,7 @@ reconstruction parity.
      distance, cross check, and max matches into the current matcher.
    - Remaining work: guided matching, full matching strategy selection,
      COLMAP database persistence, and exact FAISS/GPU matcher parity.
-7. [partial] Build a persistent COLMAP-style database/cache layer with
+7. [done] Build a persistent COLMAP-style database/cache layer with
    keypoints, descriptors, matches, two-view geometries, and correspondence
    graph.
    - Added a COLMAP-style in-memory correspondence graph foundation, including
@@ -141,14 +199,55 @@ reconstruction parity.
      COLMAP rig sensor ids, optional sensor-from-rig poses, and frame data ids.
    - Added SQLite pose_priors read-write support with correlated sensor/data
      ids, position/covariance/gravity blobs, and coordinate-system metadata.
+   - Added COLMAP-style SQLite open-time schema migration:
+     `inlier_matches` is renamed to `two_view_geometries`, legacy
+     `pose_priors(image_id, ...)` rows are migrated to correlated
+     sensor/data pose priors, missing two-view `F/E/H/qvec/tvec` and
+     descriptor `type` columns are added, old identity/zero pose sentinels and
+     zero F/E/H matrices are normalized to NULL, and `PRAGMA user_version` is
+     updated to the current COLMAP database version.
+   - Added COLMAP database API coverage for exists/count/max/rows-for-image,
+     `ReadRigWithSensor`, `ReadNumMatches`, update methods for
+     rigs/cameras/frames/images/pose_priors/keypoints/two-view geometries,
+     pair deletion, inlier-match deletion, clear methods, and transactions.
+   - Added COLMAP-style `Database::Merge`, including camera/rig/image/frame
+     id remapping, duplicate image-name rejection, pose-prior data-id remapping,
+     keypoint/descriptor transfer, match transfer through COLMAP's `rows > 0`
+     all-matches API, and two-view geometry transfer through remapped image
+     pairs.
+   - Added raw keypoint and match blob overloads for COLMAP-compatible
+     `Read/Write/UpdateKeypointsBlob`, `ReadMatchesBlob`, and
+     `ReadAllMatchesBlob` behavior, preserving matrix rows/cols/data and
+     match-pair direction swapping.
+   - Added COLMAP-style close-time vacuum behavior: delete/clear methods mark
+     the database as having removed entries, and explicit close/drop runs
+     `VACUUM` to release SQLite freelist pages.
+   - Added COLMAP-style `LoadRandomDatabaseDescriptors` helper behavior for
+     all-descriptor and bounded random-subset loads, including feature-type and
+     descriptor-dimensionality consistency checks.
+   - `WriteTwoViewGeometry` now follows COLMAP's insert-only behavior, while
+     mapper write-back uses explicit update semantics when replacing an
+     existing verified pair.
    - Added a lightweight database cache loader that collects rigs, cameras,
      frames, images, pose priors, and a filtered correspondence graph using
      COLMAP-style `min_num_matches`, watermark, and `load_all_images` controls.
+   - Added `DatabaseCache::CreateFromCache` parity, copying all images in
+     selected frames, filtered rigs/cameras/frames, pose priors, and full
+     two-view metadata/inlier matches into a rebuilt correspondence graph.
+   - Added COLMAP-style `DatabaseCache` API helpers for count, add, lookup,
+     existence checks, image-name search, and correspondence-graph access.
+   - Added COLMAP-style opt-in database-cache pose-prior conversion from WGS84
+     latitude/longitude/altitude to local ENU Cartesian coordinates, including
+     consistent coordinate-system validation and first-WGS84-prior reference
+     origin behavior.
    - Added COLMAP-style image-name filtering at frame granularity, including
      loading all images in a selected frame and reading image frame ownership
      via `frame_data`.
    - Added legacy database-cache compatibility for databases without frames by
-     creating COLMAP-style trivial frames per image.
+     creating COLMAP-style trivial rigs per camera and trivial frames per image.
+   - The correspondence graph now preserves full two-view geometry metadata
+     (`config`, optional F/E/H/qvec/tvec) separately from inlier matches, with
+     COLMAP-style inversion/update/extraction semantics.
    - Added a mapper bridge that maps database-cache image names and the
      correspondence graph into frame-indexed pair matches, with an opt-in
      two-view estimation path for database-derived candidate pairs.
@@ -161,16 +260,18 @@ reconstruction parity.
    - Database-driven pair estimation now reuses stored `qvec/tvec` two-view
      geometry poses when present and valid, falling back to local two-view
      estimation otherwise.
-   - Added official COLMAP two-view geometry configuration constants and made
-     database-cache edge loading reject `UNDEFINED`/`DEGENERATE` geometries
-     while preserving watermark filtering semantics.
+   - Added official COLMAP two-view geometry configuration constants. Database
+     cache filtering now matches COLMAP `UseInlierMatchesCheck`: only
+     `min_num_matches` and optional watermark skipping are applied, so
+     `UNDEFINED`/`DEGENERATE` rows with enough inlier matches are still loaded.
    - `PairGeometry` now carries the COLMAP two-view configuration, preserving
      database configs and marking Rust-estimated calibrated pairs explicitly.
    - Reconstruction summaries now report pair counts by COLMAP two-view
      configuration to support stage-by-stage parity checks.
-   - Remaining work: SQLite COLMAP database schema/read-write parity, database
-     cache ENU pose-prior conversion, and complete pose/config semantics for
-     all two-view geometry cases.
+   - This is the second explicitly marked 100% parity boundary:
+     `Database/cache and correspondence graph`. The boundary covers storage,
+     cache construction/filtering, and graph behavior; exact generation of
+     two-view geometry by COLMAP's estimator stack remains in P2.
 8. [done] Remove sequence-specific local-window and 192-frame ring heuristics
    from the default mapper path; keep them only behind explicit experimental
    options.
@@ -203,9 +304,40 @@ reconstruction parity.
    - Planar and panoramic two-view estimates now hand off the selected
      homography pose into the returned relative pose instead of falling back to
      essential/fundamental pose selection, including the forced-homography path.
-   - Remaining work: persist/report planar homography pose metadata with full
-     COLMAP `TwoViewGeometry` semantics and implement `CALIBRATED_RIG`
-     generalized relative pose.
+   - Rust-estimated pairs now carry COLMAP-shaped optional F/E/H/qvec/tvec
+     metadata from `TwoViewEstimate` into `PairGeometry`, and mapper summaries
+     report verified-pair metadata coverage for parity checks.
+   - Added opt-in `--write-two-view-geometries` write-back for Rust-estimated
+     verified pair metadata, including COLMAP-style replacement and
+     `TwoViewGeometry::Invert` behavior for swapped image ids.
+   - Added the COLMAP-style generalized relative pose preparation bridge:
+     RANSAC defaults, camera/ray packing, panoramic-rig ray handling, original
+     camera pose recomposition from rig-relative pose, and mapper initial-pair
+     gating for non-trivial rigs.
+   - Added an optional PoseLib-backed GR6P generalized relative pose solver
+     bridge behind the `poselib` Cargo feature. The Rust side packs
+     COLMAP-style rig observations into PoseLib's 6-point solver, scores
+     candidate rig poses with generalized Sampson residuals, and returns a
+     rig-relative pose plus inlier mask for non-panoramic rigs.
+   - Added a COLMAP-derived GR8P local estimator bridge behind the same
+     feature. Current generalized relative pose RANSAC now refits the best
+     inlier sets with GR8P, re-scores the returned rig poses, and keeps the
+     stronger support, matching the main shape of COLMAP's
+     `LORANSAC<GR6PEstimator, GR8PEstimator>` path without reimplementing
+     the solver from scratch in Rust.
+   - Tightened generalized relative pose parity further: normalized RANSAC
+     threshold is now averaged over all rig cameras like COLMAP, dynamic
+     stopping uses COLMAP's current without-replacement trial formula, GR8P
+     local optimization can recursively expand the inlier set up to COLMAP's
+     10 local trials, and the panoramic-rig branch now falls back to ordinary
+     relative pose and returns `pano2_from_pano1`.
+   - `EstimateStructureLessAbsolutePose` is now wired through the same
+     generalized relative pose solver path, matching COLMAP's world-rig to
+     query-camera formulation for non-panoramic world rigs.
+   - Remaining work: finish exact metadata semantics for every geometry config
+     and close the remaining bit-level solver/random perturbation semantics,
+     generalized absolute pose registration/refinement, and mapper
+     rig-registration integration behind `CALIBRATED_RIG`.
 10. [partial] Replace the local RANSAC implementation with COLMAP-equivalent
     RANSAC / LORANSAC support scoring, stopping criteria, random seeding, and
     solver selection.
@@ -276,8 +408,118 @@ reconstruction parity.
     correspondence counts, including registration trial bookkeeping.
    - Added registration trial bookkeeping for unregistered images and stopped
      using relative-pose-only registration as a default mapper path.
-   - Remaining work: exact COLMAP initial-image priority queue, prior focal
-     length handling, and retry/reset semantics.
+   - Initial-pair selection now follows COLMAP's two-stage ordering for the
+     covered mapper path: first images are sorted by prior focal length and
+     total correspondence count; second images are sorted by prior focal
+     length and pair correspondence count; selected pair geometry is oriented
+     to the chosen first/second image order.
+   - Added COLMAP-style initialization bookkeeping for the covered single-model
+     mapper path: `init_max_reg_trials` defaults to 2, first initial images are
+     skipped after reaching the initialization trial limit, images already
+     counted as registered are excluded from initial-pair seeding, tried
+     initial pairs are suppressed by COLMAP image-pair id, and the
+     corresponding initialization thresholds are exposed on the CLI.
+   - Initialization bookkeeping now lives in a mapper-session state that can
+     persist across reconstruction attempts: tried initial pairs and
+     initialization trial counts survive failed attempts, successful kept
+     reconstructions add COLMAP-style registration counts, discarded
+     reconstructions roll those counts back, and `ResetInitializationStats`
+     semantics are available for COLMAP's later relaxation passes.
+   - Added COLMAP-shaped `init_num_trials` and initialization relaxation
+     scheduling: strict initialization uses the configured thresholds, then
+     two relaxation rounds reset initialization stats and alternately halve
+     `init_min_num_inliers` and `init_min_tri_angle_deg`, matching the
+     controller-level order in COLMAP.
+   - Added COLMAP-style bad-initial-pair retry behavior for the covered
+     initialization path: initial reconstructions that produce no/too few 3D
+     points after triangulation or post-BA are rejected as `BAD_INITIAL_PAIR`,
+     keep the failed image pair marked as tried, and continue with the next
+     trial in the same relaxation stage. This is covered by a synthetic mapper
+     parity test that recovers from a bad first pair to a valid second pair.
+   - Added the first COLMAP-style multi-model pipeline control slice:
+     `multiple_models`, `max_num_models`, `max_model_overlap`, and
+     `min_model_size` defaults are exposed, the pipeline can keep multiple
+     sub-models through a shared mapper session, the first reconstruction is
+     kept independent of size, later reconstructions below the customized
+     `min_model_size = min(min_model_size, num_images / 2)` threshold are
+     discarded with registration counts rolled back, and retained sub-models
+     are exported as `sparse/0`, `sparse/1`, ... when more than one model is
+     kept. A synthetic parity test covers the first-small-kept /
+     later-small-discarded rule.
+   - Multi-model registration statistics now follow COLMAP's
+     `NumSharedRegImages` boundary for the covered mapper-session path:
+     shared-image counts are scoped to the current sub-model instead of being
+     accumulated across all previous sub-models, while discarded uncommitted
+     reconstructions no longer roll back global registration counts from
+     earlier kept models.
+   - Added COLMAP-shaped sparse snapshot exports for the covered incremental
+     pipeline path: `snapshot_path` and `snapshot_frames_freq` are exposed on
+     the CLI/config, snapshots are written only after registered-frame growth
+     crosses the configured frequency after initialization, and each snapshot
+     contains COLMAP sparse reconstruction text files.
+   - Added the COLMAP controller-level color extraction switch for the covered
+     mapper path: `extract_colors` defaults to true, `--no-extract-colors`
+     disables color propagation into new 3D points by zeroing sampled keypoint
+     colors, and parity tests cover the black-point behavior when disabled.
+   - Color extraction now follows COLMAP's per-registration timing for the
+     covered incremental pipeline path: new triangulated points start black,
+     the initial image pair is colorized after initial global BA/filtering,
+     each next registered frame is colorized after local/scheduled global
+     refinement and before snapshots, and the per-image extraction only fills
+     still-black 3D points instead of overwriting already-colored points.
+   - Final color extraction now follows COLMAP's all-image averaging behavior
+     for the covered output path: after the final global BA/refinement stage,
+     all registered track observations are averaged per 3D point, existing
+     non-black colors can be overwritten by the track mean, and unobserved
+     points fall back to black when color extraction is enabled.
+   - Added COLMAP-shaped controller callback event boundaries to the covered
+     pipeline log: `INITIAL_IMAGE_PAIR_REG_CALLBACK` fires after initial-pair
+     color extraction, `NEXT_IMAGE_REG_CALLBACK` fires after next-image
+     color extraction and snapshot handling, and `LAST_IMAGE_REG_CALLBACK`
+     fires after the reconstruction keep/discard decision.
+   - Added a lightweight public callback sink for the covered reconstruction
+     path: `run_reconstruction_with_callbacks` exposes the same
+     initial/next/last registration event types with model index, registered
+     image/frame counts, and point counts, and parity coverage verifies both
+     callback ordering and sink payloads.
+   - Added the first continue-existing reconstruction slice: reference sparse
+     models now seed current mapper attempts with existing registered poses,
+     point3D ids, points, and 2D-3D observations mapped by image name; seeded
+     reconstructions skip initial-pair selection and enter next-image
+     registration directly, preserving existing points while registering new
+     images. Synthetic parity coverage verifies both sparse-model seed loading
+     and the no-`initial_pair` continuation path.
+   - Added COLMAP-style `fix_existing_frames` for the covered continuation
+     path: the CLI/config exposes the switch, mapper attempts record the
+     registration units that were already registered at
+     `BeginReconstruction` time, local/global BA mark those existing units as
+     constant, and registered-frame filtering skips existing units instead of
+     deregistering them. Tests cover the default-off option, local-BA constant
+     image scheduling, and filtering protection.
+   - Added the covered `Reconstruct(..., continue_reconstruction)`
+     reconstruction-manager index-0 control flow: when a reference sparse
+     model seeds the pipeline, only the first strict trial reuses the seeded
+     reconstruction; later trials keep the same camera/rig metadata but start
+     from an empty reconstruction, matching COLMAP's index-0 reuse followed by
+     new sub-model creation. A parity test verifies one continuation attempt
+     followed by a new initial-pair sub-model.
+   - Broadened the continuation/fixed-existing coverage to non-trivial
+     COLMAP frames: tests now verify that a seeded multi-image rig frame is
+     reused only on the first continuation trial, that `fix_existing_frames`
+     marks the full seeded frame constant for local BA, and that registered
+     frame filtering protects the full seeded frame instead of deregistering
+     either sibling image.
+   - Added a real COLMAP sparse-text fixture path for this continuation slice:
+     tests now write `cameras/images/points3D/rigs/frames` files with
+     non-contiguous image ids, load them through `reference_camera_setup`,
+     verify `frames.txt` data-id ownership, confirm index-0 seed reuse only on
+     the first continuation trial, and verify `fix_existing_frames` protects
+     the seeded rig frame in local-BA scheduling and registered-frame
+     filtering.
+   - Remaining work: full `IncrementalPipeline` multi-model orchestration with
+     deterministic parallel initial-pair probing, a real user-extensible
+     callback API, and official COLMAP-output / real-dataset rig-frame
+     continuation parity fixtures.
 13. [partial] Port next-image ranking by visible points count, visible points
     ratio, and uncertainty score.
    - Registration candidates are now ranked primarily by visible 3D points,
@@ -310,6 +552,10 @@ reconstruction parity.
      image now start registration from the healthy input prior even if the
      current mutable camera block has drifted but is not yet formally bogus;
      already-registered healthy shared cameras remain fixed for later images.
+   - Local BA after a new registration now builds its constant-camera schedule
+     from COLMAP-style post-registration counters, so the just-registered
+     image/frame is included when deciding whether a shared camera is only
+     partially covered by the local bundle.
    - Absolute-pose refinement now uses only the RANSAC inlier observations,
      matching COLMAP's inlier-mask refinement path, and camera-parameter
      refinement failures or bogus refined cameras reject the registration
@@ -345,11 +591,29 @@ reconstruction parity.
    - Post-registration writes are now guarded by a reconstruction snapshot:
      failed required local BA or bogus registered cameras roll the candidate
      image/camera/track changes back and count as a failed registration trial.
+   - Failed registration trials now increment at COLMAP registration-unit
+     granularity: a failed or impossible non-trivial frame attempt marks every
+     image in that frame once, and successful registration resets the full
+     frame's trial counters.
+   - Added a COLMAP-shaped generalized absolute-pose path for non-trivial rig
+     frames. It reuses PoseLib's GP3P minimal solver behind the existing
+     `poselib` feature, converts pixel thresholds per observed rig camera,
+     scores candidate poses with COLMAP-style unique-3D-point support ordering,
+     handles panoramic three-camera samples with PoseLib P3P fallback, and
+     registers/continues tracks for the full frame in the mapper.
+   - Added COLMAP-shaped generalized absolute-pose refinement after GP3P:
+     the mapper reuses RustSFM's frame-aware BA path on a scratch
+     reconstruction, keeps points/cameras/rig sensor poses fixed, and only
+     refines `rig_from_world` from the RANSAC inlier residuals.
+   - Added COLMAP's generalized-registration scheduling gate: non-trivial rigs
+     with unknown/unregistered focal lengths fall back to central absolute pose
+     before generalized GP3P is attempted, and central registration resets any
+     bogus sibling frame cameras from priors.
    - Remaining work: validate exact sample sequences against COLMAP's target
      standard-library `std::uniform_int_distribution` behavior if byte-for-byte
-     fixed-seed parity is required, then finish full frame/rig-level
-     refinement/reset scheduling, deregistration event counters, and
-     generalized rig pose.
+     fixed-seed parity is required, then finish Ceres-equivalent generalized
+     refinement/covariance behavior, frame/rig-level camera reset/refinement
+     scheduling, and deregistration event counters.
 15. [partial] Port structure-less registration fallback.
    - The earlier pair-pose-derived structure-less registration path is now
      explicit experimental behavior only
@@ -377,11 +641,11 @@ reconstruction parity.
    - Removed the remaining default adjacent-pair-only rotation-consistency
      check in next-image registration so database/non-local verified pairs can
      participate like COLMAP correspondences.
-   - Remaining work: finish the real COLMAP `EstimateStructureLessAbsolutePose`
-     implementation by porting `LORANSAC<GR6PEstimator, GR8PEstimator>`,
-     including PoseLib's GR6P solver, COLMAP's GR8P local estimator, Sampson
-     residual support scoring, random sampler semantics, and the official
-     absolute-pose camera reset/refinement schedule.
+   - `EstimateStructureLessAbsolutePose` now reuses the generalized
+     relative-pose GR6P/GR8P path for non-panoramic world rigs.
+   - Remaining work: finish exact control-flow/random sampler semantics and
+     the official absolute-pose camera reset/refinement schedule around
+     registered non-trivial rigs.
 
 ## P4 - Triangulation And Observation Management
 
@@ -402,9 +666,13 @@ reconstruction parity.
      granularity, deleting observations and refreshing correspondence stats
      for every image in the frame, with rig sensor pose propagation for known
      `sensor_from_rig` setups.
+   - Added mapper-level registered-frame filtering that calls the frame-aware
+     deregistration hook and registration-stat rollback together, matching
+     COLMAP's `DeRegisterFrame` / `DeRegisterFrameEvent` pairing for bogus or
+     zero-observation registered frames after the 20-frame threshold.
    - Remaining work: keep a longer-lived mapper-level observation manager and
      finish exact COLMAP frame/rig semantics for generalized pose, BA
-     scheduling, and all filtering/deregistration cleanup events.
+     scheduling, retry bookkeeping, and all cleanup events.
 17. [partial] Port `IncrementalTriangulator` create/continue/merge/complete/retriangulate
     behavior, transitivity, angular/reprojection thresholds, and two-view-track
     handling.
@@ -429,9 +697,11 @@ reconstruction parity.
    - Absolute-pose registration now rejects images with bogus cameras before
      PnP, and mapper BA rejects or rolls back runs that start/end with bogus
      registered cameras.
-   - Remaining work: exact COLMAP frame/rig-level deregistration counters after
-     failed refinements and exact filtering schedules for local/global BA
-     phases.
+   - Registered-frame filtering now deregisters full frames/images with bogus
+     cameras or zero point3D observations after COLMAP's 20-frame threshold,
+     and rolls back frame/rig/camera registration counters.
+   - Remaining work: exact COLMAP deregistration counters after every failed
+     refinement path and exact filtering schedules for local/global BA phases.
 
 ## P5 - Bundle Adjustment And Refinement
 
@@ -510,6 +780,10 @@ reconstruction parity.
       fixes shared camera intrinsics when the local image set does not contain
       every currently registered image for that camera, matching COLMAP's
       per-camera local BA scheduling boundary.
+    - The mapper now mirrors COLMAP's ordering more closely by including the
+      just-registered image/frame in the registration counters used to build
+      local BA constant-camera decisions, while still only committing those
+      counters permanently after rollback checks pass.
     - Frame `rig_from_world` metadata is refreshed after successful BA so
       exported sparse models preserve the current frame pose instead of the
       original registration pose.

@@ -1,3 +1,4 @@
+use nalgebra::Matrix3;
 use rustslam::Match;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -72,6 +73,11 @@ impl From<FeatureMatch> for Match {
 pub struct TwoViewGeometryRecord {
     pub config: i32,
     pub inlier_matches: Vec<FeatureMatch>,
+    pub f_matrix: Option<[f64; 9]>,
+    pub e_matrix: Option<[f64; 9]>,
+    pub h_matrix: Option<[f64; 9]>,
+    pub qvec: Option<[f64; 4]>,
+    pub tvec: Option<[f64; 3]>,
 }
 
 impl TwoViewGeometryRecord {
@@ -79,10 +85,27 @@ impl TwoViewGeometryRecord {
         Self {
             config: 0,
             inlier_matches,
+            ..Self::default()
         }
     }
 
     pub fn invert(&mut self) {
+        self.f_matrix = self.f_matrix.map(transpose3);
+        self.e_matrix = self.e_matrix.map(transpose3);
+        self.h_matrix = self.h_matrix.and_then(invert_matrix3);
+        if let (Some(qvec), Some(tvec)) = (self.qvec, self.tvec) {
+            let rotation = glam::DQuat::from_xyzw(qvec[1], qvec[2], qvec[3], qvec[0]).normalize();
+            let translation = glam::DVec3::from_array(tvec);
+            let inverse_rotation = rotation.inverse();
+            let inverse_translation = -(inverse_rotation * translation);
+            self.qvec = Some([
+                inverse_rotation.w,
+                inverse_rotation.x,
+                inverse_rotation.y,
+                inverse_rotation.z,
+            ]);
+            self.tvec = Some(inverse_translation.to_array());
+        }
         for match_ in &mut self.inlier_matches {
             std::mem::swap(&mut match_.point2d_idx1, &mut match_.point2d_idx2);
         }
@@ -321,6 +344,15 @@ impl CorrespondenceGraph {
         Ok(self.image(image_id)?.num_correspondences)
     }
 
+    pub fn num_points2d_for_image(&self, image_id: ImageId) -> Result<usize> {
+        let image = self.image(image_id)?;
+        if self.finalized {
+            Ok(image.flat_corr_begs.len().saturating_sub(1))
+        } else {
+            Ok(image.corrs.len())
+        }
+    }
+
     pub fn num_matches_between_images(
         &self,
         image_id1: ImageId,
@@ -515,6 +547,28 @@ fn saturating_point2d_len(len: usize) -> Point2DIdx {
     len.min(Point2DIdx::MAX as usize) as Point2DIdx
 }
 
+fn transpose3(matrix: [f64; 9]) -> [f64; 9] {
+    [
+        matrix[0], matrix[3], matrix[6], matrix[1], matrix[4], matrix[7], matrix[2], matrix[5],
+        matrix[8],
+    ]
+}
+
+fn invert_matrix3(matrix: [f64; 9]) -> Option<[f64; 9]> {
+    let inverse = Matrix3::from_row_slice(&matrix).try_inverse()?;
+    Some([
+        inverse[(0, 0)],
+        inverse[(0, 1)],
+        inverse[(0, 2)],
+        inverse[(1, 0)],
+        inverse[(1, 1)],
+        inverse[(1, 2)],
+        inverse[(2, 0)],
+        inverse[(2, 1)],
+        inverse[(2, 2)],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +736,8 @@ mod tests {
         let mut graph = CorrespondenceGraph::new();
         graph.add_image(1, 2).unwrap();
         graph.add_image(2, 2).unwrap();
+        let f_matrix = Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let h_matrix = Some([1.0, 0.0, 2.0, 0.0, 1.0, 3.0, 0.0, 0.0, 1.0]);
         graph
             .add_two_view_geometry(
                 2,
@@ -689,6 +745,11 @@ mod tests {
                 TwoViewGeometryRecord {
                     config: 7,
                     inlier_matches: vec![m(1, 0)],
+                    f_matrix,
+                    h_matrix,
+                    qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                    tvec: Some([0.3, 0.4, 0.5]),
+                    ..TwoViewGeometryRecord::default()
                 },
             )
             .unwrap();
@@ -696,6 +757,14 @@ mod tests {
         let without_matches = graph.extract_two_view_geometry(2, 1, false).unwrap();
         assert_eq!(without_matches.config, 7);
         assert!(without_matches.inlier_matches.is_empty());
+        assert_eq!(without_matches.f_matrix, f_matrix);
+        assert_eq!(without_matches.h_matrix, h_matrix);
+        assert_eq!(without_matches.tvec, Some([0.3, 0.4, 0.5]));
+
+        let sorted_direction = graph.extract_two_view_geometry(1, 2, false).unwrap();
+        assert_eq!(sorted_direction.f_matrix, f_matrix.map(transpose3));
+        assert!(sorted_direction.h_matrix.is_some());
+        assert_eq!(sorted_direction.tvec, Some([-0.3, -0.4, -0.5]));
 
         let with_matches = graph.extract_two_view_geometry(2, 1, true).unwrap();
         assert_eq!(with_matches.inlier_matches, vec![m(1, 0)]);
@@ -707,11 +776,18 @@ mod tests {
                 TwoViewGeometryRecord {
                     config: 9,
                     inlier_matches: vec![m(0, 0)],
+                    e_matrix: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+                    ..TwoViewGeometryRecord::default()
                 },
             )
             .unwrap();
         let updated = graph.extract_two_view_geometry(2, 1, true).unwrap();
         assert_eq!(updated.config, 9);
         assert_eq!(updated.inlier_matches, vec![m(1, 0)]);
+        assert_eq!(
+            updated.e_matrix,
+            Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+        );
+        assert_eq!(updated.f_matrix, None);
     }
 }

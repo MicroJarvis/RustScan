@@ -14,13 +14,30 @@ Two-view verification now preserves COLMAP-style geometry configs for
 calibrated, uncalibrated, planar/panoramic, watermark, and multiple-model cases
 while filtering ambiguous watermark/multiple pairs out of the default mapper
 graph.
-Incremental registration is absolute-pose driven with visible-point ranking,
-registration trial bookkeeping, inlier-ratio checks, and pose-only
-reprojection refinement before accepting new images. Successful registrations
-now trigger a local bundle-adjustment pass over the new image, its strongest
-shared-point neighbors selected with triangulation-angle checks, and new or
-short-track local 3D points; local BA is followed by track merge/completion,
-new-image completion, and track filtering.
+Rust-estimated verified pair geometry can be written back to the COLMAP
+`two_view_geometries` table with `--write-two-view-geometries`; this is opt-in
+so the default reconstruction path does not mutate the input database.
+Generalized rig relative/absolute pose now follows COLMAP's panoramic-rig
+branches and can optionally use PoseLib's GR6P/GP3P minimal solvers plus a
+COLMAP-derived GR8P local refit bridge for non-panoramic rigs, with
+BA-backed pose-only generalized absolute-pose refinement for rig frames and
+COLMAP-style fallback to central PnP when a rig camera still needs focal-length
+estimation, by building with `--features poselib` and setting
+`POSELIB_ROOT=/path/to/PoseLib-2.0.5` (or placing PoseLib at
+`third_party/PoseLib`). This is a step toward COLMAP `CALIBRATED_RIG` parity;
+remaining compatibility work includes exact bit-level solver/random semantics,
+Ceres-equivalent generalized refinement behavior, and full mapper camera
+reset/refinement scheduling.
+Incremental registration is absolute-pose driven with COLMAP-style next-image
+ranking methods, registration trial bookkeeping, inlier-ratio checks, and
+pose-only reprojection refinement before accepting new images. Filtered or
+previously failed registration units are retried from a lower-priority bucket
+like COLMAP, and max-trial checks are applied over the full frame registration
+unit.
+Successful registrations now trigger a local bundle-adjustment pass over the
+new image, its strongest shared-point neighbors selected with
+triangulation-angle checks, and new or short-track local 3D points; local BA is
+followed by track merge/completion, new-image completion, and track filtering.
 Global bundle adjustment now runs after initialization, on COLMAP-style
 registered-image/point growth triggers, and at finalization when the model has
 changed since the last global pass; each pass fixes two registered images as the
@@ -30,4 +47,7 @@ completion/merge/filter post-processing.
 Triangulation applies angular/reprojection gates, re-estimates track geometry
 after continuation/merge, and filters negative-depth, reprojection,
 triangulation-angle, bogus-camera, and short-track outliers during the
-incremental loop.
+incremental loop. After COLMAP's 20-registration-unit warm-up threshold, mapper
+cleanup also deregisters full frames/images whose registered cameras are bogus
+or whose frame has no remaining point3D observations, keeping the frame/rig and
+per-camera registration counters in sync with the reconstruction state.

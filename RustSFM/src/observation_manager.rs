@@ -1148,6 +1148,11 @@ mod tests {
             left,
             right,
             two_view_config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+            f_matrix: None,
+            e_matrix: None,
+            h_matrix: None,
+            qvec: None,
+            tvec: None,
             matches: Vec::new(),
             inlier_matches: matches
                 .iter()

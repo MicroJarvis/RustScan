@@ -105,6 +105,7 @@ pub fn compare_database_parity(
     min_num_matches: usize,
     ignore_watermarks: bool,
     load_all_images: bool,
+    convert_pose_priors_to_enu: bool,
 ) -> Result<ParityReport> {
     let requested_images = image_names.into_iter().collect::<BTreeSet<_>>();
     let db = ColmapDatabase::open(database)?;
@@ -119,6 +120,8 @@ pub fn compare_database_parity(
         ignore_watermarks,
         image_names: requested_images.clone(),
         load_all_images,
+        convert_pose_priors_to_enu,
+        ..DatabaseCacheOptions::default()
     })?;
     let cache_stats = cache_stats(&cache, &db)?;
     let frames = cache_frames(&cache.images, &keypoint_counts);
@@ -612,7 +615,7 @@ mod tests {
             },
         )?;
 
-        let report = compare_database_parity(&path, Vec::<String>::new(), 1, true, false)?;
+        let report = compare_database_parity(&path, Vec::<String>::new(), 1, true, false, false)?;
         assert_eq!(report.raw.images, 3);
         assert_eq!(report.raw.frames, 0);
         assert_eq!(report.raw.frame_data, 0);
@@ -620,21 +623,29 @@ mod tests {
         assert_eq!(report.raw.images_without_frame, 3);
         assert_eq!(report.raw.two_view_pairs, 3);
         assert_eq!(report.raw.verified_two_view_pairs, 2);
-        assert_eq!(report.cache.images, 2);
+        assert_eq!(report.cache.images, 3);
         assert_eq!(report.cache.frames, 3);
         assert_eq!(report.cache.frame_data, 3);
-        assert_eq!(report.cache.images_with_frame, 2);
+        assert_eq!(report.cache.images_with_frame, 3);
         assert_eq!(report.cache.images_without_frame, 0);
-        assert_eq!(report.cache.two_view_pairs, 1);
-        assert_eq!(report.bridge.frame_pairs, 1);
-        assert_eq!(report.bridge.matches, 2);
-        assert_eq!(report.initial_pair_input.total_candidates, 1);
+        assert_eq!(report.cache.two_view_pairs, 2);
+        assert_eq!(report.cache.inlier_matches, 4);
+        assert_eq!(report.bridge.frame_pairs, 2);
+        assert_eq!(report.bridge.matches, 4);
+        assert_eq!(report.initial_pair_input.total_candidates, 2);
         assert_eq!(report.initial_pair_input.eligible_candidates, 0);
         assert!(report.initial_pair_input.selected.is_none());
-        assert_eq!(
-            report.initial_pair_input.top_candidates[0].rejection_reasons,
-            vec!["inliers_lt_100".to_string()]
-        );
+        let rejection_reasons = report
+            .initial_pair_input
+            .top_candidates
+            .iter()
+            .map(|candidate| candidate.rejection_reasons.clone())
+            .collect::<Vec<_>>();
+        assert!(rejection_reasons.contains(&vec!["inliers_lt_100".to_string()]));
+        assert!(rejection_reasons.contains(&vec![
+            "inliers_lt_100".to_string(),
+            "config_degenerate".to_string()
+        ]));
         assert!(report
             .config_histogram
             .iter()
@@ -648,8 +659,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("database.db");
         let db = ColmapDatabase::open(&path)?;
-        let report =
-            compare_database_parity(&path, vec!["missing.jpg".to_string()], 1, false, false)?;
+        let report = compare_database_parity(
+            &path,
+            vec!["missing.jpg".to_string()],
+            1,
+            false,
+            false,
+            false,
+        )?;
         assert_eq!(
             report.bridge.missing_requested_images,
             vec!["missing.jpg".to_string()]
@@ -714,7 +731,7 @@ mod tests {
             },
         )?;
 
-        let report = compare_database_parity(&path, Vec::<String>::new(), 1, false, false)?;
+        let report = compare_database_parity(&path, Vec::<String>::new(), 1, false, false, false)?;
         let selected = report
             .initial_pair_input
             .selected

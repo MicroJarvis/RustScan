@@ -33,6 +33,11 @@ pub struct TwoViewOptions {
 #[derive(Debug, Clone)]
 pub struct TwoViewEstimate {
     pub essential: Matrix3<f64>,
+    pub fundamental: Option<Matrix3<f64>>,
+    pub homography: Option<Matrix3<f64>>,
+    pub e_matrix: Option<[f64; 9]>,
+    pub qvec: Option<[f64; 4]>,
+    pub tvec: Option<[f64; 3]>,
     pub two_view_config: i32,
     pub inlier_mask: Vec<bool>,
     pub pose: SE3,
@@ -378,9 +383,15 @@ pub fn estimate_calibrated_two_view_with_observations_and_cameras(
     if pose_score.triangulated < options.min_triangulated {
         return None;
     }
+    let pose_rigid = rigid3_from_se3(pose_score.pose);
 
     Some(TwoViewEstimate {
         essential: pose_essential,
+        fundamental: f_support.as_ref().map(|(model, _)| *model),
+        homography: h_support.as_ref().map(|(model, _)| *model),
+        e_matrix: Some(matrix3_to_row_array(pose_essential)),
+        qvec: Some(pose_rigid.qvec),
+        tvec: Some(pose_rigid.tvec),
         two_view_config,
         inlier_mask: selected_mask,
         pose: pose_score.pose,
@@ -492,9 +503,15 @@ fn estimate_force_h_two_view(
     if pose_score.triangulated < options.min_triangulated {
         return None;
     }
+    let pose_rigid = rigid3_from_se3(pose_score.pose);
 
     Some(TwoViewEstimate {
         essential,
+        fundamental: None,
+        homography: Some(homography),
+        e_matrix: Some(matrix3_to_row_array(essential)),
+        qvec: Some(pose_rigid.qvec),
+        tvec: Some(pose_rigid.tvec),
         two_view_config,
         inlier_mask: h_support.inlier_mask,
         pose: pose_score.pose,
@@ -725,6 +742,148 @@ pub(crate) fn triangulate_world_point(
     Some(left_pose.inverse().transform_point(&point_left))
 }
 
+pub(crate) fn estimate_relative_pose_from_rays(
+    rays1: &[[f64; 3]],
+    rays2: &[[f64; 3]],
+    max_error: f64,
+    min_inlier_ratio: f64,
+    min_num_trials: usize,
+    max_num_trials: usize,
+    confidence: f64,
+    dyn_num_trials_multiplier: f64,
+    random_seed: i32,
+) -> Option<(SE3, usize, Vec<bool>)> {
+    const SAMPLE_SIZE: usize = 5;
+    let n = rays1.len().min(rays2.len());
+    if n < SAMPLE_SIZE {
+        return None;
+    }
+
+    let pts1 = rays1
+        .iter()
+        .take(n)
+        .map(|ray| Vector3::new(ray[0], ray[1], ray[2]))
+        .collect::<Vec<_>>();
+    let pts2 = rays2
+        .iter()
+        .take(n)
+        .map(|ray| Vector3::new(ray[0], ray[1], ray[2]))
+        .collect::<Vec<_>>();
+    let active_indices = (0..n).collect::<Vec<_>>();
+    let seed = if random_seed >= 0 {
+        random_seed as u64
+    } else {
+        0x6a09_e667_f3bc_c909
+    };
+    let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
+    let mut max_iterations = max_num_trials.max(1);
+    let min_iterations = min_num_trials.max(1);
+    let assumed_inliers =
+        ((min_inlier_ratio.clamp(0.0, 1.0) * 100_000.0) as usize).max(SAMPLE_SIZE);
+    max_iterations = max_iterations.min(
+        ransac_num_trials_from_counts(
+            assumed_inliers,
+            100_000,
+            SAMPLE_SIZE,
+            confidence,
+            dyn_num_trials_multiplier,
+        )
+        .max(min_iterations),
+    );
+
+    let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let mut iteration = 0usize;
+    while iteration < max_iterations {
+        iteration += 1;
+        let sample = sampler.sample(SAMPLE_SIZE);
+        if sample.len() != SAMPLE_SIZE {
+            break;
+        }
+        for model in estimate_essential_five_point_indexed(&pts1, &pts2, &sample) {
+            let mut support =
+                model_support_indexed(&pts1, &pts2, &active_indices, &model, max_error);
+            if support.inliers < SAMPLE_SIZE {
+                continue;
+            }
+
+            if is_better_support(&support, best.as_ref().map(|(_, support)| support)) {
+                let mut local_model = model;
+                for _ in 0..10 {
+                    let previous_inliers = support.inliers;
+                    if previous_inliers < SAMPLE_SIZE {
+                        break;
+                    }
+                    let inliers = support
+                        .inlier_mask
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, &is_inlier)| is_inlier.then_some(idx))
+                        .collect::<Vec<_>>();
+                    let local_models =
+                        estimate_essential_five_point_indexed(&pts1, &pts2, &inliers);
+                    let mut improved = false;
+                    for candidate_model in local_models {
+                        let candidate_support = model_support_indexed(
+                            &pts1,
+                            &pts2,
+                            &active_indices,
+                            &candidate_model,
+                            max_error,
+                        );
+                        if is_better_support(&candidate_support, Some(&support)) {
+                            local_model = candidate_model;
+                            support = candidate_support;
+                            improved = true;
+                        }
+                    }
+                    if support.inliers <= previous_inliers || !improved {
+                        break;
+                    }
+                }
+
+                max_iterations = max_iterations.min(
+                    ransac_num_trials_from_counts(
+                        support.inliers,
+                        n,
+                        SAMPLE_SIZE,
+                        confidence,
+                        dyn_num_trials_multiplier,
+                    )
+                    .max(min_iterations)
+                    .min(max_num_trials.max(1)),
+                );
+                best = Some((local_model, support));
+            }
+        }
+    }
+
+    let (essential, support) = best?;
+    if support.inliers < SAMPLE_SIZE {
+        return None;
+    }
+    let pose_score = choose_pose_from_essential(
+        &essential,
+        &pts1,
+        &pts2,
+        &rays_to_pixel_like_observations(rays1, n),
+        &rays_to_pixel_like_observations(rays2, n),
+        &support.inlier_mask,
+        CameraModel::new_pinhole(1, 1, 1.0, 1.0, 0.0, 0.0),
+        CameraModel::new_pinhole(1, 1, 1.0, 1.0, 0.0, 0.0),
+    )?;
+    Some((pose_score.pose, support.inliers, support.inlier_mask))
+}
+
+fn rays_to_pixel_like_observations(rays: &[[f64; 3]], n: usize) -> Vec<[f32; 2]> {
+    rays.iter()
+        .take(n)
+        .map(|ray| {
+            let z = if ray[2].abs() > 1.0e-12 { ray[2] } else { 1.0 };
+            [(ray[0] / z) as f32, (ray[1] / z) as f32]
+        })
+        .collect()
+}
+
 fn is_better_support(candidate: &ModelSupport, current: Option<&ModelSupport>) -> bool {
     let Some(current) = current else {
         return true;
@@ -770,6 +929,42 @@ fn adaptive_ransac_iterations(
         } else {
             num_trials.clamp(1.0, max_iterations as f64) as u32
         }
+    }
+}
+
+fn ransac_num_trials_from_counts(
+    inliers: usize,
+    total: usize,
+    sample_size: usize,
+    confidence: f64,
+    multiplier: f64,
+) -> usize {
+    if sample_size == 0 || total >= sample_size && inliers >= total {
+        return 1;
+    }
+    if inliers < sample_size || total < sample_size {
+        return usize::MAX;
+    }
+    let prob_failure = 1.0 - confidence;
+    if prob_failure <= 0.0 {
+        return usize::MAX;
+    }
+    let mut prob_inlier = 1.0;
+    for idx in 0..sample_size {
+        prob_inlier *= (inliers - idx) as f64 / (total - idx) as f64;
+    }
+    let prob_outlier = 1.0 - prob_inlier;
+    if prob_outlier <= 0.0 {
+        return 1;
+    }
+    if prob_outlier >= 1.0 {
+        return usize::MAX;
+    }
+    let trials = (prob_failure.ln() / prob_outlier.ln() * multiplier).ceil();
+    if trials.is_finite() && trials > 0.0 {
+        trials as usize
+    } else {
+        usize::MAX
     }
 }
 
@@ -2253,6 +2448,29 @@ fn se3_from_parts(r: &Matrix3<f64>, t: &Vector3<f64>) -> Option<SE3> {
         .then_some(SE3::from_quat_translation(quat, translation))
 }
 
+fn rigid3_from_se3(pose: SE3) -> crate::types::Rigid3 {
+    let q = pose.quaternion();
+    let t = pose.translation();
+    crate::types::Rigid3 {
+        qvec: [q[3] as f64, q[0] as f64, q[1] as f64, q[2] as f64],
+        tvec: [t[0] as f64, t[1] as f64, t[2] as f64],
+    }
+}
+
+fn matrix3_to_row_array(matrix: Matrix3<f64>) -> [f64; 9] {
+    [
+        matrix[(0, 0)],
+        matrix[(0, 1)],
+        matrix[(0, 2)],
+        matrix[(1, 0)],
+        matrix[(1, 1)],
+        matrix[(1, 2)],
+        matrix[(2, 0)],
+        matrix[(2, 1)],
+        matrix[(2, 2)],
+    ]
+}
+
 struct ColmapMt19937 {
     state: [u32; 624],
     index: usize,
@@ -2841,6 +3059,50 @@ mod tests {
         assert!((pose_rotation - rotation).norm() < 1.0e-6);
         assert!((pose_translation.normalize() - ref_translation).norm() < 1.0e-6);
         assert!(score.median_angle_deg > 0.0);
+    }
+
+    #[test]
+    fn two_view_estimate_carries_colmap_pose_metadata() {
+        let rotation = Rotation3::from_euler_angles(0.03, -0.04, 0.02).into_inner();
+        let translation = Vector3::new(0.2, -0.03, 0.05).normalize();
+        let points_world = [
+            Vector3::new(-0.4, -0.2, 3.0),
+            Vector3::new(0.1, -0.3, 4.0),
+            Vector3::new(0.5, -0.1, 3.5),
+            Vector3::new(-0.2, 0.4, 4.2),
+            Vector3::new(0.4, 0.3, 3.8),
+            Vector3::new(-0.6, 0.15, 4.5),
+            Vector3::new(0.25, -0.45, 3.7),
+            Vector3::new(0.7, 0.25, 4.8),
+            Vector3::new(-0.35, 0.45, 5.0),
+            Vector3::new(0.55, -0.25, 4.4),
+        ];
+        let pts1 = points_world
+            .iter()
+            .map(|p| [p.x as f32 / p.z as f32, p.y as f32 / p.z as f32])
+            .collect::<Vec<_>>();
+        let pts2 = points_world
+            .iter()
+            .map(|p| {
+                let q = rotation * p + translation;
+                [q.x as f32 / q.z as f32, q.y as f32 / q.z as f32]
+            })
+            .collect::<Vec<_>>();
+        let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let mut options = default_test_options();
+        options.min_inliers = 8;
+        options.min_triangulated = 4;
+        options.ransac_max_iterations = 128;
+        let estimate = estimate_calibrated_two_view(&pts1, &pts2, camera, &options).unwrap();
+
+        assert_eq!(
+            estimate.e_matrix.unwrap(),
+            matrix3_to_row_array(estimate.essential)
+        );
+        assert!(estimate.qvec.is_some());
+        assert!(estimate.tvec.is_some());
+        assert!(estimate.qvec.unwrap().iter().all(|value| value.is_finite()));
+        assert!(estimate.tvec.unwrap().iter().all(|value| value.is_finite()));
     }
 
     fn transform_homography_point(h: &Matrix3<f64>, x: f64, y: f64) -> Vector3<f64> {

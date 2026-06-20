@@ -42,6 +42,7 @@ pub struct BundleAdjustmentOptions {
     pub refine_extra_params: bool,
     pub point_ids: Option<Vec<usize>>,
     pub constant_point_ids: Option<Vec<usize>>,
+    pub allow_single_observation_points: bool,
 }
 
 impl Default for BundleAdjustmentOptions {
@@ -68,6 +69,7 @@ impl Default for BundleAdjustmentOptions {
             refine_extra_params: false,
             point_ids: None,
             constant_point_ids: None,
+            allow_single_observation_points: false,
         }
     }
 }
@@ -186,6 +188,7 @@ pub fn refine_bundle_adjustment(
         reconstruction,
         options.max_observation_error_px,
         point_filter.as_ref(),
+        options.allow_single_observation_points,
     );
     if matches!(options.gauge, BundleAdjustmentGauge::TwoCamsFromWorld) {
         let fixed = apply_two_cams_from_world_gauge(
@@ -990,13 +993,14 @@ fn collect_observations(
     reconstruction: &Reconstruction,
     max_error_px: f64,
     point_filter: Option<&HashSet<usize>>,
+    allow_single_observation_points: bool,
 ) -> Vec<BaObservation> {
     let mut observations = Vec::new();
     for (point_id, point) in reconstruction.points.iter().enumerate() {
         if point_filter.is_some_and(|filter| !filter.contains(&point_id)) {
             continue;
         }
-        if point.track.len() < 2 {
+        if !allow_single_observation_points && point.track.len() < 2 {
             continue;
         }
         for obs in &point.track {
@@ -3981,6 +3985,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             original_points
         );
+    }
+
+    #[test]
+    fn bundle_adjustment_can_refine_pose_from_single_observation_points_when_enabled() {
+        let camera = CameraModel::new_pinhole(120, 100, 80.0, 80.0, 60.0, 50.0);
+        let true_pose =
+            SE3::from_quat_translation(Quat::from_rotation_y(0.04), Vec3::new(0.05, -0.02, 0.03));
+        let initial_pose =
+            SE3::from_quat_translation(Quat::from_rotation_y(0.08), Vec3::new(0.22, -0.05, 0.08));
+        let scene_points = [
+            [-0.5, -0.3, 3.0],
+            [-0.2, -0.2, 3.2],
+            [0.1, -0.25, 3.1],
+            [0.4, -0.1, 3.4],
+            [-0.4, 0.1, 3.3],
+            [0.0, 0.0, 3.0],
+            [0.35, 0.15, 3.5],
+            [-0.15, 0.35, 3.2],
+        ];
+        let mut frames = vec![frame(0)];
+        frames[0].keypoints = scene_points
+            .iter()
+            .map(|&point| {
+                let xy = project_point(camera, true_pose, point).unwrap();
+                rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)
+            })
+            .collect();
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses[0] = Some(initial_pose);
+        for (idx, xyz) in scene_points.into_iter().enumerate() {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: idx,
+                }],
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+        let initial_error = translation_distance(initial_pose, true_pose);
+
+        let skipped = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction.clone(),
+            BundleAdjustmentOptions {
+                iterations: 4,
+                max_observation_error_px: 100.0,
+                variable_images: Some(vec![0]),
+                constant_point_ids: Some((0..scene_points.len()).collect()),
+                ..BundleAdjustmentOptions::default()
+            },
+        );
+        assert!(skipped.is_none());
+
+        let report = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 8,
+                max_observation_error_px: 100.0,
+                variable_images: Some(vec![0]),
+                constant_point_ids: Some((0..scene_points.len()).collect()),
+                allow_single_observation_points: true,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.is_solution_usable());
+        assert!(report.final_cost < report.initial_cost);
+        assert!(translation_distance(reconstruction.poses[0].unwrap(), true_pose) < initial_error);
     }
 
     #[test]

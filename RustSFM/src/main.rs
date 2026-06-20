@@ -29,8 +29,26 @@ struct ReconstructArgs {
     reference: Option<PathBuf>,
     #[arg(long)]
     database: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    write_two_view_geometries: bool,
     #[arg(long)]
     max_images: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    single_model: bool,
+    #[arg(long, default_value = "50")]
+    max_num_models: usize,
+    #[arg(long, default_value = "20")]
+    max_model_overlap: usize,
+    #[arg(long, default_value = "10")]
+    min_model_size: usize,
+    #[arg(long)]
+    snapshot_path: Option<PathBuf>,
+    #[arg(long, default_value = "0")]
+    snapshot_frames_freq: usize,
+    #[arg(long, default_value_t = false)]
+    no_extract_colors: bool,
+    #[arg(long, default_value_t = false)]
+    fix_existing_frames: bool,
     #[arg(long, default_value = "sift")]
     feature_type: FeatureType,
     #[arg(long, default_value = "8192")]
@@ -55,6 +73,16 @@ struct ReconstructArgs {
     min_inliers: usize,
     #[arg(long, default_value = "4")]
     min_triangulated: usize,
+    #[arg(long, default_value = "100")]
+    init_min_num_inliers: usize,
+    #[arg(long, default_value = "16.0")]
+    init_min_tri_angle_deg: f32,
+    #[arg(long, default_value = "0.95")]
+    init_max_forward_motion: f32,
+    #[arg(long, default_value = "200")]
+    init_num_trials: usize,
+    #[arg(long, default_value = "2")]
+    init_max_reg_trials: usize,
     #[arg(long, default_value = "2.0")]
     essential_threshold_px: f32,
     #[arg(long, default_value = "10000")]
@@ -159,6 +187,8 @@ struct ParityArgs {
     ignore_watermarks: bool,
     #[arg(long, default_value_t = false)]
     load_all_images: bool,
+    #[arg(long, default_value_t = false)]
+    convert_pose_priors_to_enu: bool,
     #[arg(long)]
     output_json: Option<PathBuf>,
     #[arg(long, default_value = "info")]
@@ -177,7 +207,16 @@ fn main() -> Result<()> {
                 output: args.output,
                 reference: args.reference,
                 database: args.database,
+                write_two_view_geometries: args.write_two_view_geometries,
                 max_images: args.max_images,
+                multiple_models: !args.single_model,
+                max_num_models: args.max_num_models,
+                max_model_overlap: args.max_model_overlap,
+                min_model_size: args.min_model_size,
+                snapshot_path: args.snapshot_path,
+                snapshot_frames_freq: args.snapshot_frames_freq,
+                extract_colors: !args.no_extract_colors,
+                fix_existing_frames: args.fix_existing_frames,
                 feature_type: args.feature_type,
                 max_features: args.max_features,
                 match_ratio: args.match_ratio,
@@ -191,6 +230,11 @@ fn main() -> Result<()> {
                 min_matches: args.min_matches,
                 min_inliers: args.min_inliers,
                 min_triangulated: args.min_triangulated,
+                init_min_num_inliers: args.init_min_num_inliers,
+                init_min_tri_angle_deg: args.init_min_tri_angle_deg,
+                init_max_forward_motion: args.init_max_forward_motion,
+                init_num_trials: args.init_num_trials,
+                init_max_reg_trials: args.init_max_reg_trials,
                 essential_threshold_px: args.essential_threshold_px,
                 essential_iterations: args.essential_iterations,
                 pnp_threshold_px: args.pnp_threshold_px,
@@ -269,6 +313,7 @@ fn main() -> Result<()> {
                 args.min_matches,
                 args.ignore_watermarks,
                 args.load_all_images,
+                args.convert_pose_priors_to_enu,
             )?;
             println!(
                 "COLMAP database parity: raw_images={} cache_images={} raw_frames={} cache_frames={} raw_frame_data={} cache_frame_data={} raw_pairs={} cache_pairs={} bridge_pairs={} bridge_matches={} differences={}",
