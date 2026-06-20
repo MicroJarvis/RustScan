@@ -738,9 +738,9 @@ reconstruction parity.
      gating, angular and squared-reprojection residuals (matching
      `scene/projection.cc`), `InlierSupportMeasurer` support comparison, the
      COLMAP dynamic-stopping trial count, and a final inlier multi-view refit.
-     The 2-view sampling enumerates combinations deterministically; exact
-     `CombinationSampler` RNG/shuffle and bit-level LORANSAC parity remain under
-     the `optim` RANSAC item.
+     The 2-view sampling uses a shared Rust port of COLMAP's deterministic
+     `CombinationSampler`; random-sampler and bit-level LORANSAC parity remain
+     under the broader `optim` RANSAC item.
    - Wired `estimate_triangulation` into the incremental triangulator's
      track-creation path: `IncrementalTriangulator::create_pair_track` now
      gathers the seed observation pair plus transitively-corresponding
@@ -753,13 +753,13 @@ reconstruction parity.
      matching COLMAP. Verified by a three-view track-creation test plus the
      existing pair/retriangulate/color-extraction suite (293 default / 298
      poselib lib tests green).
-   - Remaining work: exact COLMAP `CombinationSampler` RNG/shuffle parity under
-     the `optim` RANSAC item, and finish observation-manager event/counter paths.
+   - Remaining work: finish broader random/progressive sampler and bit-level
+     LORANSAC parity under the `optim` RANSAC item.
    - **Update 2026-06-20:** `CompleteImage` per point2D (complete tracks +
      orphan-cluster reprojection RANSAC), `Complete` direct-graph BFS, and
-     `EstimateTriangulation` `random_seed` + MT19937 combination shuffle when
-     view count exceeds 15 are implemented. P4 triangulation + observation
-     manager marked 100% in `COLMAP_MODULE_PARITY.md` (303 lib tests).
+     `EstimateTriangulation` deterministic `CombinationSampler` order are
+     implemented. P4 triangulation + observation manager marked 100% in
+     `COLMAP_MODULE_PARITY.md` (303 lib tests).
 18. [partial] Port filtering by negative depth, reprojection error, triangulation angle,
     short tracks, and bogus camera parameters.
    - Reprojection filtering is now part of the default incremental loop.

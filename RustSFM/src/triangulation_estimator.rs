@@ -11,16 +11,14 @@
 //! `InlierSupportMeasurer` structure: it enumerates the 2-view combinations,
 //! scores each candidate by inlier support, applies the COLMAP dynamic
 //! stopping criterion, and performs a final local-optimization refit over all
-//! inliers via the multi-view DLT. Exact RANSAC RNG / sampler-shuffle parity is
-//! tracked separately under the `optim` RANSAC module when `random_seed < 0`;
-//! fixed seeds reproduce the COLMAP `CombinationSampler` shuffle order.
+//! inliers via the multi-view DLT.
 
 use crate::triangulation::{
     calculate_triangulation_angle, triangulate_multi_view_point, triangulate_point,
 };
 use crate::types::CameraModel;
 use nalgebra::{Matrix3, Matrix3x4, Vector2, Vector3};
-use rustslam::ColmapMt19937;
+use rustslam::ColmapCombinationSampler;
 
 /// COLMAP `TriangulationEstimator::ResidualType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,8 +50,7 @@ pub struct PoseData {
 /// COLMAP `scene/projection.cc::HasPointPositiveDepth`.
 pub fn has_point_positive_depth(cam_from_world: &Matrix3x4<f64>, point3d: &Vector3<f64>) -> bool {
     let row2 = cam_from_world.row(2);
-    let depth =
-        row2[0] * point3d[0] + row2[1] * point3d[1] + row2[2] * point3d[2] + row2[3];
+    let depth = row2[0] * point3d[0] + row2[1] * point3d[1] + row2[2] * point3d[2] + row2[3];
     depth >= f64::EPSILON
 }
 
@@ -121,7 +118,11 @@ impl TriangulationEstimator {
     }
 
     /// COLMAP `TriangulationEstimator::Estimate`. Returns at most one model.
-    pub fn estimate(&self, point_data: &[PointData], pose_data: &[PoseData]) -> Option<Vector3<f64>> {
+    pub fn estimate(
+        &self,
+        point_data: &[PointData],
+        pose_data: &[PoseData],
+    ) -> Option<Vector3<f64>> {
         debug_assert!(point_data.len() >= 2);
         debug_assert_eq!(point_data.len(), pose_data.len());
 
@@ -217,10 +218,12 @@ pub struct EstimateTriangulationOptions {
     /// `max_error^2`.
     pub max_error: f64,
     pub confidence: f64,
+    pub dyn_num_trials_multiplier: f64,
     pub min_inlier_ratio: f64,
     pub min_num_trials: usize,
     pub max_num_trials: usize,
-    /// COLMAP `random_seed`; values >= 0 fix the combination-shuffle order.
+    /// COLMAP `random_seed`; ignored for `CombinationSampler`, which is
+    /// deterministic and non-randomized in COLMAP.
     pub random_seed: i32,
 }
 
@@ -232,6 +235,7 @@ impl Default for EstimateTriangulationOptions {
             residual_type: ResidualType::AngularError,
             max_error: 2.0_f64.to_radians(),
             confidence: 0.9999,
+            dyn_num_trials_multiplier: 3.0,
             min_inlier_ratio: 0.02,
             min_num_trials: 0,
             max_num_trials: 10000,
@@ -240,28 +244,61 @@ impl Default for EstimateTriangulationOptions {
     }
 }
 
-/// COLMAP `RANSAC::GetNumTrials` with `min_num_samples = 2`.
+/// COLMAP `RANSAC::ComputeNumTrials` with `min_num_samples = 2`.
 fn compute_num_trials(
     num_inliers: usize,
     num_samples: usize,
     confidence: f64,
-    min_num_trials: usize,
-    max_num_trials: usize,
+    dyn_num_trials_multiplier: f64,
 ) -> usize {
-    let inlier_ratio = num_inliers as f64 / num_samples as f64;
-    let nom = 1.0 - confidence;
-    if nom <= 0.0 {
-        return max_num_trials;
+    let prob_failure = 1.0 - confidence;
+    if prob_failure <= 0.0 {
+        return usize::MAX;
     }
-    let denom = 1.0 - inlier_ratio.powi(TriangulationEstimator::MIN_NUM_SAMPLES as i32);
-    if denom <= 0.0 {
-        return min_num_trials;
+
+    if num_inliers < TriangulationEstimator::MIN_NUM_SAMPLES
+        || num_samples < TriangulationEstimator::MIN_NUM_SAMPLES
+    {
+        return usize::MAX;
     }
-    let num_trials = (nom.ln() / denom.ln()).ceil();
+
+    let mut prob_inlier = 1.0;
+    for idx in 0..TriangulationEstimator::MIN_NUM_SAMPLES {
+        prob_inlier *= (num_inliers - idx) as f64 / (num_samples - idx) as f64;
+    }
+
+    let prob_outlier = 1.0 - prob_inlier;
+    if prob_outlier <= 0.0 {
+        return 1;
+    }
+    if prob_outlier == 1.0 {
+        return usize::MAX;
+    }
+
+    let num_trials = (prob_failure.ln() / prob_outlier.ln() * dyn_num_trials_multiplier).ceil();
     if !num_trials.is_finite() {
-        return max_num_trials;
+        return usize::MAX;
     }
-    (num_trials as usize).clamp(min_num_trials, max_num_trials)
+    num_trials.max(1.0) as usize
+}
+
+fn initial_max_num_trials(
+    options: &EstimateTriangulationOptions,
+    max_sampler_samples: usize,
+) -> usize {
+    let assumed_samples = 100_000usize;
+    let assumed_inliers =
+        (options.min_inlier_ratio.clamp(0.0, 1.0) * assumed_samples as f64) as usize;
+    let dyn_max_num_trials = compute_num_trials(
+        assumed_inliers,
+        assumed_samples,
+        options.confidence,
+        options.dyn_num_trials_multiplier,
+    );
+    options
+        .max_num_trials
+        .min(dyn_max_num_trials)
+        .min(max_sampler_samples)
 }
 
 /// Inlier support under COLMAP's `InlierSupportMeasurer`: more inliers is
@@ -288,27 +325,24 @@ fn evaluate_support(residuals: &[f64], max_residual: f64) -> Support {
 
 fn support_is_better(candidate: &Support, best: &Support) -> bool {
     candidate.num_inliers > best.num_inliers
-        || (candidate.num_inliers == best.num_inliers
-            && candidate.residual_sum < best.residual_sum)
+        || (candidate.num_inliers == best.num_inliers && candidate.residual_sum < best.residual_sum)
 }
 
-const EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD: usize = 15;
-
-pub(crate) fn triangulation_sample_pairs(num_samples: usize, random_seed: i32) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for i in 0..num_samples {
-        for j in (i + 1)..num_samples {
-            pairs.push((i, j));
-        }
+pub(crate) fn triangulation_sample_pairs(
+    num_samples: usize,
+    random_seed: i32,
+) -> Vec<(usize, usize)> {
+    let _ = random_seed;
+    let mut sampler = ColmapCombinationSampler::new(TriangulationEstimator::MIN_NUM_SAMPLES);
+    if !sampler.initialize(num_samples) {
+        return Vec::new();
     }
-    if num_samples > EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD && random_seed >= 0 {
-        let mut rng = ColmapMt19937::new(random_seed as u64);
-        if !pairs.is_empty() {
-            let last = pairs.len() - 1;
-            for i in 0..pairs.len() {
-                let j = rng.uniform_usize(i, last);
-                pairs.swap(i, j);
-            }
+    let max_num_samples = sampler.max_num_samples() as usize;
+    let mut pairs = Vec::with_capacity(max_num_samples);
+    for _ in 0..max_num_samples {
+        let sample = sampler.sample();
+        if sample.len() == 2 {
+            pairs.push((sample[0], sample[1]));
         }
     }
     pairs
@@ -362,15 +396,15 @@ pub fn estimate_triangulation(
         num_inliers: 0,
         residual_sum: f64::MAX,
     };
-    let mut dynamic_max_trials = options.max_num_trials;
-    let mut trial = 0usize;
     let sample_pairs = triangulation_sample_pairs(num_samples, options.random_seed);
+    let max_num_trials = initial_max_num_trials(options, sample_pairs.len());
+    let mut dynamic_max_trials = max_num_trials;
+    let mut abort = false;
 
-    for (i, j) in sample_pairs {
-        if trial >= dynamic_max_trials && trial >= options.min_num_trials {
+    for (curr_thread_trial, (i, j)) in sample_pairs.into_iter().enumerate() {
+        if curr_thread_trial >= max_num_trials || abort {
             break;
         }
-        trial += 1;
 
         let sample_points = [point_data[i], point_data[j]];
         let sample_poses = [pose_data[i], pose_data[j]];
@@ -385,11 +419,14 @@ pub fn estimate_triangulation(
                 support.num_inliers,
                 num_samples,
                 options.confidence,
-                options.min_num_trials,
-                options.max_num_trials,
+                options.dyn_num_trials_multiplier,
             );
             best_support = support;
             best_model = Some(xyz);
+        }
+
+        if curr_thread_trial >= dynamic_max_trials && curr_thread_trial >= options.min_num_trials {
+            abort = true;
         }
     }
 
@@ -397,7 +434,8 @@ pub fn estimate_triangulation(
 
     // Local optimization: refit using all current inliers via the multi-view
     // DLT, and keep the refit if its support is at least as good.
-    let inlier_indices = inlier_indices(&estimator, &point_data, &pose_data, &best_xyz, max_residual);
+    let inlier_indices =
+        inlier_indices(&estimator, &point_data, &pose_data, &best_xyz, max_residual);
     if inlier_indices.len() > TriangulationEstimator::MIN_NUM_SAMPLES {
         let lo_points: Vec<PointData> = inlier_indices.iter().map(|&k| point_data[k]).collect();
         let lo_poses: Vec<PoseData> = inlier_indices.iter().map(|&k| pose_data[k]).collect();
@@ -457,7 +495,11 @@ mod tests {
         CameraModel::from_colmap(COLMAP_PINHOLE, 640, 480, &[500.0, 500.0, 320.0, 240.0]).unwrap()
     }
 
-    fn project_pixel(camera: &CameraModel, cam_from_world: &Matrix3x4<f64>, xyz: &Vector3<f64>) -> Vector2<f64> {
+    fn project_pixel(
+        camera: &CameraModel,
+        cam_from_world: &Matrix3x4<f64>,
+        xyz: &Vector3<f64>,
+    ) -> Vector2<f64> {
         let p = project_into_cam(cam_from_world, xyz);
         let uv = camera.img_from_cam(p[0], p[1], p[2]).unwrap();
         Vector2::new(uv[0], uv[1])
@@ -466,7 +508,10 @@ mod tests {
     fn three_view_setup() -> (Vec<Matrix3x4<f64>>, Vec<CameraModel>, Vector3<f64>) {
         let cams = vec![
             pose_from_center(&Matrix3::identity(), &Vector3::new(0.0, 0.0, 0.0)),
-            pose_from_center(&rot(Vector3::new(0.0, 1.0, 0.0), 0.3), &Vector3::new(1.0, 0.0, 0.0)),
+            pose_from_center(
+                &rot(Vector3::new(0.0, 1.0, 0.0), 0.3),
+                &Vector3::new(1.0, 0.0, 0.0),
+            ),
             pose_from_center(
                 &rot(Vector3::new(1.0, 0.0, 0.0), -0.2),
                 &Vector3::new(0.3, 0.8, -0.2),
@@ -493,7 +538,10 @@ mod tests {
         };
         let (mask, xyz) = estimate_triangulation(&options, &points, &cams, &cameras)
             .expect("estimation succeeds");
-        assert!(mask.iter().all(|&m| m), "all observations should be inliers");
+        assert!(
+            mask.iter().all(|&m| m),
+            "all observations should be inliers"
+        );
         assert!((xyz - truth).norm() < 1e-6, "{xyz:?} vs {truth:?}");
     }
 
@@ -525,7 +573,10 @@ mod tests {
         let (mask, xyz) = estimate_triangulation(&options, &points, &cams, &cameras)
             .expect("estimation succeeds despite outlier");
         assert_eq!(mask.len(), 4);
-        assert!(mask[0] && mask[1] && mask[2], "true observations are inliers");
+        assert!(
+            mask[0] && mask[1] && mask[2],
+            "true observations are inliers"
+        );
         assert!(!mask[3], "corrupted observation is an outlier");
         assert!((xyz - truth).norm() < 1e-4, "{xyz:?} vs {truth:?}");
     }
@@ -572,17 +623,40 @@ mod tests {
     fn has_point_positive_depth_matches_sign_of_camera_depth() {
         let cam = pose_from_center(&Matrix3::identity(), &Vector3::new(0.0, 0.0, 0.0));
         assert!(has_point_positive_depth(&cam, &Vector3::new(0.0, 0.0, 5.0)));
-        assert!(!has_point_positive_depth(&cam, &Vector3::new(0.0, 0.0, -5.0)));
+        assert!(!has_point_positive_depth(
+            &cam,
+            &Vector3::new(0.0, 0.0, -5.0)
+        ));
     }
 
     #[test]
-    fn triangulation_sample_pairs_shuffles_with_fixed_seed() {
+    fn triangulation_sample_pairs_match_colmap_combination_sampler() {
         let exhaustive = super::triangulation_sample_pairs(10, -1);
         let seeded_a = super::triangulation_sample_pairs(16, 42);
-        let seeded_b = super::triangulation_sample_pairs(16, 42);
+        let seeded_b = super::triangulation_sample_pairs(16, 123);
         assert_eq!(exhaustive.len(), 45);
         assert_eq!(seeded_a.len(), 120);
-        assert_ne!(seeded_a, exhaustive);
         assert_eq!(seeded_a, seeded_b);
+        assert_eq!(
+            &seeded_a[..6],
+            &[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]
+        );
+        assert_eq!(seeded_a.last().copied(), Some((14, 15)));
+    }
+
+    #[test]
+    fn ransac_trial_count_matches_colmap_without_replacement_formula() {
+        assert_eq!(super::compute_num_trials(1, 100, 0.99, 1.0), usize::MAX);
+        assert_eq!(super::compute_num_trials(10, 100, 0.99, 1.0), 505);
+        assert_eq!(super::compute_num_trials(10, 100, 0.9999, 3.0), 3026);
+        assert_eq!(super::compute_num_trials(100, 100, 0.9999, 3.0), 1);
+
+        let options = EstimateTriangulationOptions {
+            max_num_trials: 10_000,
+            min_inlier_ratio: 0.02,
+            ..EstimateTriangulationOptions::default()
+        };
+        assert_eq!(super::initial_max_num_trials(&options, 45), 45);
+        assert_eq!(super::initial_max_num_trials(&options, 50_000), 10_000);
     }
 }

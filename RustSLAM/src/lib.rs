@@ -7,12 +7,14 @@
 //! ```
 
 // Re-export core types
+pub use colmap_rng::{
+    n_choose_k, sample_unique_indices, ColmapCombinationSampler, ColmapMt19937, ColmapRandomSampler,
+};
 pub use core::{Camera, Frame, FrameFeatures, KeyFrame, Map, MapPoint, SE3};
 pub use features::{
     Descriptors, DistanceMetric, FeatureExtractor, FeatureMatcher, KeyPoint, KnnMatcher, Match,
     OrbExtractor,
 };
-pub use colmap_rng::{sample_unique_indices, ColmapMt19937, ColmapRandomSampler};
 pub use tracker::{VOResult, VOState, VisualOdometry};
 
 // Modules

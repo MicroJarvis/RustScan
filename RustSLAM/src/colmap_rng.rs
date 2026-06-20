@@ -1,7 +1,7 @@
 //! COLMAP-compatible MT19937 and random sampling.
 //!
-//! Matches COLMAP `RandomSampler` / libc++ `std::uniform_int_distribution` behavior
-//! used by two-view geometry and absolute-pose RANSAC.
+//! Matches COLMAP `RandomSampler` / `CombinationSampler` behavior used by
+//! RANSAC-based estimators.
 
 /// COLMAP-compatible MT19937-32 generator.
 #[derive(Debug, Clone)]
@@ -121,6 +121,92 @@ impl ColmapRandomSampler {
     }
 }
 
+/// COLMAP `math::NChooseK`.
+///
+/// Mirrors COLMAP's edge cases: `n_choose_k(0, 0) == 0`, and `n < k` returns
+/// zero. Arithmetic intentionally uses `u64` like COLMAP's implementation.
+pub fn n_choose_k(mut n: u64, k: u64) -> u64 {
+    if n == 0 || n < k {
+        return 0;
+    }
+    let mut r = 1u64;
+    for d in 1..=k {
+        r *= n;
+        r /= d;
+        n -= 1;
+    }
+    r
+}
+
+/// COLMAP `CombinationSampler`, which enumerates unique sorted combinations.
+#[derive(Debug, Clone)]
+pub struct ColmapCombinationSampler {
+    num_samples: usize,
+    total_sample_indices: Vec<usize>,
+    initialized: bool,
+}
+
+impl ColmapCombinationSampler {
+    pub fn new(num_samples: usize) -> Self {
+        Self {
+            num_samples,
+            total_sample_indices: Vec::new(),
+            initialized: false,
+        }
+    }
+
+    pub fn initialize(&mut self, total_num_samples: usize) -> bool {
+        if self.num_samples > total_num_samples {
+            self.total_sample_indices.clear();
+            self.initialized = false;
+            return false;
+        }
+        self.total_sample_indices = (0..total_num_samples).collect();
+        self.initialized = true;
+        true
+    }
+
+    pub fn max_num_samples(&self) -> u64 {
+        n_choose_k(
+            self.total_sample_indices.len() as u64,
+            self.num_samples as u64,
+        )
+    }
+
+    pub fn sample(&mut self) -> Vec<usize> {
+        if !self.initialized || self.num_samples > self.total_sample_indices.len() {
+            return Vec::new();
+        }
+        let sample = self.total_sample_indices[..self.num_samples].to_vec();
+        if !next_combination(&mut self.total_sample_indices, self.num_samples) {
+            self.total_sample_indices
+                .iter_mut()
+                .enumerate()
+                .for_each(|(idx, value)| *value = idx);
+        }
+        sample
+    }
+}
+
+fn next_combination(values: &mut [usize], middle: usize) -> bool {
+    if middle == 0 || middle >= values.len() {
+        return false;
+    }
+    let n = values.len();
+    let mut i = middle - 1;
+    while values[i] == i + n - middle {
+        if i == 0 {
+            return false;
+        }
+        i -= 1;
+    }
+    values[i] += 1;
+    for j in (i + 1)..middle {
+        values[j] = values[j - 1] + 1;
+    }
+    true
+}
+
 /// Draw `k` unique indices from `[0, n)` using COLMAP's per-iteration sampling shape.
 pub fn sample_unique_indices(rng: &mut ColmapMt19937, n: usize, k: usize) -> Vec<usize> {
     if n == 0 || k == 0 {
@@ -188,5 +274,58 @@ mod tests {
         let mut sampler = ColmapRandomSampler::new(42, &[0, 1, 2, 3, 4, 5]);
         assert_eq!(sampler.sample(3), vec![3, 5, 4]);
         assert_eq!(sampler.sample(3), vec![4, 1, 3]);
+    }
+
+    #[test]
+    fn n_choose_k_matches_colmap_math_helper() {
+        assert_eq!(n_choose_k(0, 0), 0);
+        assert_eq!(n_choose_k(1, 0), 1);
+        assert_eq!(n_choose_k(2, 0), 1);
+        assert_eq!(n_choose_k(3, 0), 1);
+        assert_eq!(n_choose_k(1, 1), 1);
+        assert_eq!(n_choose_k(2, 1), 2);
+        assert_eq!(n_choose_k(3, 1), 3);
+        assert_eq!(n_choose_k(2, 2), 1);
+        assert_eq!(n_choose_k(2, 3), 0);
+        assert_eq!(n_choose_k(3, 2), 3);
+        assert_eq!(n_choose_k(4, 2), 6);
+        assert_eq!(n_choose_k(5, 2), 10);
+        assert_eq!(n_choose_k(500, 3), 20_708_500);
+        assert_eq!(n_choose_k(500, 7), 1_486_071_034_734_000);
+        assert_eq!(n_choose_k(10_000, 5), 832_500_291_625_002_000);
+    }
+
+    #[test]
+    fn colmap_combination_sampler_enumerates_and_wraps() {
+        let mut sampler = ColmapCombinationSampler::new(2);
+        assert!(sampler.initialize(5));
+        assert_eq!(sampler.max_num_samples(), 10);
+
+        let expected = [
+            vec![0, 1],
+            vec![0, 2],
+            vec![0, 3],
+            vec![0, 4],
+            vec![1, 2],
+            vec![1, 3],
+            vec![1, 4],
+            vec![2, 3],
+            vec![2, 4],
+            vec![3, 4],
+        ];
+        for sample in expected {
+            assert_eq!(sampler.sample(), sample);
+        }
+        assert_eq!(sampler.sample(), vec![0, 1]);
+    }
+
+    #[test]
+    fn colmap_combination_sampler_handles_equal_samples() {
+        let mut sampler = ColmapCombinationSampler::new(5);
+        assert!(sampler.initialize(5));
+        assert_eq!(sampler.max_num_samples(), 1);
+        for _ in 0..10 {
+            assert_eq!(sampler.sample(), vec![0, 1, 2, 3, 4]);
+        }
     }
 }
