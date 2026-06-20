@@ -374,6 +374,13 @@ reconstruction parity.
       well-determined, underdetermined, diagonal, identity, outlier, and ridge
       tests are covered. The Rust implementation currently uses a dense
       `nalgebra` Cholesky backend for both COLMAP solver-type variants.
+    - Ported COLMAP `optim/sparse_cholesky` as a dense-backed compatibility
+      wrapper in `sparse_cholesky.rs`: `Compute`, `AnalyzePattern`,
+      `Factorize`, `Solve`, Cholesky-first state, fallback state, diagonal,
+      chain Laplacian, reused-pattern, singular, ridge, indefinite fallback,
+      and ill-conditioned-chain tests are covered. LAD's
+      `SupernodalCholmodLlt` variant now uses this wrapper, so it has a real
+      fallback path distinct from strict `SimplicialLlt`.
     - Two-view E/F/H fixed-seed sampling now uses COLMAP's MT19937-32 random
       source plus the local libc++ `std::uniform_int_distribution<uint32_t>`
       bit-extraction behavior for `RandomSampler::Shuffle`.
@@ -415,8 +422,9 @@ reconstruction parity.
     - Remaining work: replace the lightweight samplers/solvers with COLMAP's
       exact estimator stack, including byte-level full-pivot Householder
       parity for minimal nullspaces, byte-level Eigen JacobiSVD / companion
-      root parity, and the sparse-matrix / sparse-Cholesky / CHOLMOD fallback
-      backend behind LAD and `optim/sparse_cholesky`.
+      root parity, and replacing the current dense `nalgebra` sparse-Cholesky
+      compatibility wrapper with true sparse matrix storage, sparse
+      factorization, and CHOLMOD-backed fallback behavior.
 11. [partial] Match COLMAP initial-pair checks: min inliers, max forward
     motion, triangulation-angle threshold, and generalized relative pose for
     rigs.

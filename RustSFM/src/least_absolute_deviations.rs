@@ -5,6 +5,7 @@
 //! the ADMM update equations, options, convergence tests, validity semantics,
 //! and ridge regularization behavior.
 
+use crate::sparse_cholesky::SparseCholeskyWithFallbackSolver;
 use nalgebra::{DMatrix, DVector};
 use std::fmt;
 
@@ -72,7 +73,7 @@ pub struct LeastAbsoluteDeviationSolver {
     options: LeastAbsoluteDeviationOptions,
     a: DMatrix<f64>,
     at: DMatrix<f64>,
-    ata: DMatrix<f64>,
+    linear_solver: LeastAbsoluteDeviationLinearSolver,
     valid: bool,
 }
 
@@ -88,14 +89,15 @@ impl LeastAbsoluteDeviationSolver {
 
         let at = a.transpose();
         let ata = normal_equations(&a, options.ridge_regularization);
-        let full_rank = options.ridge_regularization > 0.0 || matrix_rank(&a) >= a.ncols();
-        let valid = full_rank && ata.clone().cholesky().is_some();
+        let linear_solver =
+            LeastAbsoluteDeviationLinearSolver::factorize(options.solver_type, &ata);
+        let valid = linear_solver.is_some();
 
         Ok(Self {
             options,
             a,
             at,
-            ata,
+            linear_solver: linear_solver.unwrap_or(LeastAbsoluteDeviationLinearSolver::Invalid),
             valid,
         })
     }
@@ -108,10 +110,6 @@ impl LeastAbsoluteDeviationSolver {
         if !self.valid || b.len() != self.a.nrows() || x.len() != self.a.ncols() {
             return false;
         }
-
-        let Some(cholesky) = self.ata.clone().cholesky() else {
-            return false;
-        };
 
         let mut z = DVector::<f64>::zeros(self.a.nrows());
         let mut z_old = DVector::<f64>::zeros(self.a.nrows());
@@ -126,7 +124,10 @@ impl LeastAbsoluteDeviationSolver {
 
         for _ in 0..self.options.max_num_iterations {
             let rhs = &self.at * (b + &z - &u);
-            *x = cholesky.solve(&rhs);
+            let Some(solution) = self.linear_solver.solve(&rhs) else {
+                return false;
+            };
+            *x = solution;
             if !x.iter().all(|v| v.is_finite()) {
                 return false;
             }
@@ -152,6 +153,52 @@ impl LeastAbsoluteDeviationSolver {
         }
 
         true
+    }
+}
+
+#[derive(Debug, Clone)]
+enum LeastAbsoluteDeviationLinearSolver {
+    SimplicialLlt(DMatrix<f64>),
+    SupernodalCholmodLlt(SparseCholeskyWithFallbackSolver),
+    Invalid,
+}
+
+impl LeastAbsoluteDeviationLinearSolver {
+    fn factorize(
+        solver_type: LeastAbsoluteDeviationSolverType,
+        ata: &DMatrix<f64>,
+    ) -> Option<Self> {
+        match solver_type {
+            LeastAbsoluteDeviationSolverType::SimplicialLlt => {
+                if ata.clone().cholesky().is_some() {
+                    Some(Self::SimplicialLlt(ata.clone()))
+                } else {
+                    None
+                }
+            }
+            LeastAbsoluteDeviationSolverType::SupernodalCholmodLlt => {
+                let mut solver = SparseCholeskyWithFallbackSolver::new();
+                if solver.compute(ata) {
+                    Some(Self::SupernodalCholmodLlt(solver))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn solve(&self, rhs: &DVector<f64>) -> Option<DVector<f64>> {
+        match self {
+            Self::SimplicialLlt(matrix) => matrix
+                .clone()
+                .cholesky()
+                .map(|cholesky| cholesky.solve(rhs)),
+            Self::SupernodalCholmodLlt(solver) => {
+                let mut x = DVector::<f64>::zeros(rhs.len());
+                solver.solve(rhs, &mut x).then_some(x)
+            }
+            Self::Invalid => None,
+        }
     }
 }
 
@@ -203,16 +250,6 @@ fn normal_equations(a: &DMatrix<f64>, ridge_regularization: f64) -> DMatrix<f64>
         }
     }
     ata
-}
-
-fn matrix_rank(a: &DMatrix<f64>) -> usize {
-    let singular_values = a.clone().svd(false, false).singular_values;
-    let max_sv = singular_values.iter().fold(0.0_f64, |acc, &v| acc.max(v));
-    if max_sv == 0.0 {
-        return 0;
-    }
-    let tolerance = f64::EPSILON * (a.nrows().max(a.ncols()) as f64) * max_sv;
-    singular_values.iter().filter(|&&v| v > tolerance).count()
 }
 
 #[cfg(test)]
@@ -331,10 +368,7 @@ mod tests {
             for i in 0..5 {
                 a[(i, i)] = i as f64 + 1.0;
             }
-            let b = DVector::from_iterator(
-                5,
-                (0..5).map(|i| (i as f64 + 1.0) * (i as f64 + 2.0)),
-            );
+            let b = DVector::from_iterator(5, (0..5).map(|i| (i as f64 + 1.0) * (i as f64 + 2.0)));
             let mut x = DVector::<f64>::zeros(5);
             let opts = LeastAbsoluteDeviationOptions {
                 max_num_iterations: 100,
@@ -415,8 +449,7 @@ mod tests {
                 solver_type,
                 ..LeastAbsoluteDeviationOptions::default()
             };
-            let loose_solver =
-                LeastAbsoluteDeviationSolver::new(loose_options, a.clone()).unwrap();
+            let loose_solver = LeastAbsoluteDeviationSolver::new(loose_options, a.clone()).unwrap();
             assert!(loose_solver.solve(&b, &mut loose_x));
 
             let mut tight_x = DVector::<f64>::zeros(3);
@@ -427,8 +460,7 @@ mod tests {
                 solver_type,
                 ..LeastAbsoluteDeviationOptions::default()
             };
-            let tight_solver =
-                LeastAbsoluteDeviationSolver::new(tight_options, a.clone()).unwrap();
+            let tight_solver = LeastAbsoluteDeviationSolver::new(tight_options, a.clone()).unwrap();
             assert!(tight_solver.solve(&b, &mut tight_x));
 
             let loose_residual = (&a * loose_x - &b).abs().sum();
