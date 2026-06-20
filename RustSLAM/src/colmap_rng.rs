@@ -209,6 +209,9 @@ pub fn colmap_ransac_num_trials(
     }
 }
 
+/// COLMAP stores `RANSACOptions::max_num_trials` as a signed `int`.
+pub const COLMAP_RANSAC_DEFAULT_MAX_NUM_TRIALS: usize = i32::MAX as usize;
+
 /// COLMAP `RANSACOptions` default surface and validation rules.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColmapRansacOptions {
@@ -230,7 +233,7 @@ impl Default for ColmapRansacOptions {
             confidence: 0.99,
             dyn_num_trials_multiplier: 3.0,
             min_num_trials: 0,
-            max_num_trials: usize::MAX,
+            max_num_trials: COLMAP_RANSAC_DEFAULT_MAX_NUM_TRIALS,
             random_seed: -1,
             num_threads: 1,
         }
@@ -605,7 +608,7 @@ mod tests {
         assert_eq!(options.confidence, 0.99);
         assert_eq!(options.dyn_num_trials_multiplier, 3.0);
         assert_eq!(options.min_num_trials, 0);
-        assert_eq!(options.max_num_trials, usize::MAX);
+        assert_eq!(options.max_num_trials, COLMAP_RANSAC_DEFAULT_MAX_NUM_TRIALS);
         assert_eq!(options.random_seed, -1);
         assert_eq!(options.num_threads, 1);
     }
@@ -631,7 +634,7 @@ mod tests {
         options.max_num_trials = 1;
         assert!(options.check().is_err());
         options.min_num_trials = 0;
-        options.max_num_trials = usize::MAX;
+        options.max_num_trials = COLMAP_RANSAC_DEFAULT_MAX_NUM_TRIALS;
         options.random_seed = -2;
         assert!(options.check().is_err());
         options.random_seed = -1;
