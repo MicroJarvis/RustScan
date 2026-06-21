@@ -927,6 +927,9 @@ reconstruction parity.
       scalar. The mapper local/global BA now defaults to COLMAP's Cauchy loss
       with scale 1.0 (overridable via `RUSTSFM_BA_LOSS` /
       `RUSTSFM_BA_LOSS_SCALE`), matching COLMAP's incremental mapper default.
+      Ceres-backed BA now also creates an explicit `TrivialLoss` for
+      non-robust residuals, matching COLMAP's `CreateLossFunction(TRIVIAL)`
+      path instead of omitting the loss pointer.
     - The reduced camera matrix (Schur complement) is now solved with a
       Cholesky factorization and an LU fallback (`ba.rs::solve_linear_system`),
       matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers that rely on

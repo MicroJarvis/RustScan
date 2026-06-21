@@ -18,6 +18,11 @@ pub type LossFunctionType = Box<dyn Fn(f64, &mut [f64; 3])>;
 pub struct LossFunction(UniquePtr<ffi::LossFunction>);
 
 impl LossFunction {
+    /// Trivial loss function, see details at <http://ceres-solver.org/nnls_modeling.html#_CPPv4N5ceres11TrivialLossE>.
+    pub fn trivial() -> Self {
+        Self(ffi::new_trivial_loss())
+    }
+
     /// Create a [LossFunction] to handle a custom loss function.
     ///
     /// # Arguments

@@ -266,9 +266,7 @@ pub fn solve_bundle_adjustment_ceres(
                 &mut next_storage_index,
             ));
         }
-        if let Some(loss) = ceres_loss(options.loss_function) {
-            builder = builder.set_loss(loss);
-        }
+        builder = builder.set_loss(ceres_loss(options.loss_function));
         problem = builder.build_into_problem().ok()?.0;
         bindings += 1;
     }
@@ -1338,12 +1336,12 @@ fn count_variable_blocks(
         .sum()
 }
 
-fn ceres_loss(loss: BundleAdjustmentLoss) -> Option<LossFunction> {
+fn ceres_loss(loss: BundleAdjustmentLoss) -> LossFunction {
     match loss {
-        BundleAdjustmentLoss::Trivial => None,
-        BundleAdjustmentLoss::Huber { scale } => Some(LossFunction::huber(scale)),
-        BundleAdjustmentLoss::SoftL1 { scale } => Some(LossFunction::soft_l1(scale)),
-        BundleAdjustmentLoss::Cauchy { scale } => Some(LossFunction::cauchy(scale)),
+        BundleAdjustmentLoss::Trivial => LossFunction::trivial(),
+        BundleAdjustmentLoss::Huber { scale } => LossFunction::huber(scale),
+        BundleAdjustmentLoss::SoftL1 { scale } => LossFunction::soft_l1(scale),
+        BundleAdjustmentLoss::Cauchy { scale } => LossFunction::cauchy(scale),
     }
 }
 
@@ -1682,6 +1680,67 @@ mod tests {
             report.termination_reason,
             BundleAdjustmentTerminationReason::GradientTolerance
         );
+    }
+
+    #[test]
+    fn ceres_trivial_loss_matches_colmap_explicit_loss_function() {
+        let frames = vec![ImageFrame {
+            id: 0,
+            name: "0.jpg".into(),
+            path: PathBuf::from("0.jpg"),
+            width: 100,
+            height: 100,
+            keypoints: vec![KeyPoint::new(50.0, 50.0)],
+            descriptors: Descriptors::new(),
+            sift: SiftFeatures::default(),
+            wide_descriptors: WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            },
+            strong_feature_indices: Vec::new(),
+            colors: Vec::new(),
+        }];
+        let mut reconstruction = Reconstruction {
+            camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            cameras: vec![CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0)],
+            camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_names: vec!["0.jpg".into()],
+            image_paths: vec![PathBuf::from("0.jpg")],
+            image_ids: vec![1],
+            image_camera_indices: vec![0],
+            image_frame_indices: vec![None],
+            poses: vec![Some(SE3::identity())],
+            observations: vec![vec![Some(0)]],
+            keypoints: frames.iter().map(|f| f.keypoints.clone()).collect(),
+            point_ids: vec![1],
+            points: vec![Point3D {
+                xyz: [0.0, 0.0, 2.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: 0,
+                }],
+            }],
+        };
+
+        let report = solve_bundle_adjustment_ceres(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 5,
+                allow_single_observation_points: true,
+                loss_function: BundleAdjustmentLoss::Trivial,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .expect("trivial loss should be explicit and Ceres-compatible");
+
+        assert!(report.is_solution_usable());
+        assert!(report.final_cost <= report.initial_cost + 1.0e-12);
     }
 
     #[test]
