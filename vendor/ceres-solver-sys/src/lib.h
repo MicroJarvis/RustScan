@@ -114,6 +114,8 @@ namespace ceres {
         bool is_solution_usable() const;
         uint32_t termination_type_value() const;
         std::unique_ptr<std::string> message() const;
+        int num_residuals_reduced() const;
+        int num_effective_parameters_reduced() const;
         double initial_cost() const;
         double final_cost() const;
         double fixed_cost() const;

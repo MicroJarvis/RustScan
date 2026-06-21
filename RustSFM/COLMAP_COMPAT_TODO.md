@@ -881,6 +881,9 @@ reconstruction parity.
       structured bindings and maps the termination type directly like
       COLMAP's `CeresTerminationTypeToTerminationType`, keeping report-text
       parsing only as a fallback for reason classification.
+    - Ceres-backed BA now reports reduced residual and effective-parameter
+      counts directly from `ceres::Solver::Summary`, matching the fields
+      COLMAP uses in `CeresBundleAdjustmentSummary` and `PrintSolverSummary`.
     - Ceres-backed BA now mirrors COLMAP's CPU threading gate: mapper
       `--threads` is forwarded to Ceres, while problems below 50,000 residuals
       are forced to one Ceres thread to avoid small-problem threading overhead.

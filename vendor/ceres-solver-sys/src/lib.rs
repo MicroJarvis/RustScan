@@ -389,6 +389,8 @@ pub mod ffi {
         fn is_solution_usable(self: &SolverSummary) -> bool;
         fn termination_type_value(self: &SolverSummary) -> u32;
         fn message(self: &SolverSummary) -> UniquePtr<CxxString>;
+        fn num_residuals_reduced(self: &SolverSummary) -> i32;
+        fn num_effective_parameters_reduced(self: &SolverSummary) -> i32;
         fn initial_cost(self: &SolverSummary) -> f64;
         fn final_cost(self: &SolverSummary) -> f64;
         fn fixed_cost(self: &SolverSummary) -> f64;

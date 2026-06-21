@@ -2,7 +2,7 @@ use super::native::{
     analytic_frame_pose_jacobian, analytic_img_from_cam_jacobian, analytic_sensor_pose_jacobian,
     apply_two_cams_from_world_gauge, camera_by_index, camera_param_jacobian, camera_param_specs,
     count_variable_residuals, frame_sensor_from_rig, frame_sensor_key_for_image,
-    point_effective_parameter_count, projection_jacobians, sensor_pose_specs, set_frame_pose_block,
+    projection_jacobians, sensor_pose_specs, set_frame_pose_block,
     sync_camera_intrinsics_from_params, sync_pose_blocks_for_sensor_changes, variable_pose_blocks,
     CameraParamSpec, PoseBlockKind, SensorPoseKey,
 };
@@ -332,6 +332,8 @@ pub fn solve_bundle_adjustment_ceres(
     let unsuccessful_steps = summary.num_unsuccessful_steps().max(0) as usize;
     let (termination_type, termination_reason, gradient_max_norm, step_norm, step_quality, damping) =
         map_ceres_summary(&summary);
+    let residuals_reduced = summary.num_residuals_reduced().max(0) as usize;
+    let effective_parameters_reduced = summary.num_effective_parameters_reduced().max(0) as usize;
     Some(BundleAdjustmentReport {
         iterations: successful_steps,
         attempted_iterations: successful_steps + unsuccessful_steps,
@@ -345,11 +347,8 @@ pub fn solve_bundle_adjustment_ceres(
         initial_cost: summary.initial_cost(),
         final_cost: summary.final_cost(),
         observations: observations.len(),
-        residuals,
-        effective_parameters: pose_blocks.dim
-            + sensor_pose_specs.len() * 6
-            + camera_param_specs.len()
-            + point_effective_parameter_count(&observations, &constant_point_filter),
+        residuals: residuals_reduced,
+        effective_parameters: effective_parameters_reduced,
         gradient_max_norm,
         step_norm,
         step_quality,
@@ -1682,6 +1681,8 @@ mod tests {
             report.termination_reason,
             BundleAdjustmentTerminationReason::GradientTolerance
         );
+        assert_eq!(report.residuals, 2);
+        assert_eq!(report.effective_parameters, 3);
     }
 
     #[test]

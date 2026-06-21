@@ -510,6 +510,16 @@ impl SolverSummary {
     }
 
     #[inline]
+    pub fn num_residuals_reduced(&self) -> i32 {
+        self.inner().num_residuals_reduced()
+    }
+
+    #[inline]
+    pub fn num_effective_parameters_reduced(&self) -> i32 {
+        self.inner().num_effective_parameters_reduced()
+    }
+
+    #[inline]
     pub fn initial_cost(&self) -> f64 {
         self.inner().initial_cost()
     }

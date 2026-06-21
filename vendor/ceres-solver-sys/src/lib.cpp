@@ -290,6 +290,12 @@ namespace ceres {
     std::unique_ptr<std::string> SolverSummary::message() const {
         return std::make_unique<std::string>(inner.message);
     }
+    int SolverSummary::num_residuals_reduced() const {
+        return inner.num_residuals_reduced;
+    }
+    int SolverSummary::num_effective_parameters_reduced() const {
+        return inner.num_effective_parameters_reduced;
+    }
     double SolverSummary::initial_cost() const {
         return inner.initial_cost;
     }
