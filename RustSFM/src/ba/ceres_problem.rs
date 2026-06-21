@@ -1353,20 +1353,30 @@ fn ceres_solver_options(
     num_residuals: usize,
 ) -> Option<SolverOptions> {
     let solver_policy = ceres_solver_policy(num_pose_entities, ceres_has_sparse_backend());
+    let max_num_iterations = ceres_i32_option(options.iterations)?;
+    let max_linear_solver_iterations = ceres_i32_option(options.max_linear_solver_iterations)?;
+    let max_num_consecutive_invalid_steps =
+        ceres_i32_option(options.max_num_consecutive_invalid_steps)?;
+    let max_consecutive_nonmonotonic_steps =
+        ceres_i32_option(options.max_consecutive_nonmonotonic_steps)?;
     let mut builder = SolverOptions::builder()
-        .max_num_iterations(options.iterations as i32)
+        .max_num_iterations(max_num_iterations)
         .function_tolerance(options.function_tolerance)
         .gradient_tolerance(options.gradient_tolerance)
         .parameter_tolerance(options.parameter_tolerance)
-        .max_linear_solver_iterations(options.max_linear_solver_iterations as i32)
+        .max_linear_solver_iterations(max_linear_solver_iterations)
         .num_threads(ceres_num_threads(options, num_residuals))
-        .max_num_consecutive_invalid_steps(options.max_num_consecutive_invalid_steps as i32)
-        .max_consecutive_nonmonotonic_steps(options.max_consecutive_nonmonotonic_steps as i32)
+        .max_num_consecutive_invalid_steps(max_num_consecutive_invalid_steps)
+        .max_consecutive_nonmonotonic_steps(max_consecutive_nonmonotonic_steps)
         .linear_solver_type(solver_policy.linear_solver);
     if let Some(preconditioner) = solver_policy.preconditioner {
         builder = builder.preconditioner_type(preconditioner);
     }
     builder.build().ok()
+}
+
+fn ceres_i32_option(value: usize) -> Option<i32> {
+    i32::try_from(value).ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1797,6 +1807,51 @@ mod tests {
         assert!(ceres_solver_options(
             &BundleAdjustmentOptions {
                 max_linear_solver_iterations: usize::MAX,
+                ..BundleAdjustmentOptions::default()
+            },
+            1,
+            2,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn ceres_options_reject_usize_fields_before_i32_wraparound() {
+        let Some(wraps_to_positive) = (u32::MAX as usize).checked_add(101) else {
+            return;
+        };
+        assert_eq!(wraps_to_positive as i32, 100);
+
+        assert!(ceres_solver_options(
+            &BundleAdjustmentOptions {
+                iterations: wraps_to_positive,
+                ..BundleAdjustmentOptions::default()
+            },
+            1,
+            2,
+        )
+        .is_none());
+        assert!(ceres_solver_options(
+            &BundleAdjustmentOptions {
+                max_linear_solver_iterations: wraps_to_positive,
+                ..BundleAdjustmentOptions::default()
+            },
+            1,
+            2,
+        )
+        .is_none());
+        assert!(ceres_solver_options(
+            &BundleAdjustmentOptions {
+                max_num_consecutive_invalid_steps: wraps_to_positive,
+                ..BundleAdjustmentOptions::default()
+            },
+            1,
+            2,
+        )
+        .is_none());
+        assert!(ceres_solver_options(
+            &BundleAdjustmentOptions {
+                max_consecutive_nonmonotonic_steps: wraps_to_positive,
                 ..BundleAdjustmentOptions::default()
             },
             1,

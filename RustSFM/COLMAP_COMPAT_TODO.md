@@ -942,6 +942,9 @@ reconstruction parity.
       The Ceres solver auto-selection path now also reads Ceres' configured
       sparse linear algebra backend and skips `SPARSE_SCHUR` when it is
       `NO_SPARSE`, matching COLMAP's `has_sparse` gate.
+      Ceres integer option forwarding now rejects `usize` values that cannot
+      be represented by Ceres' signed `int` fields before they can wrap into
+      apparently valid solver settings.
     - The reduced camera matrix (Schur complement) is now solved with a
       Cholesky factorization and an LU fallback (`ba.rs::solve_linear_system`),
       matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers that rely on
