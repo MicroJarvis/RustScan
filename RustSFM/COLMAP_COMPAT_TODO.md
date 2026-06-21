@@ -937,6 +937,8 @@ reconstruction parity.
       Ceres-backed BA now also creates an explicit `TrivialLoss` for
       non-robust residuals, matching COLMAP's `CreateLossFunction(TRIVIAL)`
       path instead of omitting the loss pointer.
+      BA entrypoints now reject negative, infinite, or NaN robust loss scales
+      before solving, matching COLMAP's Ceres option validation gate.
     - The reduced camera matrix (Schur complement) is now solved with a
       Cholesky factorization and an LU fallback (`ba.rs::solve_linear_system`),
       matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers that rely on

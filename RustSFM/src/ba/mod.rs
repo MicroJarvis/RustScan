@@ -28,6 +28,17 @@ pub enum BundleAdjustmentLoss {
 }
 
 impl BundleAdjustmentLoss {
+    /// Match COLMAP's `CeresBundleAdjustmentOptions::Check()` scale gate.
+    #[inline]
+    pub fn has_colmap_valid_scale(self) -> bool {
+        match self {
+            Self::Trivial => true,
+            Self::Huber { scale } | Self::SoftL1 { scale } | Self::Cauchy { scale } => {
+                scale.is_finite() && scale >= 0.0
+            }
+        }
+    }
+
     /// IRLS weight `rho'(s)` for a squared residual `s = ||r||^2`.
     #[inline]
     pub fn weight(self, s: f64) -> f64 {
@@ -228,10 +239,34 @@ pub fn refine_bundle_adjustment(
     reconstruction: &mut Reconstruction,
     options: BundleAdjustmentOptions,
 ) -> Option<BundleAdjustmentReport> {
+    if !options.loss_function.has_colmap_valid_scale() {
+        return None;
+    }
+
     #[cfg(feature = "ceres-ba")]
     {
         return ceres::refine_bundle_adjustment_ceres(frames, reconstruction, options);
     }
     #[cfg(not(feature = "ceres-ba"))]
     native::refine_bundle_adjustment_native(frames, reconstruction, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BundleAdjustmentLoss;
+
+    #[test]
+    fn loss_scale_check_matches_colmap_ceres_options() {
+        assert!(BundleAdjustmentLoss::Trivial.has_colmap_valid_scale());
+        assert!(BundleAdjustmentLoss::Huber { scale: 0.0 }.has_colmap_valid_scale());
+        assert!(BundleAdjustmentLoss::SoftL1 { scale: 1.0 }.has_colmap_valid_scale());
+        assert!(BundleAdjustmentLoss::Cauchy { scale: 1.0 }.has_colmap_valid_scale());
+
+        assert!(!BundleAdjustmentLoss::Huber { scale: -1.0 }.has_colmap_valid_scale());
+        assert!(!BundleAdjustmentLoss::SoftL1 { scale: f64::NAN }.has_colmap_valid_scale());
+        assert!(!BundleAdjustmentLoss::Cauchy {
+            scale: f64::INFINITY
+        }
+        .has_colmap_valid_scale());
+    }
 }
