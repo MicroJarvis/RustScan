@@ -1544,7 +1544,12 @@ fn analytic_projection_jacobians(
     Some((j_pose, j_point))
 }
 
-fn analytic_img_from_cam_jacobian(camera: CameraModel, x: f64, y: f64, z: f64) -> Option<Mat2x3> {
+pub(crate) fn analytic_img_from_cam_jacobian(
+    camera: CameraModel,
+    x: f64,
+    y: f64,
+    z: f64,
+) -> Option<Mat2x3> {
     if z <= f64::EPSILON || ![x, y, z].iter().all(|v| v.is_finite()) {
         return None;
     }

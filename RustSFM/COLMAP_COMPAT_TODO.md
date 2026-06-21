@@ -939,9 +939,14 @@ reconstruction parity.
       gauge policies (`THREE_POINTS`, `TWO_CAMS_FROM_WORLD`). Ceres cost
       callbacks reuse native analytic projection/frame/sensor/camera
       Jacobians with numeric fallback.
-    - Remaining work: replace the Ceres pose-block numeric ambient Jacobian
-      bridge with exact COLMAP/Ceres quaternion-manifold analytic Jacobians,
-      switch native LM damping from a fixed `mu*I` to Ceres' jacobian-scaled
+    - Ceres image-pose cost callbacks now evaluate COLMAP's raw Eigen
+      quaternion rotation formula and fill exact 2x7 ambient Jacobians for
+      ordinary image pose blocks, matching
+      `AnalyticalReprojErrorCostFunction`.
+    - Remaining work: replace the frame/sensor composite Ceres pose-block
+      numeric ambient Jacobian bridge with exact COLMAP/Ceres
+      quaternion-manifold analytic Jacobians, switch native LM damping from a
+      fixed `mu*I` to Ceres' jacobian-scaled
       `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with Ceres'
       radius-based trust-region update (a naive switch under the current
       `damping*=10` recovery regressed the generalized-rig refinement test, so
