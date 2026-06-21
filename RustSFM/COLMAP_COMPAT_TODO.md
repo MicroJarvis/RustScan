@@ -880,6 +880,10 @@ reconstruction parity.
     - Ceres-backed BA now mirrors COLMAP's CPU threading gate: mapper
       `--threads` is forwarded to Ceres, while problems below 50,000 residuals
       are forced to one Ceres thread to avoid small-problem threading overhead.
+    - Ceres-backed BA now mirrors COLMAP's CPU linear-solver auto-selection
+      thresholds: up to 50 pose entities use `DENSE_SCHUR`, 51 through 1000
+      use `SPARSE_SCHUR`, and larger problems use `ITERATIVE_SCHUR` with
+      `SCHUR_JACOBI` preconditioning.
     - BA now uses analytic pose/point Jacobians for SIMPLE_PINHOLE, PINHOLE,
       SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, FOV, SIMPLE_FISHEYE,
       FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, OPENCV_FISHEYE,

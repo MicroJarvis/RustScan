@@ -17,7 +17,7 @@ use super::{
 use crate::types::{CameraModel, ImageFrame, Reconstruction, Rigid3};
 use ceres_solver::loss::LossFunction;
 use ceres_solver::parameter_block::ParameterBlockOrIndex;
-use ceres_solver::solver::{LinearSolverType, SolverOptions};
+use ceres_solver::solver::{LinearSolverType, PreconditionerType, SolverOptions};
 use ceres_solver::{CostFunctionType, NllsProblem};
 use glam::{Quat, Vec3};
 use nalgebra::SMatrix;
@@ -1352,12 +1352,8 @@ fn ceres_solver_options(
     num_pose_entities: usize,
     num_residuals: usize,
 ) -> Option<SolverOptions> {
-    let linear_solver = if num_pose_entities >= 50 {
-        LinearSolverType::SPARSE_SCHUR
-    } else {
-        LinearSolverType::DENSE_SCHUR
-    };
-    SolverOptions::builder()
+    let solver_policy = ceres_solver_policy(num_pose_entities);
+    let mut builder = SolverOptions::builder()
         .max_num_iterations(options.iterations as i32)
         .function_tolerance(options.function_tolerance)
         .gradient_tolerance(options.gradient_tolerance)
@@ -1366,9 +1362,36 @@ fn ceres_solver_options(
         .num_threads(ceres_num_threads(options, num_residuals))
         .max_num_consecutive_invalid_steps(options.max_num_consecutive_invalid_steps as i32)
         .max_consecutive_nonmonotonic_steps(options.max_consecutive_nonmonotonic_steps as i32)
-        .linear_solver_type(linear_solver)
-        .build()
-        .ok()
+        .linear_solver_type(solver_policy.linear_solver);
+    if let Some(preconditioner) = solver_policy.preconditioner {
+        builder = builder.preconditioner_type(preconditioner);
+    }
+    builder.build().ok()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CeresSolverPolicy {
+    linear_solver: LinearSolverType,
+    preconditioner: Option<PreconditionerType>,
+}
+
+fn ceres_solver_policy(num_pose_entities: usize) -> CeresSolverPolicy {
+    if num_pose_entities <= 50 {
+        CeresSolverPolicy {
+            linear_solver: LinearSolverType::DENSE_SCHUR,
+            preconditioner: None,
+        }
+    } else if num_pose_entities <= 1000 {
+        CeresSolverPolicy {
+            linear_solver: LinearSolverType::SPARSE_SCHUR,
+            preconditioner: None,
+        }
+    } else {
+        CeresSolverPolicy {
+            linear_solver: LinearSolverType::ITERATIVE_SCHUR,
+            preconditioner: Some(PreconditionerType::SCHUR_JACOBI),
+        }
+    }
 }
 
 fn ceres_num_threads(options: &BundleAdjustmentOptions, num_residuals: usize) -> i32 {
@@ -1682,6 +1705,27 @@ mod tests {
             2,
         )
         .is_none());
+    }
+
+    #[test]
+    fn ceres_options_match_colmap_solver_type_thresholds() {
+        let policy = ceres_solver_policy(50);
+        assert!(policy.linear_solver == LinearSolverType::DENSE_SCHUR);
+        assert!(policy.preconditioner.is_none());
+
+        let policy = ceres_solver_policy(51);
+        assert!(policy.linear_solver == LinearSolverType::SPARSE_SCHUR);
+        assert!(policy.preconditioner.is_none());
+
+        let policy = ceres_solver_policy(1000);
+        assert!(policy.linear_solver == LinearSolverType::SPARSE_SCHUR);
+        assert!(policy.preconditioner.is_none());
+
+        let policy = ceres_solver_policy(1001);
+        assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
+        assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
+
+        assert!(ceres_solver_options(&BundleAdjustmentOptions::default(), 1001, 2).is_some());
     }
 
     #[test]
