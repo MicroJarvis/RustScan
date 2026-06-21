@@ -928,6 +928,10 @@ reconstruction parity.
       tolerance 10 and 25 iterations; global BA uses gradient tolerance 1 and
       50 iterations; both use 100 linear-solver iterations and zero parameter
       tolerance.
+      Local BA now also follows COLMAP's iterative refinement defaults
+      (`ba_local_max_refinements = 2`, `ba_local_max_refinement_change = 0.001`)
+      and switches refinement rounds after the first from Soft-L1 to Trivial
+      loss.
     - BA now provides a Ceres-equivalent robust loss family
       (`BundleAdjustmentLoss`: Trivial, Huber, SoftL1, Cauchy) whose `rho(s)`
       cost and `rho'(s)` IRLS weight match Ceres' `LossFunction` formulas for

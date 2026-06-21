@@ -541,6 +541,8 @@ pub struct MapperConfig {
     pub local_ba_num_images: usize,
     pub local_ba_min_shared_points: usize,
     pub local_ba_iterations: usize,
+    pub local_ba_max_refinements: usize,
+    pub local_ba_max_refinement_change: f32,
     pub global_ba: bool,
     pub global_ba_iterations: usize,
     pub global_ba_images_ratio: f32,
@@ -618,6 +620,8 @@ impl Default for MapperConfig {
             local_ba_num_images: 6,
             local_ba_min_shared_points: 15,
             local_ba_iterations: 25,
+            local_ba_max_refinements: 2,
+            local_ba_max_refinement_change: 0.001,
             global_ba: true,
             global_ba_iterations: 50,
             global_ba_images_ratio: 1.1,
@@ -1639,6 +1643,14 @@ fn mapper_global_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
 
 fn mapper_local_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
     mapper_ba_loss_function(crate::ba::BundleAdjustmentLoss::SoftL1 { scale: 1.0 })
+}
+
+fn mapper_local_ba_refinement_loss_function(round: usize) -> crate::ba::BundleAdjustmentLoss {
+    if round == 0 {
+        mapper_local_ba_loss_function()
+    } else {
+        crate::ba::BundleAdjustmentLoss::Trivial
+    }
 }
 
 fn global_ba_max_observation_error_px(config: &MapperConfig) -> f64 {
@@ -4285,11 +4297,6 @@ fn incremental_map_single_attempt(
             &local_registration_stats,
             &mut triangulation_state,
         );
-        let mut local_ba_filter_removed = 0usize;
-        if local_ba_report.is_some() {
-            local_ba_filter_removed =
-                filter_reprojection_tracks(frames, pairs, &mut reconstruction, config);
-        }
         let rollback_reason = registration_rollback_reason(
             &reconstruction,
             choice.image,
@@ -4342,8 +4349,9 @@ fn incremental_map_single_attempt(
         }
         if let Some(report) = local_ba_report {
             debug_log.push(format!(
-                "local_ba image={} local_images={} variable_images={} points={} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} reason={:?} merged={} completed={} image_completed={}",
+                "local_ba image={} refinements={} local_images={} variable_images={} points={} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} reason={:?} merged={} completed={} image_completed={} filtered={} changed={:.6}",
                 frames[choice.image].name,
+                report.refinements,
                 report.local_images,
                 report.variable_images,
                 report.points,
@@ -4357,13 +4365,10 @@ fn incremental_map_single_attempt(
                 report.report.termination_reason,
                 report.merged_observations,
                 report.completed_observations,
-                report.completed_image_observations
+                report.completed_image_observations,
+                report.filtered_observations,
+                report.changed_observation_ratio
             ));
-            if local_ba_filter_removed > 0 {
-                debug_log.push(format!(
-                    "local_ba_filter removed_observations={local_ba_filter_removed}"
-                ));
-            }
         }
         if filtered_frames > 0 {
             debug_log.push(format!("filtered_frames count={filtered_frames}"));
@@ -5213,12 +5218,15 @@ fn reset_registration_unit_trials_for_mode(
 #[derive(Debug, Clone, Copy)]
 struct LocalBundleReport {
     report: crate::ba::BundleAdjustmentReport,
+    refinements: usize,
     variable_images: usize,
     local_images: usize,
     points: usize,
     merged_observations: usize,
     completed_observations: usize,
     completed_image_observations: usize,
+    filtered_observations: usize,
+    changed_observation_ratio: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5557,9 +5565,84 @@ fn refine_local_bundle_after_registration(
     registration_stats: &RegistrationStats,
     triangulation_state: &mut IncrementalTriangulatorState,
 ) -> Option<LocalBundleReport> {
-    if !config.local_ba || config.local_ba_iterations == 0 {
+    if !local_ba_enabled(config) {
         return None;
     }
+
+    let mut last_report: Option<LocalBundleReport> = None;
+    for round in 0..config.local_ba_max_refinements {
+        let Some(mut report) = refine_local_bundle_round(
+            frames,
+            pairs,
+            reconstruction,
+            registered_image,
+            gauge_image,
+            tri_options,
+            config,
+            registration_stats,
+            triangulation_state,
+            mapper_local_ba_refinement_loss_function(round),
+        ) else {
+            break;
+        };
+        report.refinements = round + 1;
+        let changed = report.changed_observation_ratio;
+        if let Some(accumulated) = last_report.as_mut() {
+            accumulated.report = report.report;
+            accumulated.refinements = report.refinements;
+            accumulated.variable_images = report.variable_images;
+            accumulated.local_images = report.local_images;
+            accumulated.points = report.points;
+            accumulated.merged_observations += report.merged_observations;
+            accumulated.completed_observations += report.completed_observations;
+            accumulated.completed_image_observations += report.completed_image_observations;
+            accumulated.filtered_observations += report.filtered_observations;
+            accumulated.changed_observation_ratio = changed;
+        } else {
+            last_report = Some(report);
+        }
+        if changed < config.local_ba_max_refinement_change {
+            break;
+        }
+    }
+    last_report
+}
+
+fn local_bundle_refinement_required(
+    reconstruction: &Reconstruction,
+    registered_image: usize,
+    gauge_image: usize,
+    config: &MapperConfig,
+) -> bool {
+    if !local_ba_enabled(config) {
+        return false;
+    }
+    select_local_bundle(
+        reconstruction,
+        registered_image,
+        gauge_image,
+        config.local_ba_num_images,
+        config.local_ba_min_shared_points,
+    )
+    .is_some()
+}
+
+fn local_ba_enabled(config: &MapperConfig) -> bool {
+    config.local_ba && config.local_ba_iterations > 0 && config.local_ba_max_refinements > 0
+}
+
+fn refine_local_bundle_round(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    registered_image: usize,
+    gauge_image: usize,
+    tri_options: &IncrementalTriangulatorOptions,
+    config: &MapperConfig,
+    registration_stats: &RegistrationStats,
+    triangulation_state: &mut IncrementalTriangulatorState,
+    loss_function: crate::ba::BundleAdjustmentLoss,
+) -> Option<LocalBundleReport> {
     let local_bundle = select_local_bundle(
         reconstruction,
         registered_image,
@@ -5567,7 +5650,7 @@ fn refine_local_bundle_after_registration(
         config.local_ba_num_images,
         config.local_ba_min_shared_points,
     )?;
-    let ba_options = mapper_local_ba_options(
+    let mut ba_options = mapper_local_ba_options(
         config,
         reconstruction,
         registration_stats,
@@ -5577,6 +5660,7 @@ fn refine_local_bundle_after_registration(
         Some(local_bundle.point_ids.clone()),
         Some(local_bundle.constant_point_ids.clone()),
     );
+    ba_options.loss_function = loss_function;
     let report = refine_bundle_adjustment_checked(frames, reconstruction, config, ba_options)?;
     let stable_point_ids = local_bundle.stable_point_ids.clone();
     let mut post_ba_point_ids =
@@ -5600,36 +5684,44 @@ fn refine_local_bundle_after_registration(
         image_report.created_points += complete_report.created_points;
         (completed, image_report.total_observations())
     };
+    let filtered_observations = filter_reprojection_tracks(frames, pairs, reconstruction, config);
+    if filtered_observations > 0 {
+        triangulation_state.rebuild(frames, pairs, reconstruction);
+    }
+    let changed_observation_ratio = local_ba_refinement_change_ratio(
+        report.observations,
+        merged_observations,
+        completed_observations + completed_image_observations,
+        filtered_observations,
+    );
     let variable_image_count =
         expand_images_to_registration_frames(reconstruction, &local_bundle.variable_images).len();
     Some(LocalBundleReport {
         report,
+        refinements: 1,
         variable_images: variable_image_count,
         local_images: local_bundle.local_images.len(),
         points: local_bundle.point_ids.len(),
         merged_observations,
         completed_observations,
         completed_image_observations,
+        filtered_observations,
+        changed_observation_ratio,
     })
 }
 
-fn local_bundle_refinement_required(
-    reconstruction: &Reconstruction,
-    registered_image: usize,
-    gauge_image: usize,
-    config: &MapperConfig,
-) -> bool {
-    if !config.local_ba || config.local_ba_iterations == 0 {
-        return false;
+fn local_ba_refinement_change_ratio(
+    adjusted_observations: usize,
+    merged_observations: usize,
+    completed_observations: usize,
+    filtered_observations: usize,
+) -> f32 {
+    if adjusted_observations == 0 {
+        0.0
+    } else {
+        (merged_observations + completed_observations + filtered_observations) as f32
+            / adjusted_observations as f32
     }
-    select_local_bundle(
-        reconstruction,
-        registered_image,
-        gauge_image,
-        config.local_ba_num_images,
-        config.local_ba_min_shared_points,
-    )
-    .is_some()
 }
 
 fn registration_state_has_bogus_camera(
@@ -10764,6 +10856,8 @@ mod tests {
 
         let config = MapperConfig::default();
         assert_eq!(config.local_ba_iterations, 25);
+        assert_eq!(config.local_ba_max_refinements, 2);
+        assert_eq!(config.local_ba_max_refinement_change, 0.001);
         assert_eq!(config.global_ba_iterations, 50);
 
         let options = mapper_ba_options(
@@ -11012,6 +11106,20 @@ mod tests {
             local_options.loss_function,
             crate::ba::BundleAdjustmentLoss::SoftL1 { scale: 1.0 }
         );
+        assert_eq!(
+            mapper_local_ba_refinement_loss_function(0),
+            crate::ba::BundleAdjustmentLoss::SoftL1 { scale: 1.0 }
+        );
+        assert_eq!(
+            mapper_local_ba_refinement_loss_function(1),
+            crate::ba::BundleAdjustmentLoss::Trivial
+        );
+    }
+
+    #[test]
+    fn local_ba_refinement_change_ratio_matches_colmap_formula() {
+        assert_eq!(local_ba_refinement_change_ratio(0, 1, 2, 3), 0.0);
+        assert_eq!(local_ba_refinement_change_ratio(100, 7, 11, 2), 0.2);
     }
 
     #[test]

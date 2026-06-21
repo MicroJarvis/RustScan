@@ -26,6 +26,7 @@ pub mod two_view;
 pub mod types;
 pub mod wide;
 
+pub use compare::{compare_colmap, CompareReport};
 pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use mapper::{
     run_reconstruction, run_reconstruction_with_callbacks, FeatureType,

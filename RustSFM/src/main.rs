@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rustsfm::feature_matching::MatchingPairStrategy;
-use rustsfm::{compare_colmap, compare_database_parity, run_reconstruction, FeatureType, MapperConfig};
 use rustsfm::sift::SiftMatchingOptions;
+use rustsfm::{
+    compare_colmap, compare_database_parity, run_reconstruction, FeatureType, MapperConfig,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -121,11 +123,15 @@ struct ReconstructArgs {
     local_ba_num_images: usize,
     #[arg(long, default_value = "15")]
     local_ba_min_shared_points: usize,
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "25")]
     local_ba_iterations: usize,
+    #[arg(long, default_value = "2")]
+    local_ba_max_refinements: usize,
+    #[arg(long, default_value = "0.001")]
+    local_ba_max_refinement_change: f32,
     #[arg(long, default_value_t = false)]
     no_global_ba: bool,
-    #[arg(long, default_value = "8")]
+    #[arg(long, default_value = "50")]
     global_ba_iterations: usize,
     #[arg(long, default_value = "1.1")]
     global_ba_images_ratio: f32,
@@ -283,6 +289,8 @@ fn main() -> Result<()> {
                 local_ba_num_images: args.local_ba_num_images,
                 local_ba_min_shared_points: args.local_ba_min_shared_points,
                 local_ba_iterations: args.local_ba_iterations,
+                local_ba_max_refinements: args.local_ba_max_refinements,
+                local_ba_max_refinement_change: args.local_ba_max_refinement_change,
                 global_ba: !args.no_global_ba,
                 global_ba_iterations: args.global_ba_iterations,
                 global_ba_images_ratio: args.global_ba_images_ratio,
