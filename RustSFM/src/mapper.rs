@@ -1640,6 +1640,7 @@ fn mapper_ba_options(
         refine_focal_length: config.ba_refine_focal_length,
         refine_principal_point: config.ba_refine_principal_point,
         refine_extra_params: config.ba_refine_extra_params,
+        num_threads: config.threads.map(|threads| threads as isize).unwrap_or(-1),
         point_ids,
         constant_point_ids,
         ..crate::ba::BundleAdjustmentOptions::default()
@@ -10745,6 +10746,21 @@ mod tests {
         assert_eq!(options.gradient_tolerance, 1.0);
         assert_eq!(options.parameter_tolerance, 0.0);
         assert_eq!(options.max_linear_solver_iterations, 100);
+        assert_eq!(options.num_threads, -1);
+
+        let threaded_options = mapper_ba_options(
+            &MapperConfig {
+                threads: Some(4),
+                ..MapperConfig::default()
+            },
+            &reconstruction,
+            3,
+            Some(vec![0]),
+            Vec::new(),
+            None,
+            None,
+        );
+        assert_eq!(threaded_options.num_threads, 4);
     }
 
     #[test]
@@ -10793,6 +10809,7 @@ mod tests {
         assert_eq!(options.gradient_tolerance, 10.0);
         assert_eq!(options.parameter_tolerance, 0.0);
         assert_eq!(options.max_linear_solver_iterations, 100);
+        assert_eq!(options.num_threads, -1);
     }
 
     #[test]

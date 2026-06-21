@@ -261,6 +261,12 @@ namespace ceres {
     int SolverSummary::num_line_search_steps() const {
         return inner.num_line_search_steps;
     }
+    int SolverSummary::num_threads_given() const {
+        return inner.num_threads_given;
+    }
+    int SolverSummary::num_threads_used() const {
+        return inner.num_threads_used;
+    }
     double SolverSummary::last_gradient_max_norm() const {
         return inner.iterations.empty() ? std::numeric_limits<double>::quiet_NaN()
                                         : inner.iterations.back().gradient_max_norm;

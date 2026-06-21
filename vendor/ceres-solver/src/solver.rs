@@ -512,6 +512,16 @@ impl SolverSummary {
     }
 
     #[inline]
+    pub fn num_threads_given(&self) -> i32 {
+        self.inner().num_threads_given()
+    }
+
+    #[inline]
+    pub fn num_threads_used(&self) -> i32 {
+        self.inner().num_threads_used()
+    }
+
+    #[inline]
     pub fn last_gradient_max_norm(&self) -> f64 {
         self.inner().last_gradient_max_norm()
     }

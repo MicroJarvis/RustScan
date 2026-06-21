@@ -376,6 +376,8 @@ pub mod ffi {
         fn num_unsuccessful_steps(self: &SolverSummary) -> i32;
         fn num_inner_iteration_steps(self: &SolverSummary) -> i32;
         fn num_line_search_steps(self: &SolverSummary) -> i32;
+        fn num_threads_given(self: &SolverSummary) -> i32;
+        fn num_threads_used(self: &SolverSummary) -> i32;
         fn last_gradient_max_norm(self: &SolverSummary) -> f64;
         fn last_step_norm(self: &SolverSummary) -> f64;
         fn last_relative_decrease(self: &SolverSummary) -> f64;

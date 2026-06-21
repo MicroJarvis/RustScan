@@ -288,7 +288,7 @@ pub fn solve_bundle_adjustment_ceres(
         problem.set_parameter_block_constant(storage_idx).ok()?;
     }
 
-    let solver_options = ceres_solver_options(&options, pose_entity_registry.len())?;
+    let solver_options = ceres_solver_options(&options, pose_entity_registry.len(), bindings * 2)?;
     let solution = problem.solve(&solver_options).ok()?;
 
     write_back_solution(
@@ -915,6 +915,7 @@ fn ceres_loss(loss: BundleAdjustmentLoss) -> Option<LossFunction> {
 fn ceres_solver_options(
     options: &BundleAdjustmentOptions,
     num_pose_entities: usize,
+    num_residuals: usize,
 ) -> Option<SolverOptions> {
     let linear_solver = if num_pose_entities >= 50 {
         LinearSolverType::SPARSE_SCHUR
@@ -927,11 +928,25 @@ fn ceres_solver_options(
         .gradient_tolerance(options.gradient_tolerance)
         .parameter_tolerance(options.parameter_tolerance)
         .max_linear_solver_iterations(options.max_linear_solver_iterations as i32)
+        .num_threads(ceres_num_threads(options, num_residuals))
         .max_num_consecutive_invalid_steps(options.max_num_consecutive_invalid_steps as i32)
         .max_consecutive_nonmonotonic_steps(options.max_consecutive_nonmonotonic_steps as i32)
         .linear_solver_type(linear_solver)
         .build()
         .ok()
+}
+
+fn ceres_num_threads(options: &BundleAdjustmentOptions, num_residuals: usize) -> i32 {
+    if num_residuals < options.min_num_residuals_for_multi_threading {
+        1
+    } else if options.num_threads <= 0 {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+            .max(1) as i32
+    } else {
+        options.num_threads.min(i32::MAX as isize) as i32
+    }
 }
 
 pub(crate) fn se3_to_params(pose: SE3) -> [f64; 6] {
@@ -1205,6 +1220,7 @@ mod tests {
                 ..BundleAdjustmentOptions::default()
             },
             1,
+            2,
         )
         .is_some());
 
@@ -1214,7 +1230,30 @@ mod tests {
                 ..BundleAdjustmentOptions::default()
             },
             1,
+            2,
         )
         .is_none());
+    }
+
+    #[test]
+    fn ceres_options_match_colmap_threading_gate() {
+        let options = BundleAdjustmentOptions {
+            num_threads: 7,
+            min_num_residuals_for_multi_threading: 100,
+            ..BundleAdjustmentOptions::default()
+        };
+
+        assert_eq!(ceres_num_threads(&options, 99), 1);
+        assert_eq!(ceres_num_threads(&options, 100), 7);
+        assert!(
+            ceres_num_threads(
+                &BundleAdjustmentOptions {
+                    num_threads: -1,
+                    min_num_residuals_for_multi_threading: 0,
+                    ..BundleAdjustmentOptions::default()
+                },
+                0,
+            ) >= 1
+        );
     }
 }

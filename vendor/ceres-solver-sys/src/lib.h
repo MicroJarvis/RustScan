@@ -116,6 +116,8 @@ namespace ceres {
         int num_unsuccessful_steps() const;
         int num_inner_iteration_steps() const;
         int num_line_search_steps() const;
+        int num_threads_given() const;
+        int num_threads_used() const;
         double last_gradient_max_norm() const;
         double last_step_norm() const;
         double last_relative_decrease() const;

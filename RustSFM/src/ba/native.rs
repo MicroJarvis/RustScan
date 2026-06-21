@@ -350,7 +350,6 @@ pub(crate) fn point_effective_parameter_count(
     points.len() * 3
 }
 
-
 struct SchurSystem {
     h: DMatrix<f64>,
     g: DVector<f64>,
@@ -887,7 +886,10 @@ fn selected_camera_params(
     selected
 }
 
-pub(crate) fn camera_index_for_image(reconstruction: &Reconstruction, image: usize) -> Option<usize> {
+pub(crate) fn camera_index_for_image(
+    reconstruction: &Reconstruction,
+    image: usize,
+) -> Option<usize> {
     match reconstruction.image_camera_indices.get(image).copied() {
         Some(camera_idx) if camera_idx < reconstruction.cameras.len() => Some(camera_idx),
         Some(0) if reconstruction.cameras.is_empty() => Some(0),
@@ -902,7 +904,10 @@ pub(crate) fn camera_index_for_image(reconstruction: &Reconstruction, image: usi
     }
 }
 
-pub(crate) fn camera_by_index(reconstruction: &Reconstruction, camera_idx: usize) -> Option<CameraModel> {
+pub(crate) fn camera_by_index(
+    reconstruction: &Reconstruction,
+    camera_idx: usize,
+) -> Option<CameraModel> {
     reconstruction
         .cameras
         .get(camera_idx)
@@ -2877,6 +2882,8 @@ mod tests {
         assert_eq!(options.gradient_tolerance, 1.0e-4);
         assert_eq!(options.parameter_tolerance, 0.0);
         assert_eq!(options.max_linear_solver_iterations, 200);
+        assert_eq!(options.num_threads, -1);
+        assert_eq!(options.min_num_residuals_for_multi_threading, 50_000);
         assert_eq!(options.max_num_consecutive_invalid_steps, 10);
         assert_eq!(options.max_consecutive_nonmonotonic_steps, 10);
     }
@@ -2892,9 +2899,7 @@ mod tests {
         assert!((BundleAdjustmentLoss::Trivial.weight(s_in) - 1.0).abs() < 1e-12);
         assert!((BundleAdjustmentLoss::Huber { scale }.weight(s_in) - 1.0).abs() < 1e-12);
         assert!((BundleAdjustmentLoss::Trivial.cost(s_in) - 0.5 * s_in).abs() < 1e-12);
-        assert!(
-            (BundleAdjustmentLoss::Huber { scale }.cost(s_in) - 0.5 * s_in).abs() < 1e-12
-        );
+        assert!((BundleAdjustmentLoss::Huber { scale }.cost(s_in) - 0.5 * s_in).abs() < 1e-12);
 
         // Outlier region: s > scale^2.
         let s_out = 16.0; // err = 4, scale = 2

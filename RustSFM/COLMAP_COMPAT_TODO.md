@@ -877,6 +877,9 @@ reconstruction parity.
     - Ceres-backed BA now reads final gradient norm, step norm, trust-region
       decrease ratio, and LM damping from Ceres iteration summaries through
       structured bindings instead of relying on report-text parsing.
+    - Ceres-backed BA now mirrors COLMAP's CPU threading gate: mapper
+      `--threads` is forwarded to Ceres, while problems below 50,000 residuals
+      are forced to one Ceres thread to avoid small-problem threading overhead.
     - BA now uses analytic pose/point Jacobians for SIMPLE_PINHOLE, PINHOLE,
       SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, FOV, SIMPLE_FISHEYE,
       FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, OPENCV_FISHEYE,
