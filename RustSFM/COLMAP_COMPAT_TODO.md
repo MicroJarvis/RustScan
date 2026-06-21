@@ -877,6 +877,10 @@ reconstruction parity.
     - Ceres-backed BA now reads final gradient norm, step norm, trust-region
       decrease ratio, and LM damping from Ceres iteration summaries through
       structured bindings instead of relying on report-text parsing.
+    - Ceres-backed BA now reads Ceres termination type and message through
+      structured bindings and maps the termination type directly like
+      COLMAP's `CeresTerminationTypeToTerminationType`, keeping report-text
+      parsing only as a fallback for reason classification.
     - Ceres-backed BA now mirrors COLMAP's CPU threading gate: mapper
       `--threads` is forwarded to Ceres, while problems below 50,000 residuals
       are forced to one Ceres thread to avoid small-problem threading overhead.

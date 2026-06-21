@@ -17,7 +17,7 @@ use super::{
 use crate::types::{CameraModel, ImageFrame, Reconstruction, Rigid3};
 use ceres_solver::loss::LossFunction;
 use ceres_solver::parameter_block::ParameterBlockOrIndex;
-use ceres_solver::solver::{LinearSolverType, PreconditionerType, SolverOptions};
+use ceres_solver::solver::{LinearSolverType, PreconditionerType, SolverOptions, TerminationType};
 use ceres_solver::{CostFunctionType, NllsProblem};
 use glam::{Quat, Vec3};
 use nalgebra::SMatrix;
@@ -331,7 +331,7 @@ pub fn solve_bundle_adjustment_ceres(
     let successful_steps = summary.num_successful_steps().max(0) as usize;
     let unsuccessful_steps = summary.num_unsuccessful_steps().max(0) as usize;
     let (termination_type, termination_reason, gradient_max_norm, step_norm, step_quality, damping) =
-        map_ceres_summary(&summary, &options);
+        map_ceres_summary(&summary);
     Some(BundleAdjustmentReport {
         iterations: successful_steps,
         attempted_iterations: successful_steps + unsuccessful_steps,
@@ -1450,7 +1450,6 @@ fn pose_params_to_se3(params: &[f64]) -> SE3 {
 
 fn map_ceres_summary(
     summary: &ceres_solver::solver::SolverSummary,
-    options: &BundleAdjustmentOptions,
 ) -> (
     BundleAdjustmentTerminationType,
     BundleAdjustmentTerminationReason,
@@ -1467,7 +1466,8 @@ fn map_ceres_summary(
         &brief
     };
 
-    let (termination_type, termination_reason) = parse_ceres_termination(source, summary, options);
+    let termination_type = map_ceres_termination_type(summary.termination_type());
+    let termination_reason = parse_ceres_termination_reason(source, summary);
     let gradient_max_norm = finite_or_none(summary.last_gradient_max_norm())
         .or_else(|| parse_ceres_gradient_max_norm(&full))
         .or_else(|| parse_ceres_gradient_max_norm(&brief))
@@ -1506,21 +1506,37 @@ fn finite_or_none(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-fn parse_ceres_termination(
+fn map_ceres_termination_type(ceres_type: TerminationType) -> BundleAdjustmentTerminationType {
+    match ceres_type {
+        TerminationType::Convergence => BundleAdjustmentTerminationType::Convergence,
+        TerminationType::NoConvergence => BundleAdjustmentTerminationType::NoConvergence,
+        TerminationType::Failure => BundleAdjustmentTerminationType::Failure,
+        TerminationType::UserSuccess => BundleAdjustmentTerminationType::UserSuccess,
+        TerminationType::UserFailure => BundleAdjustmentTerminationType::UserFailure,
+        TerminationType::Unknown(_) => BundleAdjustmentTerminationType::Failure,
+    }
+}
+
+fn parse_ceres_termination_reason(
     report: &str,
     summary: &ceres_solver::solver::SolverSummary,
-    options: &BundleAdjustmentOptions,
-) -> (
-    BundleAdjustmentTerminationType,
-    BundleAdjustmentTerminationReason,
-) {
+) -> BundleAdjustmentTerminationReason {
     let termination_line = report
         .lines()
         .find(|line| line.contains("Termination:"))
         .unwrap_or("");
-    let upper = termination_line.to_ascii_uppercase();
+    let message = summary.message();
+    let upper = if termination_line.is_empty() {
+        message.to_ascii_uppercase()
+    } else {
+        format!(
+            "{} {}",
+            termination_line.to_ascii_uppercase(),
+            message.to_ascii_uppercase()
+        )
+    };
 
-    let reason = if upper.contains("MAXIMUM") || upper.contains("MAX NUM") {
+    if upper.contains("MAXIMUM") || upper.contains("MAX NUM") {
         BundleAdjustmentTerminationReason::MaxIterations
     } else if upper.contains("GRADIENT") {
         BundleAdjustmentTerminationReason::GradientTolerance
@@ -1534,21 +1550,7 @@ fn parse_ceres_termination(
         BundleAdjustmentTerminationReason::GradientTolerance
     } else {
         BundleAdjustmentTerminationReason::MaxIterations
-    };
-
-    let termination_type = if !summary.is_solution_usable() {
-        BundleAdjustmentTerminationType::Failure
-    } else if upper.contains("NO CONVERGENCE")
-        || (summary.num_successful_steps() == 0
-            && options.iterations > 0
-            && summary.num_unsuccessful_steps() >= options.iterations as i32)
-    {
-        BundleAdjustmentTerminationType::NoConvergence
-    } else {
-        BundleAdjustmentTerminationType::Convergence
-    };
-
-    (termination_type, reason)
+    }
 }
 
 fn parse_ceres_gradient_max_norm(report: &str) -> Option<f64> {
@@ -1741,6 +1743,34 @@ mod tests {
 
         assert!(report.is_solution_usable());
         assert!(report.final_cost <= report.initial_cost + 1.0e-12);
+    }
+
+    #[test]
+    fn ceres_termination_type_mapping_matches_colmap_summary_bridge() {
+        assert_eq!(
+            map_ceres_termination_type(TerminationType::Convergence),
+            BundleAdjustmentTerminationType::Convergence
+        );
+        assert_eq!(
+            map_ceres_termination_type(TerminationType::NoConvergence),
+            BundleAdjustmentTerminationType::NoConvergence
+        );
+        assert_eq!(
+            map_ceres_termination_type(TerminationType::Failure),
+            BundleAdjustmentTerminationType::Failure
+        );
+        assert_eq!(
+            map_ceres_termination_type(TerminationType::UserSuccess),
+            BundleAdjustmentTerminationType::UserSuccess
+        );
+        assert_eq!(
+            map_ceres_termination_type(TerminationType::UserFailure),
+            BundleAdjustmentTerminationType::UserFailure
+        );
+        assert_eq!(
+            map_ceres_termination_type(TerminationType::Unknown(99)),
+            BundleAdjustmentTerminationType::Failure
+        );
     }
 
     #[test]

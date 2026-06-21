@@ -284,6 +284,12 @@ namespace ceres {
     bool SolverSummary::is_solution_usable() const {
         return inner.IsSolutionUsable();
     }
+    uint32_t SolverSummary::termination_type_value() const {
+        return static_cast<uint32_t>(inner.termination_type);
+    }
+    std::unique_ptr<std::string> SolverSummary::message() const {
+        return std::make_unique<std::string>(inner.message);
+    }
     double SolverSummary::initial_cost() const {
         return inner.initial_cost;
     }

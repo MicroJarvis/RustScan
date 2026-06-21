@@ -112,6 +112,8 @@ namespace ceres {
         std::unique_ptr<std::string> brief_report() const;
         std::unique_ptr<std::string> full_report() const;
         bool is_solution_usable() const;
+        uint32_t termination_type_value() const;
+        std::unique_ptr<std::string> message() const;
         double initial_cost() const;
         double final_cost() const;
         double fixed_cost() const;

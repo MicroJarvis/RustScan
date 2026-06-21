@@ -387,6 +387,8 @@ pub mod ffi {
         fn brief_report(self: &SolverSummary) -> UniquePtr<CxxString>;
         fn full_report(self: &SolverSummary) -> UniquePtr<CxxString>;
         fn is_solution_usable(self: &SolverSummary) -> bool;
+        fn termination_type_value(self: &SolverSummary) -> u32;
+        fn message(self: &SolverSummary) -> UniquePtr<CxxString>;
         fn initial_cost(self: &SolverSummary) -> f64;
         fn final_cost(self: &SolverSummary) -> f64;
         fn fixed_cost(self: &SolverSummary) -> f64;

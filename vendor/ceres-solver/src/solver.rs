@@ -18,6 +18,29 @@ use std::pin::Pin;
 
 pub struct SolverOptions(pub(crate) UniquePtr<ffi::SolverOptions>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationType {
+    Convergence,
+    NoConvergence,
+    Failure,
+    UserSuccess,
+    UserFailure,
+    Unknown(u32),
+}
+
+impl TerminationType {
+    fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::Convergence,
+            1 => Self::NoConvergence,
+            2 => Self::Failure,
+            3 => Self::UserSuccess,
+            4 => Self::UserFailure,
+            value => Self::Unknown(value),
+        }
+    }
+}
+
 impl SolverOptions {
     pub fn builder() -> SolverOptionsBuilder {
         SolverOptionsBuilder::new()
@@ -474,6 +497,16 @@ impl SolverSummary {
     #[inline]
     pub fn is_solution_usable(&self) -> bool {
         self.inner().is_solution_usable()
+    }
+
+    #[inline]
+    pub fn termination_type(&self) -> TerminationType {
+        TerminationType::from_u32(self.inner().termination_type_value())
+    }
+
+    #[inline]
+    pub fn message(&self) -> String {
+        self.inner().message().to_string_lossy().into_owned()
     }
 
     #[inline]
