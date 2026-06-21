@@ -925,8 +925,9 @@ reconstruction parity.
       step.
     - Mapper local/global BA option construction now applies COLMAP
       incremental-pipeline Ceres convergence settings: local BA uses gradient
-      tolerance 10 and global BA uses gradient tolerance 1, both with 100
-      linear-solver iterations and zero parameter tolerance.
+      tolerance 10 and 25 iterations; global BA uses gradient tolerance 1 and
+      50 iterations; both use 100 linear-solver iterations and zero parameter
+      tolerance.
     - BA now provides a Ceres-equivalent robust loss family
       (`BundleAdjustmentLoss`: Trivial, Huber, SoftL1, Cauchy) whose `rho(s)`
       cost and `rho'(s)` IRLS weight match Ceres' `LossFunction` formulas for

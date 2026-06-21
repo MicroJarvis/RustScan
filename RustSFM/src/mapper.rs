@@ -617,9 +617,9 @@ impl Default for MapperConfig {
             local_ba: true,
             local_ba_num_images: 6,
             local_ba_min_shared_points: 15,
-            local_ba_iterations: 5,
+            local_ba_iterations: 25,
             global_ba: true,
-            global_ba_iterations: 8,
+            global_ba_iterations: 50,
             global_ba_images_ratio: 1.1,
             global_ba_points_ratio: 1.1,
             global_ba_images_freq: 500,
@@ -10762,8 +10762,12 @@ mod tests {
         let frames = vec![minimal_frame(0, "a.jpg")];
         let reconstruction = test_reconstruction(&frames);
 
+        let config = MapperConfig::default();
+        assert_eq!(config.local_ba_iterations, 25);
+        assert_eq!(config.global_ba_iterations, 50);
+
         let options = mapper_ba_options(
-            &MapperConfig::default(),
+            &config,
             &reconstruction,
             3,
             Some(vec![0]),
