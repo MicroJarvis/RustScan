@@ -8,6 +8,9 @@ use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler};
 use rustslam::{ColmapRansacOptions, SE3};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static GENERALIZED_POSE_RANSAC_SEED: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RansacOptions {
@@ -85,6 +88,18 @@ impl RansacOptions {
             num_threads: self.num_threads,
         }
     }
+}
+
+fn generalized_pose_sampler_seed(random_seed: i32) -> u64 {
+    if random_seed >= 0 {
+        random_seed as u64
+    } else {
+        next_generalized_pose_ransac_seed()
+    }
+}
+
+fn next_generalized_pose_ransac_seed() -> u64 {
+    GENERALIZED_POSE_RANSAC_SEED.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -725,11 +740,7 @@ fn estimate_generalized_absolute_pose_ransac(
     }
 
     let active_indices = (0..num_points).collect::<Vec<_>>();
-    let seed = if options.ransac_options.random_seed >= 0 {
-        options.ransac_options.random_seed as u64
-    } else {
-        0x510e_527f_ade6_82d1
-    };
+    let seed = generalized_pose_sampler_seed(options.ransac_options.random_seed);
     let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
     let threshold_sq = observations.normalized_max_error * observations.normalized_max_error;
     let ransac_options = options
@@ -885,11 +896,7 @@ fn estimate_generalized_relative_pose_ransac(
     }
 
     let active_indices = (0..num_points).collect::<Vec<_>>();
-    let seed = if options.ransac_options.random_seed >= 0 {
-        options.ransac_options.random_seed as u64
-    } else {
-        0x6a09_e667_f3bc_c909
-    };
+    let seed = generalized_pose_sampler_seed(options.ransac_options.random_seed);
     let mut sampler = ColmapRandomSampler::new(seed, &active_indices);
     let threshold_sq = observations.normalized_max_error * observations.normalized_max_error;
     let ransac_options = options
@@ -1579,6 +1586,20 @@ mod tests {
         assert_eq!(options.ransac_options.max_error, 4.0);
         assert_eq!(options.ransac_options.min_num_trials, 30);
         assert_eq!(options.ransac_options.random_seed, -1);
+    }
+
+    #[test]
+    fn generalized_pose_sampler_seed_honors_colmap_signed_seed() {
+        assert_eq!(generalized_pose_sampler_seed(42), 42);
+        assert_eq!(generalized_pose_sampler_seed(42), 42);
+    }
+
+    #[test]
+    fn generalized_pose_sampler_seed_changes_for_colmap_default_seed() {
+        let first = generalized_pose_sampler_seed(-1);
+        let second = generalized_pose_sampler_seed(-1);
+
+        assert_ne!(first, second);
     }
 
     #[test]

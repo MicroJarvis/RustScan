@@ -687,6 +687,10 @@ reconstruction parity.
      with unknown/unregistered focal lengths fall back to central absolute pose
      before generalized GP3P is attempted, and central registration resets any
      bogus sibling frame cameras from priors.
+   - Generalized absolute and generalized relative pose sampling now honor the
+     same signed COLMAP seed semantics as mapper PnP: non-negative
+     `random_seed` values are fixed, while `-1` no longer collapses to a
+     hard-coded deterministic seed in the covered PoseLib-backed RANSAC paths.
    - Remaining work: validate exact sample sequences against COLMAP's target
      standard-library `std::uniform_int_distribution` behavior if byte-for-byte
      fixed-seed parity is required, then finish Ceres-equivalent generalized
