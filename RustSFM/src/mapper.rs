@@ -1706,6 +1706,42 @@ fn apply_colmap_global_ba_solver_options(options: &mut crate::ba::BundleAdjustme
     options.max_linear_solver_iterations = 100;
 }
 
+fn mapper_global_ba_options(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    iterations: usize,
+    constant_images: Vec<usize>,
+    point_ids: Option<Vec<usize>>,
+    constant_point_ids: Option<Vec<usize>>,
+) -> crate::ba::BundleAdjustmentOptions {
+    let mut options = mapper_ba_options(
+        config,
+        reconstruction,
+        iterations,
+        None,
+        constant_images,
+        point_ids,
+        constant_point_ids,
+    );
+    apply_colmap_small_reconstruction_global_ba_solver_options(reconstruction, &mut options);
+    options
+}
+
+fn apply_colmap_small_reconstruction_global_ba_solver_options(
+    reconstruction: &Reconstruction,
+    options: &mut crate::ba::BundleAdjustmentOptions,
+) {
+    const MIN_NUM_REG_FRAMES_FOR_FAST_BA: usize = 10;
+    if registered_frame_count(reconstruction) >= MIN_NUM_REG_FRAMES_FOR_FAST_BA {
+        return;
+    }
+    options.function_tolerance /= 10.0;
+    options.gradient_tolerance /= 10.0;
+    options.parameter_tolerance /= 10.0;
+    options.iterations = options.iterations.saturating_mul(2);
+    options.max_linear_solver_iterations = 200;
+}
+
 fn apply_colmap_local_ba_solver_options(options: &mut crate::ba::BundleAdjustmentOptions) {
     options.gradient_tolerance = 10.0;
     options.parameter_tolerance = 0.0;
@@ -5297,11 +5333,10 @@ fn refine_global_bundle_with_postprocessing(
             break;
         }
         attempted = true;
-        let mut ba_options = mapper_ba_options(
+        let mut ba_options = mapper_global_ba_options(
             config,
             reconstruction,
             global_ba_iterations(config),
-            None,
             if config.fix_existing_frames {
                 registration_stats
                     .as_deref()
@@ -10941,6 +10976,47 @@ mod tests {
         assert_eq!(options.parameter_tolerance, 0.0);
         assert_eq!(options.max_linear_solver_iterations, 100);
         assert_eq!(options.num_threads, -1);
+    }
+
+    #[test]
+    fn global_ba_options_tighten_small_reconstructions_like_colmap() {
+        let frames = (0..10)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        let mut reconstruction = test_reconstruction(&frames);
+        for image in 0..9 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        let config = MapperConfig::default();
+
+        let small_options = mapper_global_ba_options(
+            &config,
+            &reconstruction,
+            config.global_ba_iterations,
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(registered_frame_count(&reconstruction), 9);
+        assert_eq!(small_options.iterations, 100);
+        assert_eq!(small_options.function_tolerance, 0.0);
+        assert_eq!(small_options.gradient_tolerance, 0.1);
+        assert_eq!(small_options.parameter_tolerance, 0.0);
+        assert_eq!(small_options.max_linear_solver_iterations, 200);
+
+        reconstruction.poses[9] = Some(SE3::identity());
+        let large_options = mapper_global_ba_options(
+            &config,
+            &reconstruction,
+            config.global_ba_iterations,
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(registered_frame_count(&reconstruction), 10);
+        assert_eq!(large_options.iterations, 50);
+        assert_eq!(large_options.gradient_tolerance, 1.0);
+        assert_eq!(large_options.max_linear_solver_iterations, 100);
     }
 
     #[test]

@@ -932,6 +932,10 @@ reconstruction parity.
       (`ba_local_max_refinements = 2`, `ba_local_max_refinement_change = 0.001`)
       and switches refinement rounds after the first from Soft-L1 to Trivial
       loss.
+      Global BA now applies COLMAP's small-reconstruction convergence rule
+      for fewer than 10 registered frames: tolerances are divided by 10,
+      max iterations are doubled, and max linear-solver iterations are set to
+      200.
     - BA now provides a Ceres-equivalent robust loss family
       (`BundleAdjustmentLoss`: Trivial, Huber, SoftL1, Cauchy) whose `rho(s)`
       cost and `rho'(s)` IRLS weight match Ceres' `LossFunction` formulas for
