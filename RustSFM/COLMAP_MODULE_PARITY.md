@@ -164,7 +164,7 @@ as complete for now:
 1. Bundle adjustment / Ceres layer (`P5`, ~80%) — largest numerical-parity
    bottleneck; caps final reconstruction accuracy.
    - Done: Ceres robust loss family (Trivial/Huber/SoftL1/Cauchy) with COLMAP's
-     Cauchy default; Cholesky reduced-camera-matrix solve (LU fallback)
+     incremental BA local Soft-L1 and global Trivial defaults; Cholesky reduced-camera-matrix solve (LU fallback)
      matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers; `ba/` split
      with Ceres default path, COLMAP-style 7D pose manifolds, rig/frame/sensor/
      intrinsics blocks, gauges, analytic point/camera Jacobians reused from

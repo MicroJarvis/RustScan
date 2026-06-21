@@ -1578,12 +1578,14 @@ fn global_ba_huber_delta_px() -> f64 {
         .unwrap_or(4.0)
 }
 
-/// COLMAP's incremental mapper uses a Cauchy robust loss with scale 1.0 for both
-/// local and global bundle adjustment. The loss type and scale can be overridden
-/// via `RUSTSFM_BA_LOSS` (`trivial|huber|softl1|cauchy`) and
+/// COLMAP's incremental pipeline uses Soft-L1(scale=1.0) for local BA and a
+/// trivial loss for global BA. The loss type and scale can be overridden via
+/// `RUSTSFM_BA_LOSS` (`trivial|huber|softl1|cauchy`) and
 /// `RUSTSFM_BA_LOSS_SCALE`; for backward compatibility a `huber` selection still
 /// honors `RUSTSFM_BA_HUBER_PX` when no explicit scale is provided.
-fn mapper_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
+fn mapper_ba_loss_function(
+    colmap_default: crate::ba::BundleAdjustmentLoss,
+) -> crate::ba::BundleAdjustmentLoss {
     use crate::ba::BundleAdjustmentLoss;
     let kind = std::env::var("RUSTSFM_BA_LOSS")
         .ok()
@@ -1591,7 +1593,7 @@ fn mapper_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
     let scale_override = std::env::var("RUSTSFM_BA_LOSS_SCALE")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0);
+        .filter(|value| value.is_finite() && *value >= 0.0);
     match kind.as_deref() {
         Some("trivial") => BundleAdjustmentLoss::Trivial,
         Some("huber") => BundleAdjustmentLoss::Huber {
@@ -1600,13 +1602,43 @@ fn mapper_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
         Some("softl1") | Some("soft_l1") => BundleAdjustmentLoss::SoftL1 {
             scale: scale_override.unwrap_or(1.0),
         },
-        Some("cauchy") | None => BundleAdjustmentLoss::Cauchy {
+        Some("cauchy") => BundleAdjustmentLoss::Cauchy {
             scale: scale_override.unwrap_or(1.0),
         },
-        Some(_) => BundleAdjustmentLoss::Cauchy {
-            scale: scale_override.unwrap_or(1.0),
-        },
+        None | Some(_) => mapper_ba_loss_with_scale_override(colmap_default, scale_override),
     }
+}
+
+fn mapper_ba_loss_with_scale_override(
+    loss: crate::ba::BundleAdjustmentLoss,
+    scale_override: Option<f64>,
+) -> crate::ba::BundleAdjustmentLoss {
+    match loss {
+        crate::ba::BundleAdjustmentLoss::Trivial => crate::ba::BundleAdjustmentLoss::Trivial,
+        crate::ba::BundleAdjustmentLoss::Huber { scale } => {
+            crate::ba::BundleAdjustmentLoss::Huber {
+                scale: scale_override.unwrap_or(scale),
+            }
+        }
+        crate::ba::BundleAdjustmentLoss::SoftL1 { scale } => {
+            crate::ba::BundleAdjustmentLoss::SoftL1 {
+                scale: scale_override.unwrap_or(scale),
+            }
+        }
+        crate::ba::BundleAdjustmentLoss::Cauchy { scale } => {
+            crate::ba::BundleAdjustmentLoss::Cauchy {
+                scale: scale_override.unwrap_or(scale),
+            }
+        }
+    }
+}
+
+fn mapper_global_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
+    mapper_ba_loss_function(crate::ba::BundleAdjustmentLoss::Trivial)
+}
+
+fn mapper_local_ba_loss_function() -> crate::ba::BundleAdjustmentLoss {
+    mapper_ba_loss_function(crate::ba::BundleAdjustmentLoss::SoftL1 { scale: 1.0 })
 }
 
 fn global_ba_max_observation_error_px(config: &MapperConfig) -> f64 {
@@ -1629,7 +1661,7 @@ fn mapper_ba_options(
     let constant_images = expanded_constant_images(reconstruction, constant_images);
     let mut options = crate::ba::BundleAdjustmentOptions {
         iterations,
-        loss_function: mapper_ba_loss_function(),
+        loss_function: mapper_global_ba_loss_function(),
         max_observation_error_px: global_ba_max_observation_error_px(config),
         variable_images,
         constant_images,
@@ -1709,6 +1741,7 @@ fn mapper_local_ba_options(
     options.constant_cameras = local_constant_cameras;
     options.constant_sensor_from_rig = local_constant_sensors;
     options.gauge = crate::ba::BundleAdjustmentGauge::ThreePoints;
+    options.loss_function = mapper_local_ba_loss_function();
     apply_colmap_local_ba_solver_options(&mut options);
     options
 }
@@ -10940,18 +10973,40 @@ mod tests {
     }
 
     #[test]
-    fn mapper_ba_defaults_to_colmap_cauchy_loss() {
-        // COLMAP's incremental mapper uses a Cauchy robust loss with scale 1.0
-        // for both local and global bundle adjustment. Only assert when the
-        // environment overrides are unset so the test stays deterministic.
+    fn mapper_ba_defaults_match_colmap_incremental_pipeline_losses() {
+        // Only assert when the environment overrides are unset so the test
+        // stays deterministic.
         if std::env::var_os("RUSTSFM_BA_LOSS").is_some()
             || std::env::var_os("RUSTSFM_BA_LOSS_SCALE").is_some()
         {
             return;
         }
+        let frames = vec![minimal_frame(0, "registered.jpg")];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        let stats = registration_stats(&reconstruction);
+        let config = MapperConfig::default();
+
+        let global_options =
+            mapper_ba_options(&config, &reconstruction, 3, None, vec![], None, None);
         assert_eq!(
-            mapper_ba_loss_function(),
-            crate::ba::BundleAdjustmentLoss::Cauchy { scale: 1.0 }
+            global_options.loss_function,
+            crate::ba::BundleAdjustmentLoss::Trivial
+        );
+
+        let local_options = mapper_local_ba_options(
+            &config,
+            &reconstruction,
+            &stats,
+            3,
+            vec![0],
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            local_options.loss_function,
+            crate::ba::BundleAdjustmentLoss::SoftL1 { scale: 1.0 }
         );
     }
 

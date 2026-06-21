@@ -931,9 +931,10 @@ reconstruction parity.
       (`BundleAdjustmentLoss`: Trivial, Huber, SoftL1, Cauchy) whose `rho(s)`
       cost and `rho'(s)` IRLS weight match Ceres' `LossFunction` formulas for
       the squared residual `s = ||r||^2`, replacing the previous Huber-only
-      scalar. The mapper local/global BA now defaults to COLMAP's Cauchy loss
-      with scale 1.0 (overridable via `RUSTSFM_BA_LOSS` /
-      `RUSTSFM_BA_LOSS_SCALE`), matching COLMAP's incremental mapper default.
+      scalar. The mapper BA loss defaults now match COLMAP's incremental
+      pipeline split: local BA uses Soft-L1 with scale 1.0 and global BA uses
+      a trivial loss (overridable via `RUSTSFM_BA_LOSS` /
+      `RUSTSFM_BA_LOSS_SCALE`).
       Ceres-backed BA now also creates an explicit `TrivialLoss` for
       non-robust residuals, matching COLMAP's `CreateLossFunction(TRIVIAL)`
       path instead of omitting the loss pointer.
