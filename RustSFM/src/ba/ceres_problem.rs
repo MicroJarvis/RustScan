@@ -24,6 +24,8 @@ use nalgebra::SMatrix;
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
 
+type Mat3 = SMatrix<f64, 3, 3>;
+type Mat3x7 = SMatrix<f64, 3, 7>;
 type Mat2x7 = SMatrix<f64, 2, 7>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -564,6 +566,20 @@ fn eval_residual(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<[f6
             let pose_params = pose_params_for_role(parameters, binding, ParamRole::ImagePose)?;
             project_image_pose_point(state.camera, pose_params, state.point)?
         }
+        PoseEval::Frame { sensor, .. } => {
+            let rig_pose = pose_params_for_role(parameters, binding, ParamRole::FramePose)?;
+            match sensor {
+                FrameSensorEval::Fixed(pose) => {
+                    let sensor_pose = se3_to_pose_params(*pose);
+                    project_frame_pose_point(state.camera, &sensor_pose, rig_pose, state.point)?
+                }
+                FrameSensorEval::Variable { .. } => {
+                    let sensor_pose =
+                        pose_params_for_role(parameters, binding, ParamRole::SensorPose)?;
+                    project_frame_pose_point(state.camera, sensor_pose, rig_pose, state.point)?
+                }
+            }
+        }
         _ => project_point(state.camera, state.pose, state.point)?,
     };
     Some([predicted[0] - binding.xy[0], predicted[1] - binding.xy[1]])
@@ -749,6 +765,36 @@ fn fill_pose_jacobians(
                         } else {
                             fill_numeric_jacobian_block(parameters, binding, p_idx, jac)?;
                         }
+                    } else if *role == ParamRole::FramePose {
+                        if let Some(j_pose) = analytic_frame_pose_jacobian_block(
+                            parameters,
+                            binding,
+                            p_idx,
+                            state.camera,
+                            state.point,
+                        ) {
+                            for k in 0..7 {
+                                jac[0][k] = j_pose[(0, k)];
+                                jac[1][k] = j_pose[(1, k)];
+                            }
+                        } else {
+                            fill_numeric_jacobian_block(parameters, binding, p_idx, jac)?;
+                        }
+                    } else if *role == ParamRole::SensorPose {
+                        if let Some(j_pose) = analytic_sensor_pose_jacobian_block(
+                            parameters,
+                            binding,
+                            p_idx,
+                            state.camera,
+                            state.point,
+                        ) {
+                            for k in 0..7 {
+                                jac[0][k] = j_pose[(0, k)];
+                                jac[1][k] = j_pose[(1, k)];
+                            }
+                        } else {
+                            fill_numeric_jacobian_block(parameters, binding, p_idx, jac)?;
+                        }
                     } else {
                         fill_numeric_jacobian_block(parameters, binding, p_idx, jac)?;
                     }
@@ -791,6 +837,42 @@ fn analytic_image_pose_jacobian_block(
     analytic_image_pose_jacobian_ambient(camera, point, pose_params)
 }
 
+fn analytic_frame_pose_jacobian_block(
+    parameters: &[&[f64]],
+    binding: &ResidualBinding,
+    p_idx: usize,
+    camera: CameraModel,
+    point: [f32; 3],
+) -> Option<Mat2x7> {
+    if binding.param_roles.get(p_idx) != Some(&ParamRole::FramePose) {
+        return None;
+    }
+    let rig_pose = parameters.get(p_idx)?;
+    if rig_pose.len() != 7 {
+        return None;
+    }
+    let sensor_pose = sensor_pose_params_for_binding(parameters, binding)?;
+    analytic_frame_pose_jacobian_ambient(camera, &sensor_pose, rig_pose, point)
+}
+
+fn analytic_sensor_pose_jacobian_block(
+    parameters: &[&[f64]],
+    binding: &ResidualBinding,
+    p_idx: usize,
+    camera: CameraModel,
+    point: [f32; 3],
+) -> Option<Mat2x7> {
+    if binding.param_roles.get(p_idx) != Some(&ParamRole::SensorPose) {
+        return None;
+    }
+    let sensor_pose = parameters.get(p_idx)?;
+    if sensor_pose.len() != 7 {
+        return None;
+    }
+    let rig_pose = pose_params_array_for_role(parameters, binding, ParamRole::FramePose)?;
+    analytic_sensor_pose_jacobian_ambient(camera, sensor_pose, &rig_pose, point)
+}
+
 fn analytic_image_pose_jacobian_ambient(
     camera: CameraModel,
     point: [f32; 3],
@@ -801,7 +883,7 @@ fn analytic_image_pose_jacobian_ambient(
     let y = cam_point[1];
     let z = cam_point[2];
     let j_cam = analytic_img_from_cam_jacobian(camera, x, y, z)?;
-    let j_rot = quaternion_rotate_point_jacobian(pose_params, point)?;
+    let j_rot = quaternion_rotate_point_jacobian(pose_params, point_f64(point))?;
 
     let mut j_pose = Mat2x7::zeros();
     for col in 0..4 {
@@ -819,6 +901,71 @@ fn analytic_image_pose_jacobian_ambient(
     Some(j_pose)
 }
 
+fn analytic_frame_pose_jacobian_ambient(
+    camera: CameraModel,
+    sensor_pose_params: &[f64],
+    rig_pose_params: &[f64],
+    point: [f32; 3],
+) -> Option<Mat2x7> {
+    let cam_point = frame_pose_cam_point(sensor_pose_params, rig_pose_params, point)?;
+    let j_cam = analytic_img_from_cam_jacobian(camera, cam_point[0], cam_point[1], cam_point[2])?;
+    let j_rig_rot = quaternion_rotate_point_jacobian(rig_pose_params, point_f64(point))?;
+    let r_sensor = quaternion_rotation_matrix_colmap(sensor_pose_params)?;
+
+    let mut dcam_drig = Mat3x7::zeros();
+    for col in 0..4 {
+        for row in 0..3 {
+            dcam_drig[(row, col)] = r_sensor[(row, 0)] * j_rig_rot[(0, col)]
+                + r_sensor[(row, 1)] * j_rig_rot[(1, col)]
+                + r_sensor[(row, 2)] * j_rig_rot[(2, col)];
+        }
+    }
+    for col in 0..3 {
+        for row in 0..3 {
+            dcam_drig[(row, col + 4)] = r_sensor[(row, col)];
+        }
+    }
+
+    Some(mul_img_from_cam_jacobian(&j_cam, &dcam_drig))
+}
+
+fn analytic_sensor_pose_jacobian_ambient(
+    camera: CameraModel,
+    sensor_pose_params: &[f64],
+    rig_pose_params: &[f64],
+    point: [f32; 3],
+) -> Option<Mat2x7> {
+    let point_in_rig = rig_pose_point(rig_pose_params, point)?;
+    let cam_point = frame_pose_cam_point(sensor_pose_params, rig_pose_params, point)?;
+    let j_cam = analytic_img_from_cam_jacobian(camera, cam_point[0], cam_point[1], cam_point[2])?;
+    let j_sensor_rot = quaternion_rotate_point_jacobian(sensor_pose_params, point_in_rig)?;
+
+    let mut dcam_dsensor = Mat3x7::zeros();
+    for col in 0..4 {
+        for row in 0..3 {
+            dcam_dsensor[(row, col)] = j_sensor_rot[(row, col)];
+        }
+    }
+    for col in 0..3 {
+        dcam_dsensor[(col, col + 4)] = 1.0;
+    }
+
+    Some(mul_img_from_cam_jacobian(&j_cam, &dcam_dsensor))
+}
+
+fn mul_img_from_cam_jacobian(j_cam: &SMatrix<f64, 2, 3>, dcam_dpose: &Mat3x7) -> Mat2x7 {
+    let mut jacobian = Mat2x7::zeros();
+    for col in 0..7 {
+        jacobian[(0, col)] = j_cam[(0, 0)] * dcam_dpose[(0, col)]
+            + j_cam[(0, 1)] * dcam_dpose[(1, col)]
+            + j_cam[(0, 2)] * dcam_dpose[(2, col)];
+        jacobian[(1, col)] = j_cam[(1, 0)] * dcam_dpose[(0, col)]
+            + j_cam[(1, 1)] * dcam_dpose[(1, col)]
+            + j_cam[(1, 2)] * dcam_dpose[(2, col)];
+    }
+    jacobian
+}
+
 fn pose_params_for_role<'a>(
     parameters: &'a [&'a [f64]],
     binding: &ResidualBinding,
@@ -832,6 +979,32 @@ fn pose_params_for_role<'a>(
     (pose_params.len() == 7).then_some(*pose_params)
 }
 
+fn pose_params_array_for_role(
+    parameters: &[&[f64]],
+    binding: &ResidualBinding,
+    role: ParamRole,
+) -> Option<[f64; 7]> {
+    let pose_params = pose_params_for_role(parameters, binding, role)?;
+    let mut out = [0.0; 7];
+    out.copy_from_slice(pose_params);
+    Some(out)
+}
+
+fn sensor_pose_params_for_binding(
+    parameters: &[&[f64]],
+    binding: &ResidualBinding,
+) -> Option<[f64; 7]> {
+    match &binding.pose_eval {
+        PoseEval::Frame { sensor, .. } => match sensor {
+            FrameSensorEval::Fixed(pose) => Some(se3_to_pose_params(*pose)),
+            FrameSensorEval::Variable { .. } => {
+                pose_params_array_for_role(parameters, binding, ParamRole::SensorPose)
+            }
+        },
+        _ => None,
+    }
+}
+
 fn project_image_pose_point(
     camera: CameraModel,
     pose_params: &[f64],
@@ -841,11 +1014,21 @@ fn project_image_pose_point(
     camera.img_from_cam(cam_point[0], cam_point[1], cam_point[2])
 }
 
+fn project_frame_pose_point(
+    camera: CameraModel,
+    sensor_pose_params: &[f64],
+    rig_pose_params: &[f64],
+    point: [f32; 3],
+) -> Option<[f64; 2]> {
+    let cam_point = frame_pose_cam_point(sensor_pose_params, rig_pose_params, point)?;
+    camera.img_from_cam(cam_point[0], cam_point[1], cam_point[2])
+}
+
 fn image_pose_cam_point(pose_params: &[f64], point: [f32; 3]) -> Option<[f64; 3]> {
     if pose_params.len() != 7 {
         return None;
     }
-    let rotated = quaternion_rotate_point_colmap(pose_params, point)?;
+    let rotated = quaternion_rotate_point_colmap(pose_params, point_f64(point))?;
     let cam_point = [
         rotated[0] + pose_params[4],
         rotated[1] + pose_params[5],
@@ -857,7 +1040,54 @@ fn image_pose_cam_point(pose_params: &[f64], point: [f32; 3]) -> Option<[f64; 3]
         .then_some(cam_point)
 }
 
-fn quaternion_rotate_point_colmap(q: &[f64], point: [f32; 3]) -> Option<[f64; 3]> {
+fn frame_pose_cam_point(
+    sensor_pose_params: &[f64],
+    rig_pose_params: &[f64],
+    point: [f32; 3],
+) -> Option<[f64; 3]> {
+    let point_in_rig = rig_pose_point(rig_pose_params, point)?;
+    let rotated = quaternion_rotate_point_colmap(sensor_pose_params, point_in_rig)?;
+    let cam_point = [
+        rotated[0] + sensor_pose_params[4],
+        rotated[1] + sensor_pose_params[5],
+        rotated[2] + sensor_pose_params[6],
+    ];
+    cam_point
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(cam_point)
+}
+
+fn rig_pose_point(rig_pose_params: &[f64], point: [f32; 3]) -> Option<[f64; 3]> {
+    if rig_pose_params.len() != 7 {
+        return None;
+    }
+    let rotated = quaternion_rotate_point_colmap(rig_pose_params, point_f64(point))?;
+    let point_in_rig = [
+        rotated[0] + rig_pose_params[4],
+        rotated[1] + rig_pose_params[5],
+        rotated[2] + rig_pose_params[6],
+    ];
+    point_in_rig
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(point_in_rig)
+}
+
+fn point_f64(point: [f32; 3]) -> [f64; 3] {
+    [point[0] as f64, point[1] as f64, point[2] as f64]
+}
+
+fn quaternion_rotation_matrix_colmap(q: &[f64]) -> Option<Mat3> {
+    let ex = quaternion_rotate_point_colmap(q, [1.0, 0.0, 0.0])?;
+    let ey = quaternion_rotate_point_colmap(q, [0.0, 1.0, 0.0])?;
+    let ez = quaternion_rotate_point_colmap(q, [0.0, 0.0, 1.0])?;
+    Some(Mat3::from_row_slice(&[
+        ex[0], ey[0], ez[0], ex[1], ey[1], ez[1], ex[2], ey[2], ez[2],
+    ]))
+}
+
+fn quaternion_rotate_point_colmap(q: &[f64], point: [f64; 3]) -> Option<[f64; 3]> {
     if q.len() < 4 {
         return None;
     }
@@ -865,9 +1095,9 @@ fn quaternion_rotate_point_colmap(q: &[f64], point: [f32; 3]) -> Option<[f64; 3]
     let qy = q[1];
     let qz = q[2];
     let qw = q[3];
-    let px = point[0] as f64;
-    let py = point[1] as f64;
-    let pz = point[2] as f64;
+    let px = point[0];
+    let py = point[1];
+    let pz = point[2];
 
     let v_x_p0 = qy * pz - qz * py;
     let v_x_p1 = qz * px - qx * pz;
@@ -887,7 +1117,7 @@ fn quaternion_rotate_point_colmap(q: &[f64], point: [f32; 3]) -> Option<[f64; 3]
         .then_some(rotated)
 }
 
-fn quaternion_rotate_point_jacobian(q: &[f64], point: [f32; 3]) -> Option<SMatrix<f64, 3, 4>> {
+fn quaternion_rotate_point_jacobian(q: &[f64], point: [f64; 3]) -> Option<SMatrix<f64, 3, 4>> {
     if q.len() < 4 {
         return None;
     }
@@ -895,9 +1125,9 @@ fn quaternion_rotate_point_jacobian(q: &[f64], point: [f32; 3]) -> Option<SMatri
     let qy = q[1];
     let qz = q[2];
     let qw = q[3];
-    let px = point[0] as f64;
-    let py = point[1] as f64;
-    let pz = point[2] as f64;
+    let px = point[0];
+    let py = point[1];
+    let pz = point[2];
     let qx_px = qx * px;
     let qx_py = qx * py;
     let qx_pz = qx * pz;
@@ -1493,25 +1723,121 @@ mod tests {
         };
         let analytic = analytic_image_pose_jacobian_ambient(camera, point, &pose_params).unwrap();
         let point_params = [point[0] as f64, point[1] as f64, point[2] as f64];
+        let parameters = [pose_params.as_slice(), point_params.as_slice()];
+        let numeric = numeric_jacobian_for_block(&parameters, &binding, 0);
+        assert_mat2x7_close(analytic, numeric, 1.0e-3);
+    }
+
+    #[test]
+    fn frame_pose_ambient_jacobian_matches_numeric_ceres_block() {
+        let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
+        let sensor_pose = SE3::from_quat_translation(
+            Quat::from_rotation_x(-0.11).normalize(),
+            Vec3::new(0.15, 0.03, -0.02),
+        );
+        let rig_pose = SE3::from_quat_translation(
+            Quat::from_rotation_y(0.17).normalize(),
+            Vec3::new(0.2, -0.1, 0.05),
+        );
+        let point = [0.25, -0.1, 2.5];
+        let sensor_params = se3_to_pose_params(sensor_pose);
+        let rig_params = se3_to_pose_params(rig_pose);
+        let binding = ResidualBinding {
+            xy: [70.0, 82.0],
+            param_roles: vec![
+                ParamRole::SensorPose,
+                ParamRole::FramePose,
+                ParamRole::Point,
+            ],
+            pose_eval: PoseEval::Frame {
+                frame_handle: 1,
+                sensor: FrameSensorEval::Variable { handle: 0 },
+            },
+            camera_base: camera,
+        };
+        let analytic =
+            analytic_frame_pose_jacobian_ambient(camera, &sensor_params, &rig_params, point)
+                .unwrap();
+        let point_params = [point[0] as f64, point[1] as f64, point[2] as f64];
+        let parameters = [
+            sensor_params.as_slice(),
+            rig_params.as_slice(),
+            point_params.as_slice(),
+        ];
+        let numeric = numeric_jacobian_for_block(&parameters, &binding, 1);
+        assert_mat2x7_close(analytic, numeric, 1.0e-3);
+    }
+
+    #[test]
+    fn sensor_pose_ambient_jacobian_matches_numeric_ceres_block() {
+        let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
+        let sensor_pose = SE3::from_quat_translation(
+            Quat::from_rotation_x(-0.11).normalize(),
+            Vec3::new(0.15, 0.03, -0.02),
+        );
+        let rig_pose = SE3::from_quat_translation(
+            Quat::from_rotation_y(0.17).normalize(),
+            Vec3::new(0.2, -0.1, 0.05),
+        );
+        let point = [0.25, -0.1, 2.5];
+        let sensor_params = se3_to_pose_params(sensor_pose);
+        let rig_params = se3_to_pose_params(rig_pose);
+        let binding = ResidualBinding {
+            xy: [70.0, 82.0],
+            param_roles: vec![
+                ParamRole::SensorPose,
+                ParamRole::FramePose,
+                ParamRole::Point,
+            ],
+            pose_eval: PoseEval::Frame {
+                frame_handle: 1,
+                sensor: FrameSensorEval::Variable { handle: 0 },
+            },
+            camera_base: camera,
+        };
+        let analytic =
+            analytic_sensor_pose_jacobian_ambient(camera, &sensor_params, &rig_params, point)
+                .unwrap();
+        let point_params = [point[0] as f64, point[1] as f64, point[2] as f64];
+        let parameters = [
+            sensor_params.as_slice(),
+            rig_params.as_slice(),
+            point_params.as_slice(),
+        ];
+        let numeric = numeric_jacobian_for_block(&parameters, &binding, 0);
+        assert_mat2x7_close(analytic, numeric, 1.0e-3);
+    }
+
+    fn numeric_jacobian_for_block(
+        parameters: &[&[f64]],
+        binding: &ResidualBinding,
+        block: usize,
+    ) -> Mat2x7 {
         let mut numeric = Mat2x7::zeros();
         let eps = 1.0e-6;
         for col in 0..7 {
-            let mut plus_pose = pose_params;
-            plus_pose[col] += eps;
-            let plus_parameters = [plus_pose.as_slice(), point_params.as_slice()];
-            let plus = eval_residual(&plus_parameters, &binding).unwrap();
-            let mut minus_pose = pose_params;
-            minus_pose[col] -= eps;
-            let minus_parameters = [minus_pose.as_slice(), point_params.as_slice()];
-            let minus = eval_residual(&minus_parameters, &binding).unwrap();
+            let mut plus_params = parameters.iter().map(|p| p.to_vec()).collect::<Vec<_>>();
+            plus_params[block][col] += eps;
+            let plus_slices = plus_params.iter().map(|p| p.as_slice()).collect::<Vec<_>>();
+            let plus = eval_residual(&plus_slices, binding).unwrap();
+            let mut minus_params = parameters.iter().map(|p| p.to_vec()).collect::<Vec<_>>();
+            minus_params[block][col] -= eps;
+            let minus_slices = minus_params
+                .iter()
+                .map(|p| p.as_slice())
+                .collect::<Vec<_>>();
+            let minus = eval_residual(&minus_slices, binding).unwrap();
             numeric[(0, col)] = (plus[0] - minus[0]) / (2.0 * eps);
             numeric[(1, col)] = (plus[1] - minus[1]) / (2.0 * eps);
         }
+        numeric
+    }
 
+    fn assert_mat2x7_close(analytic: Mat2x7, numeric: Mat2x7, tolerance: f64) {
         for row in 0..2 {
             for col in 0..7 {
                 assert!(
-                    (analytic[(row, col)] - numeric[(row, col)]).abs() < 1.0e-3,
+                    (analytic[(row, col)] - numeric[(row, col)]).abs() < tolerance,
                     "row={row} col={col} analytic={} numeric={}",
                     analytic[(row, col)],
                     numeric[(row, col)]
