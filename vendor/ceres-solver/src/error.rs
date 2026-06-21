@@ -28,6 +28,10 @@ pub enum ResidualBlockBuildingError {
 pub enum ParameterBlockStorageError {
     #[error("Index of ParameterBlock out of bounds: {index} >= {len}")]
     IndexOutOfBounds { index: usize, len: usize },
+    #[error("ParameterBlock has size {actual}, expected {expected}")]
+    WrongBlockSize { actual: usize, expected: usize },
+    #[error("Translation parameter index out of bounds: {index} >= 3")]
+    TranslationIndexOutOfBounds { index: usize },
 }
 
 #[derive(Debug, thiserror::Error)]

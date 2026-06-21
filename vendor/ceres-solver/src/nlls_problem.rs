@@ -340,6 +340,64 @@ impl<'cost> NllsProblem<'cost> {
         unsafe { Ok(self.inner().IsParameterBlockConstant(block_pointer)) }
     }
 
+    /// Attach Ceres' Eigen quaternion manifold to a 4D `[x, y, z, w]` parameter block.
+    ///
+    /// This matches COLMAP's `CreateEigenQuaternionManifold()` convention and keeps the
+    /// quaternion on the unit sphere while exposing a 3D local tangent space to Ceres.
+    pub fn set_eigen_quaternion_manifold(
+        &mut self,
+        block_index: usize,
+    ) -> Result<(), ParameterBlockStorageError> {
+        let block = self.parameter_storage.get_block(block_index)?;
+        if block.len() != 4 {
+            return Err(ParameterBlockStorageError::WrongBlockSize {
+                actual: block.len(),
+                expected: 4,
+            });
+        }
+        let block_pointer = block.pointer_mut();
+        unsafe {
+            ffi::set_eigen_quaternion_manifold(self.inner_mut(), block_pointer);
+        }
+        Ok(())
+    }
+
+    /// Attach COLMAP-style pose manifold to a 7D `[x, y, z, w, tx, ty, tz]` block.
+    ///
+    /// The rotation component uses Ceres' Eigen quaternion manifold. Translation is Euclidean
+    /// unless indices in the translation sub-block (`0`, `1`, `2`) are passed as constant.
+    pub fn set_pose_manifold(
+        &mut self,
+        block_index: usize,
+        constant_translation_indices: &[usize],
+    ) -> Result<(), ParameterBlockStorageError> {
+        let block = self.parameter_storage.get_block(block_index)?;
+        if block.len() != 7 {
+            return Err(ParameterBlockStorageError::WrongBlockSize {
+                actual: block.len(),
+                expected: 7,
+            });
+        }
+        for &index in constant_translation_indices {
+            if index >= 3 {
+                return Err(ParameterBlockStorageError::TranslationIndexOutOfBounds { index });
+            }
+        }
+        let block_pointer = block.pointer_mut();
+        let constant_translation_indices = constant_translation_indices
+            .iter()
+            .map(|&index| index as i32)
+            .collect::<Vec<_>>();
+        unsafe {
+            ffi::set_pose_manifold(
+                self.inner_mut(),
+                block_pointer,
+                &constant_translation_indices,
+            );
+        }
+        Ok(())
+    }
+
     /// Solve the problem.
     pub fn solve(
         mut self,
@@ -749,5 +807,47 @@ mod tests {
     #[test]
     fn simple_end_to_end_test_arctan_stock_loss() {
         simple_end_to_end_test_with_loss(LossFunction::arctan(1.0));
+    }
+
+    #[test]
+    fn eigen_quaternion_manifold_keeps_unit_norm() {
+        let target = [
+            0.0,
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        ];
+        let cost: CostFunctionType = Box::new(move |parameters, residuals, mut jacobians| {
+            for i in 0..4 {
+                residuals[i] = parameters[0][i] - target[i];
+            }
+            if let Some(jacobians) = jacobians.as_mut() {
+                if let Some(d_dq) = jacobians[0].as_mut() {
+                    for r in 0..4 {
+                        for c in 0..4 {
+                            d_dq[r][c] = if r == c { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+            }
+            true
+        });
+
+        let (mut problem, _) = NllsProblem::new()
+            .residual_block_builder()
+            .set_cost(cost, 4)
+            .set_parameters([vec![0.0, 0.0, 0.0, 1.0]])
+            .build_into_problem()
+            .unwrap();
+        problem.set_eigen_quaternion_manifold(0).unwrap();
+
+        let solution = problem.solve(&SolverOptions::default()).unwrap();
+        assert!(solution.summary.is_solution_usable());
+        let q = &solution.parameters[0];
+        let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert_abs_diff_eq!(1.0, norm, epsilon = 1.0e-12);
+        for i in 0..4 {
+            assert_abs_diff_eq!(target[i], q[i], epsilon = 1.0e-8);
+        }
     }
 }

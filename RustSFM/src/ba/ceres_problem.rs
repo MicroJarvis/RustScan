@@ -1256,4 +1256,102 @@ mod tests {
             ) >= 1
         );
     }
+
+    #[test]
+    fn ceres_eigen_quaternion_manifold_matches_colmap_binding() {
+        let target = [
+            0.0,
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        ];
+        let cost: CostFunctionType = Box::new(move |parameters, residuals, mut jacobians| {
+            for i in 0..4 {
+                residuals[i] = parameters[0][i] - target[i];
+            }
+            if let Some(jacobians) = jacobians.as_mut() {
+                if let Some(d_dq) = jacobians[0].as_mut() {
+                    for r in 0..4 {
+                        for c in 0..4 {
+                            d_dq[r][c] = if r == c { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+            }
+            true
+        });
+
+        let (mut problem, _) = NllsProblem::new()
+            .residual_block_builder()
+            .set_cost(cost, 4)
+            .set_parameters([vec![0.0, 0.0, 0.0, 1.0]])
+            .build_into_problem()
+            .unwrap();
+        problem.set_eigen_quaternion_manifold(0).unwrap();
+
+        let solution = problem.solve(&SolverOptions::default()).unwrap();
+        assert!(solution.summary.is_solution_usable());
+        let q = &solution.parameters[0];
+        let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1.0e-12);
+        for i in 0..4 {
+            assert!((q[i] - target[i]).abs() < 1.0e-8);
+        }
+    }
+
+    #[test]
+    fn ceres_pose_manifold_supports_colmap_fixed_translation_axis() {
+        let target = [
+            0.0,
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+            1.0,
+            3.0,
+            3.0,
+        ];
+        let cost: CostFunctionType = Box::new(move |parameters, residuals, mut jacobians| {
+            for i in 0..7 {
+                residuals[i] = parameters[0][i] - target[i];
+            }
+            if let Some(jacobians) = jacobians.as_mut() {
+                if let Some(d_dp) = jacobians[0].as_mut() {
+                    for r in 0..7 {
+                        for c in 0..7 {
+                            d_dp[r][c] = if r == c { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+            }
+            true
+        });
+
+        let (mut problem, _) = NllsProblem::new()
+            .residual_block_builder()
+            .set_cost(cost, 7)
+            .set_parameters([vec![0.0, 0.0, 0.0, 1.0, -5.0, 2.0, -9.0]])
+            .build_into_problem()
+            .unwrap();
+        problem.set_pose_manifold(0, &[1]).unwrap();
+
+        let solver_options = SolverOptions::builder()
+            .max_num_iterations(100)
+            .function_tolerance(1.0e-12)
+            .gradient_tolerance(1.0e-12)
+            .parameter_tolerance(1.0e-12)
+            .build()
+            .unwrap();
+        let solution = problem.solve(&solver_options).unwrap();
+        assert!(solution.summary.is_solution_usable());
+        let pose = &solution.parameters[0];
+        let norm = pose[0..4].iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1.0e-12);
+        assert!((pose[0] - target[0]).abs() < 1.0e-8);
+        assert!((pose[1] - target[1]).abs() < 1.0e-8);
+        assert!((pose[2] - target[2]).abs() < 1.0e-8);
+        assert!((pose[3] - target[3]).abs() < 1.0e-8);
+        assert!((pose[4] - target[4]).abs() < 1.0e-8);
+        assert!((pose[5] - 2.0).abs() < 1.0e-12);
+        assert!((pose[6] - target[6]).abs() < 1.0e-8);
+    }
 }

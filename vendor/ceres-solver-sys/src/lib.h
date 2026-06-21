@@ -6,6 +6,7 @@
 #define CERES_SOLVER_RS_LIB_H
 
 #include <ceres/ceres.h>
+#include <ceres/version.h>
 #include <rust/cxx.h>
 
 namespace ceres {
@@ -46,6 +47,8 @@ namespace ceres {
                                                         std::unique_ptr<LossFunction> loss_function,
                                                         double* const* const parameter_blocks,
                                                         int num_parameter_blocks);
+    void set_eigen_quaternion_manifold(Problem& problem, double* values);
+    void set_pose_manifold(Problem& problem, double* values, rust::Slice<const int32_t> constant_translation_indices);
 
     struct SolverOptions {
         Solver::Options inner;

@@ -895,9 +895,10 @@ reconstruction parity.
       `rig_from_world` and non-reference `sensor_from_rig` pose blocks,
       replacing the finite-difference rig/sensor pose derivatives in the
       active frame-aware BA path.
-    - BA pose updates now follow COLMAP/Ceres parameter-block semantics:
-      quaternion manifold updates for rotation and direct Euclidean updates for
-      translation, instead of coupled SE(3) exponential updates.
+    - The vendored Rust Ceres binding now exposes COLMAP-compatible
+      `EigenQuaternionManifold` support for 4D `[x,y,z,w]` rotation blocks and
+      7D `[x,y,z,w,tx,ty,tz]` pose product manifolds, including fixed
+      translation-axis subsets used by `TWO_CAMS_FROM_WORLD` gauges.
     - BA termination now separates Ceres-style gradient and parameter tolerance
       exits and reports reduced effective parameter counts, gradient max-norm,
       and step norm in the solver summary.
@@ -934,14 +935,15 @@ reconstruction parity.
       gauge policies (`THREE_POINTS`, `TWO_CAMS_FROM_WORLD`). Ceres cost
       callbacks reuse native analytic projection/frame/sensor/camera
       Jacobians with numeric fallback.
-    - Remaining work: quaternion manifold parameterization in the Rust Ceres
-      binding, populate Ceres solver summary fields in BA reports, switch native
-      LM damping from a fixed `mu*I` to Ceres' jacobian-scaled
+    - Remaining work: migrate the active Ceres BA problem from its current 6D
+      axis-angle scalar pose blocks to COLMAP's 7D quaternion+translation pose
+      blocks using the new Rust Ceres manifold API, switch native LM damping
+      from a fixed `mu*I` to Ceres' jacobian-scaled
       `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with Ceres'
       radius-based trust-region update (a naive switch under the current
       `damping*=10` recovery regressed the generalized-rig refinement test, so
       both must land together); then true sparse Schur storage, covariance,
-      threading, and full backend solver-summary parity.
+      and full backend solver-summary parity.
 20. Match COLMAP local BA image selection, gauge fixing, robust losses,
     constant camera/rig controls, and short-track point selection.
     - Added a first COLMAP-style local BA pass after each successful

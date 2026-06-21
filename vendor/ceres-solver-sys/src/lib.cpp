@@ -6,6 +6,7 @@
 #include "ceres-solver-sys/src/lib.rs.h"
 
 #include <limits>
+#include <vector>
 
 namespace ceres {
     CallbackCostFunction::CallbackCostFunction(rust::Box<RustCostFunction> inner,
@@ -71,6 +72,49 @@ namespace ceres {
                                                  parameter_blocks,
                                                  num_parameter_blocks);
         return std::make_shared<ResidualBlockId>(block_id);
+    }
+
+    void set_eigen_quaternion_manifold(Problem& problem, double* values) {
+#if CERES_VERSION_MAJOR >= 3 || (CERES_VERSION_MAJOR == 2 && CERES_VERSION_MINOR >= 1)
+        problem.SetManifold(values, new EigenQuaternionManifold());
+#else
+        problem.SetParameterization(values, new EigenQuaternionParameterization());
+#endif
+    }
+
+    void set_pose_manifold(Problem& problem,
+                           double* values,
+                           rust::Slice<const int32_t> constant_translation_indices) {
+        std::vector<int> constant_translation;
+        constant_translation.reserve(constant_translation_indices.size());
+        for (const auto& index : constant_translation_indices) {
+            constant_translation.push_back(index);
+        }
+#if CERES_VERSION_MAJOR >= 3 || (CERES_VERSION_MAJOR == 2 && CERES_VERSION_MINOR >= 1)
+        if (constant_translation.empty()) {
+            problem.SetManifold(values,
+                                new ProductManifold<EigenQuaternionManifold, EuclideanManifold<3>>(
+                                    EigenQuaternionManifold(),
+                                    EuclideanManifold<3>()));
+        } else {
+            problem.SetManifold(values,
+                                new ProductManifold<EigenQuaternionManifold, SubsetManifold>(
+                                    EigenQuaternionManifold(),
+                                    SubsetManifold(3, constant_translation)));
+        }
+#else
+        if (constant_translation.empty()) {
+            problem.SetParameterization(values,
+                                        new ProductParameterization(
+                                            new EigenQuaternionParameterization(),
+                                            new IdentityParameterization(3)));
+        } else {
+            problem.SetParameterization(values,
+                                        new ProductParameterization(
+                                            new EigenQuaternionParameterization(),
+                                            new SubsetParameterization(3, constant_translation)));
+        }
+#endif
     }
 
     SolverOptions::SolverOptions():

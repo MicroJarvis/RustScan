@@ -233,6 +233,24 @@ pub mod ffi {
             parameter_blocks: *const *mut f64,
             num_parameter_blocks: i32,
         ) -> SharedPtr<ResidualBlockId>;
+        /// Set COLMAP-compatible Eigen quaternion manifold on a 4D `[x, y, z, w]` block.
+        ///
+        /// # Safety
+        /// `values` must point to an existing 4D parameter block.
+        unsafe fn set_eigen_quaternion_manifold<'cost>(
+            problem: Pin<&mut Problem<'cost>>,
+            values: *mut f64,
+        );
+        /// Set COLMAP-compatible pose manifold on a 7D `[x, y, z, w, tx, ty, tz]` block.
+        ///
+        /// # Safety
+        /// `values` must point to an existing 7D parameter block and
+        /// `constant_translation_indices` must contain translation component indices in `0..3`.
+        unsafe fn set_pose_manifold<'cost>(
+            problem: Pin<&mut Problem<'cost>>,
+            values: *mut f64,
+            constant_translation_indices: &[i32],
+        );
 
         type SolverOptions;
         fn is_valid(self: &SolverOptions, error: Pin<&mut CxxString>) -> bool;
