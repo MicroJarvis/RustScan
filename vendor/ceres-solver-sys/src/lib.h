@@ -92,6 +92,7 @@ namespace ceres {
         void set_residual_blocks_for_subset_preconditioner(rust::Slice<const std::shared_ptr<ResidualBlockId>> residual_blocks);
         void set_dense_linear_algebra_library_type(DenseLinearAlgebraLibraryType dense_linear_algebra_library_type);
         void set_sparse_linear_algebra_library_type(SparseLinearAlgebraLibraryType sparse_linear_algebra_library_type);
+        SparseLinearAlgebraLibraryType sparse_linear_algebra_library_type() const;
         // We skip bundle adjustment specific options.
         void set_logging_type(LoggingType logging_type);
         void set_minimizer_progress_to_stdout(bool yes);

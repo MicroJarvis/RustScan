@@ -355,6 +355,9 @@ pub mod ffi {
             self: Pin<&mut SolverOptions>,
             sparse_linear_algebra_library_type: SparseLinearAlgebraLibraryType,
         );
+        fn sparse_linear_algebra_library_type(
+            self: &SolverOptions,
+        ) -> SparseLinearAlgebraLibraryType;
         fn set_logging_type(self: Pin<&mut SolverOptions>, logging_type: LoggingType);
         fn set_minimizer_progress_to_stdout(self: Pin<&mut SolverOptions>, yes: bool);
         fn set_trust_region_minimizer_iterations_to_dump(

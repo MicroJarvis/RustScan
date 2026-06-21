@@ -239,6 +239,9 @@ namespace ceres {
     void SolverOptions::set_sparse_linear_algebra_library_type(SparseLinearAlgebraLibraryType sparse_linear_algebra_library_type) {
         inner.sparse_linear_algebra_library_type = sparse_linear_algebra_library_type;
     }
+    SparseLinearAlgebraLibraryType SolverOptions::sparse_linear_algebra_library_type() const {
+        return inner.sparse_linear_algebra_library_type;
+    }
     void SolverOptions::set_logging_type(LoggingType logging_type) {
         inner.logging_type = logging_type;
     }

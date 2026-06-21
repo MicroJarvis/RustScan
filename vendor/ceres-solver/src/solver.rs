@@ -375,6 +375,14 @@ impl SolverOptionsBuilder {
     }
 
     #[inline]
+    pub fn current_sparse_linear_algebra_library_type(&self) -> SparseLinearAlgebraLibraryType {
+        self.0
+            .as_ref()
+            .expect("Underlying C++ unique_ptr<SolverOptions> must not hold nullptr")
+            .sparse_linear_algebra_library_type()
+    }
+
+    #[inline]
     pub fn logging_type(mut self, logging_type: LoggingType) -> Self {
         self.inner_mut().set_logging_type(logging_type);
         self

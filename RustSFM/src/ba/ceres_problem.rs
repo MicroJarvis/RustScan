@@ -17,7 +17,10 @@ use super::{
 use crate::types::{CameraModel, ImageFrame, Reconstruction, Rigid3};
 use ceres_solver::loss::LossFunction;
 use ceres_solver::parameter_block::ParameterBlockOrIndex;
-use ceres_solver::solver::{LinearSolverType, PreconditionerType, SolverOptions, TerminationType};
+use ceres_solver::solver::{
+    LinearSolverType, PreconditionerType, SolverOptions, SparseLinearAlgebraLibraryType,
+    TerminationType,
+};
 use ceres_solver::{CostFunctionType, NllsProblem};
 use glam::{Quat, Vec3};
 use nalgebra::SMatrix;
@@ -1349,7 +1352,7 @@ fn ceres_solver_options(
     num_pose_entities: usize,
     num_residuals: usize,
 ) -> Option<SolverOptions> {
-    let solver_policy = ceres_solver_policy(num_pose_entities);
+    let solver_policy = ceres_solver_policy(num_pose_entities, ceres_has_sparse_backend());
     let mut builder = SolverOptions::builder()
         .max_num_iterations(options.iterations as i32)
         .function_tolerance(options.function_tolerance)
@@ -1372,13 +1375,13 @@ struct CeresSolverPolicy {
     preconditioner: Option<PreconditionerType>,
 }
 
-fn ceres_solver_policy(num_pose_entities: usize) -> CeresSolverPolicy {
+fn ceres_solver_policy(num_pose_entities: usize, has_sparse_backend: bool) -> CeresSolverPolicy {
     if num_pose_entities <= 50 {
         CeresSolverPolicy {
             linear_solver: LinearSolverType::DENSE_SCHUR,
             preconditioner: None,
         }
-    } else if num_pose_entities <= 1000 {
+    } else if has_sparse_backend && num_pose_entities <= 1000 {
         CeresSolverPolicy {
             linear_solver: LinearSolverType::SPARSE_SCHUR,
             preconditioner: None,
@@ -1389,6 +1392,11 @@ fn ceres_solver_policy(num_pose_entities: usize) -> CeresSolverPolicy {
             preconditioner: Some(PreconditionerType::SCHUR_JACOBI),
         }
     }
+}
+
+fn ceres_has_sparse_backend() -> bool {
+    SolverOptions::builder().current_sparse_linear_algebra_library_type()
+        != SparseLinearAlgebraLibraryType::NO_SPARSE
 }
 
 fn ceres_num_threads(options: &BundleAdjustmentOptions, num_residuals: usize) -> i32 {
@@ -1799,23 +1807,34 @@ mod tests {
 
     #[test]
     fn ceres_options_match_colmap_solver_type_thresholds() {
-        let policy = ceres_solver_policy(50);
+        let policy = ceres_solver_policy(50, true);
         assert!(policy.linear_solver == LinearSolverType::DENSE_SCHUR);
         assert!(policy.preconditioner.is_none());
 
-        let policy = ceres_solver_policy(51);
+        let policy = ceres_solver_policy(51, true);
         assert!(policy.linear_solver == LinearSolverType::SPARSE_SCHUR);
         assert!(policy.preconditioner.is_none());
 
-        let policy = ceres_solver_policy(1000);
+        let policy = ceres_solver_policy(1000, true);
         assert!(policy.linear_solver == LinearSolverType::SPARSE_SCHUR);
         assert!(policy.preconditioner.is_none());
 
-        let policy = ceres_solver_policy(1001);
+        let policy = ceres_solver_policy(1001, true);
         assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
         assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
 
         assert!(ceres_solver_options(&BundleAdjustmentOptions::default(), 1001, 2).is_some());
+    }
+
+    #[test]
+    fn ceres_options_match_colmap_sparse_backend_gate() {
+        let policy = ceres_solver_policy(51, false);
+        assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
+        assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
+
+        let policy = ceres_solver_policy(1000, false);
+        assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
+        assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
     }
 
     #[test]

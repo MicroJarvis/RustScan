@@ -939,6 +939,9 @@ reconstruction parity.
       path instead of omitting the loss pointer.
       BA entrypoints now reject negative, infinite, or NaN robust loss scales
       before solving, matching COLMAP's Ceres option validation gate.
+      The Ceres solver auto-selection path now also reads Ceres' configured
+      sparse linear algebra backend and skips `SPARSE_SCHUR` when it is
+      `NO_SPARSE`, matching COLMAP's `has_sparse` gate.
     - The reduced camera matrix (Schur complement) is now solved with a
       Cholesky factorization and an LU fallback (`ba.rs::solve_linear_system`),
       matching Ceres' `DENSE_SCHUR`/`SPARSE_SCHUR` linear solvers that rely on
