@@ -4157,7 +4157,7 @@ fn incremental_map_single_attempt(
         &tri_options,
         config,
         "initial",
-        false,
+        incremental_global_ba_normalizes_reconstruction(config),
         &mut debug_log,
         Some(&mut registration_stats),
         Some(&mut filtered_units),
@@ -4418,7 +4418,7 @@ fn incremental_map_single_attempt(
                 &tri_options,
                 config,
                 "scheduled",
-                false,
+                incremental_global_ba_normalizes_reconstruction(config),
                 &mut debug_log,
                 Some(&mut registration_stats),
                 Some(&mut filtered_units),
@@ -4472,7 +4472,7 @@ fn incremental_map_single_attempt(
             &tri_options,
             config,
             "final",
-            false,
+            incremental_global_ba_normalizes_reconstruction(config),
             &mut debug_log,
             Some(&mut registration_stats),
             Some(&mut filtered_units),
@@ -5481,6 +5481,11 @@ fn should_run_final_global_ba(
 
 fn global_ba_enabled(config: &MapperConfig) -> bool {
     config.global_ba && global_ba_iterations(config) > 0 && config.global_ba_max_refinements > 0
+}
+
+fn incremental_global_ba_normalizes_reconstruction(_config: &MapperConfig) -> bool {
+    // COLMAP disables this only for prior-position BA and final-all handoff paths.
+    true
 }
 
 fn normalize_reconstruction_colmap(
@@ -14098,6 +14103,13 @@ mod tests {
 
         reconstruction.poses[2] = Some(SE3::identity());
         assert!(should_run_global_ba(&schedule, &reconstruction, &config));
+    }
+
+    #[test]
+    fn incremental_global_ba_normalization_default_matches_colmap() {
+        assert!(incremental_global_ba_normalizes_reconstruction(
+            &MapperConfig::default()
+        ));
     }
 
     #[test]

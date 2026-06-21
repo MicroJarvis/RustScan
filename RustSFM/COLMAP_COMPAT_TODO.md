@@ -1056,9 +1056,11 @@ reconstruction parity.
       frame transforms, and non-reference rig `sensor_from_rig` translation
       scaling. The global BA refinement helper now has a
       `normalize_reconstruction` hook using COLMAP's default
-      `Normalize(false, 10, 0.1, 0.9, true)` settings; current incremental
-      pipeline call sites still pass `false`, matching COLMAP's final pipeline
-      handoff where normalization is explicitly disabled.
+      `Normalize(false, 10, 0.1, 0.9, true)` settings. The covered incremental
+      global refinement call sites enable it like COLMAP's default
+      `IterativeGlobalRefinement` path; future final-all/retriangulate-all
+      controller handoffs should keep passing `false`, matching COLMAP's
+      explicit final pipeline override.
     - Remaining work: pose priors, redundant 3D point pruning, and
       Ceres-equivalent convergence settings.
 
