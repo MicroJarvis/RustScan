@@ -4157,6 +4157,7 @@ fn incremental_map_single_attempt(
         &tri_options,
         config,
         "initial",
+        false,
         &mut debug_log,
         Some(&mut registration_stats),
         Some(&mut filtered_units),
@@ -4417,6 +4418,7 @@ fn incremental_map_single_attempt(
                 &tri_options,
                 config,
                 "scheduled",
+                false,
                 &mut debug_log,
                 Some(&mut registration_stats),
                 Some(&mut filtered_units),
@@ -4470,6 +4472,7 @@ fn incremental_map_single_attempt(
             &tri_options,
             config,
             "final",
+            false,
             &mut debug_log,
             Some(&mut registration_stats),
             Some(&mut filtered_units),
@@ -5272,6 +5275,12 @@ struct GlobalBaSchedule {
     prev_points: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ReconstructionNormalizationTransform {
+    scale: f32,
+    translation: glam::Vec3,
+}
+
 impl GlobalBaSchedule {
     fn new(reconstruction: &Reconstruction) -> Self {
         Self {
@@ -5295,6 +5304,7 @@ fn refine_global_bundle_with_postprocessing(
     tri_options: &IncrementalTriangulatorOptions,
     config: &MapperConfig,
     reason: &str,
+    normalize_reconstruction: bool,
     debug_log: &mut Vec<String>,
     mut registration_stats: Option<&mut RegistrationStats>,
     mut filtered_units: Option<&mut HashSet<RegistrationUnitKey>>,
@@ -5360,6 +5370,11 @@ fn refine_global_bundle_with_postprocessing(
             ));
             break;
         };
+        let normalization = if normalize_reconstruction {
+            normalize_reconstruction_colmap(reconstruction, false, 10.0, 0.1, 0.9, true)
+        } else {
+            None
+        };
 
         let (completed, merged) = {
             let mut triangulator =
@@ -5402,6 +5417,16 @@ fn refine_global_bundle_with_postprocessing(
             filtered_frames,
             changed
         ));
+        if let Some(transform) = normalization {
+            debug_log.push(format!(
+                "global_ba_normalize reason={reason} round={} scale={:.6} translation=({:.6},{:.6},{:.6})",
+                round + 1,
+                transform.scale,
+                transform.translation.x,
+                transform.translation.y,
+                transform.translation.z
+            ));
+        }
         if changed <= config.global_ba_max_refinement_change {
             break;
         }
@@ -5456,6 +5481,172 @@ fn should_run_final_global_ba(
 
 fn global_ba_enabled(config: &MapperConfig) -> bool {
     config.global_ba && global_ba_iterations(config) > 0 && config.global_ba_max_refinements > 0
+}
+
+fn normalize_reconstruction_colmap(
+    reconstruction: &mut Reconstruction,
+    fixed_scale: bool,
+    extent: f32,
+    min_percentile: f32,
+    max_percentile: f32,
+    use_images: bool,
+) -> Option<ReconstructionNormalizationTransform> {
+    if !extent.is_finite()
+        || extent <= 0.0
+        || !min_percentile.is_finite()
+        || !max_percentile.is_finite()
+        || !(0.0..=1.0).contains(&min_percentile)
+        || !(0.0..=1.0).contains(&max_percentile)
+        || min_percentile > max_percentile
+    {
+        return None;
+    }
+    if (use_images && registered_frame_count(reconstruction) < 2)
+        || (!use_images && reconstruction.points.len() < 2)
+    {
+        return None;
+    }
+    let coords = if use_images {
+        registered_reconstruction_camera_centers(reconstruction)
+    } else {
+        reconstruction
+            .points
+            .iter()
+            .map(|point| glam::Vec3::from_array(point.xyz))
+            .collect::<Vec<_>>()
+    };
+    if coords.len() < 2 {
+        return None;
+    }
+    let (min, max, centroid) =
+        robust_bbox_and_centroid_colmap(coords, min_percentile, max_percentile)?;
+    let old_extent = (max - min).length();
+    let scale = if fixed_scale || old_extent <= f32::EPSILON {
+        1.0
+    } else {
+        extent / old_extent
+    };
+    let transform = ReconstructionNormalizationTransform {
+        scale,
+        translation: -scale * centroid,
+    };
+    transform_reconstruction_colmap(reconstruction, transform);
+    Some(transform)
+}
+
+fn registered_reconstruction_camera_centers(reconstruction: &Reconstruction) -> Vec<glam::Vec3> {
+    reconstruction
+        .poses
+        .iter()
+        .filter_map(|pose| pose.map(camera_center))
+        .collect()
+}
+
+fn robust_bbox_and_centroid_colmap(
+    coords: Vec<glam::Vec3>,
+    min_percentile: f32,
+    max_percentile: f32,
+) -> Option<(glam::Vec3, glam::Vec3, glam::Vec3)> {
+    if coords.is_empty() || min_percentile > max_percentile {
+        return None;
+    }
+    let end_idx = coords.len() - 1;
+    let min_idx = ((min_percentile * end_idx as f32).floor() as usize).min(end_idx);
+    let max_idx = ((max_percentile * end_idx as f32).ceil() as usize).min(end_idx);
+    let mut coords_x = coords.iter().map(|coord| coord.x).collect::<Vec<_>>();
+    let mut coords_y = coords.iter().map(|coord| coord.y).collect::<Vec<_>>();
+    let mut coords_z = coords.iter().map(|coord| coord.z).collect::<Vec<_>>();
+    coords_x.sort_by(|a, b| a.total_cmp(b));
+    coords_y.sort_by(|a, b| a.total_cmp(b));
+    coords_z.sort_by(|a, b| a.total_cmp(b));
+    let bbox_min = glam::Vec3::new(coords_x[min_idx], coords_y[min_idx], coords_z[min_idx]);
+    let bbox_max = glam::Vec3::new(coords_x[max_idx], coords_y[max_idx], coords_z[max_idx]);
+    let normalization = 1.0 / (max_idx - min_idx + 1) as f32;
+    let mut centroid = glam::Vec3::ZERO;
+    for idx in min_idx..=max_idx {
+        centroid += normalization * glam::Vec3::new(coords_x[idx], coords_y[idx], coords_z[idx]);
+    }
+    Some((bbox_min, bbox_max, centroid))
+}
+
+fn transform_reconstruction_colmap(
+    reconstruction: &mut Reconstruction,
+    transform: ReconstructionNormalizationTransform,
+) {
+    for rig in &mut reconstruction.rigs {
+        for sensor in &mut rig.sensors {
+            if rig
+                .ref_sensor_id
+                .as_ref()
+                .is_some_and(|ref_sensor_id| ref_sensor_id == &sensor.sensor_id)
+            {
+                continue;
+            }
+            if let Some(sensor_from_rig) = sensor.sensor_from_rig.as_mut() {
+                for value in &mut sensor_from_rig.tvec {
+                    *value *= transform.scale as f64;
+                }
+            }
+        }
+    }
+    for frame_idx in 0..reconstruction.frames.len() {
+        if !frame_has_registered_image(reconstruction, frame_idx) {
+            continue;
+        }
+        let rig_from_world = reconstruction.frames[frame_idx].rig_from_world.to_se3();
+        reconstruction.frames[frame_idx].rig_from_world = Rigid3::from_se3(
+            transform_camera_world_pose_colmap(rig_from_world, transform),
+        );
+    }
+    for image in 0..reconstruction.poses.len() {
+        if reconstruction.frame_index_for_image(image).is_some() {
+            continue;
+        }
+        if let Some(pose) = reconstruction.poses[image] {
+            reconstruction.poses[image] = Some(transform_camera_world_pose_colmap(pose, transform));
+        }
+    }
+    for point in &mut reconstruction.points {
+        point.xyz = (transform.scale * glam::Vec3::from_array(point.xyz) + transform.translation)
+            .to_array();
+    }
+    sync_registered_image_poses_from_frames(reconstruction);
+}
+
+fn frame_has_registered_image(reconstruction: &Reconstruction, frame_idx: usize) -> bool {
+    reconstruction
+        .image_indices_for_frame_index(frame_idx)
+        .into_iter()
+        .any(|image| reconstruction.poses.get(image).copied().flatten().is_some())
+}
+
+fn transform_camera_world_pose_colmap(
+    pose: SE3,
+    transform: ReconstructionNormalizationTransform,
+) -> SE3 {
+    let center = camera_center(pose);
+    let transformed_center = transform.scale * center + transform.translation;
+    pose_from_rotation_center(pose_rotation(pose), transformed_center)
+}
+
+fn sync_registered_image_poses_from_frames(reconstruction: &mut Reconstruction) {
+    for frame_idx in 0..reconstruction.frames.len() {
+        let rig_from_world = reconstruction.frames[frame_idx].rig_from_world.to_se3();
+        let rig_id = reconstruction.frames[frame_idx].rig_id;
+        for image in reconstruction.image_indices_for_frame_index(frame_idx) {
+            if reconstruction.poses.get(image).copied().flatten().is_none() {
+                continue;
+            }
+            let pose = reconstruction
+                .frame_sensor_id_for_image(frame_idx, image)
+                .and_then(|sensor_id| reconstruction.sensor_from_rig(rig_id, sensor_id))
+                .map(|sensor_from_rig| sensor_from_rig.compose(&rig_from_world))
+                .unwrap_or(rig_from_world);
+            if let Some(slot) = reconstruction.poses.get_mut(image) {
+                *slot = Some(pose);
+            }
+        }
+    }
 }
 
 fn global_ba_gauge_images(reconstruction: &Reconstruction) -> Vec<usize> {
@@ -10338,6 +10529,13 @@ mod tests {
         }
     }
 
+    fn assert_vec3_near(actual: glam::Vec3, expected: glam::Vec3, tolerance: f32) {
+        assert!(
+            actual.abs_diff_eq(expected, tolerance),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
     #[test]
     fn reference_camera_setup_maps_images_to_shared_cameras() -> Result<()> {
         let dir = tempdir()?;
@@ -11017,6 +11215,266 @@ mod tests {
         assert_eq!(large_options.iterations, 50);
         assert_eq!(large_options.gradient_tolerance, 1.0);
         assert_eq!(large_options.max_linear_solver_iterations, 100);
+    }
+
+    #[test]
+    fn normalization_uses_colmap_robust_bbox_and_transforms_points_and_poses() {
+        let coords = vec![
+            glam::Vec3::new(2.0, 3.0, 4.0),
+            glam::Vec3::new(-1.0, -2.0, -3.0),
+            glam::Vec3::new(5.0, 5.0, 5.0),
+            glam::Vec3::new(100.0, 100.0, 100.0),
+            glam::Vec3::new(-100.0, -100.0, -100.0),
+        ];
+        let (bbox_min, bbox_max, centroid) =
+            robust_bbox_and_centroid_colmap(coords, 0.3, 0.7).unwrap();
+        assert_vec3_near(bbox_min, glam::Vec3::new(-1.0, -2.0, -3.0), 1.0e-6);
+        assert_vec3_near(bbox_max, glam::Vec3::new(5.0, 5.0, 5.0), 1.0e-6);
+        assert_vec3_near(centroid, glam::Vec3::new(2.0, 2.0, 2.0), 1.0e-6);
+
+        let frames = vec![
+            minimal_frame(0, "a.jpg"),
+            minimal_frame(1, "b.jpg"),
+            minimal_frame(2, "c.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let rotation = glam::Quat::from_rotation_y(0.2);
+        for (image, z) in [-20.0, -10.0, 0.0].into_iter().enumerate() {
+            reconstruction.poses[image] = Some(pose_from_rotation_center(
+                rotation,
+                glam::Vec3::new(0.0, 0.0, z),
+            ));
+            reconstruction.points.push(Point3D {
+                xyz: [0.0, 0.0, z],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: Vec::new(),
+            });
+            reconstruction.point_ids.push(image as u64 + 1);
+        }
+
+        let transform =
+            normalize_reconstruction_colmap(&mut reconstruction, true, 10.0, 0.0, 1.0, false)
+                .unwrap();
+        assert_eq!(transform.scale, 1.0);
+        assert_vec3_near(
+            transform.translation,
+            glam::Vec3::new(0.0, 0.0, 10.0),
+            1.0e-6,
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.poses[0].unwrap()),
+            glam::Vec3::new(0.0, 0.0, -10.0),
+            1.0e-5,
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.poses[1].unwrap()),
+            glam::Vec3::ZERO,
+            1.0e-5,
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.poses[2].unwrap()),
+            glam::Vec3::new(0.0, 0.0, 10.0),
+            1.0e-5,
+        );
+        assert_vec3_near(
+            glam::Vec3::from_array(reconstruction.points[0].xyz),
+            glam::Vec3::new(0.0, 0.0, -10.0),
+            1.0e-6,
+        );
+        assert!(pose_rotation(reconstruction.poses[0].unwrap()).abs_diff_eq(rotation, 1.0e-6));
+
+        let mut reconstruction = test_reconstruction(&frames);
+        for (image, z) in [-20.0, -10.0, 0.0].into_iter().enumerate() {
+            reconstruction.poses[image] = Some(pose_from_rotation_center(
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, 0.0, z),
+            ));
+            reconstruction.points.push(Point3D {
+                xyz: [0.0, 0.0, z],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: Vec::new(),
+            });
+            reconstruction.point_ids.push(image as u64 + 1);
+        }
+        let transform =
+            normalize_reconstruction_colmap(&mut reconstruction, false, 10.0, 0.0, 1.0, false)
+                .unwrap();
+        assert!((transform.scale - 0.5).abs() < 1.0e-6);
+        assert_vec3_near(
+            transform.translation,
+            glam::Vec3::new(0.0, 0.0, 5.0),
+            1.0e-6,
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.poses[0].unwrap()),
+            glam::Vec3::new(0.0, 0.0, -5.0),
+            1.0e-6,
+        );
+        assert_vec3_near(
+            glam::Vec3::from_array(reconstruction.points[2].xyz),
+            glam::Vec3::new(0.0, 0.0, 5.0),
+            1.0e-6,
+        );
+
+        let mut reconstruction = test_reconstruction(&frames);
+        for (image, z) in [-20.0, -10.0, 0.0].into_iter().enumerate() {
+            reconstruction.poses[image] = Some(pose_from_rotation_center(
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, 0.0, z),
+            ));
+        }
+        let transform =
+            normalize_reconstruction_colmap(&mut reconstruction, false, 10.0, 0.0, 1.0, true)
+                .unwrap();
+        assert!((transform.scale - 0.5).abs() < 1.0e-6);
+        assert_vec3_near(
+            transform.translation,
+            glam::Vec3::new(0.0, 0.0, 5.0),
+            1.0e-6,
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.poses[2].unwrap()),
+            glam::Vec3::new(0.0, 0.0, 5.0),
+            1.0e-6,
+        );
+    }
+
+    #[test]
+    fn normalization_scales_rig_sensors_and_registered_frames_like_colmap() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+            minimal_frame(2, "unregistered.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [7.0, 0.0, 0.0],
+                    }),
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [2.0, 0.0, 0.0],
+                    }),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![
+            Frame {
+                frame_id: 9,
+                rig_id: 3,
+                rig_from_world: Rigid3::from_se3(pose_from_rotation_center(
+                    glam::Quat::IDENTITY,
+                    glam::Vec3::new(0.0, 0.0, -20.0),
+                )),
+                data_ids: vec![
+                    DataId {
+                        sensor_id: ref_sensor,
+                        data_id: reconstruction.image_id(0) as u64,
+                    },
+                    DataId {
+                        sensor_id: aux_sensor,
+                        data_id: reconstruction.image_id(1) as u64,
+                    },
+                ],
+            },
+            Frame {
+                frame_id: 10,
+                rig_id: 3,
+                rig_from_world: Rigid3 {
+                    qvec: [1.0, 0.0, 0.0, 0.0],
+                    tvec: [3.0, 4.0, 5.0],
+                },
+                data_ids: Vec::new(),
+            },
+        ];
+        reconstruction.image_frame_indices = vec![Some(0), Some(0), Some(1)];
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        sync_registered_image_poses_from_frames(&mut reconstruction);
+        let unregistered_frame_before = reconstruction.frames[1].rig_from_world.clone();
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, -20.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: Vec::new(),
+        });
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 0.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: Vec::new(),
+        });
+
+        assert!(normalize_reconstruction_colmap(
+            &mut reconstruction.clone(),
+            false,
+            10.0,
+            0.0,
+            1.0,
+            true
+        )
+        .is_none());
+
+        let transform =
+            normalize_reconstruction_colmap(&mut reconstruction, false, 10.0, 0.0, 1.0, false)
+                .unwrap();
+
+        assert!((transform.scale - 0.5).abs() < 1.0e-6);
+        assert_eq!(
+            reconstruction.rigs[0].sensors[0]
+                .sensor_from_rig
+                .as_ref()
+                .unwrap()
+                .tvec,
+            [7.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            reconstruction.rigs[0].sensors[1]
+                .sensor_from_rig
+                .as_ref()
+                .unwrap()
+                .tvec,
+            [1.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            reconstruction.frames[1].rig_from_world,
+            unregistered_frame_before
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.frames[0].rig_from_world.to_se3()),
+            glam::Vec3::new(0.0, 0.0, -5.0),
+            1.0e-6,
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.poses[0].unwrap()),
+            glam::Vec3::new(0.0, 0.0, -5.0),
+            1.0e-6,
+        );
+        assert_vec3_near(
+            camera_center(reconstruction.poses[1].unwrap()),
+            glam::Vec3::new(-1.0, 0.0, -5.0),
+            1.0e-6,
+        );
+        assert!(reconstruction.poses[2].is_none());
     }
 
     #[test]

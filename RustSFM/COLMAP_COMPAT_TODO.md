@@ -1050,8 +1050,17 @@ reconstruction parity.
       rather than fixing two full image poses: the first observed registration
       unit is fixed, the second keeps rotation and two translation axes
       variable, and insufficient-baseline cases fall back to `THREE_POINTS`.
-    - Remaining work: reconstruction normalization, pose priors, redundant 3D
-      point pruning, and Ceres-equivalent convergence settings.
+    - Added COLMAP-style reconstruction normalization primitives for the global
+      refinement path: robust percentile bbox/centroid selection, fixed/free
+      scale, image- or point-based coordinates, point transforms, registered
+      frame transforms, and non-reference rig `sensor_from_rig` translation
+      scaling. The global BA refinement helper now has a
+      `normalize_reconstruction` hook using COLMAP's default
+      `Normalize(false, 10, 0.1, 0.9, true)` settings; current incremental
+      pipeline call sites still pass `false`, matching COLMAP's final pipeline
+      handoff where normalization is explicitly disabled.
+    - Remaining work: pose priors, redundant 3D point pruning, and
+      Ceres-equivalent convergence settings.
 
 ## P6 - I/O, Multi-Model Pipeline, And Parity Tests
 
