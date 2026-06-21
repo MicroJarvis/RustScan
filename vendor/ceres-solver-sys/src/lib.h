@@ -116,6 +116,10 @@ namespace ceres {
         int num_unsuccessful_steps() const;
         int num_inner_iteration_steps() const;
         int num_line_search_steps() const;
+        double last_gradient_max_norm() const;
+        double last_step_norm() const;
+        double last_relative_decrease() const;
+        double last_trust_region_radius() const;
         // No times nor sovler/problem options for now.
     };
     std::unique_ptr<SolverSummary> new_solver_summary();

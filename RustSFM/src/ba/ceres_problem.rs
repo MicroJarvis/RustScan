@@ -310,7 +310,7 @@ pub fn solve_bundle_adjustment_ceres(
     let summary = solution.summary;
     let successful_steps = summary.num_successful_steps().max(0) as usize;
     let unsuccessful_steps = summary.num_unsuccessful_steps().max(0) as usize;
-    let (termination_type, termination_reason, gradient_max_norm, step_norm) =
+    let (termination_type, termination_reason, gradient_max_norm, step_norm, step_quality, damping) =
         map_ceres_summary(&summary, &options);
     Some(BundleAdjustmentReport {
         iterations: successful_steps,
@@ -332,8 +332,8 @@ pub fn solve_bundle_adjustment_ceres(
             + point_effective_parameter_count(&observations, &constant_point_filter),
         gradient_max_norm,
         step_norm,
-        step_quality: f64::NAN,
-        damping: f64::NAN,
+        step_quality,
+        damping,
         termination_type,
         termination_reason,
     })
@@ -972,6 +972,8 @@ fn map_ceres_summary(
     BundleAdjustmentTerminationReason,
     f64,
     f64,
+    f64,
+    f64,
 ) {
     let full = summary.full_report();
     let brief = summary.brief_report();
@@ -982,7 +984,8 @@ fn map_ceres_summary(
     };
 
     let (termination_type, termination_reason) = parse_ceres_termination(source, summary, options);
-    let gradient_max_norm = parse_ceres_gradient_max_norm(&full)
+    let gradient_max_norm = finite_or_none(summary.last_gradient_max_norm())
+        .or_else(|| parse_ceres_gradient_max_norm(&full))
         .or_else(|| parse_ceres_gradient_max_norm(&brief))
         .or_else(|| parse_ceres_gradient_from_brief_table(&brief))
         .or_else(|| parse_ceres_gradient_from_brief_table(&full))
@@ -995,16 +998,28 @@ fn map_ceres_summary(
             gradient_max_norm = 0.0;
         }
     }
-    let step_norm = parse_ceres_scalar_field(source, "Step norm")
+    let step_norm = finite_or_none(summary.last_step_norm())
+        .or_else(|| parse_ceres_scalar_field(source, "Step norm"))
         .or_else(|| parse_ceres_step_norm_from_table(source))
         .or_else(|| parse_ceres_step_norm_from_table(&brief))
+        .unwrap_or(f64::NAN);
+    let step_quality = finite_or_none(summary.last_relative_decrease()).unwrap_or(f64::NAN);
+    let damping = finite_or_none(summary.last_trust_region_radius())
+        .filter(|radius| *radius > 0.0)
+        .map(|radius| 1.0 / radius)
         .unwrap_or(f64::NAN);
     (
         termination_type,
         termination_reason,
         gradient_max_norm,
         step_norm,
+        step_quality,
+        damping,
     )
+}
+
+fn finite_or_none(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
 }
 
 fn parse_ceres_termination(
@@ -1173,6 +1188,9 @@ mod tests {
         )
         .expect("ba should succeed");
         assert!(report.gradient_max_norm.is_finite());
+        assert!(report.step_norm.is_finite());
+        assert!(report.step_quality.is_finite());
+        assert!(report.damping.is_finite());
         assert_eq!(
             report.termination_reason,
             BundleAdjustmentTerminationReason::GradientTolerance

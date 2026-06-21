@@ -510,6 +510,26 @@ impl SolverSummary {
     pub fn num_line_search_steps(&self) -> i32 {
         self.inner().num_line_search_steps()
     }
+
+    #[inline]
+    pub fn last_gradient_max_norm(&self) -> f64 {
+        self.inner().last_gradient_max_norm()
+    }
+
+    #[inline]
+    pub fn last_step_norm(&self) -> f64 {
+        self.inner().last_step_norm()
+    }
+
+    #[inline]
+    pub fn last_relative_decrease(&self) -> f64 {
+        self.inner().last_relative_decrease()
+    }
+
+    #[inline]
+    pub fn last_trust_region_radius(&self) -> f64 {
+        self.inner().last_trust_region_radius()
+    }
 }
 
 impl std::fmt::Debug for SolverSummary {

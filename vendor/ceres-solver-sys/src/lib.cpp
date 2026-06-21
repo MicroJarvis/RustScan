@@ -5,6 +5,8 @@
 #include "ceres-solver-sys/src/lib.h"
 #include "ceres-solver-sys/src/lib.rs.h"
 
+#include <limits>
+
 namespace ceres {
     CallbackCostFunction::CallbackCostFunction(rust::Box<RustCostFunction> inner,
                                                int num_residuals,
@@ -258,6 +260,22 @@ namespace ceres {
     }
     int SolverSummary::num_line_search_steps() const {
         return inner.num_line_search_steps;
+    }
+    double SolverSummary::last_gradient_max_norm() const {
+        return inner.iterations.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                        : inner.iterations.back().gradient_max_norm;
+    }
+    double SolverSummary::last_step_norm() const {
+        return inner.iterations.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                        : inner.iterations.back().step_norm;
+    }
+    double SolverSummary::last_relative_decrease() const {
+        return inner.iterations.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                        : inner.iterations.back().relative_decrease;
+    }
+    double SolverSummary::last_trust_region_radius() const {
+        return inner.iterations.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                        : inner.iterations.back().trust_region_radius;
     }
     std::unique_ptr<SolverSummary> new_solver_summary() {
         return std::make_unique<SolverSummary>();
