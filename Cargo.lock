@@ -1279,8 +1279,6 @@ dependencies = [
 [[package]]
 name = "ceres-solver"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f5916a5587e282bde93956451f5752dc69e64552790f232eb1de149cd9a1290"
 dependencies = [
  "ceres-solver-sys",
  "thiserror 2.0.18",
@@ -1298,8 +1296,6 @@ dependencies = [
 [[package]]
 name = "ceres-solver-sys"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aad2e35bf11df207e1d14e62f7c6a1e33a83eb98f4175fb72f3385152c9b3bd0"
 dependencies = [
  "ceres-solver-src",
  "cxx",

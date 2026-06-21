@@ -1,0 +1,38 @@
+[package]
+name = "ceres-solver"
+version = "0.5.1"
+edition = "2024"
+readme = "README.md"
+description = "Safe Rust bindings for the Ceres Solver"
+repository = "https://github.com/light-curve/ceres-solver-rs"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85.0"
+exclude = [".github"]
+
+[workspace]
+members = [
+    "ceres-solver-src",
+    "ceres-solver-sys",
+]
+
+[features]
+system = ["ceres-solver-sys/system"]
+# "source" overrides "system"
+source = ["ceres-solver-sys/source"]
+default = ["system"]
+
+[dependencies.ceres-solver-sys]
+version = "0.5.3"
+path = "./ceres-solver-sys"
+
+[dependencies.thiserror]
+version = "2"
+
+[dev-dependencies]
+approx = "0.5"
+rand = "0.10"
+rand_chacha = "0.10"
+rand_distr = "0.6"
+
+[package.metadata.docs.rs]
+features = ["source"]

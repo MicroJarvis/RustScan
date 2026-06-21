@@ -872,6 +872,8 @@ reconstruction parity.
       linear solver iterations, consecutive invalid steps, and consecutive
       nonmonotonic steps. The Rust solver uses these controls to classify
       convergence, no-convergence, and failure summaries.
+    - Ceres-backed BA now forwards `max_linear_solver_iterations` through the
+      Rust Ceres binding instead of leaving Ceres on the binding default.
     - BA now uses analytic pose/point Jacobians for SIMPLE_PINHOLE, PINHOLE,
       SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, FOV, SIMPLE_FISHEYE,
       FISHEYE, SIMPLE_RADIAL_FISHEYE, RADIAL_FISHEYE, OPENCV_FISHEYE,

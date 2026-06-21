@@ -3,12 +3,12 @@ use super::native::{
     camera_by_index, camera_param_jacobian, camera_param_specs, count_variable_residuals,
     frame_sensor_from_rig, frame_sensor_key_for_image, point_effective_parameter_count,
     projection_jacobians, sensor_pose_specs, set_frame_pose_block,
-    sync_camera_intrinsics_from_params, sync_pose_blocks_for_sensor_changes,
-    variable_pose_blocks, CameraParamSpec, PoseBlockKind, SensorPoseKey,
+    sync_camera_intrinsics_from_params, sync_pose_blocks_for_sensor_changes, variable_pose_blocks,
+    CameraParamSpec, PoseBlockKind, SensorPoseKey,
 };
 use super::shared::{
-    add_three_point_gauge, bundle_adjustment_point_filter, collect_observations,
-    project_point, refresh_point_errors,
+    add_three_point_gauge, bundle_adjustment_point_filter, collect_observations, project_point,
+    refresh_point_errors,
 };
 use super::{
     BundleAdjustmentGauge, BundleAdjustmentLoss, BundleAdjustmentOptions, BundleAdjustmentReport,
@@ -33,7 +33,9 @@ enum PoseEntityKey {
 #[derive(Debug, Clone)]
 enum PoseEval {
     Fixed(SE3),
-    Image { handles: [usize; 6] },
+    Image {
+        handles: [usize; 6],
+    },
     Frame {
         frame_handles: [usize; 6],
         sensor: FrameSensorEval,
@@ -162,8 +164,7 @@ pub fn solve_bundle_adjustment_ceres(
     }
 
     for spec in &sensor_pose_specs {
-        let Some(pose) =
-            reconstruction.sensor_from_rig(spec.key.rig_id, &spec.key.sensor_id)
+        let Some(pose) = reconstruction.sensor_from_rig(spec.key.rig_id, &spec.key.sensor_id)
         else {
             continue;
         };
@@ -287,10 +288,8 @@ pub fn solve_bundle_adjustment_ceres(
         problem.set_parameter_block_constant(storage_idx).ok()?;
     }
 
-    let solution = problem.solve(&ceres_solver_options(
-        &options,
-        pose_entity_registry.len(),
-    )).ok()?;
+    let solver_options = ceres_solver_options(&options, pose_entity_registry.len())?;
+    let solution = problem.solve(&solver_options).ok()?;
 
     write_back_solution(
         reconstruction,
@@ -380,10 +379,7 @@ fn register_point(
     }
     let idx = *next_param_index;
     *next_param_index += 1;
-    block_values.insert(
-        idx,
-        vec![xyz[0] as f64, xyz[1] as f64, xyz[2] as f64],
-    );
+    block_values.insert(idx, vec![xyz[0] as f64, xyz[1] as f64, xyz[2] as f64]);
     registry.insert(point_id, idx);
     if is_constant {
         constant_blocks.insert(idx);
@@ -520,18 +516,20 @@ fn append_camera_parameters(
 }
 
 fn build_cost_function(binding: ResidualBinding) -> CostFunctionType<'static> {
-    Box::new(move |parameters: &[&[f64]], residuals: &mut [f64], jacobians| {
-        let Some(residual) = eval_residual(parameters, &binding) else {
-            residuals[0] = 0.0;
-            residuals[1] = 0.0;
-            return jacobians.is_none();
-        };
-        residuals.copy_from_slice(&residual);
-        if let Some(jacobians) = jacobians {
-            return fill_jacobians(parameters, &binding, jacobians);
-        }
-        true
-    })
+    Box::new(
+        move |parameters: &[&[f64]], residuals: &mut [f64], jacobians| {
+            let Some(residual) = eval_residual(parameters, &binding) else {
+                residuals[0] = 0.0;
+                residuals[1] = 0.0;
+                return jacobians.is_none();
+            };
+            residuals.copy_from_slice(&residual);
+            if let Some(jacobians) = jacobians {
+                return fill_jacobians(parameters, &binding, jacobians);
+            }
+            true
+        },
+    )
 }
 
 fn eval_residual(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<[f64; 2]> {
@@ -657,14 +655,22 @@ fn fill_analytic_jacobians(
                 )?),
                 FrameSensorEval::Fixed(_) => None,
             };
-            fill_pose_jacobians(binding, jacobians, &state, |role| match role {
-                ParamRole::FramePoseAxis(axis) => Some((j_frame[(0, axis)], j_frame[(1, axis)])),
-                ParamRole::SensorPoseAxis(axis) => {
-                    let j = j_sensor.as_ref()?;
-                    Some((j[(0, axis)], j[(1, axis)]))
-                }
-                _ => None,
-            }, &j_point)?;
+            fill_pose_jacobians(
+                binding,
+                jacobians,
+                &state,
+                |role| match role {
+                    ParamRole::FramePoseAxis(axis) => {
+                        Some((j_frame[(0, axis)], j_frame[(1, axis)]))
+                    }
+                    ParamRole::SensorPoseAxis(axis) => {
+                        let j = j_sensor.as_ref()?;
+                        Some((j[(0, axis)], j[(1, axis)]))
+                    }
+                    _ => None,
+                },
+                &j_point,
+            )?;
             return Some(());
         }
         _ => {}
@@ -678,13 +684,19 @@ fn fill_analytic_jacobians(
         PoseEval::Frame { .. } => unreachable!(),
     };
 
-    fill_pose_jacobians(binding, jacobians, &state, |role| match role {
-        ParamRole::ImagePoseAxis(axis) => {
-            let j = j_image_pose.as_ref()?;
-            Some((j[(0, axis)], j[(1, axis)]))
-        }
-        _ => None,
-    }, &j_point)
+    fill_pose_jacobians(
+        binding,
+        jacobians,
+        &state,
+        |role| match role {
+            ParamRole::ImagePoseAxis(axis) => {
+                let j = j_image_pose.as_ref()?;
+                Some((j[(0, axis)], j[(1, axis)]))
+            }
+            _ => None,
+        },
+        &j_point,
+    )
 }
 
 fn fill_pose_jacobians(
@@ -713,8 +725,7 @@ fn fill_pose_jacobians(
                 }
             }
             ParamRole::CameraParam(param) => {
-                let j_param =
-                    camera_param_jacobian(state.camera, *param, state.pose, state.point)?;
+                let j_param = camera_param_jacobian(state.camera, *param, state.pose, state.point)?;
                 jac[0][0] = j_param[0];
                 jac[1][0] = j_param[1];
             }
@@ -729,10 +740,7 @@ fn fill_numeric_jacobians(
     jacobians: &mut [Option<&mut [&mut [f64]]>],
 ) -> bool {
     const EPS: f64 = 1.0e-8;
-    let mut params_storage = parameters
-        .iter()
-        .map(|p| p.to_vec())
-        .collect::<Vec<_>>();
+    let mut params_storage = parameters.iter().map(|p| p.to_vec()).collect::<Vec<_>>();
 
     for (p_idx, jac_opt) in jacobians.iter_mut().enumerate() {
         let Some(jac) = jac_opt else {
@@ -761,7 +769,10 @@ fn eval_residual_from_storage(
     binding: &ResidualBinding,
     _perturbed_block: usize,
 ) -> Option<[f64; 2]> {
-    let params = params_storage.iter().map(|p| p.as_slice()).collect::<Vec<_>>();
+    let params = params_storage
+        .iter()
+        .map(|p| p.as_slice())
+        .collect::<Vec<_>>();
     eval_residual(&params, binding)
 }
 
@@ -901,7 +912,10 @@ fn ceres_loss(loss: BundleAdjustmentLoss) -> Option<LossFunction> {
     }
 }
 
-fn ceres_solver_options(options: &BundleAdjustmentOptions, num_pose_entities: usize) -> SolverOptions {
+fn ceres_solver_options(
+    options: &BundleAdjustmentOptions,
+    num_pose_entities: usize,
+) -> Option<SolverOptions> {
     let linear_solver = if num_pose_entities >= 50 {
         LinearSolverType::SPARSE_SCHUR
     } else {
@@ -912,11 +926,12 @@ fn ceres_solver_options(options: &BundleAdjustmentOptions, num_pose_entities: us
         .function_tolerance(options.function_tolerance)
         .gradient_tolerance(options.gradient_tolerance)
         .parameter_tolerance(options.parameter_tolerance)
+        .max_linear_solver_iterations(options.max_linear_solver_iterations as i32)
         .max_num_consecutive_invalid_steps(options.max_num_consecutive_invalid_steps as i32)
         .max_consecutive_nonmonotonic_steps(options.max_consecutive_nonmonotonic_steps as i32)
         .linear_solver_type(linear_solver)
         .build()
-        .unwrap_or_default()
+        .ok()
 }
 
 pub(crate) fn se3_to_params(pose: SE3) -> [f64; 6] {
@@ -984,7 +999,12 @@ fn map_ceres_summary(
         .or_else(|| parse_ceres_step_norm_from_table(source))
         .or_else(|| parse_ceres_step_norm_from_table(&brief))
         .unwrap_or(f64::NAN);
-    (termination_type, termination_reason, gradient_max_norm, step_norm)
+    (
+        termination_type,
+        termination_reason,
+        gradient_max_norm,
+        step_norm,
+    )
 }
 
 fn parse_ceres_termination(
@@ -1157,5 +1177,26 @@ mod tests {
             report.termination_reason,
             BundleAdjustmentTerminationReason::GradientTolerance
         );
+    }
+
+    #[test]
+    fn ceres_options_forward_max_linear_solver_iterations_to_validation() {
+        assert!(ceres_solver_options(
+            &BundleAdjustmentOptions {
+                max_linear_solver_iterations: 0,
+                ..BundleAdjustmentOptions::default()
+            },
+            1,
+        )
+        .is_some());
+
+        assert!(ceres_solver_options(
+            &BundleAdjustmentOptions {
+                max_linear_solver_iterations: usize::MAX,
+                ..BundleAdjustmentOptions::default()
+            },
+            1,
+        )
+        .is_none());
     }
 }
