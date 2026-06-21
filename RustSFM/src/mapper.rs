@@ -48,7 +48,8 @@ use rustslam::features::HammingMatcher;
 use rustslam::tracker::{PnPProblem, PnPSolver};
 use rustslam::{FeatureExtractor, FeatureMatcher, OrbExtractor, SE3};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5281,6 +5282,37 @@ struct ReconstructionNormalizationTransform {
     translation: glam::Vec3,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RedundantPoint3DInfo {
+    point_id: usize,
+    stable_point_id: u64,
+    gain: f64,
+}
+
+impl PartialEq for RedundantPoint3DInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.point_id == other.point_id
+            && self.stable_point_id == other.stable_point_id
+            && self.gain.total_cmp(&other.gain).is_eq()
+    }
+}
+
+impl Eq for RedundantPoint3DInfo {}
+
+impl PartialOrd for RedundantPoint3DInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RedundantPoint3DInfo {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.gain
+            .total_cmp(&other.gain)
+            .then_with(|| self.stable_point_id.cmp(&other.stable_point_id))
+    }
+}
+
 impl GlobalBaSchedule {
     fn new(reconstruction: &Reconstruction) -> Self {
         Self {
@@ -5486,6 +5518,129 @@ fn global_ba_enabled(config: &MapperConfig) -> bool {
 fn incremental_global_ba_normalizes_reconstruction(_config: &MapperConfig) -> bool {
     // COLMAP disables this only for prior-position BA and final-all handoff paths.
     true
+}
+
+fn find_redundant_points3d_colmap(
+    min_coverage_gain: f64,
+    reconstruction: &Reconstruction,
+) -> Vec<usize> {
+    const NUM_IMAGE_TILES_PER_DIM: usize = 8;
+    const NUM_IMAGE_TILES: usize = NUM_IMAGE_TILES_PER_DIM * NUM_IMAGE_TILES_PER_DIM;
+
+    if reconstruction.points.is_empty() {
+        return Vec::new();
+    }
+
+    let image_tile_idxs = compute_image_tile_idxs_colmap(NUM_IMAGE_TILES_PER_DIM, reconstruction);
+    let mut selected_points_per_image_tile =
+        vec![[0usize; NUM_IMAGE_TILES]; reconstruction.poses.len()];
+    let mut priority_queue = BinaryHeap::new();
+    for (point_id, point) in reconstruction.points.iter().enumerate() {
+        priority_queue.push(RedundantPoint3DInfo {
+            point_id,
+            stable_point_id: reconstruction_point3d_id(reconstruction, point_id),
+            gain: compute_coverage_gain_colmap(
+                point,
+                &selected_points_per_image_tile,
+                &image_tile_idxs,
+            ),
+        });
+    }
+
+    let mut selected_point_ids = HashSet::with_capacity(reconstruction.points.len());
+    while let Some(mut point_info) = priority_queue.pop() {
+        if point_info.gain <= min_coverage_gain {
+            break;
+        }
+        let Some(point) = reconstruction.points.get(point_info.point_id) else {
+            continue;
+        };
+        let updated_gain =
+            compute_coverage_gain_colmap(point, &selected_points_per_image_tile, &image_tile_idxs);
+        if updated_gain < point_info.gain {
+            point_info.gain = updated_gain;
+            priority_queue.push(point_info);
+            continue;
+        }
+        for obs in &point.track {
+            let Some(tile_idx) = image_tile_idxs
+                .get(obs.image)
+                .and_then(|tile_idxs| tile_idxs.get(obs.feature))
+                .copied()
+            else {
+                continue;
+            };
+            if let Some(counts) = selected_points_per_image_tile.get_mut(obs.image) {
+                counts[tile_idx] += 1;
+            }
+        }
+        selected_point_ids.insert(point_info.point_id);
+    }
+
+    reconstruction
+        .points
+        .iter()
+        .enumerate()
+        .filter_map(|(point_id, _)| (!selected_point_ids.contains(&point_id)).then_some(point_id))
+        .collect()
+}
+
+fn compute_image_tile_idxs_colmap(
+    num_tiles_per_dim: usize,
+    reconstruction: &Reconstruction,
+) -> Vec<Vec<usize>> {
+    reconstruction
+        .keypoints
+        .iter()
+        .enumerate()
+        .map(|(image, keypoints)| {
+            let camera = reconstruction.camera_for_image(image);
+            keypoints
+                .iter()
+                .map(|keypoint| {
+                    let tile_idx_x =
+                        image_tile_idx_colmap(num_tiles_per_dim, keypoint.x(), camera.width);
+                    let tile_idx_y =
+                        image_tile_idx_colmap(num_tiles_per_dim, keypoint.y(), camera.height);
+                    tile_idx_x * num_tiles_per_dim + tile_idx_y
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn image_tile_idx_colmap(num_tiles_per_dim: usize, coord: f32, extent: u32) -> usize {
+    if num_tiles_per_dim == 0 {
+        return 0;
+    }
+    let high = num_tiles_per_dim - 1;
+    if extent == 0 || !coord.is_finite() {
+        return 0;
+    }
+    ((num_tiles_per_dim as f32 * coord / extent as f32) as isize).clamp(0, high as isize) as usize
+}
+
+fn compute_coverage_gain_colmap(
+    point: &Point3D,
+    selected_points_per_image_tile: &[[usize; 64]],
+    image_tile_idxs: &[Vec<usize>],
+) -> f64 {
+    let mut gain = 0.0;
+    for obs in &point.track {
+        let Some(tile_idx) = image_tile_idxs
+            .get(obs.image)
+            .and_then(|tile_idxs| tile_idxs.get(obs.feature))
+            .copied()
+        else {
+            continue;
+        };
+        let Some(tile_counts) = selected_points_per_image_tile.get(obs.image) else {
+            continue;
+        };
+        let n = 1 + tile_counts[tile_idx];
+        gain += 1.0 / (n as f64).sqrt() - 1.0 / ((1 + n) as f64).sqrt();
+    }
+    gain
 }
 
 fn normalize_reconstruction_colmap(
@@ -11220,6 +11375,98 @@ mod tests {
         assert_eq!(large_options.iterations, 50);
         assert_eq!(large_options.gradient_tolerance, 1.0);
         assert_eq!(large_options.max_linear_solver_iterations, 100);
+    }
+
+    #[test]
+    fn redundant_points3d_empty_matches_colmap() {
+        let reconstruction = test_reconstruction(&[]);
+        assert!(find_redundant_points3d_colmap(0.0, &reconstruction).is_empty());
+    }
+
+    #[test]
+    fn redundant_points3d_threshold_monotonically_prunes_like_colmap() {
+        let mut frames = (0..5)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        for frame in &mut frames {
+            frame.keypoints = (0..100)
+                .map(|idx| rustslam::KeyPoint::new(10.0 + idx as f32 * 0.01, 10.0))
+                .collect();
+            frame.colors = vec![[0, 0, 0]; frame.keypoints.len()];
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        for point_id in 0..100 {
+            let track = (0..frames.len())
+                .map(|image| TrackObservation {
+                    image,
+                    feature: point_id,
+                })
+                .collect::<Vec<_>>();
+            add_test_point3d(&mut reconstruction, point_id as u64 + 1, track);
+        }
+
+        assert!(find_redundant_points3d_colmap(0.0, &reconstruction).is_empty());
+        let mut prev_redundant = 0;
+        for min_coverage_gain in [0.1, 0.4, 0.7, 10.0] {
+            let redundant = find_redundant_points3d_colmap(min_coverage_gain, &reconstruction);
+            assert!(redundant.len() > prev_redundant);
+            prev_redundant = redundant.len();
+        }
+        assert_eq!(prev_redundant, reconstruction.points.len());
+    }
+
+    #[test]
+    fn redundant_points3d_ties_use_colmap_point3d_id_order() {
+        let mut frames = vec![minimal_frame(0, "image.jpg")];
+        frames[0].keypoints = vec![rustslam::KeyPoint::new(10.0, 10.0); 3];
+        frames[0].colors = vec![[0, 0, 0]; frames[0].keypoints.len()];
+        let mut reconstruction = test_reconstruction(&frames);
+        add_test_point3d(
+            &mut reconstruction,
+            10,
+            vec![TrackObservation {
+                image: 0,
+                feature: 0,
+            }],
+        );
+        add_test_point3d(
+            &mut reconstruction,
+            20,
+            vec![TrackObservation {
+                image: 0,
+                feature: 1,
+            }],
+        );
+        add_test_point3d(
+            &mut reconstruction,
+            15,
+            vec![TrackObservation {
+                image: 0,
+                feature: 2,
+            }],
+        );
+
+        let redundant = find_redundant_points3d_colmap(0.2, &reconstruction);
+
+        assert_eq!(redundant, vec![0, 2]);
+    }
+
+    #[test]
+    fn image_tile_idxs_match_colmap_clamp_semantics() {
+        let mut frames = vec![minimal_frame(0, "image.jpg")];
+        frames[0].keypoints = vec![
+            rustslam::KeyPoint::new(-50.0, -50.0),
+            rustslam::KeyPoint::new(0.0, 0.0),
+            rustslam::KeyPoint::new(12.5, 12.5),
+            rustslam::KeyPoint::new(99.9, 99.9),
+            rustslam::KeyPoint::new(100.0, 100.0),
+        ];
+        frames[0].colors = vec![[0, 0, 0]; frames[0].keypoints.len()];
+        let reconstruction = test_reconstruction(&frames);
+
+        let tile_idxs = compute_image_tile_idxs_colmap(8, &reconstruction);
+
+        assert_eq!(tile_idxs[0], vec![0, 0, 9, 63, 63]);
     }
 
     #[test]
@@ -17168,6 +17415,30 @@ mod tests {
             point_ids: Vec::new(),
             points: Vec::new(),
         }
+    }
+
+    fn add_test_point3d(
+        reconstruction: &mut Reconstruction,
+        stable_point_id: u64,
+        track: Vec<TrackObservation>,
+    ) -> usize {
+        let point_id = reconstruction.points.len();
+        for obs in &track {
+            if let Some(image_observations) = reconstruction.observations.get_mut(obs.image) {
+                if obs.feature >= image_observations.len() {
+                    image_observations.resize(obs.feature + 1, None);
+                }
+                image_observations[obs.feature] = Some(point_id);
+            }
+        }
+        reconstruction.point_ids.push(stable_point_id);
+        reconstruction.points.push(Point3D {
+            xyz: [point_id as f32, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track,
+        });
+        point_id
     }
 
     fn project_test_point(camera: CameraModel, pose: SE3, point: [f32; 3]) -> rustslam::KeyPoint {

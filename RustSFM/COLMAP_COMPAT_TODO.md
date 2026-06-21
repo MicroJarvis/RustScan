@@ -1061,7 +1061,12 @@ reconstruction parity.
       `IterativeGlobalRefinement` path; future final-all/retriangulate-all
       controller handoffs should keep passing `false`, matching COLMAP's
       explicit final pipeline override.
-    - Remaining work: pose priors, redundant 3D point pruning, and
+    - Added a COLMAP `FindRedundantPoints3D` primitive for redundant 3D point
+      selection: 8x8 image tiles, coverage-gain priority updates, COLMAP
+      point3D-id tie ordering, and threshold behavior are covered by mapper
+      tests. Remaining work is wiring the primitive into global BA's
+      ignore/re-optimize redundant-point passes.
+    - Remaining work: pose priors, redundant-point global BA wiring, and
       Ceres-equivalent convergence settings.
 
 ## P6 - I/O, Multi-Model Pipeline, And Parity Tests
