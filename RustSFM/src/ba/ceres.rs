@@ -8,7 +8,10 @@ use super::{BundleAdjustmentOptions, BundleAdjustmentReport};
 use crate::types::{ImageFrame, Reconstruction};
 
 /// Returns true when the Ceres backend can handle this problem configuration.
-pub fn supports_ceres_ba(_reconstruction: &Reconstruction, _options: &BundleAdjustmentOptions) -> bool {
+pub fn supports_ceres_ba(
+    _reconstruction: &Reconstruction,
+    _options: &BundleAdjustmentOptions,
+) -> bool {
     true
 }
 
@@ -22,18 +25,18 @@ pub fn refine_bundle_adjustment_ceres(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::shared::project_point;
     use super::super::{refine_bundle_adjustment, BundleAdjustmentLoss};
+    use super::*;
     use crate::sift::SiftFeatures;
     use crate::types::{
         CameraModel, DataId, Frame, Point3D, Rig, RigSensor, Rigid3, SensorId, SensorType,
         TrackObservation,
     };
-    use super::super::shared::project_point;
-    use rustslam::Descriptors;
     use crate::wide::WideDescriptors;
-    use rustslam::KeyPoint;
     use glam::{Quat, Vec3};
+    use rustslam::Descriptors;
+    use rustslam::KeyPoint;
     use rustslam::SE3;
     use std::path::PathBuf;
 
@@ -158,6 +161,11 @@ mod tests {
             reconstruction.poses[0].unwrap().translation(),
             fixed_pose.translation()
         );
+        assert_eq!(
+            reconstruction.poses[0].unwrap().quaternion(),
+            fixed_pose.quaternion()
+        );
+        assert!((quaternion_norm(reconstruction.poses[1].unwrap()) - 1.0).abs() < 1.0e-6);
         assert!(report.final_cost <= report.initial_cost);
         assert!(report.gradient_max_norm.is_finite());
     }
@@ -167,6 +175,11 @@ mod tests {
         let right = right.translation();
         ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2) + (left[2] - right[2]).powi(2))
             .sqrt()
+    }
+
+    fn quaternion_norm(pose: SE3) -> f32 {
+        let q = pose.quaternion();
+        (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt()
     }
 
     fn sensor_from_rig_pose(

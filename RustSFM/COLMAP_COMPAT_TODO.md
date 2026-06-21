@@ -899,6 +899,10 @@ reconstruction parity.
       `EigenQuaternionManifold` support for 4D `[x,y,z,w]` rotation blocks and
       7D `[x,y,z,w,tx,ty,tz]` pose product manifolds, including fixed
       translation-axis subsets used by `TWO_CAMS_FROM_WORLD` gauges.
+    - The active Ceres BA problem now stores image/frame/sensor poses as
+      COLMAP-style 7D quaternion+translation parameter blocks and attaches the
+      Ceres pose manifold, including constant block handling and the
+      `TWO_CAMS_FROM_WORLD` fixed-translation-axis gauge.
     - BA termination now separates Ceres-style gradient and parameter tolerance
       exits and reports reduced effective parameter counts, gradient max-norm,
       and step norm in the solver summary.
@@ -935,10 +939,9 @@ reconstruction parity.
       gauge policies (`THREE_POINTS`, `TWO_CAMS_FROM_WORLD`). Ceres cost
       callbacks reuse native analytic projection/frame/sensor/camera
       Jacobians with numeric fallback.
-    - Remaining work: migrate the active Ceres BA problem from its current 6D
-      axis-angle scalar pose blocks to COLMAP's 7D quaternion+translation pose
-      blocks using the new Rust Ceres manifold API, switch native LM damping
-      from a fixed `mu*I` to Ceres' jacobian-scaled
+    - Remaining work: replace the Ceres pose-block numeric ambient Jacobian
+      bridge with exact COLMAP/Ceres quaternion-manifold analytic Jacobians,
+      switch native LM damping from a fixed `mu*I` to Ceres' jacobian-scaled
       `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with Ceres'
       radius-based trust-region update (a naive switch under the current
       `damping*=10` recovery regressed the generalized-rig refinement test, so

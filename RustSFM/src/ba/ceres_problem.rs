@@ -34,10 +34,10 @@ enum PoseEntityKey {
 enum PoseEval {
     Fixed(SE3),
     Image {
-        handles: [usize; 6],
+        handle: usize,
     },
     Frame {
-        frame_handles: [usize; 6],
+        frame_handle: usize,
         sensor: FrameSensorEval,
     },
 }
@@ -45,14 +45,14 @@ enum PoseEval {
 #[derive(Debug, Clone)]
 enum FrameSensorEval {
     Fixed(SE3),
-    Variable { handles: [usize; 6] },
+    Variable { handle: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParamRole {
-    ImagePoseAxis(usize),
-    FramePoseAxis(usize),
-    SensorPoseAxis(usize),
+    ImagePose,
+    FramePose,
+    SensorPose,
     Point,
     CameraParam(usize),
 }
@@ -122,7 +122,8 @@ pub fn solve_bundle_adjustment_ceres(
         .collect::<HashMap<_, _>>();
 
     let mut block_values = HashMap::<usize, Vec<f64>>::new();
-    let mut pose_entity_registry = HashMap::<PoseEntityKey, [usize; 6]>::new();
+    let mut pose_entity_registry = HashMap::<PoseEntityKey, usize>::new();
+    let mut pose_free_axes = HashMap::<usize, [bool; 6]>::new();
     let mut point_registry = HashMap::<usize, usize>::new();
     let mut camera_param_registry = HashMap::<(usize, usize), usize>::new();
     let mut constant_blocks = HashSet::<usize>::new();
@@ -138,11 +139,12 @@ pub fn solve_bundle_adjustment_ceres(
                 register_pose_entity(
                     PoseEntityKey::Image(image),
                     block.free_axes,
-                    se3_to_params(pose),
+                    se3_to_pose_params(pose),
                     &mut pose_entity_registry,
                     &mut block_values,
                     &mut next_param_index,
                     &mut constant_blocks,
+                    &mut pose_free_axes,
                 );
             }
             PoseBlockKind::Frame(frame_idx) => {
@@ -153,11 +155,12 @@ pub fn solve_bundle_adjustment_ceres(
                 register_pose_entity(
                     PoseEntityKey::Frame(frame_idx),
                     block.free_axes,
-                    se3_to_params(frame.rig_from_world.to_se3()),
+                    se3_to_pose_params(frame.rig_from_world.to_se3()),
                     &mut pose_entity_registry,
                     &mut block_values,
                     &mut next_param_index,
                     &mut constant_blocks,
+                    &mut pose_free_axes,
                 );
             }
         }
@@ -171,11 +174,12 @@ pub fn solve_bundle_adjustment_ceres(
         register_pose_entity(
             PoseEntityKey::Sensor(spec.key.clone()),
             [true; 6],
-            se3_to_params(pose),
+            se3_to_pose_params(pose),
             &mut pose_entity_registry,
             &mut block_values,
             &mut next_param_index,
             &mut constant_blocks,
+            &mut pose_free_axes,
         );
     }
 
@@ -281,6 +285,19 @@ pub fn solve_bundle_adjustment_ceres(
         return None;
     }
 
+    for (&internal_idx, &free_axes) in &pose_free_axes {
+        let Some(&storage_idx) = internal_to_storage.get(&internal_idx) else {
+            continue;
+        };
+        if constant_blocks.contains(&internal_idx) {
+            continue;
+        }
+        let constant_translation = pose_manifold_constant_translation_indices(free_axes)?;
+        problem
+            .set_pose_manifold(storage_idx, &constant_translation)
+            .ok()?;
+    }
+
     for internal_idx in constant_blocks {
         let Some(&storage_idx) = internal_to_storage.get(&internal_idx) else {
             continue;
@@ -342,27 +359,38 @@ pub fn solve_bundle_adjustment_ceres(
 fn register_pose_entity(
     key: PoseEntityKey,
     free_axes: [bool; 6],
-    values: [f64; 6],
-    registry: &mut HashMap<PoseEntityKey, [usize; 6]>,
+    values: [f64; 7],
+    registry: &mut HashMap<PoseEntityKey, usize>,
     block_values: &mut HashMap<usize, Vec<f64>>,
     next_param_index: &mut usize,
     constant_blocks: &mut HashSet<usize>,
-) -> [usize; 6] {
-    if let Some(handles) = registry.get(&key).copied() {
-        return handles;
+    pose_free_axes: &mut HashMap<usize, [bool; 6]>,
+) -> usize {
+    if let Some(handle) = registry.get(&key).copied() {
+        return handle;
     }
-    let mut handles = [0usize; 6];
-    for axis in 0..6 {
-        let idx = *next_param_index;
-        *next_param_index += 1;
-        handles[axis] = idx;
-        block_values.insert(idx, vec![values[axis]]);
-        if !free_axes[axis] {
-            constant_blocks.insert(idx);
-        }
+    let idx = *next_param_index;
+    *next_param_index += 1;
+    block_values.insert(idx, values.to_vec());
+    if free_axes.iter().all(|free| !*free) {
+        constant_blocks.insert(idx);
     }
-    registry.insert(key, handles);
-    handles
+    pose_free_axes.insert(idx, free_axes);
+    registry.insert(key, idx);
+    idx
+}
+
+fn pose_manifold_constant_translation_indices(free_axes: [bool; 6]) -> Option<Vec<usize>> {
+    if free_axes[0..3].iter().any(|free| !*free) {
+        return None;
+    }
+    Some(
+        free_axes[3..6]
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &free)| (!free).then_some(idx))
+            .collect(),
+    )
 }
 
 fn register_point(
@@ -407,7 +435,7 @@ fn build_pose_eval(
     image: usize,
     pose_blocks: &super::native::PoseBlockSet,
     sensor_lookup: &HashMap<SensorPoseKey, &super::native::SensorPoseSpec>,
-    pose_entity_registry: &HashMap<PoseEntityKey, [usize; 6]>,
+    pose_entity_registry: &HashMap<PoseEntityKey, usize>,
 ) -> Option<PoseEval> {
     let Some(block_idx) = pose_blocks.image_to_block.get(image).copied().flatten() else {
         let pose = reconstruction.poses.get(image).copied().flatten()?;
@@ -416,22 +444,22 @@ fn build_pose_eval(
     let block = pose_blocks.blocks.get(block_idx)?;
     match block.kind {
         PoseBlockKind::Image(image) => Some(PoseEval::Image {
-            handles: *pose_entity_registry.get(&PoseEntityKey::Image(image))?,
+            handle: *pose_entity_registry.get(&PoseEntityKey::Image(image))?,
         }),
         PoseBlockKind::Frame(frame_idx) => {
-            let frame_handles = *pose_entity_registry.get(&PoseEntityKey::Frame(frame_idx))?;
+            let frame_handle = *pose_entity_registry.get(&PoseEntityKey::Frame(frame_idx))?;
             if let Some(key) = frame_sensor_key_for_image(reconstruction, image) {
                 if sensor_lookup.contains_key(&key) {
                     Some(PoseEval::Frame {
-                        frame_handles,
+                        frame_handle,
                         sensor: FrameSensorEval::Variable {
-                            handles: *pose_entity_registry.get(&PoseEntityKey::Sensor(key))?,
+                            handle: *pose_entity_registry.get(&PoseEntityKey::Sensor(key))?,
                         },
                     })
                 } else {
                     let fixed = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
                     Some(PoseEval::Frame {
-                        frame_handles,
+                        frame_handle,
                         sensor: FrameSensorEval::Fixed(fixed),
                     })
                 }
@@ -465,25 +493,19 @@ fn append_pose_parameters(
 ) {
     match pose_eval {
         PoseEval::Fixed(_) => {}
-        PoseEval::Image { handles } => {
-            for axis in 0..6 {
-                param_indices.push(handles[axis]);
-                param_roles.push(ParamRole::ImagePoseAxis(axis));
-            }
+        PoseEval::Image { handle } => {
+            param_indices.push(*handle);
+            param_roles.push(ParamRole::ImagePose);
         }
         PoseEval::Frame {
-            frame_handles,
+            frame_handle,
             sensor,
         } => {
-            for axis in 0..6 {
-                param_indices.push(frame_handles[axis]);
-                param_roles.push(ParamRole::FramePoseAxis(axis));
-            }
-            if let FrameSensorEval::Variable { handles } = sensor {
-                for axis in 0..6 {
-                    param_indices.push(handles[axis]);
-                    param_roles.push(ParamRole::SensorPoseAxis(axis));
-                }
+            param_indices.push(*frame_handle);
+            param_roles.push(ParamRole::FramePose);
+            if let FrameSensorEval::Variable { handle } = sensor {
+                param_indices.push(*handle);
+                param_roles.push(ParamRole::SensorPose);
             }
         }
     }
@@ -547,9 +569,9 @@ struct AssembledState {
 }
 
 fn assemble_state(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<AssembledState> {
-    let mut image_pose = [0.0; 6];
-    let mut frame_pose = [0.0; 6];
-    let mut sensor_pose = [0.0; 6];
+    let mut image_pose = [0.0; 7];
+    let mut frame_pose = [0.0; 7];
+    let mut sensor_pose = [0.0; 7];
     let mut point = [0.0f64; 3];
     let mut has_point = false;
     let mut camera = binding.camera_base;
@@ -557,9 +579,9 @@ fn assemble_state(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<As
     for (p_idx, role) in binding.param_roles.iter().enumerate() {
         let slice = parameters.get(p_idx)?;
         match role {
-            ParamRole::ImagePoseAxis(axis) => image_pose[*axis] = slice[0],
-            ParamRole::FramePoseAxis(axis) => frame_pose[*axis] = slice[0],
-            ParamRole::SensorPoseAxis(axis) => sensor_pose[*axis] = slice[0],
+            ParamRole::ImagePose => copy_pose_params(slice, &mut image_pose)?,
+            ParamRole::FramePose => copy_pose_params(slice, &mut frame_pose)?,
+            ParamRole::SensorPose => copy_pose_params(slice, &mut sensor_pose)?,
             ParamRole::Point => {
                 point[0] = slice.first().copied().unwrap_or(0.0);
                 point[1] = slice.get(1).copied().unwrap_or(0.0);
@@ -588,12 +610,12 @@ fn assemble_state(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<As
                 camera,
             });
         }
-        PoseEval::Image { .. } => params_to_se3(&image_pose),
+        PoseEval::Image { .. } => pose_params_to_se3(&image_pose),
         PoseEval::Frame { sensor, .. } => {
-            let rig = params_to_se3(&frame_pose);
+            let rig = pose_params_to_se3(&frame_pose);
             let sensor_pose = match sensor {
                 FrameSensorEval::Fixed(pose) => *pose,
-                FrameSensorEval::Variable { .. } => params_to_se3(&sensor_pose),
+                FrameSensorEval::Variable { .. } => pose_params_to_se3(&sensor_pose),
             };
             sensor_pose.compose(&rig)
         }
@@ -602,10 +624,10 @@ fn assemble_state(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<As
     let point = [point[0] as f32, point[1] as f32, point[2] as f32];
     let (rig_from_world, sensor_from_rig) = match &binding.pose_eval {
         PoseEval::Frame { sensor, .. } => {
-            let rig = params_to_se3(&frame_pose);
+            let rig = pose_params_to_se3(&frame_pose);
             let sensor_pose = match sensor {
                 FrameSensorEval::Fixed(pose) => *pose,
-                FrameSensorEval::Variable { .. } => params_to_se3(&sensor_pose),
+                FrameSensorEval::Variable { .. } => pose_params_to_se3(&sensor_pose),
             };
             (Some(rig), Some(sensor_pose))
         }
@@ -657,15 +679,14 @@ fn fill_analytic_jacobians(
             };
             fill_pose_jacobians(
                 binding,
+                parameters,
                 jacobians,
                 &state,
                 |role| match role {
-                    ParamRole::FramePoseAxis(axis) => {
-                        Some((j_frame[(0, axis)], j_frame[(1, axis)]))
-                    }
-                    ParamRole::SensorPoseAxis(axis) => {
+                    ParamRole::FramePose => Some((j_frame[(0, 0)], j_frame[(1, 0)])),
+                    ParamRole::SensorPose => {
                         let j = j_sensor.as_ref()?;
-                        Some((j[(0, axis)], j[(1, axis)]))
+                        Some((j[(0, 0)], j[(1, 0)]))
                     }
                     _ => None,
                 },
@@ -686,12 +707,13 @@ fn fill_analytic_jacobians(
 
     fill_pose_jacobians(
         binding,
+        parameters,
         jacobians,
         &state,
         |role| match role {
-            ParamRole::ImagePoseAxis(axis) => {
+            ParamRole::ImagePose => {
                 let j = j_image_pose.as_ref()?;
-                Some((j[(0, axis)], j[(1, axis)]))
+                Some((j[(0, 0)], j[(1, 0)]))
             }
             _ => None,
         },
@@ -701,6 +723,7 @@ fn fill_analytic_jacobians(
 
 fn fill_pose_jacobians(
     binding: &ResidualBinding,
+    parameters: &[&[f64]],
     jacobians: &mut [Option<&mut [&mut [f64]]>],
     state: &AssembledState,
     mut pose_col: impl FnMut(ParamRole) -> Option<(f64, f64)>,
@@ -711,12 +734,17 @@ fn fill_pose_jacobians(
             continue;
         };
         match role {
-            ParamRole::ImagePoseAxis(_)
-            | ParamRole::FramePoseAxis(_)
-            | ParamRole::SensorPoseAxis(_) => {
-                let (d0, d1) = pose_col(*role)?;
-                jac[0][0] = d0;
-                jac[1][0] = d1;
+            ParamRole::ImagePose | ParamRole::FramePose | ParamRole::SensorPose => {
+                if parameters
+                    .get(p_idx)
+                    .is_some_and(|params| params.len() == 7)
+                {
+                    fill_numeric_jacobian_block(parameters, binding, p_idx, jac)?;
+                } else {
+                    let (d0, d1) = pose_col(*role)?;
+                    jac[0][0] = d0;
+                    jac[1][0] = d1;
+                }
             }
             ParamRole::Point => {
                 for k in 0..3 {
@@ -739,29 +767,40 @@ fn fill_numeric_jacobians(
     binding: &ResidualBinding,
     jacobians: &mut [Option<&mut [&mut [f64]]>],
 ) -> bool {
-    const EPS: f64 = 1.0e-8;
-    let mut params_storage = parameters.iter().map(|p| p.to_vec()).collect::<Vec<_>>();
-
     for (p_idx, jac_opt) in jacobians.iter_mut().enumerate() {
         let Some(jac) = jac_opt else {
             continue;
         };
-        let param_len = params_storage[p_idx].len();
-        for k in 0..param_len {
-            params_storage[p_idx][k] += EPS;
-            let plus = eval_residual_from_storage(&params_storage, binding, p_idx);
-            params_storage[p_idx][k] -= 2.0 * EPS;
-            let minus = eval_residual_from_storage(&params_storage, binding, p_idx);
-            params_storage[p_idx][k] += EPS;
-            let (Some(plus), Some(minus)) = (plus, minus) else {
-                return false;
-            };
-            for r in 0..2 {
-                jac[r][k] = (plus[r] - minus[r]) / (2.0 * EPS);
-            }
+        if fill_numeric_jacobian_block(parameters, binding, p_idx, jac).is_none() {
+            return false;
         }
     }
     true
+}
+
+fn fill_numeric_jacobian_block(
+    parameters: &[&[f64]],
+    binding: &ResidualBinding,
+    p_idx: usize,
+    jac: &mut [&mut [f64]],
+) -> Option<()> {
+    const EPS: f64 = 1.0e-8;
+    let mut params_storage = parameters.iter().map(|p| p.to_vec()).collect::<Vec<_>>();
+    let param_len = params_storage.get(p_idx)?.len();
+    for k in 0..param_len {
+        params_storage[p_idx][k] += EPS;
+        let plus = eval_residual_from_storage(&params_storage, binding, p_idx);
+        params_storage[p_idx][k] -= 2.0 * EPS;
+        let minus = eval_residual_from_storage(&params_storage, binding, p_idx);
+        params_storage[p_idx][k] += EPS;
+        let (Some(plus), Some(minus)) = (plus, minus) else {
+            return None;
+        };
+        for r in 0..2 {
+            jac[r][k] = (plus[r] - minus[r]) / (2.0 * EPS);
+        }
+    }
+    Some(())
 }
 
 fn eval_residual_from_storage(
@@ -780,7 +819,7 @@ fn write_back_solution(
     reconstruction: &mut Reconstruction,
     parameters: &[Vec<f64>],
     internal_to_storage: &HashMap<usize, usize>,
-    pose_entity_registry: &HashMap<PoseEntityKey, [usize; 6]>,
+    pose_entity_registry: &HashMap<PoseEntityKey, usize>,
     frame_images: &HashMap<usize, Vec<usize>>,
     sensor_pose_specs: &[super::native::SensorPoseSpec],
     camera_param_registry: &HashMap<(usize, usize), usize>,
@@ -791,8 +830,8 @@ fn write_back_solution(
 ) {
     let mut changed_sensors = Vec::new();
 
-    for (key, handles) in pose_entity_registry {
-        let Some(pose) = params_from_solution(parameters, handles, internal_to_storage) else {
+    for (key, &handle) in pose_entity_registry {
+        let Some(pose) = pose_params_from_solution(parameters, handle, internal_to_storage) else {
             continue;
         };
         match key {
@@ -880,16 +919,13 @@ fn parameter_values<'a>(
     parameters.get(*storage_idx).map(|values| values.as_slice())
 }
 
-fn params_from_solution(
+fn pose_params_from_solution(
     parameters: &[Vec<f64>],
-    handles: &[usize; 6],
+    handle: usize,
     internal_to_storage: &HashMap<usize, usize>,
 ) -> Option<SE3> {
-    let mut values = [0.0; 6];
-    for (axis, &internal_idx) in handles.iter().enumerate() {
-        values[axis] = parameter_values(parameters, internal_idx, internal_to_storage)?[0];
-    }
-    Some(params_to_se3(&values))
+    let values = parameter_values(parameters, handle, internal_to_storage)?;
+    Some(pose_params_to_se3(values))
 }
 
 fn count_variable_blocks(
@@ -949,33 +985,47 @@ fn ceres_num_threads(options: &BundleAdjustmentOptions, num_residuals: usize) ->
     }
 }
 
-pub(crate) fn se3_to_params(pose: SE3) -> [f64; 6] {
+fn copy_pose_params(slice: &[f64], target: &mut [f64; 7]) -> Option<()> {
+    if slice.len() != 7 {
+        return None;
+    }
+    target.copy_from_slice(slice);
+    Some(())
+}
+
+pub(crate) fn se3_to_pose_params(pose: SE3) -> [f64; 7] {
     let q = pose.quaternion();
-    let quat = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
-    let (axis, angle) = quat.to_axis_angle();
-    let aa = axis * angle;
     let t = pose.translation();
     [
-        aa.x as f64,
-        aa.y as f64,
-        aa.z as f64,
+        q[0] as f64,
+        q[1] as f64,
+        q[2] as f64,
+        q[3] as f64,
         t[0] as f64,
         t[1] as f64,
         t[2] as f64,
     ]
 }
 
-fn params_to_se3(params: &[f64]) -> SE3 {
-    let omega = Vec3::new(params[0] as f32, params[1] as f32, params[2] as f32);
-    let angle = omega.length();
-    let rotation = if angle > 1.0e-12 {
-        Quat::from_axis_angle(omega / angle, angle)
+fn pose_params_to_se3(params: &[f64]) -> SE3 {
+    let rotation = if params.len() >= 4 {
+        Quat::from_xyzw(
+            params[0] as f32,
+            params[1] as f32,
+            params[2] as f32,
+            params[3] as f32,
+        )
+        .normalize()
     } else {
         Quat::IDENTITY
     };
     SE3::from_quat_translation(
         rotation,
-        Vec3::new(params[3] as f32, params[4] as f32, params[5] as f32),
+        Vec3::new(
+            params.get(4).copied().unwrap_or(0.0) as f32,
+            params.get(5).copied().unwrap_or(0.0) as f32,
+            params.get(6).copied().unwrap_or(0.0) as f32,
+        ),
     )
 }
 
