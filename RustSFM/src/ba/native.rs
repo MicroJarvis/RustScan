@@ -3,8 +3,15 @@ use super::shared::{
     refresh_point_errors, BaObservation,
 };
 use super::{
-    BundleAdjustmentGauge, BundleAdjustmentLoss, BundleAdjustmentOptions, BundleAdjustmentReport,
-    BundleAdjustmentTerminationReason, BundleAdjustmentTerminationType,
+    camera_center_pose_jacobian, camera_center_world, compute_pose_covariances,
+    position_prior_information_matrix, BundleAdjustmentCovariance, BundleAdjustmentGauge,
+    BundleAdjustmentLinearSolver, BundleAdjustmentLoss, BundleAdjustmentOptions,
+    BundleAdjustmentPreconditioner, BundleAdjustmentReport, BundleAdjustmentTerminationReason,
+    BundleAdjustmentTerminationType, CovariancePoseBlock, POSE_PRIOR_JACOBIAN_EPS,
+};
+use crate::sparse_cholesky::{
+    schur_jacobi_preconditioner, solve_symmetric_pcg, SchurParameterBlock, SymmetricSparseMatrix,
+    DENSE_SCHUR_MAX_POSE_ENTITIES, SPARSE_SCHUR_MAX_POSE_ENTITIES,
 };
 use crate::types::{
     colmap_camera_model_focal_idxs, colmap_camera_model_principal_point_idxs, CameraModel, Frame,
@@ -81,9 +88,6 @@ pub(crate) fn refine_bundle_adjustment_native(
         pose_blocks.dim + sensor_pose_specs.len() * 6,
     );
     let nonpoint_dim = pose_blocks.dim + sensor_pose_specs.len() * 6 + camera_param_specs.len();
-    if nonpoint_dim == 0 || observations.len() * 2 < nonpoint_dim {
-        return None;
-    }
     let residuals = count_variable_residuals(
         reconstruction,
         &observations,
@@ -95,10 +99,33 @@ pub(crate) fn refine_bundle_adjustment_native(
     if residuals == 0 {
         return None;
     }
+    if nonpoint_dim == 0 {
+        return refine_point_only_bundle_adjustment_native(
+            frames,
+            reconstruction,
+            &options,
+            observations,
+            constant_point_filter,
+            residuals,
+        );
+    }
+    let pose_entities = pose_blocks.blocks.len() + sensor_pose_specs.len();
+    let (linear_solver, preconditioner) = native_linear_solver_policy(pose_entities);
+    let schur_blocks =
+        schur_parameter_blocks(&pose_blocks, &sensor_pose_specs, &camera_param_specs);
+    if observations.len() * 2 < nonpoint_dim {
+        return None;
+    }
     let initial_poses = reconstruction.poses.clone();
     let initial_frames = reconstruction.frames.clone();
     sync_frame_pose_blocks_from_images(reconstruction, &pose_blocks);
-    let initial_cost = total_cost(reconstruction, &observations, options.loss_function);
+    let initial_cost = total_cost(
+        reconstruction,
+        &observations,
+        options.loss_function,
+        &options.pose_priors,
+        options.prior_position_fallback_stddev,
+    );
     if !initial_cost.is_finite() {
         reconstruction.poses.clone_from_slice(&initial_poses);
         reconstruction.frames.clone_from_slice(&initial_frames);
@@ -120,7 +147,7 @@ pub(crate) fn refine_bundle_adjustment_native(
     let mut step_quality = f64::NAN;
     let mut termination_type = BundleAdjustmentTerminationType::NoConvergence;
     let mut termination_reason = BundleAdjustmentTerminationReason::MaxIterations;
-    let mut damping = 1.0e-3;
+    let mut trust_region = TrustRegionState::ceres_initial();
 
     for _ in 0..options.iterations {
         attempted += 1;
@@ -132,7 +159,9 @@ pub(crate) fn refine_bundle_adjustment_native(
             &camera_param_specs,
             &constant_point_filter,
             options.loss_function,
-            damping,
+            trust_region.radius,
+            &options.pose_priors,
+            options.prior_position_fallback_stddev,
         ) else {
             linearization_failures += 1;
             unsuccessful_steps += 1;
@@ -146,15 +175,21 @@ pub(crate) fn refine_bundle_adjustment_native(
             termination_reason = BundleAdjustmentTerminationReason::GradientTolerance;
             break;
         }
-        let linear_solution =
-            solve_linear_system(&system.h, &system.g, options.max_linear_solver_iterations);
+        let linear_solution = solve_linear_system(
+            &system.h,
+            &system.g,
+            linear_solver,
+            preconditioner,
+            &schur_blocks,
+            options.max_linear_solver_iterations,
+        );
         linear_solver_iterations += linear_solution.iterations;
         let Some(delta) = linear_solution.delta else {
             linear_solve_failures += 1;
             unsuccessful_steps += 1;
             consecutive_invalid_steps += 1;
             consecutive_nonmonotonic_steps = 0;
-            damping *= 10.0;
+            trust_region.on_step_rejected();
             termination_reason = BundleAdjustmentTerminationReason::LinearSolveFailure;
             if options.max_num_consecutive_invalid_steps > 0
                 && consecutive_invalid_steps >= options.max_num_consecutive_invalid_steps
@@ -172,7 +207,7 @@ pub(crate) fn refine_bundle_adjustment_native(
             unsuccessful_steps += 1;
             consecutive_invalid_steps += 1;
             consecutive_nonmonotonic_steps = 0;
-            damping *= 10.0;
+            trust_region.on_step_rejected();
             termination_reason = BundleAdjustmentTerminationReason::InvalidStep;
             if options.max_num_consecutive_invalid_steps > 0
                 && consecutive_invalid_steps >= options.max_num_consecutive_invalid_steps
@@ -212,7 +247,13 @@ pub(crate) fn refine_bundle_adjustment_native(
                 &delta,
                 step,
             );
-            let candidate_cost = total_cost(reconstruction, &observations, options.loss_function);
+            let candidate_cost = total_cost(
+                reconstruction,
+                &observations,
+                options.loss_function,
+                &options.pose_priors,
+                options.prior_position_fallback_stddev,
+            );
             let actual_decrease = final_cost - candidate_cost;
             step_quality = step_quality_ratio(actual_decrease, predicted_decrease);
             if candidate_cost.is_finite()
@@ -222,7 +263,7 @@ pub(crate) fn refine_bundle_adjustment_native(
             {
                 let previous_cost = final_cost;
                 final_cost = candidate_cost;
-                damping = update_damping_after_step(damping, step_quality);
+                trust_region.on_step_accepted(step_quality);
                 completed += 1;
                 accepted = true;
                 consecutive_invalid_steps = 0;
@@ -248,7 +289,7 @@ pub(crate) fn refine_bundle_adjustment_native(
             rejected_steps += 1;
             consecutive_invalid_steps = 0;
             consecutive_nonmonotonic_steps += 1;
-            damping = (damping * 4.0).min(1.0e12);
+            trust_region.on_step_rejected();
             termination_reason = BundleAdjustmentTerminationReason::NoAcceptedStep;
             if options.max_consecutive_nonmonotonic_steps > 0
                 && consecutive_nonmonotonic_steps >= options.max_consecutive_nonmonotonic_steps
@@ -276,6 +317,22 @@ pub(crate) fn refine_bundle_adjustment_native(
     }
 
     refresh_point_errors(frames, reconstruction);
+    let covariance = options
+        .compute_covariance
+        .then(|| {
+            compute_bundle_adjustment_covariance(
+                reconstruction,
+                &observations,
+                &pose_blocks,
+                &sensor_pose_specs,
+                &camera_param_specs,
+                &constant_point_filter,
+                options.loss_function,
+                &options.pose_priors,
+                options.prior_position_fallback_stddev,
+            )
+        })
+        .flatten();
     Some(BundleAdjustmentReport {
         iterations: completed,
         attempted_iterations: attempted,
@@ -295,7 +352,10 @@ pub(crate) fn refine_bundle_adjustment_native(
         gradient_max_norm,
         step_norm,
         step_quality,
-        damping,
+        damping: trust_region.radius,
+        linear_solver,
+        preconditioner,
+        covariance,
         termination_type,
         termination_reason,
     })
@@ -337,6 +397,220 @@ pub(crate) fn count_variable_residuals(
     variable_observations * 2
 }
 
+fn refine_point_only_bundle_adjustment_native(
+    frames: &[ImageFrame],
+    reconstruction: &mut Reconstruction,
+    options: &BundleAdjustmentOptions,
+    observations: Vec<BaObservation>,
+    constant_point_filter: HashSet<usize>,
+    residuals: usize,
+) -> Option<BundleAdjustmentReport> {
+    let initial_cost = total_cost(
+        reconstruction,
+        &observations,
+        options.loss_function,
+        &[],
+        1.0,
+    );
+    if !initial_cost.is_finite() {
+        return None;
+    }
+
+    let mut final_cost = initial_cost;
+    let mut completed = 0usize;
+    let mut attempted = 0usize;
+    let mut unsuccessful_steps = 0usize;
+    let mut linear_solver_iterations = 0usize;
+    let mut linearization_failures = 0usize;
+    let mut linear_solve_failures = 0usize;
+    let mut invalid_steps = 0usize;
+    let mut rejected_steps = 0usize;
+    let mut consecutive_invalid_steps = 0usize;
+    let mut consecutive_nonmonotonic_steps = 0usize;
+    let mut gradient_max_norm = f64::INFINITY;
+    let mut step_norm = 0.0;
+    let mut step_quality = f64::NAN;
+    let mut termination_type = BundleAdjustmentTerminationType::NoConvergence;
+    let mut termination_reason = BundleAdjustmentTerminationReason::MaxIterations;
+    let mut trust_region = TrustRegionState::ceres_initial();
+
+    for _ in 0..options.iterations {
+        attempted += 1;
+        let Some(system) = build_point_only_system(
+            reconstruction,
+            &observations,
+            &constant_point_filter,
+            options.loss_function,
+            trust_region.radius,
+        ) else {
+            linearization_failures += 1;
+            unsuccessful_steps += 1;
+            termination_type = BundleAdjustmentTerminationType::Failure;
+            termination_reason = BundleAdjustmentTerminationReason::LinearizationFailure;
+            break;
+        };
+        gradient_max_norm = system
+            .point_blocks
+            .iter()
+            .filter(|block| block.active)
+            .map(|block| block.g.amax())
+            .fold(0.0, f64::max);
+        if options.gradient_tolerance > 0.0 && gradient_max_norm <= options.gradient_tolerance {
+            termination_type = BundleAdjustmentTerminationType::Convergence;
+            termination_reason = BundleAdjustmentTerminationReason::GradientTolerance;
+            break;
+        }
+        let point_deltas =
+            solve_point_only_system(&system.point_blocks, options.max_linear_solver_iterations);
+        linear_solver_iterations += point_deltas.iterations;
+        let Some(point_deltas) = point_deltas.deltas else {
+            linear_solve_failures += 1;
+            unsuccessful_steps += 1;
+            consecutive_invalid_steps += 1;
+            consecutive_nonmonotonic_steps = 0;
+            trust_region.on_step_rejected();
+            termination_reason = BundleAdjustmentTerminationReason::LinearSolveFailure;
+            if options.max_num_consecutive_invalid_steps > 0
+                && consecutive_invalid_steps >= options.max_num_consecutive_invalid_steps
+            {
+                termination_type = BundleAdjustmentTerminationType::Failure;
+                termination_reason = BundleAdjustmentTerminationReason::MaxConsecutiveInvalidSteps;
+                break;
+            }
+            continue;
+        };
+        step_norm = point_deltas
+            .iter()
+            .map(|delta| delta.dot(delta))
+            .sum::<f64>()
+            .sqrt();
+        if !step_norm.is_finite() || step_norm > 20.0 {
+            invalid_steps += 1;
+            unsuccessful_steps += 1;
+            consecutive_invalid_steps += 1;
+            consecutive_nonmonotonic_steps = 0;
+            trust_region.on_step_rejected();
+            termination_reason = BundleAdjustmentTerminationReason::InvalidStep;
+            if options.max_num_consecutive_invalid_steps > 0
+                && consecutive_invalid_steps >= options.max_num_consecutive_invalid_steps
+            {
+                termination_type = BundleAdjustmentTerminationType::Failure;
+                termination_reason = BundleAdjustmentTerminationReason::MaxConsecutiveInvalidSteps;
+                break;
+            }
+            continue;
+        }
+        if options.parameter_tolerance > 0.0 && step_norm <= options.parameter_tolerance {
+            termination_type = BundleAdjustmentTerminationType::Convergence;
+            termination_reason = BundleAdjustmentTerminationReason::ParameterTolerance;
+            break;
+        }
+
+        let base_points = reconstruction
+            .points
+            .iter()
+            .map(|point| point.xyz)
+            .collect::<Vec<_>>();
+        let mut accepted = false;
+        for step in [1.0, 0.5, 0.25, 0.125, 0.0625] {
+            let predicted_decrease =
+                point_only_predicted_model_decrease(&system.point_blocks, &point_deltas, step);
+            apply_point_only_delta(reconstruction, &point_deltas, step);
+            let candidate_cost = total_cost(
+                reconstruction,
+                &observations,
+                options.loss_function,
+                &[],
+                1.0,
+            );
+            let actual_decrease = final_cost - candidate_cost;
+            step_quality = step_quality_ratio(actual_decrease, predicted_decrease);
+            if candidate_cost.is_finite()
+                && predicted_decrease > 0.0
+                && actual_decrease > 0.0
+                && step_quality > 0.0
+            {
+                let previous_cost = final_cost;
+                final_cost = candidate_cost;
+                trust_region.on_step_accepted(step_quality);
+                completed += 1;
+                accepted = true;
+                consecutive_invalid_steps = 0;
+                consecutive_nonmonotonic_steps = 0;
+                if relative_cost_change(previous_cost, final_cost) <= options.function_tolerance {
+                    termination_type = BundleAdjustmentTerminationType::Convergence;
+                    termination_reason = BundleAdjustmentTerminationReason::FunctionTolerance;
+                }
+                break;
+            }
+            for (point, xyz) in reconstruction.points.iter_mut().zip(base_points.iter()) {
+                point.xyz = *xyz;
+            }
+        }
+        if !accepted {
+            unsuccessful_steps += 1;
+            rejected_steps += 1;
+            consecutive_invalid_steps = 0;
+            consecutive_nonmonotonic_steps += 1;
+            trust_region.on_step_rejected();
+            termination_reason = BundleAdjustmentTerminationReason::NoAcceptedStep;
+            if options.max_consecutive_nonmonotonic_steps > 0
+                && consecutive_nonmonotonic_steps >= options.max_consecutive_nonmonotonic_steps
+            {
+                termination_type = BundleAdjustmentTerminationType::Failure;
+                termination_reason =
+                    BundleAdjustmentTerminationReason::MaxConsecutiveNonmonotonicSteps;
+                break;
+            }
+        } else if termination_type == BundleAdjustmentTerminationType::Convergence {
+            break;
+        }
+    }
+
+    if termination_type != BundleAdjustmentTerminationType::Failure
+        && termination_type != BundleAdjustmentTerminationType::Convergence
+    {
+        termination_type = if completed == 0
+            && attempted > 0
+            && linear_solve_failures + invalid_steps == attempted
+        {
+            BundleAdjustmentTerminationType::Failure
+        } else {
+            BundleAdjustmentTerminationType::NoConvergence
+        };
+    }
+
+    refresh_point_errors(frames, reconstruction);
+    Some(BundleAdjustmentReport {
+        iterations: completed,
+        attempted_iterations: attempted,
+        successful_steps: completed,
+        unsuccessful_steps,
+        linear_solver_iterations,
+        linearization_failures,
+        linear_solve_failures,
+        invalid_steps,
+        rejected_steps,
+        initial_cost,
+        final_cost,
+        observations: observations.len(),
+        residuals,
+        effective_parameters: point_effective_parameter_count(
+            &observations,
+            &constant_point_filter,
+        ),
+        gradient_max_norm,
+        step_norm,
+        step_quality,
+        damping: trust_region.radius,
+        linear_solver: BundleAdjustmentLinearSolver::DenseSchur,
+        preconditioner: None,
+        covariance: None,
+        termination_type,
+        termination_reason,
+    })
+}
+
 pub(crate) fn point_effective_parameter_count(
     observations: &[BaObservation],
     constant_point_filter: &HashSet<usize>,
@@ -350,10 +624,268 @@ pub(crate) fn point_effective_parameter_count(
     points.len() * 3
 }
 
+#[derive(Clone)]
 struct SchurSystem {
-    h: DMatrix<f64>,
+    h: SchurHessian,
     g: DVector<f64>,
     point_blocks: Vec<PointBlock>,
+}
+
+#[derive(Debug, Clone)]
+enum SchurHessian {
+    Dense(DMatrix<f64>),
+    Sparse(SymmetricSparseMatrix),
+}
+
+impl SchurHessian {
+    fn new_dense(n: usize) -> Self {
+        Self::Dense(DMatrix::zeros(n, n))
+    }
+
+    fn new_for_pose_entities(n: usize, pose_entities: usize) -> Self {
+        if pose_entities > DENSE_SCHUR_MAX_POSE_ENTITIES {
+            Self::Sparse(SymmetricSparseMatrix::new(n))
+        } else {
+            Self::new_dense(n)
+        }
+    }
+
+    fn add(&mut self, row: usize, col: usize, value: f64) {
+        match self {
+            Self::Dense(matrix) => matrix[(row, col)] += value,
+            Self::Sparse(matrix) => matrix.add(row, col, value),
+        }
+    }
+
+    fn add_lm_damping(&mut self, radius: f64) {
+        match self {
+            Self::Dense(matrix) => add_lm_damping_to_matrix_diagonal(matrix, radius),
+            Self::Sparse(matrix) => {
+                matrix.add_lm_damping_to_diagonal(radius, clamp_lm_diagonal);
+            }
+        }
+    }
+
+    fn get(&self, row: usize, col: usize) -> f64 {
+        match self {
+            Self::Dense(matrix) => matrix[(row, col)],
+            Self::Sparse(matrix) => matrix.get(row, col),
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        match self {
+            Self::Dense(matrix) => matrix.nrows(),
+            Self::Sparse(matrix) => matrix.dimension(),
+        }
+    }
+
+    fn mat_vec(&self, vector: &DVector<f64>) -> DVector<f64> {
+        match self {
+            Self::Dense(matrix) => matrix * vector,
+            Self::Sparse(matrix) => matrix.mat_vec(vector),
+        }
+    }
+
+    fn to_dense(&self) -> DMatrix<f64> {
+        match self {
+            Self::Dense(matrix) => matrix.clone(),
+            Self::Sparse(matrix) => matrix.to_dense(),
+        }
+    }
+}
+
+fn native_linear_solver_policy(
+    pose_entities: usize,
+) -> (
+    BundleAdjustmentLinearSolver,
+    Option<BundleAdjustmentPreconditioner>,
+) {
+    if pose_entities <= DENSE_SCHUR_MAX_POSE_ENTITIES {
+        (BundleAdjustmentLinearSolver::DenseSchur, None)
+    } else if pose_entities <= SPARSE_SCHUR_MAX_POSE_ENTITIES {
+        (BundleAdjustmentLinearSolver::SparseSchur, None)
+    } else {
+        (
+            BundleAdjustmentLinearSolver::IterativeSchur,
+            Some(BundleAdjustmentPreconditioner::SchurJacobi),
+        )
+    }
+}
+
+fn schur_parameter_blocks(
+    pose_blocks: &PoseBlockSet,
+    sensor_pose_specs: &[SensorPoseSpec],
+    camera_param_specs: &[CameraParamSpec],
+) -> Vec<SchurParameterBlock> {
+    let mut blocks = pose_blocks
+        .blocks
+        .iter()
+        .map(|block| SchurParameterBlock {
+            offset: block.offset,
+            dim: pose_block_dim(block),
+        })
+        .filter(|block| block.dim > 0)
+        .collect::<Vec<_>>();
+    blocks.extend(sensor_pose_specs.iter().map(|spec| SchurParameterBlock {
+        offset: spec.offset,
+        dim: 6,
+    }));
+    blocks.extend(camera_param_specs.iter().map(|spec| SchurParameterBlock {
+        offset: spec.offset,
+        dim: 1,
+    }));
+    blocks
+}
+
+fn schur_covariance_pose_blocks(pose_blocks: &PoseBlockSet) -> Vec<CovariancePoseBlock> {
+    pose_blocks
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let PoseBlockKind::Image(image) = block.kind else {
+                return None;
+            };
+            (pose_block_dim(block) == 6).then_some(CovariancePoseBlock {
+                image,
+                offset: block.offset,
+                dim: 6,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn compute_bundle_adjustment_covariance(
+    reconstruction: &Reconstruction,
+    observations: &[BaObservation],
+    pose_blocks: &PoseBlockSet,
+    sensor_pose_specs: &[SensorPoseSpec],
+    camera_param_specs: &[CameraParamSpec],
+    constant_point_filter: &HashSet<usize>,
+    loss_function: BundleAdjustmentLoss,
+    pose_priors: &[super::BundleAdjustmentPosePrior],
+    prior_position_fallback_stddev: f64,
+) -> Option<BundleAdjustmentCovariance> {
+    const COVARIANCE_TRUST_REGION_RADIUS: f64 = 1.0e32;
+    let system = build_schur_system(
+        reconstruction,
+        observations,
+        pose_blocks,
+        sensor_pose_specs,
+        camera_param_specs,
+        constant_point_filter,
+        loss_function,
+        COVARIANCE_TRUST_REGION_RADIUS,
+        pose_priors,
+        prior_position_fallback_stddev,
+    )?;
+    compute_pose_covariances(
+        &system.h.to_dense(),
+        &schur_covariance_pose_blocks(pose_blocks),
+    )
+}
+
+fn pose_block_jacobian_3d(
+    jacobian: crate::ba::pose_prior::Mat3x6,
+    block: &PoseBlock,
+) -> Option<DMatrix<f64>> {
+    let dim = pose_block_dim(block);
+    if dim == 0 {
+        return None;
+    }
+    let mut out = DMatrix::<f64>::zeros(3, dim);
+    let mut local_col = 0usize;
+    for axis in 0..6 {
+        if block.free_axes[axis] {
+            out.set_column(local_col, &jacobian.column(axis));
+            local_col += 1;
+        }
+    }
+    Some(out)
+}
+
+fn mat3x6_to_dmatrix(matrix: crate::ba::pose_prior::Mat3x6) -> DMatrix<f64> {
+    DMatrix::from_fn(3, 6, |row, col| matrix[(row, col)])
+}
+
+fn accumulate_pose_priors(
+    reconstruction: &Reconstruction,
+    pose_blocks: &PoseBlockSet,
+    sensor_pose_specs: &[SensorPoseSpec],
+    pose_priors: &[super::BundleAdjustmentPosePrior],
+    fallback_stddev: f64,
+    h_cc: &mut SchurHessian,
+    g_c: &mut DVector<f64>,
+) {
+    let sensor_pose_lookup = sensor_pose_specs
+        .iter()
+        .map(|spec| (spec.key.clone(), spec.offset))
+        .collect::<BTreeMap<_, _>>();
+    for prior in pose_priors {
+        let Some(pose) = reconstruction.poses.get(prior.image).copied().flatten() else {
+            continue;
+        };
+        let mut nonpoint_jacobians = Vec::new();
+        if let Some(block_idx) = pose_blocks
+            .image_to_block
+            .get(prior.image)
+            .copied()
+            .flatten()
+        {
+            let block = &pose_blocks.blocks[block_idx];
+            let jacobian = match block.kind {
+                PoseBlockKind::Image(_) => camera_center_pose_jacobian(pose),
+                PoseBlockKind::Frame(frame_idx) => {
+                    let Some(frame_jacobian) =
+                        frame_camera_center_jacobian(reconstruction, frame_idx, prior.image)
+                    else {
+                        continue;
+                    };
+                    frame_jacobian
+                }
+            };
+            if let Some(jacobian) = pose_block_jacobian_3d(jacobian, block) {
+                nonpoint_jacobians.push((block.offset, jacobian));
+            }
+        }
+        if let Some(key) = frame_sensor_key_for_image(reconstruction, prior.image) {
+            if let Some(&offset) = sensor_pose_lookup.get(&key) {
+                let Some(jacobian) = sensor_camera_center_jacobian(reconstruction, prior.image)
+                else {
+                    continue;
+                };
+                nonpoint_jacobians.push((offset, mat3x6_to_dmatrix(jacobian)));
+            }
+        }
+        if nonpoint_jacobians.is_empty() {
+            continue;
+        }
+        let center = camera_center_world(pose);
+        let residual = center - DVector::from_column_slice(&prior.position);
+        let information =
+            position_prior_information_matrix(&prior.position_covariance, fallback_stddev);
+        let info_residual = information * residual;
+        for (offset, jacobian) in &nonpoint_jacobians {
+            for col in 0..jacobian.ncols() {
+                g_c[*offset + col] += jacobian.column(col).dot(&info_residual);
+            }
+        }
+        for (offset_i, jacobian_i) in &nonpoint_jacobians {
+            for (offset_j, jacobian_j) in &nonpoint_jacobians {
+                for row in 0..jacobian_i.ncols() {
+                    for col in 0..jacobian_j.ncols() {
+                        h_cc.add(
+                            *offset_i + row,
+                            *offset_j + col,
+                            jacobian_i
+                                .column(row)
+                                .dot(&(information * jacobian_j.column(col))),
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct LinearSolveResult {
@@ -361,9 +893,28 @@ struct LinearSolveResult {
     iterations: usize,
 }
 
+struct PointOnlySystem {
+    point_blocks: Vec<PointOnlyBlock>,
+}
+
+#[derive(Debug, Clone)]
+struct PointOnlyBlock {
+    h: Mat3,
+    g: Vec3d,
+    active: bool,
+}
+
+struct PointOnlySolveResult {
+    deltas: Option<Vec<Vec3d>>,
+    iterations: usize,
+}
+
 fn solve_linear_system(
-    hessian: &DMatrix<f64>,
+    hessian: &SchurHessian,
     gradient: &DVector<f64>,
+    linear_solver: BundleAdjustmentLinearSolver,
+    preconditioner: Option<BundleAdjustmentPreconditioner>,
+    blocks: &[SchurParameterBlock],
     max_iterations: usize,
 ) -> LinearSolveResult {
     if max_iterations == 0 {
@@ -373,31 +924,201 @@ fn solve_linear_system(
         };
     }
     let rhs = -gradient;
-    // The LM-damped reduced camera matrix (Schur complement) is symmetric
-    // positive definite, so prefer a Cholesky factorization like Ceres'
-    // DENSE_SCHUR / SPARSE_SCHUR linear solvers. Fall back to LU only when the
-    // factorization fails on an ill-conditioned or indefinite system.
+    match linear_solver {
+        BundleAdjustmentLinearSolver::IterativeSchur => {
+            let dim = hessian.dimension();
+            let mat_vec = |vector: &DVector<f64>| hessian.mat_vec(vector);
+            let delta = if matches!(
+                preconditioner,
+                Some(BundleAdjustmentPreconditioner::SchurJacobi)
+            ) {
+                let precondition =
+                    schur_jacobi_preconditioner(blocks, |row, col| hessian.get(row, col), dim);
+                solve_symmetric_pcg(dim, mat_vec, precondition, &rhs, max_iterations, 1.0e-6)
+            } else {
+                solve_symmetric_pcg(
+                    dim,
+                    mat_vec,
+                    |vector: &DVector<f64>| vector.clone(),
+                    &rhs,
+                    max_iterations,
+                    1.0e-6,
+                )
+            };
+            let solved = delta.is_some();
+            LinearSolveResult {
+                delta,
+                iterations: if solved { max_iterations.max(1) } else { 0 },
+            }
+        }
+        BundleAdjustmentLinearSolver::SparseSchur => match hessian {
+            SchurHessian::Sparse(hessian) => LinearSolveResult {
+                delta: hessian.solve(&rhs),
+                iterations: 1,
+            },
+            SchurHessian::Dense(hessian) => direct_dense_linear_solve(hessian, &rhs),
+        },
+        BundleAdjustmentLinearSolver::DenseSchur => match hessian {
+            SchurHessian::Dense(hessian) => direct_dense_linear_solve(hessian, &rhs),
+            SchurHessian::Sparse(hessian) => LinearSolveResult {
+                delta: hessian.solve(&rhs),
+                iterations: 1,
+            },
+        },
+    }
+}
+
+fn direct_dense_linear_solve(hessian: &DMatrix<f64>, rhs: &DVector<f64>) -> LinearSolveResult {
     if let Some(cholesky) = hessian.clone().cholesky() {
         return LinearSolveResult {
-            delta: Some(cholesky.solve(&rhs)),
+            delta: Some(cholesky.solve(rhs)),
             iterations: 1,
         };
     }
     LinearSolveResult {
-        delta: hessian.clone().lu().solve(&rhs),
+        delta: hessian.clone().lu().solve(rhs),
         iterations: 1,
     }
 }
 
-fn predicted_model_decrease(
+fn solve_dense_linear_system(
     hessian: &DMatrix<f64>,
+    gradient: &DVector<f64>,
+    max_iterations: usize,
+) -> LinearSolveResult {
+    solve_linear_system(
+        &SchurHessian::Dense(hessian.clone()),
+        gradient,
+        BundleAdjustmentLinearSolver::DenseSchur,
+        None,
+        &[],
+        max_iterations,
+    )
+}
+
+fn build_point_only_system(
+    reconstruction: &Reconstruction,
+    observations: &[BaObservation],
+    constant_point_filter: &HashSet<usize>,
+    loss_function: BundleAdjustmentLoss,
+    radius: f64,
+) -> Option<PointOnlySystem> {
+    let mut point_blocks = (0..reconstruction.points.len())
+        .map(|_| PointOnlyBlock {
+            h: Mat3::zeros(),
+            g: Vec3d::zeros(),
+            active: false,
+        })
+        .collect::<Vec<_>>();
+
+    for obs in observations {
+        if constant_point_filter.contains(&obs.point) {
+            continue;
+        }
+        let pose = reconstruction.poses[obs.image]?;
+        let point = reconstruction.points.get(obs.point)?.xyz;
+        let (residual, _, j_point) = residual_and_jacobians(
+            reconstruction.camera_for_image(obs.image),
+            pose,
+            point,
+            obs.xy,
+        )?;
+        let err = residual.norm();
+        let weight = loss_function.weight(err * err);
+        let sqrt_w = weight.sqrt();
+        let residual = residual * sqrt_w;
+        let j_point = j_point * sqrt_w;
+        let block = &mut point_blocks[obs.point];
+        block.h += j_point.transpose() * j_point;
+        block.g += j_point.transpose() * residual;
+        block.active = true;
+    }
+
+    for block in &mut point_blocks {
+        if !block.active {
+            continue;
+        }
+        add_lm_damping_to_mat3_diagonal(&mut block.h, radius);
+    }
+
+    Some(PointOnlySystem { point_blocks })
+}
+
+fn solve_point_only_system(
+    point_blocks: &[PointOnlyBlock],
+    max_iterations: usize,
+) -> PointOnlySolveResult {
+    if max_iterations == 0 {
+        return PointOnlySolveResult {
+            deltas: None,
+            iterations: 0,
+        };
+    }
+    let mut deltas = vec![Vec3d::zeros(); point_blocks.len()];
+    let mut solved = false;
+    for (point_id, block) in point_blocks.iter().enumerate() {
+        if !block.active {
+            continue;
+        }
+        solved = true;
+        let rhs = -block.g;
+        let Some(delta) = block
+            .h
+            .cholesky()
+            .map(|cholesky| cholesky.solve(&rhs))
+            .or_else(|| block.h.lu().solve(&rhs))
+        else {
+            return PointOnlySolveResult {
+                deltas: None,
+                iterations: 1,
+            };
+        };
+        deltas[point_id] = delta;
+    }
+    PointOnlySolveResult {
+        deltas: solved.then_some(deltas),
+        iterations: 1,
+    }
+}
+
+fn point_only_predicted_model_decrease(
+    point_blocks: &[PointOnlyBlock],
+    point_deltas: &[Vec3d],
+    step: f64,
+) -> f64 {
+    let mut decrease = 0.0;
+    for (block, delta) in point_blocks.iter().zip(point_deltas.iter()) {
+        if !block.active {
+            continue;
+        }
+        let scaled_delta = delta * step;
+        let linear = block.g.dot(&scaled_delta);
+        let quadratic = 0.5 * scaled_delta.dot(&(block.h * scaled_delta));
+        decrease -= linear + quadratic;
+    }
+    decrease
+}
+
+fn apply_point_only_delta(reconstruction: &mut Reconstruction, point_deltas: &[Vec3d], step: f64) {
+    for (point, delta) in reconstruction.points.iter_mut().zip(point_deltas.iter()) {
+        point.xyz[0] += (delta[0] * step) as f32;
+        point.xyz[1] += (delta[1] * step) as f32;
+        point.xyz[2] += (delta[2] * step) as f32;
+    }
+}
+
+fn predicted_model_decrease(
+    hessian: &SchurHessian,
     gradient: &DVector<f64>,
     delta: &DVector<f64>,
     step: f64,
 ) -> f64 {
     let scaled_delta = delta * step;
     let linear = gradient.dot(&scaled_delta);
-    let quadratic = 0.5 * scaled_delta.dot(&(hessian * &scaled_delta));
+    let quadratic = match hessian {
+        SchurHessian::Dense(hessian) => 0.5 * scaled_delta.dot(&(hessian * &scaled_delta)),
+        SchurHessian::Sparse(hessian) => 0.5 * scaled_delta.dot(&hessian.mat_vec(&scaled_delta)),
+    };
     -(linear + quadratic)
 }
 
@@ -409,14 +1130,68 @@ fn step_quality_ratio(actual_decrease: f64, predicted_decrease: f64) -> f64 {
     actual_decrease / predicted_decrease
 }
 
-fn update_damping_after_step(damping: f64, quality: f64) -> f64 {
-    if quality > 0.75 {
-        (damping * 0.5).max(1.0e-8)
-    } else if quality < 0.25 {
-        (damping * 2.0).min(1.0e12)
-    } else {
-        damping
+const LM_MIN_DIAGONAL: f64 = 1.0e-6;
+const LM_MAX_DIAGONAL: f64 = 1.0e32;
+const INITIAL_TRUST_REGION_RADIUS: f64 = 1.0e4;
+const MAX_TRUST_REGION_RADIUS: f64 = 1.0e16;
+const MIN_TRUST_REGION_RADIUS: f64 = 1.0e-32;
+
+fn clamp_lm_diagonal(value: f64) -> f64 {
+    if !value.is_finite() {
+        return LM_MIN_DIAGONAL;
     }
+    value.clamp(LM_MIN_DIAGONAL, LM_MAX_DIAGONAL)
+}
+
+fn add_lm_damping_to_matrix_diagonal(matrix: &mut DMatrix<f64>, radius: f64) {
+    let radius = radius.max(MIN_TRUST_REGION_RADIUS);
+    for idx in 0..matrix.nrows() {
+        let diag = clamp_lm_diagonal(matrix[(idx, idx)]);
+        matrix[(idx, idx)] += diag / radius;
+    }
+}
+
+fn add_lm_damping_to_mat3_diagonal(matrix: &mut Mat3, radius: f64) {
+    let radius = radius.max(MIN_TRUST_REGION_RADIUS);
+    for d in 0..3 {
+        let diag = clamp_lm_diagonal(matrix[(d, d)]);
+        matrix[(d, d)] += diag / radius;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrustRegionState {
+    radius: f64,
+    decrease_factor: f64,
+}
+
+impl TrustRegionState {
+    fn ceres_initial() -> Self {
+        Self {
+            radius: INITIAL_TRUST_REGION_RADIUS,
+            decrease_factor: 2.0,
+        }
+    }
+
+    fn on_step_accepted(&mut self, step_quality: f64) {
+        let shrink = 1.0 - (2.0 * step_quality - 1.0).powi(3);
+        self.radius = (self.radius / shrink.max(1.0 / 3.0)).min(MAX_TRUST_REGION_RADIUS);
+        self.decrease_factor = 2.0;
+    }
+
+    fn on_step_rejected(&mut self) {
+        self.radius = (self.radius / self.decrease_factor).max(MIN_TRUST_REGION_RADIUS);
+        self.decrease_factor = (self.decrease_factor * 2.0).min(1.0e16);
+    }
+}
+
+fn ceres_step_accepted_radius(radius: f64, step_quality: f64) -> f64 {
+    let shrink = 1.0 - (2.0 * step_quality - 1.0).powi(3);
+    (radius / shrink.max(1.0 / 3.0)).min(MAX_TRUST_REGION_RADIUS)
+}
+
+fn ceres_step_rejected_radius(radius: f64, decrease_factor: f64) -> f64 {
+    (radius / decrease_factor).max(MIN_TRUST_REGION_RADIUS)
 }
 
 #[derive(Debug, Clone)]
@@ -923,7 +1698,9 @@ fn build_schur_system(
     camera_param_specs: &[CameraParamSpec],
     constant_point_filter: &HashSet<usize>,
     loss_function: BundleAdjustmentLoss,
-    damping: f64,
+    radius: f64,
+    pose_priors: &[super::BundleAdjustmentPosePrior],
+    prior_position_fallback_stddev: f64,
 ) -> Option<SchurSystem> {
     let mut camera_param_lookup = vec![
         Vec::new();
@@ -943,7 +1720,8 @@ fn build_schur_system(
         .collect::<BTreeMap<_, _>>();
 
     let nonpoint_dim = pose_blocks.dim + sensor_pose_specs.len() * 6 + camera_param_specs.len();
-    let mut h_cc = DMatrix::<f64>::zeros(nonpoint_dim, nonpoint_dim);
+    let pose_entities = pose_blocks.blocks.len() + sensor_pose_specs.len();
+    let mut h_cc = SchurHessian::new_for_pose_entities(nonpoint_dim, pose_entities);
     let mut g_c = DVector::<f64>::zeros(nonpoint_dim);
     let mut point_blocks = (0..reconstruction.points.len())
         .map(|_| PointBlock {
@@ -1035,24 +1813,29 @@ fn build_schur_system(
                 let h = jacobian_i.transpose() * jacobian_j;
                 for r in 0..jacobian_i.ncols() {
                     for c in 0..jacobian_j.ncols() {
-                        h_cc[(*offset_i + r, *offset_j + c)] += h[(r, c)];
+                        h_cc.add(*offset_i + r, *offset_j + c, h[(r, c)]);
                     }
                 }
             }
         }
     }
 
-    for idx in 0..nonpoint_dim {
-        h_cc[(idx, idx)] += damping;
-    }
+    h_cc.add_lm_damping(radius);
+    accumulate_pose_priors(
+        reconstruction,
+        pose_blocks,
+        sensor_pose_specs,
+        pose_priors,
+        prior_position_fallback_stddev,
+        &mut h_cc,
+        &mut g_c,
+    );
 
     for block in &mut point_blocks {
         if block.nonpoint_blocks.is_empty() {
             continue;
         }
-        for d in 0..3 {
-            block.h_inv[(d, d)] += damping;
-        }
+        add_lm_damping_to_mat3_diagonal(&mut block.h_inv, radius);
         block.h_inv = block.h_inv.try_inverse()?;
         for e_i in &block.nonpoint_blocks {
             let schur_g = e_i.jacobian.transpose() * block.h_inv * block.g;
@@ -1063,7 +1846,7 @@ fn build_schur_system(
                 let schur_h = e_i.jacobian.transpose() * block.h_inv * &e_j.jacobian;
                 for r in 0..e_i.jacobian.ncols() {
                     for c in 0..e_j.jacobian.ncols() {
-                        h_cc[(e_i.offset + r, e_j.offset + c)] -= schur_h[(r, c)];
+                        h_cc.add(e_i.offset + r, e_j.offset + c, -schur_h[(r, c)]);
                     }
                 }
             }
@@ -1262,6 +2045,62 @@ fn sensor_pose_jacobian(
     let sensor_from_rig = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
     analytic_sensor_pose_jacobian(camera, sensor_from_rig, rig_from_world, point)
         .or_else(|| numerical_sensor_pose_jacobian(camera, sensor_from_rig, rig_from_world, point))
+}
+
+fn frame_camera_center_jacobian(
+    reconstruction: &Reconstruction,
+    frame_idx: usize,
+    image: usize,
+) -> Option<crate::ba::pose_prior::Mat3x6> {
+    let frame = reconstruction.frames.get(frame_idx)?;
+    let rig_from_world = frame.rig_from_world.to_se3();
+    let sensor_from_rig = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
+    let mut jacobian = crate::ba::pose_prior::Mat3x6::zeros();
+    for axis in 0..6 {
+        let mut plus = Vec6::zeros();
+        plus[axis] = POSE_PRIOR_JACOBIAN_EPS;
+        let mut minus = Vec6::zeros();
+        minus[axis] = -POSE_PRIOR_JACOBIAN_EPS;
+        let plus_center = camera_center_world(
+            sensor_from_rig.compose(&apply_pose_delta_f64(rig_from_world, plus)),
+        );
+        let minus_center = camera_center_world(
+            sensor_from_rig.compose(&apply_pose_delta_f64(rig_from_world, minus)),
+        );
+        jacobian.set_column(
+            axis,
+            &((plus_center - minus_center) / (2.0 * POSE_PRIOR_JACOBIAN_EPS)),
+        );
+    }
+    Some(jacobian)
+}
+
+fn sensor_camera_center_jacobian(
+    reconstruction: &Reconstruction,
+    image: usize,
+) -> Option<crate::ba::pose_prior::Mat3x6> {
+    let frame_idx = reconstruction.frame_index_for_image(image)?;
+    let frame = reconstruction.frames.get(frame_idx)?;
+    let rig_from_world = frame.rig_from_world.to_se3();
+    let sensor_from_rig = frame_sensor_from_rig(reconstruction, frame_idx, image)?;
+    let mut jacobian = crate::ba::pose_prior::Mat3x6::zeros();
+    for axis in 0..6 {
+        let mut plus = Vec6::zeros();
+        plus[axis] = POSE_PRIOR_JACOBIAN_EPS;
+        let mut minus = Vec6::zeros();
+        minus[axis] = -POSE_PRIOR_JACOBIAN_EPS;
+        let plus_center = camera_center_world(
+            apply_pose_delta_f64(sensor_from_rig, plus).compose(&rig_from_world),
+        );
+        let minus_center = camera_center_world(
+            apply_pose_delta_f64(sensor_from_rig, minus).compose(&rig_from_world),
+        );
+        jacobian.set_column(
+            axis,
+            &((plus_center - minus_center) / (2.0 * POSE_PRIOR_JACOBIAN_EPS)),
+        );
+    }
+    Some(jacobian)
 }
 
 pub(crate) fn analytic_frame_pose_jacobian(
@@ -2803,6 +3642,8 @@ fn total_cost(
     reconstruction: &Reconstruction,
     observations: &[BaObservation],
     loss_function: BundleAdjustmentLoss,
+    pose_priors: &[super::BundleAdjustmentPosePrior],
+    prior_position_fallback_stddev: f64,
 ) -> f64 {
     let mut total = 0.0;
     let mut count = 0usize;
@@ -2828,7 +3669,31 @@ fn total_cost(
         f64::INFINITY
     } else {
         total / count as f64
+            + pose_prior_total_cost(reconstruction, pose_priors, prior_position_fallback_stddev)
     }
+}
+
+fn pose_prior_total_cost(
+    reconstruction: &Reconstruction,
+    pose_priors: &[super::BundleAdjustmentPosePrior],
+    fallback_stddev: f64,
+) -> f64 {
+    let mut total = 0.0;
+    for prior in pose_priors {
+        let Some(pose) = reconstruction.poses.get(prior.image).copied().flatten() else {
+            continue;
+        };
+        let center = camera_center_world(pose);
+        let prior_position = Vec3d::from_column_slice(&prior.position);
+        let residual = center - prior_position;
+        let information =
+            position_prior_information_matrix(&prior.position_covariance, fallback_stddev);
+        let cost = 0.5 * residual.dot(&(information * residual));
+        if cost.is_finite() {
+            total += cost;
+        }
+    }
+    total
 }
 
 fn relative_cost_change(previous: f64, current: f64) -> f64 {
@@ -2865,8 +3730,8 @@ fn pose_from_parts(rotation: Quat, translation: Vec3) -> SE3 {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        refine_bundle_adjustment, BundleAdjustmentGauge, BundleAdjustmentLoss,
-        BundleAdjustmentOptions, BundleAdjustmentReport, BundleAdjustmentTerminationReason,
+        refine_bundle_adjustment, BundleAdjustmentLinearSolver, BundleAdjustmentLoss,
+        BundleAdjustmentOptions, BundleAdjustmentPreconditioner, BundleAdjustmentTerminationReason,
         BundleAdjustmentTerminationType,
     };
     use super::*;
@@ -2931,11 +3796,260 @@ mod tests {
     }
 
     #[test]
-    fn trust_region_quality_updates_damping() {
-        assert_eq!(update_damping_after_step(1.0e-3, 0.9), 5.0e-4);
-        assert_eq!(update_damping_after_step(1.0e-3, 0.5), 1.0e-3);
-        assert_eq!(update_damping_after_step(1.0e-3, 0.1), 2.0e-3);
-        assert_eq!(update_damping_after_step(1.0e-10, 0.9), 1.0e-8);
+    fn trust_region_radius_updates_match_ceres_levenberg_marquardt() {
+        assert!(
+            (ceres_step_accepted_radius(1.0e4, 0.9) - 1.0e4 / (1.0 - 0.8_f64.powi(3))).abs()
+                < 1.0e-6
+        );
+        assert_eq!(ceres_step_accepted_radius(1.0e4, 0.5), 1.0e4);
+        assert!(
+            (ceres_step_accepted_radius(1.0e4, 0.1) - 1.0e4 / (1.0 - (-0.8_f64).powi(3))).abs()
+                < 1.0e-6
+        );
+        assert_eq!(ceres_step_rejected_radius(1.0e4, 2.0), 5.0e3);
+        assert_eq!(
+            ceres_step_rejected_radius(1.0e-40, 2.0),
+            MIN_TRUST_REGION_RADIUS
+        );
+    }
+
+    #[test]
+    fn lm_diagonal_clamp_matches_ceres_bounds() {
+        assert_eq!(clamp_lm_diagonal(0.0), LM_MIN_DIAGONAL);
+        assert_eq!(clamp_lm_diagonal(1.0e40), LM_MAX_DIAGONAL);
+        assert_eq!(clamp_lm_diagonal(1.0), 1.0);
+    }
+
+    #[test]
+    fn schur_hessian_uses_sparse_storage_above_ceres_dense_threshold() {
+        let dense = SchurHessian::new_for_pose_entities(120, DENSE_SCHUR_MAX_POSE_ENTITIES);
+        assert!(matches!(dense, SchurHessian::Dense(_)));
+        let sparse = SchurHessian::new_for_pose_entities(120, DENSE_SCHUR_MAX_POSE_ENTITIES + 1);
+        assert!(matches!(sparse, SchurHessian::Sparse(_)));
+    }
+
+    #[test]
+    fn native_linear_solver_policy_matches_ceres_thresholds() {
+        assert_eq!(
+            native_linear_solver_policy(DENSE_SCHUR_MAX_POSE_ENTITIES).0,
+            BundleAdjustmentLinearSolver::DenseSchur
+        );
+        assert_eq!(
+            native_linear_solver_policy(DENSE_SCHUR_MAX_POSE_ENTITIES + 1).0,
+            BundleAdjustmentLinearSolver::SparseSchur
+        );
+        assert_eq!(
+            native_linear_solver_policy(SPARSE_SCHUR_MAX_POSE_ENTITIES).0,
+            BundleAdjustmentLinearSolver::SparseSchur
+        );
+        let (solver, preconditioner) =
+            native_linear_solver_policy(SPARSE_SCHUR_MAX_POSE_ENTITIES + 1);
+        assert_eq!(solver, BundleAdjustmentLinearSolver::IterativeSchur);
+        assert_eq!(
+            preconditioner,
+            Some(BundleAdjustmentPreconditioner::SchurJacobi)
+        );
+    }
+
+    #[test]
+    fn iterative_schur_linear_solver_solves_spd_reduced_system() {
+        let hessian = SchurHessian::Dense(DMatrix::from_row_slice(
+            3,
+            3,
+            &[4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0],
+        ));
+        let expected = DVector::from_column_slice(&[1.0, -2.0, 0.5]);
+        let gradient = -(&hessian.to_dense() * &expected);
+        let blocks = vec![
+            SchurParameterBlock { offset: 0, dim: 2 },
+            SchurParameterBlock { offset: 2, dim: 1 },
+        ];
+        let result = solve_linear_system(
+            &hessian,
+            &gradient,
+            BundleAdjustmentLinearSolver::IterativeSchur,
+            Some(BundleAdjustmentPreconditioner::SchurJacobi),
+            &blocks,
+            50,
+        );
+        let delta = result.delta.expect("iterative schur solve");
+        for i in 0..3 {
+            assert!((delta[i] - expected[i]).abs() < 1.0e-4, "i={i}");
+        }
+    }
+
+    #[test]
+    fn bundle_adjustment_pose_prior_pulls_camera_center_toward_prior() {
+        use super::super::BundleAdjustmentPosePrior;
+
+        let true_camera = CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0);
+        let end_pose = SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.45, 0.02, 0.0));
+        let prior_center = {
+            let center = camera_center_world(end_pose);
+            [center[0] as f64, center[1] as f64, center[2] as f64]
+        };
+        let start_pose = SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(2.45, 0.02, 0.0));
+        let scene_points = [
+            [-0.6, -0.4, 3.2],
+            [-0.2, -0.4, 3.0],
+            [0.3, -0.35, 3.4],
+            [0.7, -0.2, 3.6],
+        ];
+        let mut frames = vec![frame(0), frame(1)];
+        for point in scene_points {
+            let projected0 = project_point(true_camera, SE3::identity(), point).unwrap();
+            let projected1 = project_point(true_camera, end_pose, point).unwrap();
+            frames[0].keypoints.push(rustslam::KeyPoint::new(
+                projected0[0] as f32,
+                projected0[1] as f32,
+            ));
+            frames[1].keypoints.push(rustslam::KeyPoint::new(
+                projected1[0] as f32,
+                projected1[1] as f32,
+            ));
+        }
+        let mut reconstruction = Reconstruction {
+            camera: true_camera,
+            cameras: vec![true_camera],
+            camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_names: vec!["0.jpg".into(), "1.jpg".into()],
+            image_paths: vec![PathBuf::from("0.jpg"), PathBuf::from("1.jpg")],
+            image_ids: vec![1, 2],
+            image_camera_indices: vec![0, 0],
+            image_frame_indices: vec![None, None],
+            poses: vec![Some(SE3::identity()), Some(start_pose)],
+            observations: vec![
+                (0..scene_points.len()).map(Some).collect(),
+                (0..scene_points.len()).map(Some).collect(),
+            ],
+            keypoints: frames.iter().map(|f| f.keypoints.clone()).collect(),
+            point_ids: (1..=scene_points.len() as u64).collect(),
+            points: scene_points
+                .iter()
+                .enumerate()
+                .map(|(idx, xyz)| Point3D {
+                    xyz: *xyz,
+                    color: [0, 0, 0],
+                    error: 0.0,
+                    track: vec![
+                        TrackObservation {
+                            image: 0,
+                            feature: idx,
+                        },
+                        TrackObservation {
+                            image: 1,
+                            feature: idx,
+                        },
+                    ],
+                })
+                .collect(),
+        };
+        let start_center = camera_center_world(start_pose);
+        let report = refine_bundle_adjustment_native(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 20,
+                loss_function: BundleAdjustmentLoss::Trivial,
+                max_observation_error_px: 50.0,
+                constant_images: vec![0],
+                pose_priors: vec![BundleAdjustmentPosePrior::new(1, prior_center)],
+                prior_position_fallback_stddev: 0.05,
+                allow_single_observation_points: true,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .expect("ba with pose prior");
+        assert!(report.is_solution_usable());
+        let optimized = reconstruction.poses[1].expect("optimized pose");
+        let end_center = camera_center_world(optimized);
+        let start_error =
+            (start_center - nalgebra::DVector::from_column_slice(&prior_center)).norm();
+        let end_error = (end_center - nalgebra::DVector::from_column_slice(&prior_center)).norm();
+        assert!(
+            end_error < start_error,
+            "start_error={start_error} end_error={end_error}"
+        );
+    }
+
+    #[test]
+    fn bundle_adjustment_compute_covariance_returns_pose_blocks() {
+        let true_camera = CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.45, 0.02, 0.0)),
+        ];
+        let scene_points = [[0.0, 0.0, 3.0], [0.4, 0.1, 3.2]];
+        let mut frames = vec![frame(0), frame(1)];
+        for point in scene_points {
+            let projected0 = project_point(true_camera, poses[0], point).unwrap();
+            let projected1 = project_point(true_camera, poses[1], point).unwrap();
+            frames[0].keypoints.push(rustslam::KeyPoint::new(
+                projected0[0] as f32,
+                projected0[1] as f32,
+            ));
+            frames[1].keypoints.push(rustslam::KeyPoint::new(
+                projected1[0] as f32,
+                projected1[1] as f32,
+            ));
+        }
+        let mut reconstruction = Reconstruction {
+            camera: true_camera,
+            cameras: vec![true_camera],
+            camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_names: vec!["0.jpg".into(), "1.jpg".into()],
+            image_paths: vec![PathBuf::from("0.jpg"), PathBuf::from("1.jpg")],
+            image_ids: vec![1, 2],
+            image_camera_indices: vec![0, 0],
+            image_frame_indices: vec![None, None],
+            poses: vec![Some(poses[0]), Some(poses[1])],
+            observations: vec![vec![Some(0), Some(1)], vec![Some(0), Some(1)]],
+            keypoints: frames.iter().map(|f| f.keypoints.clone()).collect(),
+            point_ids: vec![1, 2],
+            points: scene_points
+                .iter()
+                .enumerate()
+                .map(|(idx, xyz)| Point3D {
+                    xyz: *xyz,
+                    color: [0, 0, 0],
+                    error: 0.0,
+                    track: vec![
+                        TrackObservation {
+                            image: 0,
+                            feature: idx,
+                        },
+                        TrackObservation {
+                            image: 1,
+                            feature: idx,
+                        },
+                    ],
+                })
+                .collect(),
+        };
+        let report = refine_bundle_adjustment_native(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 8,
+                loss_function: BundleAdjustmentLoss::Trivial,
+                max_observation_error_px: 50.0,
+                constant_images: vec![0],
+                allow_single_observation_points: true,
+                compute_covariance: true,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .expect("ba with covariance");
+        let covariance = report.covariance.expect("covariance report");
+        let block1 = covariance
+            .pose_blocks
+            .get(&1)
+            .expect("image 1 covariance block");
+        assert!(block1[(0, 0)].is_finite());
     }
 
     #[test]
@@ -2946,7 +4060,7 @@ mod tests {
         let expected = DVector::from_column_slice(&[1.0, -2.0, 0.5]);
         let gradient = -(&hessian * &expected);
 
-        let result = solve_linear_system(&hessian, &gradient, 1);
+        let result = solve_dense_linear_system(&hessian, &gradient, 1);
         let delta = result.delta.expect("SPD system must solve");
         assert_eq!(result.iterations, 1);
         for i in 0..3 {
@@ -2955,7 +4069,7 @@ mod tests {
 
         // A zero iteration budget yields no step, matching Ceres' zero
         // linear-solver iteration guard.
-        let none = solve_linear_system(&hessian, &gradient, 0);
+        let none = solve_dense_linear_system(&hessian, &gradient, 0);
         assert!(none.delta.is_none());
         assert_eq!(none.iterations, 0);
     }
@@ -3622,6 +4736,50 @@ mod tests {
     }
 
     #[test]
+    fn bundle_adjustment_frame_pose_prior_pulls_rig_aux_camera_center() {
+        use super::super::BundleAdjustmentPosePrior;
+
+        let SensorBaFixture {
+            frames,
+            mut reconstruction,
+            ..
+        } = sensor_ba_fixture();
+        let start_center = camera_center_world(reconstruction.poses[1].unwrap());
+        let prior_center = [
+            start_center[0] + 0.35,
+            start_center[1] + 0.08,
+            start_center[2],
+        ];
+        let start_error = center_error(start_center, prior_center);
+
+        let report = refine_bundle_adjustment_native(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 12,
+                gradient_tolerance: 0.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
+                max_observation_error_px: 200.0,
+                variable_images: Some(vec![0, 1]),
+                constant_images: vec![2, 3],
+                point_ids: Some((0..8).collect()),
+                pose_priors: vec![BundleAdjustmentPosePrior::new(1, prior_center)],
+                prior_position_fallback_stddev: 0.01,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .unwrap();
+
+        let end_center = camera_center_world(reconstruction.poses[1].unwrap());
+        let end_error = center_error(end_center, prior_center);
+        assert!(report.is_solution_usable());
+        assert!(
+            end_error < start_error,
+            "start_error={start_error} end_error={end_error}"
+        );
+    }
+
+    #[test]
     fn bundle_adjustment_keeps_constant_sensor_from_rig_fixed() {
         let SensorBaFixture {
             frames,
@@ -3750,6 +4908,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             original_points
         );
+    }
+
+    #[test]
+    fn bundle_adjustment_refines_points_when_all_nonpoint_parameters_are_fixed() {
+        let camera = CameraModel::new_pinhole(120, 100, 70.0, 70.0, 60.0, 50.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.5, 0.0, 0.0)),
+        ];
+        let true_point = [0.2, 0.1, 3.0];
+        let mut frames = vec![frame(0), frame(1)];
+        for image in 0..2 {
+            let xy = project_point(camera, poses[image], true_point).unwrap();
+            frames[image].keypoints = vec![rustslam::KeyPoint::new(xy[0] as f32, xy[1] as f32)];
+        }
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[1] = Some(poses[1]);
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.points.push(Point3D {
+            xyz: [0.45, -0.15, 2.6],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+        reconstruction.point_ids.push(1);
+        let initial_pose0 = reconstruction.poses[0].unwrap();
+        let initial_pose1 = reconstruction.poses[1].unwrap();
+        let initial_camera = reconstruction.cameras[0];
+        let initial_distance =
+            Vec3::from_array(reconstruction.points[0].xyz).distance(Vec3::from_array(true_point));
+
+        let report = refine_bundle_adjustment_native(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 8,
+                gradient_tolerance: 0.0,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
+                max_observation_error_px: 200.0,
+                variable_images: Some(Vec::new()),
+                constant_images: vec![0, 1],
+                constant_cameras: vec![0],
+                point_ids: Some(vec![0]),
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.final_cost < report.initial_cost);
+        assert!(report.is_solution_usable());
+        assert_eq!(report.effective_parameters, 3);
+        assert_eq!(
+            reconstruction.poses[0].unwrap().translation(),
+            initial_pose0.translation()
+        );
+        assert_eq!(
+            reconstruction.poses[1].unwrap().translation(),
+            initial_pose1.translation()
+        );
+        assert_eq!(reconstruction.cameras[0].fx, initial_camera.fx);
+        let final_distance =
+            Vec3::from_array(reconstruction.points[0].xyz).distance(Vec3::from_array(true_point));
+        assert!(final_distance < initial_distance);
     }
 
     #[test]
@@ -4453,6 +5687,13 @@ mod tests {
         let right = right.translation();
         ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2) + (left[2] - right[2]).powi(2))
             .sqrt()
+    }
+
+    fn center_error(center: Vec3d, target: [f64; 3]) -> f64 {
+        ((center[0] - target[0]).powi(2)
+            + (center[1] - target[1]).powi(2)
+            + (center[2] - target[2]).powi(2))
+        .sqrt()
     }
 
     fn assert_jacobian_close(left: Mat2x6, right: Mat2x6, tolerance: f64) {

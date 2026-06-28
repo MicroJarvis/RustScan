@@ -2010,7 +2010,8 @@ mod tests {
     use crate::types::{
         Point3D, COLMAP_FULL_OPENCV, COLMAP_PINHOLE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
     };
-    use rustslam::{KeyPoint, SE3};
+    use rustslam::{tracker::PnPProblem, tracker::PnPSolver, KeyPoint, SE3};
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     #[test]
@@ -2169,6 +2170,84 @@ mod tests {
     }
 
     #[test]
+    fn real_colmap_sparse_tracks_recover_registered_image_pose_with_pnp() -> Result<()> {
+        let sparse = read_colmap_sparse_files_with_format(
+            Path::new("../test_data/flowers2_colmap/sparse/text"),
+            ColmapSparseFormat::Text,
+        )?;
+        let camera = sparse
+            .cameras
+            .iter()
+            .find(|camera| camera.camera_id == 1)
+            .cloned()
+            .map(camera_model_from_colmap)
+            .transpose()?
+            .expect("fixture camera");
+        assert_eq!(camera.model_id, COLMAP_PINHOLE);
+
+        let image = sparse
+            .images
+            .iter()
+            .find(|image| image.image_id == 3)
+            .expect("fixture image");
+        let points_by_id = sparse
+            .points3d
+            .iter()
+            .map(|point| (point.point3d_id, point.xyz))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut problem = PnPProblem::new();
+        for point2d in &image.points2d {
+            let Some(point3d_id) = point2d.point3d_id else {
+                continue;
+            };
+            let Some(xyz) = points_by_id.get(&point3d_id) else {
+                continue;
+            };
+            let Some(cam_point) =
+                camera.cam_from_img_f32(point2d.xy[0] as f32, point2d.xy[1] as f32)
+            else {
+                continue;
+            };
+            problem.add_correspondence(cam_point, [xyz[0] as f32, xyz[1] as f32, xyz[2] as f32]);
+            if problem.image_points.len() == 256 {
+                break;
+            }
+        }
+        assert_eq!(problem.image_points.len(), 256);
+
+        let mut solver = PnPSolver::new(1.0, 1.0, 0.0, 0.0);
+        solver.ransac_threshold = camera.cam_from_img_threshold(8.0) as f32;
+        solver.ransac_confidence = 0.99999;
+        solver.ransac_min_iterations = 100;
+        solver.ransac_max_iterations = 10_000;
+        solver.ransac_random_seed = Some(0);
+        let (estimated, inliers) = solver.solve(&problem).expect("COLMAP fixture PnP pose");
+        assert!(
+            inliers.iter().filter(|&&value| value).count() >= 240,
+            "real COLMAP tracks should be mostly consistent with the registered pose"
+        );
+
+        let reference = se3_from_colmap_pose(image.qvec, image.tvec);
+        let rotation_error = rotation_error_deg(&reference, &estimated);
+        let translation_error = translation_error(&reference, &estimated);
+
+        assert!(
+            rotation_error < 0.05,
+            "rotation_error={rotation_error}deg reference={:?} estimated={:?}",
+            reference.quaternion(),
+            estimated.quaternion()
+        );
+        assert!(
+            translation_error < 0.05,
+            "translation_error={translation_error} reference={:?} estimated={:?}",
+            reference.translation(),
+            estimated.translation()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn raw_sparse_text_and_binary_roundtrip_preserves_colmap_files() -> Result<()> {
         let dir = tempdir()?;
         let original = sample_sparse_files();
@@ -2192,6 +2271,24 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn rotation_error_deg(a: &SE3, b: &SE3) -> f32 {
+        let ra = a.rotation_matrix();
+        let rb = b.rotation_matrix();
+        let mut trace = 0.0f32;
+        for row in 0..3 {
+            for col in 0..3 {
+                trace += ra[row][col] * rb[row][col];
+            }
+        }
+        ((trace - 1.0) * 0.5).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    fn translation_error(a: &SE3, b: &SE3) -> f32 {
+        let ta = a.translation();
+        let tb = b.translation();
+        ((ta[0] - tb[0]).powi(2) + (ta[1] - tb[1]).powi(2) + (ta[2] - tb[2]).powi(2)).sqrt()
     }
 
     #[test]

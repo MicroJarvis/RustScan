@@ -11,8 +11,10 @@ use super::shared::{
     refresh_point_errors,
 };
 use super::{
-    BundleAdjustmentGauge, BundleAdjustmentLoss, BundleAdjustmentOptions, BundleAdjustmentReport,
-    BundleAdjustmentTerminationReason, BundleAdjustmentTerminationType,
+    camera_center_world, position_prior_information_matrix, BundleAdjustmentGauge,
+    BundleAdjustmentLinearSolver, BundleAdjustmentLoss, BundleAdjustmentOptions,
+    BundleAdjustmentPreconditioner, BundleAdjustmentReport, BundleAdjustmentTerminationReason,
+    BundleAdjustmentTerminationType, POSE_PRIOR_JACOBIAN_EPS,
 };
 use crate::types::{CameraModel, ImageFrame, Reconstruction, Rigid3};
 use ceres_solver::loss::LossFunction;
@@ -71,6 +73,14 @@ struct ResidualBinding {
     param_roles: Vec<ParamRole>,
     pose_eval: PoseEval,
     camera_base: CameraModel,
+}
+
+#[derive(Debug, Clone)]
+struct PosePriorBinding {
+    prior_position: [f64; 3],
+    sqrt_information: Mat3,
+    param_roles: Vec<ParamRole>,
+    pose_eval: PoseEval,
 }
 
 pub fn solve_bundle_adjustment_ceres(
@@ -274,6 +284,55 @@ pub fn solve_bundle_adjustment_ceres(
         bindings += 1;
     }
 
+    for prior in &options.pose_priors {
+        let Some(pose_eval) = build_pose_eval(
+            reconstruction,
+            prior.image,
+            &pose_blocks,
+            &sensor_lookup,
+            &pose_entity_registry,
+        ) else {
+            continue;
+        };
+        let mut param_indices = Vec::new();
+        let mut param_roles = Vec::new();
+        append_pose_parameters(&pose_eval, &mut param_indices, &mut param_roles);
+        let (param_indices, param_roles) = dedup_residual_parameters(&param_indices, &param_roles);
+        if param_indices.is_empty()
+            || param_indices
+                .iter()
+                .all(|idx| constant_blocks.contains(idx))
+        {
+            continue;
+        }
+        let information = position_prior_information_matrix(
+            &prior.position_covariance,
+            options.prior_position_fallback_stddev,
+        );
+        let sqrt_information = information
+            .cholesky()
+            .map(|factor| factor.l().clone())
+            .unwrap_or_else(Mat3::identity);
+        let cost = build_pose_prior_cost(PosePriorBinding {
+            prior_position: prior.position,
+            sqrt_information,
+            param_roles,
+            pose_eval,
+        });
+        let mut builder = problem.residual_block_builder().set_cost(cost, 3);
+        for &idx in &param_indices {
+            builder = builder.add_parameter(param_ref(
+                idx,
+                block_values
+                    .get(&idx)
+                    .expect("pose prior parameter block must exist"),
+                &mut internal_to_storage,
+                &mut next_storage_index,
+            ));
+        }
+        problem = builder.build_into_problem().ok()?.0;
+    }
+
     if point_registry.is_empty() || bindings == 0 {
         return None;
     }
@@ -311,6 +370,7 @@ pub fn solve_bundle_adjustment_ceres(
         problem.set_parameter_block_constant(storage_idx).ok()?;
     }
 
+    let solver_policy = ceres_solver_policy(pose_entity_registry.len(), ceres_has_sparse_backend());
     let solver_options = ceres_solver_options(&options, pose_entity_registry.len(), bindings * 2)?;
     let solution = problem.solve(&solver_options).ok()?;
 
@@ -329,6 +389,23 @@ pub fn solve_bundle_adjustment_ceres(
     );
 
     refresh_point_errors(frames, reconstruction);
+
+    let covariance = options
+        .compute_covariance
+        .then(|| {
+            super::native::compute_bundle_adjustment_covariance(
+                reconstruction,
+                &observations,
+                &pose_blocks,
+                &sensor_pose_specs,
+                &camera_param_specs,
+                &constant_point_filter,
+                options.loss_function,
+                &options.pose_priors,
+                options.prior_position_fallback_stddev,
+            )
+        })
+        .flatten();
 
     let summary = solution.summary;
     let successful_steps = summary.num_successful_steps().max(0) as usize;
@@ -356,6 +433,9 @@ pub fn solve_bundle_adjustment_ceres(
         step_norm,
         step_quality,
         damping,
+        linear_solver: map_bundle_adjustment_linear_solver(solver_policy),
+        preconditioner: map_bundle_adjustment_preconditioner(solver_policy),
+        covariance,
         termination_type,
         termination_reason,
     })
@@ -557,6 +637,146 @@ fn build_cost_function(binding: ResidualBinding) -> CostFunctionType<'static> {
             true
         },
     )
+}
+
+fn build_pose_prior_cost(binding: PosePriorBinding) -> CostFunctionType<'static> {
+    Box::new(
+        move |parameters: &[&[f64]], residuals: &mut [f64], jacobians| {
+            let Some(center) = pose_prior_camera_center(parameters, &binding) else {
+                for residual in residuals.iter_mut() {
+                    *residual = 0.0;
+                }
+                return jacobians.is_none();
+            };
+            let diff = center - nalgebra::DVector::from_column_slice(&binding.prior_position);
+            let weighted = binding.sqrt_information * diff;
+            for (residual, value) in residuals.iter_mut().zip(weighted.iter()) {
+                *residual = *value;
+            }
+            if let Some(jacobians) = jacobians {
+                for (p_idx, role) in binding.param_roles.iter().enumerate() {
+                    let Some(jacobian) = jacobians.get_mut(p_idx).and_then(|block| block.as_mut())
+                    else {
+                        continue;
+                    };
+                    let Some(ambient) =
+                        camera_center_ambient_jacobian_for_role(parameters, &binding, p_idx, *role)
+                    else {
+                        return false;
+                    };
+                    let product = binding.sqrt_information * ambient;
+                    for row in 0..3 {
+                        for col in 0..7 {
+                            jacobian[row][col] = product[(row, col)];
+                        }
+                    }
+                }
+            }
+            true
+        },
+    )
+}
+
+fn pose_prior_camera_center(
+    parameters: &[&[f64]],
+    binding: &PosePriorBinding,
+) -> Option<nalgebra::SVector<f64, 3>> {
+    let pose = match &binding.pose_eval {
+        PoseEval::Fixed(pose) => *pose,
+        PoseEval::Image { .. } => {
+            let pose_params =
+                pose_params_for_roles(parameters, &binding.param_roles, ParamRole::ImagePose)?;
+            pose_params_to_se3(pose_params)
+        }
+        PoseEval::Frame { sensor, .. } => {
+            let rig_pose =
+                pose_params_for_roles(parameters, &binding.param_roles, ParamRole::FramePose)?;
+            let rig = pose_params_to_se3(rig_pose);
+            let sensor_pose = match sensor {
+                FrameSensorEval::Fixed(pose) => *pose,
+                FrameSensorEval::Variable { .. } => {
+                    let sensor_pose = pose_params_for_roles(
+                        parameters,
+                        &binding.param_roles,
+                        ParamRole::SensorPose,
+                    )?;
+                    pose_params_to_se3(sensor_pose)
+                }
+            };
+            sensor_pose.compose(&rig)
+        }
+    };
+    Some(camera_center_world(pose))
+}
+
+fn camera_center_ambient_jacobian_for_role(
+    parameters: &[&[f64]],
+    binding: &PosePriorBinding,
+    p_idx: usize,
+    role: ParamRole,
+) -> Option<Mat3x7> {
+    let mut base = [0.0; 7];
+    copy_pose_params(parameters.get(p_idx)?, &mut base)?;
+    let mut jacobian = Mat3x7::zeros();
+    for col in 0..7 {
+        let mut plus = base;
+        let mut minus = base;
+        plus[col] += POSE_PRIOR_JACOBIAN_EPS;
+        minus[col] -= POSE_PRIOR_JACOBIAN_EPS;
+        let plus_center =
+            pose_prior_camera_center_with_replaced_block(parameters, binding, role, &plus)?;
+        let minus_center =
+            pose_prior_camera_center_with_replaced_block(parameters, binding, role, &minus)?;
+        jacobian.set_column(
+            col,
+            &((plus_center - minus_center) / (2.0 * POSE_PRIOR_JACOBIAN_EPS)),
+        );
+    }
+    Some(jacobian)
+}
+
+fn pose_prior_camera_center_with_replaced_block(
+    parameters: &[&[f64]],
+    binding: &PosePriorBinding,
+    role: ParamRole,
+    replacement: &[f64; 7],
+) -> Option<nalgebra::SVector<f64, 3>> {
+    let pose = match &binding.pose_eval {
+        PoseEval::Fixed(pose) => *pose,
+        PoseEval::Image { .. } => {
+            if role != ParamRole::ImagePose {
+                return None;
+            }
+            pose_params_to_se3(replacement)
+        }
+        PoseEval::Frame { sensor, .. } => {
+            let rig = if role == ParamRole::FramePose {
+                pose_params_to_se3(replacement)
+            } else {
+                pose_params_to_se3(pose_params_for_roles(
+                    parameters,
+                    &binding.param_roles,
+                    ParamRole::FramePose,
+                )?)
+            };
+            let sensor_pose = match sensor {
+                FrameSensorEval::Fixed(pose) => *pose,
+                FrameSensorEval::Variable { .. } => {
+                    if role == ParamRole::SensorPose {
+                        pose_params_to_se3(replacement)
+                    } else {
+                        pose_params_to_se3(pose_params_for_roles(
+                            parameters,
+                            &binding.param_roles,
+                            ParamRole::SensorPose,
+                        )?)
+                    }
+                }
+            };
+            sensor_pose.compose(&rig)
+        }
+    };
+    Some(camera_center_world(pose))
 }
 
 fn eval_residual(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<[f64; 2]> {
@@ -971,8 +1191,15 @@ fn pose_params_for_role<'a>(
     binding: &ResidualBinding,
     role: ParamRole,
 ) -> Option<&'a [f64]> {
-    let p_idx = binding
-        .param_roles
+    pose_params_for_roles(parameters, &binding.param_roles, role)
+}
+
+fn pose_params_for_roles<'a>(
+    parameters: &'a [&'a [f64]],
+    param_roles: &[ParamRole],
+    role: ParamRole,
+) -> Option<&'a [f64]> {
+    let p_idx = param_roles
         .iter()
         .position(|candidate| *candidate == role)?;
     let pose_params = parameters.get(p_idx)?;
@@ -1404,6 +1631,24 @@ fn ceres_solver_policy(num_pose_entities: usize, has_sparse_backend: bool) -> Ce
     }
 }
 
+fn map_bundle_adjustment_linear_solver(policy: CeresSolverPolicy) -> BundleAdjustmentLinearSolver {
+    match policy.linear_solver {
+        LinearSolverType::DENSE_SCHUR => BundleAdjustmentLinearSolver::DenseSchur,
+        LinearSolverType::SPARSE_SCHUR => BundleAdjustmentLinearSolver::SparseSchur,
+        LinearSolverType::ITERATIVE_SCHUR => BundleAdjustmentLinearSolver::IterativeSchur,
+        _ => BundleAdjustmentLinearSolver::DenseSchur,
+    }
+}
+
+fn map_bundle_adjustment_preconditioner(
+    policy: CeresSolverPolicy,
+) -> Option<BundleAdjustmentPreconditioner> {
+    match policy.preconditioner {
+        Some(PreconditionerType::SCHUR_JACOBI) => Some(BundleAdjustmentPreconditioner::SchurJacobi),
+        _ => None,
+    }
+}
+
 fn ceres_has_sparse_backend() -> bool {
     SolverOptions::builder().current_sparse_linear_algebra_library_type()
         != SparseLinearAlgebraLibraryType::NO_SPARSE
@@ -1507,7 +1752,6 @@ fn map_ceres_summary(
     let step_quality = finite_or_none(summary.last_relative_decrease()).unwrap_or(f64::NAN);
     let damping = finite_or_none(summary.last_trust_region_radius())
         .filter(|radius| *radius > 0.0)
-        .map(|radius| 1.0 / radius)
         .unwrap_or(f64::NAN);
     (
         termination_type,
@@ -1627,6 +1871,7 @@ fn parse_ceres_scalar_field(report: &str, label: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::BundleAdjustmentLinearSolver;
     use super::*;
     use crate::sift::SiftFeatures;
     use crate::types::{CameraModel, ImageFrame, Point3D, TrackObservation};
@@ -1701,6 +1946,11 @@ mod tests {
         );
         assert_eq!(report.residuals, 2);
         assert_eq!(report.effective_parameters, 3);
+        assert_eq!(
+            report.linear_solver,
+            BundleAdjustmentLinearSolver::DenseSchur
+        );
+        assert!(report.preconditioner.is_none());
     }
 
     #[test]
@@ -2150,5 +2400,33 @@ mod tests {
         assert!((pose[4] - target[4]).abs() < 1.0e-8);
         assert!((pose[5] - 2.0).abs() < 1.0e-12);
         assert!((pose[6] - target[6]).abs() < 1.0e-8);
+    }
+
+    #[test]
+    fn ceres_pose_prior_cost_moves_camera_center() {
+        let binding = PosePriorBinding {
+            prior_position: [0.0, 0.0, 0.0],
+            sqrt_information: Mat3::identity() * 100.0,
+            param_roles: vec![ParamRole::ImagePose],
+            pose_eval: PoseEval::Image { handle: 0 },
+        };
+        let cost = build_pose_prior_cost(binding);
+        let (mut problem, _) = NllsProblem::new()
+            .residual_block_builder()
+            .set_cost(cost, 3)
+            .set_parameters([se3_to_pose_params(SE3::from_quat_translation(
+                Quat::IDENTITY,
+                Vec3::new(-4.0, 0.0, 0.0),
+            ))
+            .to_vec()])
+            .build_into_problem()
+            .unwrap();
+        problem.set_pose_manifold(0, &[]).unwrap();
+
+        let solution = problem.solve(&SolverOptions::default()).unwrap();
+        assert!(solution.summary.is_solution_usable());
+        let pose = pose_params_to_se3(&solution.parameters[0]);
+        let center = camera_center_world(pose);
+        assert!(center.norm() < 1.0e-3, "center={center:?}");
     }
 }

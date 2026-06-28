@@ -15,6 +15,11 @@ pub enum MatchingPairStrategy {
     },
     /// Match each image against the next `window` images only.
     LocalWindow { window: usize },
+    /// Match each image against its most visually similar images, found via a
+    /// vocabulary tree (COLMAP `vocab_tree_matcher`). Pair generation is
+    /// descriptor-aware and handled in the matching path, not by
+    /// [`generate_matching_pairs`], which has no descriptor access.
+    VocabTree { num_images: usize },
 }
 
 impl Default for MatchingPairStrategy {
@@ -33,7 +38,12 @@ impl MatchingPairStrategy {
         match name.to_ascii_lowercase().as_str() {
             "exhaustive" => Some(Self::Exhaustive),
             "sequential" => Some(Self::default()),
-            "local-window" | "local_window" | "localwindow" => Some(Self::LocalWindow { window: 3 }),
+            "local-window" | "local_window" | "localwindow" => {
+                Some(Self::LocalWindow { window: 3 })
+            }
+            "vocab-tree" | "vocab_tree" | "vocabtree" => {
+                Some(Self::VocabTree { num_images: 100 })
+            }
             _ => None,
         }
     }
@@ -97,6 +107,9 @@ pub fn generate_matching_pairs(
                 }
             }
         }
+        // Vocabulary-tree pairing needs descriptors and is produced by the
+        // descriptor-aware matching path (see `feature_matching_db`).
+        MatchingPairStrategy::VocabTree { .. } => return Vec::new(),
     }
     pairs.into_iter().collect()
 }
@@ -114,6 +127,26 @@ mod tests {
     }
 
     #[test]
+    fn from_name_parses_vocab_tree_aliases() {
+        for alias in ["vocab-tree", "vocab_tree", "VocabTree"] {
+            assert_eq!(
+                MatchingPairStrategy::from_name(alias),
+                Some(MatchingPairStrategy::VocabTree { num_images: 100 })
+            );
+        }
+    }
+
+    #[test]
+    fn vocab_tree_yields_no_index_only_pairs() {
+        // Vocab-tree pairing is descriptor-aware; the index-only generator must
+        // defer by returning no pairs.
+        assert!(
+            generate_matching_pairs(8, MatchingPairStrategy::VocabTree { num_images: 4 })
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn sequential_overlap_matches_colmap_neighbor_window() {
         let pairs = generate_matching_pairs(
             5,
@@ -124,7 +157,10 @@ mod tests {
                 loop_detection_period: 10,
             },
         );
-        assert_eq!(pairs, vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3), (2, 4), (3, 4)]);
+        assert_eq!(
+            pairs,
+            vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3), (2, 4), (3, 4)]
+        );
     }
 
     #[test]
@@ -141,6 +177,20 @@ mod tests {
         assert!(pairs.contains(&(0, 5)));
         assert!(pairs.contains(&(0, 10)));
         assert!(!pairs.contains(&(0, 15)));
+    }
+
+    #[test]
+    fn sequential_overlap_two_quadratic_matches_flowers2_colmap_pair_count() {
+        let pairs = generate_matching_pairs(
+            24,
+            MatchingPairStrategy::Sequential {
+                overlap: 2,
+                quadratic_overlap: true,
+                loop_detection: false,
+                loop_detection_period: 10,
+            },
+        );
+        assert_eq!(pairs.len(), 89);
     }
 
     #[test]
@@ -161,10 +211,7 @@ mod tests {
     #[test]
     fn local_window_matches_legacy_local_pair_candidates() {
         assert_eq!(
-            generate_matching_pairs(
-                5,
-                MatchingPairStrategy::LocalWindow { window: 2 }
-            ),
+            generate_matching_pairs(5, MatchingPairStrategy::LocalWindow { window: 2 }),
             vec![(0, 1), (0, 2), (1, 2), (1, 3), (2, 3), (2, 4), (3, 4)]
         );
     }

@@ -164,12 +164,10 @@ impl PnPSolver {
         let mut best_support = InlierSupport::default();
         let sample_size = 3usize; // true P3P uses exactly 3 correspondences
         let max_iterations = self.initial_max_iterations(sample_size);
-        let mut adaptive_max_iter = max_iterations;
+        let mut dynamic_max_trials = max_iterations as usize;
 
         for iter in 0..max_iterations {
-            if iter >= adaptive_max_iter {
-                break;
-            }
+            let curr_thread_trial = iter as usize;
             // Randomly select 3 points for true P3P hypothesis
             let indices = self.random_indices(&mut rng, n, sample_size);
 
@@ -203,9 +201,12 @@ impl PnPSolver {
             }
 
             if best_support.num_inliers >= sample_size {
-                adaptive_max_iter = self
-                    .update_adaptive_max_iterations(best_support.num_inliers, n, sample_size)
-                    .min(max_iterations);
+                dynamic_max_trials =
+                    self.dynamic_num_trials(best_support.num_inliers, n, sample_size);
+            }
+
+            if self.colmap_ransac_abort_after_trial(curr_thread_trial, dynamic_max_trials) {
+                break;
             }
         }
 
@@ -261,7 +262,7 @@ impl PnPSolver {
 
         let sample_size = 4usize;
         let max_iterations = self.initial_max_iterations(sample_size);
-        let mut adaptive_max_iter = max_iterations;
+        let mut dynamic_max_trials = max_iterations as usize;
         let mut best_model = None::<FocalPoseModel>;
         let mut best_eval = PoseEvaluation {
             inliers: vec![false; n],
@@ -269,9 +270,7 @@ impl PnPSolver {
         };
 
         for iter in 0..max_iterations {
-            if iter >= adaptive_max_iter {
-                break;
-            }
+            let curr_thread_trial = iter as usize;
 
             let indices = self.random_indices(&mut rng, n, sample_size);
             for model in
@@ -291,9 +290,12 @@ impl PnPSolver {
             }
 
             if best_eval.support.num_inliers >= sample_size {
-                adaptive_max_iter = self
-                    .update_adaptive_max_iterations(best_eval.support.num_inliers, n, sample_size)
-                    .min(max_iterations);
+                dynamic_max_trials =
+                    self.dynamic_num_trials(best_eval.support.num_inliers, n, sample_size);
+            }
+
+            if self.colmap_ransac_abort_after_trial(curr_thread_trial, dynamic_max_trials) {
+                break;
             }
         }
 
@@ -360,20 +362,28 @@ impl PnPSolver {
         }
     }
 
-    fn update_adaptive_max_iterations(
+    fn dynamic_num_trials(
         &self,
         num_inliers: usize,
         num_samples: usize,
         sample_size: usize,
-    ) -> u32 {
-        compute_ransac_num_trials(
+    ) -> usize {
+        colmap_ransac_num_trials(
             num_inliers,
             num_samples,
             sample_size,
-            self.ransac_confidence,
-            self.ransac_dyn_num_trials_multiplier,
+            self.ransac_confidence as f64,
+            self.ransac_dyn_num_trials_multiplier as f64,
         )
-        .max(self.ransac_min_iterations)
+    }
+
+    fn colmap_ransac_abort_after_trial(
+        &self,
+        curr_thread_trial: usize,
+        dynamic_max_trials: usize,
+    ) -> bool {
+        curr_thread_trial >= dynamic_max_trials
+            && curr_thread_trial >= self.ransac_min_iterations as usize
     }
 
     fn local_optimize_pose(
@@ -3874,5 +3884,22 @@ mod colmap_ransac_tests {
         solver.ransac_min_iterations = 2;
         solver.ransac_max_iterations = 1;
         assert_eq!(solver.initial_max_iterations(3), 0);
+    }
+
+    #[test]
+    fn pnp_dynamic_abort_uses_colmap_zero_based_trial_gate() {
+        let mut solver = PnPSolver::new(500.0, 500.0, 320.0, 240.0);
+        solver.ransac_confidence = 0.999;
+        solver.ransac_dyn_num_trials_multiplier = 1.0;
+        solver.ransac_min_iterations = 100;
+
+        assert_eq!(solver.dynamic_num_trials(90, 100, 3), 6);
+        assert!(!solver.colmap_ransac_abort_after_trial(6, 6));
+        assert!(!solver.colmap_ransac_abort_after_trial(99, 6));
+        assert!(solver.colmap_ransac_abort_after_trial(100, 6));
+
+        solver.ransac_min_iterations = 0;
+        assert!(!solver.colmap_ransac_abort_after_trial(0, 1));
+        assert!(solver.colmap_ransac_abort_after_trial(1, 1));
     }
 }

@@ -26,7 +26,10 @@ pub fn refine_bundle_adjustment_ceres(
 #[cfg(test)]
 mod tests {
     use super::super::shared::project_point;
-    use super::super::{refine_bundle_adjustment, BundleAdjustmentLoss};
+    use super::super::{
+        camera_center_world, refine_bundle_adjustment, BundleAdjustmentLoss,
+        BundleAdjustmentPosePrior,
+    };
     use super::*;
     use crate::sift::SiftFeatures;
     use crate::types::{
@@ -350,5 +353,142 @@ mod tests {
         assert!(report.final_cost < report.initial_cost);
         assert!(report.gradient_max_norm.is_finite());
         assert!(translation_distance(refined, true_sensor_from_rig) < initial_error);
+    }
+
+    #[test]
+    fn ceres_frame_pose_prior_pulls_rig_aux_camera_center() {
+        let (frames, mut reconstruction, ..) = rig_sensor_ba_fixture();
+        let start_center = camera_center_world(reconstruction.poses[1].unwrap());
+        let prior_center = [
+            start_center[0] + 0.35,
+            start_center[1] + 0.08,
+            start_center[2],
+        ];
+        let start_error = center_error(start_center, prior_center);
+
+        let report = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 30,
+                loss_function: BundleAdjustmentLoss::Huber { scale: 4.0 },
+                max_observation_error_px: 200.0,
+                variable_images: Some(vec![0, 1]),
+                constant_images: vec![2, 3],
+                point_ids: Some((0..8).collect()),
+                pose_priors: vec![BundleAdjustmentPosePrior::new(1, prior_center)],
+                prior_position_fallback_stddev: 0.01,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .expect("ceres rig ba with pose prior should succeed");
+
+        let end_center = camera_center_world(reconstruction.poses[1].unwrap());
+        let end_error = center_error(end_center, prior_center);
+        assert!(report.is_solution_usable());
+        assert!(
+            end_error < start_error,
+            "start_error={start_error} end_error={end_error}"
+        );
+    }
+
+    #[test]
+    fn ceres_pose_prior_without_explicit_gauge_pins_camera_centers() {
+        let true_camera = CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0);
+        let poses = [
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.0, 0.0, 0.0)),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.35, 0.0, 0.0)),
+            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.7, 0.0, 0.0)),
+        ];
+        let points = [
+            [-0.4, -0.3, 3.0],
+            [0.0, -0.2, 3.2],
+            [0.35, 0.1, 3.4],
+            [0.7, 0.2, 3.1],
+        ];
+        let mut frames = vec![frame(0), frame(1), frame(2)];
+        for image in 0..3 {
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| {
+                    let projected =
+                        super::super::shared::project_point(true_camera, poses[image], point)
+                            .expect("projected point");
+                    KeyPoint::new(projected[0] as f32, projected[1] as f32)
+                })
+                .collect();
+        }
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.camera = true_camera;
+        reconstruction.cameras = vec![true_camera];
+        reconstruction.poses = poses
+            .iter()
+            .map(|pose| {
+                let center = camera_center_world(*pose);
+                let shifted_center =
+                    Vec3::new(center[0] as f32 + 4.0, center[1] as f32, center[2] as f32);
+                Some(crate::geometry::pose_from_rotation_center(
+                    Quat::IDENTITY,
+                    shifted_center,
+                ))
+            })
+            .collect();
+        for (idx, xyz) in points.into_iter().enumerate() {
+            for image in 0..3 {
+                reconstruction.observations[image][idx] = Some(idx);
+            }
+            reconstruction.points.push(Point3D {
+                xyz: [xyz[0] + 4.0, xyz[1], xyz[2]],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: (0..3)
+                    .map(|image| TrackObservation {
+                        image,
+                        feature: idx,
+                    })
+                    .collect(),
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+        let priors = poses
+            .iter()
+            .enumerate()
+            .map(|(image, pose)| {
+                let center = camera_center_world(*pose);
+                BundleAdjustmentPosePrior::new(image, [center[0], center[1], center[2]])
+            })
+            .collect::<Vec<_>>();
+
+        let report = refine_bundle_adjustment(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 50,
+                loss_function: BundleAdjustmentLoss::Trivial,
+                max_observation_error_px: 100.0,
+                gauge: super::super::BundleAdjustmentGauge::None,
+                pose_priors: priors,
+                prior_position_fallback_stddev: 0.01,
+                ..BundleAdjustmentOptions::default()
+            },
+        )
+        .expect("ceres prior-position BA should succeed");
+
+        assert!(report.is_solution_usable());
+        for (image, pose) in poses.iter().enumerate() {
+            let expected = camera_center_world(*pose);
+            let actual = camera_center_world(reconstruction.poses[image].unwrap());
+            assert!(
+                center_error(actual, [expected[0], expected[1], expected[2]]) < 0.1,
+                "image={image} actual={actual:?} expected={expected:?}"
+            );
+        }
+    }
+
+    fn center_error(center: nalgebra::SVector<f64, 3>, target: [f64; 3]) -> f64 {
+        ((center[0] - target[0]).powi(2)
+            + (center[1] - target[1]).powi(2)
+            + (center[2] - target[2]).powi(2))
+        .sqrt()
     }
 }

@@ -1,6 +1,6 @@
 use crate::two_view::{
-    estimate_calibrated_two_view_with_observations_and_cameras, triangulate_world_point,
-    TwoViewOptions,
+    estimate_calibrated_two_view_with_observations_and_cameras, essential_to_fundamental,
+    squared_sampson_error, triangulate_world_point, TwoViewOptions,
 };
 use crate::types::{CameraModel, ImageFrame, PairGeometry};
 use glam::{Quat, Vec3};
@@ -110,6 +110,7 @@ pub struct PairEstimationOptions {
     pub use_five_point: bool,
     pub refine_sampson: bool,
     pub ransac_random_seed: i32,
+    pub expand_dense_inliers: bool,
 }
 
 impl Default for PairEstimationOptions {
@@ -120,6 +121,7 @@ impl Default for PairEstimationOptions {
             use_five_point: true,
             refine_sampson: true,
             ransac_random_seed: -1,
+            expand_dense_inliers: true,
         }
     }
 }
@@ -233,12 +235,11 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
             watermark_detection_max_error_px: 4.0,
             filter_stationary_matches: false,
             stationary_matches_max_error_px: 4.0,
-            use_hartley_refinement: options.use_hartley_refinement
-                && right_idx.abs_diff(left_idx) <= 2,
-            use_five_point: options.use_five_point && right_idx.abs_diff(left_idx) <= 3,
+            use_hartley_refinement: options.use_hartley_refinement,
+            use_five_point: options.use_five_point,
         },
     )?;
-    let inlier_mask = estimate.inlier_mask;
+    let inlier_mask = estimate.inlier_mask.clone();
     let mut pose_inlier_matches = Vec::new();
     let mut in_left = Vec::new();
     let mut in_right = Vec::new();
@@ -324,18 +325,21 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
     if best_count < min_triangulated {
         return None;
     }
+    let pose_inlier_count = pose_inlier_matches.len();
     let mut output_inlier_matches = pose_inlier_matches;
-    if std::env::var_os("RUSTSFM_DENSE_PAIR_INLIERS").is_some() {
-        let dense_inlier_matches = collect_pose_consistent_matches(
+    if options.expand_dense_inliers || std::env::var_os("RUSTSFM_DENSE_PAIR_INLIERS").is_some() {
+        let expanded = limit_dense_pair_inliers(expand_dense_inlier_matches(
             matches,
             left,
             right,
             left_camera,
             right_camera,
+            &estimate,
             relative_pose,
-        );
-        if dense_inlier_matches.len() > output_inlier_matches.len() {
-            output_inlier_matches = limit_dense_pair_inliers(dense_inlier_matches);
+            essential_threshold as f64,
+        ));
+        if expanded.len() >= output_inlier_matches.len() {
+            output_inlier_matches = expanded;
         }
     }
     Some(PairGeometry {
@@ -348,9 +352,9 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         qvec: estimate.qvec,
         tvec: estimate.tvec,
         matches: valid_matches,
-        inlier_matches: output_inlier_matches,
+        inlier_matches: output_inlier_matches.clone(),
         relative_pose,
-        inliers: inlier_mask.iter().filter(|&&x| x).count(),
+        inliers: output_inlier_matches.len(),
         triangulated: best_count,
         mean_reprojection_error_px: best_mean_reproj,
         rotation_deg: best_rotation_deg,
@@ -404,6 +408,93 @@ fn dense_pair_inlier_limit() -> usize {
         .unwrap_or(2048)
 }
 
+fn expand_dense_inlier_matches(
+    matches: &[Match],
+    left: &ImageFrame,
+    right: &ImageFrame,
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    estimate: &crate::two_view::TwoViewEstimate,
+    relative_pose: SE3,
+    max_error_px: f64,
+) -> Vec<Match> {
+    let pose_essential = pose_to_essential(relative_pose);
+    let fundamentals = [
+        estimate.fundamental,
+        Some(essential_to_fundamental(
+            &estimate.essential,
+            left_camera,
+            right_camera,
+        )),
+        Some(essential_to_fundamental(
+            &pose_essential,
+            left_camera,
+            right_camera,
+        )),
+    ];
+    let mut best = Vec::new();
+    for fundamental in fundamentals.into_iter().flatten() {
+        let expanded = collect_epipolar_consistent_matches(matches, left, right, &fundamental, max_error_px);
+        if expanded.len() > best.len() {
+            best = expanded;
+        }
+    }
+    best
+}
+
+fn pose_to_essential(pose: SE3) -> Matrix3<f64> {
+    let (rotation, translation) = relative_rotation_translation(pose);
+    let rotation = Matrix3::from_fn(|row, col| rotation[(row, col)] as f64);
+    let translation = Vector3::new(
+        translation[0] as f64,
+        translation[1] as f64,
+        translation[2] as f64,
+    );
+    skew_f64(translation) * rotation
+}
+
+fn skew_f64(translation: Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(
+        0.0,
+        -translation[2],
+        translation[1],
+        translation[2],
+        0.0,
+        -translation[0],
+        -translation[1],
+        translation[0],
+        0.0,
+    )
+}
+
+fn collect_epipolar_consistent_matches(
+    matches: &[Match],
+    left: &ImageFrame,
+    right: &ImageFrame,
+    epipolar: &Matrix3<f64>,
+    max_error_px: f64,
+) -> Vec<Match> {
+    let threshold_sq = max_error_px.max(1.0e-12).powi(2);
+    let mut inliers = Vec::new();
+    for m in matches {
+        let li = m.query_idx as usize;
+        let ri = m.train_idx as usize;
+        if li >= left.keypoints.len() || ri >= right.keypoints.len() {
+            continue;
+        }
+        let lk = &left.keypoints[li];
+        let rk = &right.keypoints[ri];
+        let x1 = Vector3::new(lk.x() as f64, lk.y() as f64, 1.0);
+        let x2 = Vector3::new(rk.x() as f64, rk.y() as f64, 1.0);
+        let residual = squared_sampson_error(&x1, &x2, epipolar);
+        if residual.is_finite() && residual <= threshold_sq {
+            inliers.push(m.clone());
+        }
+    }
+    inliers
+}
+
+#[allow(dead_code)]
 fn collect_pose_consistent_matches(
     matches: &[Match],
     left: &ImageFrame,

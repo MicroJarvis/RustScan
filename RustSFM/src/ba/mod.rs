@@ -1,12 +1,21 @@
 use crate::types::{ImageFrame, Reconstruction, SensorId};
 
+mod covariance;
 mod native;
+mod pose_prior;
 mod shared;
 
 #[cfg(feature = "ceres-ba")]
 mod ceres;
 #[cfg(feature = "ceres-ba")]
 mod ceres_problem;
+
+pub use covariance::{compute_pose_covariances, BundleAdjustmentCovariance, CovariancePoseBlock};
+pub(crate) use pose_prior::POSE_PRIOR_JACOBIAN_EPS;
+pub use pose_prior::{
+    camera_center_pose_jacobian, camera_center_world, position_prior_information_matrix,
+    BundleAdjustmentPosePrior,
+};
 
 /// Ceres-equivalent robust loss functions for bundle adjustment.
 ///
@@ -116,6 +125,9 @@ pub struct BundleAdjustmentOptions {
     pub point_ids: Option<Vec<usize>>,
     pub constant_point_ids: Option<Vec<usize>>,
     pub allow_single_observation_points: bool,
+    pub pose_priors: Vec<BundleAdjustmentPosePrior>,
+    pub prior_position_fallback_stddev: f64,
+    pub compute_covariance: bool,
 }
 
 impl Default for BundleAdjustmentOptions {
@@ -145,12 +157,28 @@ impl Default for BundleAdjustmentOptions {
             point_ids: None,
             constant_point_ids: None,
             allow_single_observation_points: false,
+            pose_priors: Vec::new(),
+            prior_position_fallback_stddev: 1.0,
+            compute_covariance: false,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleAdjustmentLinearSolver {
+    DenseSchur,
+    SparseSchur,
+    IterativeSchur,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleAdjustmentPreconditioner {
+    SchurJacobi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleAdjustmentGauge {
+    None,
     Default,
     ThreePoints,
     TwoCamsFromWorld,
@@ -188,7 +216,7 @@ pub enum BundleAdjustmentTerminationReason {
     MaxConsecutiveNonmonotonicSteps,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BundleAdjustmentReport {
     pub iterations: usize,
     pub attempted_iterations: usize,
@@ -208,6 +236,9 @@ pub struct BundleAdjustmentReport {
     pub step_norm: f64,
     pub step_quality: f64,
     pub damping: f64,
+    pub linear_solver: BundleAdjustmentLinearSolver,
+    pub preconditioner: Option<BundleAdjustmentPreconditioner>,
+    pub covariance: Option<BundleAdjustmentCovariance>,
     pub termination_type: BundleAdjustmentTerminationType,
     pub termination_reason: BundleAdjustmentTerminationReason,
 }
@@ -219,9 +250,10 @@ impl BundleAdjustmentReport {
 
     pub fn brief_report(&self) -> String {
         format!(
-            "termination={:?} reason={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6}",
+            "termination={:?} reason={:?} solver={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6}",
             self.termination_type,
             self.termination_reason,
+            self.linear_solver,
             self.residuals,
             self.effective_parameters,
             self.iterations,

@@ -624,15 +624,13 @@ impl ObservationManager {
                     if corr_image < self.image_stats.len() {
                         self.image_stats[corr_image].num_visible_correspondences += 1;
                     }
-                    if reconstruction.poses.get(corr_image).copied().flatten().is_some()
-                        && reconstruction.observations[corr_image][corr_feature].is_some()
-                    {
+                    if reconstruction.observations[image][feature].is_some() {
                         increment_correspondence_has_point3d(
                             &mut self.image_stats,
                             &mut self.point3d_correspondence_counts,
                             frames,
-                            image,
-                            feature,
+                            corr_image,
+                            corr_feature,
                         );
                     }
                 }
@@ -666,20 +664,15 @@ impl ObservationManager {
             );
 
             let corr_point = reconstruction.observations[corr_image][corr_feature];
-            if corr_point == Some(point_id)
-                && (is_continued_point3d || image < corr_image)
-            {
+            if corr_point == Some(point_id) && (is_continued_point3d || image < corr_image) {
                 let key = ordered_pair(image, corr_image);
                 let num_total = graph
                     .num_matches_between_images(image as u32, corr_image as u32)
                     .unwrap_or(0) as usize;
-                let stat = self
-                    .image_pair_stats
-                    .entry(key)
-                    .or_insert(ImagePairStat {
-                        num_total_corrs: num_total,
-                        num_tri_corrs: 0,
-                    });
+                let stat = self.image_pair_stats.entry(key).or_insert(ImagePairStat {
+                    num_total_corrs: num_total,
+                    num_tri_corrs: 0,
+                });
                 stat.num_tri_corrs += 1;
             }
         }
@@ -711,9 +704,7 @@ impl ObservationManager {
             );
 
             let corr_point = reconstruction.observations[corr_image][corr_feature];
-            if corr_point == Some(point_id)
-                && (!is_deleted_point3d || image < corr_image)
-            {
+            if corr_point == Some(point_id) && (!is_deleted_point3d || image < corr_image) {
                 let key = ordered_pair(image, corr_image);
                 if let Some(stat) = self.image_pair_stats.get_mut(&key) {
                     debug_assert!(stat.num_tri_corrs > 0);
@@ -1045,6 +1036,43 @@ mod tests {
         assert!(reconstruction.poses[0].is_some());
         assert_eq!(manager.num_visible_correspondences(1), 2);
         assert_eq!(manager.num_visible_correspondences(0), 0);
+    }
+
+    #[test]
+    fn register_image_does_not_double_count_existing_point3d_correspondences() {
+        let frames = vec![frame(0, 100, 100), frame(1, 100, 100), frame(2, 100, 100)];
+        let pairs = vec![pair(0, 2, &[(0, 0)]), pair(1, 2, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+        let mut manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+        assert_eq!(manager.num_correspondences_have_point3d(2, 0), 2);
+
+        assert!(manager.register_image(&frames, &pairs, &mut reconstruction, 2, SE3::identity()));
+
+        let fresh_manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+        assert_eq!(manager.num_correspondences_have_point3d(2, 0), 2);
+        assert_eq!(
+            manager.num_correspondences_have_point3d(2, 0),
+            fresh_manager.num_correspondences_have_point3d(2, 0)
+        );
     }
 
     #[test]
@@ -1488,7 +1516,11 @@ mod tests {
             );
         }
         assert_eq!(
-            incremental.image_pairs().get(&(0, 1)).unwrap().num_tri_corrs,
+            incremental
+                .image_pairs()
+                .get(&(0, 1))
+                .unwrap()
+                .num_tri_corrs,
             rebuild.image_pairs().get(&(0, 1)).unwrap().num_tri_corrs
         );
     }

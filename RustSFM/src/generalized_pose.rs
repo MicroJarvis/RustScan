@@ -753,7 +753,9 @@ fn estimate_generalized_absolute_pose_ransac(
 
     let mut best = None::<GeneralizedAbsoluteModelSupport>;
     let mut trial = 0usize;
-    while trial < max_num_trials && trial < dynamic_max_trials {
+    let mut abort = false;
+    while trial < max_num_trials && !abort {
+        let curr_thread_trial = trial;
         trial += 1;
         let sample = sampler.sample(SAMPLE_SIZE);
         if sample.len() != SAMPLE_SIZE {
@@ -770,25 +772,27 @@ fn estimate_generalized_absolute_pose_ransac(
                 &observations.unique_point3d_ids,
                 threshold_sq,
             );
-            if support.num_inliers < SAMPLE_SIZE || support.num_unique_inliers < SAMPLE_SIZE {
-                continue;
-            }
-            if best
-                .as_ref()
-                .is_none_or(|current| support.is_better_than(current))
+            if generalized_absolute_support_passes_colmap_success_gate(&support, SAMPLE_SIZE)
+                && best
+                    .as_ref()
+                    .is_none_or(|current| support.is_better_than(current))
             {
-                dynamic_max_trials = dynamic_max_trials.min(
-                    ransac_trials_from_counts(
-                        support.num_inliers,
-                        num_points,
-                        SAMPLE_SIZE,
-                        ransac_options.confidence,
-                        ransac_options.dyn_num_trials_multiplier,
-                    )
-                    .min(max_num_trials)
-                    .max(ransac_options.min_num_trials.max(1)),
+                dynamic_max_trials = ransac_trials_from_counts(
+                    support.num_inliers,
+                    num_points,
+                    SAMPLE_SIZE,
+                    ransac_options.confidence,
+                    ransac_options.dyn_num_trials_multiplier,
                 );
                 best = Some(support);
+            }
+            if colmap_ransac_abort_after_trial(
+                curr_thread_trial,
+                dynamic_max_trials,
+                ransac_options.min_num_trials,
+            ) {
+                abort = true;
+                break;
             }
         }
     }
@@ -798,7 +802,7 @@ fn estimate_generalized_absolute_pose_ransac(
     };
     Ok(Some(GeneralizedAbsolutePoseEstimate {
         rig_from_world: best.pose,
-        num_inliers: best.num_inliers,
+        num_inliers: generalized_absolute_colmap_report_num_inliers(&best),
         num_unique_inliers: best.num_unique_inliers,
         inlier_mask: best.inlier_mask,
     }))
@@ -823,6 +827,30 @@ impl GeneralizedAbsoluteModelSupport {
                     || (self.num_inliers == other.num_inliers
                         && self.residual_sum < other.residual_sum)))
     }
+}
+
+#[cfg(feature = "poselib")]
+fn generalized_absolute_support_passes_colmap_success_gate(
+    support: &GeneralizedAbsoluteModelSupport,
+    min_num_samples: usize,
+) -> bool {
+    support.num_inliers >= min_num_samples
+}
+
+#[cfg(feature = "poselib")]
+fn generalized_absolute_colmap_report_num_inliers(
+    support: &GeneralizedAbsoluteModelSupport,
+) -> usize {
+    support.num_unique_inliers
+}
+
+#[cfg(feature = "poselib")]
+fn colmap_ransac_abort_after_trial(
+    curr_thread_trial: usize,
+    dynamic_max_trials: usize,
+    min_num_trials: usize,
+) -> bool {
+    curr_thread_trial >= dynamic_max_trials && curr_thread_trial >= min_num_trials
 }
 
 #[cfg(feature = "poselib")]
@@ -909,7 +937,9 @@ fn estimate_generalized_relative_pose_ransac(
 
     let mut best: Option<GeneralizedRelativeModelSupport> = None;
     let mut trial = 0usize;
-    while trial < max_num_trials && trial < dynamic_max_trials {
+    let mut abort = false;
+    while trial < max_num_trials && !abort {
+        let curr_thread_trial = trial;
         trial += 1;
         let sample = sampler.sample(SAMPLE_SIZE);
         if sample.len() != SAMPLE_SIZE {
@@ -927,12 +957,10 @@ fn estimate_generalized_relative_pose_ransac(
                 &observations.observations2,
                 threshold_sq,
             );
-            if support.num_inliers < SAMPLE_SIZE {
-                continue;
-            }
-            if best
-                .as_ref()
-                .is_none_or(|current| support.is_better_than(current))
+            if support.num_inliers >= SAMPLE_SIZE
+                && best
+                    .as_ref()
+                    .is_none_or(|current| support.is_better_than(current))
             {
                 support = refine_generalized_relative_pose_with_gr8p(
                     &observations.observations1,
@@ -941,32 +969,29 @@ fn estimate_generalized_relative_pose_ransac(
                     support,
                     seed.wrapping_add(trial as u64) as u32,
                 )?;
-                dynamic_max_trials = dynamic_max_trials.min(
-                    ransac_trials_from_counts(
-                        support.num_inliers,
-                        num_points,
-                        SAMPLE_SIZE,
-                        ransac_options.confidence,
-                        ransac_options.dyn_num_trials_multiplier,
-                    )
-                    .min(max_num_trials)
-                    .max(ransac_options.min_num_trials.max(1)),
+                dynamic_max_trials = ransac_trials_from_counts(
+                    support.num_inliers,
+                    num_points,
+                    SAMPLE_SIZE,
+                    ransac_options.confidence,
+                    ransac_options.dyn_num_trials_multiplier,
                 );
                 best = Some(support);
+            }
+            if colmap_ransac_abort_after_trial(
+                curr_thread_trial,
+                dynamic_max_trials,
+                ransac_options.min_num_trials,
+            ) {
+                abort = true;
+                break;
             }
         }
     }
 
-    let Some(mut best) = best else {
+    let Some(best) = best else {
         return Ok(None);
     };
-    best = refine_generalized_relative_pose_with_gr8p(
-        &observations.observations1,
-        &observations.observations2,
-        threshold_sq,
-        best,
-        seed as u32,
-    )?;
     Ok(Some(GeneralizedRelativePoseEstimate {
         rig2_from_rig1: Some(best.pose),
         pano2_from_pano1: None,
@@ -1010,8 +1035,6 @@ fn score_generalized_relative_pose(
         if is_inlier {
             num_inliers += 1;
             residual_sum += residual;
-        } else {
-            residual_sum += threshold_sq;
         }
         inlier_mask.push(is_inlier);
     }
@@ -1999,6 +2022,88 @@ mod tests {
         let best = best.unwrap();
         assert_eq!(best.num_inliers, scene.num_points);
         assert_pose_close(best.pose, scene.rig2_from_rig1, 5.0e-2);
+    }
+
+    #[cfg(feature = "poselib")]
+    #[test]
+    fn generalized_relative_support_residual_sum_ignores_outliers_like_colmap() {
+        let rig2_from_rig1 =
+            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0));
+        let observations1 = [
+            GRNPObservation {
+                cam_from_rig: SE3::identity(),
+                ray_in_cam: [0.0, 0.0, 1.0],
+            },
+            GRNPObservation {
+                cam_from_rig: SE3::identity(),
+                ray_in_cam: [0.0, 0.0, 1.0],
+            },
+        ];
+        let observations2 = [
+            GRNPObservation {
+                cam_from_rig: SE3::identity(),
+                ray_in_cam: [0.0, 0.0, 1.0],
+            },
+            GRNPObservation {
+                cam_from_rig: SE3::identity(),
+                ray_in_cam: [0.0, 1.0, 1.0],
+            },
+        ];
+
+        let support =
+            score_generalized_relative_pose(rig2_from_rig1, &observations1, &observations2, 1.0e-4);
+
+        assert_eq!(support.num_inliers, 1);
+        assert_eq!(support.inlier_mask, vec![true, false]);
+        assert!(support.residual_sum.abs() < 1.0e-12);
+    }
+
+    #[cfg(feature = "poselib")]
+    #[test]
+    fn generalized_absolute_success_gate_uses_total_inliers_like_colmap() {
+        let support = GeneralizedAbsoluteModelSupport {
+            pose: SE3::identity(),
+            num_unique_inliers: 2,
+            num_inliers: 3,
+            residual_sum: 0.0,
+            inlier_mask: vec![true, true, true],
+        };
+        let stronger_unique_support = GeneralizedAbsoluteModelSupport {
+            pose: SE3::identity(),
+            num_unique_inliers: 3,
+            num_inliers: 3,
+            residual_sum: 1.0,
+            inlier_mask: vec![true, true, true],
+        };
+
+        assert!(generalized_absolute_support_passes_colmap_success_gate(
+            &support, 3
+        ));
+        assert!(stronger_unique_support.is_better_than(&support));
+    }
+
+    #[cfg(feature = "poselib")]
+    #[test]
+    fn generalized_absolute_report_num_inliers_uses_unique_inliers_like_colmap() {
+        let support = GeneralizedAbsoluteModelSupport {
+            pose: SE3::identity(),
+            num_unique_inliers: 2,
+            num_inliers: 5,
+            residual_sum: 0.0,
+            inlier_mask: vec![true; 5],
+        };
+
+        assert_eq!(generalized_absolute_colmap_report_num_inliers(&support), 2);
+    }
+
+    #[cfg(feature = "poselib")]
+    #[test]
+    fn generalized_ransac_dynamic_abort_uses_colmap_zero_based_trial_gate() {
+        assert!(!colmap_ransac_abort_after_trial(0, 1, 0));
+        assert!(colmap_ransac_abort_after_trial(1, 1, 0));
+
+        assert!(!colmap_ransac_abort_after_trial(99, 1, 100));
+        assert!(colmap_ransac_abort_after_trial(100, 1, 100));
     }
 
     #[cfg(feature = "poselib")]

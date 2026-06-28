@@ -226,6 +226,10 @@ pub struct EstimateTriangulationOptions {
     /// COLMAP `random_seed`; ignored for `CombinationSampler`, which is
     /// deterministic and non-randomized in COLMAP.
     pub random_seed: i32,
+    /// COLMAP `RANSACOptions::num_threads`. `EstimateTriangulation` uses
+    /// `CombinationSampler`; COLMAP's LORANSAC only permits parallel execution
+    /// for `RandomSampler`, so this path must remain explicitly serial.
+    pub num_threads: isize,
 }
 
 impl Default for EstimateTriangulationOptions {
@@ -241,6 +245,7 @@ impl Default for EstimateTriangulationOptions {
             min_num_trials: 0,
             max_num_trials: 10000,
             random_seed: -1,
+            num_threads: 1,
         }
     }
 }
@@ -255,8 +260,17 @@ impl EstimateTriangulationOptions {
             min_num_trials: self.min_num_trials,
             max_num_trials: self.max_num_trials,
             random_seed: self.random_seed,
-            num_threads: 1,
+            num_threads: self.num_threads,
         }
+    }
+
+    fn check_combination_sampler_ransac_options(&self) -> Result<(), &'static str> {
+        let options = self.colmap_ransac_options();
+        options.check()?;
+        if options.num_threads != 1 {
+            return Err("EstimateTriangulation uses CombinationSampler and requires num_threads=1");
+        }
+        Ok(())
     }
 }
 
@@ -276,10 +290,15 @@ fn compute_num_trials(
     )
 }
 
+const COLMAP_LORANSAC_MAX_LOCAL_TRIALS: usize = 10;
+
 fn initial_max_num_trials(
     options: &EstimateTriangulationOptions,
     max_sampler_samples: usize,
 ) -> usize {
+    if options.check_combination_sampler_ransac_options().is_err() {
+        return 0;
+    }
     options
         .colmap_ransac_options()
         .with_initial_max_num_trials(TriangulationEstimator::MIN_NUM_SAMPLES)
@@ -324,6 +343,9 @@ pub fn estimate_triangulation(
         || cams_from_world.len() != num_samples
         || cameras.len() != num_samples
     {
+        return None;
+    }
+    if options.check_combination_sampler_ransac_options().is_err() {
         return None;
     }
 
@@ -372,39 +394,36 @@ pub fn estimate_triangulation(
         let residuals = estimator.residuals(&point_data, &pose_data, &xyz);
         let support = support_measurer.evaluate(&residuals, max_residual);
         if support_measurer.is_left_better(&support, &best_support) {
+            let (local_xyz, local_support) = locally_optimize_triangulation(
+                &estimator,
+                &point_data,
+                &pose_data,
+                xyz,
+                support,
+                residuals,
+                max_residual,
+                &support_measurer,
+            );
             dynamic_max_trials = compute_num_trials(
-                support.num_inliers,
+                local_support.num_inliers,
                 num_samples,
                 options.confidence,
                 options.dyn_num_trials_multiplier,
             );
-            best_support = support;
-            best_model = Some(xyz);
+            best_support = local_support;
+            best_model = Some(local_xyz);
         }
 
-        if curr_thread_trial >= dynamic_max_trials && curr_thread_trial >= options.min_num_trials {
+        if colmap_loransac_abort_after_trial(
+            curr_thread_trial,
+            dynamic_max_trials,
+            options.min_num_trials,
+        ) {
             abort = true;
         }
     }
 
-    let mut best_xyz = best_model?;
-
-    // Local optimization: refit using all current inliers via the multi-view
-    // DLT, and keep the refit if its support is at least as good.
-    let inlier_indices =
-        inlier_indices(&estimator, &point_data, &pose_data, &best_xyz, max_residual);
-    if inlier_indices.len() > TriangulationEstimator::MIN_NUM_SAMPLES {
-        let lo_points: Vec<PointData> = inlier_indices.iter().map(|&k| point_data[k]).collect();
-        let lo_poses: Vec<PoseData> = inlier_indices.iter().map(|&k| pose_data[k]).collect();
-        if let Some(refit) = estimator.estimate(&lo_points, &lo_poses) {
-            let residuals = estimator.residuals(&point_data, &pose_data, &refit);
-            let support = support_measurer.evaluate(&residuals, max_residual);
-            if !support_measurer.is_left_better(&best_support, &support) {
-                best_support = support;
-                best_xyz = refit;
-            }
-        }
-    }
+    let best_xyz = best_model?;
 
     if best_support.num_inliers < TriangulationEstimator::MIN_NUM_SAMPLES {
         return None;
@@ -415,19 +434,67 @@ pub fn estimate_triangulation(
     Some((inlier_mask, best_xyz))
 }
 
-fn inlier_indices(
+fn locally_optimize_triangulation(
     estimator: &TriangulationEstimator,
     point_data: &[PointData],
     pose_data: &[PoseData],
-    xyz: &Vector3<f64>,
+    initial_xyz: Vector3<f64>,
+    initial_support: InlierSupport,
+    initial_residuals: Vec<f64>,
     max_residual: f64,
-) -> Vec<usize> {
-    estimator
-        .residuals(point_data, pose_data, xyz)
-        .into_iter()
+    support_measurer: &InlierSupportMeasurer,
+) -> (Vector3<f64>, InlierSupport) {
+    let mut best_xyz = initial_xyz;
+    let mut best_support = initial_support;
+    let mut residuals = initial_residuals;
+
+    if best_support.num_inliers <= TriangulationEstimator::MIN_NUM_SAMPLES {
+        return (best_xyz, best_support);
+    }
+
+    for _ in 0..COLMAP_LORANSAC_MAX_LOCAL_TRIALS {
+        let previous_num_inliers = best_support.num_inliers;
+        let inlier_indices = inlier_indices_from_residuals(&residuals, max_residual);
+        if inlier_indices.len() < TriangulationEstimator::MIN_NUM_SAMPLES {
+            break;
+        }
+
+        let lo_points: Vec<PointData> = inlier_indices.iter().map(|&idx| point_data[idx]).collect();
+        let lo_poses: Vec<PoseData> = inlier_indices.iter().map(|&idx| pose_data[idx]).collect();
+        let Some(local_xyz) = estimator.estimate(&lo_points, &lo_poses) else {
+            break;
+        };
+        let local_residuals = estimator.residuals(point_data, pose_data, &local_xyz);
+        let local_support = support_measurer.evaluate(&local_residuals, max_residual);
+
+        if support_measurer.is_left_better(&local_support, &best_support) {
+            best_xyz = local_xyz;
+            best_support = local_support;
+            residuals = local_residuals;
+        }
+
+        if best_support.num_inliers <= previous_num_inliers {
+            break;
+        }
+    }
+
+    (best_xyz, best_support)
+}
+
+fn inlier_indices_from_residuals(residuals: &[f64], max_residual: f64) -> Vec<usize> {
+    residuals
+        .iter()
         .enumerate()
-        .filter_map(|(idx, r)| (r <= max_residual).then_some(idx))
+        .filter_map(|(idx, &r)| (r <= max_residual).then_some(idx))
         .collect()
+}
+
+fn colmap_loransac_abort_after_trial(
+    curr_thread_trial: usize,
+    dynamic_max_trials: usize,
+    min_num_trials: usize,
+) -> bool {
+    curr_thread_trial >= dynamic_max_trials && curr_thread_trial >= min_num_trials
 }
 
 #[cfg(test)]
@@ -475,6 +542,35 @@ mod tests {
             ),
         ];
         let cameras = vec![pinhole(), pinhole(), pinhole()];
+        let truth = Vector3::new(-0.4, 0.5, 4.0);
+        (cams, cameras, truth)
+    }
+
+    fn six_view_setup() -> (Vec<Matrix3x4<f64>>, Vec<CameraModel>, Vector3<f64>) {
+        let cams = vec![
+            pose_from_center(&Matrix3::identity(), &Vector3::new(0.0, 0.0, 0.0)),
+            pose_from_center(
+                &rot(Vector3::new(0.0, 1.0, 0.0), 0.3),
+                &Vector3::new(1.0, 0.0, 0.0),
+            ),
+            pose_from_center(
+                &rot(Vector3::new(1.0, 0.0, 0.0), -0.2),
+                &Vector3::new(0.3, 0.8, -0.2),
+            ),
+            pose_from_center(
+                &rot(Vector3::new(0.0, 1.0, 0.0), -0.4),
+                &Vector3::new(-1.0, 0.1, 0.0),
+            ),
+            pose_from_center(
+                &rot(Vector3::new(1.0, 1.0, 0.0), 0.25),
+                &Vector3::new(0.2, -0.9, 0.1),
+            ),
+            pose_from_center(
+                &rot(Vector3::new(0.0, 0.0, 1.0), 0.15),
+                &Vector3::new(0.8, 0.6, -0.3),
+            ),
+        ];
+        let cameras = vec![pinhole(); cams.len()];
         let truth = Vector3::new(-0.4, 0.5, 4.0);
         (cams, cameras, truth)
     }
@@ -577,6 +673,56 @@ mod tests {
     }
 
     #[test]
+    fn loransac_local_optimization_expands_triangulation_inliers() {
+        let (cams, cameras, truth) = six_view_setup();
+        let points: Vec<Vector2<f64>> = cams
+            .iter()
+            .zip(cameras.iter())
+            .map(|(cam, camera)| project_pixel(camera, cam, &truth))
+            .collect();
+        let point_data = points
+            .iter()
+            .map(|point| PointData {
+                img_point: *point,
+                cam_point: Vector2::new((point[0] - 320.0) / 500.0, (point[1] - 240.0) / 500.0),
+            })
+            .collect::<Vec<_>>();
+        let pose_data = cams
+            .iter()
+            .zip(cameras.iter())
+            .map(|(cam, camera)| PoseData {
+                cam_from_world: *cam,
+                proj_center: projection_center(cam),
+                camera: *camera,
+            })
+            .collect::<Vec<_>>();
+        let estimator = TriangulationEstimator::new(0.0, ResidualType::ReprojectionError);
+        let support_measurer = InlierSupportMeasurer;
+        let max_residual = 2.0_f64.powi(2);
+        let initial_xyz = truth + Vector3::new(0.02, 0.0, -0.05);
+        let initial_residuals = estimator.residuals(&point_data, &pose_data, &initial_xyz);
+        let initial_support = support_measurer.evaluate(&initial_residuals, max_residual);
+        assert_eq!(initial_support.num_inliers, 3);
+
+        let (optimized_xyz, optimized_support) = locally_optimize_triangulation(
+            &estimator,
+            &point_data,
+            &pose_data,
+            initial_xyz,
+            initial_support,
+            initial_residuals,
+            max_residual,
+            &support_measurer,
+        );
+
+        assert_eq!(optimized_support.num_inliers, 6);
+        assert!(
+            (optimized_xyz - truth).norm() < 1.0e-8,
+            "{optimized_xyz:?} vs {truth:?}"
+        );
+    }
+
+    #[test]
     fn has_point_positive_depth_matches_sign_of_camera_depth() {
         let cam = pose_from_center(&Matrix3::identity(), &Vector3::new(0.0, 0.0, 0.0));
         assert!(has_point_positive_depth(&cam, &Vector3::new(0.0, 0.0, 5.0)));
@@ -618,6 +764,16 @@ mod tests {
     }
 
     #[test]
+    fn loransac_dynamic_abort_uses_colmap_zero_based_trial_gate() {
+        assert!(!super::colmap_loransac_abort_after_trial(0, 1, 0));
+        assert!(super::colmap_loransac_abort_after_trial(1, 1, 0));
+
+        assert!(!super::colmap_loransac_abort_after_trial(24, 24, 100));
+        assert!(!super::colmap_loransac_abort_after_trial(99, 24, 100));
+        assert!(super::colmap_loransac_abort_after_trial(100, 24, 100));
+    }
+
+    #[test]
     fn invalid_ransac_options_fail_like_colmap_check() {
         let (cams, cameras, truth) = three_view_setup();
         let points: Vec<Vector2<f64>> = cams
@@ -634,6 +790,30 @@ mod tests {
         let options = EstimateTriangulationOptions {
             min_num_trials: 2,
             max_num_trials: 1,
+            ..EstimateTriangulationOptions::default()
+        };
+        assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());
+
+        let options = EstimateTriangulationOptions {
+            num_threads: 0,
+            ..EstimateTriangulationOptions::default()
+        };
+        assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());
+
+        let options = EstimateTriangulationOptions {
+            num_threads: -2,
+            ..EstimateTriangulationOptions::default()
+        };
+        assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());
+
+        let options = EstimateTriangulationOptions {
+            num_threads: -1,
+            ..EstimateTriangulationOptions::default()
+        };
+        assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());
+
+        let options = EstimateTriangulationOptions {
+            num_threads: 2,
             ..EstimateTriangulationOptions::default()
         };
         assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());

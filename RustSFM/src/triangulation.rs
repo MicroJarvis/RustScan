@@ -243,7 +243,8 @@ pub fn calculate_triangulation_angle(
     proj_center2: &Vector3<f64>,
     point3d: &Vector3<f64>,
 ) -> f64 {
-    let angle = calculate_angle_between_vectors(&(point3d - proj_center1), &(point3d - proj_center2));
+    let angle =
+        calculate_angle_between_vectors(&(point3d - proj_center1), &(point3d - proj_center2));
     angle.min(std::f64::consts::PI - angle)
 }
 

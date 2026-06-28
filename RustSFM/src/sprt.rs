@@ -91,8 +91,7 @@ impl Sprt {
             * ((1.0 - self.options.delta) / (1.0 - self.options.epsilon)).ln()
             + self.options.delta * (self.options.delta / self.options.epsilon).ln();
 
-        let a0 =
-            self.options.eval_time_ratio * c / self.options.num_models_per_sample as f64 + 1.0;
+        let a0 = self.options.eval_time_ratio * c / self.options.num_models_per_sample as f64 + 1.0;
         let mut a = a0;
         const EPS: f64 = 1.5e-8;
 

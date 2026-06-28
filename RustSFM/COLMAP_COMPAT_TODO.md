@@ -4,6 +4,9 @@ Goal: reimplement COLMAP in Rust with behavior-compatible algorithms and model
 semantics. The items below are ordered by dependency and expected impact on
 reconstruction parity.
 
+**Out of scope:** Qt GUI, Python/pycolmap bindings, CUDA/SiftGPU. GPU compute
+uses **wgpu** (Vulkan/Metal/DX12) instead.
+
 ## P0 - Core Data And Camera Semantics
 
 1. [done] Parse and preserve COLMAP camera model ids, names, parameter counts,
@@ -170,6 +173,13 @@ reconstruction parity.
      VLFeat/SiftGPU exactly, including feature limiting by scale, affine shape,
      DSP, upright orientation, descriptor normalization, and multi-orientation
      handling.
+   - Update 2026-06: VLFeat CPU extraction backend is vendored and default
+     (`vlfeat-sift`); COLMAP uint8 L2 matching is used with the VLFeat backend.
+     Covariant covdet extraction supports `estimate_affine_shape` and
+     `domain_size_pooling` (COLMAP `CovariantSiftCPUFeatureExtractor`).
+     Indexed CPU matching (`SiftDescriptorIndex`) and brute-force fallback
+     (`cpu_brute_force_matcher`) are available; `benchmark-sift` CLI added.
+     Remaining gaps: SiftGPU extraction and FAISS IVF acceleration.
 6. [partial] Port COLMAP matching options: max ratio, max distance, cross
    check, max matches, guided matching, matching strategy selection, and
    geometric verification persistence.
@@ -339,6 +349,19 @@ reconstruction parity.
      local optimization can recursively expand the inlier set up to COLMAP's
      10 local trials, and the panoramic-rig branch now falls back to ordinary
      relative pose and returns `pano2_from_pano1`.
+   - **Update 2026-06-22:** generalized relative pose now returns the best
+     model maintained by the GR6P/GR8P LORANSAC loop directly, without the
+     previous RustSFM-only final GR8P refit after the robust loop. This keeps
+     the report boundary closer to COLMAP's
+     `LORANSAC<GR6PEstimator, GR8PEstimator>`.
+   - Generalized relative pose support scoring now matches COLMAP's default
+     `InlierSupportMeasurer` tie-break behavior: outlier residuals no longer
+     contribute a capped `max_residual` penalty to `residual_sum`; only inlier
+     residuals are summed.
+   - Generalized absolute/relative RANSAC now follows COLMAP's post-model,
+     zero-based dynamic abort gate: the loop no longer pre-filters the next
+     trial with the dynamic bound, and the dynamic limit is replaced from the
+     latest best support instead of being forced to monotonically decrease.
    - `EstimateStructureLessAbsolutePose` is now wired through the same
      generalized relative pose solver path, matching COLMAP's world-rig to
      query-camera formulation for non-panoramic world rigs.
@@ -387,18 +410,26 @@ reconstruction parity.
       `TwoViewGeometryOptions` inlier prior (`ransac_options.min_inlier_ratio`
       default 0.25, overridden by top-level `min_inlier_ratio` when enabled)
       through the same constructor-time initial trial clamp.
-      Shared `ColmapRansacOptions::dynamic_max_num_trials` now centralizes the
-      post-best-model dynamic trial cap (`ComputeNumTrials`, min-trial floor,
-      max-trial ceiling); two-view E/F/H and the ray relative-pose fallback use
-      that shared COLMAP option path instead of local count wrappers.
-      Two-view E/F/H dynamic stopping now honors COLMAP's
-      `TwoViewGeometryOptions` `ransac_options.min_num_trials = 100` floor,
-      clamped to the configured maximum trial budget, so high-support samples
-      cannot collapse the loop below COLMAP's default minimum trial count.
+      Two-view E/F/H and the ray relative-pose fallback now use raw
+      `RANSAC::ComputeNumTrials` dynamic caps and COLMAP's post-model,
+      zero-based abort gate. The `min_num_trials` floor is applied by the
+      abort predicate (`curr_thread_trial >= dyn_max_num_trials &&
+      curr_thread_trial >= min_num_trials`) instead of pre-clamping the next
+      loop bound, and the dynamic limit is replaced from the latest best
+      support rather than forced to monotonically decrease.
+      RustSLAM's PnP/PNPF RANSAC loops now follow the same boundary for
+      RustSFM central absolute-pose registration: raw `ComputeNumTrials`
+      dynamic caps are kept un-clamped, and the zero-based abort predicate
+      applies the COLMAP `min_num_trials` floor after each trial.
       Two-view pair estimation now accepts and propagates COLMAP's signed
       `RANSACOptions::random_seed` semantics from the mapper config: `-1`
       keeps the default non-fixed sampling behavior, while non-negative seeds
       use a reproducible fixed sampler seed for the covered E/F/H paths.
+      **Update 2026-06-22:** fixed-seed two-view E/F/H samplers now mirror
+      COLMAP's per-`LORANSAC` PRNG reset semantics: non-negative
+      `random_seed` is passed through unchanged for each essential,
+      fundamental, and homography estimator instance. The RustSFM-only salted
+      seed streams remain limited to COLMAP's `-1` non-fixed sampling path.
     - Two-view E/F/H support ordering now matches COLMAP's default
       `InlierSupportMeasurer`: more inliers win, ties are broken by smaller
       summed inlier residuals instead of median/mean residual heuristics.
@@ -477,7 +508,7 @@ reconstruction parity.
 
 ## P3 - Incremental Mapper State Machine
 
-12. [partial] Port COLMAP initial image selection using prior focal length and
+12. [done] Port COLMAP initial image selection using prior focal length and
     correspondence counts, including registration trial bookkeeping.
    - Added registration trial bookkeeping for unregistered images and stopped
      using relative-pose-only registration as a default mapper path.
@@ -589,10 +620,26 @@ reconstruction parity.
      the first continuation trial, and verify `fix_existing_frames` protects
      the seeded rig frame in local-BA scheduling and registered-frame
      filtering.
-   - Remaining work: full `IncrementalPipeline` multi-model orchestration with
-     deterministic parallel initial-pair probing, a real user-extensible
-     callback API, and official COLMAP-output / real-dataset rig-frame
-     continuation parity fixtures.
+   - Remaining work: exact generalized-pose RANSAC byte parity,
+     reconstruction-manager retry/multi-model parity, controller-level parity
+     fixtures, and Ceres-equivalent generalized refinement tracked under item
+     14.
+   - **Update 2026-06-21:** initial-pair search now mirrors COLMAP's deterministic
+     parallel probing when `threads > 1`: one rayon task per first-image
+     candidate, first-success selection in COLMAP submission order, and
+     state updates replayed sequentially so parallel probing cannot mark
+     earlier COLMAP-ordered pairs as tried out of order. Registration probing
+     now resets bogus sibling rig-frame cameras from priors before
+     PnP/GP3P/structureless estimation, matching COLMAP `RegisterNextImage`'s
+     database camera reset boundary.
+   - **Update 2026-06-21 (P3 advanced slice):** added public controller API
+     (`run_incremental_pipeline`, `IncrementalPipelineStatus`/`Result`,
+     `reference_camera_setup`, `ReconstructionSeed`), COLMAP-style initial-pair
+     whole registration-unit triangulation, registration-commit probe camera
+     reset, bad-initial-pair guard scoped to the initial-pair path (not
+     continuation seeds), and a dense COLMAP sparse-text rig continuation
+     fixture that registers new images in a single-model single-attempt path
+     (`rig_seed_continuation_registers_new_images_in_single_attempt`).
 13. [partial] Port next-image ranking by visible points count, visible points
     ratio, and uncertainty score.
    - Registration candidates are now ranked primarily by visible 3D points,
@@ -666,6 +713,31 @@ reconstruction parity.
    - The PnP RANSAC path now uses an internal MT19937-32 generator with
      rejection-based uniform integer sampling instead of the earlier LCG/modulo
      sampler.
+   - Known-focal PnP and unknown-focal PNPF RANSAC now use COLMAP's post-model,
+     zero-based dynamic abort boundary: the dynamic trial count is the raw
+     `RANSAC::ComputeNumTrials` result from the current best support, and
+     `min_num_trials` is enforced only by the abort predicate after evaluating
+     a trial.
+   - Added a real COLMAP sparse-text central absolute-pose fixture:
+     `real_colmap_sparse_tracks_recover_registered_image_pose_with_pnp`
+     reads `flowers2_colmap` `images.txt`/`points3D.txt`, lifts registered
+     2D tracks through `CameraModel::CamFromImg`, runs RustSLAM PnP, and
+     verifies the recovered pose against COLMAP's registered image pose. This
+     is fixture evidence for the sparse-track-to-PnP boundary, not a claim of
+     byte-level RANSAC/LORANSAC parity.
+   - Added a mapper-level real COLMAP sparse-text continuation fixture:
+     `real_colmap_sparse_seed_registers_neighbor_with_mapper_pnp` seeds
+     `frame_0002.jpg` from the `flowers2_colmap` sparse model, withholds the
+     neighboring `frame_0003.jpg` pose/observations, builds pair matches from
+     true shared COLMAP 3D tracks, and verifies that
+     `incremental_map_single_attempt` registers the neighbor through
+     `source=pnp` with the recovered pose matching COLMAP's registered pose.
+     A follow-up fixture,
+     `real_colmap_sparse_seed_mapper_pnp_survives_local_ba`, seeds two
+     registered `flowers2_colmap` images, registers `frame_0003.jpg` through
+     mapper PnP, verifies that a `local_ba image=frame_0003.jpg` pass runs,
+     and checks that the post-local-BA pose/observations stay aligned with
+     COLMAP's sparse model.
    - Post-registration writes are now guarded by a reconstruction snapshot:
      failed required local BA or bogus registered cameras roll the candidate
      image/camera/track changes back and count as a failed registration trial.
@@ -691,6 +763,16 @@ reconstruction parity.
      same signed COLMAP seed semantics as mapper PnP: non-negative
      `random_seed` values are fixed, while `-1` no longer collapses to a
      hard-coded deterministic seed in the covered PoseLib-backed RANSAC paths.
+   - Generalized absolute pose RANSAC now matches COLMAP's support boundary:
+     `UniqueInlierSupportMeasurer` ordering still prefers more unique 3D
+     inliers, but the generic RANSAC success gate and trial budgeting use
+     total inlier count rather than rejecting candidates with fewer than three
+     unique point ids.
+   - Generalized absolute pose reports its public `num_inliers` value as the
+     unique-3D-point inlier count, matching COLMAP's
+     `EstimateGeneralizedAbsolutePose` output assignment from
+     `report.support.num_unique_inliers`; total observation inliers remain
+     represented by the returned inlier mask.
    - Remaining work: validate exact sample sequences against COLMAP's target
      standard-library `std::uniform_int_distribution` behavior if byte-for-byte
      fixed-seed parity is required, then finish Ceres-equivalent generalized
@@ -777,9 +859,29 @@ reconstruction parity.
      deregistration hook and registration-stat rollback together, matching
      COLMAP's `DeRegisterFrame` / `DeRegisterFrameEvent` pairing for bogus or
      zero-observation registered frames after the 20-frame threshold.
-   - Remaining work: keep a longer-lived mapper-level observation manager and
-     finish exact COLMAP frame/rig semantics for generalized pose, BA
-     scheduling, retry bookkeeping, and all cleanup events.
+   - Registered-frame filtering now preserves the session-scoped
+     `IncrementalTriangulatorState` instead of rebuilding triangulation state; a
+     regression verifies pair retriangulation trial counters survive the
+     frame-aware filtering path and that the long-lived observation-manager
+     stats match a fresh rebuild after filtering.
+   - Real COLMAP sparse registered-frame filtering is now covered with the full
+     24-image `flowers2_colmap` sparse model: after the COLMAP 20-frame
+     filtering threshold is active, one registered image is assigned a bogus
+     camera, `filter_registered_frames` deregisters the full frame through the
+     long-lived observation manager, registration stats roll back, retriangulation
+     trial history is preserved, and session-scoped stats match a fresh rebuild.
+   - Mapper reprojection/track filtering now reuses the session-scoped
+     `IncrementalTriangulatorState` observation manager for the covered
+     initial-pair, post-registration, local-BA, and global-BA cleanup phases,
+     so visible 3D-point statistics stay synchronized without clearing
+     merge/retriangulation trial state.
+   - Registration rollback now calls a rollback-specific triangulator-state
+     sync that rebuilds the observation manager/correspondence graph against
+     the restored reconstruction while preserving merge/retriangulation trial
+     history; the camera bogus-parameter cache is cleared because it depends on
+     mutable camera blocks.
+   - Remaining work: finish exact COLMAP frame/rig semantics for generalized
+     pose, BA scheduling, retry bookkeeping, and all cleanup/rollback events.
    - **Update 2026-06-20:** incremental COLMAP event paths are now implemented:
      embedded `CorrespondenceGraph`, `SetObservationAsTriangulated` /
      `ResetTriObservations`, increment/decrement correspondence-has-point3D
@@ -806,10 +908,9 @@ reconstruction parity.
      two-view/multi-view model estimation with cheirality + triangulation-angle
      gating, angular and squared-reprojection residuals (matching
      `scene/projection.cc`), `InlierSupportMeasurer` support comparison, the
-     COLMAP dynamic-stopping trial count, and a final inlier multi-view refit.
-     The 2-view sampling uses a shared Rust port of COLMAP's deterministic
-     `CombinationSampler`; broader random/progressive sampler infrastructure is
-     tracked under the `optim` RANSAC item.
+     COLMAP dynamic-stopping trial count, deterministic `CombinationSampler`
+     order, and COLMAP-style recursive `LORANSAC` local optimization using the
+     same `TriangulationEstimator` as local estimator.
    - Wired `estimate_triangulation` into the incremental triangulator's
      track-creation path: `IncrementalTriangulator::create_pair_track` now
      gathers the seed observation pair plus transitively-corresponding
@@ -820,15 +921,119 @@ reconstruction parity.
      track from the inlier set in one robust step. Newly created points are left
      uncolored ([0,0,0]) so the dedicated color-extraction stage assigns colors,
      matching COLMAP. Verified by a three-view track-creation test plus the
-     existing pair/retriangulate/color-extraction suite (293 default / 298
-     poselib lib tests green).
-   - Remaining work: finish parallel random seeding and bit-level LORANSAC
-     parity under the `optim` RANSAC item.
+     existing pair/retriangulate/color-extraction suite.
+   - **Update 2026-06-22 (P4 LORANSAC):** `estimate_triangulation` now performs
+     local optimization when a candidate beats the current best, recursively
+     refitting from the current inlier set for up to COLMAP's 10 local trials
+     and using the locally optimized support for dynamic trial updates. A
+     six-view test verifies local optimization expands the inlier set from 3
+     to 6 observations.
+   - `EstimateTriangulation` now has an explicit COLMAP zero-based dynamic
+     abort guard (`curr_thread_trial >= dyn_max_num_trials &&
+     curr_thread_trial >= min_num_trials`) with a regression test, keeping the
+     deterministic `CombinationSampler` loop aligned with COLMAP's
+     post-model-abort boundary.
+   - `EstimateTriangulationOptions` now carries COLMAP
+     `RANSACOptions::num_threads`, validates invalid thread counts through the
+     shared COLMAP RANSAC option path, and enforces COLMAP's serial-only
+     `CombinationSampler` constraint. Mapper triangulation pins this path to
+     `num_threads=1` even when global mapper/BA threads are configured,
+     because COLMAP parallel LORANSAC only supports `RandomSampler`.
+   - Mapper track filtering now mutates the long-lived
+     `IncrementalTriangulatorState` observation manager instead of rebuilding a
+     temporary manager, preserving pair retriangulation/merge trial counters
+     while keeping candidate-image visible-point stats aligned with the
+     filtered reconstruction.
+   - `IncrementalTriangulatorState::sync_after_reconstruction_rollback` now
+     keeps `re_num_trials_`-style pair retriangulation counters alive across
+     registration rollback while refreshing observation-manager statistics to
+     match the restored reconstruction. A regression test verifies trial
+     preservation plus visible-point stat refresh after rollback.
+   - Mapper-level failed local-BA registration rollback is now covered: after
+     post-registration retriangulation mutates the long-lived state, the same
+     rollback sync used by the incremental mapper preserves retriangulation
+     trial history while making the observation manager match a fresh rebuild
+     of the restored reconstruction.
+   - Real COLMAP sparse-track filtering is now covered with the
+     `flowers2_colmap` fixture: corrupting one reference 3D point and filtering
+     through the long-lived mapper observation manager removes the expected
+     track while matching a fresh `ObservationManager` rebuild afterwards.
+   - Real COLMAP sparse local-BA post-filtering is now covered with the same
+     fixture: the candidate image is populated with true shared 2D-3D tracks, a
+     deliberately shortened real candidate track survives into
+     `refine_local_bundle_after_registration`, the post-local-BA cleanup
+     removes observations, and the session-scoped observation manager still
+     matches a fresh rebuild afterwards.
+   - Real COLMAP sparse local-BA post-merge is now covered with the same
+     fixture: `real_colmap_sparse_local_ba_merges_tracks_keeps_observation_manager_in_sync`
+     populates true shared candidate tracks, splits one real correspondence
+     into a duplicate 3D point before local BA, verifies the local post-BA
+     `merge_tracks` pass merges it back, and checks session state against a
+     fresh rebuild.
+   - Real COLMAP sparse global-BA post-filtering is now covered with the same
+     fixture: a deliberately shortened real track survives into
+     `refine_global_bundle_with_postprocessing`, the post-BA cleanup removes
+     observations, and the session-scoped observation manager still matches a
+     fresh rebuild afterwards.
+   - Real COLMAP sparse global-BA prepare completion is now covered with the
+     same fixture: `frame_0003.jpg` is registered with the true COLMAP pose but
+     no 3D observations, `refine_global_bundle_with_postprocessing` logs a
+     `global_ba_prepare` completion pass, `complete_all_tracks` fills the true
+     shared candidate tracks, and the session-scoped observation manager matches
+     a fresh rebuild afterwards.
+   - Real COLMAP sparse global-BA prepare merge and retriangulation are also
+     covered: `real_colmap_sparse_global_ba_prepare_merges_tracks_keeps_observation_manager_in_sync`
+     splits one true shared correspondence into duplicate points and verifies
+     `merge_all_tracks`, while
+     `real_colmap_sparse_global_ba_prepare_retriangulates_tracks_keeps_observation_manager_in_sync`
+     under-reconstructs true pair correspondences and verifies the prepare
+     `retriangulate` path plus preserved pair trial state.
+   - The seeded public pipeline entry is now covered for the same lifecycle:
+     `real_colmap_sparse_pipeline_seeded_global_ba_prepare_completes_tracks`
+     drives `run_incremental_pipeline` with a true registered
+     `flowers2_colmap` continuation seed, verifies
+     `global_ba_prepare reason=initial`, and checks the candidate observations
+     are completed through the controller-level path.
+   - Real COLMAP sparse registration rollback is now covered with the same
+     fixture: candidate registration uses the observation-manager register hook,
+     retriangulation continues true shared COLMAP tracks, rollback restores the
+     seed reconstruction, pair retriangulation trial history survives, and the
+     session-scoped observation manager matches a fresh rebuild before and after
+     rollback.
+   - The same real COLMAP sparse rollback fixture now also covers the
+     bogus-camera rejection branch: after candidate registration and
+     retriangulation, the candidate is moved to a dedicated bogus camera block,
+     `registration_rollback_reason` returns `bogus_camera`, rollback restores
+     the seed reconstruction, and long-lived retriangulation trials plus
+     observation-manager stats stay in sync with a fresh rebuild.
+   - Real COLMAP sparse post-registration filtering is now covered with the same
+     fixture: candidate registration uses the observation-manager register hook,
+     retriangulation continues true shared COLMAP tracks, one continued
+     candidate track is deliberately corrupted, `filter_reprojection_tracks_with_state`
+     removes the expected observations, pair retriangulation trial history
+     survives, and the session-scoped observation manager matches a fresh
+     rebuild afterwards.
+   - Fixed `ObservationManager::register_image` incremental propagation so
+     registering a candidate image only propagates point3D ownership from the
+     newly registered image to its correspondences. Existing registered 3D-point
+     correspondences visible to the candidate are already present in the rebuild
+     baseline and are no longer double-counted.
+   - Registered-frame filtering uses the frame-aware deregistration path without
+     rebuilding triangulation state; regression coverage verifies
+     `retriangulation_trials` survive filtering and the long-lived
+     observation-manager stats match a fresh rebuild.
+   - Real COLMAP sparse registered-frame filtering now uses the full
+     24-registered-image `flowers2_colmap` model to exercise the 20-frame
+     threshold, bogus-camera frame filtering, registration-stat rollback,
+     retriangulation-trial preservation, and fresh-rebuild observation-manager
+     parity.
+   - Remaining work: mapper-wide filtering parity fixtures for the last
+     real-pipeline cleanup/rollback event branches before marking P4 as 100%.
    - **Update 2026-06-20:** `CompleteImage` per point2D (complete tracks +
      orphan-cluster reprojection RANSAC), `Complete` direct-graph BFS, and
      `EstimateTriangulation` deterministic `CombinationSampler` order are
-     implemented. P4 triangulation + observation manager marked 100% in
-     `COLMAP_MODULE_PARITY.md` (303 lib tests).
+     implemented. Remaining P4 work is mapper-wide filtering/cleanup parity
+     fixtures.
 18. [partial] Port filtering by negative depth, reprojection error, triangulation angle,
     short tracks, and bogus camera parameters.
    - Reprojection filtering is now part of the default incremental loop.
@@ -844,6 +1049,10 @@ reconstruction parity.
    - Registered-frame filtering now deregisters full frames/images with bogus
      cameras or zero point3D observations after COLMAP's 20-frame threshold,
      and rolls back frame/rig/camera registration counters.
+   - Mapper post-triangulation and post-BA track filters now reuse the
+     session-scoped observation manager, with a regression test comparing the
+     updated manager against a fresh rebuild after a filtered point removes a
+     candidate image's visible 3D-point support.
    - Remaining work: exact COLMAP deregistration counters after every failed
      refinement path and exact filtering schedules for local/global BA phases.
 
@@ -980,13 +1189,46 @@ reconstruction parity.
       2x7 ambient Jacobians for both `rig_from_world` and `sensor_from_rig`
       pose blocks, replacing the numeric ambient bridge for active Ceres rig
       BA.
-    - Remaining work: switch native LM damping from a fixed `mu*I` to Ceres'
-      jacobian-scaled
-      `mu*clamp(diag(JᵀJ), 1e-6, 1e32)` diagonal together with Ceres'
-      radius-based trust-region update (a naive switch under the current
-      `damping*=10` recovery regressed the generalized-rig refinement test, so
-      both must land together); then true sparse Schur storage, covariance,
-      and full backend solver-summary parity.
+    - **Update 2026-06-21 (P5 backend slice):** native `ITERATIVE_SCHUR` with Schur-Jacobi
+      PCG for >1000 pose entities; pose-prior residuals in native and Ceres
+      (`pose_prior.rs`, 3DOF camera-center costs); post-BA pose covariance
+      (`covariance.rs`, `compute_covariance` option); solver summary now
+      reports `linear_solver`, `preconditioner`, and trust-region radius
+      damping (Ceres `last_trust_region_radius`); 381 lib tests green.
+    - **Update 2026-06-22:** mapper BA options now consume database/cache
+      pose priors: COLMAP correlated camera/data ids are mapped to registered
+      reconstruction images, filtered by local/global BA variable/constant
+      image scheduling, and omitted for point-only redundant-point BA passes.
+      Covered by mapper tests for global BA, local BA, point-only BA, and rig
+      frame data-id mapping.
+    - **Update 2026-06-22 (pose-prior backend):** native and Ceres BA now both
+      apply pose-prior camera-center residuals through image, frame, and
+      sensor pose parameter blocks. Step acceptance accounts for prior cost,
+      and rig auxiliary-camera priors are covered by native and Ceres tests
+      (`pose_prior` suites green across default, `poselib`, and native-only
+      builds).
+    - **Update 2026-06-22 (prior-position BA):** pose-prior camera-center
+      finite differences now use an f32-stable epsilon
+      (`POSE_PRIOR_JACOBIAN_EPS = 1e-5`) across native, Ceres ambient, frame,
+      and sensor pose-prior Jacobians. Prior-position BA can run without an
+      explicit gauge (`BundleAdjustmentGauge::None`), matching COLMAP's
+      `use_prior_position` global-BA gauge boundary in the covered path.
+    - Remaining work: exact Ceres/Eigen sparse backend behavior, broader
+      COLMAP prior-position numerical comparisons, and large-reconstruction
+      solver-summary parity.
+    - **Update 2026-06-21 (LM damping):** native LM now mirrors Ceres'
+      `LevenbergMarquardtStrategy`: diagonal damping uses
+      `diag(JᵀJ) / trust_region_radius` with diagonal clamped to
+      `[1e-6, 1e32]`, accepted steps grow the radius via
+      `radius / max(1/3, 1 - (2ρ - 1)³)`, and rejected/invalid steps shrink it
+      with doubling `decrease_factor` recovery. `bundle_adjustment_refines_sensor_from_rig_when_not_constant`
+      and the full lib suite (370 tests) stay green.
+    - **Update 2026-06-21 (sparse Schur):** native BA now accumulates reduced
+      camera Schur complements in CSC lower-triangle storage with simplicial
+      Cholesky when pose entities exceed the Ceres `DENSE_SCHUR` threshold (50);
+      smaller problems keep the dense path. `sparse_cholesky.rs` adds
+      `SymmetricSparseMatrix` + `SimplicialSparseCholesky` with dense Cholesky/LU
+      fallback (373 lib tests).
 20. Match COLMAP local BA image selection, gauge fixing, robust losses,
     constant camera/rig controls, and short-track point selection.
     - Added a first COLMAP-style local BA pass after each successful
@@ -1023,6 +1265,13 @@ reconstruction parity.
       partial-rig local BA rules.
     - Local BA now uses a `THREE_POINTS` gauge policy that fixes three
       linearly independent observed 3D points when possible.
+    - Added real COLMAP sparse-text coverage for the post-registration local
+      BA path: `real_colmap_sparse_seed_mapper_pnp_survives_local_ba` uses
+      true `flowers2_colmap` tracks across two seeded registered images and a
+      withheld candidate, verifies the mapper registers the candidate via
+      `source=pnp`, confirms the local BA debug report is emitted with one
+      local image and 256 points, and checks that BA does not degrade the
+      COLMAP pose/track boundary.
     - Remaining work: exact COLMAP local bundle selection, formal gauge
       strategies, and Ceres-equivalent backend behavior.
 21. Match COLMAP global BA scheduling, convergence settings, optional redundant
@@ -1061,13 +1310,76 @@ reconstruction parity.
       `IterativeGlobalRefinement` path; future final-all/retriangulate-all
       controller handoffs should keep passing `false`, matching COLMAP's
       explicit final pipeline override.
-    - Added a COLMAP `FindRedundantPoints3D` primitive for redundant 3D point
-      selection: 8x8 image tiles, coverage-gain priority updates, COLMAP
-      point3D-id tie ordering, and threshold behavior are covered by mapper
-      tests. Remaining work is wiring the primitive into global BA's
-      ignore/re-optimize redundant-point passes.
-    - Remaining work: pose priors, redundant-point global BA wiring, and
-      Ceres-equivalent convergence settings.
+    - Added COLMAP redundant 3D point handling for global BA: optional
+      `FindRedundantPoints3D` selection uses 8x8 image tiles, coverage-gain
+      priority updates, COLMAP point3D-id tie ordering, and threshold behavior;
+      large-reconstruction global BA can ignore those points in the main solve
+      and then re-optimize only the redundant points while fixing all poses,
+      camera intrinsics, rig poses, and non-reference sensor-from-rig poses.
+      Native BA now supports this point-only refinement path for
+      no-default-features builds.
+    - Mapper-level database pose priors now feed local/global BA option
+      construction for registered variable poses and are filtered out of
+      point-only redundant BA passes.
+    - Added real COLMAP sparse-text coverage for scheduled incremental global
+      BA: `real_colmap_sparse_seed_mapper_pnp_survives_scheduled_global_ba`
+      seeds two registered `flowers2_colmap` images, withholds
+      `frame_0003.jpg`, registers it through mapper PnP, forces the scheduled
+      global BA trigger, verifies the `global_ba reason=scheduled round=1`
+      and `global_ba_normalize reason=scheduled round=1` debug reports, and
+      checks that normalized BA preserves the candidate's COLMAP rotation plus
+      seed/candidate relative rotation and translation direction.
+    - Prior-position scheduled global BA now mirrors COLMAP's
+      `use_prior_position` control flow: when registered images have mapped
+      database pose priors and the reconstruction has more than two registered
+      images, the mapper uses no explicit `TWO_CAMS_FROM_WORLD` gauge and skips
+      incremental reconstruction normalization. Covered by
+      `global_ba_prior_position_disables_incremental_normalization_like_colmap`
+      and the real COLMAP sparse-text fixture
+      `real_colmap_sparse_seed_mapper_pnp_prior_global_ba_skips_normalization`,
+      which verifies scheduled global BA still runs but no
+      `global_ba_normalize reason=scheduled` report is emitted.
+    - Final global BA now has an explicit final-all handoff boundary: the
+      final `global_ba reason=final` call no longer uses incremental
+      reconstruction normalization, matching COLMAP's final pipeline override.
+      Covered by `final_global_ba_normalization_disabled_like_colmap_final_all`
+      and `pipeline_final_global_ba_skips_normalization_like_colmap_final_all`,
+      which verifies incremental global BA still normalizes but final global BA
+      does not emit `global_ba_normalize reason=final`.
+      A real `flowers2_colmap` fixture,
+      `real_colmap_sparse_final_ba_prepare_keeps_observation_manager_in_sync`,
+      now also exercises `global_ba_prepare reason=final`, verifies final
+      all-track completion on true shared sparse tracks, and checks the
+      session-scoped observation manager against a fresh rebuild.
+    - Added a real COLMAP sparse-text global-BA post-filter fixture:
+      `real_colmap_sparse_global_ba_post_filter_keeps_observation_manager_in_sync`
+      drives the `refine_global_bundle_with_postprocessing` cleanup path and
+      verifies filtered session state against a fresh observation-manager
+      rebuild.
+    - Added a real COLMAP sparse-text global-BA prepare fixture:
+      `real_colmap_sparse_global_ba_prepare_completes_tracks_keeps_observation_manager_in_sync`
+      drives the `global_ba_prepare` `complete_all_tracks` path on true shared
+      `flowers2_colmap` tracks and verifies session state against a fresh
+      observation-manager rebuild.
+      Follow-up fixtures cover the sibling prepare branches:
+      `real_colmap_sparse_global_ba_prepare_merges_tracks_keeps_observation_manager_in_sync`
+      for `merge_all_tracks`, and
+      `real_colmap_sparse_global_ba_prepare_retriangulates_tracks_keeps_observation_manager_in_sync`
+      for pair `retriangulate`.
+      Added controller-entry coverage with
+      `real_colmap_sparse_pipeline_seeded_global_ba_prepare_completes_tracks`,
+      which reaches `global_ba_prepare reason=initial` through
+      `run_incremental_pipeline`.
+    - Added the matching real COLMAP sparse-text local-BA post-filter fixture:
+      `real_colmap_sparse_local_ba_post_filter_keeps_observation_manager_in_sync`
+      drives `refine_local_bundle_after_registration` with a registered
+      candidate image and verifies filtered session state against a fresh
+      observation-manager rebuild.
+      Added `real_colmap_sparse_local_ba_merges_tracks_keeps_observation_manager_in_sync`
+      for the local post-BA `merge_tracks` branch on a split real COLMAP track.
+    - Remaining work: broader final-all/retriangulate-all parity, broader
+      COLMAP prior-position numerical comparisons, and large-reconstruction BA
+      behavior.
 
 ## P6 - I/O, Multi-Model Pipeline, And Parity Tests
 

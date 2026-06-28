@@ -1809,6 +1809,36 @@ impl ColmapDatabase {
         Ok(())
     }
 
+    pub fn upsert_keypoints(&self, image_id: ImageId, keypoints: &[ColmapKeypoint]) -> Result<()> {
+        if self.exists_keypoints(image_id)? {
+            self.update_keypoints(image_id, keypoints)
+        } else {
+            self.write_keypoints(image_id, keypoints)
+        }
+    }
+
+    pub fn upsert_descriptors(
+        &self,
+        image_id: ImageId,
+        descriptors: &ColmapDescriptors,
+    ) -> Result<()> {
+        if self.exists_descriptors(image_id)? {
+            self.conn.execute(
+                "UPDATE descriptors SET rows = ?1, cols = ?2, data = ?3, type = ?4 WHERE image_id = ?5;",
+                params![
+                    descriptors.rows as i64,
+                    descriptors.cols as i64,
+                    descriptors.data,
+                    descriptors.feature_type,
+                    image_id
+                ],
+            )?;
+            Ok(())
+        } else {
+            self.write_descriptors(image_id, descriptors)
+        }
+    }
+
     pub fn update_keypoints(&self, image_id: ImageId, keypoints: &[ColmapKeypoint]) -> Result<()> {
         let (rows, cols, data) = encode_keypoints_blob(keypoints);
         self.update_keypoints_blob(image_id, &ColmapKeypointsBlob { rows, cols, data })

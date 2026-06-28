@@ -2,6 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+"$ROOT/scripts/setup_vlfeat.sh"
+
+if [[ ! -f /opt/homebrew/opt/freeimage/include/FreeImage.h ]] \
+  && [[ ! -f /usr/local/opt/freeimage/include/FreeImage.h ]] \
+  && ! pkg-config --exists freeimage 2>/dev/null; then
+  echo "Note: install FreeImage for COLMAP-parity JPEG loading (e.g. brew install freeimage)"
+fi
+
 POSELIB_DIR="${POSELIB_ROOT:-$ROOT/third_party/PoseLib}"
 POSELIB_TAG="${POSELIB_TAG:-v2.0.5}"
 

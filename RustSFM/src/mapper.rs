@@ -9,7 +9,8 @@ use crate::correspondence_graph::FeatureMatch;
 use crate::correspondence_graph::{image_pair_to_pair_id, CorrespondenceGraph, ImagePairId};
 use crate::database::{
     ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint,
-    ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions, COLMAP_FEATURE_SIFT,
+    ColmapPosePrior, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions,
+    COLMAP_FEATURE_SIFT,
 };
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::generalized_pose::{
@@ -22,15 +23,25 @@ use crate::geometry::{
     mean_pair_reprojection_error_with_cameras, pose_from_rotation_center, pose_rotation,
     pose_with_flipped_translation, relative_rotation_deg, PairEstimationOptions,
 };
+use crate::global_mapper::{
+    run_global_reconstruction, run_global_reconstructions, GlobalMapperOptions,
+    GlobalRefinementOptions, GlobalReconstructionOptions,
+};
+use crate::view_graph_splitting::ViewGraphComponentSplittingOptions;
+use crate::joint_global_positioning::JointGlobalPositioningOptions;
+use crate::view_graph_calibration::ViewGraphCalibrationOptions;
 use crate::incremental_triangulator::{
     IncrementalTriangulator, IncrementalTriangulatorOptions, IncrementalTriangulatorState,
     TriangulationReport,
 };
 use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
+use crate::rotation_averaging::RotationAveragingOptions;
+use crate::track_establishment::TrackEstablishmentOptions;
+use crate::track_triangulation::TrackTriangulationOptions;
 use crate::sift::{
-    extract_sift_features_with_options, match_sift_guided_with_options, match_sift_with_options,
-    SiftExtractionOptions, SiftMatchingOptions,
+    match_sift_guided_with_options, match_sift_with_options, SiftExtractionOptions,
+    SiftMatchingOptions,
 };
 use crate::types::{
     colmap_camera_model_extra_idxs, colmap_camera_model_focal_idxs,
@@ -38,7 +49,7 @@ use crate::types::{
     Point3D, Reconstruction, Rig, RigSensor, Rigid3, SensorId, SensorType, TrackObservation,
 };
 use crate::wide::{
-    build_wide_descriptors, match_wide_mutual, match_wide_mutual_indices, rgb_to_gray,
+    build_wide_descriptors, match_wide_mutual, match_wide_mutual_indices,
 };
 use anyhow::{bail, Context, Result};
 use image::ImageReader;
@@ -53,7 +64,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -305,7 +316,7 @@ struct IncrementalMapperSession {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InitialPairFailure {
+pub enum InitialPairFailure {
     NoInitialPair,
     BadInitialPair,
 }
@@ -492,6 +503,25 @@ pub enum ImageSelectionMethod {
     MinUncertainty,
 }
 
+impl std::str::FromStr for ImageSelectionMethod {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "max_visible_points_num" | "max_visible_points" | "num_visible_points" => {
+                Ok(Self::MaxVisiblePointsNum)
+            }
+            "max_visible_points_ratio" | "visible_points_ratio" => {
+                Ok(Self::MaxVisiblePointsRatio)
+            }
+            "min_uncertainty" | "uncertainty" => Ok(Self::MinUncertainty),
+            _ => bail!(
+                "unsupported image selection method '{value}', expected max_visible_points_num, max_visible_points_ratio, or min_uncertainty"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MapperConfig {
     pub input: PathBuf,
@@ -536,6 +566,7 @@ pub struct MapperConfig {
     pub abs_pose_min_num_inliers: usize,
     pub abs_pose_min_inlier_ratio: f32,
     pub image_selection_method: ImageSelectionMethod,
+    pub pose_priors: Vec<ColmapPosePrior>,
     pub random_seed: i32,
     pub max_reg_trials: usize,
     pub local_ba: bool,
@@ -552,6 +583,8 @@ pub struct MapperConfig {
     pub global_ba_points_freq: usize,
     pub global_ba_max_refinements: usize,
     pub global_ba_max_refinement_change: f32,
+    pub global_ba_ignore_redundant_points3d: bool,
+    pub global_ba_ignore_redundant_points3d_min_coverage_gain: f64,
     pub ba_refine_focal_length: bool,
     pub ba_refine_principal_point: bool,
     pub ba_refine_extra_params: bool,
@@ -561,6 +594,9 @@ pub struct MapperConfig {
     pub max_focal_length_ratio: f64,
     pub max_extra_param: f64,
     pub max_reprojection_error_px: f32,
+    pub ignore_two_view_tracks: bool,
+    /// Run the GLOMAP-style global mapper pipeline instead of incremental SfM.
+    pub global_mapper: bool,
     pub pose_graph: bool,
     pub copy_images: bool,
     pub threads: Option<usize>,
@@ -599,7 +635,7 @@ impl Default for MapperConfig {
             matching_pair_strategy: MatchingPairStrategy::default(),
             experimental_sequence_heuristics: false,
             experimental_ring_closure: false,
-            experimental_structureless_pair_pose_fallback: false,
+            experimental_structureless_pair_pose_fallback: true,
             min_matches: 15,
             min_inliers: 15,
             min_triangulated: 4,
@@ -615,6 +651,7 @@ impl Default for MapperConfig {
             abs_pose_min_num_inliers: 30,
             abs_pose_min_inlier_ratio: 0.25,
             image_selection_method: ImageSelectionMethod::MinUncertainty,
+            pose_priors: Vec::new(),
             random_seed: -1,
             max_reg_trials: 3,
             local_ba: true,
@@ -631,6 +668,8 @@ impl Default for MapperConfig {
             global_ba_points_freq: 250_000,
             global_ba_max_refinements: 5,
             global_ba_max_refinement_change: 0.0005,
+            global_ba_ignore_redundant_points3d: false,
+            global_ba_ignore_redundant_points3d_min_coverage_gain: 0.05,
             ba_refine_focal_length: true,
             ba_refine_principal_point: false,
             ba_refine_extra_params: true,
@@ -640,6 +679,8 @@ impl Default for MapperConfig {
             max_focal_length_ratio: 10.0,
             max_extra_param: 1.0,
             max_reprojection_error_px: 8.0,
+            ignore_two_view_tracks: true,
+            global_mapper: false,
             pose_graph: false,
             copy_images: true,
             threads: None,
@@ -677,6 +718,8 @@ fn run_reconstruction_impl(
     config: &MapperConfig,
     callback_sink: Option<&mut dyn PipelineCallbackSink>,
 ) -> Result<ReconstructionSummary> {
+    let mut runtime_config = config.clone();
+    let config = &mut runtime_config;
     if let Some(threads) = config.threads {
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads.max(1))
@@ -753,6 +796,7 @@ fn run_reconstruction_impl(
     };
     if let Some(database) = mapper_database.as_ref() {
         apply_database_keypoints(&mut frames, &database.keypoints_by_name);
+        config.pose_priors = database.cache.pose_priors.clone();
         if reference_camera_setup.is_none() {
             reference_camera_setup = database_camera_setup(&database.cache, &paths).ok();
             if let Some(setup) = &mut reference_camera_setup {
@@ -864,34 +908,116 @@ fn run_reconstruction_impl(
         debug_log.extend(pair_reference_error_summary(&pairs, &frames, reference));
     }
     let incremental_start = Instant::now();
-    let pipeline_result = if let Some(callback_sink) = callback_sink {
-        incremental_pipeline_map_with_callbacks(
-            &frames,
-            camera,
-            reference_camera_setup.as_ref(),
-            &pairs,
-            config,
-            Some(callback_sink),
-        )?
-    } else {
-        incremental_pipeline_map(
-            &frames,
-            camera,
-            reference_camera_setup.as_ref(),
-            &pairs,
-            config,
-        )?
-    };
-    let mut reconstructions = pipeline_result.reconstructions;
-    let mut reconstruction = reconstructions
-        .first()
-        .cloned()
-        .context("incremental pipeline kept no reconstruction")?;
+    let (mut reconstructions, mut reconstruction, pipeline_debug) = if config.global_mapper {
+            let mapping_pairs = pairs
+                .iter()
+                .filter(|pair| !pair.pose_graph_only)
+                .cloned()
+                .collect::<Vec<_>>();
+            let global_options = global_reconstruction_options_from_config(config);
+            let results = run_global_reconstructions(&frames, &mapping_pairs, camera, &global_options)
+                .context("global mapper failed to produce a reconstruction")?;
+            let mut pipeline_debug = vec!["pipeline=global_mapper".to_string()];
+            pipeline_debug.push(format!(
+                "global_mapper components found={} selected={} reconstructed={} sizes={:?}",
+                results.component_splitting.num_components,
+                results.component_splitting.num_selected,
+                results.component_splitting.num_reconstructed,
+                results.component_splitting.selected_component_sizes,
+            ));
+            for (model_index, result) in results.reconstructions.iter().enumerate() {
+                pipeline_debug.push(format!(
+                    "global_mapper model={} component_views={:?} registered={} tracks={} observations={} triangulated={} joint={} ba_rounds={} created={} image_completed={} completed={} merged={} retriangulated={} filtered={} global_ba={}",
+                    model_index,
+                    result.component_views,
+                    result.mapper.num_registered,
+                    result.track_stats.num_tracks,
+                    result.track_stats.num_observations,
+                    result.triangulation_stats.num_triangulated,
+                    result.used_joint_positioning,
+                    result.refinement_rounds,
+                    result.structure_refinement.created_points,
+                    result.structure_refinement.image_completed_observations,
+                    result.structure_refinement.completed_observations,
+                    result.structure_refinement.merged_tracks,
+                    result.structure_refinement.retriangulated_points,
+                    result.structure_refinement.filtered_observations,
+                    result.global_ba_success,
+                ));
+                pipeline_debug.push(format!(
+                    "global_mapper model={} rotation_residual_deg={:.4} position_residual={:.4}",
+                    model_index,
+                    result.mapper.mean_rotation_residual_deg,
+                    result.mapper.mean_position_residual,
+                ));
+            }
+            if let Some(result) = results.reconstructions.first() {
+                pipeline_debug.push(format!(
+                    "global_mapper view_graph pairs={}/{} matches={}/{} rotation_filtered={} intrinsics_refined={}",
+                    result.view_graph_calibration.pairs_out,
+                    result.view_graph_calibration.pairs_in,
+                    result.view_graph_calibration.matches_out,
+                    result.view_graph_calibration.matches_in,
+                    result.view_graph_calibration.rotation_filtered_pairs,
+                    result.view_graph_calibration.intrinsics_refined,
+                ));
+            }
+            let reconstructions = results
+                .reconstructions
+                .into_iter()
+                .map(|result| result.reconstruction)
+                .collect::<Vec<_>>();
+            let reconstruction = reconstructions
+                .first()
+                .cloned()
+                .context("global mapper kept no reconstruction")?;
+            (reconstructions, reconstruction, pipeline_debug)
+        } else if let Some(callback_sink) = callback_sink {
+            let pipeline_result = incremental_pipeline_map_with_callbacks(
+                &frames,
+                camera,
+                reference_camera_setup.as_ref(),
+                &pairs,
+                config,
+                Some(callback_sink),
+            )?;
+            let reconstruction = pipeline_result
+                .reconstructions
+                .first()
+                .cloned()
+                .context("incremental pipeline kept no reconstruction")?;
+            (
+                pipeline_result.reconstructions,
+                reconstruction,
+                pipeline_result.debug_log,
+            )
+        } else {
+            let pipeline_result = incremental_pipeline_map(
+                &frames,
+                camera,
+                reference_camera_setup.as_ref(),
+                &pairs,
+                config,
+            )?;
+            let reconstruction = pipeline_result
+                .reconstructions
+                .first()
+                .cloned()
+                .context("incremental pipeline kept no reconstruction")?;
+            (
+                pipeline_result.reconstructions,
+                reconstruction,
+                pipeline_result.debug_log,
+            )
+        };
     let incremental_elapsed_ms = incremental_start.elapsed().as_secs_f64() * 1000.0;
     debug_log.push(format!("timing_incremental_ms={incremental_elapsed_ms:.2}"));
-    debug_log.extend(pipeline_result.debug_log);
+    debug_log.extend(pipeline_debug);
     debug_log.extend(pair_quality_summary(&pairs));
-    if config.pose_graph && reconstruction.poses.iter().all(|p| p.is_some()) {
+    if config.pose_graph
+        && !config.global_mapper
+        && reconstruction.poses.iter().all(|p| p.is_some())
+    {
         let pose_graph_start = Instant::now();
         let graph_poses = initialize_pose_graph(frames.len(), &pairs, &reconstruction.poses);
         reconstruction.poses = graph_poses.into_iter().map(Some).collect();
@@ -1037,24 +1163,24 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 #[derive(Debug, Clone)]
-struct ReferenceCameraSetup {
-    cameras: Vec<CameraModel>,
-    camera_ids: Vec<u32>,
-    camera_has_prior_focal_length: Vec<bool>,
-    rigs: Vec<Rig>,
-    frames: Vec<Frame>,
-    image_ids: Vec<u32>,
-    image_camera_indices: Vec<usize>,
-    image_frame_indices: Vec<Option<usize>>,
-    seed_reconstruction: Option<ReconstructionSeed>,
+pub struct ReferenceCameraSetup {
+    pub cameras: Vec<CameraModel>,
+    pub camera_ids: Vec<u32>,
+    pub camera_has_prior_focal_length: Vec<bool>,
+    pub rigs: Vec<Rig>,
+    pub frames: Vec<Frame>,
+    pub image_ids: Vec<u32>,
+    pub image_camera_indices: Vec<usize>,
+    pub image_frame_indices: Vec<Option<usize>>,
+    pub seed_reconstruction: Option<ReconstructionSeed>,
 }
 
 #[derive(Debug, Clone)]
-struct ReconstructionSeed {
-    poses: Vec<Option<SE3>>,
-    observations: Vec<Vec<Option<usize>>>,
-    point_ids: Vec<u64>,
-    points: Vec<Point3D>,
+pub struct ReconstructionSeed {
+    pub poses: Vec<Option<SE3>>,
+    pub observations: Vec<Vec<Option<usize>>>,
+    pub point_ids: Vec<u64>,
+    pub points: Vec<Point3D>,
 }
 
 fn setup_for_reconstruction_attempt(
@@ -1068,7 +1194,7 @@ fn setup_for_reconstruction_attempt(
     Some(setup)
 }
 
-fn reference_camera_setup(
+pub fn reference_camera_setup(
     reference: &Path,
     image_paths: &[PathBuf],
 ) -> Result<ReferenceCameraSetup> {
@@ -1567,12 +1693,140 @@ fn fallback_camera(first_image: &Path) -> CameraModel {
     )
 }
 
+fn global_reconstruction_options_from_config(config: &MapperConfig) -> GlobalReconstructionOptions {
+    GlobalReconstructionOptions {
+        view_graph_calibration: ViewGraphCalibrationOptions {
+            enabled: true,
+            max_epipolar_error_px: config.essential_threshold_px,
+            min_inliers_per_pair: config.min_inliers,
+            essential_threshold_px: config.essential_threshold_px,
+            essential_iterations: config.essential_iterations.min(512),
+            min_triangulated_per_pair: config.min_triangulated,
+            refine_relative_poses: false,
+            ..ViewGraphCalibrationOptions::default()
+        },
+        mapper: GlobalMapperOptions {
+            rotation_averaging: RotationAveragingOptions::default(),
+            ..GlobalMapperOptions::default()
+        },
+        tracks: TrackEstablishmentOptions {
+            min_track_length: 2,
+            max_track_length: 0,
+        },
+        triangulation: TrackTriangulationOptions {
+            // `init_min_tri_angle_deg` is for incremental init-pair selection (default 16°),
+            // not global point establishment (COLMAP/GLOMAP use ~1.5°).
+            min_triangulation_angle_deg: TrackTriangulationOptions::default()
+                .min_triangulation_angle_deg,
+            max_reprojection_error_px: std::env::var("RUSTSFM_GLOBAL_TRIANGULATION_MAX_REPROJ_PX")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(
+                    config
+                        .max_reprojection_error_px
+                        .min(TrackTriangulationOptions::default().max_reprojection_error_px),
+                ),
+            require_cheirality: true,
+        },
+        use_joint_positioning: true,
+        joint_positioning: JointGlobalPositioningOptions::default(),
+        refinement: GlobalRefinementOptions {
+            max_refinements: config.global_ba_max_refinements,
+            max_refinement_change: std::env::var("RUSTSFM_GLOBAL_BA_MAX_REFINEMENT_CHANGE")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(config.global_ba_max_refinement_change),
+            filter_max_reprojection_error_px: std::env::var(
+                "RUSTSFM_GLOBAL_FILTER_MAX_REPROJ_PX",
+            )
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(
+                config
+                    .max_reprojection_error_px
+                    .min(GlobalRefinementOptions::default().filter_max_reprojection_error_px),
+            ),
+            filter_min_track_length: GlobalRefinementOptions::default().filter_min_track_length,
+            filter_min_triangulation_angle_deg: TrackTriangulationOptions::default()
+                .min_triangulation_angle_deg,
+            complete_max_reprojection_error_px: std::env::var(
+                "RUSTSFM_GLOBAL_COMPLETE_MAX_REPROJ_PX",
+            )
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(
+                config
+                    .max_reprojection_error_px
+                    .min(GlobalRefinementOptions::default().complete_max_reprojection_error_px),
+            ),
+        },
+        incremental_triangulation: {
+            let max_reproj = std::env::var("RUSTSFM_GLOBAL_TRIANGULATION_MAX_REPROJ_PX")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(
+                    config
+                        .max_reprojection_error_px
+                        .min(TrackTriangulationOptions::default().max_reprojection_error_px),
+                );
+            let mut tri = IncrementalTriangulatorOptions::from_mapper_config_values(
+                max_reproj,
+                config.min_focal_length_ratio,
+                config.max_focal_length_ratio,
+                config.max_extra_param,
+                config.random_seed,
+                std::env::var("RUSTSFM_GLOBAL_IGNORE_TWO_VIEW_TRACKS")
+                    .ok()
+                    .and_then(|value| value.parse::<bool>().ok())
+                    .unwrap_or(true),
+                1,
+            );
+            tri.re_max_trials = std::env::var("RUSTSFM_GLOBAL_RE_MAX_TRIALS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(tri.re_max_trials);
+            tri
+        },
+        run_global_ba: config.global_ba,
+        global_ba_iterations: global_ba_iterations(config),
+        component_splitting: ViewGraphComponentSplittingOptions {
+            enabled: config.multiple_models,
+            min_component_size: config.min_model_size.max(2),
+            max_components: if config.multiple_models {
+                config.max_num_models.max(1)
+            } else {
+                1
+            },
+        },
+    }
+}
+
 fn global_ba_iterations(config: &MapperConfig) -> usize {
     std::env::var("RUSTSFM_BA_ITERATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(config.global_ba_iterations)
+}
+
+fn global_ba_iterations_for_reconstruction(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+) -> usize {
+    let base = global_ba_iterations(config);
+    let observations = reconstruction_num_observations(reconstruction);
+    if observations >= 20_000 {
+        base.saturating_mul(3)
+    } else if observations >= 10_000 {
+        base.saturating_mul(2)
+    } else {
+        base
+    }
 }
 
 fn global_ba_huber_delta_px() -> f64 {
@@ -1662,6 +1916,20 @@ fn global_ba_max_observation_error_px(config: &MapperConfig) -> f64 {
         .unwrap_or(config.max_reprojection_error_px as f64 * 2.0)
 }
 
+fn mapper_triangulator_options(config: &MapperConfig) -> IncrementalTriangulatorOptions {
+    IncrementalTriangulatorOptions::from_mapper_config_values(
+        config.max_reprojection_error_px,
+        config.min_focal_length_ratio,
+        config.max_focal_length_ratio,
+        config.max_extra_param,
+        config.random_seed,
+        config.ignore_two_view_tracks,
+        // COLMAP's `EstimateTriangulation` uses `CombinationSampler`, and
+        // LORANSAC parallel execution is only supported for `RandomSampler`.
+        1,
+    )
+}
+
 fn mapper_ba_options(
     config: &MapperConfig,
     reconstruction: &Reconstruction,
@@ -1672,12 +1940,19 @@ fn mapper_ba_options(
     constant_point_ids: Option<Vec<usize>>,
 ) -> crate::ba::BundleAdjustmentOptions {
     let constant_images = expanded_constant_images(reconstruction, constant_images);
+    let pose_priors = mapper_pose_priors(
+        config,
+        reconstruction,
+        variable_images.as_deref(),
+        &constant_images,
+    );
     let mut options = crate::ba::BundleAdjustmentOptions {
         iterations,
         loss_function: mapper_global_ba_loss_function(),
         max_observation_error_px: global_ba_max_observation_error_px(config),
         variable_images,
         constant_images,
+        pose_priors,
         variable_cameras: None,
         constant_cameras: ba_constant_camera_indices(config, reconstruction),
         constant_rigs: ba_constant_rig_ids(config, reconstruction),
@@ -1692,6 +1967,78 @@ fn mapper_ba_options(
     };
     apply_colmap_global_ba_solver_options(&mut options);
     options
+}
+
+fn mapper_pose_priors(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    variable_images: Option<&[usize]>,
+    constant_images: &[usize],
+) -> Vec<crate::ba::BundleAdjustmentPosePrior> {
+    if config.pose_priors.is_empty() {
+        return Vec::new();
+    }
+
+    let variable_set = variable_images.map(|images| images.iter().copied().collect::<HashSet<_>>());
+    let constant_set = constant_images.iter().copied().collect::<HashSet<_>>();
+    let mut priors = config
+        .pose_priors
+        .iter()
+        .filter_map(|prior| {
+            let image = pose_prior_image_index(reconstruction, &prior.corr_data_id)?;
+            if reconstruction
+                .poses
+                .get(image)
+                .is_none_or(|pose| pose.is_none())
+            {
+                return None;
+            }
+            if constant_set.contains(&image) {
+                return None;
+            }
+            if variable_set
+                .as_ref()
+                .is_some_and(|images| !images.contains(&image))
+            {
+                return None;
+            }
+            Some(
+                crate::ba::BundleAdjustmentPosePrior::new(image, prior.position)
+                    .with_covariance(prior.position_covariance),
+            )
+        })
+        .collect::<Vec<_>>();
+    priors.sort_by_key(|prior| prior.image);
+    priors.dedup_by_key(|prior| prior.image);
+    priors
+}
+
+fn pose_prior_image_index(
+    reconstruction: &Reconstruction,
+    data_id: &ColmapDataId,
+) -> Option<usize> {
+    if data_id.sensor_id.sensor_type != ColmapSensorType::Camera {
+        return None;
+    }
+    for image in 0..reconstruction.poses.len() {
+        if reconstruction.image_id(image) as u64 != data_id.data_id {
+            continue;
+        }
+        if let Some(frame_idx) = reconstruction.frame_index_for_image(image) {
+            let frame = reconstruction.frames.get(frame_idx)?;
+            if frame.data_ids.iter().any(|frame_data_id| {
+                frame_data_id.data_id == data_id.data_id
+                    && frame_data_id.sensor_id == sensor_id_from_colmap(&data_id.sensor_id)
+            }) {
+                return Some(image);
+            }
+            continue;
+        }
+        if reconstruction.camera_id_for_image(image) == data_id.sensor_id.sensor_id {
+            return Some(image);
+        }
+    }
+    None
 }
 
 fn expanded_constant_images(
@@ -1711,6 +2058,7 @@ fn mapper_global_ba_options(
     config: &MapperConfig,
     reconstruction: &Reconstruction,
     iterations: usize,
+    variable_images: Option<Vec<usize>>,
     constant_images: Vec<usize>,
     point_ids: Option<Vec<usize>>,
     constant_point_ids: Option<Vec<usize>>,
@@ -1719,7 +2067,7 @@ fn mapper_global_ba_options(
         config,
         reconstruction,
         iterations,
-        None,
+        variable_images,
         constant_images,
         point_ids,
         constant_point_ids,
@@ -2132,6 +2480,17 @@ fn apply_image_camera(reconstruction: &mut Reconstruction, image: usize, camera:
     }
 }
 
+fn reconstruction_with_reset_frame_cameras(
+    reconstruction: &Reconstruction,
+    image: usize,
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+) -> Reconstruction {
+    let mut snapshot = reconstruction.clone();
+    reset_bogus_frame_cameras_from_priors(&mut snapshot, image, config, camera_priors);
+    snapshot
+}
+
 fn reset_bogus_frame_cameras_from_priors(
     reconstruction: &mut Reconstruction,
     image: usize,
@@ -2175,46 +2534,59 @@ fn extract_frames(
     feature_type: FeatureType,
     sift_options: &SiftExtractionOptions,
 ) -> Result<Vec<ImageFrame>> {
+    use crate::colmap_image::load_colmap_grayscale_u8;
+    use crate::feature_matching_db::load_rgb_image_for_frame;
+    use crate::sift::extract_sift_from_grayscale_u8;
+
     paths
         .par_iter()
         .enumerate()
         .map(|(id, path)| -> Result<ImageFrame> {
-            let image = ImageReader::open(path)
-                .with_context(|| format!("failed to open {}", path.display()))?
-                .decode()
-                .with_context(|| format!("failed to decode {}", path.display()))?
-                .to_rgb8();
-            let (width, height) = image.dimensions();
-            let (keypoints, descriptors, sift) = match feature_type {
+            let (keypoints, descriptors, sift, width, height, colors) = match feature_type {
                 FeatureType::Orb => {
+                    let (rgb, width, height) = load_rgb_image_for_frame(path)?;
                     let mut extractor = OrbExtractor::new(max_features);
                     let (keypoints, descriptors) = extractor
-                        .detect_and_compute(image.as_raw(), width, height)
+                        .detect_and_compute(&rgb, width, height)
                         .map_err(|e| anyhow::anyhow!("feature extraction failed: {e}"))?;
-                    (keypoints, descriptors, Default::default())
+                    let colors = sample_colors_from_rgb(&rgb, width, height, &keypoints);
+                    (keypoints, descriptors, Default::default(), width, height, colors)
                 }
                 FeatureType::Sift => {
-                    let sift = extract_sift_features_with_options(
-                        image.as_raw(),
-                        width,
-                        height,
+                    let gray = load_colmap_grayscale_u8(path)
+                        .with_context(|| format!("failed to load {}", path.display()))?;
+                    let sift = extract_sift_from_grayscale_u8(
+                        &gray.data,
+                        gray.width,
+                        gray.height,
                         sift_options,
                     )?;
-                    (sift.keypoints.clone(), rustslam::Descriptors::new(), sift)
+                    let (rgb, width, height) = load_rgb_image_for_frame(path)?;
+                    let colors = sample_colors_from_rgb(&rgb, width, height, &sift.keypoints);
+                    (
+                        sift.keypoints.clone(),
+                        rustslam::Descriptors::new(),
+                        sift,
+                        width,
+                        height,
+                        colors,
+                    )
                 }
             };
-            let gray = rgb_to_gray(image.as_raw(), width, height);
-            let wide_descriptors = build_wide_descriptors(&gray, width, height, &keypoints);
-            let strong_feature_indices = strong_feature_indices(&keypoints, 1024);
-            let colors = keypoints
+            let gray = load_colmap_grayscale_u8(path)
+                .with_context(|| format!("failed to load {}", path.display()))?;
+            let gray_f32 = gray
+                .data
                 .iter()
-                .map(|kp| {
-                    let x = kp.x().round().clamp(0.0, (width - 1) as f32) as u32;
-                    let y = kp.y().round().clamp(0.0, (height - 1) as f32) as u32;
-                    let p = image.get_pixel(x, y).0;
-                    [p[0], p[1], p[2]]
-                })
-                .collect();
+                .map(|value| *value as f32 / 255.0)
+                .collect::<Vec<_>>();
+            let wide_descriptors = build_wide_descriptors(
+                &gray_f32,
+                gray.width,
+                gray.height,
+                &keypoints,
+            );
+            let strong_feature_indices = strong_feature_indices(&keypoints, 1024);
             Ok(ImageFrame {
                 id,
                 name: path.file_name().unwrap().to_string_lossy().to_string(),
@@ -2228,6 +2600,27 @@ fn extract_frames(
                 strong_feature_indices,
                 colors,
             })
+        })
+        .collect()
+}
+
+fn sample_colors_from_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    keypoints: &[rustslam::KeyPoint],
+) -> Vec<[u8; 3]> {
+    keypoints
+        .iter()
+        .map(|kp| {
+            let x = kp.x().round().clamp(0.0, (width.saturating_sub(1)) as f32) as u32;
+            let y = kp.y().round().clamp(0.0, (height.saturating_sub(1)) as f32) as u32;
+            let idx = ((y * width + x) * 3) as usize;
+            if idx + 2 < rgb.len() {
+                [rgb[idx], rgb[idx + 1], rgb[idx + 2]]
+            } else {
+                [0, 0, 0]
+            }
         })
         .collect()
 }
@@ -2252,7 +2645,16 @@ fn build_pair_graph(
     sift_matching: &SiftMatchingOptions,
 ) -> Result<Vec<PairGeometry>> {
     let matcher = HammingMatcher::new(2).with_ratio_threshold(config.match_ratio);
-    let mut candidates = generate_matching_pairs(frames.len(), config.matching_pair_strategy);
+    let mut candidates = match config.matching_pair_strategy {
+        MatchingPairStrategy::VocabTree { num_images } => {
+            crate::feature_matching_db::vocab_tree_pairs_from_frames(
+                frames,
+                num_images,
+                config.random_seed,
+            )
+        }
+        strategy => generate_matching_pairs(frames.len(), strategy),
+    };
     if config.experimental_sequence_heuristics {
         add_segment_bridge_candidates(frames.len(), &mut candidates);
     }
@@ -2496,12 +2898,17 @@ fn frame_keypoints_for_database(
     feature_type: FeatureType,
 ) -> Vec<ColmapKeypoint> {
     match feature_type {
-        FeatureType::Sift => frame
-            .sift
-            .keypoints
-            .iter()
-            .map(ColmapKeypoint::from)
-            .collect(),
+        FeatureType::Sift => {
+            if !frame.sift.colmap_keypoints.is_empty() {
+                return frame.sift.colmap_keypoints.clone();
+            }
+            frame
+                .sift
+                .keypoints
+                .iter()
+                .map(ColmapKeypoint::from)
+                .collect()
+        }
         FeatureType::Orb => frame.keypoints.iter().map(ColmapKeypoint::from).collect(),
     }
 }
@@ -2597,13 +3004,13 @@ fn database_pair_geometry_from_stored_pose(
         .collect::<HashMap<_, _>>();
     let left_image_id = *image_by_name.get(left_name)?;
     let right_image_id = *image_by_name.get(right_name)?;
-    if left_image_id > right_image_id {
-        return None;
-    }
     let pair_id =
         crate::correspondence_graph::image_pair_to_pair_id(left_image_id, right_image_id).ok()?;
-    let geometry = stored_geometries.get(&pair_id)?;
-    let pose = stored_two_view_pose(geometry)?;
+    let mut geometry = stored_geometries.get(&pair_id)?.clone();
+    if crate::correspondence_graph::should_swap_image_pair(left_image_id, right_image_id) {
+        geometry.invert();
+    }
+    let pose = stored_two_view_pose(&geometry)?;
     let metrics = stored_pose_pair_metrics(
         pair,
         &frames[pair.left],
@@ -2844,6 +3251,7 @@ fn estimate_candidate_pair(
                 use_five_point: false,
                 refine_sampson: false,
                 ransac_random_seed: config.random_seed,
+                expand_dense_inliers: false,
             },
         )
     } else {
@@ -3652,10 +4060,25 @@ fn incremental_map(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IncrementalPipelineStatus {
+    Success,
+    NoInitialPair,
+    BadInitialPair,
+    NoModelsKept,
+}
+
 #[derive(Debug, Clone)]
-struct IncrementalPipelineMapResult {
-    reconstructions: Vec<Reconstruction>,
-    debug_log: Vec<String>,
+pub struct IncrementalPipelineResult {
+    pub status: IncrementalPipelineStatus,
+    pub reconstructions: Vec<Reconstruction>,
+    pub debug_log: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IncrementalPipelineMapResult {
+    pub reconstructions: Vec<Reconstruction>,
+    pub debug_log: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3839,6 +4262,125 @@ fn incremental_pipeline_map_with_callbacks(
         reconstructions,
         debug_log,
     })
+}
+
+pub fn run_incremental_pipeline(
+    frames: &[ImageFrame],
+    camera: CameraModel,
+    reference_camera_setup: Option<&ReferenceCameraSetup>,
+    pairs: &[PairGeometry],
+    config: &MapperConfig,
+    callback_sink: Option<&mut dyn PipelineCallbackSink>,
+) -> IncrementalPipelineResult {
+    match incremental_pipeline_map_with_callbacks(
+        frames,
+        camera,
+        reference_camera_setup,
+        pairs,
+        config,
+        callback_sink,
+    ) {
+        Ok(result) => IncrementalPipelineResult {
+            status: IncrementalPipelineStatus::Success,
+            reconstructions: result.reconstructions,
+            debug_log: result.debug_log,
+        },
+        Err(err) => {
+            let mut status = IncrementalPipelineStatus::NoModelsKept;
+            let mut current: &(dyn std::error::Error + 'static) = err.as_ref();
+            loop {
+                if let Some(failure) = current.downcast_ref::<InitialPairFailure>() {
+                    status = match failure {
+                        InitialPairFailure::NoInitialPair => {
+                            IncrementalPipelineStatus::NoInitialPair
+                        }
+                        InitialPairFailure::BadInitialPair => {
+                            IncrementalPipelineStatus::BadInitialPair
+                        }
+                    };
+                    break;
+                }
+                match current.source() {
+                    Some(source) => current = source,
+                    None => break,
+                }
+            }
+            IncrementalPipelineResult {
+                status,
+                reconstructions: Vec::new(),
+                debug_log: vec![err.to_string()],
+            }
+        }
+    }
+}
+
+fn triangulate_registration_unit(
+    triangulator: &mut IncrementalTriangulator<'_>,
+    tri_options: &IncrementalTriangulatorOptions,
+    unit_images: &[usize],
+) {
+    for &frame_image in unit_images {
+        triangulator.triangulate_image(tri_options, frame_image);
+        triangulator.complete_image(tri_options, frame_image);
+    }
+}
+
+fn apply_probe_cameras_to_registration_unit(
+    reconstruction: &mut Reconstruction,
+    probe: &Reconstruction,
+    image: usize,
+) {
+    for frame_image in reconstruction.image_indices_for_registration_unit(image) {
+        let Some(camera_idx) = reconstruction
+            .image_camera_indices
+            .get(frame_image)
+            .copied()
+        else {
+            continue;
+        };
+        let Some(camera) = probe.cameras.get(camera_idx).copied() else {
+            continue;
+        };
+        if let Some(slot) = reconstruction.cameras.get_mut(camera_idx) {
+            *slot = camera;
+        }
+        if camera_idx == 0 {
+            reconstruction.camera = camera;
+        }
+    }
+}
+
+fn register_and_triangulate_initial_image_pair(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    triangulation_state: &mut IncrementalTriangulatorState,
+    tri_options: &IncrementalTriangulatorOptions,
+    initial: &PairGeometry,
+) {
+    triangulation_state
+        .observation_manager_mut()
+        .register_image(frames, pairs, reconstruction, initial.left, SE3::identity());
+    triangulation_state
+        .observation_manager_mut()
+        .register_image(
+            frames,
+            pairs,
+            reconstruction,
+            initial.right,
+            initial.relative_pose,
+        );
+    let left_unit = reconstruction.image_indices_for_registration_unit(initial.left);
+    let right_unit = reconstruction.image_indices_for_registration_unit(initial.right);
+    let mut triangulator =
+        IncrementalTriangulator::new(frames, pairs, reconstruction, triangulation_state);
+    triangulate_registration_unit(&mut triangulator, tri_options, &left_unit);
+    triangulate_registration_unit(&mut triangulator, tri_options, &right_unit);
+    let modified = triangulator.get_modified_points3d().clone();
+    triangulator.complete_tracks(tri_options, &modified);
+    let modified = triangulator.get_modified_points3d().clone();
+    triangulator.merge_tracks(tri_options, &modified);
+    triangulator.retriangulate(tri_options);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4070,13 +4612,7 @@ fn incremental_map_single_attempt(
     if config.fix_existing_frames {
         registration_stats.set_existing_registration_units_from_reconstruction(&reconstruction);
     }
-    let tri_options = IncrementalTriangulatorOptions::from_mapper_config_values(
-        config.max_reprojection_error_px,
-        config.min_focal_length_ratio,
-        config.max_focal_length_ratio,
-        config.max_extra_param,
-        config.random_seed,
-    );
+    let tri_options = mapper_triangulator_options(config);
     let mut triangulation_state = IncrementalTriangulatorState::new(frames, pairs, &reconstruction);
     let mut initial_color_images = Vec::new();
     let gauge_image = if let Some(image) = reconstruction.poses.iter().position(Option::is_some) {
@@ -4106,46 +4642,25 @@ fn incremental_map_single_attempt(
             initial.triangulated
         ));
         {
-            triangulation_state
-                .observation_manager_mut()
-                .register_image(
-                    frames,
-                    pairs,
-                    &mut reconstruction,
-                    initial.left,
-                    SE3::identity(),
-                );
-            triangulation_state
-                .observation_manager_mut()
-                .register_image(
-                    frames,
-                    pairs,
-                    &mut reconstruction,
-                    initial.right,
-                    initial.relative_pose,
-                );
-        }
-        registration_stats = RegistrationStats::from_reconstruction(&reconstruction);
-        registration_stats.set_initial_pair_selection_state(initial_pair_state);
-        {
-            let mut triangulator = IncrementalTriangulator::new(
+            register_and_triangulate_initial_image_pair(
                 frames,
                 pairs,
                 &mut reconstruction,
                 &mut triangulation_state,
+                &tri_options,
+                &initial,
             );
-            triangulator.triangulate_image(&tri_options, initial.left);
-            triangulator.complete_image(&tri_options, initial.left);
-            triangulator.triangulate_image(&tri_options, initial.right);
-            triangulator.complete_image(&tri_options, initial.right);
-            let modified = triangulator.get_modified_points3d().clone();
-            triangulator.complete_tracks(&tri_options, &modified);
-            let modified = triangulator.get_modified_points3d().clone();
-            triangulator.merge_tracks(&tri_options, &modified);
-            triangulator.retriangulate(&tri_options);
         }
+        registration_stats = RegistrationStats::from_reconstruction(&reconstruction);
+        registration_stats.set_initial_pair_selection_state(initial_pair_state);
         reject_bad_initial_pair_after_registration(&reconstruction, config)?;
-        filter_reprojection_tracks(frames, pairs, &mut reconstruction, config);
+        filter_reprojection_tracks_with_state(
+            frames,
+            pairs,
+            &mut reconstruction,
+            config,
+            &mut triangulation_state,
+        );
         initial_color_images = vec![initial.left, initial.right];
         initial.left
     };
@@ -4166,8 +4681,10 @@ fn incremental_map_single_attempt(
     ) {
         global_ba_schedule.mark(&reconstruction);
     }
-    reject_bad_initial_pair_after_registration(&reconstruction, config)?;
     let initial_pair_registered = !initial_color_images.is_empty();
+    if initial_pair_registered {
+        reject_bad_initial_pair_after_registration(&reconstruction, config)?;
+    }
     for image in initial_color_images.iter().copied() {
         let color_report =
             extract_colors_for_registration_unit(frames, &mut reconstruction, image, config);
@@ -4241,6 +4758,17 @@ fn incremental_map_single_attempt(
             choice.pair_rot_error
         );
         apply_image_camera(&mut reconstruction, choice.image, choice.camera);
+        let registration_probe = reconstruction_with_reset_frame_cameras(
+            &reconstruction,
+            choice.image,
+            config,
+            &camera_priors,
+        );
+        apply_probe_cameras_to_registration_unit(
+            &mut reconstruction,
+            &registration_probe,
+            choice.image,
+        );
         reset_bogus_frame_cameras_from_priors(
             &mut reconstruction,
             choice.image,
@@ -4305,21 +4833,27 @@ fn incremental_map_single_attempt(
             TriangulationReport::default()
         };
         {
+            let unit_images = reconstruction.image_indices_for_registration_unit(choice.image);
             let mut triangulator = IncrementalTriangulator::new(
                 frames,
                 pairs,
                 &mut reconstruction,
                 &mut triangulation_state,
             );
-            triangulator.triangulate_image(&tri_options, choice.image);
-            triangulator.complete_image(&tri_options, choice.image);
+            triangulate_registration_unit(&mut triangulator, &tri_options, &unit_images);
             let modified = triangulator.get_modified_points3d().clone();
             triangulator.complete_tracks(&tri_options, &modified);
             let modified = triangulator.get_modified_points3d().clone();
             triangulator.merge_tracks(&tri_options, &modified);
             triangulator.retriangulate(&tri_options);
         }
-        filter_reprojection_tracks(frames, pairs, &mut reconstruction, config);
+        filter_reprojection_tracks_with_state(
+            frames,
+            pairs,
+            &mut reconstruction,
+            config,
+            &mut triangulation_state,
+        );
         let mut local_registration_stats = registration_stats.clone();
         local_registration_stats.register_frame_for_image_event(&reconstruction, choice.image);
         let local_ba_required =
@@ -4344,7 +4878,7 @@ fn incremental_map_single_attempt(
         );
         if let Some(reason) = rollback_reason {
             reconstruction = registration_snapshot;
-            triangulation_state.rebuild(frames, pairs, &reconstruction);
+            triangulation_state.sync_after_reconstruction_rollback(frames, pairs, &reconstruction);
             increment_registration_unit_trials_for_mode(
                 &reconstruction,
                 choice.image,
@@ -4453,6 +4987,11 @@ fn incremental_map_single_attempt(
                 points: reconstruction.points.len(),
             },
         );
+        reset_unregistered_registration_trials(
+            &reconstruction,
+            &mut reg_trials,
+            &mut structureless_reg_trials,
+        );
         mark_unregistered_images_with_no_absolute_pose(
             frames,
             pairs,
@@ -4473,7 +5012,7 @@ fn incremental_map_single_attempt(
             &tri_options,
             config,
             "final",
-            incremental_global_ba_normalizes_reconstruction(config),
+            final_global_ba_normalizes_reconstruction(config),
             &mut debug_log,
             Some(&mut registration_stats),
             Some(&mut filtered_units),
@@ -4784,8 +5323,9 @@ fn next_registration_modes(config: &MapperConfig) -> Vec<NextImageRegistrationMo
     modes
 }
 
-fn structureless_registration_enabled(config: &MapperConfig) -> bool {
-    config.experimental_structureless_pair_pose_fallback || cfg!(feature = "poselib")
+fn structureless_registration_enabled(_config: &MapperConfig) -> bool {
+    // COLMAP always runs a structure-less registration bucket after structure-based.
+    true
 }
 
 fn registration_unit_num_visible_points3d(
@@ -4898,11 +5438,13 @@ fn registration_choice_for_image(
     correspondence_graph: Option<&CorrespondenceGraph>,
     mode: NextImageRegistrationMode,
 ) -> Option<RegistrationChoice> {
+    let registration_reconstruction =
+        reconstruction_with_reset_frame_cameras(reconstruction, image, config, camera_priors);
     let (abs_pose, source) = match mode {
         NextImageRegistrationMode::StructureBased => {
             if generalized_frame_registration_applicable(
                 image,
-                reconstruction,
+                &registration_reconstruction,
                 config,
                 obs_manager,
                 camera_has_prior_focal_length,
@@ -4912,7 +5454,7 @@ fn registration_choice_for_image(
                     image,
                     frames,
                     pairs,
-                    reconstruction,
+                    &registration_reconstruction,
                     config,
                     obs_manager,
                     camera_has_prior_focal_length,
@@ -4924,7 +5466,7 @@ fn registration_choice_for_image(
                 image,
                 frames,
                 pairs,
-                reconstruction,
+                &registration_reconstruction,
                 config,
                 camera_priors,
                 camera_has_prior_focal_length,
@@ -4941,7 +5483,7 @@ fn registration_choice_for_image(
                 image,
                 frames,
                 pairs,
-                reconstruction,
+                &registration_reconstruction,
                 config,
                 obs_manager,
                 camera_priors,
@@ -5255,7 +5797,24 @@ fn reset_registration_unit_trials_for_mode(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// COLMAP retries unregistered images as the reconstruction grows. Reset trial
+/// counters after each successful registration so tail frames are not excluded
+/// because they were probed too early with insufficient 2D-3D visibility.
+fn reset_unregistered_registration_trials(
+    reconstruction: &Reconstruction,
+    reg_trials: &mut [usize],
+    structureless_reg_trials: &mut [usize],
+) {
+    for image in 0..reconstruction.poses.len() {
+        if registration_unit_is_registered(reconstruction, image) {
+            continue;
+        }
+        reset_registration_unit_trials(reconstruction, image, reg_trials);
+        reset_registration_unit_trials(reconstruction, image, structureless_reg_trials);
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LocalBundleReport {
     report: crate::ba::BundleAdjustmentReport,
     refinements: usize,
@@ -5375,10 +5934,23 @@ fn refine_global_bundle_with_postprocessing(
             break;
         }
         attempted = true;
+        let redundant_point_ids = global_ba_redundant_point_ids(config, reconstruction);
+        if let Some(redundant_point_ids) = redundant_point_ids.as_ref() {
+            debug_log.push(format!(
+                "global_ba_redundant_points reason={reason} round={} ignored={} points={}",
+                round + 1,
+                redundant_point_ids.len(),
+                reconstruction.points.len()
+            ));
+        }
+        let non_redundant_point_ids = redundant_point_ids.as_ref().map(|redundant_point_ids| {
+            non_redundant_point_ids(reconstruction.points.len(), redundant_point_ids)
+        });
         let mut ba_options = mapper_global_ba_options(
             config,
             reconstruction,
-            global_ba_iterations(config),
+            global_ba_iterations_for_reconstruction(config, reconstruction),
+            None,
             if config.fix_existing_frames {
                 registration_stats
                     .as_deref()
@@ -5387,10 +5959,15 @@ fn refine_global_bundle_with_postprocessing(
             } else {
                 Vec::new()
             },
-            None,
+            non_redundant_point_ids,
             None,
         );
-        ba_options.gauge = crate::ba::BundleAdjustmentGauge::TwoCamsFromWorld;
+        let uses_prior_position = global_ba_uses_prior_position(&ba_options, reconstruction);
+        ba_options.gauge = if uses_prior_position {
+            crate::ba::BundleAdjustmentGauge::None
+        } else {
+            crate::ba::BundleAdjustmentGauge::TwoCamsFromWorld
+        };
         let Some(report) =
             refine_bundle_adjustment_checked(frames, reconstruction, config, ba_options)
         else {
@@ -5402,7 +5979,34 @@ fn refine_global_bundle_with_postprocessing(
             ));
             break;
         };
-        let normalization = if normalize_reconstruction {
+        if let Some(redundant_point_ids) = redundant_point_ids {
+            let redundant_ba_options =
+                redundant_point_global_ba_options(config, reconstruction, redundant_point_ids);
+            let Some(redundant_report) = refine_bundle_adjustment_checked(
+                frames,
+                reconstruction,
+                config,
+                redundant_ba_options,
+            ) else {
+                debug_log.push(format!(
+                    "global_ba_redundant_points reason={reason} round={} skipped",
+                    round + 1
+                ));
+                break;
+            };
+            debug_log.push(format!(
+                "global_ba_redundant_points reason={reason} round={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?}",
+                round + 1,
+                redundant_report.residuals,
+                redundant_report.initial_cost,
+                redundant_report.final_cost,
+                redundant_report.iterations,
+                redundant_report.attempted_iterations,
+                redundant_report.termination_type,
+                redundant_report.termination_reason
+            ));
+        }
+        let normalization = if normalize_reconstruction && !uses_prior_position {
             normalize_reconstruction_colmap(reconstruction, false, 10.0, 0.1, 0.9, true)
         } else {
             None
@@ -5415,7 +6019,13 @@ fn refine_global_bundle_with_postprocessing(
             let merged = triangulator.merge_all_tracks(tri_options);
             (completed, merged)
         };
-        let filtered = filter_reprojection_tracks(frames, pairs, reconstruction, config);
+        let filtered = filter_reprojection_tracks_with_state(
+            frames,
+            pairs,
+            reconstruction,
+            config,
+            triangulation_state,
+        );
         let filtered_frames = if let Some(stats) = registration_stats.as_deref_mut() {
             filter_registered_frames(
                 frames,
@@ -5518,6 +6128,97 @@ fn global_ba_enabled(config: &MapperConfig) -> bool {
 fn incremental_global_ba_normalizes_reconstruction(_config: &MapperConfig) -> bool {
     // COLMAP disables this only for prior-position BA and final-all handoff paths.
     true
+}
+
+fn final_global_ba_normalizes_reconstruction(_config: &MapperConfig) -> bool {
+    false
+}
+
+fn global_ba_uses_prior_position(
+    options: &crate::ba::BundleAdjustmentOptions,
+    reconstruction: &Reconstruction,
+) -> bool {
+    options.pose_priors.len() > 0 && registered_image_count(reconstruction) > 2
+}
+
+fn global_ba_redundant_point_ids(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+) -> Option<Vec<usize>> {
+    const MIN_NUM_REG_FRAMES_FOR_FAST_BA: usize = 10;
+    if !config.global_ba_ignore_redundant_points3d
+        || registered_frame_count(reconstruction) < MIN_NUM_REG_FRAMES_FOR_FAST_BA
+    {
+        return None;
+    }
+    Some(find_redundant_points3d_colmap(
+        config.global_ba_ignore_redundant_points3d_min_coverage_gain,
+        reconstruction,
+    ))
+}
+
+fn non_redundant_point_ids(num_points: usize, redundant_point_ids: &[usize]) -> Vec<usize> {
+    let redundant = redundant_point_ids.iter().copied().collect::<HashSet<_>>();
+    (0..num_points)
+        .filter(|point_id| !redundant.contains(point_id))
+        .collect()
+}
+
+fn redundant_point_global_ba_options(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    redundant_point_ids: Vec<usize>,
+) -> crate::ba::BundleAdjustmentOptions {
+    let mut options = mapper_global_ba_options(
+        config,
+        reconstruction,
+        global_ba_iterations_for_reconstruction(config, reconstruction),
+        Some(Vec::new()),
+        registered_image_indices(reconstruction),
+        Some(redundant_point_ids),
+        None,
+    );
+    options.variable_images = Some(Vec::new());
+    options.constant_cameras = all_camera_indices(reconstruction);
+    options.constant_rigs = reconstruction.rigs.iter().map(|rig| rig.rig_id).collect();
+    options.constant_sensor_from_rig = all_non_ref_sensor_from_rig_ids(reconstruction);
+    options.refine_focal_length = false;
+    options.refine_principal_point = false;
+    options.refine_extra_params = false;
+    options.gauge = crate::ba::BundleAdjustmentGauge::Default;
+    options
+}
+
+fn registered_image_indices(reconstruction: &Reconstruction) -> Vec<usize> {
+    reconstruction
+        .poses
+        .iter()
+        .enumerate()
+        .filter_map(|(image, pose)| pose.is_some().then_some(image))
+        .collect()
+}
+
+fn all_camera_indices(reconstruction: &Reconstruction) -> Vec<usize> {
+    (0..reconstruction.cameras.len().max(1)).collect()
+}
+
+fn all_non_ref_sensor_from_rig_ids(reconstruction: &Reconstruction) -> Vec<SensorId> {
+    let mut sensor_ids = Vec::new();
+    for rig in &reconstruction.rigs {
+        for sensor in &rig.sensors {
+            if rig
+                .ref_sensor_id
+                .as_ref()
+                .is_some_and(|ref_sensor_id| ref_sensor_id == &sensor.sensor_id)
+            {
+                continue;
+            }
+            sensor_ids.push(sensor.sensor_id.clone());
+        }
+    }
+    sensor_ids.sort();
+    sensor_ids.dedup();
+    sensor_ids
 }
 
 fn find_redundant_points3d_colmap(
@@ -6070,10 +6771,13 @@ fn refine_local_bundle_round(
         image_report.created_points += complete_report.created_points;
         (completed, image_report.total_observations())
     };
-    let filtered_observations = filter_reprojection_tracks(frames, pairs, reconstruction, config);
-    if filtered_observations > 0 {
-        triangulation_state.rebuild(frames, pairs, reconstruction);
-    }
+    let filtered_observations = filter_reprojection_tracks_with_state(
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        triangulation_state,
+    );
     let changed_observation_ratio = local_ba_refinement_change_ratio(
         report.observations,
         merged_observations,
@@ -6394,7 +7098,37 @@ fn absolute_pose_pair_rotation_limit_deg() -> f32 {
         .unwrap_or(20.0)
 }
 
+fn initial_pair_probe_num_threads(config: &MapperConfig) -> usize {
+    config.threads.filter(|&threads| threads > 1).unwrap_or(1)
+}
+
 fn choose_initial_pair(
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    camera_has_prior_focal_length: &[bool],
+    selection_state: &mut InitialPairSelectionState,
+) -> Option<PairGeometry> {
+    if initial_pair_probe_num_threads(config) > 1 {
+        choose_initial_pair_parallel(
+            pairs,
+            reconstruction,
+            config,
+            camera_has_prior_focal_length,
+            selection_state,
+        )
+    } else {
+        choose_initial_pair_sequential(
+            pairs,
+            reconstruction,
+            config,
+            camera_has_prior_focal_length,
+            selection_state,
+        )
+    }
+}
+
+fn choose_initial_pair_sequential(
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
     config: &MapperConfig,
@@ -6409,23 +7143,95 @@ fn choose_initial_pair(
         selection_state,
         config,
     ) {
-        for image_id2 in sorted_second_initial_image_ids(
+        if let Some(pair) = probe_initial_pairs_for_first_image(
             pairs,
             reconstruction,
-            image_id1,
+            config,
             camera_has_prior_focal_length,
             selection_state,
-            config,
+            image_id1,
         ) {
-            if !selection_state.mark_initial_pair_tried(reconstruction, image_id1, image_id2) {
-                continue;
-            }
-            let Some(pair) = oriented_initial_pair(pairs, image_id1, image_id2) else {
-                continue;
-            };
-            if is_colmap_style_initial_pair(&pair, reconstruction, config) {
-                return Some(pair);
-            }
+            return Some(pair);
+        }
+    }
+    None
+}
+
+fn choose_initial_pair_parallel(
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    camera_has_prior_focal_length: &[bool],
+    selection_state: &mut InitialPairSelectionState,
+) -> Option<PairGeometry> {
+    let image_correspondences = image_correspondence_counts(pairs);
+    let image_ids1 = sorted_initial_image_ids(
+        reconstruction,
+        &image_correspondences,
+        camera_has_prior_focal_length,
+        selection_state,
+        config,
+    );
+    let base_state = selection_state.clone();
+    let first_success_idx = image_ids1
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, &image_id1)| {
+            let mut state = base_state.clone();
+            probe_initial_pairs_for_first_image(
+                pairs,
+                reconstruction,
+                config,
+                camera_has_prior_focal_length,
+                &mut state,
+                image_id1,
+            )
+            .map(|_| idx)
+        })
+        .min();
+
+    let replay_len = first_success_idx
+        .map(|idx| idx + 1)
+        .unwrap_or(image_ids1.len());
+    for &image_id1 in image_ids1.iter().take(replay_len) {
+        if let Some(pair) = probe_initial_pairs_for_first_image(
+            pairs,
+            reconstruction,
+            config,
+            camera_has_prior_focal_length,
+            selection_state,
+            image_id1,
+        ) {
+            return Some(pair);
+        }
+    }
+    None
+}
+
+fn probe_initial_pairs_for_first_image(
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    camera_has_prior_focal_length: &[bool],
+    selection_state: &mut InitialPairSelectionState,
+    image_id1: usize,
+) -> Option<PairGeometry> {
+    for image_id2 in sorted_second_initial_image_ids(
+        pairs,
+        reconstruction,
+        image_id1,
+        camera_has_prior_focal_length,
+        selection_state,
+        config,
+    ) {
+        if !selection_state.mark_initial_pair_tried(reconstruction, image_id1, image_id2) {
+            continue;
+        }
+        let Some(pair) = oriented_initial_pair(pairs, image_id1, image_id2) else {
+            continue;
+        };
+        if is_colmap_style_initial_pair(&pair, reconstruction, config) {
+            return Some(pair);
         }
     }
     None
@@ -6654,6 +7460,12 @@ fn non_trivial_registration_rig(reconstruction: &Reconstruction, image: usize) -
 }
 
 fn initial_pair_forward_motion(pair: &PairGeometry) -> f32 {
+    if let Some(tvec) = pair.tvec {
+        let tz = tvec[2].abs() as f32;
+        if tz.is_finite() {
+            return tz;
+        }
+    }
     let translation = glam::Vec3::from_array(pair.relative_pose.translation());
     let norm = translation.length();
     if norm <= f32::EPSILON || !norm.is_finite() {
@@ -8582,7 +9394,7 @@ fn absolute_pose_ransac_seed(config: &MapperConfig) -> u64 {
 
 fn next_absolute_pose_ransac_seed() -> u64 {
     static ABSOLUTE_POSE_RANSAC_SEED: AtomicU64 = AtomicU64::new(1);
-    ABSOLUTE_POSE_RANSAC_SEED.fetch_add(1, Ordering::Relaxed)
+    ABSOLUTE_POSE_RANSAC_SEED.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 fn average_camera_focal(camera: CameraModel) -> f64 {
@@ -9327,9 +10139,32 @@ fn filter_reprojection_tracks(
         pairs,
         reconstruction,
         config,
+        None,
         track_filter_max_error_px(config),
         track_filter_min_tri_angle_deg(config),
         track_filter_min_track_length(),
+    )
+}
+
+fn filter_reprojection_tracks_with_state(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+    triangulation_state: &mut IncrementalTriangulatorState,
+) -> usize {
+    let max_error = track_filter_max_error_px(config);
+    let min_tri_angle = track_filter_min_tri_angle_deg(config);
+    let min_track_length = track_filter_min_track_length();
+    filter_reprojection_tracks_with_policy(
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        Some(triangulation_state.observation_manager_mut()),
+        max_error,
+        min_tri_angle,
+        min_track_length,
     )
 }
 
@@ -9338,6 +10173,7 @@ fn filter_reprojection_tracks_with_policy(
     pairs: &[PairGeometry],
     reconstruction: &mut Reconstruction,
     config: &MapperConfig,
+    observation_manager: Option<&mut ObservationManager>,
     max_error: f32,
     min_tri_angle: f32,
     min_track_length: usize,
@@ -9346,7 +10182,13 @@ fn filter_reprojection_tracks_with_policy(
         .map(|image| reconstruction.camera_for_image(image))
         .collect::<Vec<_>>();
     let mut removed = 0usize;
-    let mut observation_manager = ObservationManager::new(frames, pairs, reconstruction);
+    let mut temporary_manager;
+    let observation_manager = if let Some(observation_manager) = observation_manager {
+        observation_manager
+    } else {
+        temporary_manager = ObservationManager::new(frames, pairs, reconstruction);
+        &mut temporary_manager
+    };
     let mut point_id = 0usize;
     while point_id < reconstruction.points.len() {
         let point_xyz = reconstruction.points[point_id].xyz;
@@ -10670,14 +11512,15 @@ fn triangulate_pair(
 mod tests {
     use super::*;
     use crate::colmap::{
-        write_colmap_sparse_text, ColmapCamera, ColmapDataId, ColmapFrame, ColmapImage,
-        ColmapPoint2D, ColmapPoint3D, ColmapRig, ColmapRigSensor, ColmapSensorId, ColmapSensorType,
-        ColmapSparseFiles, ColmapTrackElement,
+        read_colmap_sparse_model, write_colmap_sparse_text, ColmapCamera, ColmapDataId,
+        ColmapFrame, ColmapImage, ColmapPoint2D, ColmapPoint3D, ColmapRig, ColmapRigSensor,
+        ColmapSensorId, ColmapSensorType, ColmapSparseFiles, ColmapTrackElement,
     };
     use crate::correspondence_graph::FeatureMatch;
     use crate::database::{
         ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseFrame, ColmapDatabaseImage,
-        ColmapKeypoint, ColmapTwoViewGeometry, DatabaseCacheOptions,
+        ColmapKeypoint, ColmapPosePriorCoordinateSystem, ColmapTwoViewGeometry,
+        DatabaseCacheOptions,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -11088,6 +11931,28 @@ mod tests {
     }
 
     #[test]
+    fn reset_unregistered_registration_trials_clears_stale_tail_frame_exclusions() {
+        let frames = vec![
+            minimal_frame(0, "a.jpg"),
+            minimal_frame(1, "b.jpg"),
+            minimal_frame(2, "c.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        let mut reg_trials = vec![3, 2, 3];
+        let mut structureless_reg_trials = vec![1, 2, 2];
+
+        reset_unregistered_registration_trials(
+            &reconstruction,
+            &mut reg_trials,
+            &mut structureless_reg_trials,
+        );
+
+        assert_eq!(reg_trials, vec![3, 0, 0]);
+        assert_eq!(structureless_reg_trials, vec![1, 0, 0]);
+    }
+
+    #[test]
     fn local_matching_requires_explicit_opt_in() {
         assert!(!MapperConfig::default().local_matching);
         assert_eq!(MapperConfig::default().local_window, 0);
@@ -11288,6 +12153,21 @@ mod tests {
     }
 
     #[test]
+    fn mapper_triangulator_options_keep_colmap_combination_sampler_serial() {
+        let options = mapper_triangulator_options(&MapperConfig::default());
+        assert_eq!(options.random_seed, -1);
+        assert_eq!(options.num_threads, 1);
+
+        let threaded = mapper_triangulator_options(&MapperConfig {
+            random_seed: 7,
+            threads: Some(4),
+            ..MapperConfig::default()
+        });
+        assert_eq!(threaded.random_seed, 7);
+        assert_eq!(threaded.num_threads, 1);
+    }
+
+    #[test]
     fn local_ba_options_expand_images_to_frames_and_fix_partial_shared_cameras() {
         let frames = vec![
             minimal_frame(0, "outside_shared_camera.jpg"),
@@ -11337,6 +12217,26 @@ mod tests {
     }
 
     #[test]
+    fn global_reconstruction_options_follow_mapper_config() {
+        let config = MapperConfig {
+            random_seed: 42,
+            global_ba: false,
+            global_ba_iterations: 17,
+            init_min_tri_angle_deg: 3.5,
+            max_reprojection_error_px: 6.0,
+            ..MapperConfig::default()
+        };
+        let options = global_reconstruction_options_from_config(&config);
+        assert!(!options.run_global_ba);
+        assert_eq!(options.global_ba_iterations, 17);
+        assert!(options.use_joint_positioning);
+        assert_eq!(options.refinement.max_refinements, config.global_ba_max_refinements);
+        assert_eq!(options.triangulation.min_triangulation_angle_deg, 3.5);
+        assert_eq!(options.triangulation.max_reprojection_error_px, 6.0);
+        assert!(!options.incremental_triangulation.ignore_two_view_tracks);
+    }
+
+    #[test]
     fn global_ba_options_tighten_small_reconstructions_like_colmap() {
         let frames = (0..10)
             .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
@@ -11351,6 +12251,7 @@ mod tests {
             &config,
             &reconstruction,
             config.global_ba_iterations,
+            None,
             vec![],
             None,
             None,
@@ -11367,6 +12268,7 @@ mod tests {
             &config,
             &reconstruction,
             config.global_ba_iterations,
+            None,
             vec![],
             None,
             None,
@@ -11375,6 +12277,104 @@ mod tests {
         assert_eq!(large_options.iterations, 50);
         assert_eq!(large_options.gradient_tolerance, 1.0);
         assert_eq!(large_options.max_linear_solver_iterations, 100);
+    }
+
+    #[test]
+    fn global_ba_redundant_points_gate_matches_colmap_min_frames() {
+        let frames = (0..10)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        let mut reconstruction = test_reconstruction(&frames);
+        for image in 0..9 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        let config = MapperConfig {
+            global_ba_ignore_redundant_points3d: true,
+            ..MapperConfig::default()
+        };
+
+        assert!(global_ba_redundant_point_ids(&config, &reconstruction).is_none());
+
+        reconstruction.poses[9] = Some(SE3::identity());
+        assert_eq!(
+            global_ba_redundant_point_ids(&config, &reconstruction),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn redundant_point_global_ba_options_fix_all_non_point_parameters() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+            minimal_frame(2, "plain.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![11, 12];
+        reconstruction.image_camera_indices = vec![0, 1, 1];
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3::identity()),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: vec![
+                DataId {
+                    sensor_id: ref_sensor,
+                    data_id: reconstruction.image_id(0) as u64,
+                },
+                DataId {
+                    sensor_id: aux_sensor.clone(),
+                    data_id: reconstruction.image_id(1) as u64,
+                },
+            ],
+        }];
+        reconstruction.image_frame_indices[0] = Some(0);
+        reconstruction.image_frame_indices[1] = Some(0);
+        for image in 0..3 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+
+        let options = redundant_point_global_ba_options(
+            &MapperConfig::default(),
+            &reconstruction,
+            vec![2, 4],
+        );
+
+        assert_eq!(options.variable_images, Some(Vec::new()));
+        assert_eq!(options.constant_images, vec![0, 1, 2]);
+        assert_eq!(options.point_ids, Some(vec![2, 4]));
+        assert_eq!(options.constant_cameras, vec![0, 1]);
+        assert_eq!(options.constant_rigs, vec![3]);
+        assert_eq!(options.constant_sensor_from_rig, vec![aux_sensor]);
+        assert!(!options.refine_focal_length);
+        assert!(!options.refine_principal_point);
+        assert!(!options.refine_extra_params);
+        assert_eq!(options.gauge, crate::ba::BundleAdjustmentGauge::Default);
     }
 
     #[test]
@@ -11857,6 +12857,184 @@ mod tests {
     }
 
     #[test]
+    fn mapper_global_ba_options_map_database_pose_priors_to_registered_images() {
+        let frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "registered_b.jpg"),
+            minimal_frame(2, "unregistered.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera_ids = vec![11];
+        reconstruction.image_ids = vec![101, 102, 103];
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        let covariance = [1.0, 0.1, 0.0, 0.1, 2.0, 0.0, 0.0, 0.0, 3.0];
+        let config = MapperConfig {
+            pose_priors: vec![
+                test_pose_prior(1, 11, 101, [1.0, 2.0, 3.0], covariance),
+                test_pose_prior(2, 11, 102, [4.0, 5.0, 6.0], [0.0; 9]),
+                test_pose_prior(3, 11, 103, [7.0, 8.0, 9.0], [0.0; 9]),
+            ],
+            ..MapperConfig::default()
+        };
+
+        let options =
+            mapper_global_ba_options(&config, &reconstruction, 5, None, vec![1], None, None);
+
+        assert_eq!(options.pose_priors.len(), 1);
+        assert_eq!(options.pose_priors[0].image, 0);
+        assert_eq!(options.pose_priors[0].position, [1.0, 2.0, 3.0]);
+        assert_eq!(options.pose_priors[0].position_covariance, covariance);
+    }
+
+    #[test]
+    fn mapper_local_ba_options_filter_pose_priors_to_variable_images() {
+        let frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "registered_b.jpg"),
+            minimal_frame(2, "registered_c.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera_ids = vec![11];
+        reconstruction.image_ids = vec![101, 102, 103];
+        for image in 0..3 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        let stats = registration_stats(&reconstruction);
+        let config = MapperConfig {
+            pose_priors: vec![
+                test_pose_prior(1, 11, 101, [1.0, 0.0, 0.0], [0.0; 9]),
+                test_pose_prior(2, 11, 102, [2.0, 0.0, 0.0], [0.0; 9]),
+                test_pose_prior(3, 11, 103, [3.0, 0.0, 0.0], [0.0; 9]),
+            ],
+            ..MapperConfig::default()
+        };
+
+        let options = mapper_local_ba_options(
+            &config,
+            &reconstruction,
+            &stats,
+            5,
+            vec![0, 2],
+            vec![2],
+            None,
+            None,
+        );
+
+        assert_eq!(options.variable_images, Some(vec![0, 2]));
+        assert_eq!(options.constant_images, vec![2]);
+        assert_eq!(
+            options
+                .pose_priors
+                .iter()
+                .map(|prior| prior.image)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn redundant_point_global_ba_options_do_not_inject_pose_priors() {
+        let frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera_ids = vec![11];
+        reconstruction.image_ids = vec![101, 102];
+        for image in 0..2 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        let config = MapperConfig {
+            pose_priors: vec![test_pose_prior(1, 11, 101, [1.0, 2.0, 3.0], [0.0; 9])],
+            ..MapperConfig::default()
+        };
+
+        let options = redundant_point_global_ba_options(&config, &reconstruction, vec![0]);
+
+        assert_eq!(options.variable_images, Some(Vec::new()));
+        assert!(options.pose_priors.is_empty());
+    }
+
+    #[test]
+    fn mapper_pose_priors_match_rig_frame_data_ids() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![11, 12];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.image_ids = vec![101, 102];
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(SensorId {
+                sensor_type: SensorType::Camera,
+                sensor_id: 11,
+            }),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: SensorId {
+                        sensor_type: SensorType::Camera,
+                        sensor_id: 11,
+                    },
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: SensorId {
+                        sensor_type: SensorType::Camera,
+                        sensor_id: 12,
+                    },
+                    sensor_from_rig: Some(Rigid3::identity()),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: vec![
+                DataId {
+                    sensor_id: SensorId {
+                        sensor_type: SensorType::Camera,
+                        sensor_id: 11,
+                    },
+                    data_id: 101,
+                },
+                DataId {
+                    sensor_id: SensorId {
+                        sensor_type: SensorType::Camera,
+                        sensor_id: 12,
+                    },
+                    data_id: 102,
+                },
+            ],
+        }];
+        reconstruction.image_frame_indices = vec![Some(0), Some(0)];
+        let config = MapperConfig {
+            pose_priors: vec![test_pose_prior(1, 12, 102, [2.0, 3.0, 4.0], [0.0; 9])],
+            ..MapperConfig::default()
+        };
+
+        let options = mapper_ba_options(
+            &config,
+            &reconstruction,
+            5,
+            Some(vec![0, 1]),
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert_eq!(options.pose_priors.len(), 1);
+        assert_eq!(options.pose_priors[0].image, 1);
+        assert_eq!(options.pose_priors[0].position, [2.0, 3.0, 4.0]);
+    }
+
+    #[test]
     fn mapper_ba_defaults_match_colmap_incremental_pipeline_losses() {
         // Only assert when the environment overrides are unset so the test
         // stays deterministic.
@@ -11950,6 +13128,101 @@ mod tests {
         assert_eq!(
             registration_rollback_reason(&reconstruction, 0, false, false, &config),
             Some("bogus_camera")
+        );
+    }
+
+    #[test]
+    fn local_ba_failure_rollback_preserves_triangulator_state_and_refreshes_stats() {
+        let mut frames = vec![
+            minimal_frame(0, "seed.jpg"),
+            minimal_frame(1, "gauge.jpg"),
+            minimal_frame(2, "candidate.jpg"),
+        ];
+        frames[0].keypoints = vec![
+            rustslam::KeyPoint::new(50.0, 50.0),
+            rustslam::KeyPoint::new(55.0, 50.0),
+        ];
+        frames[2].keypoints = vec![
+            rustslam::KeyPoint::new(55.0, 50.0),
+            rustslam::KeyPoint::new(60.0, 50.0),
+        ];
+        let pairs = vec![pair_with_inliers(0, 2, &[(0, 0), (1, 1)])];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        let registration_snapshot = reconstruction.clone();
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+
+        reconstruction.poses[2] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        let tri_options = IncrementalTriangulatorOptions {
+            re_min_ratio: 0.5,
+            re_max_trials: 1,
+            min_angle_deg: 0.1,
+            merge_max_reproj_error_px: 10.0,
+            ignore_two_view_tracks: false,
+            ..IncrementalTriangulatorOptions::default()
+        };
+        {
+            let mut triangulator = IncrementalTriangulator::new(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                &mut triangulation_state,
+            );
+            assert_eq!(triangulator.retriangulate(&tri_options), 4);
+        }
+        assert_eq!(reconstruction.points.len(), 2);
+        assert_eq!(
+            triangulation_state
+                .retriangulation_trials()
+                .get(&(0, 2))
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            triangulation_state
+                .observation_manager()
+                .num_observations(2),
+            2
+        );
+
+        assert_eq!(
+            registration_rollback_reason(&reconstruction, 2, true, false, &MapperConfig::default()),
+            Some("local_ba_failed")
+        );
+        reconstruction = registration_snapshot;
+        triangulation_state.sync_after_reconstruction_rollback(&frames, &pairs, &reconstruction);
+
+        assert!(reconstruction.points.is_empty());
+        assert!(reconstruction.poses[2].is_none());
+        assert_eq!(
+            triangulation_state
+                .retriangulation_trials()
+                .get(&(0, 2))
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            triangulation_state
+                .observation_manager()
+                .num_visible_points3d(2),
+            0
+        );
+        assert_eq!(
+            triangulation_state
+                .observation_manager()
+                .num_correspondences_have_point3d(2, 0),
+            0
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
         );
     }
 
@@ -12271,6 +13544,83 @@ mod tests {
         assert!(reconstruction.observations[1]
             .iter()
             .all(|obs| obs.is_none()));
+    }
+
+    #[test]
+    fn filter_registered_frames_preserves_triangulator_trial_state() {
+        let mut frames = (0..21)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        frames[2].keypoints = vec![
+            rustslam::KeyPoint::new(50.0, 50.0),
+            rustslam::KeyPoint::new(55.0, 50.0),
+        ];
+        frames[3].keypoints = vec![
+            rustslam::KeyPoint::new(55.0, 50.0),
+            rustslam::KeyPoint::new(60.0, 50.0),
+        ];
+        let pairs = vec![pair_with_inliers(2, 3, &[(0, 0), (1, 1)])];
+        let mut reconstruction = test_reconstruction(&frames);
+        for pose in &mut reconstruction.poses {
+            *pose = Some(SE3::identity());
+        }
+        reconstruction.poses[3] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        for image in 4..frames.len() {
+            let point_id = reconstruction.points.len();
+            reconstruction.observations[image][0] = Some(point_id);
+            reconstruction.point_ids.push(point_id as u64 + 1);
+            reconstruction.points.push(Point3D {
+                xyz: [image as f32, 0.0, 5.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation { image, feature: 0 }],
+            });
+        }
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        {
+            let mut triangulator =
+                IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction, &mut tri_state);
+            assert_eq!(
+                triangulator.retriangulate(&IncrementalTriangulatorOptions {
+                    re_min_ratio: 0.5,
+                    re_max_trials: 1,
+                    min_angle_deg: 0.1,
+                    merge_max_reproj_error_px: 10.0,
+                    ignore_two_view_tracks: false,
+                    ..IncrementalTriangulatorOptions::default()
+                }),
+                4
+            );
+        }
+        assert_eq!(
+            tri_state.retriangulation_trials().get(&(2, 3)).copied(),
+            Some(1)
+        );
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+
+        let filtered = filter_registered_frames(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut stats,
+            Some(&mut filtered_units),
+            &mut tri_state,
+        );
+
+        assert_eq!(filtered, 2);
+        assert!(filtered_units.contains(&RegistrationUnitKey::Image(0)));
+        assert!(filtered_units.contains(&RegistrationUnitKey::Image(1)));
+        assert_eq!(
+            tri_state.retriangulation_trials().get(&(2, 3)).copied(),
+            Some(1)
+        );
+        assert_observation_manager_matches_fresh(&frames, &pairs, &reconstruction, &tri_state);
+        assert_eq!(registered_frame_count(&reconstruction), 19);
     }
 
     #[test]
@@ -13649,7 +14999,7 @@ mod tests {
     }
 
     #[test]
-    fn default_structureless_path_does_not_use_pair_pose_fallback() {
+    fn default_structureless_path_uses_pair_pose_fallback_without_poselib() {
         let frames = structureless_frames(4);
         let poses = structureless_world_poses();
         let mut reconstruction = test_reconstruction(&frames);
@@ -13682,9 +15032,12 @@ mod tests {
                 .expect("COLMAP structureless should register via correspondence graph + PoseLib");
             assert_eq!(choice.image, 1);
             assert_eq!(choice.source, "structureless");
-            assert!(!config.experimental_structureless_pair_pose_fallback);
         } else {
-            assert!(choice.is_none());
+            let choice =
+                choice.expect("default experimental structureless fallback should register");
+            assert_eq!(choice.image, 1);
+            assert_eq!(choice.source, "structureless");
+            assert!(config.experimental_structureless_pair_pose_fallback);
         }
     }
 
@@ -14360,6 +15713,41 @@ mod tests {
     }
 
     #[test]
+    fn final_global_ba_normalization_disabled_like_colmap_final_all() {
+        assert!(!final_global_ba_normalizes_reconstruction(
+            &MapperConfig::default()
+        ));
+    }
+
+    #[test]
+    fn global_ba_prior_position_disables_incremental_normalization_like_colmap() {
+        let frames = vec![
+            minimal_frame(0, "a.jpg"),
+            minimal_frame(1, "b.jpg"),
+            minimal_frame(2, "c.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera_ids = vec![11];
+        reconstruction.image_ids = vec![101, 102, 103];
+        for image in 0..3 {
+            reconstruction.poses[image] = Some(SE3::identity());
+        }
+        let config = MapperConfig {
+            pose_priors: vec![
+                test_pose_prior(1, 11, 101, [0.0, 0.0, 0.0], [0.0; 9]),
+                test_pose_prior(2, 11, 102, [1.0, 0.0, 0.0], [0.0; 9]),
+                test_pose_prior(3, 11, 103, [2.0, 0.0, 0.0], [0.0; 9]),
+            ],
+            ..MapperConfig::default()
+        };
+        let options =
+            mapper_global_ba_options(&config, &reconstruction, 5, None, vec![], None, None);
+
+        assert!(incremental_global_ba_normalizes_reconstruction(&config));
+        assert!(global_ba_uses_prior_position(&options, &reconstruction));
+    }
+
+    #[test]
     fn global_ba_gauge_images_use_registered_images_not_zero_index() {
         let frames = vec![
             minimal_frame(0, "a.jpg"),
@@ -14603,6 +15991,237 @@ mod tests {
     }
 
     #[test]
+    fn database_pair_geometry_orients_stored_pose_when_image_ids_descend() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        let first_keypoints = vec![
+            ColmapKeypoint::new(45.0, 45.0),
+            ColmapKeypoint::new(55.0, 45.0),
+            ColmapKeypoint::new(45.0, 55.0),
+            ColmapKeypoint::new(55.0, 55.0),
+        ];
+        let second_keypoints = vec![
+            ColmapKeypoint::new(40.0, 45.0),
+            ColmapKeypoint::new(50.0, 45.0),
+            ColmapKeypoint::new(40.0, 55.0),
+            ColmapKeypoint::new(50.0, 55.0),
+        ];
+        for (image_id, name, keypoints) in [
+            (5, "first.jpg", first_keypoints),
+            (2, "second.jpg", second_keypoints),
+        ] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(image_id, &keypoints)?;
+        }
+        db.write_two_view_geometry(
+            5,
+            2,
+            &ColmapTwoViewGeometry {
+                config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+                inlier_matches: (0..4).map(|idx| FeatureMatch::new(idx, idx)).collect(),
+                qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                tvec: Some([-1.0, 0.0, 0.0]),
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let mut frames = vec![minimal_frame(0, "first.jpg"), minimal_frame(1, "second.jpg")];
+        let database = load_mapper_database(Some(&db_path), &frames, 0)?.expect("database input");
+        apply_database_keypoints(&mut frames, &database.keypoints_by_name);
+        let pair_matches = database_pair_matches_for_frames(&frames, &database.cache)?;
+        let camera = CameraModel::from_colmap(
+            crate::types::COLMAP_PINHOLE,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 50.0],
+        )
+        .unwrap();
+
+        let pair = database_pair_geometry_from_stored_pose(
+            &pair_matches[0],
+            &frames,
+            &database.cache,
+            &database.two_view_geometries,
+            camera,
+            camera,
+            &MapperConfig {
+                min_inliers: 4,
+                min_triangulated: 4,
+                max_reprojection_error_px: 1.0,
+                ..MapperConfig::default()
+            },
+        )
+        .expect("stored pose pair with descending image ids");
+
+        assert_eq!(pair.inliers, 4);
+        assert_eq!(pair.relative_pose.translation(), [-1.0, 0.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn database_pair_geometry_preserves_calibrated_rig_config_for_initial_pair_gate() -> Result<()>
+    {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        let left_keypoints = vec![
+            ColmapKeypoint::new(45.0, 45.0),
+            ColmapKeypoint::new(55.0, 45.0),
+            ColmapKeypoint::new(45.0, 55.0),
+            ColmapKeypoint::new(55.0, 55.0),
+        ];
+        let right_keypoints = vec![
+            ColmapKeypoint::new(40.0, 45.0),
+            ColmapKeypoint::new(50.0, 45.0),
+            ColmapKeypoint::new(40.0, 55.0),
+            ColmapKeypoint::new(50.0, 55.0),
+        ];
+        for (image_id, name, keypoints) in [
+            (1, "left.jpg", left_keypoints),
+            (2, "right.jpg", right_keypoints),
+        ] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(image_id, &keypoints)?;
+        }
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: crate::database::COLMAP_TWO_VIEW_CALIBRATED_RIG,
+                inlier_matches: (0..4).map(|idx| FeatureMatch::new(idx, idx)).collect(),
+                qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                tvec: Some([-1.0, 0.0, 0.0]),
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        let database = load_mapper_database(Some(&db_path), &frames, 0)?.expect("database input");
+        apply_database_keypoints(&mut frames, &database.keypoints_by_name);
+        let pair_matches = database_pair_matches_for_frames(&frames, &database.cache)?;
+        let camera = CameraModel::from_colmap(
+            crate::types::COLMAP_PINHOLE,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 50.0],
+        )
+        .unwrap();
+
+        let pair = database_pair_geometry_from_stored_pose(
+            &pair_matches[0],
+            &frames,
+            &database.cache,
+            &database.two_view_geometries,
+            camera,
+            camera,
+            &MapperConfig {
+                min_inliers: 4,
+                min_triangulated: 4,
+                max_reprojection_error_px: 1.0,
+                ..MapperConfig::default()
+            },
+        )
+        .expect("stored pose pair");
+
+        assert_eq!(
+            pair.two_view_config,
+            crate::database::COLMAP_TWO_VIEW_CALIBRATED_RIG
+        );
+
+        let mut reconstruction = test_reconstruction(&frames);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 1,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 2,
+        };
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3 {
+                        qvec: [1.0, 0.0, 0.0, 0.0],
+                        tvec: [0.2, 0.0, 0.0],
+                    }),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![
+            Frame {
+                frame_id: 11,
+                rig_id: 3,
+                rig_from_world: Rigid3::identity(),
+                data_ids: vec![DataId {
+                    sensor_id: ref_sensor,
+                    data_id: 1,
+                }],
+            },
+            Frame {
+                frame_id: 12,
+                rig_id: 3,
+                rig_from_world: Rigid3::identity(),
+                data_ids: vec![DataId {
+                    sensor_id: aux_sensor,
+                    data_id: 2,
+                }],
+            },
+        ];
+        reconstruction.image_frame_indices = vec![Some(0), Some(1)];
+
+        assert!(generalized_initial_pair_gate(&pair, &reconstruction));
+        Ok(())
+    }
+
+    #[test]
     fn writes_pair_geometries_to_database_with_colmap_direction() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("database.db");
@@ -14668,6 +16287,536 @@ mod tests {
     }
 
     #[test]
+    fn run_incremental_pipeline_reports_success_status() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.02),
+                glam::Vec3::new(-0.35, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.03),
+                glam::Vec3::new(0.45, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.04),
+                glam::Vec3::new(0.9, 0.0, 0.0),
+            ),
+        ];
+        let points = (0..12)
+            .map(|idx| {
+                let col = (idx % 4) as f32;
+                let row = (idx / 4) as f32;
+                [-0.3 + col * 0.2, -0.2 + row * 0.18, 3.0 + idx as f32 * 0.03]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = (0..4)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+            frames[image].colors = vec![[image as u8, 0, 0]; points.len()];
+        }
+        let pairs = vec![initial_pair_from_projected_points(
+            2,
+            3,
+            poses[2],
+            poses[3],
+            points.len(),
+        )];
+        let config = MapperConfig {
+            multiple_models: false,
+            local_ba: false,
+            global_ba: false,
+            init_num_trials: 1,
+            init_min_num_inliers: 4,
+            init_min_tri_angle_deg: 0.5,
+            min_triangulated: 0,
+            abs_pose_min_num_inliers: 4,
+            ignore_two_view_tracks: false,
+            ..MapperConfig::default()
+        };
+
+        let result = run_incremental_pipeline(&frames, camera, None, &pairs, &config, None);
+
+        assert_eq!(result.status, IncrementalPipelineStatus::Success);
+        assert_eq!(result.reconstructions.len(), 1);
+        assert!(registered_image_count(&result.reconstructions[0]) >= 2);
+    }
+
+    #[test]
+    fn rig_seed_continuation_registers_new_images_in_single_attempt() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        let (camera, poses, points, frames, mut sparse_model) = colmap_rig_frame_seed_fixture();
+        densify_colmap_rig_sparse_seed(&mut sparse_model, &frames, &points);
+        write_colmap_sparse_text(&sparse, &sparse_model)?;
+        let setup = reference_camera_setup(
+            dir.path(),
+            &frames.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        )?;
+        let pairs = vec![
+            initial_pair_from_projected_points(0, 2, poses[0], poses[2], points.len()),
+            initial_pair_from_projected_points(1, 2, poses[1], poses[2], points.len()),
+            initial_pair_from_projected_points(2, 3, poses[2], poses[3], points.len()),
+        ];
+        let config = MapperConfig {
+            multiple_models: false,
+            local_ba: false,
+            global_ba: false,
+            init_num_trials: 1,
+            init_min_num_inliers: 4,
+            init_min_tri_angle_deg: 0.5,
+            min_triangulated: 0,
+            abs_pose_min_num_inliers: 1,
+            max_reg_trials: 8,
+            ..MapperConfig::default()
+        };
+        assert!(
+            setup
+                .seed_reconstruction
+                .as_ref()
+                .is_some_and(|seed| seed.poses.iter().any(Option::is_some)),
+            "COLMAP sparse reference should seed existing reconstruction"
+        );
+        let mut session = IncrementalMapperSession::default();
+        let (reconstruction, log) = incremental_map_single_attempt(
+            &frames,
+            camera,
+            Some(&setup),
+            &pairs,
+            &config,
+            &mut session,
+            0,
+            &mut None,
+        )?;
+
+        assert!(log
+            .iter()
+            .any(|line| line.starts_with("continue_reconstruction registered_images=2 points=12")));
+        assert!(!log.iter().any(|line| line.starts_with("initial_pair ")));
+        assert!(reconstruction.poses[0].is_some());
+        assert!(reconstruction.poses[1].is_some());
+        assert!(
+            reconstruction.poses[2].is_some(),
+            "continuation should register image_2 from COLMAP rig seed: {:?}",
+            log
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_seed_registers_neighbor_with_mapper_pnp() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_mapper_fixture()?;
+        let config = MapperConfig {
+            multiple_models: false,
+            local_ba: false,
+            global_ba: false,
+            extract_colors: false,
+            init_num_trials: 1,
+            abs_pose_min_num_inliers: 120,
+            pnp_iterations: 10_000,
+            random_seed: 0,
+            ..MapperConfig::default()
+        };
+        let mut session = IncrementalMapperSession::default();
+        let (reconstruction, log) = incremental_map_single_attempt(
+            &frames,
+            camera,
+            Some(&setup),
+            &pairs,
+            &config,
+            &mut session,
+            0,
+            &mut None,
+        )?;
+
+        assert!(log
+            .iter()
+            .any(|line| line.starts_with("continue_reconstruction registered_images=1 ")));
+        assert!(!log.iter().any(|line| line.starts_with("initial_pair ")));
+        let registration = log
+            .iter()
+            .find(|line| line.starts_with("register frame_0003.jpg source=pnp"))
+            .unwrap_or_else(|| panic!("missing mapper PnP registration log: {log:?}"));
+        assert!(
+            registration.contains("pnp_inliers=256") || registration.contains("pnp_inliers=255"),
+            "unexpected registration log: {registration}"
+        );
+
+        let estimated = reconstruction.poses[1].expect("candidate registered");
+        let rotation_error = relative_rotation_deg(estimated, reference_pose);
+        let translation_error = pose_translation_error(estimated, reference_pose);
+        assert!(
+            rotation_error < 0.2,
+            "rotation_error={rotation_error}deg estimated={:?} reference={:?}",
+            estimated.quaternion(),
+            reference_pose.quaternion()
+        );
+        assert!(
+            translation_error < 0.05,
+            "translation_error={translation_error} estimated={:?} reference={:?}",
+            estimated.translation(),
+            reference_pose.translation()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_seed_mapper_pnp_survives_local_ba() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let config = MapperConfig {
+            multiple_models: false,
+            local_ba: true,
+            local_ba_iterations: 10,
+            local_ba_max_refinements: 1,
+            global_ba: false,
+            extract_colors: false,
+            init_num_trials: 1,
+            abs_pose_min_num_inliers: 120,
+            pnp_iterations: 10_000,
+            random_seed: 0,
+            ..MapperConfig::default()
+        };
+        let mut session = IncrementalMapperSession::default();
+        let (reconstruction, log) = incremental_map_single_attempt(
+            &frames,
+            camera,
+            Some(&setup),
+            &pairs,
+            &config,
+            &mut session,
+            0,
+            &mut None,
+        )?;
+
+        assert!(log
+            .iter()
+            .any(|line| line.starts_with("continue_reconstruction registered_images=2 ")));
+        assert!(!log.iter().any(|line| line.starts_with("initial_pair ")));
+        let registration = log
+            .iter()
+            .find(|line| line.starts_with("register frame_0003.jpg source=pnp"))
+            .unwrap_or_else(|| panic!("missing mapper PnP registration log: {log:?}"));
+        assert!(
+            registration.contains("pnp_inliers=256") || registration.contains("pnp_inliers=255"),
+            "unexpected registration log: {registration}"
+        );
+        let local_ba = log
+            .iter()
+            .find(|line| line.starts_with("local_ba image=frame_0003.jpg"))
+            .unwrap_or_else(|| panic!("missing local BA log after mapper PnP: {log:?}"));
+        assert!(
+            local_ba.contains("local_images=1")
+                && local_ba.contains("variable_images=2")
+                && local_ba.contains("points=256"),
+            "unexpected local BA log: {local_ba}"
+        );
+
+        let estimated = reconstruction.poses[2].expect("candidate registered after local BA");
+        let rotation_error = relative_rotation_deg(estimated, reference_pose);
+        let translation_error = pose_translation_error(estimated, reference_pose);
+        assert!(
+            rotation_error < 0.05,
+            "rotation_error={rotation_error}deg estimated={:?} reference={:?}",
+            estimated.quaternion(),
+            reference_pose.quaternion()
+        );
+        assert!(
+            translation_error < 0.05,
+            "translation_error={translation_error} estimated={:?} reference={:?}",
+            estimated.translation(),
+            reference_pose.translation()
+        );
+        let candidate_observations = reconstruction.observations[2]
+            .iter()
+            .filter(|point| point.is_some())
+            .count();
+        assert!(
+            candidate_observations >= 255,
+            "candidate observations should survive local BA: {candidate_observations}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_seed_mapper_pnp_survives_scheduled_global_ba() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let reference_relative = pairs
+            .iter()
+            .find(|pair| pair.left == 1 && pair.right == 2)
+            .expect("seed-candidate reference pair")
+            .relative_pose;
+        let config = MapperConfig {
+            multiple_models: false,
+            local_ba: false,
+            global_ba: true,
+            global_ba_iterations: 10,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 1.1,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            init_num_trials: 1,
+            abs_pose_min_num_inliers: 120,
+            pnp_iterations: 10_000,
+            random_seed: 0,
+            ..MapperConfig::default()
+        };
+        let mut session = IncrementalMapperSession::default();
+        let (reconstruction, log) = incremental_map_single_attempt(
+            &frames,
+            camera,
+            Some(&setup),
+            &pairs,
+            &config,
+            &mut session,
+            0,
+            &mut None,
+        )?;
+
+        assert!(log
+            .iter()
+            .any(|line| line.starts_with("continue_reconstruction registered_images=2 ")));
+        assert!(!log.iter().any(|line| line.starts_with("initial_pair ")));
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("register frame_0003.jpg source=pnp")),
+            "missing mapper PnP registration log: {log:?}"
+        );
+        let global_ba = log
+            .iter()
+            .find(|line| line.starts_with("global_ba reason=scheduled round=1"))
+            .unwrap_or_else(|| panic!("missing scheduled global BA log: {log:?}"));
+        assert!(
+            global_ba.contains("size=small")
+                && global_ba.contains("observations=")
+                && global_ba.contains("residuals="),
+            "unexpected scheduled global BA log: {global_ba}"
+        );
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("global_ba_normalize reason=scheduled round=1")),
+            "scheduled global BA should normalize incremental reconstructions: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|line| line.starts_with("registration_rollback ")),
+            "global BA fixture should not roll back registration: {log:?}"
+        );
+
+        let estimated = reconstruction.poses[2].expect("candidate registered after global BA");
+        let rotation_error = relative_rotation_deg(estimated, reference_pose);
+        assert!(
+            rotation_error < 0.1,
+            "rotation_error={rotation_error}deg estimated={:?} reference={:?}",
+            estimated.quaternion(),
+            reference_pose.quaternion()
+        );
+        let estimated_relative = estimated.compose(
+            &reconstruction.poses[1]
+                .expect("seed remains registered")
+                .inverse(),
+        );
+        let relative_rotation_error = relative_rotation_deg(estimated_relative, reference_relative);
+        let relative_translation_error =
+            pose_translation_direction_error_deg(estimated_relative, reference_relative);
+        assert!(
+            relative_rotation_error < 0.05,
+            "relative_rotation_error={relative_rotation_error}deg"
+        );
+        assert!(
+            relative_translation_error < 0.5,
+            "relative_translation_direction_error={relative_translation_error}deg"
+        );
+        let candidate_observations = reconstruction.observations[2]
+            .iter()
+            .filter(|point| point.is_some())
+            .count();
+        assert!(
+            candidate_observations >= 255,
+            "candidate observations should survive scheduled global BA: {candidate_observations}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_pipeline_seeded_global_ba_prepare_completes_tracks() -> Result<()> {
+        let (camera, frames, mut setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let seed = setup
+            .seed_reconstruction
+            .as_mut()
+            .expect("fixture seed reconstruction");
+        seed.poses[2] = Some(reference_pose);
+        assert_eq!(
+            seed.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            0
+        );
+        let config = MapperConfig {
+            multiple_models: false,
+            local_ba: false,
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            init_num_trials: 1,
+            random_seed: 0,
+            ..MapperConfig::default()
+        };
+
+        let result = run_incremental_pipeline(&frames, camera, Some(&setup), &pairs, &config, None);
+
+        assert_eq!(result.status, IncrementalPipelineStatus::Success);
+        assert_eq!(result.reconstructions.len(), 1);
+        assert!(result
+            .debug_log
+            .iter()
+            .any(|line| line.starts_with("continue_reconstruction registered_images=3 ")));
+        let prepare = result
+            .debug_log
+            .iter()
+            .find(|line| line.starts_with("global_ba_prepare reason=initial"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing pipeline global BA prepare log: {:?}",
+                    result.debug_log
+                )
+            });
+        let completed = prepare
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("completed="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("prepare completed count");
+        assert!(
+            completed > 0,
+            "pipeline global BA prepare should complete true COLMAP tracks: {prepare}"
+        );
+        let reconstruction = &result.reconstructions[0];
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            256
+        );
+        assert!(
+            !result
+                .debug_log
+                .iter()
+                .any(|line| line.starts_with("registration_rollback ")),
+            "seeded pipeline prepare fixture should not roll back: {:?}",
+            result.debug_log
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_seed_mapper_pnp_prior_global_ba_skips_normalization() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let seed = setup
+            .seed_reconstruction
+            .as_ref()
+            .expect("fixture seed reconstruction");
+        let pose_priors = [
+            seed.poses[0].expect("gauge pose"),
+            seed.poses[1].expect("seed pose"),
+            reference_pose,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(image, pose)| {
+            let center = camera_center(pose);
+            test_pose_prior(
+                image as u32 + 1,
+                setup.camera_ids[setup.image_camera_indices[image]],
+                setup.image_ids[image] as u64,
+                [center.x as f64, center.y as f64, center.z as f64],
+                position_prior_covariance(0.01),
+            )
+        })
+        .collect::<Vec<_>>();
+        let config = MapperConfig {
+            multiple_models: false,
+            local_ba: false,
+            global_ba: true,
+            global_ba_iterations: 10,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 1.1,
+            global_ba_points_ratio: 10.0,
+            pose_priors,
+            extract_colors: false,
+            init_num_trials: 1,
+            abs_pose_min_num_inliers: 120,
+            pnp_iterations: 10_000,
+            random_seed: 0,
+            ..MapperConfig::default()
+        };
+        let mut session = IncrementalMapperSession::default();
+        let (reconstruction, log) = incremental_map_single_attempt(
+            &frames,
+            camera,
+            Some(&setup),
+            &pairs,
+            &config,
+            &mut session,
+            0,
+            &mut None,
+        )?;
+
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("global_ba reason=scheduled round=1")),
+            "missing scheduled global BA log: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|line| line.starts_with("global_ba_normalize reason=scheduled")),
+            "COLMAP prior-position global BA should skip normalization: {log:?}"
+        );
+
+        let estimated =
+            reconstruction.poses[2].expect("candidate registered after prior-position global BA");
+        let rotation_error = relative_rotation_deg(estimated, reference_pose);
+        let estimated_center = camera_center(estimated);
+        let reference_center = camera_center(reference_pose);
+        assert!(
+            rotation_error < 3.0,
+            "rotation_error={rotation_error}deg estimated={:?} reference={:?}",
+            estimated.quaternion(),
+            reference_pose.quaternion()
+        );
+        assert!(
+            estimated_center.distance(reference_center) < 0.25,
+            "center_error={} estimated={:?} reference={:?}",
+            estimated_center.distance(reference_center),
+            estimated_center,
+            reference_center
+        );
+        Ok(())
+    }
+
+    #[test]
     fn initial_pair_prefers_strong_non_adjacent_colmap_style_candidate() {
         let weak_adjacent = test_pair(0, 1, 120, 60, 20.0, [1.0, 0.0, 0.0]);
         let strong_non_adjacent = test_pair(0, 3, 220, 140, 25.0, [1.0, 0.1, 0.0]);
@@ -14684,6 +16833,116 @@ mod tests {
         .unwrap();
 
         assert_eq!((chosen.left, chosen.right), (0, 3));
+    }
+
+    #[test]
+    fn parallel_initial_pair_selection_matches_sequential_colmap_order() {
+        let weak_adjacent = test_pair(0, 1, 120, 60, 20.0, [1.0, 0.0, 0.0]);
+        let strong_non_adjacent = test_pair(0, 3, 220, 140, 25.0, [1.0, 0.1, 0.0]);
+        let pairs = vec![weak_adjacent, strong_non_adjacent];
+        let frames = structureless_frames(4);
+        let reconstruction = test_reconstruction(&frames);
+        let camera_flags = camera_prior_focal_flags(&reconstruction, true);
+
+        let sequential = {
+            let mut selection_state =
+                InitialPairSelectionState::from_reconstruction(&reconstruction);
+            choose_initial_pair(
+                &pairs,
+                &reconstruction,
+                &MapperConfig::default(),
+                &camera_flags,
+                &mut selection_state,
+            )
+            .unwrap()
+        };
+        let parallel = {
+            let mut selection_state =
+                InitialPairSelectionState::from_reconstruction(&reconstruction);
+            choose_initial_pair(
+                &pairs,
+                &reconstruction,
+                &MapperConfig {
+                    threads: Some(4),
+                    ..MapperConfig::default()
+                },
+                &camera_flags,
+                &mut selection_state,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            (sequential.left, sequential.right),
+            (parallel.left, parallel.right)
+        );
+        assert_eq!((sequential.left, sequential.right), (0, 3));
+    }
+
+    #[test]
+    fn reconstruction_with_reset_frame_cameras_restores_bogus_sibling_prior() {
+        let frames = vec![
+            minimal_frame(0, "rig_ref.jpg"),
+            minimal_frame(1, "rig_aux.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        let good = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let bogus = CameraModel::new_pinhole(100, 100, 1.0e6, 1.0e6, 50.0, 50.0);
+        let ref_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 11,
+        };
+        let aux_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 12,
+        };
+        reconstruction.cameras = vec![good, bogus];
+        reconstruction.camera_ids = vec![11, 12];
+        reconstruction.image_camera_indices = vec![0, 1];
+        reconstruction.rigs = vec![Rig {
+            rig_id: 3,
+            ref_sensor_id: Some(ref_sensor.clone()),
+            sensors: vec![
+                RigSensor {
+                    sensor_id: ref_sensor.clone(),
+                    sensor_from_rig: None,
+                },
+                RigSensor {
+                    sensor_id: aux_sensor.clone(),
+                    sensor_from_rig: Some(Rigid3::identity()),
+                },
+            ],
+        }];
+        reconstruction.frames = vec![Frame {
+            frame_id: 9,
+            rig_id: 3,
+            rig_from_world: Rigid3::identity(),
+            data_ids: vec![
+                DataId {
+                    sensor_id: ref_sensor,
+                    data_id: reconstruction.image_id(0) as u64,
+                },
+                DataId {
+                    sensor_id: aux_sensor,
+                    data_id: reconstruction.image_id(1) as u64,
+                },
+            ],
+        }];
+        reconstruction.image_frame_indices = vec![Some(0), Some(0)];
+        let priors = vec![good, good];
+        let config = MapperConfig::default();
+
+        let snapshot =
+            reconstruction_with_reset_frame_cameras(&reconstruction, 0, &config, &priors);
+
+        assert!(!camera_has_bogus_params(
+            snapshot.camera_for_image(1),
+            &config
+        ));
+        assert!(camera_has_bogus_params(
+            reconstruction.camera_for_image(1),
+            &config
+        ));
     }
 
     #[test]
@@ -15021,6 +17280,7 @@ mod tests {
             abs_pose_min_num_inliers: 4,
             local_ba: false,
             global_ba: false,
+            ignore_two_view_tracks: false,
             ..MapperConfig::default()
         };
         let mut session = IncrementalMapperSession::default();
@@ -15108,6 +17368,7 @@ mod tests {
             abs_pose_min_num_inliers: 4,
             local_ba: false,
             global_ba: false,
+            ignore_two_view_tracks: false,
             ..MapperConfig::default()
         };
 
@@ -15199,6 +17460,102 @@ mod tests {
             .iter()
             .any(|line| line.starts_with("pipeline_snapshot path=")
                 && line.contains("registered_frames=3")));
+    }
+
+    #[test]
+    fn pipeline_final_global_ba_skips_normalization_like_colmap_final_all() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.03),
+                glam::Vec3::new(-0.35, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.02),
+                glam::Vec3::new(0.45, 0.0, 0.0),
+            ),
+        ];
+        let points = (0..12)
+            .map(|idx| {
+                let col = (idx % 4) as f32;
+                let row = (idx / 4) as f32;
+                [-0.3 + col * 0.2, -0.2 + row * 0.18, 3.0 + idx as f32 * 0.03]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = (0..3)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+            frames[image].colors = vec![[image as u8, 0, 0]; points.len()];
+        }
+        let pairs = vec![
+            initial_pair_from_projected_points(0, 1, poses[0], poses[1], points.len()),
+            initial_pair_from_projected_points(0, 2, poses[0], poses[2], points.len()),
+            initial_pair_from_projected_points(1, 2, poses[1], poses[2], points.len()),
+        ];
+        let config = MapperConfig {
+            multiple_models: false,
+            init_num_trials: 1,
+            init_min_num_inliers: 4,
+            init_min_tri_angle_deg: 0.5,
+            min_triangulated: 0,
+            abs_pose_min_num_inliers: 4,
+            local_ba: false,
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        let result = incremental_pipeline_map(&frames, camera, None, &pairs, &config)
+            .expect("final global BA pipeline");
+
+        assert_eq!(result.reconstructions.len(), 1);
+        assert!(result.reconstructions[0].poses.iter().all(Option::is_some));
+        assert!(
+            result
+                .debug_log
+                .iter()
+                .any(|line| line.starts_with("global_ba reason=initial round=1")),
+            "initial incremental global BA should still run: {:?}",
+            result.debug_log
+        );
+        assert!(
+            result
+                .debug_log
+                .iter()
+                .any(|line| line.starts_with("global_ba_normalize reason=initial round=1")),
+            "initial incremental global BA should still normalize: {:?}",
+            result.debug_log
+        );
+        assert!(
+            result
+                .debug_log
+                .iter()
+                .any(|line| line.starts_with("global_ba reason=final round=1")),
+            "final global BA should run after the reconstruction changed: {:?}",
+            result.debug_log
+        );
+        assert!(
+            !result
+                .debug_log
+                .iter()
+                .any(|line| line.starts_with("global_ba_normalize reason=final")),
+            "COLMAP final-all global BA should not normalize: {:?}",
+            result.debug_log
+        );
     }
 
     #[test]
@@ -15666,6 +18023,7 @@ mod tests {
             abs_pose_min_num_inliers: 1,
             local_ba: false,
             global_ba: false,
+            ignore_two_view_tracks: false,
             ..MapperConfig::default()
         };
 
@@ -15811,6 +18169,7 @@ mod tests {
             abs_pose_min_num_inliers: 1,
             local_ba: false,
             global_ba: false,
+            ignore_two_view_tracks: false,
             ..MapperConfig::default()
         };
 
@@ -15880,6 +18239,7 @@ mod tests {
             abs_pose_min_num_inliers: 1,
             local_ba: false,
             global_ba: false,
+            ignore_two_view_tracks: false,
             ..MapperConfig::default()
         };
 
@@ -16363,6 +18723,18 @@ mod tests {
                     ..MapperConfig::default()
                 }
             )
+        );
+        assert_eq!(
+            registration_rank(
+                &many_visible,
+                &reconstruction,
+                &manager,
+                &MapperConfig {
+                    image_selection_method: ImageSelectionMethod::MinUncertainty,
+                    ..MapperConfig::default()
+                }
+            ),
+            manager.point3d_visibility_score(1) as f32
         );
         assert_eq!(
             registration_rank(
@@ -16997,6 +19369,7 @@ mod tests {
                 max_reprojection_error_px: 1.0,
                 ..MapperConfig::default()
             },
+            None,
             1.0,
             0.1,
             3,
@@ -17004,6 +19377,1699 @@ mod tests {
 
         assert_eq!(removed, 2);
         assert!(reconstruction.points.is_empty());
+    }
+
+    #[test]
+    fn stateful_track_filter_updates_candidate_visibility_stats() {
+        let mut frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "registered_b.jpg"),
+            minimal_frame(2, "candidate.jpg"),
+        ];
+        frames[0].keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        frames[1].keypoints[0] = rustslam::KeyPoint::new(90.0, 50.0);
+        frames[2].keypoints[0] = rustslam::KeyPoint::new(55.0, 50.0);
+        let pairs = vec![
+            pair_with_inliers(0, 2, &[(0, 0)]),
+            pair_with_inliers(1, 2, &[(0, 0)]),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.point_ids.push(21);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+
+        assert_eq!(
+            triangulation_state
+                .observation_manager()
+                .num_visible_correspondences(2),
+            2
+        );
+        assert_eq!(
+            triangulation_state
+                .observation_manager()
+                .num_visible_points3d(2),
+            1
+        );
+        assert!(
+            triangulation_state
+                .observation_manager()
+                .point3d_visibility_score(2)
+                > 0
+        );
+        assert_eq!(
+            triangulation_state
+                .observation_manager()
+                .num_correspondences_have_point3d(2, 0),
+            2
+        );
+
+        let removed = filter_reprojection_tracks_with_state(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &MapperConfig {
+                max_reprojection_error_px: 1.0,
+                ..MapperConfig::default()
+            },
+            &mut triangulation_state,
+        );
+
+        assert_eq!(removed, 2);
+        assert!(reconstruction.points.is_empty());
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        let state_manager = triangulation_state.observation_manager();
+        assert_eq!(state_manager.num_visible_correspondences(2), 2);
+        assert_eq!(state_manager.num_visible_points3d(2), 0);
+        assert_eq!(state_manager.point3d_visibility_score(2), 0);
+        assert_eq!(state_manager.num_correspondences_have_point3d(2, 0), 0);
+    }
+
+    #[test]
+    fn real_colmap_sparse_track_filter_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, pairs, _) = real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        assert_eq!(reconstruction.points.len(), 256);
+        let removed_track = reconstruction.points[0].track.clone();
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+
+        reconstruction.points[0].xyz = [0.0, 0.0, -10.0];
+        let removed = filter_reprojection_tracks_with_policy(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &MapperConfig::default(),
+            Some(triangulation_state.observation_manager_mut()),
+            4.0,
+            0.0,
+            2,
+        );
+
+        assert_eq!(removed, removed_track.len());
+        assert_eq!(reconstruction.points.len(), 255);
+        for obs in removed_track {
+            assert_eq!(reconstruction.observations[obs.image][obs.feature], None);
+        }
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_initial_pair_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, pairs, _) = real_colmap_sparse_seed_mapper_fixture()?;
+        let setup = ReferenceCameraSetup {
+            seed_reconstruction: None,
+            ..setup
+        };
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        let initial = pairs[0].clone();
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        let tri_options = IncrementalTriangulatorOptions {
+            ignore_two_view_tracks: false,
+            ..IncrementalTriangulatorOptions::from_mapper_threshold(4.0)
+        };
+
+        register_and_triangulate_initial_image_pair(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &mut triangulation_state,
+            &tri_options,
+            &initial,
+        );
+        assert!(
+            reconstruction.points.len() > 0,
+            "initial pair should triangulate real COLMAP correspondences"
+        );
+        filter_reprojection_tracks_with_state(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut triangulation_state,
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structureless_tracks_keep_observation_manager_in_sync_with_fresh_rebuild() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.04),
+                glam::Vec3::new(-0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.03),
+                glam::Vec3::new(0.35, 0.0, 0.0),
+            ),
+        ];
+        let point = [0.05, -0.02, 3.2];
+        let mut frames = vec![
+            minimal_frame(0, "registered_a.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+            minimal_frame(2, "registered_b.jpg"),
+        ];
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = vec![project_test_point(camera, pose, point)];
+            frames[image].colors = vec![[image as u8, 0, 0]];
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses[0] = Some(poses[0]);
+        reconstruction.poses[1] = Some(poses[1]);
+        reconstruction.poses[2] = Some(poses[2]);
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.points.push(Point3D {
+            xyz: point,
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 0,
+                feature: 0,
+            }],
+        });
+        reconstruction.point_ids.push(1);
+        let inliers = vec![
+            StructurelessInlier {
+                image: 1,
+                feature: 0,
+                other: 0,
+                other_feature: 0,
+            },
+            StructurelessInlier {
+                image: 1,
+                feature: 0,
+                other: 2,
+                other_feature: 0,
+            },
+        ];
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+        let report = continue_or_triangulate_structureless_tracks(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &inliers,
+            &IncrementalTriangulatorOptions::from_mapper_threshold(4.0),
+            &MapperConfig {
+                max_reprojection_error_px: 4.0,
+                ..MapperConfig::default()
+            },
+            triangulation_state.observation_manager_mut(),
+        );
+        assert_eq!(report.continued_observations, 1);
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &[],
+            &reconstruction,
+            &triangulation_state,
+        );
+    }
+
+    #[test]
+    fn real_colmap_sparse_local_ba_post_filter_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, mut pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        reconstruction.poses[2] = Some(reference_pose);
+        assert_eq!(reconstruction.points.len(), 256);
+
+        let gauge_candidate_pair = pairs
+            .iter()
+            .find(|pair| pair.left == 0 && pair.right == 2)
+            .expect("gauge-candidate pair");
+        for m in &gauge_candidate_pair.inlier_matches {
+            let gauge_feature = m.query_idx as usize;
+            let candidate_feature = m.train_idx as usize;
+            let Some(point_id) = reconstruction.observations[0][gauge_feature] else {
+                continue;
+            };
+            if reconstruction.observations[2][candidate_feature].is_none() {
+                reconstruction.observations[2][candidate_feature] = Some(point_id);
+                reconstruction.points[point_id]
+                    .track
+                    .push(TrackObservation {
+                        image: 2,
+                        feature: candidate_feature,
+                    });
+            }
+        }
+        assert_eq!(reconstruction.points[0].track.len(), 3);
+
+        let removed_track = reconstruction.points[0].track.clone();
+        remove_track_features_from_pairs(&mut pairs, &removed_track);
+        let candidate_obs = removed_track
+            .iter()
+            .copied()
+            .find(|obs| obs.image == 2)
+            .expect("candidate observation");
+        for obs in &removed_track {
+            reconstruction.observations[obs.image][obs.feature] = None;
+        }
+        reconstruction.observations[candidate_obs.image][candidate_obs.feature] = Some(0);
+        reconstruction.points[0].track = vec![candidate_obs];
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        let stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let config = MapperConfig {
+            local_ba: true,
+            local_ba_iterations: 3,
+            local_ba_max_refinements: 1,
+            global_ba: false,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        let report = refine_local_bundle_after_registration(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            2,
+            0,
+            &mapper_triangulator_options(&config),
+            &config,
+            &stats,
+            &mut triangulation_state,
+        )
+        .expect("local BA should run on real COLMAP sparse fixture");
+
+        assert!(
+            report.filtered_observations > 0,
+            "local BA post-filter should delete observations from the real fixture: {report:?}"
+        );
+        assert!(reconstruction.points.len() < 256);
+        for obs in removed_track {
+            assert_eq!(reconstruction.observations[obs.image][obs.feature], None);
+        }
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_local_ba_merges_tracks_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        reconstruction.poses[2] = Some(reference_pose);
+        assert_eq!(reconstruction.points.len(), 256);
+
+        let gauge_candidate_pair = pairs
+            .iter()
+            .find(|pair| pair.left == 0 && pair.right == 2)
+            .expect("gauge-candidate pair");
+        let mut split_candidate_feature = None;
+        for (idx, m) in gauge_candidate_pair.inlier_matches.iter().enumerate() {
+            let gauge_feature = m.query_idx as usize;
+            let candidate_feature = m.train_idx as usize;
+            let Some(point_id) = reconstruction.observations[0][gauge_feature] else {
+                continue;
+            };
+            if idx == 0 {
+                split_candidate_feature = Some((point_id, candidate_feature));
+                continue;
+            }
+            if reconstruction.observations[2][candidate_feature].is_none() {
+                reconstruction.observations[2][candidate_feature] = Some(point_id);
+                reconstruction.points[point_id]
+                    .track
+                    .push(TrackObservation {
+                        image: 2,
+                        feature: candidate_feature,
+                    });
+            }
+        }
+        let (target_point, candidate_feature) =
+            split_candidate_feature.expect("real COLMAP split candidate feature");
+        assert_eq!(reconstruction.observations[2][candidate_feature], None);
+
+        let split_point_id = reconstruction.points.len();
+        let split_point = Point3D {
+            xyz: reconstruction.points[target_point].xyz,
+            color: reconstruction.points[target_point].color,
+            error: reconstruction.points[target_point].error,
+            track: vec![TrackObservation {
+                image: 2,
+                feature: candidate_feature,
+            }],
+        };
+        reconstruction.observations[2][candidate_feature] = Some(split_point_id);
+        reconstruction
+            .point_ids
+            .push(reconstruction.point3d_id(target_point) + 2_000_000);
+        reconstruction.points.push(split_point);
+        assert_eq!(reconstruction.points.len(), 257);
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        let stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let config = MapperConfig {
+            local_ba: true,
+            local_ba_iterations: 3,
+            local_ba_max_refinements: 1,
+            global_ba: false,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        let report = refine_local_bundle_after_registration(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            2,
+            0,
+            &mapper_triangulator_options(&config),
+            &config,
+            &stats,
+            &mut triangulation_state,
+        )
+        .expect("local BA should run on real COLMAP sparse fixture");
+
+        assert!(
+            report.merged_observations > 0,
+            "local BA post-merge should merge split real COLMAP tracks: {report:?}"
+        );
+        assert_eq!(reconstruction.points.len(), 256);
+        assert_eq!(
+            reconstruction.observations[2][candidate_feature],
+            Some(target_point)
+        );
+        assert!(reconstruction.points[target_point]
+            .track
+            .iter()
+            .any(|obs| obs.image == 2 && obs.feature == candidate_feature));
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_global_ba_prepare_completes_tracks_keeps_observation_manager_in_sync(
+    ) -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        reconstruction.poses[2] = Some(reference_pose);
+        assert_eq!(reconstruction.points.len(), 256);
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            0
+        );
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut debug_log = Vec::new();
+        let config = MapperConfig {
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        assert!(refine_global_bundle_with_postprocessing(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "prepare_fixture",
+            false,
+            &mut debug_log,
+            Some(&mut stats),
+            Some(&mut filtered_units),
+            &mut triangulation_state,
+        ));
+
+        let prepare = debug_log
+            .iter()
+            .find(|line| line.starts_with("global_ba_prepare reason=prepare_fixture"))
+            .unwrap_or_else(|| panic!("missing global BA prepare log: {debug_log:?}"));
+        let completed = prepare
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("completed="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("prepare completed count");
+        assert!(
+            completed > 0,
+            "global BA prepare should complete real COLMAP tracks: {prepare}"
+        );
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            256
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_final_ba_prepare_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        reconstruction.poses[2] = Some(reference_pose);
+        assert_eq!(reconstruction.points.len(), 256);
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            0
+        );
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut debug_log = Vec::new();
+        let config = MapperConfig {
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        assert!(refine_global_bundle_with_postprocessing(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "final",
+            final_global_ba_normalizes_reconstruction(&config),
+            &mut debug_log,
+            Some(&mut stats),
+            Some(&mut filtered_units),
+            &mut triangulation_state,
+        ));
+
+        let prepare = debug_log
+            .iter()
+            .find(|line| line.starts_with("global_ba_prepare reason=final"))
+            .unwrap_or_else(|| panic!("missing final global BA prepare log: {debug_log:?}"));
+        let completed = prepare
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("completed="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("final prepare completed count");
+        assert!(
+            completed > 0,
+            "final global BA prepare should complete true COLMAP tracks: {prepare}"
+        );
+        assert!(
+            debug_log
+                .iter()
+                .any(|line| line.starts_with("global_ba reason=final round=1")),
+            "missing final global BA report: {debug_log:?}"
+        );
+        assert!(
+            !debug_log
+                .iter()
+                .any(|line| line.starts_with("global_ba_normalize reason=final")),
+            "final global BA should not normalize: {debug_log:?}"
+        );
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            256
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_global_ba_prepare_merges_tracks_keeps_observation_manager_in_sync(
+    ) -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        reconstruction.poses[2] = Some(reference_pose);
+        assert_eq!(reconstruction.points.len(), 256);
+
+        let target_point = 0usize;
+        let gauge_feature = reconstruction.points[target_point]
+            .track
+            .iter()
+            .find(|obs| obs.image == 0)
+            .map(|obs| obs.feature)
+            .expect("target point has gauge observation");
+        let candidate_feature = pairs
+            .iter()
+            .find(|pair| pair.left == 0 && pair.right == 2)
+            .and_then(|pair| {
+                pair.inlier_matches
+                    .iter()
+                    .find(|m| m.query_idx as usize == gauge_feature)
+            })
+            .map(|m| m.train_idx as usize)
+            .expect("target point has real COLMAP gauge-candidate match");
+        assert_eq!(reconstruction.observations[2][candidate_feature], None);
+
+        let split_point_id = reconstruction.points.len();
+        let split_point = Point3D {
+            xyz: reconstruction.points[target_point].xyz,
+            color: reconstruction.points[target_point].color,
+            error: reconstruction.points[target_point].error,
+            track: vec![TrackObservation {
+                image: 2,
+                feature: candidate_feature,
+            }],
+        };
+        reconstruction.observations[2][candidate_feature] = Some(split_point_id);
+        reconstruction
+            .point_ids
+            .push(reconstruction.point3d_id(target_point) + 1_000_000);
+        reconstruction.points.push(split_point);
+        assert_eq!(reconstruction.points.len(), 257);
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut debug_log = Vec::new();
+        let config = MapperConfig {
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        assert!(refine_global_bundle_with_postprocessing(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "prepare_merge_fixture",
+            false,
+            &mut debug_log,
+            Some(&mut stats),
+            Some(&mut filtered_units),
+            &mut triangulation_state,
+        ));
+
+        let prepare = debug_log
+            .iter()
+            .find(|line| line.starts_with("global_ba_prepare reason=prepare_merge_fixture"))
+            .unwrap_or_else(|| panic!("missing global BA prepare merge log: {debug_log:?}"));
+        let merged = prepare
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("merged="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("prepare merged count");
+        assert!(
+            merged > 0,
+            "global BA prepare should merge split real COLMAP tracks: {prepare}"
+        );
+        assert_eq!(reconstruction.points.len(), 256);
+        assert_eq!(
+            reconstruction.observations[2][candidate_feature],
+            Some(target_point)
+        );
+        assert!(reconstruction.points[target_point]
+            .track
+            .iter()
+            .any(|obs| obs.image == 2 && obs.feature == candidate_feature));
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_global_ba_prepare_retriangulates_tracks_keeps_observation_manager_in_sync(
+    ) -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        reconstruction.poses[2] = Some(reference_pose);
+        assert_eq!(reconstruction.points.len(), 256);
+
+        let kept_points = 8usize;
+        for image_observations in &mut reconstruction.observations {
+            for observation in image_observations {
+                if observation.is_some_and(|point_id| point_id >= kept_points) {
+                    *observation = None;
+                }
+            }
+        }
+        reconstruction.points.truncate(kept_points);
+        reconstruction.point_ids.truncate(kept_points);
+        assert_eq!(reconstruction.points.len(), kept_points);
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            0
+        );
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut debug_log = Vec::new();
+        let config = MapperConfig {
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        assert!(refine_global_bundle_with_postprocessing(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "prepare_retriangulate_fixture",
+            false,
+            &mut debug_log,
+            Some(&mut stats),
+            Some(&mut filtered_units),
+            &mut triangulation_state,
+        ));
+
+        let prepare = debug_log
+            .iter()
+            .find(|line| line.starts_with("global_ba_prepare reason=prepare_retriangulate_fixture"))
+            .unwrap_or_else(|| {
+                panic!("missing global BA prepare retriangulate log: {debug_log:?}")
+            });
+        let retriangulated = prepare
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("retriangulated="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("prepare retriangulated count");
+        assert!(
+            retriangulated > 0,
+            "global BA prepare should retriangulate under-reconstructed real COLMAP pairs: {prepare}"
+        );
+        assert!(
+            reconstruction.points.len() > kept_points,
+            "retriangulation should restore real COLMAP sparse points"
+        );
+        assert!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count()
+                > 0,
+            "candidate image should gain retriangulated observations"
+        );
+        assert_eq!(
+            triangulation_state
+                .retriangulation_trials()
+                .get(&(0, 2))
+                .copied(),
+            Some(1)
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_global_ba_post_filter_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, mut pairs, _) = real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        assert_eq!(reconstruction.points.len(), 256);
+
+        let removed_track = reconstruction.points[0].track.clone();
+        assert_eq!(removed_track.len(), 2);
+        remove_track_features_from_pairs(&mut pairs, &removed_track);
+        let orphaned_obs = removed_track[1];
+        reconstruction.observations[orphaned_obs.image][orphaned_obs.feature] = None;
+        reconstruction.points[0].track.truncate(1);
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut debug_log = Vec::new();
+        let config = MapperConfig {
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 999,
+            global_ba_points_freq: 999_999,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        assert!(refine_global_bundle_with_postprocessing(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "post_filter_fixture",
+            false,
+            &mut debug_log,
+            Some(&mut stats),
+            Some(&mut filtered_units),
+            &mut triangulation_state,
+        ));
+
+        let global_ba = debug_log
+            .iter()
+            .find(|line| line.starts_with("global_ba reason=post_filter_fixture round=1"))
+            .unwrap_or_else(|| panic!("missing global BA log: {debug_log:?}"));
+        let filtered = global_ba
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("filtered="))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("global BA filtered count");
+        assert!(
+            filtered > 0,
+            "global BA post-filter should delete observations from the real fixture: {global_ba}"
+        );
+        assert!(reconstruction.points.len() < 256);
+        for obs in removed_track {
+            assert_eq!(reconstruction.observations[obs.image][obs.feature], None);
+        }
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_registered_frame_filter_keeps_observation_manager_in_sync() -> Result<()>
+    {
+        let (frames, pairs, mut reconstruction) = real_colmap_sparse_full_registration_fixture()?;
+        assert_eq!(registered_frame_count(&reconstruction), 24);
+        let target_image = reconstruction
+            .image_names
+            .iter()
+            .position(|name| name == "frame_0009.jpg")
+            .expect("registered real COLMAP target image");
+        let target_observations = reconstruction.observations[target_image]
+            .iter()
+            .filter(|point| point.is_some())
+            .count();
+        assert!(
+            target_observations > 0,
+            "target image should start with true COLMAP sparse observations"
+        );
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        {
+            let mut triangulator = IncrementalTriangulator::new(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                &mut triangulation_state,
+            );
+            let _ = triangulator.retriangulate(&IncrementalTriangulatorOptions {
+                re_min_ratio: 0.5,
+                re_max_trials: 1,
+                min_angle_deg: 0.1,
+                merge_max_reproj_error_px: 10.0,
+                ignore_two_view_tracks: false,
+                random_seed: 0,
+                ..IncrementalTriangulatorOptions::default()
+            });
+        }
+        let trial_snapshot = triangulation_state.retriangulation_trials().clone();
+
+        let bogus_camera_id = 999_001;
+        reconstruction.cameras.push(CameraModel::new_pinhole(
+            1000, 1000, 1.0e9, 1.0e9, 500.0, 500.0,
+        ));
+        reconstruction.camera_ids.push(bogus_camera_id);
+        reconstruction.image_camera_indices[target_image] = reconstruction.cameras.len() - 1;
+        assert!(camera_has_bogus_params(
+            reconstruction.camera_for_image(target_image),
+            &MapperConfig::default()
+        ));
+
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let filtered = filter_registered_frames(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut stats,
+            Some(&mut filtered_units),
+            &mut triangulation_state,
+        );
+
+        assert_eq!(filtered, 1);
+        assert!(filtered_units.contains(&RegistrationUnitKey::Frame(0)));
+        assert_eq!(registered_frame_count(&reconstruction), 23);
+        assert!(reconstruction.poses[target_image].is_none());
+        assert!(reconstruction.observations[target_image]
+            .iter()
+            .all(|point| point.is_none()));
+        assert_eq!(stats.registered_images_with_camera_id(bogus_camera_id), 0);
+        assert_eq!(stats.num_total_reg_images, 23);
+        assert_eq!(
+            triangulation_state.retriangulation_trials(),
+            &trial_snapshot
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_post_registration_filter_keeps_observation_manager_in_sync() -> Result<()>
+    {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        assert_eq!(reconstruction.points.len(), 256);
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert!(triangulation_state
+            .observation_manager_mut()
+            .register_image(&frames, &pairs, &mut reconstruction, 2, reference_pose));
+        let tri_options = mapper_triangulator_options(&MapperConfig {
+            random_seed: 0,
+            ..MapperConfig::default()
+        });
+        {
+            let mut triangulator = IncrementalTriangulator::new(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                &mut triangulation_state,
+            );
+            let completed = triangulator.retriangulate(&tri_options);
+            assert!(
+                completed > 0,
+                "real COLMAP sparse post-registration fixture should add candidate observations"
+            );
+        }
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+
+        let target_point = reconstruction
+            .points
+            .iter()
+            .position(|point| {
+                point.track.len() >= 3 && point.track.iter().any(|obs| obs.image == 2)
+            })
+            .expect("continued real COLMAP candidate track");
+        let removed_track = reconstruction.points[target_point].track.clone();
+        reconstruction.points[target_point].xyz = [0.0, 0.0, -10.0];
+
+        let removed = filter_reprojection_tracks_with_state(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut triangulation_state,
+        );
+
+        assert_eq!(removed, removed_track.len());
+        assert_eq!(
+            triangulation_state
+                .retriangulation_trials()
+                .get(&(0, 2))
+                .copied(),
+            Some(1)
+        );
+        for obs in removed_track {
+            assert_eq!(reconstruction.observations[obs.image][obs.feature], None);
+        }
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_registration_rollback_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        let registration_snapshot = reconstruction.clone();
+        assert_eq!(reconstruction.points.len(), 256);
+        assert!(reconstruction.poses[2].is_none());
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            0
+        );
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert!(triangulation_state
+            .observation_manager_mut()
+            .register_image(&frames, &pairs, &mut reconstruction, 2, reference_pose));
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        let tri_options = mapper_triangulator_options(&MapperConfig {
+            random_seed: 0,
+            ..MapperConfig::default()
+        });
+        {
+            let mut triangulator = IncrementalTriangulator::new(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                &mut triangulation_state,
+            );
+            let completed = triangulator.retriangulate(&tri_options);
+            assert!(
+                completed > 0,
+                "real COLMAP sparse rollback fixture should add candidate observations"
+            );
+        }
+        let candidate_observations = reconstruction.observations[2]
+            .iter()
+            .filter(|point| point.is_some())
+            .count();
+        assert!(
+            candidate_observations > 0,
+            "candidate observations should be present before rollback"
+        );
+        assert_eq!(
+            triangulation_state
+                .retriangulation_trials()
+                .get(&(0, 2))
+                .copied(),
+            Some(1)
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+
+        assert_eq!(
+            registration_rollback_reason(&reconstruction, 2, true, false, &MapperConfig::default()),
+            Some("local_ba_failed")
+        );
+        reconstruction = registration_snapshot;
+        triangulation_state.sync_after_reconstruction_rollback(&frames, &pairs, &reconstruction);
+
+        assert!(reconstruction.poses[2].is_none());
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            0
+        );
+        assert_eq!(
+            triangulation_state
+                .retriangulation_trials()
+                .get(&(0, 2))
+                .copied(),
+            Some(1)
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_colmap_sparse_bogus_camera_rollback_keeps_observation_manager_in_sync() -> Result<()> {
+        let (camera, frames, setup, pairs, reference_pose) =
+            real_colmap_sparse_seed_local_ba_fixture()?;
+        let mut reconstruction =
+            reconstruction_from_reference_setup_for_test(&frames, camera, &setup);
+        let registration_snapshot = reconstruction.clone();
+
+        let mut triangulation_state =
+            IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        assert!(triangulation_state
+            .observation_manager_mut()
+            .register_image(&frames, &pairs, &mut reconstruction, 2, reference_pose));
+        let tri_options = mapper_triangulator_options(&MapperConfig {
+            random_seed: 0,
+            ..MapperConfig::default()
+        });
+        {
+            let mut triangulator = IncrementalTriangulator::new(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                &mut triangulation_state,
+            );
+            let completed = triangulator.retriangulate(&tri_options);
+            assert!(
+                completed > 0,
+                "real COLMAP sparse rollback fixture should add candidate observations"
+            );
+        }
+        let trial_snapshot = triangulation_state.retriangulation_trials().clone();
+        assert_eq!(trial_snapshot.get(&(0, 2)).copied(), Some(1));
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+
+        let bogus_camera_id = 999_002;
+        reconstruction.cameras.push(CameraModel::new_pinhole(
+            1000, 1000, 1.0e9, 1.0e9, 500.0, 500.0,
+        ));
+        reconstruction.camera_ids.push(bogus_camera_id);
+        reconstruction.image_camera_indices[2] = reconstruction.cameras.len() - 1;
+        assert!(registration_state_has_bogus_camera(
+            &reconstruction,
+            2,
+            &MapperConfig::default()
+        ));
+        assert_eq!(
+            registration_rollback_reason(&reconstruction, 2, false, false, &MapperConfig::default()),
+            Some("bogus_camera")
+        );
+
+        reconstruction = registration_snapshot;
+        triangulation_state.sync_after_reconstruction_rollback(&frames, &pairs, &reconstruction);
+
+        assert!(reconstruction.poses[2].is_none());
+        assert_eq!(
+            reconstruction.observations[2]
+                .iter()
+                .filter(|point| point.is_some())
+                .count(),
+            0
+        );
+        assert_eq!(
+            triangulation_state.retriangulation_trials(),
+            &trial_snapshot
+        );
+        assert_observation_manager_matches_fresh(
+            &frames,
+            &pairs,
+            &reconstruction,
+            &triangulation_state,
+        );
+        Ok(())
+    }
+
+    fn remove_track_features_from_pairs(pairs: &mut [PairGeometry], track: &[TrackObservation]) {
+        for pair in pairs {
+            pair.matches.retain(|m| {
+                !track.iter().any(|obs| {
+                    (pair.left == obs.image && m.query_idx as usize == obs.feature)
+                        || (pair.right == obs.image && m.train_idx as usize == obs.feature)
+                })
+            });
+            pair.inlier_matches.retain(|m| {
+                !track.iter().any(|obs| {
+                    (pair.left == obs.image && m.query_idx as usize == obs.feature)
+                        || (pair.right == obs.image && m.train_idx as usize == obs.feature)
+                })
+            });
+            pair.inliers = pair.inlier_matches.len();
+            pair.triangulated = pair.triangulated.min(pair.inliers);
+        }
+    }
+
+    fn real_colmap_sparse_seed_mapper_fixture() -> Result<(
+        CameraModel,
+        Vec<ImageFrame>,
+        ReferenceCameraSetup,
+        Vec<PairGeometry>,
+        SE3,
+    )> {
+        let sparse =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../test_data/flowers2_colmap/sparse/text");
+        let reference = read_colmap_sparse_model(&sparse)?.reconstruction;
+        let seed_ref = reference
+            .image_names
+            .iter()
+            .position(|name| name == "frame_0002.jpg")
+            .expect("flowers2 seed image");
+        let candidate_ref = reference
+            .image_names
+            .iter()
+            .position(|name| name == "frame_0003.jpg")
+            .expect("flowers2 candidate image");
+        let seed_pose = reference.poses[seed_ref].expect("registered seed pose");
+        let candidate_pose = reference.poses[candidate_ref].expect("registered candidate pose");
+        let frames = vec![
+            image_frame_from_reference(&reference, seed_ref, 0),
+            image_frame_from_reference(&reference, candidate_ref, 1),
+        ];
+
+        let mut candidate_feature_by_point = HashMap::<usize, usize>::new();
+        for (feature, point_idx) in reference.observations[candidate_ref].iter().enumerate() {
+            if let Some(point_idx) = point_idx {
+                candidate_feature_by_point
+                    .entry(*point_idx)
+                    .or_insert(feature);
+            }
+        }
+
+        let mut observations = vec![
+            vec![None; frames[0].keypoints.len()],
+            vec![None; frames[1].keypoints.len()],
+        ];
+        let mut point_ids = Vec::new();
+        let mut points = Vec::new();
+        let mut matches = Vec::new();
+        for (seed_feature, point_idx) in reference.observations[seed_ref].iter().enumerate() {
+            let Some(reference_point_idx) = *point_idx else {
+                continue;
+            };
+            let Some(&candidate_feature) = candidate_feature_by_point.get(&reference_point_idx)
+            else {
+                continue;
+            };
+            let seed_point_idx = points.len();
+            observations[0][seed_feature] = Some(seed_point_idx);
+            let point = &reference.points[reference_point_idx];
+            point_ids.push(reference.point3d_id(reference_point_idx));
+            points.push(Point3D {
+                xyz: point.xyz,
+                color: point.color,
+                error: point.error,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: seed_feature,
+                }],
+            });
+            matches.push(rustslam::Match {
+                query_idx: seed_feature as u32,
+                train_idx: candidate_feature as u32,
+                distance: 0.0,
+            });
+            if matches.len() == 256 {
+                break;
+            }
+        }
+        assert_eq!(matches.len(), 256);
+
+        let relative_pose = candidate_pose.compose(&seed_pose.inverse());
+        let pair = PairGeometry {
+            left: 0,
+            right: 1,
+            two_view_config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+            f_matrix: None,
+            e_matrix: None,
+            h_matrix: None,
+            qvec: None,
+            tvec: None,
+            matches: matches.clone(),
+            inlier_matches: matches,
+            relative_pose,
+            inliers: 256,
+            triangulated: 256,
+            mean_reprojection_error_px: 0.0,
+            rotation_deg: relative_rotation_deg(relative_pose, SE3::identity()),
+            median_triangulation_angle_deg: 6.0,
+            pose_graph_only: false,
+        };
+        let setup = ReferenceCameraSetup {
+            cameras: reference.cameras.clone(),
+            camera_ids: reference.camera_ids.clone(),
+            camera_has_prior_focal_length: vec![true; reference.cameras.len()],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_ids: vec![
+                reference.image_id(seed_ref),
+                reference.image_id(candidate_ref),
+            ],
+            image_camera_indices: vec![
+                reference.image_camera_indices[seed_ref],
+                reference.image_camera_indices[candidate_ref],
+            ],
+            image_frame_indices: vec![None, None],
+            seed_reconstruction: Some(ReconstructionSeed {
+                poses: vec![Some(seed_pose), None],
+                observations,
+                point_ids,
+                points,
+            }),
+        };
+
+        Ok((
+            reference.camera_for_image(seed_ref),
+            frames,
+            setup,
+            vec![pair],
+            candidate_pose,
+        ))
+    }
+
+    fn real_colmap_sparse_seed_local_ba_fixture() -> Result<(
+        CameraModel,
+        Vec<ImageFrame>,
+        ReferenceCameraSetup,
+        Vec<PairGeometry>,
+        SE3,
+    )> {
+        let sparse =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../test_data/flowers2_colmap/sparse/text");
+        let reference = read_colmap_sparse_model(&sparse)?.reconstruction;
+        let gauge_ref = reference
+            .image_names
+            .iter()
+            .position(|name| name == "frame_0001.jpg")
+            .expect("flowers2 gauge image");
+        let seed_ref = reference
+            .image_names
+            .iter()
+            .position(|name| name == "frame_0002.jpg")
+            .expect("flowers2 seed image");
+        let candidate_ref = reference
+            .image_names
+            .iter()
+            .position(|name| name == "frame_0003.jpg")
+            .expect("flowers2 candidate image");
+        let gauge_pose = reference.poses[gauge_ref].expect("registered gauge pose");
+        let seed_pose = reference.poses[seed_ref].expect("registered seed pose");
+        let candidate_pose = reference.poses[candidate_ref].expect("registered candidate pose");
+        let frames = vec![
+            image_frame_from_reference(&reference, gauge_ref, 0),
+            image_frame_from_reference(&reference, seed_ref, 1),
+            image_frame_from_reference(&reference, candidate_ref, 2),
+        ];
+
+        let mut seed_feature_by_point = HashMap::<usize, usize>::new();
+        for (feature, point_idx) in reference.observations[seed_ref].iter().enumerate() {
+            if let Some(point_idx) = point_idx {
+                seed_feature_by_point.entry(*point_idx).or_insert(feature);
+            }
+        }
+        let mut candidate_feature_by_point = HashMap::<usize, usize>::new();
+        for (feature, point_idx) in reference.observations[candidate_ref].iter().enumerate() {
+            if let Some(point_idx) = point_idx {
+                candidate_feature_by_point
+                    .entry(*point_idx)
+                    .or_insert(feature);
+            }
+        }
+
+        let mut observations = vec![
+            vec![None; frames[0].keypoints.len()],
+            vec![None; frames[1].keypoints.len()],
+            vec![None; frames[2].keypoints.len()],
+        ];
+        let mut point_ids = Vec::new();
+        let mut points = Vec::new();
+        let mut gauge_candidate_matches = Vec::new();
+        let mut seed_candidate_matches = Vec::new();
+        for (gauge_feature, point_idx) in reference.observations[gauge_ref].iter().enumerate() {
+            let Some(reference_point_idx) = *point_idx else {
+                continue;
+            };
+            let Some(&seed_feature) = seed_feature_by_point.get(&reference_point_idx) else {
+                continue;
+            };
+            let Some(&candidate_feature) = candidate_feature_by_point.get(&reference_point_idx)
+            else {
+                continue;
+            };
+            let seed_point_idx = points.len();
+            observations[0][gauge_feature] = Some(seed_point_idx);
+            observations[1][seed_feature] = Some(seed_point_idx);
+            let point = &reference.points[reference_point_idx];
+            point_ids.push(reference.point3d_id(reference_point_idx));
+            points.push(Point3D {
+                xyz: point.xyz,
+                color: point.color,
+                error: point.error,
+                track: vec![
+                    TrackObservation {
+                        image: 0,
+                        feature: gauge_feature,
+                    },
+                    TrackObservation {
+                        image: 1,
+                        feature: seed_feature,
+                    },
+                ],
+            });
+            gauge_candidate_matches.push(rustslam::Match {
+                query_idx: gauge_feature as u32,
+                train_idx: candidate_feature as u32,
+                distance: 0.0,
+            });
+            seed_candidate_matches.push(rustslam::Match {
+                query_idx: seed_feature as u32,
+                train_idx: candidate_feature as u32,
+                distance: 0.0,
+            });
+            if points.len() == 256 {
+                break;
+            }
+        }
+        assert_eq!(points.len(), 256);
+
+        let gauge_candidate_pair =
+            real_colmap_sparse_seed_pair(0, 2, gauge_pose, candidate_pose, gauge_candidate_matches);
+        let seed_candidate_pair =
+            real_colmap_sparse_seed_pair(1, 2, seed_pose, candidate_pose, seed_candidate_matches);
+        let setup = ReferenceCameraSetup {
+            cameras: reference.cameras.clone(),
+            camera_ids: reference.camera_ids.clone(),
+            camera_has_prior_focal_length: vec![true; reference.cameras.len()],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_ids: vec![
+                reference.image_id(gauge_ref),
+                reference.image_id(seed_ref),
+                reference.image_id(candidate_ref),
+            ],
+            image_camera_indices: vec![
+                reference.image_camera_indices[gauge_ref],
+                reference.image_camera_indices[seed_ref],
+                reference.image_camera_indices[candidate_ref],
+            ],
+            image_frame_indices: vec![None, None, None],
+            seed_reconstruction: Some(ReconstructionSeed {
+                poses: vec![Some(gauge_pose), Some(seed_pose), None],
+                observations,
+                point_ids,
+                points,
+            }),
+        };
+
+        Ok((
+            reference.camera_for_image(candidate_ref),
+            frames,
+            setup,
+            vec![gauge_candidate_pair, seed_candidate_pair],
+            candidate_pose,
+        ))
+    }
+
+    fn real_colmap_sparse_full_registration_fixture(
+    ) -> Result<(Vec<ImageFrame>, Vec<PairGeometry>, Reconstruction)> {
+        let sparse =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../test_data/flowers2_colmap/sparse/text");
+        let reference = read_colmap_sparse_model(&sparse)?.reconstruction;
+        assert_eq!(
+            reference.poses.iter().filter(|pose| pose.is_some()).count(),
+            24
+        );
+        let frames = (0..reference.image_names.len())
+            .map(|image| image_frame_from_reference(&reference, image, image))
+            .collect::<Vec<_>>();
+        let pairs = pair_geometries_from_reference_tracks(&reference);
+        assert!(
+            pairs.iter().any(|pair| pair.left == 0 || pair.right == 0),
+            "real COLMAP fixture should include correspondences for the target image"
+        );
+        Ok((frames, pairs, reference))
+    }
+
+    fn pair_geometries_from_reference_tracks(reference: &Reconstruction) -> Vec<PairGeometry> {
+        let mut matches_by_pair = BTreeMap::<(usize, usize), Vec<rustslam::Match>>::new();
+        for point in &reference.points {
+            for i in 0..point.track.len() {
+                for j in (i + 1)..point.track.len() {
+                    let obs1 = point.track[i];
+                    let obs2 = point.track[j];
+                    if obs1.image == obs2.image {
+                        continue;
+                    }
+                    let (left, left_feature, right, right_feature) = if obs1.image < obs2.image {
+                        (obs1.image, obs1.feature, obs2.image, obs2.feature)
+                    } else {
+                        (obs2.image, obs2.feature, obs1.image, obs1.feature)
+                    };
+                    matches_by_pair
+                        .entry((left, right))
+                        .or_default()
+                        .push(rustslam::Match {
+                            query_idx: left_feature as u32,
+                            train_idx: right_feature as u32,
+                            distance: 0.0,
+                        });
+                }
+            }
+        }
+
+        matches_by_pair
+            .into_iter()
+            .filter_map(|((left, right), mut matches)| {
+                matches.sort_by_key(|m| (m.query_idx, m.train_idx));
+                matches.dedup_by_key(|m| (m.query_idx, m.train_idx));
+                if matches.is_empty() {
+                    return None;
+                }
+                let left_pose = reference.poses[left]?;
+                let right_pose = reference.poses[right]?;
+                Some(real_colmap_sparse_seed_pair(
+                    left, right, left_pose, right_pose, matches,
+                ))
+            })
+            .collect()
+    }
+
+    fn real_colmap_sparse_seed_pair(
+        left: usize,
+        right: usize,
+        left_pose: SE3,
+        right_pose: SE3,
+        matches: Vec<rustslam::Match>,
+    ) -> PairGeometry {
+        let inliers = matches.len();
+        let relative_pose = right_pose.compose(&left_pose.inverse());
+        PairGeometry {
+            left,
+            right,
+            two_view_config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+            f_matrix: None,
+            e_matrix: None,
+            h_matrix: None,
+            qvec: None,
+            tvec: None,
+            matches: matches.clone(),
+            inlier_matches: matches,
+            relative_pose,
+            inliers,
+            triangulated: inliers,
+            mean_reprojection_error_px: 0.0,
+            rotation_deg: relative_rotation_deg(relative_pose, SE3::identity()),
+            median_triangulation_angle_deg: 6.0,
+            pose_graph_only: false,
+        }
+    }
+
+    fn image_frame_from_reference(
+        reference: &Reconstruction,
+        reference_image: usize,
+        current_id: usize,
+    ) -> ImageFrame {
+        let camera = reference.camera_for_image(reference_image);
+        let keypoints = reference.keypoints[reference_image].clone();
+        ImageFrame {
+            id: current_id,
+            name: reference.image_names[reference_image].clone(),
+            path: PathBuf::from(&reference.image_names[reference_image]),
+            width: camera.width,
+            height: camera.height,
+            keypoints,
+            descriptors: rustslam::Descriptors::new(),
+            sift: crate::sift::SiftFeatures::default(),
+            wide_descriptors: crate::wide::WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            },
+            strong_feature_indices: Vec::new(),
+            colors: vec![[0, 0, 0]; reference.keypoints[reference_image].len()],
+        }
+    }
+
+    fn pose_translation_error(a: SE3, b: SE3) -> f32 {
+        let ta = a.translation();
+        let tb = b.translation();
+        ((ta[0] - tb[0]).powi(2) + (ta[1] - tb[1]).powi(2) + (ta[2] - tb[2]).powi(2)).sqrt()
+    }
+
+    fn pose_translation_direction_error_deg(a: SE3, b: SE3) -> f32 {
+        let ta = glam::Vec3::from_array(a.translation());
+        let tb = glam::Vec3::from_array(b.translation());
+        let Some(ta) = ta.try_normalize() else {
+            return f32::INFINITY;
+        };
+        let Some(tb) = tb.try_normalize() else {
+            return f32::INFINITY;
+        };
+        ta.dot(tb).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    fn position_prior_covariance(stddev: f64) -> [f64; 9] {
+        let variance = stddev * stddev;
+        [variance, 0.0, 0.0, 0.0, variance, 0.0, 0.0, 0.0, variance]
     }
 
     fn colmap_rig_frame_seed_fixture() -> (
@@ -17149,6 +21215,54 @@ mod tests {
             }],
         };
         (camera, poses, points, frames, sparse_model)
+    }
+
+    fn densify_colmap_rig_sparse_seed(
+        sparse_model: &mut ColmapSparseFiles,
+        frames: &[ImageFrame],
+        points: &[[f32; 3]],
+    ) {
+        let seeded_images = [(101_u32, 0_usize), (205, 1)];
+        for (image_id, frame_idx) in seeded_images {
+            let Some(image) = sparse_model
+                .images
+                .iter_mut()
+                .find(|image| image.image_id == image_id)
+            else {
+                continue;
+            };
+            image.points2d = (0..points.len())
+                .map(|feature| ColmapPoint2D {
+                    xy: [
+                        frames[frame_idx].keypoints[feature].x() as f64,
+                        frames[frame_idx].keypoints[feature].y() as f64,
+                    ],
+                    point3d_id: Some(700 + feature as u64),
+                })
+                .collect();
+        }
+        sparse_model.points3d = (0..points.len())
+            .map(|feature| ColmapPoint3D {
+                point3d_id: 700 + feature as u64,
+                xyz: [
+                    points[feature][0] as f64,
+                    points[feature][1] as f64,
+                    points[feature][2] as f64,
+                ],
+                color: [7, 7, 7],
+                error: 0.0,
+                track: vec![
+                    ColmapTrackElement {
+                        image_id: 101,
+                        point2d_idx: feature as u64,
+                    },
+                    ColmapTrackElement {
+                        image_id: 205,
+                        point2d_idx: feature as u64,
+                    },
+                ],
+            })
+            .collect();
     }
 
     fn test_pair(
@@ -17314,6 +21428,74 @@ mod tests {
 
     fn registration_stats(reconstruction: &Reconstruction) -> RegistrationStats {
         RegistrationStats::from_reconstruction(reconstruction)
+    }
+
+    fn assert_observation_manager_matches_fresh(
+        frames: &[ImageFrame],
+        pairs: &[PairGeometry],
+        reconstruction: &Reconstruction,
+        state: &IncrementalTriangulatorState,
+    ) {
+        let fresh_manager = ObservationManager::new(frames, pairs, reconstruction);
+        let state_manager = state.observation_manager();
+        assert_eq!(state_manager.image_pairs(), fresh_manager.image_pairs());
+        for image in 0..frames.len() {
+            assert_eq!(
+                state_manager.num_observations(image),
+                fresh_manager.num_observations(image),
+                "observations image {image}"
+            );
+            assert_eq!(
+                state_manager.num_correspondences(image),
+                fresh_manager.num_correspondences(image),
+                "correspondences image {image}"
+            );
+            assert_eq!(
+                state_manager.num_visible_correspondences(image),
+                fresh_manager.num_visible_correspondences(image),
+                "visible correspondences image {image}"
+            );
+            assert_eq!(
+                state_manager.num_visible_points3d(image),
+                fresh_manager.num_visible_points3d(image),
+                "visible points image {image}"
+            );
+            assert_eq!(
+                state_manager.point3d_visibility_score(image),
+                fresh_manager.point3d_visibility_score(image),
+                "visibility score image {image}"
+            );
+            for feature in 0..frames[image].keypoints.len() {
+                assert_eq!(
+                    state_manager.num_correspondences_have_point3d(image, feature),
+                    fresh_manager.num_correspondences_have_point3d(image, feature),
+                    "correspondence point3D count image {image} feature {feature}"
+                );
+            }
+        }
+    }
+
+    fn test_pose_prior(
+        pose_prior_id: u32,
+        camera_id: u32,
+        image_id: u64,
+        position: [f64; 3],
+        position_covariance: [f64; 9],
+    ) -> ColmapPosePrior {
+        ColmapPosePrior {
+            pose_prior_id,
+            corr_data_id: ColmapDataId {
+                sensor_id: ColmapSensorId {
+                    sensor_type: ColmapSensorType::Camera,
+                    sensor_id: camera_id,
+                },
+                data_id: image_id,
+            },
+            position,
+            position_covariance,
+            coordinate_system: ColmapPosePriorCoordinateSystem::Cartesian,
+            gravity: [f64::NAN; 3],
+        }
     }
 
     fn reconstruction_from_reference_setup_for_test(

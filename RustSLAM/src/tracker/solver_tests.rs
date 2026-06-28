@@ -4,11 +4,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::core::SE3;
     use crate::colmap_rng::ColmapMt19937;
+    use crate::core::SE3;
     use crate::tracker::solver::{
-        compute_ransac_num_trials, EssentialSolver, PnPProblem, PnPSolver, Sim3Solver,
-        Triangulator,
+        compute_ransac_num_trials, EssentialSolver, PnPProblem, PnPSolver, Sim3Solver, Triangulator,
     };
     use glam::{Mat3, Vec3};
 
