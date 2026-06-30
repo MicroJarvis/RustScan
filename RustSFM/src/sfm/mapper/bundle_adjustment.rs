@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt;
 
 pub(super) fn global_reconstruction_options_from_config(
     config: &MapperConfig,
