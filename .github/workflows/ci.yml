@@ -23,7 +23,8 @@ jobs:
             libswscale-dev \
             libavfilter-dev \
             libavdevice-dev \
-            libswresample-dev
+            libswresample-dev \
+            libeigen3-dev
       - name: Format
         run: cargo fmt --check
       - name: Workspace check
@@ -46,3 +47,24 @@ jobs:
         env:
           RUSTSCAN_E2E: "1"
         run: cargo test
+
+  rustsfm-sparse-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            libclang-dev \
+            pkg-config \
+            libeigen3-dev
+      - name: RustSFM format
+        run: cargo fmt --package rustsfm --check
+      - name: RustSFM sparse parity build matrix
+        run: |
+          cargo test -p rustsfm --lib --no-run
+          cargo test -p rustsfm --lib --features poselib --no-run
+          cargo test -p rustsfm --lib --no-default-features --no-run

@@ -35,9 +35,7 @@ pub struct WgpuSiftExtractor;
 
 impl WgpuSiftExtractor {
     pub fn try_new() -> Result<Self> {
-        bail!(
-            "wgpu SIFT backend is not implemented yet; use the default VLFeat CPU extractor"
-        )
+        bail!("wgpu SIFT backend is not implemented yet; use the default VLFeat CPU extractor")
     }
 }
 

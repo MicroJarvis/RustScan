@@ -39,3 +39,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "rustsfm"
 path = "src/main.rs"
+
+[[bin]]
+name = "twoview-diff"
+path = "src/bin/twoview_diff.rs"
+
+[[bin]]
+name = "twoview-trace-diff"
+path = "src/bin/twoview_trace_diff.rs"

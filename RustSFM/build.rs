@@ -2,6 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(colmap_freeimage)");
+    println!("cargo:rustc-check-cfg=cfg(colmap_eigen)");
     println!("cargo:rerun-if-env-changed=POSELIB_ROOT");
     println!("cargo:rerun-if-env-changed=EIGEN3_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=VLFEAT_ROOT");
@@ -14,6 +16,7 @@ fn main() {
         build_vlfeat_sift();
     }
 
+    build_colmap_eigen();
     build_colmap_image();
 }
 
@@ -24,8 +27,8 @@ fn build_vlfeat_sift() {
         )
     });
 
-    println!("cargo:rerun-if-changed=src/vlfeat_sift.c");
-    println!("cargo:rerun-if-changed=src/vlfeat_sift.h");
+    println!("cargo:rerun-if-changed=src/native/vlfeat_sift.c");
+    println!("cargo:rerun-if-changed=src/native/vlfeat_sift.h");
     println!(
         "cargo:rerun-if-changed={}",
         vlfeat_root.join("sift.c").display()
@@ -35,7 +38,7 @@ fn build_vlfeat_sift() {
     build
         .warnings(false)
         .include(&vlfeat_root)
-        .file("src/vlfeat_sift.c");
+        .file("src/native/vlfeat_sift.c");
 
     let arch = target_arch();
     for source in vlfeat_sift_sources(&arch) {
@@ -96,7 +99,7 @@ fn build_poselib_bridge() {
         )
     });
 
-    println!("cargo:rerun-if-changed=src/poselib_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/native/poselib_bridge.cpp");
     println!(
         "cargo:rerun-if-changed={}",
         poselib_root
@@ -115,7 +118,7 @@ fn build_poselib_bridge() {
         .warnings(false)
         .include(&poselib_root)
         .include(&eigen_include)
-        .file("src/poselib_bridge.cpp")
+        .file("src/native/poselib_bridge.cpp")
         .file(poselib_root.join("PoseLib/solvers/gen_relpose_6pt.cc"))
         .file(poselib_root.join("PoseLib/solvers/gp3p.cc"))
         .file(poselib_root.join("PoseLib/solvers/p3p.cc"))
@@ -200,6 +203,33 @@ fn pkg_config_include_dir(package: &str) -> Option<PathBuf> {
         .find(|path| path.join("Eigen/Core").exists())
 }
 
+fn build_colmap_eigen() {
+    let Some(eigen_include) = eigen_include_dir() else {
+        println!(
+            "cargo:warning=Eigen3 not found; COLMAP Eigen numerical bridge disabled (set EIGEN3_INCLUDE_DIR or install eigen3)"
+        );
+        return;
+    };
+
+    println!("cargo:rerun-if-changed=src/native/colmap_eigen.cpp");
+    println!("cargo:rerun-if-changed=src/native/colmap_eigen.h");
+    println!("cargo:rustc-cfg=colmap_eigen");
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++17")
+        .warnings(false)
+        .include(&eigen_include)
+        .file("src/native/colmap_eigen.cpp");
+
+    if cfg!(target_os = "macos") {
+        build.flag_if_supported("-stdlib=libc++");
+    }
+
+    build.compile("rustsfm_colmap_eigen");
+}
+
 fn build_colmap_image() {
     let Some(root) = resolve_freeimage_root() else {
         println!(
@@ -208,12 +238,12 @@ fn build_colmap_image() {
         return;
     };
 
-    println!("cargo:rerun-if-changed=src/colmap_image.c");
-    println!("cargo:rerun-if-changed=src/colmap_image.h");
+    println!("cargo:rerun-if-changed=src/native/colmap_image.c");
+    println!("cargo:rerun-if-changed=src/native/colmap_image.h");
     println!("cargo:rustc-cfg=colmap_freeimage");
 
     cc::Build::new()
-        .file("src/colmap_image.c")
+        .file("src/native/colmap_image.c")
         .include(root.join("include"))
         .compile("rustsfm_colmap_image");
 
