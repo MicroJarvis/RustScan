@@ -78,6 +78,13 @@ pub struct ReconstructionSeed {
     pub points: Vec<Point3D>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct MapperDatabaseInput {
+    pub(super) cache: DatabaseCache,
+    pub(super) keypoints_by_name: HashMap<String, Vec<rustslam::KeyPoint>>,
+    pub(super) two_view_geometries: HashMap<ImagePairId, ColmapTwoViewGeometry>,
+}
+
 pub(super) fn setup_for_reconstruction_attempt(
     setup: Option<&ReferenceCameraSetup>,
     use_seed: bool,

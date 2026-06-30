@@ -34,10 +34,7 @@ use crate::joint_global_positioning::JointGlobalPositioningOptions;
 use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
 use crate::rotation_averaging::RotationAveragingOptions;
-use crate::sift::{
-    match_sift_guided_with_options, match_sift_with_options, SiftExtractionOptions,
-    SiftMatchingOptions,
-};
+use crate::sift::{match_sift_guided_with_options, match_sift_with_options, SiftMatchingOptions};
 use crate::track_establishment::TrackEstablishmentOptions;
 use crate::track_triangulation::TrackTriangulationOptions;
 use crate::types::{
@@ -47,14 +44,14 @@ use crate::types::{
 };
 use crate::view_graph_calibration::ViewGraphCalibrationOptions;
 use crate::view_graph_splitting::ViewGraphComponentSplittingOptions;
-use crate::wide::{build_wide_descriptors, match_wide_mutual, match_wide_mutual_indices};
+use crate::wide::{match_wide_mutual, match_wide_mutual_indices};
 use anyhow::{bail, Context, Result};
 use image::ImageReader;
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, SMatrix, SVector, Vector3};
 use rayon::prelude::*;
 use rustslam::features::HammingMatcher;
 use rustslam::tracker::{PnPProblem, PnPSolver};
-use rustslam::{FeatureExtractor, FeatureMatcher, OrbExtractor, SE3};
+use rustslam::{FeatureMatcher, SE3};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs;
@@ -66,6 +63,8 @@ use std::time::Instant;
 mod bundle_adjustment;
 #[path = "mapper/config.rs"]
 mod config;
+#[path = "mapper/image_features.rs"]
+mod image_features;
 #[path = "mapper/pipeline_types.rs"]
 mod pipeline_types;
 #[path = "mapper/reconstruction_input.rs"]
@@ -75,6 +74,7 @@ mod state;
 
 use bundle_adjustment::*;
 pub use config::{FeatureType, ImageSelectionMethod, MapperConfig, ReconstructionSummary};
+use image_features::extract_frames;
 pub use pipeline_types::{
     IncrementalPipelineCallback, IncrementalPipelineMapResult, IncrementalPipelineResult,
     IncrementalPipelineStatus, PipelineCallbackEvent, PipelineCallbackSink,
@@ -95,13 +95,6 @@ pub struct DatabasePairMatches {
     pub left: usize,
     pub right: usize,
     pub matches: Vec<rustslam::Match>,
-}
-
-#[derive(Debug, Clone)]
-struct MapperDatabaseInput {
-    cache: DatabaseCache,
-    keypoints_by_name: HashMap<String, Vec<rustslam::KeyPoint>>,
-    two_view_geometries: HashMap<ImagePairId, ColmapTwoViewGeometry>,
 }
 
 pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary> {
@@ -636,118 +629,6 @@ fn reset_bogus_frame_cameras_from_priors(
             reconstruction.camera = prior;
         }
     }
-}
-
-fn extract_frames(
-    paths: &[PathBuf],
-    max_features: usize,
-    feature_type: FeatureType,
-    sift_options: &SiftExtractionOptions,
-) -> Result<Vec<ImageFrame>> {
-    use crate::colmap_image::load_colmap_grayscale_u8;
-    use crate::feature_matching_db::load_rgb_image_for_frame;
-    use crate::sift::extract_sift_from_grayscale_u8;
-
-    paths
-        .par_iter()
-        .enumerate()
-        .map(|(id, path)| -> Result<ImageFrame> {
-            let (keypoints, descriptors, sift, width, height, colors) = match feature_type {
-                FeatureType::Orb => {
-                    let (rgb, width, height) = load_rgb_image_for_frame(path)?;
-                    let mut extractor = OrbExtractor::new(max_features);
-                    let (keypoints, descriptors) = extractor
-                        .detect_and_compute(&rgb, width, height)
-                        .map_err(|e| anyhow::anyhow!("feature extraction failed: {e}"))?;
-                    let colors = sample_colors_from_rgb(&rgb, width, height, &keypoints);
-                    (
-                        keypoints,
-                        descriptors,
-                        Default::default(),
-                        width,
-                        height,
-                        colors,
-                    )
-                }
-                FeatureType::Sift => {
-                    let gray = load_colmap_grayscale_u8(path)
-                        .with_context(|| format!("failed to load {}", path.display()))?;
-                    let sift = extract_sift_from_grayscale_u8(
-                        &gray.data,
-                        gray.width,
-                        gray.height,
-                        sift_options,
-                    )?;
-                    let (rgb, width, height) = load_rgb_image_for_frame(path)?;
-                    let colors = sample_colors_from_rgb(&rgb, width, height, &sift.keypoints);
-                    (
-                        sift.keypoints.clone(),
-                        rustslam::Descriptors::new(),
-                        sift,
-                        width,
-                        height,
-                        colors,
-                    )
-                }
-            };
-            let gray = load_colmap_grayscale_u8(path)
-                .with_context(|| format!("failed to load {}", path.display()))?;
-            let gray_f32 = gray
-                .data
-                .iter()
-                .map(|value| *value as f32 / 255.0)
-                .collect::<Vec<_>>();
-            let wide_descriptors =
-                build_wide_descriptors(&gray_f32, gray.width, gray.height, &keypoints);
-            let strong_feature_indices = strong_feature_indices(&keypoints, 1024);
-            Ok(ImageFrame {
-                id,
-                name: path.file_name().unwrap().to_string_lossy().to_string(),
-                path: path.clone(),
-                width,
-                height,
-                keypoints,
-                descriptors,
-                sift,
-                wide_descriptors,
-                strong_feature_indices,
-                colors,
-            })
-        })
-        .collect()
-}
-
-fn sample_colors_from_rgb(
-    rgb: &[u8],
-    width: u32,
-    height: u32,
-    keypoints: &[rustslam::KeyPoint],
-) -> Vec<[u8; 3]> {
-    keypoints
-        .iter()
-        .map(|kp| {
-            let x = kp.x().round().clamp(0.0, (width.saturating_sub(1)) as f32) as u32;
-            let y = kp.y().round().clamp(0.0, (height.saturating_sub(1)) as f32) as u32;
-            let idx = ((y * width + x) * 3) as usize;
-            if idx + 2 < rgb.len() {
-                [rgb[idx], rgb[idx + 1], rgb[idx + 2]]
-            } else {
-                [0, 0, 0]
-            }
-        })
-        .collect()
-}
-
-fn strong_feature_indices(keypoints: &[rustslam::KeyPoint], limit: usize) -> Vec<usize> {
-    let mut indices = (0..keypoints.len()).collect::<Vec<_>>();
-    indices.sort_by(|&a, &b| {
-        keypoints[b]
-            .response
-            .partial_cmp(&keypoints[a].response)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    indices.truncate(limit.min(indices.len()));
-    indices
 }
 
 fn build_pair_graph(
