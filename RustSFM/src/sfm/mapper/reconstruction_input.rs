@@ -1,4 +1,5 @@
 use super::*;
+use crate::colmap::read_colmap_poses;
 
 pub(super) fn collect_images(input: &Path, max_images: Option<usize>) -> Result<Vec<PathBuf>> {
     let mut paths = fs::read_dir(input)
