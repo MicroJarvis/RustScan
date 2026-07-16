@@ -126,6 +126,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn project_bwd<B: ProjectBwdBackend>(
     splats: &DeviceSplats<B>,
     active_sh_degree: u32,

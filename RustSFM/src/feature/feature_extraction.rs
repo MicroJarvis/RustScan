@@ -125,7 +125,7 @@ pub fn compare_extracted_sift_features(
 }
 
 fn reference_keypoint_counts(database_path: &Path) -> Result<HashMap<String, usize>> {
-    let db = ColmapDatabase::open(database_path)?;
+    let db = ColmapDatabase::open_read_only(database_path)?;
     db.read_keypoint_counts()?
         .into_iter()
         .map(|(image_id, count)| {

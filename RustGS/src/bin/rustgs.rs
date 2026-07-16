@@ -1,7 +1,7 @@
 //! RustGS CLI - 3D Gaussian Splatting Training
 //!
 //! Usage:
-//!   rustgs train --input <colmap_dir> --output <scene.splat>
+//!   rustgs train --input <colmap_dir> --output <scene.ply>
 //!   rustgs render --input <scene.splat|scene.ply> --camera <pose.json> --output <image.png>
 
 use anyhow::{bail, Context};
@@ -27,8 +27,12 @@ struct TrainArgs {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output path for trained splats (.splat or .ply)
-    #[arg(short, long)]
+    /// Root containing images referenced by the COLMAP sparse model
+    #[arg(long)]
+    image_root: Option<PathBuf>,
+
+    /// Output path (.ply preserves training data; legacy .splat is lossy)
+    #[arg(short, long, default_value = "output/scene.ply")]
     output: PathBuf,
 
     /// Path to a JSON training config file. Defaults to <input>/rustgs-train.json when present.
@@ -499,6 +503,21 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn training_defaults_to_lossless_ply_artifact() {
+        let cli = Cli::try_parse_from(["rustgs", "train", "--input", "dataset"]).unwrap();
+        let Commands::Train(args) = cli.command else {
+            panic!("expected train command");
+        };
+        assert_eq!(args.output, PathBuf::from("output/scene.ply"));
+    }
 }
 
 #[cfg(feature = "gpu")]

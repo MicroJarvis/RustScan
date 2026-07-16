@@ -22,6 +22,7 @@ mod ffi {
     }
 
     extern "C" {
+        pub fn rustsfm_colmap_initialize();
         pub fn rustsfm_colmap_load_grayscale_u8(
             path: *const c_char,
             out: *mut RustSfmColmapGrayImage,
@@ -44,8 +45,13 @@ pub fn load_colmap_grayscale_u8(path: &Path) -> Result<ColmapGrayImage> {
 #[cfg(colmap_freeimage)]
 fn load_colmap_grayscale_u8_freeimage(path: &Path) -> Result<ColmapGrayImage> {
     use ffi::{
-        rustsfm_colmap_free_gray_image, rustsfm_colmap_load_grayscale_u8, RustSfmColmapGrayImage,
+        rustsfm_colmap_free_gray_image, rustsfm_colmap_initialize,
+        rustsfm_colmap_load_grayscale_u8, RustSfmColmapGrayImage,
     };
+    use std::sync::Once;
+
+    static FREEIMAGE_INIT: Once = Once::new();
+    FREEIMAGE_INIT.call_once(|| unsafe { rustsfm_colmap_initialize() });
 
     let path = CString::new(path.to_string_lossy().as_ref())
         .context("image path contains interior NUL byte")?;
@@ -108,4 +114,24 @@ fn load_colmap_grayscale_u8_image_crate(path: &Path) -> Result<ColmapGrayImage> 
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn freeimage_initialization_uses_a_thread_safe_once_primitive() {
+        let native = include_str!("../native/colmap_image.c");
+        let rust = include_str!("colmap_image.rs");
+        assert!(!native.contains("static int initialized"));
+        assert!(native.contains("rustsfm_colmap_initialize"));
+        assert!(rust.contains("Once::new"));
+        assert!(rust.contains("call_once"));
+    }
+
+    #[test]
+    fn native_build_flags_are_selected_from_the_target_os() {
+        let build = include_str!("../../build.rs");
+        assert!(!build.contains("cfg!(target_os"));
+        assert!(build.contains("CARGO_CFG_TARGET_OS"));
+    }
 }

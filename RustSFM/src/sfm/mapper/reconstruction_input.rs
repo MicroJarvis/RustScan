@@ -1,5 +1,5 @@
 use super::*;
-use crate::colmap::read_colmap_poses;
+use crate::colmap::{read_colmap_poses, resolve_sparse_dir};
 
 pub(super) fn collect_images(input: &Path, max_images: Option<usize>) -> Result<Vec<PathBuf>> {
     let mut paths = fs::read_dir(input)
@@ -123,7 +123,19 @@ pub fn reference_camera_setup(
         .iter()
         .map(|pose| (pose.name.as_str(), pose))
         .collect::<HashMap<_, _>>();
-    let sparse_model = read_colmap_sparse_model(reference).ok();
+    let sparse_dir = resolve_sparse_dir(reference)?;
+    let has_points =
+        sparse_dir.join("points3D.bin").exists() || sparse_dir.join("points3D.txt").exists();
+    let sparse_model = if has_points {
+        Some(read_colmap_sparse_model(reference).with_context(|| {
+            format!(
+                "failed to load reference model from {}",
+                reference.display()
+            )
+        })?)
+    } else {
+        None
+    };
     let rigs = sparse_model
         .as_ref()
         .map(|model| model.reconstruction.rigs.clone())
@@ -155,7 +167,14 @@ pub fn reference_camera_setup(
             .unwrap_or_default();
         if let Some(pose) = pose_by_name.get(name) {
             image_ids.push(pose.image_id);
-            image_camera_indices.push(*camera_index_by_id.get(&pose.camera_id).unwrap_or(&0));
+            image_camera_indices.push(*camera_index_by_id.get(&pose.camera_id).with_context(
+                || {
+                    format!(
+                        "reference image '{}' uses missing camera id {}",
+                        pose.name, pose.camera_id
+                    )
+                },
+            )?);
             image_frame_indices.push(*image_frame_by_id.get(&pose.image_id).unwrap_or(&None));
         } else {
             image_ids.push(idx as u32 + 1);
@@ -309,7 +328,7 @@ pub(super) fn load_mapper_database(
         .iter()
         .map(|frame| frame.name.clone())
         .collect::<BTreeSet<_>>();
-    let db = ColmapDatabase::open(database)?;
+    let db = ColmapDatabase::open_read_only(database)?;
     let cache = db.load_cache(&DatabaseCacheOptions {
         min_num_matches,
         ignore_watermarks: false,

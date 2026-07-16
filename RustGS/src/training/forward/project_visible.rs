@@ -90,6 +90,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn project_visible<B: ProjectVisibleBackend>(
     splats: &DeviceSplats<B>,
     active_sh_degree: u32,

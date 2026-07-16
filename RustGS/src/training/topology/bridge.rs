@@ -22,6 +22,7 @@ pub(crate) struct TopologySnapshot {
     pub invisible_windows: Vec<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn snapshot_for_topology<S: Backend, A: Backend>(
     splats: &DeviceSplats<S>,
     grad_2d_accum: &Tensor<A, 1>,

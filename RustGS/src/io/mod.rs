@@ -8,8 +8,11 @@ pub mod scene_io;
 
 #[cfg(feature = "gpu")]
 use crate::core::HostSplats;
+#[cfg(feature = "gpu")]
 use crate::TrainingError;
+#[cfg(feature = "gpu")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "gpu")]
 use std::path::Path;
 
 /// Simple training checkpoint used by the trainer's incremental save.

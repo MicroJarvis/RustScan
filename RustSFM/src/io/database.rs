@@ -10,7 +10,7 @@ use crate::types::colmap_camera_model_num_params;
 use anyhow::{bail, Context, Result};
 use nalgebra::Matrix3;
 use rand::seq::SliceRandom;
-use rusqlite::{params, Connection, OptionalExtension, Row, Rows};
+use rusqlite::{params, types::Type, Connection, OpenFlags, OptionalExtension, Row, Rows};
 use rustslam::{Descriptors, KeyPoint};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -601,6 +601,19 @@ impl Default for DatabaseCache {
 }
 
 impl ColmapDatabase {
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("open COLMAP database read-only")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA query_only = ON;",
+        )?;
+        Ok(Self {
+            conn,
+            database_entry_deleted: Cell::new(false),
+        })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).context("open COLMAP database")?;
         let db = Self {
@@ -985,6 +998,27 @@ impl ColmapDatabase {
         Ok(())
     }
 
+    pub fn with_transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let deleted_before = self.database_entry_deleted.get();
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        match operation() {
+            Ok(value) => {
+                if let Err(commit_error) = self.conn.execute_batch("COMMIT;") {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    self.database_entry_deleted.set(deleted_before);
+                    return Err(commit_error.into());
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let rollback = self.conn.execute_batch("ROLLBACK;");
+                self.database_entry_deleted.set(deleted_before);
+                rollback.context("roll back COLMAP database transaction")?;
+                Err(error)
+            }
+        }
+    }
+
     pub fn exists_rig(&self, rig_id: u32) -> Result<bool> {
         self.exists_row_id("rigs", "rig_id", rig_id as i64)
     }
@@ -1112,27 +1146,26 @@ impl ColmapDatabase {
     fn count_rows(&self, table_name: &str) -> Result<usize> {
         self.conn
             .query_row(&format!("SELECT COUNT(*) FROM {table_name};"), [], |row| {
-                row.get::<_, i64>(0)
+                checked_row_integer(row, 0)
             })
-            .map(|value| value as usize)
             .map_err(Into::into)
     }
 
     fn sum_rows(&self, table_name: &str) -> Result<usize> {
         self.conn
             .query_row(&format!("SELECT SUM(rows) FROM {table_name};"), [], |row| {
-                row.get::<_, Option<i64>>(0)
+                checked_optional_row_integer(row, 0)
             })
-            .map(|value| value.unwrap_or(0) as usize)
+            .map(|value: Option<usize>| value.unwrap_or(0))
             .map_err(Into::into)
     }
 
     fn max_rows(&self, table_name: &str) -> Result<usize> {
         self.conn
             .query_row(&format!("SELECT MAX(rows) FROM {table_name};"), [], |row| {
-                row.get::<_, Option<i64>>(0)
+                checked_optional_row_integer(row, 0)
             })
-            .map(|value| value.unwrap_or(0) as usize)
+            .map(|value: Option<usize>| value.unwrap_or(0))
             .map_err(Into::into)
     }
 
@@ -1141,10 +1174,10 @@ impl ColmapDatabase {
             .query_row(
                 &format!("SELECT rows FROM {table_name} WHERE {column_name} = ?1;"),
                 params![value],
-                |row| row.get::<_, i64>(0),
+                |row| checked_row_integer(row, 0),
             )
             .optional()
-            .map(|value| value.unwrap_or(0) as usize)
+            .map(|value: Option<usize>| value.unwrap_or(0))
             .map_err(Into::into)
     }
 
@@ -1509,8 +1542,8 @@ impl ColmapDatabase {
             .conn
             .query_row(sql, params![id], |row| {
                 Ok((
-                    row.get::<_, i64>(0)? as usize,
-                    row.get::<_, i64>(1)? as usize,
+                    checked_row_integer(row, 0)?,
+                    checked_row_integer(row, 1)?,
                     row.get::<_, Vec<u8>>(2)?,
                 ))
             })
@@ -1555,8 +1588,8 @@ impl ColmapDatabase {
                 params![image_id],
                 |row| {
                     Ok((
-                        row.get::<_, i64>(0)? as usize,
-                        row.get::<_, i64>(1)? as usize,
+                        checked_row_integer(row, 0)?,
+                        checked_row_integer(row, 1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, i32>(3)?,
                     ))
@@ -1576,10 +1609,7 @@ impl ColmapDatabase {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push((
-                row.get::<_, i64>(0)? as ImageId,
-                row.get::<_, i64>(1)? as usize,
-            ));
+            out.push((checked_row_integer(row, 0)?, checked_row_integer(row, 1)?));
         }
         Ok(out)
     }
@@ -1652,8 +1682,8 @@ impl ColmapDatabase {
                 params![pair_id as i64],
                 |row| {
                     Ok((
-                        row.get::<_, i64>(0)? as usize,
-                        row.get::<_, i64>(1)? as usize,
+                        checked_row_integer(row, 0)?,
+                        checked_row_integer(row, 1)?,
                         row.get::<_, Vec<u8>>(2)?,
                     ))
                 },
@@ -1677,10 +1707,10 @@ impl ColmapDatabase {
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push((
-                row.get::<_, i64>(0)? as ImagePairId,
+                checked_row_integer(row, 0)?,
                 ColmapMatchesBlob::new(
-                    row.get::<_, i64>(1)? as usize,
-                    row.get::<_, i64>(2)? as usize,
+                    checked_row_integer(row, 1)?,
+                    checked_row_integer(row, 2)?,
                     row.get::<_, Vec<u8>>(3)?,
                 )?,
             ));
@@ -1707,10 +1737,7 @@ impl ColmapDatabase {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push((
-                row.get::<_, i64>(0)? as ImagePairId,
-                row.get::<_, i64>(1)? as i32,
-            ));
+            out.push((checked_row_integer(row, 0)?, checked_row_integer(row, 1)?));
         }
         Ok(out)
     }
@@ -2023,8 +2050,8 @@ impl ColmapDatabase {
                 params![pair_id as i64],
                 |row| {
                     Ok((
-                        row.get::<_, i64>(0)? as usize,
-                        row.get::<_, i64>(1)? as usize,
+                        checked_row_integer(row, 0)?,
+                        checked_row_integer(row, 1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, i32>(3)?,
                         row.get::<_, Option<Vec<u8>>>(4)?,
@@ -2070,10 +2097,7 @@ impl ColmapDatabase {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push((
-                row.get::<_, i64>(0)? as ImagePairId,
-                row.get::<_, i64>(1)? as i32,
-            ));
+            out.push((checked_row_integer(row, 0)?, checked_row_integer(row, 1)?));
         }
         Ok(out)
     }
@@ -2088,9 +2112,9 @@ impl ColmapDatabase {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let pair_id = row.get::<_, i64>(0)? as ImagePairId;
-            let match_rows = row.get::<_, i64>(1)? as usize;
-            let cols = row.get::<_, i64>(2)? as usize;
+            let pair_id = checked_row_integer(row, 0)?;
+            let match_rows = checked_row_integer(row, 1)?;
+            let cols = checked_row_integer(row, 2)?;
             let data = row.get::<_, Vec<u8>>(3)?;
             out.push((
                 pair_id,
@@ -2581,10 +2605,10 @@ fn remap_id(ids: &HashMap<u32, u32>, old_id: u32, kind: &str) -> Result<u32> {
 }
 
 fn read_camera_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseCamera> {
-    let camera_id = row.get::<_, i64>(0)? as u32;
-    let model_id = row.get::<_, i64>(1)? as i32;
-    let width = row.get::<_, i64>(2)? as u32;
-    let height = row.get::<_, i64>(3)? as u32;
+    let camera_id = checked_row_integer(row, 0)?;
+    let model_id = checked_row_integer(row, 1)?;
+    let width = checked_row_integer(row, 2)?;
+    let height = checked_row_integer(row, 3)?;
     let params_blob = row.get::<_, Vec<u8>>(4)?;
     let params = decode_f64_values_vec(&params_blob).map_err(to_sql_error)?;
     let camera = ColmapCamera {
@@ -2789,10 +2813,10 @@ fn connected_frames_from_geometries(
 
 fn read_image_row(row: &Row<'_>) -> rusqlite::Result<ColmapDatabaseImage> {
     Ok(ColmapDatabaseImage {
-        image_id: row.get::<_, i64>(0)? as ImageId,
+        image_id: checked_row_integer(row, 0)?,
         name: row.get(1)?,
-        camera_id: row.get::<_, i64>(2)? as u32,
-        frame_id: row.get::<_, Option<i64>>(3)?.map(|id| id as u32),
+        camera_id: checked_row_integer(row, 2)?,
+        frame_id: checked_optional_row_integer(row, 3)?,
     })
 }
 
@@ -2801,11 +2825,11 @@ fn read_pose_prior_row(row: &Row<'_>) -> rusqlite::Result<ColmapPosePrior> {
     let position_covariance_blob = row.get::<_, Vec<u8>>(5)?;
     let gravity_blob = row.get::<_, Vec<u8>>(7)?;
     Ok(ColmapPosePrior {
-        pose_prior_id: row.get::<_, i64>(0)? as u32,
+        pose_prior_id: checked_row_integer(row, 0)?,
         corr_data_id: ColmapDataId {
-            data_id: row.get::<_, i64>(1)? as u64,
+            data_id: checked_row_integer(row, 1)?,
             sensor_id: ColmapSensorId {
-                sensor_id: row.get::<_, i64>(2)? as u32,
+                sensor_id: checked_row_integer(row, 2)?,
                 sensor_type: sensor_type_from_i64(row.get::<_, i64>(3)?),
             },
         },
@@ -2820,12 +2844,12 @@ fn read_pose_prior_row(row: &Row<'_>) -> rusqlite::Result<ColmapPosePrior> {
 fn collect_rig_rows(rows: &mut Rows<'_>) -> Result<Vec<ColmapRig>> {
     let mut rigs = BTreeMap::<u32, ColmapRig>::new();
     while let Some(row) = rows.next()? {
-        let rig_id = row.get::<_, i64>(0)? as u32;
+        let rig_id = checked_row_integer(row, 0)?;
         if let std::collections::btree_map::Entry::Vacant(entry) = rigs.entry(rig_id) {
             entry.insert(ColmapRig {
                 rig_id,
                 ref_sensor_id: Some(ColmapSensorId {
-                    sensor_id: row.get::<_, i64>(1)? as u32,
+                    sensor_id: checked_row_integer(row, 1)?,
                     sensor_type: sensor_type_from_i64(row.get::<_, i64>(2)?),
                 }),
                 sensors: Vec::new(),
@@ -2849,7 +2873,7 @@ fn push_rig_sensor_from_row(rig: &mut ColmapRig, row: &Row<'_>) -> Result<()> {
         .transpose()?;
     rig.sensors.push(ColmapRigSensor {
         sensor_id: ColmapSensorId {
-            sensor_id: sensor_id as u32,
+            sensor_id: checked_integer(sensor_id, 3)?,
             sensor_type: sensor_type_from_i64(row.get::<_, i64>(4)?),
         },
         sensor_from_rig,
@@ -2860,11 +2884,11 @@ fn push_rig_sensor_from_row(rig: &mut ColmapRig, row: &Row<'_>) -> Result<()> {
 fn collect_frame_rows(rows: &mut Rows<'_>) -> Result<Vec<ColmapDatabaseFrame>> {
     let mut frames = BTreeMap::<u32, ColmapDatabaseFrame>::new();
     while let Some(row) = rows.next()? {
-        let frame_id = row.get::<_, i64>(0)? as u32;
+        let frame_id = checked_row_integer(row, 0)?;
         if let std::collections::btree_map::Entry::Vacant(entry) = frames.entry(frame_id) {
             entry.insert(ColmapDatabaseFrame {
                 frame_id,
-                rig_id: row.get::<_, i64>(1)? as u32,
+                rig_id: checked_row_integer(row, 1)?,
                 data_ids: Vec::new(),
             });
         }
@@ -2880,9 +2904,9 @@ fn push_frame_data_from_row(frame: &mut ColmapDatabaseFrame, row: &Row<'_>) -> R
         return Ok(());
     };
     frame.data_ids.push(ColmapDataId {
-        data_id: data_id as u64,
+        data_id: checked_integer(data_id, 2)?,
         sensor_id: ColmapSensorId {
-            sensor_id: row.get::<_, i64>(3)? as u32,
+            sensor_id: checked_row_integer(row, 3)?,
             sensor_type: sensor_type_from_i64(row.get::<_, i64>(4)?),
         },
     });
@@ -2986,6 +3010,34 @@ fn validate_camera_params(camera: &ColmapCamera) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn checked_integer<T>(value: i64, column: usize) -> rusqlite::Result<T>
+where
+    T: TryFrom<i64>,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    T::try_from(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(err))
+    })
+}
+
+fn checked_row_integer<T>(row: &Row<'_>, column: usize) -> rusqlite::Result<T>
+where
+    T: TryFrom<i64>,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    checked_integer(row.get::<_, i64>(column)?, column)
+}
+
+fn checked_optional_row_integer<T>(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<T>>
+where
+    T: TryFrom<i64>,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| checked_integer(value, column))
+        .transpose()
 }
 
 fn to_sql_error(err: anyhow::Error) -> rusqlite::Error {
@@ -3334,6 +3386,63 @@ mod tests {
             Some(image.clone())
         );
         assert_eq!(db.read_all_images().unwrap(), vec![image]);
+    }
+
+    #[test]
+    fn database_read_only_open_preserves_file_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("database.db");
+        {
+            let db = ColmapDatabase::open(&path).unwrap();
+            write_test_camera(&db, 1);
+            write_test_images(&db, 1, &[1]);
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        {
+            let db = ColmapDatabase::open_read_only(&path).unwrap();
+            assert_eq!(db.read_all_cameras().unwrap().len(), 1);
+            assert_eq!(db.read_all_images().unwrap().len(), 1);
+        }
+
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn negative_keypoint_rows_are_rejected_before_usize_conversion() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        write_test_camera(&db, 1);
+        write_test_images(&db, 1, &[1]);
+        db.conn
+            .execute(
+                "INSERT INTO keypoints(image_id, rows, cols, data) VALUES(?1, -1, 2, ?2);",
+                params![1i64, Vec::<u8>::new()],
+            )
+            .unwrap();
+
+        assert!(db.read_keypoint_counts().is_err());
+        assert!(db.read_keypoints(1).is_err());
+    }
+
+    #[test]
+    fn transaction_error_rolls_back_rows_and_deletion_state() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        write_test_camera(&db, 1);
+        write_test_images(&db, 1, &[1, 2]);
+        let original = vec![m(0, 1)];
+        db.write_matches(1, 2, &original).unwrap();
+
+        let result: Result<()> = db.with_transaction(|| {
+            db.clear_matches()?;
+            db.write_matches(1, 2, &[m(1, 0)])?;
+            bail!("injected transaction failure")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(db.read_matches(1, 2).unwrap(), original);
+        assert!(!db.database_entry_deleted.get());
     }
 
     #[test]

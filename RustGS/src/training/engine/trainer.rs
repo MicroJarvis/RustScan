@@ -44,6 +44,28 @@ pub(crate) struct TrainingIterationMetrics {
     pub gaussian_count: usize,
 }
 
+fn validate_loss_value(loss: f32, iteration: usize) -> Result<f32, TrainingError> {
+    if loss.is_finite() {
+        Ok(loss)
+    } else {
+        Err(TrainingError::TrainingFailed(format!(
+            "non-finite loss {loss} at iteration {iteration}"
+        )))
+    }
+}
+
+fn record_completed_step(
+    report: &mut WgpuTrainingReport,
+    iteration: usize,
+    gaussian_count: usize,
+    loss: f32,
+) {
+    report.completed_iterations = iteration;
+    report.final_gaussian_count = gaussian_count;
+    report.final_loss = Some(loss);
+    report.final_step_loss = Some(loss);
+}
+
 pub(crate) trait TrainingLoopObserver {
     fn should_cancel(&self) -> bool {
         false
@@ -340,9 +362,8 @@ impl WgpuTrainer {
         image_dims: (usize, usize),
         iteration: usize,
         frame_count: usize,
-        read_loss_scalar: bool,
         collect_topology_stats: bool,
-    ) -> Option<f32> {
+    ) -> Result<f32, TrainingError> {
         let profile_step = log::log_enabled!(log::Level::Debug)
             && (iteration <= 3 || iteration.is_multiple_of(100));
         let step_started_at = Instant::now();
@@ -391,22 +412,13 @@ impl WgpuTrainer {
             &self.ssim_config,
             self.ssim_kernel.clone(),
         );
-        let read_loss_for_profile = profile_step && !read_loss_scalar;
         let loss_sync_started_at = Instant::now();
-        let loss_value = if read_loss_scalar || read_loss_for_profile {
-            let loss_value = loss.clone().into_scalar_async().await.expect("loss scalar");
-            if !loss_value.is_finite() {
-                log::warn!(
-                    "Non-finite loss ({loss_value:.6}) at iteration {iteration}; skipping gradient update"
-                );
-                return Some(loss_value);
-            }
-            Some(loss_value)
-        } else {
-            None
-        };
-        let loss_elapsed =
-            (read_loss_scalar || read_loss_for_profile).then(|| loss_sync_started_at.elapsed());
+        let loss_value =
+            loss.clone().into_scalar_async().await.map_err(|err| {
+                TrainingError::TrainingFailed(format!("failed to read loss: {err}"))
+            })?;
+        let loss_value = validate_loss_value(loss_value, iteration)?;
+        let loss_elapsed = loss_sync_started_at.elapsed();
         let mut grads = loss.backward();
 
         let transforms_grad = splats
@@ -514,7 +526,7 @@ impl WgpuTrainer {
                 iteration,
                 target_ready_elapsed.as_secs_f64() * 1000.0,
                 forward_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
-                loss_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                loss_elapsed.as_secs_f64() * 1000.0,
                 backward_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
                 optimizer_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
                 step_started_at.elapsed().as_secs_f64() * 1000.0,
@@ -583,7 +595,7 @@ impl WgpuTrainer {
                 .await;
         }
 
-        loss_value
+        Ok(loss_value)
     }
 
     pub(crate) async fn train_with_frame_loader(
@@ -651,7 +663,6 @@ impl WgpuTrainer {
             let emit_progress = observer.should_emit_progress(iteration_idx);
             let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
             let should_log_step = iteration_idx.is_multiple_of(100);
-            let should_read_loss = emit_progress || emit_snapshot || should_log_step;
             let loss = self
                 .train_step(
                     splats,
@@ -660,46 +671,33 @@ impl WgpuTrainer {
                     image_dims,
                     iteration_idx,
                     cameras.len(),
-                    should_read_loss,
                     collect_topology_stats,
                 )
-                .await;
-            report.completed_iterations = iteration_idx;
-            report.final_gaussian_count = splats.num_splats();
-
-            if let Some(loss) = loss {
-                report.final_loss = Some(loss);
-                report.final_step_loss = Some(loss);
-                self.record_loss_sample(
-                    iteration_idx,
-                    frame_idx,
-                    loss,
-                    should_log_step || iteration_idx == num_iterations,
-                );
-                let metrics = TrainingIterationMetrics {
-                    iteration: iteration_idx,
-                    loss,
-                    gaussian_count: splats.num_splats(),
-                };
-                if emit_progress {
-                    observer.on_iteration(metrics);
-                }
-                if emit_snapshot {
-                    let host = device_splats_to_host(splats).await;
-                    observer.on_snapshot(metrics, host);
-                }
-                if should_log_step {
-                    log::info!(
-                        "WGPU training step {} | loss={:.6} | splats={}",
-                        iteration_idx,
-                        loss,
-                        splats.num_splats()
-                    );
-                }
-            } else if should_log_step {
+                .await?;
+            record_completed_step(&mut report, iteration_idx, splats.num_splats(), loss);
+            self.record_loss_sample(
+                iteration_idx,
+                frame_idx,
+                loss,
+                should_log_step || iteration_idx == num_iterations,
+            );
+            let metrics = TrainingIterationMetrics {
+                iteration: iteration_idx,
+                loss,
+                gaussian_count: splats.num_splats(),
+            };
+            if emit_progress {
+                observer.on_iteration(metrics);
+            }
+            if emit_snapshot {
+                let host = device_splats_to_host(splats).await;
+                observer.on_snapshot(metrics, host);
+            }
+            if should_log_step {
                 log::info!(
-                    "WGPU training step {} | splats={}",
+                    "WGPU training step {} | loss={:.6} | splats={}",
                     iteration_idx,
+                    loss,
                     splats.num_splats()
                 );
             }
@@ -1079,9 +1077,31 @@ fn initial_training_telemetry(
 }
 
 fn training_epoch_count(iterations: usize, frame_count: usize) -> usize {
-    if frame_count == 0 {
-        0
-    } else {
-        (iterations / frame_count).max(1)
+    iterations
+        .checked_div(frame_count)
+        .map(|epochs| epochs.max(1))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_finite_loss_is_rejected_before_gradient_work() {
+        assert!(validate_loss_value(f32::NAN, 7).is_err());
+        assert!(validate_loss_value(f32::INFINITY, 7).is_err());
+        assert_eq!(validate_loss_value(0.25, 7).unwrap(), 0.25);
+    }
+
+    #[test]
+    fn completed_step_always_replaces_reported_final_loss() {
+        let mut report = WgpuTrainingReport::default();
+        record_completed_step(&mut report, 1, 10, 0.5);
+        record_completed_step(&mut report, 2, 11, 0.25);
+        assert_eq!(report.final_loss, Some(0.25));
+        assert_eq!(report.final_step_loss, Some(0.25));
+        assert_eq!(report.completed_iterations, 2);
+        assert_eq!(report.final_gaussian_count, 11);
     }
 }

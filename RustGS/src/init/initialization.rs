@@ -4,14 +4,18 @@
 //! from sparse point clouds (e.g., SLAM map points).
 //! Uses KdTree for nearest-neighbor scale computation.
 
+#[cfg(feature = "gpu")]
 use glam::Vec3;
+#[cfg(feature = "gpu")]
 use kiddo::{KdTree, SquaredEuclidean};
+#[cfg(feature = "gpu")]
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[cfg(feature = "gpu")]
 use crate::core::HostSplats;
 #[cfg(feature = "gpu")]
 use crate::sh::{rgb_to_sh0_value, sh_coeff_count_for_degree};
+#[cfg(feature = "gpu")]
 use crate::TrainingError;
 
 /// Configuration for Gaussian initialization from point clouds.
@@ -107,6 +111,7 @@ pub fn initialize_host_splats_from_points(
     )
 }
 
+#[cfg(feature = "gpu")]
 fn compute_scales(points: &[Vec3], config: &GaussianInitConfig) -> Vec<f32> {
     if points.len() < 3 {
         return vec![1.0; points.len()];
@@ -158,6 +163,7 @@ fn compute_scales(points: &[Vec3], config: &GaussianInitConfig) -> Vec<f32> {
     scales
 }
 
+#[cfg(feature = "gpu")]
 fn brush_scene_max_scale(points: &[Vec3]) -> f32 {
     let bounds = percentile_bounds(points, 0.75);
     let mut extents = [
@@ -170,6 +176,7 @@ fn brush_scene_max_scale(points: &[Vec3]) -> f32 {
     median_size * 0.1
 }
 
+#[cfg(feature = "gpu")]
 fn percentile_bounds(points: &[Vec3], percentile: f32) -> (Vec3, Vec3) {
     let mut xs = Vec::with_capacity(points.len());
     let mut ys = Vec::with_capacity(points.len());
@@ -194,11 +201,13 @@ fn percentile_bounds(points: &[Vec3], percentile: f32) -> (Vec3, Vec3) {
     )
 }
 
+#[cfg(feature = "gpu")]
 fn opacity_to_logit(opacity: f32) -> f32 {
     let clamped = opacity.clamp(1e-6, 1.0 - 1e-6);
     (clamped / (1.0 - clamped)).ln()
 }
 
+#[cfg(feature = "gpu")]
 fn next_rotation(rotation_rng: &mut Option<StdRng>) -> [f32; 4] {
     let Some(rng) = rotation_rng else {
         return [1.0, 0.0, 0.0, 0.0];
@@ -219,6 +228,7 @@ fn next_rotation(rotation_rng: &mut Option<StdRng>) -> [f32; 4] {
     }
 }
 
+#[cfg(feature = "gpu")]
 fn standard_normal(rng: &mut StdRng) -> f32 {
     let u1 = rng.gen::<f32>().clamp(f32::MIN_POSITIVE, 1.0);
     let u2 = rng.gen::<f32>();

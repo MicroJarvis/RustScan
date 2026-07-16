@@ -18,6 +18,24 @@ typedef struct LevelData {
     size_t count;
 } LevelData;
 
+#if defined(_MSC_VER)
+#define RUSTSFM_THREAD_LOCAL __declspec(thread)
+#else
+#define RUSTSFM_THREAD_LOCAL _Thread_local
+#endif
+
+static RUSTSFM_THREAD_LOCAL int paired_allocation_fail_after = -1;
+
+static void* paired_malloc(size_t size) {
+    if (paired_allocation_fail_after == 0) {
+        return NULL;
+    }
+    if (paired_allocation_fail_after > 0) {
+        --paired_allocation_fail_after;
+    }
+    return malloc(size);
+}
+
 static void set_error(RustSfmVlfeatSiftFeatures* out, const char* message) {
     if (out == NULL) {
         return;
@@ -118,27 +136,158 @@ static int allocate_features_output(
 }
 
 static int level_reserve(LevelData* level, size_t extra) {
-    if (level->count + extra <= level->capacity) {
+    if (extra > SIZE_MAX - level->count) {
+        return 0;
+    }
+    const size_t required = level->count + extra;
+    if (required <= level->capacity) {
         return 1;
     }
     size_t new_capacity = level->capacity == 0 ? extra : level->capacity;
-    while (new_capacity < level->count + extra) {
+    while (new_capacity < required) {
+        if (new_capacity > SIZE_MAX / 2) {
+            new_capacity = required;
+            break;
+        }
         new_capacity *= 2;
     }
-    RustSfmVlfeatSiftKeypoint* new_keypoints =
-        (RustSfmVlfeatSiftKeypoint*)realloc(
-            level->keypoints, new_capacity * sizeof(RustSfmVlfeatSiftKeypoint));
-    uint8_t* new_descriptors =
-        (uint8_t*)realloc(level->descriptors, new_capacity * DESCRIPTOR_DIM);
-    if (new_keypoints == NULL || new_descriptors == NULL) {
-        free(new_keypoints);
-        free(new_descriptors);
+    if (new_capacity > SIZE_MAX / sizeof(RustSfmVlfeatSiftKeypoint) ||
+        new_capacity > SIZE_MAX / DESCRIPTOR_DIM) {
         return 0;
     }
+
+    RustSfmVlfeatSiftKeypoint* new_keypoints = (RustSfmVlfeatSiftKeypoint*)paired_malloc(
+        new_capacity * sizeof(RustSfmVlfeatSiftKeypoint));
+    if (new_keypoints == NULL) {
+        return 0;
+    }
+    uint8_t* new_descriptors =
+        (uint8_t*)paired_malloc(new_capacity * DESCRIPTOR_DIM);
+    if (new_descriptors == NULL) {
+        free(new_keypoints);
+        return 0;
+    }
+
+    if (level->count > 0) {
+        memcpy(
+            new_keypoints,
+            level->keypoints,
+            level->count * sizeof(RustSfmVlfeatSiftKeypoint));
+        memcpy(
+            new_descriptors,
+            level->descriptors,
+            level->count * DESCRIPTOR_DIM);
+    }
+    free(level->keypoints);
+    free(level->descriptors);
     level->keypoints = new_keypoints;
     level->descriptors = new_descriptors;
     level->capacity = new_capacity;
     return 1;
+}
+
+static int levels_append(
+    LevelData** levels,
+    size_t** level_num_features,
+    size_t num_levels) {
+    if (num_levels == SIZE_MAX) {
+        return 0;
+    }
+    const size_t new_count = num_levels + 1;
+    if (new_count > SIZE_MAX / sizeof(LevelData) ||
+        new_count > SIZE_MAX / sizeof(size_t)) {
+        return 0;
+    }
+
+    LevelData* new_levels =
+        (LevelData*)paired_malloc(new_count * sizeof(LevelData));
+    if (new_levels == NULL) {
+        return 0;
+    }
+    size_t* new_level_num_features =
+        (size_t*)paired_malloc(new_count * sizeof(size_t));
+    if (new_level_num_features == NULL) {
+        free(new_levels);
+        return 0;
+    }
+
+    if (num_levels > 0) {
+        memcpy(new_levels, *levels, num_levels * sizeof(LevelData));
+        memcpy(
+            new_level_num_features,
+            *level_num_features,
+            num_levels * sizeof(size_t));
+    }
+    memset(&new_levels[num_levels], 0, sizeof(LevelData));
+    new_level_num_features[num_levels] = 0;
+
+    free(*levels);
+    free(*level_num_features);
+    *levels = new_levels;
+    *level_num_features = new_level_num_features;
+    return 1;
+}
+
+int rustsfm_vlfeat_test_paired_allocation_failure(
+    int growth_path,
+    int fail_allocation) {
+    if ((growth_path != 0 && growth_path != 1) ||
+        (fail_allocation != 0 && fail_allocation != 1)) {
+        return 0;
+    }
+
+    if (growth_path == 0) {
+        LevelData level;
+        memset(&level, 0, sizeof(level));
+        level.keypoints = (RustSfmVlfeatSiftKeypoint*)malloc(
+            sizeof(RustSfmVlfeatSiftKeypoint));
+        level.descriptors = (uint8_t*)malloc(DESCRIPTOR_DIM);
+        if (level.keypoints == NULL || level.descriptors == NULL) {
+            free(level.keypoints);
+            free(level.descriptors);
+            return 0;
+        }
+        level.capacity = 1;
+        level.count = 1;
+        level.keypoints[0].x = 123.0f;
+        level.descriptors[0] = 77;
+        RustSfmVlfeatSiftKeypoint* old_keypoints = level.keypoints;
+        uint8_t* old_descriptors = level.descriptors;
+
+        paired_allocation_fail_after = fail_allocation;
+        const int grew = level_reserve(&level, 1);
+        paired_allocation_fail_after = -1;
+        const int preserved = !grew && level.keypoints == old_keypoints &&
+                              level.descriptors == old_descriptors &&
+                              level.capacity == 1 && level.count == 1 &&
+                              level.keypoints[0].x == 123.0f &&
+                              level.descriptors[0] == 77;
+        free(level.keypoints);
+        free(level.descriptors);
+        return preserved;
+    }
+
+    LevelData* levels = (LevelData*)malloc(sizeof(LevelData));
+    size_t* level_num_features = (size_t*)malloc(sizeof(size_t));
+    if (levels == NULL || level_num_features == NULL) {
+        free(levels);
+        free(level_num_features);
+        return 0;
+    }
+    memset(levels, 0, sizeof(LevelData));
+    level_num_features[0] = 19;
+    LevelData* old_levels = levels;
+    size_t* old_level_num_features = level_num_features;
+
+    paired_allocation_fail_after = fail_allocation;
+    const int grew = levels_append(&levels, &level_num_features, 1);
+    paired_allocation_fail_after = -1;
+    const int preserved = !grew && levels == old_levels &&
+                          level_num_features == old_level_num_features &&
+                          level_num_features[0] == 19;
+    free(levels);
+    free(level_num_features);
+    return preserved;
 }
 
 static void level_free(LevelData* level) {
@@ -481,13 +630,7 @@ static int extract_sift_standard(
                     levels[num_levels - 1].count = level_idx;
                 }
 
-                LevelData* new_levels =
-                    (LevelData*)realloc(levels, (num_levels + 1) * sizeof(LevelData));
-                size_t* new_level_num_features = (size_t*)realloc(
-                    level_num_features, (num_levels + 1) * sizeof(size_t));
-                if (new_levels == NULL || new_level_num_features == NULL) {
-                    free(new_levels);
-                    free(new_level_num_features);
+                if (!levels_append(&levels, &level_num_features, num_levels)) {
                     free(data_float);
                     levels_free(levels, num_levels);
                     free(level_num_features);
@@ -495,12 +638,8 @@ static int extract_sift_standard(
                     set_error(out, "out of memory");
                     return 0;
                 }
-                levels = new_levels;
-                level_num_features = new_level_num_features;
 
                 LevelData* level = &levels[num_levels];
-                memset(level, 0, sizeof(*level));
-                level_num_features[num_levels] = 0;
                 num_levels += 1;
 
                 size_t reserve_count =

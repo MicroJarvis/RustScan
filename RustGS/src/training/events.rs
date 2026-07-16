@@ -136,6 +136,12 @@ pub struct TrainingRunCancelled {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TrainingRunFailed {
+    pub error: String,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum TrainingEvent {
     RunStarted(TrainingRunStarted),
@@ -143,23 +149,16 @@ pub enum TrainingEvent {
     IterationProgress(TrainingIterationProgress),
     SnapshotReady(TrainingSnapshotReady),
     RunCancelled(TrainingRunCancelled),
+    RunFailed(TrainingRunFailed),
     RunCompleted(TrainingRunCompleted),
 }
 
 pub type TrainingEventSink<'a> = dyn FnMut(TrainingEvent) + 'a;
 
+#[derive(Default)]
 pub struct TrainingOptions<'a> {
     pub control: TrainingControl,
     pub on_event: Option<Box<TrainingEventSink<'a>>>,
-}
-
-impl<'a> Default for TrainingOptions<'a> {
-    fn default() -> Self {
-        Self {
-            control: TrainingControl::default(),
-            on_event: None,
-        }
-    }
 }
 
 impl<'a> TrainingOptions<'a> {

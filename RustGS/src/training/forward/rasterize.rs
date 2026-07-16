@@ -158,3 +158,15 @@ pub(crate) fn rasterize<B: RasterizeBackend>(
         depth: Tensor::from_primitive(TensorPrimitive::Float(depth)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visibility_writes_are_atomic() {
+        assert!(SHADER_SRC.contains("array<atomic<u32>>"));
+        assert!(SHADER_SRC.contains("atomicStore(&visible"));
+        assert!(!SHADER_SRC.contains("visible[load_gid[t]] ="));
+    }
+}

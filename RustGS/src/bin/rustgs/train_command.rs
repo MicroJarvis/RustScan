@@ -34,8 +34,12 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
         log::info!("Applied RustGS train preset: {}", preset);
     }
 
-    let (dataset, source) =
-        load_training_dataset_for_training(&args.input, args.max_frames, args.frame_stride)?;
+    let (dataset, source) = load_training_dataset_for_training(
+        &args.input,
+        args.image_root.as_deref(),
+        args.max_frames,
+        args.frame_stride,
+    )?;
     let included_training_ranges = parse_frame_ranges(args.include_frame_ranges.as_deref())?;
     let dataset = filter_dataset_to_frame_ranges(dataset, &included_training_ranges, "training")?;
     let excluded_training_ranges = parse_frame_ranges(args.exclude_frame_ranges.as_deref())?;
@@ -96,6 +100,7 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
         &args.output,
         &dataset,
         &splats,
+        &metadata,
         &config,
         training_telemetry,
         training_report.training_loop_elapsed,
@@ -947,6 +952,7 @@ impl TrainArgSources {
 
 pub(super) fn load_training_dataset_for_training(
     input: &Path,
+    image_root: Option<&Path>,
     max_frames: usize,
     frame_stride: usize,
 ) -> anyhow::Result<(rustscan_types::TrainingDataset, rustgs::TrainingInputKind)> {
@@ -962,6 +968,7 @@ pub(super) fn load_training_dataset_for_training(
         &rustgs::ColmapConfig {
             max_frames,
             frame_stride,
+            image_root: image_root.map(Path::to_path_buf),
             ..Default::default()
         },
     )?;
@@ -979,6 +986,7 @@ pub(super) fn load_training_dataset_for_training(
 #[cfg(feature = "gpu")]
 fn load_evaluation_dataset(
     input: &Path,
+    image_root: Option<&Path>,
     max_frames: usize,
     frame_stride: usize,
 ) -> anyhow::Result<rustscan_types::TrainingDataset> {
@@ -987,6 +995,7 @@ fn load_evaluation_dataset(
         &rustgs::ColmapConfig {
             max_frames,
             frame_stride,
+            image_root: image_root.map(Path::to_path_buf),
             ..Default::default()
         },
     )?;
@@ -1274,11 +1283,10 @@ fn crop_frame_indices(
             .poses
             .iter()
             .enumerate()
-            .filter_map(|(idx, pose)| {
-                requested_frame_ids.contains(&pose.frame_id).then(|| {
-                    found.insert(pose.frame_id);
-                    idx
-                })
+            .filter(|(_, pose)| requested_frame_ids.contains(&pose.frame_id))
+            .map(|(idx, pose)| {
+                found.insert(pose.frame_id);
+                idx
             })
             .collect::<Vec<_>>();
         if found.len() != requested_frame_ids.len() {
@@ -1473,7 +1481,12 @@ fn maybe_evaluate_trained_splats(
         .map_err(anyhow::Error::msg)?;
     let device = rustgs::evaluation_device(eval_device).map_err(anyhow::Error::from)?;
     let (dataset_max_frames, dataset_frame_stride) = evaluation_dataset_load_params(args);
-    let dataset = load_evaluation_dataset(&args.input, dataset_max_frames, dataset_frame_stride)?;
+    let dataset = load_evaluation_dataset(
+        &args.input,
+        args.image_root.as_deref(),
+        dataset_max_frames,
+        dataset_frame_stride,
+    )?;
     let included_eval_ranges = parse_frame_ranges(args.eval_include_frame_ranges.as_deref())?;
     let dataset = filter_dataset_to_frame_ranges(dataset, &included_eval_ranges, "evaluation")?;
     let excluded_eval_ranges = parse_frame_ranges(args.eval_exclude_frame_ranges.as_deref())?;
@@ -1782,6 +1795,7 @@ pub(super) fn maybe_write_litegs_parity_report(
     output: &Path,
     dataset: &rustscan_types::TrainingDataset,
     splats: &rustgs::HostSplats,
+    metadata: &rustgs::SplatMetadata,
     config: &rustgs::TrainingConfig,
     training_telemetry: Option<&rustgs::LiteGsTrainingTelemetry>,
     training_loop_elapsed: Duration,
@@ -1793,6 +1807,7 @@ pub(super) fn maybe_write_litegs_parity_report(
         output,
         dataset,
         splats,
+        metadata,
         config,
         training_telemetry,
         training_loop_elapsed,
@@ -1807,6 +1822,7 @@ pub(super) fn maybe_write_litegs_parity_report_with_manifest_dir(
     output: &Path,
     dataset: &rustscan_types::TrainingDataset,
     splats: &rustgs::HostSplats,
+    metadata: &rustgs::SplatMetadata,
     config: &rustgs::TrainingConfig,
     training_telemetry: Option<&rustgs::LiteGsTrainingTelemetry>,
     training_loop_elapsed: Duration,
@@ -1880,9 +1896,25 @@ pub(super) fn maybe_write_litegs_parity_report_with_manifest_dir(
     }
 
     let (roundtrip_splats, roundtrip_metadata) = rustgs::load_splats(output)?;
-    report.metrics.export_roundtrip_ok = roundtrip_splats.len() == splats.len()
-        && roundtrip_metadata.gaussian_count == splats.len()
-        && !splats_have_non_finite(&roundtrip_splats);
+    report.metrics.export_roundtrip_ok = matches!(
+        rustgs::splat_artifact_fidelity(output)?,
+        rustgs::SplatArtifactFidelity::Lossless
+    ) && rustgs::verify_lossless_roundtrip(
+        splats,
+        metadata,
+        &roundtrip_splats,
+        &roundtrip_metadata,
+    )
+    .is_ok();
+    if matches!(
+        rustgs::splat_artifact_fidelity(output)?,
+        rustgs::SplatArtifactFidelity::LossyLegacy
+    ) {
+        report.notes.push(
+            "The legacy .splat export is intentionally lossy, so it cannot satisfy the lossless export round-trip gate."
+                .to_string(),
+        );
+    }
 
     if let Some(reference_report_path) =
         resolve_parity_reference_report_path_from_manifest_dir(&report.fixture_id, manifest_dir)

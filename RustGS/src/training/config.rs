@@ -421,8 +421,8 @@ pub struct LiteGsConfig {
 
 impl LiteGsConfig {
     fn validate(&self, invalid: &mut Vec<String>) {
-        if self.rendering.sh_degree == 0 {
-            invalid.push("litegs.sh_degree must be >= 1".to_string());
+        if self.rendering.sh_degree > 3 {
+            invalid.push("litegs.sh_degree must be in the fully supported range 0..=3".to_string());
         }
         if self.rendering.tile_size.width == 0 || self.rendering.tile_size.height == 0 {
             invalid.push("litegs.tile_size width and height must both be >= 1".to_string());
@@ -490,6 +490,21 @@ impl LiteGsConfig {
         );
         validate_loss_weight("litegs.reg_weight", self.features.reg_weight, invalid);
         validate_lr("litegs.lr_pose", self.camera.lr_pose, false, invalid);
+        if self.features.sparse_grad {
+            invalid.push("litegs.sparse_grad is not implemented".to_string());
+        }
+        if self.features.enable_transmittance {
+            invalid.push("litegs.enable_transmittance is not implemented".to_string());
+        }
+        if self.features.enable_depth {
+            invalid.push("litegs.enable_depth is not implemented".to_string());
+        }
+        if self.features.reg_weight != 0.0 {
+            invalid.push("litegs.reg_weight is not implemented".to_string());
+        }
+        if self.camera.learnable_viewproj {
+            invalid.push("litegs.learnable_viewproj is not implemented".to_string());
+        }
     }
 }
 
@@ -915,4 +930,45 @@ pub struct TrainingResult {
     pub num_gaussians: usize,
     /// Training time in seconds
     pub training_time: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sh_degree_is_limited_to_shader_supported_range() {
+        let mut config = TrainingConfig::default();
+        config.litegs.rendering.sh_degree = 0;
+        assert!(config.validate().is_ok());
+        config.litegs.rendering.sh_degree = 3;
+        assert!(config.validate().is_ok());
+        config.litegs.rendering.sh_degree = 4;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn unimplemented_litegs_features_are_rejected_explicitly() {
+        let mut cases = Vec::new();
+        let mut sparse_grad = TrainingConfig::default();
+        sparse_grad.litegs.features.sparse_grad = true;
+        cases.push(sparse_grad);
+        let mut transmittance = TrainingConfig::default();
+        transmittance.litegs.features.enable_transmittance = true;
+        cases.push(transmittance);
+        let mut depth = TrainingConfig::default();
+        depth.litegs.features.enable_depth = true;
+        cases.push(depth);
+        let mut regularization = TrainingConfig::default();
+        regularization.litegs.features.reg_weight = 0.1;
+        cases.push(regularization);
+        let mut camera = TrainingConfig::default();
+        camera.litegs.camera.learnable_viewproj = true;
+        cases.push(camera);
+
+        for config in cases {
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("not implemented"));
+        }
+    }
 }

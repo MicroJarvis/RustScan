@@ -67,6 +67,10 @@ fn target_arch() -> String {
     env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default()
 }
 
+fn target_os() -> String {
+    env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
+}
+
 fn vlfeat_sift_sources(target_arch: &str) -> Vec<&'static str> {
     let mut sources = vec![
         "generic.c",
@@ -126,7 +130,7 @@ fn build_poselib_bridge() {
         .file(poselib_root.join("PoseLib/misc/univariate.cc"))
         .file(poselib_root.join("PoseLib/misc/essential.cc"));
 
-    if cfg!(target_os = "macos") {
+    if target_os() == "macos" {
         build.flag_if_supported("-stdlib=libc++");
     }
 
@@ -223,7 +227,7 @@ fn build_colmap_eigen() {
         .include(&eigen_include)
         .file("src/native/colmap_eigen.cpp");
 
-    if cfg!(target_os = "macos") {
+    if target_os() == "macos" {
         build.flag_if_supported("-stdlib=libc++");
     }
 

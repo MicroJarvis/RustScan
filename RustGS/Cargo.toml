@@ -2,6 +2,7 @@
 name = "rustgs"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.92"
 description = "3D Gaussian Splatting training library"
 authors = ["RustScan Developers"]
 
@@ -43,6 +44,7 @@ wgpu = { version = "29.0.1", default-features = false, features = ["naga-ir", "w
 naga_oil = { version = "0.22", optional = true }
 bytemuck = { version = "1.20", features = ["derive"], optional = true }
 tokio = { version = "1", features = ["macros", "rt"], optional = true }
+rustsfm = { path = "../RustSFM", default-features = false, optional = true }
 
 [features]
 default = ["gpu", "cli"]
@@ -60,6 +62,10 @@ gpu = [
 ]
 gpu-wgpu = ["gpu"]
 cli = ["dep:clap", "dep:env_logger", "dep:anyhow"]
+rustsfm-contract-tests = ["dep:rustsfm"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [[example]]
 name = "evaluate_psnr"

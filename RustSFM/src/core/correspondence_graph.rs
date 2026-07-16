@@ -119,6 +119,7 @@ pub enum CorrespondenceGraphError {
     ImagePairAlreadyExists(ImageId, ImageId),
     ImagePairDoesNotExist(ImageId, ImageId),
     ImageIdExceedsMax(ImageId),
+    InvalidPairId(ImagePairId),
     AlreadyFinalized,
 }
 
@@ -163,10 +164,15 @@ pub fn image_pair_to_pair_id(image_id1: ImageId, image_id2: ImageId) -> Result<I
 }
 
 pub fn pair_id_to_image_pair(pair_id: ImagePairId) -> Result<(ImageId, ImageId)> {
-    let image_id2 = (pair_id % MAX_NUM_IMAGES) as ImageId;
-    let image_id1 = ((pair_id - image_id2 as ImagePairId) / MAX_NUM_IMAGES) as ImageId;
-    throw_if_gt_max_images(image_id1)?;
-    throw_if_gt_max_images(image_id2)?;
+    let image_id2_raw = pair_id % MAX_NUM_IMAGES;
+    let image_id1_raw = pair_id / MAX_NUM_IMAGES;
+    if image_id1_raw >= MAX_NUM_IMAGES || image_id2_raw >= MAX_NUM_IMAGES {
+        return Err(CorrespondenceGraphError::InvalidPairId(pair_id));
+    }
+    let image_id1 = ImageId::try_from(image_id1_raw)
+        .map_err(|_| CorrespondenceGraphError::InvalidPairId(pair_id))?;
+    let image_id2 = ImageId::try_from(image_id2_raw)
+        .map_err(|_| CorrespondenceGraphError::InvalidPairId(pair_id))?;
     Ok((image_id1, image_id2))
 }
 
@@ -629,6 +635,12 @@ mod tests {
             image_pair_to_pair_id(i32::MAX as u32, 1),
             Err(CorrespondenceGraphError::ImageIdExceedsMax(i32::MAX as u32))
         );
+    }
+
+    #[test]
+    fn pair_id_rejects_values_that_would_wrap_image_ids() {
+        let pair_id = 9_223_372_034_707_292_161u64;
+        assert!(pair_id_to_image_pair(pair_id).is_err());
     }
 
     #[test]

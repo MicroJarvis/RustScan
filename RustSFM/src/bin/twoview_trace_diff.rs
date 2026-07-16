@@ -172,7 +172,7 @@ fn main() -> Result<()> {
 fn build_report(args: &Args) -> Result<DiffReport> {
     let trace_events = read_trace_events(&args.trace_json)?;
     let trace_by_name = trace_events_by_name(&trace_events)?;
-    let candidate = ColmapDatabase::open(&args.candidate_db)
+    let candidate = ColmapDatabase::open_read_only(&args.candidate_db)
         .with_context(|| format!("open candidate db {}", args.candidate_db.display()))?;
     let candidate_names = image_id_to_name_map(&candidate)?;
     let candidate_ids_by_name = image_name_to_id_map(&candidate_names);

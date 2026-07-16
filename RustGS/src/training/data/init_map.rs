@@ -14,7 +14,16 @@ pub(crate) fn build_initial_splats(
 
     let sh_degree = config.litegs.rendering.sh_degree;
     let init_config = gaussian_init_config_for_training(config);
-    let splats = initialize_host_splats_from_points(&dataset.initial_points, &init_config, sh_degree)?;
+    let initial_count = dataset
+        .initial_points
+        .len()
+        .min(config.initialization.max_initial_gaussians)
+        .min(config.litegs.topology.target_primitives);
+    let splats = initialize_host_splats_from_points(
+        &dataset.initial_points[..initial_count],
+        &init_config,
+        sh_degree,
+    )?;
 
     splats
         .validate()
@@ -30,5 +39,24 @@ pub(super) fn gaussian_init_config_for_training(config: &TrainingConfig) -> Gaus
         randomize_rotations: config.initialization.randomize_rotations,
         rotation_seed: config.initialization.rotation_seed,
         ..GaussianInitConfig::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Intrinsics;
+
+    #[test]
+    fn sparse_initialization_honors_max_initial_gaussians() {
+        let mut dataset = TrainingDataset::new(Intrinsics::default());
+        for idx in 0..8 {
+            dataset.add_point([idx as f32, 0.0, 1.0], None);
+        }
+        let mut config = TrainingConfig::default();
+        config.initialization.max_initial_gaussians = 3;
+
+        let splats = build_initial_splats(&dataset, &config).unwrap();
+        assert_eq!(splats.len(), 3);
     }
 }

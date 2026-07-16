@@ -48,8 +48,8 @@ pub use evaluation::{SharedWgpuContext, SplatEvaluationRenderer};
 pub use events::{
     TrainingControl, TrainingEvent, TrainingEventCadence, TrainingEventRoute,
     TrainingIterationProgress, TrainingOptions, TrainingPlanSelected, TrainingRun,
-    TrainingRunCancelled, TrainingRunCompleted, TrainingRunReport, TrainingRunStarted,
-    TrainingSnapshotReady,
+    TrainingRunCancelled, TrainingRunCompleted, TrainingRunFailed, TrainingRunReport,
+    TrainingRunStarted, TrainingSnapshotReady,
 };
 pub use reporting::metrics::{
     ParityFloatDistribution, ParityLossCurveSample, ParityLossTerms, ParityTopologyMetrics,

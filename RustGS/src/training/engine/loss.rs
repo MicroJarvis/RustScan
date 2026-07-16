@@ -68,6 +68,7 @@ pub fn ssim_loss_with_kernel<B: Backend>(
     ssim_mean.mul_scalar(-1.0).add_scalar(1.0).reshape([1])
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn combined_loss_with_kernel<B: Backend>(
     pred: Tensor<B, 3>,
     target: Tensor<B, 3>,
@@ -106,6 +107,7 @@ pub fn combined_loss_with_kernel<B: Backend>(
     total
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconstruction_residual_loss<B: Backend>(
     pred: Tensor<B, 3>,
     target: Tensor<B, 3>,

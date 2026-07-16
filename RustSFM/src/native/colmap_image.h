@@ -15,6 +15,8 @@ typedef struct RustSfmColmapGrayImage {
     char* error_message;
 } RustSfmColmapGrayImage;
 
+void rustsfm_colmap_initialize(void);
+
 int rustsfm_colmap_load_grayscale_u8(
     const char* path,
     RustSfmColmapGrayImage* out);

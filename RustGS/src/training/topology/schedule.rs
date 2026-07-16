@@ -1,6 +1,4 @@
-use super::{
-    LiteGsDensifySelection, TopologyAnalysis, TopologyPolicy, BRUSH_REFINE_PROGRESS_LIMIT,
-};
+use super::{LiteGsDensifySelection, TopologyAnalysis, TopologyPolicy};
 use crate::training::{LiteGsOpacityResetMode, TrainingConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,21 +52,29 @@ pub(super) fn schedule_topology(
             .map(|freeze_epoch| epoch >= freeze_epoch)
             .unwrap_or(false);
     let refine_every = policy.litegs.topology.refine_every.max(1);
-    let progress = if policy.max_iterations == 0 {
-        1.0
-    } else {
-        phase_iter as f32 / policy.max_iterations as f32
-    };
     let on_refine_cadence = phase_iter > 0 && phase_iter.is_multiple_of(refine_every);
-    let growth_window = progress <= BRUSH_REFINE_PROGRESS_LIMIT;
+    let densify_from = policy.litegs_effective_densify_from_epoch(step.frame_count);
+    let densify_until = policy.litegs_densify_until_epoch(step.frame_count);
+    let densification_interval = policy.litegs.topology.densification_interval.max(1);
+    let in_densify_window = epoch >= densify_from && epoch < densify_until;
+    let on_densify_epoch = in_densify_window
+        && epoch
+            .saturating_sub(densify_from)
+            .is_multiple_of(densification_interval);
+    let prune_start = densify_from.saturating_add(policy.litegs.pruning.prune_offset_epochs);
+    let on_prune_epoch = epoch >= prune_start
+        && epoch
+            .saturating_sub(prune_start)
+            .is_multiple_of(densification_interval);
+    let default_prune_until = densify_until.max(prune_start.saturating_add(1));
     let prune_window = policy
         .litegs
         .pruning
         .prune_until_epoch
         .map(|until_epoch| epoch < until_epoch)
-        .unwrap_or(growth_window);
-    let densify = on_refine_cadence && !growth_frozen && growth_window;
-    let prune = on_refine_cadence && !topology_frozen && prune_window;
+        .unwrap_or(epoch < default_prune_until);
+    let densify = on_refine_cadence && !growth_frozen && on_densify_epoch;
+    let prune = on_refine_cadence && !topology_frozen && on_prune_epoch && prune_window;
     let reset_opacity = on_refine_cadence
         && !topology_frozen
         && matches!(
@@ -130,4 +136,51 @@ fn litegs_current_epoch(iteration: usize, frame_count: usize) -> Option<usize> {
         return None;
     }
     Some(iteration.saturating_sub(1) / frame_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_consumes_densify_and_prune_windows() {
+        let config = TrainingConfig {
+            iterations: 1_000,
+            litegs: crate::training::LiteGsConfig {
+                topology: crate::training::LiteGsTopologyConfig {
+                    densify_from: 3,
+                    densify_until: Some(8),
+                    densification_interval: 2,
+                    refine_every: 1,
+                    ..Default::default()
+                },
+                pruning: crate::training::LiteGsPruningConfig {
+                    prune_offset_epochs: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy = TopologyPolicy::from_training_config(&config, 1.0);
+        let at_epoch = |epoch: usize| {
+            schedule_topology(
+                &policy,
+                TopologyStepContext {
+                    iteration: epoch * 10 + 1,
+                    frame_count: 10,
+                },
+            )
+        };
+
+        assert!(!at_epoch(2).densify);
+        assert!(at_epoch(3).densify);
+        assert!(!at_epoch(3).prune);
+        assert!(!at_epoch(4).densify);
+        assert!(at_epoch(4).prune);
+        assert!(at_epoch(5).densify);
+        assert!(!at_epoch(5).prune);
+        assert!(!at_epoch(8).densify);
+        assert!(!at_epoch(8).prune);
+    }
 }

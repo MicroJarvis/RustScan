@@ -78,9 +78,9 @@ fn main() -> Result<()> {
 }
 
 fn build_report(args: &Args) -> Result<DiffReport> {
-    let reference = ColmapDatabase::open(&args.reference_db)
+    let reference = ColmapDatabase::open_read_only(&args.reference_db)
         .with_context(|| format!("open reference db {}", args.reference_db.display()))?;
-    let candidate = ColmapDatabase::open(&args.candidate_db)
+    let candidate = ColmapDatabase::open_read_only(&args.candidate_db)
         .with_context(|| format!("open candidate db {}", args.candidate_db.display()))?;
     let reference_names = image_id_to_name_map(&reference)?;
     let candidate_names = image_id_to_name_map(&candidate)?;

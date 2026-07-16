@@ -1,8 +1,14 @@
+#[cfg(feature = "gpu")]
 use crate::core::GaussianCamera;
-use crate::{SplatMetadata, TrainingDataset};
+#[cfg(feature = "gpu")]
+use crate::SplatMetadata;
+use crate::TrainingDataset;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "gpu")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
+#[cfg(feature = "gpu")]
 use std::time::Instant;
 
 #[cfg(feature = "gpu")]
@@ -217,6 +223,7 @@ pub fn summarize_psnr_samples(values: &[f32]) -> PsnrSummary {
     }
 }
 
+#[cfg(feature = "gpu")]
 fn mean_f32(values: &[f32]) -> f32 {
     values.iter().copied().sum::<f32>() / values.len().max(1) as f32
 }
@@ -263,6 +270,7 @@ pub fn compute_psnr_f32(rendered: &[f32], target: &[f32]) -> f32 {
     }
 }
 
+#[cfg(feature = "gpu")]
 pub fn compute_gradient_sharpness_f32(rgb: &[f32], width: usize, height: usize) -> f32 {
     if rgb.len() != width.saturating_mul(height).saturating_mul(3) || width < 2 || height < 2 {
         return 0.0;
@@ -286,6 +294,7 @@ pub fn compute_gradient_sharpness_f32(rgb: &[f32], width: usize, height: usize) 
     sum / count.max(1) as f32
 }
 
+#[cfg(feature = "gpu")]
 pub fn compute_laplacian_sharpness_f32(rgb: &[f32], width: usize, height: usize) -> f32 {
     if rgb.len() != width.saturating_mul(height).saturating_mul(3) || width < 3 || height < 3 {
         return 0.0;
@@ -311,11 +320,13 @@ pub fn compute_laplacian_sharpness_f32(rgb: &[f32], width: usize, height: usize)
     (sum_sq / count.max(1) as f32 - mean * mean).max(0.0)
 }
 
+#[cfg(feature = "gpu")]
 fn luminance_at(rgb: &[f32], width: usize, x: usize, y: usize) -> f32 {
     let base = (y * width + x) * 3;
     0.2126 * rgb[base] + 0.7152 * rgb[base + 1] + 0.0722 * rgb[base + 2]
 }
 
+#[cfg(feature = "gpu")]
 fn sharpness_ratio(rendered: f32, target: f32) -> f32 {
     if target <= 1e-12 {
         0.0
@@ -738,6 +749,7 @@ fn scaled_camera_for_pose(
     )
 }
 
+#[cfg(feature = "gpu")]
 fn load_resized_target(
     path: &Path,
     src_width: usize,
@@ -770,6 +782,7 @@ fn load_resized_target(
     ))
 }
 
+#[cfg(feature = "gpu")]
 fn resize_rgb_box(
     src: &[f32],
     src_width: usize,

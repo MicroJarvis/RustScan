@@ -170,9 +170,15 @@ impl<B: Backend> AdamScaled<B> {
     }
 
     pub fn reset(&mut self) {
-        self.transforms = AdamState::default();
-        self.sh_coeffs = AdamState::default();
-        self.raw_opacities = AdamState::default();
+        Self::reset_state(&mut self.transforms);
+        Self::reset_state(&mut self.sh_coeffs);
+        Self::reset_state(&mut self.raw_opacities);
+    }
+
+    fn reset_state<const D: usize>(state: &mut AdamState<B, D>) {
+        state.moment1 = None;
+        state.moment2 = None;
+        state.step = 0;
     }
 
     pub fn set_transform_scaling(&mut self, scaling: Tensor<B, 2>) {
@@ -322,5 +328,22 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
             output.moment2,
         )));
         Tensor::from_primitive(TensorPrimitive::Float(output.param))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn optimizer_reset_preserves_per_parameter_scaling_contract() {
+        let source = include_str!("optimizer.rs");
+        let reset_state = source
+            .split("fn reset_state")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn set_transform_scaling").next())
+            .expect("reset_state body");
+        assert!(!reset_state.contains("scaling = None"));
+        assert!(!reset_state.contains("AdamState::default"));
+        assert!(reset_state.contains("moment1 = None"));
+        assert!(reset_state.contains("step = 0"));
     }
 }

@@ -61,17 +61,17 @@ struct Args {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateProfile {
-    TumPrefixQuality,
-    TumPrefixCompact,
-    TumPrefixEfficient,
+    Quality,
+    Compact,
+    Efficient,
 }
 
 impl GateProfile {
     fn as_str(self) -> &'static str {
         match self {
-            Self::TumPrefixQuality => "tum-prefix-quality",
-            Self::TumPrefixCompact => "tum-prefix-compact",
-            Self::TumPrefixEfficient => "tum-prefix-efficient",
+            Self::Quality => "tum-prefix-quality",
+            Self::Compact => "tum-prefix-compact",
+            Self::Efficient => "tum-prefix-efficient",
         }
     }
 }
@@ -87,9 +87,9 @@ impl FromStr for GateProfile {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "tum-prefix-quality" => Ok(Self::TumPrefixQuality),
-            "tum-prefix-compact" => Ok(Self::TumPrefixCompact),
-            "tum-prefix-efficient" => Ok(Self::TumPrefixEfficient),
+            "tum-prefix-quality" => Ok(Self::Quality),
+            "tum-prefix-compact" => Ok(Self::Compact),
+            "tum-prefix-efficient" => Ok(Self::Efficient),
             other => Err(format!(
                 "unsupported gate profile '{other}'. Expected one of: tum-prefix-quality, tum-prefix-compact, tum-prefix-efficient"
             )),
@@ -425,9 +425,9 @@ fn filter_dataset_to_frame_ranges(
 fn evaluate_gate(profile: GateProfile, reports: &[EvaluationCaseReport]) -> GateReport {
     let mut checks = Vec::new();
     let (full_threshold, static_threshold, splat_limit) = match profile {
-        GateProfile::TumPrefixQuality => (23.05, 23.65, None),
-        GateProfile::TumPrefixCompact => (22.95, 23.58, Some(55_000.0)),
-        GateProfile::TumPrefixEfficient => (22.90, 23.50, Some(43_000.0)),
+        GateProfile::Quality => (23.05, 23.65, None),
+        GateProfile::Compact => (22.95, 23.58, Some(55_000.0)),
+        GateProfile::Efficient => (22.90, 23.50, Some(43_000.0)),
     };
 
     push_min_check(
@@ -585,6 +585,7 @@ fn render_markdown(report: &SuiteReport) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_worst_frames(
     dataset: &TrainingDataset,
     splats: &HostSplats,

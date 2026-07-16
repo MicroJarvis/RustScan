@@ -377,24 +377,24 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn compare_features(reference_db: &Path, candidate_db: &Path) -> Result<FeaturesCompareReport> {
-    let reference = ColmapDatabase::open(reference_db)?;
-    let candidate = ColmapDatabase::open(candidate_db)?;
+    let reference = ColmapDatabase::open_read_only(reference_db)?;
+    let candidate = ColmapDatabase::open_read_only(candidate_db)?;
     let reference_counts = keypoint_counts_by_name(&reference)?;
     let candidate_counts = keypoint_counts_by_name(&candidate)?;
     compare_feature_counts(&reference_counts, &candidate_counts)
 }
 
 fn compare_matches(reference_db: &Path, candidate_db: &Path) -> Result<MatchesCompareReport> {
-    let reference = ColmapDatabase::open(reference_db)?;
-    let candidate = ColmapDatabase::open(candidate_db)?;
+    let reference = ColmapDatabase::open_read_only(reference_db)?;
+    let candidate = ColmapDatabase::open_read_only(candidate_db)?;
     let reference_counts = raw_match_counts_by_name(&reference)?;
     let candidate_counts = raw_match_counts_by_name(&candidate)?;
     compare_pair_count_maps(&reference_counts, &candidate_counts)
 }
 
 fn compare_two_view(reference_db: &Path, candidate_db: &Path) -> Result<TwoViewCompareReport> {
-    let reference = ColmapDatabase::open(reference_db)?;
-    let candidate = ColmapDatabase::open(candidate_db)?;
+    let reference = ColmapDatabase::open_read_only(reference_db)?;
+    let candidate = ColmapDatabase::open_read_only(candidate_db)?;
     let reference_geometries = two_view_by_name(&reference)?;
     let candidate_geometries = two_view_by_name(&candidate)?;
     let reference_names = image_id_to_name_map(&reference)?;

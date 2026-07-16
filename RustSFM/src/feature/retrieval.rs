@@ -110,12 +110,98 @@ impl VocabTree {
     /// Load a vocabulary tree previously written by [`VocabTree::save`].
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+        let tree: Self = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        tree.validate()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+        Ok(tree)
     }
 
     /// Total number of leaf visual words.
     pub fn num_visual_words(&self) -> usize {
         self.num_words
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.dim == 0 {
+            return Err("vocabulary tree descriptor dimension must be positive".to_string());
+        }
+        if self.nodes.is_empty() {
+            return Err("vocabulary tree must contain a root node".to_string());
+        }
+        if self.num_words == 0 {
+            return Err("vocabulary tree must contain at least one visual word".to_string());
+        }
+
+        let mut state = vec![0u8; self.nodes.len()];
+        let mut parent_count = vec![0usize; self.nodes.len()];
+        let mut word_seen = vec![false; self.num_words];
+        self.validate_node(0, &mut state, &mut parent_count, &mut word_seen)?;
+        if state.iter().any(|&value| value == 0) {
+            return Err("vocabulary tree contains nodes unreachable from the root".to_string());
+        }
+        if word_seen.iter().any(|&seen| !seen) {
+            return Err("vocabulary tree visual word ids are not contiguous".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_node(
+        &self,
+        node_idx: usize,
+        state: &mut [u8],
+        parent_count: &mut [usize],
+        word_seen: &mut [bool],
+    ) -> std::result::Result<(), String> {
+        match state[node_idx] {
+            1 => {
+                return Err(format!(
+                    "vocabulary tree contains a cycle at node {node_idx}"
+                ))
+            }
+            2 => return Ok(()),
+            _ => {}
+        }
+        state[node_idx] = 1;
+        let node = &self.nodes[node_idx];
+        if node.centroid.len() != self.dim || !node.centroid.iter().all(|value| value.is_finite()) {
+            return Err(format!(
+                "vocabulary tree node {node_idx} has an invalid centroid"
+            ));
+        }
+        if node.children.is_empty() {
+            let word_id = node
+                .word_id
+                .ok_or_else(|| format!("vocabulary tree leaf {node_idx} has no word id"))?;
+            let seen = word_seen.get_mut(word_id).ok_or_else(|| {
+                format!("vocabulary tree leaf {node_idx} has out-of-range word id {word_id}")
+            })?;
+            if *seen {
+                return Err(format!("vocabulary tree word id {word_id} is duplicated"));
+            }
+            *seen = true;
+        } else {
+            if node.word_id.is_some() {
+                return Err(format!(
+                    "vocabulary tree internal node {node_idx} must not have a word id"
+                ));
+            }
+            for &child_idx in &node.children {
+                if child_idx >= self.nodes.len() {
+                    return Err(format!(
+                        "vocabulary tree node {node_idx} references missing child {child_idx}"
+                    ));
+                }
+                parent_count[child_idx] += 1;
+                if parent_count[child_idx] > 1 {
+                    return Err(format!(
+                        "vocabulary tree node {child_idx} has more than one parent"
+                    ));
+                }
+                self.validate_node(child_idx, state, parent_count, word_seen)?;
+            }
+        }
+        state[node_idx] = 2;
+        Ok(())
     }
 
     /// Train a vocabulary tree from L2-normalized `descriptors`, supplied as a
@@ -741,6 +827,19 @@ mod tests {
             let d = &data[i * dim..(i + 1) * dim];
             assert_eq!(loaded.quantize(d), tree.quantize(d));
         }
+    }
+
+    #[test]
+    fn load_rejects_structurally_invalid_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-vocab.json");
+        std::fs::write(
+            &path,
+            r#"{"nodes":[{"centroid":[0.0],"children":[9],"word_id":null}],"dim":1,"num_words":1}"#,
+        )
+        .unwrap();
+
+        assert!(VocabTree::load(&path).is_err());
     }
 
     #[test]

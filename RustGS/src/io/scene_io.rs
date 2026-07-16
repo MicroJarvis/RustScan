@@ -1,15 +1,18 @@
 //! Host-side splat export and import utilities (PLY and binary .splat).
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(feature = "gpu")]
 use std::fs::File;
+#[cfg(feature = "gpu")]
 use std::io::{BufWriter, Write};
+#[cfg(feature = "gpu")]
 use std::path::Path;
 
 #[cfg(feature = "gpu")]
 use crate::sh::{rgb_to_sh0_value, sh_coeff_count_for_degree};
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SplatMetadata {
     pub iterations: usize,
     pub final_loss: f32,
@@ -47,12 +50,14 @@ pub enum SceneIoError {
     Parse(String),
 }
 
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlyOpacityRepresentation {
     Probability,
     RawLogit,
 }
 
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlyShCoeffLayout {
     Interleaved,
@@ -71,6 +76,16 @@ enum PlyFormat {
 enum SplatFileFormat {
     Ply,
     Splat,
+}
+
+/// Fidelity guarantees provided by a scene artifact format.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplatArtifactFidelity {
+    /// Preserves all Gaussian parameters, SH coefficients, and training metadata.
+    Lossless,
+    /// Legacy 32-byte rows with quantized RGB, opacity, and rotation and no metadata.
+    LossyLegacy,
 }
 
 #[cfg(feature = "gpu")]
@@ -96,11 +111,13 @@ struct VertexFieldMap {
     sh_rest: Vec<usize>,
 }
 
+#[cfg(feature = "gpu")]
 fn write_ply_header<W: Write>(
     writer: &mut W,
     path: &Path,
     metadata: &SplatMetadata,
     vertex_count: usize,
+    sh_rest_count: usize,
 ) -> Result<(), SceneIoError> {
     writeln!(writer, "ply").map_err(|source| SceneIoError::Write {
         path: path.display().to_string(),
@@ -156,7 +173,7 @@ fn write_ply_header<W: Write>(
             source,
         })?;
     }
-    for i in 0..45 {
+    for i in 0..sh_rest_count {
         writeln!(writer, "property float f_rest_{i}").map_err(|source| SceneIoError::Write {
             path: path.display().to_string(),
             source,
@@ -201,6 +218,15 @@ fn splat_file_format(path: &Path) -> Result<SplatFileFormat, SceneIoError> {
         None => Err(SceneIoError::InvalidFormat {
             message: "missing splat output extension; expected .splat or .ply".to_string(),
         }),
+    }
+}
+
+/// Return the documented fidelity contract for a supported splat artifact extension.
+#[cfg(feature = "gpu")]
+pub fn splat_artifact_fidelity(path: &Path) -> Result<SplatArtifactFidelity, SceneIoError> {
+    match splat_file_format(path)? {
+        SplatFileFormat::Ply => Ok(SplatArtifactFidelity::Lossless),
+        SplatFileFormat::Splat => Ok(SplatArtifactFidelity::LossyLegacy),
     }
 }
 
@@ -369,17 +395,28 @@ fn find_property_index(properties: &[String], name: &str) -> Result<usize, Scene
 
 #[cfg(feature = "gpu")]
 fn build_vertex_field_map(properties: &[String]) -> Result<VertexFieldMap, SceneIoError> {
-    let mut sh_rest = properties
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, property)| {
-            property
-                .strip_prefix("f_rest_")
-                .and_then(|suffix| suffix.parse::<usize>().ok())
-                .map(|order| (order, idx))
-        })
-        .collect::<Vec<_>>();
+    let mut sh_rest = Vec::new();
+    for (idx, property) in properties.iter().enumerate() {
+        let Some(suffix) = property.strip_prefix("f_rest_") else {
+            continue;
+        };
+        let order = suffix
+            .parse::<usize>()
+            .map_err(|_| SceneIoError::InvalidFormat {
+                message: format!("invalid SH property name {property}"),
+            })?;
+        sh_rest.push((order, idx));
+    }
     sh_rest.sort_by_key(|(order, _)| *order);
+    for (expected, (actual, _)) in sh_rest.iter().enumerate() {
+        if *actual != expected {
+            return Err(SceneIoError::InvalidFormat {
+                message: format!(
+                    "f_rest properties must be contiguous from f_rest_0; expected f_rest_{expected}, found f_rest_{actual}"
+                ),
+            });
+        }
+    }
 
     Ok(VertexFieldMap {
         positions: [
@@ -414,30 +451,36 @@ fn infer_sh_degree(
     sh_rest_count: usize,
 ) -> Result<usize, SceneIoError> {
     if let Some(degree) = explicit_degree {
+        if degree > 3 {
+            return Err(SceneIoError::InvalidFormat {
+                message: format!(
+                    "unsupported sh_degree {degree} in splat loader; current path supports up to degree 3"
+                ),
+            });
+        }
+        let expected = sh_coeff_count_for_degree(degree)
+            .saturating_sub(1)
+            .saturating_mul(3);
+        if sh_rest_count != expected {
+            return Err(SceneIoError::InvalidFormat {
+                message: format!(
+                    "sh_degree {degree} requires {expected} f_rest properties, found {sh_rest_count}"
+                ),
+            });
+        }
         return Ok(degree);
     }
-    if sh_rest_count == 0 {
-        return Ok(0);
-    }
-    if !sh_rest_count.is_multiple_of(3) {
-        return Err(SceneIoError::InvalidFormat {
+    match sh_rest_count {
+        0 => Ok(0),
+        9 => Ok(1),
+        24 => Ok(2),
+        45 => Ok(3),
+        _ => Err(SceneIoError::InvalidFormat {
             message: format!(
-                "invalid f_rest property count {sh_rest_count}; expected a multiple of 3"
+                "could not infer supported SH degree from {sh_rest_count} f_rest properties"
             ),
-        });
+        }),
     }
-
-    let coeffs_per_channel = sh_rest_count / 3 + 1;
-    let mut degree = 0usize;
-    while sh_coeff_count_for_degree(degree) < coeffs_per_channel {
-        degree += 1;
-    }
-    if sh_coeff_count_for_degree(degree) != coeffs_per_channel {
-        return Err(SceneIoError::InvalidFormat {
-            message: format!("could not infer SH degree from {sh_rest_count} rest coefficients"),
-        });
-    }
-    Ok(degree)
 }
 
 #[cfg(feature = "gpu")]
@@ -493,12 +536,42 @@ pub fn save_splats_ply(
             message: err.to_string(),
         })?;
 
+    if splats.sh_degree() > 3 {
+        return Err(SceneIoError::InvalidFormat {
+            message: format!(
+                "unsupported sh_degree {} in splat writer; current path supports up to degree 3",
+                splats.sh_degree()
+            ),
+        });
+    }
+    if metadata.sh_degree != splats.sh_degree() {
+        return Err(SceneIoError::InvalidFormat {
+            message: format!(
+                "metadata sh_degree {} does not match scene sh_degree {}",
+                metadata.sh_degree,
+                splats.sh_degree()
+            ),
+        });
+    }
+    if metadata.gaussian_count != 0 && metadata.gaussian_count != splats.len() {
+        return Err(SceneIoError::InvalidFormat {
+            message: format!(
+                "metadata gaussian_count {} does not match scene count {}",
+                metadata.gaussian_count,
+                splats.len()
+            ),
+        });
+    }
+
     let file = File::create(path).map_err(|source| SceneIoError::Write {
         path: path.display().to_string(),
         source,
     })?;
     let mut writer = BufWriter::new(file);
-    write_ply_header(&mut writer, path, metadata, splats.len())?;
+    let sh_rest_count = sh_coeff_count_for_degree(splats.sh_degree())
+        .saturating_sub(1)
+        .saturating_mul(3);
+    write_ply_header(&mut writer, path, metadata, splats.len(), sh_rest_count)?;
 
     let view = splats.as_view();
     let sh_coeff_row_width = sh_coeff_count_for_degree(view.sh_degree) * 3;
@@ -526,8 +599,7 @@ pub fn save_splats_ply(
 
         let sh_rest = &sh_coeffs[3..];
         let sh_rest_channel_major = interleaved_sh_rest_to_channel_major(sh_rest);
-        for i in 0..45 {
-            let value = sh_rest_channel_major.get(i).copied().unwrap_or(0.0);
+        for value in sh_rest_channel_major {
             write!(writer, "{} ", value).map_err(|source| SceneIoError::Write {
                 path: path.display().to_string(),
                 source,
@@ -876,6 +948,55 @@ pub fn load_splats(path: &Path) -> Result<(crate::core::HostSplats, SplatMetadat
     }
 }
 
+/// Verify that a lossless scene round-trip preserved all components and metadata.
+#[cfg(feature = "gpu")]
+pub fn verify_lossless_roundtrip(
+    expected: &crate::core::HostSplats,
+    expected_metadata: &SplatMetadata,
+    actual: &crate::core::HostSplats,
+    actual_metadata: &SplatMetadata,
+) -> Result<(), SceneIoError> {
+    expected
+        .validate()
+        .map_err(|err| SceneIoError::InvalidFormat {
+            message: format!("invalid expected splats: {err}"),
+        })?;
+    actual
+        .validate()
+        .map_err(|err| SceneIoError::InvalidFormat {
+            message: format!("invalid round-trip splats: {err}"),
+        })?;
+
+    if expected_metadata != actual_metadata {
+        return Err(SceneIoError::InvalidFormat {
+            message: format!(
+                "round-trip metadata mismatch: expected {expected_metadata:?}, got {actual_metadata:?}"
+            ),
+        });
+    }
+
+    let expected = expected.as_view();
+    let actual = actual.as_view();
+    for (name, matches) in [
+        ("positions", expected.positions == actual.positions),
+        ("log_scales", expected.log_scales == actual.log_scales),
+        ("rotations", expected.rotations == actual.rotations),
+        (
+            "opacity_logits",
+            expected.opacity_logits == actual.opacity_logits,
+        ),
+        ("sh_coeffs", expected.sh_coeffs == actual.sh_coeffs),
+        ("sh_degree", expected.sh_degree == actual.sh_degree),
+    ] {
+        if !matches {
+            return Err(SceneIoError::InvalidFormat {
+                message: format!("round-trip {name} mismatch"),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "gpu")]
 fn read_le_f32(bytes: &[u8], offset: usize) -> Result<f32, SceneIoError> {
     let chunk: [u8; 4] = bytes
@@ -917,4 +1038,146 @@ fn normalized_quaternion(rotation: [f32; 4]) -> [f32; 4] {
         rotation[2] * inv_length,
         rotation[3] * inv_length,
     ]
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
+    use crate::core::HostSplats;
+
+    fn degree_one_splats() -> HostSplats {
+        HostSplats::from_components(
+            vec![1.25, -2.5, 3.75, -4.0, 5.5, -6.25],
+            vec![-1.0, -0.5, 0.25, 0.0, 0.5, 1.0],
+            vec![1.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5],
+            vec![-0.75, 1.25],
+            (0..24).map(|value| value as f32 * 0.125 - 1.0).collect(),
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ply_roundtrip_preserves_every_component_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scene.ply");
+        let splats = degree_one_splats();
+        let metadata = SplatMetadata {
+            iterations: 123,
+            final_loss: 0.03125,
+            gaussian_count: splats.len(),
+            sh_degree: splats.sh_degree(),
+        };
+
+        save_splats_ply(&path, &splats, &metadata).unwrap();
+        let (loaded, loaded_metadata) = load_splats_ply(&path).unwrap();
+
+        verify_lossless_roundtrip(&splats, &metadata, &loaded, &loaded_metadata).unwrap();
+    }
+
+    #[test]
+    fn lossless_roundtrip_verifier_rejects_component_changes() {
+        let expected = degree_one_splats();
+        let view = expected.as_view();
+        let mut positions = view.positions.to_vec();
+        positions[0] += 0.5;
+        let changed = HostSplats::from_components(
+            positions,
+            view.log_scales.to_vec(),
+            view.rotations.to_vec(),
+            view.opacity_logits.to_vec(),
+            view.sh_coeffs.to_vec(),
+            view.sh_degree,
+        )
+        .unwrap();
+        let metadata = expected.to_splat_metadata(3, 0.25);
+
+        let err = verify_lossless_roundtrip(&expected, &metadata, &changed, &metadata).unwrap_err();
+        assert!(err.to_string().contains("positions"));
+    }
+
+    #[test]
+    fn ply_writer_rejects_metadata_that_disagrees_with_scene() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scene.ply");
+        let splats = degree_one_splats();
+        let metadata = SplatMetadata {
+            gaussian_count: splats.len(),
+            sh_degree: 0,
+            ..Default::default()
+        };
+
+        let err = save_splats_ply(&path, &splats, &metadata).unwrap_err();
+        assert!(err.to_string().contains("metadata sh_degree"));
+    }
+
+    #[test]
+    fn explicit_sh_degree_must_match_f_rest_property_count() {
+        let err = infer_sh_degree(Some(1), 45).unwrap_err();
+        assert!(err.to_string().contains("sh_degree 1 requires 9 f_rest"));
+    }
+
+    #[test]
+    fn malformed_ply_fixture_with_mismatched_degree_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mismatched-degree.ply");
+        std::fs::write(
+            &path,
+            concat!(
+                "ply\n",
+                "format ascii 1.0\n",
+                "comment sh_degree 1\n",
+                "element vertex 1\n",
+                "property float x\nproperty float y\nproperty float z\n",
+                "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n",
+                "property float opacity\n",
+                "property float scale_0\nproperty float scale_1\nproperty float scale_2\n",
+                "property float rot_0\nproperty float rot_1\n",
+                "property float rot_2\nproperty float rot_3\n",
+                "end_header\n",
+                "0 0 1 0 0 0 0 0 0 1 0 0 0 0\n",
+            ),
+        )
+        .unwrap();
+
+        let err = load_splats_ply(&path).unwrap_err();
+        assert!(err.to_string().contains("sh_degree 1 requires 9 f_rest"));
+    }
+
+    #[test]
+    fn f_rest_properties_must_be_contiguously_numbered() {
+        let mut properties = vec![
+            "x", "y", "z", "scale_0", "scale_1", "scale_2", "opacity", "rot_0", "rot_1", "rot_2",
+            "rot_3", "f_dc_0", "f_dc_1", "f_dc_2", "f_rest_0", "f_rest_2",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        properties.sort();
+
+        let err = build_vertex_field_map(&properties).unwrap_err();
+        assert!(err.to_string().contains("contiguous"));
+    }
+
+    #[test]
+    fn artifact_fidelity_distinguishes_lossless_ply_from_legacy_splat() {
+        assert_eq!(
+            splat_artifact_fidelity(Path::new("scene.ply")).unwrap(),
+            SplatArtifactFidelity::Lossless
+        );
+        assert_eq!(
+            splat_artifact_fidelity(Path::new("scene.splat")).unwrap(),
+            SplatArtifactFidelity::LossyLegacy
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_splat_row_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("truncated.splat");
+        std::fs::write(&path, [0_u8; 31]).unwrap();
+
+        let err = load_splats_splat(&path).unwrap_err();
+        assert!(err.to_string().contains("multiple of 32"));
+    }
 }

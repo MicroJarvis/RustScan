@@ -5,12 +5,8 @@
 
 #include <FreeImage.h>
 
-static void ensure_freeimage_initialized(void) {
-    static int initialized = 0;
-    if (!initialized) {
-        FreeImage_Initialise(FALSE);
-        initialized = 1;
-    }
+void rustsfm_colmap_initialize(void) {
+    FreeImage_Initialise(FALSE);
 }
 
 static void set_error(RustSfmColmapGrayImage* out, const char* message) {
@@ -41,7 +37,6 @@ int rustsfm_colmap_load_grayscale_u8(
         return 0;
     }
     memset(out, 0, sizeof(*out));
-    ensure_freeimage_initialized();
 
     const FREE_IMAGE_FORMAT format = FreeImage_GetFileType(path, 0);
     if (format == FIF_UNKNOWN) {

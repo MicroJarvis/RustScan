@@ -57,17 +57,6 @@ impl TopologySplatMetrics {
         [log[0].exp(), log[1].exp(), log[2].exp()]
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn rotation(&self, idx: usize) -> [f32; 4] {
-        let base = idx * 4;
-        [
-            self.rotations.get(base).copied().unwrap_or(1.0),
-            self.rotations.get(base + 1).copied().unwrap_or_default(),
-            self.rotations.get(base + 2).copied().unwrap_or_default(),
-            self.rotations.get(base + 3).copied().unwrap_or_default(),
-        ]
-    }
-
     pub(super) fn max_scale(&self, idx: usize) -> f32 {
         let scale = self.scale(idx);
         scale[0].max(scale[1]).max(scale[2])

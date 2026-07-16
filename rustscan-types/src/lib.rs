@@ -7,6 +7,7 @@
 //! - `SlamOutput`: SLAM output format for downstream processing
 
 pub mod camera;
+pub mod colmap;
 pub mod pose;
 pub mod scene;
 

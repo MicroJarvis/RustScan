@@ -11,7 +11,7 @@ struct RasterizeUniforms {
 @group(0) @binding(2) var<storage, read> projected: array<helpers::ProjectedSplat>;
 @group(0) @binding(3) var<storage, read_write> out_img: array<f32>;
 @group(0) @binding(4) var<storage, read> global_from_compact_gid: array<u32>;
-@group(0) @binding(5) var<storage, read_write> visible: array<f32>;
+@group(0) @binding(5) var<storage, read_write> visible: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> depth: array<f32>;
 @group(0) @binding(7) var<storage, read> uniforms: RasterizeUniforms;
 
@@ -79,7 +79,7 @@ fn main(
                 pix_out += max(vec3<f32>(splat.color_r, splat.color_g, splat.color_b), vec3<f32>(0.0)) * vis;
                 depth_sum += splat.depth * vis;
                 T *= (1.0 - alpha);
-                visible[load_gid[t]] = 1.0;
+                atomicStore(&visible[load_gid[t]], bitcast<u32>(1.0));
 
                 if T < 1e-4 {
                     done = true;

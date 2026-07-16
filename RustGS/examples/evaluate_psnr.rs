@@ -359,6 +359,7 @@ fn default_export_dir(scene: &std::path::Path) -> PathBuf {
     parent.join(format!("{stem}_psnr_review"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_worst_frames(
     dataset: &rustgs::TrainingDataset,
     splats: &HostSplats,

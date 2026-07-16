@@ -1,7 +1,7 @@
 use crate::colmap::{
     export_colmap, export_colmap_sparse_snapshot, export_colmap_with_sparse_index,
-    read_camera_model, read_colmap_cameras, read_colmap_sparse_model, ColmapDataId, ColmapRig,
-    ColmapRigSensor, ColmapRigid3, ColmapSensorId, ColmapSensorType,
+    read_colmap_cameras, read_colmap_sparse_model, ColmapDataId, ColmapRig, ColmapRigSensor,
+    ColmapRigid3, ColmapSensorId, ColmapSensorType,
 };
 use crate::correspondence_graph::{image_pair_to_pair_id, CorrespondenceGraph, ImagePairId};
 use crate::database::{ColmapDatabase, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions};
@@ -130,15 +130,21 @@ fn run_reconstruction_impl(
     let mut reference_camera_setup = config
         .reference
         .as_ref()
-        .and_then(|reference| reference_camera_setup(reference, &paths).ok());
+        .map(|reference| {
+            reference_camera_setup(reference, &paths).with_context(|| {
+                format!(
+                    "failed to configure reference model {}",
+                    reference.display()
+                )
+            })
+        })
+        .transpose()?;
     let mut camera = if let Some(setup) = &reference_camera_setup {
         setup
             .cameras
             .first()
             .copied()
             .unwrap_or_else(|| fallback_camera(&paths[0]))
-    } else if let Some(reference) = &config.reference {
-        read_camera_model(reference).unwrap_or_else(|_| fallback_camera(&paths[0]))
     } else {
         fallback_camera(&paths[0])
     };
@@ -9413,6 +9419,22 @@ mod tests {
         assert_eq!(setup.image_ids, vec![7, 8]);
         assert_eq!(setup.image_camera_indices, vec![0, 1]);
         assert_eq!(setup.cameras[1].model_name(), "SIMPLE_RADIAL");
+        Ok(())
+    }
+
+    #[test]
+    fn reference_camera_setup_propagates_malformed_sparse_model() -> Result<()> {
+        let dir = tempdir()?;
+        let sparse = dir.path().join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("cameras.txt"),
+            "1 PINHOLE 640 480 500 500 320 240\n",
+        )?;
+        fs::write(sparse.join("images.txt"), "1 1 0 0 0 0 0 0 1 a.jpg\n\n")?;
+        fs::write(sparse.join("points3D.txt"), "1 malformed\n")?;
+
+        assert!(reference_camera_setup(dir.path(), &[PathBuf::from("a.jpg")]).is_err());
         Ok(())
     }
 

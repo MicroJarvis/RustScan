@@ -23,6 +23,7 @@ pub struct SplatView<'a> {
     pub sh_degree: usize,
 }
 
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostSplatsCacheKey {
     len: usize,
@@ -67,6 +68,7 @@ impl HostSplats {
         }
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) fn cache_key(&self) -> HostSplatsCacheKey {
         let view = self.as_view();
         HostSplatsCacheKey {
@@ -185,6 +187,7 @@ impl HostSplats {
         }
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) fn scene_extent(&self) -> f32 {
         if self.is_empty() {
             return 1.0;

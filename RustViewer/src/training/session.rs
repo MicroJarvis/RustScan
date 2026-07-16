@@ -570,6 +570,10 @@ fn apply_backend_event(
             guard.progress.elapsed = cancelled.elapsed;
             guard.progress.latest_iteration = Some(cancelled.completed_iterations);
         }
+        TrainingEvent::RunFailed(failed) => {
+            guard.progress.elapsed = failed.elapsed;
+            guard.last_error = Some(failed.error.clone());
+        }
         TrainingEvent::RunCompleted(completed) => {
             guard.progress.latest_loss = completed.report.final_loss;
             guard.progress.gaussian_count = Some(completed.report.gaussian_count);

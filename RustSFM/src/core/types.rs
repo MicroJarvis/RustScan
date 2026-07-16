@@ -4,25 +4,13 @@ use std::path::PathBuf;
 
 use crate::sift::SiftFeatures;
 use crate::wide::WideDescriptors;
-
-pub const COLMAP_SIMPLE_PINHOLE: i32 = 0;
-pub const COLMAP_PINHOLE: i32 = 1;
-pub const COLMAP_SIMPLE_RADIAL: i32 = 2;
-pub const COLMAP_RADIAL: i32 = 3;
-pub const COLMAP_OPENCV: i32 = 4;
-pub const COLMAP_OPENCV_FISHEYE: i32 = 5;
-pub const COLMAP_FULL_OPENCV: i32 = 6;
-pub const COLMAP_FOV: i32 = 7;
-pub const COLMAP_SIMPLE_RADIAL_FISHEYE: i32 = 8;
-pub const COLMAP_RADIAL_FISHEYE: i32 = 9;
-pub const COLMAP_THIN_PRISM_FISHEYE: i32 = 10;
-pub const COLMAP_RAD_TAN_THIN_PRISM_FISHEYE: i32 = 11;
-pub const COLMAP_SIMPLE_DIVISION: i32 = 12;
-pub const COLMAP_DIVISION: i32 = 13;
-pub const COLMAP_SIMPLE_FISHEYE: i32 = 14;
-pub const COLMAP_FISHEYE: i32 = 15;
-pub const COLMAP_EUCM: i32 = 16;
-pub const COLMAP_MAX_CAMERA_PARAMS: usize = 16;
+pub use rustscan_types::colmap::{
+    COLMAP_DIVISION, COLMAP_EUCM, COLMAP_FISHEYE, COLMAP_FOV, COLMAP_FULL_OPENCV,
+    COLMAP_MAX_CAMERA_PARAMS, COLMAP_OPENCV, COLMAP_OPENCV_FISHEYE, COLMAP_PINHOLE, COLMAP_RADIAL,
+    COLMAP_RADIAL_FISHEYE, COLMAP_RAD_TAN_THIN_PRISM_FISHEYE, COLMAP_SIMPLE_DIVISION,
+    COLMAP_SIMPLE_FISHEYE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
+    COLMAP_SIMPLE_RADIAL_FISHEYE, COLMAP_THIN_PRISM_FISHEYE,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CameraModel {
@@ -496,134 +484,28 @@ impl CameraModel {
 }
 
 pub fn colmap_camera_model_id(model_name: &str) -> Option<i32> {
-    match model_name {
-        "SIMPLE_PINHOLE" => Some(COLMAP_SIMPLE_PINHOLE),
-        "PINHOLE" => Some(COLMAP_PINHOLE),
-        "SIMPLE_RADIAL" => Some(COLMAP_SIMPLE_RADIAL),
-        "RADIAL" => Some(COLMAP_RADIAL),
-        "OPENCV" => Some(COLMAP_OPENCV),
-        "OPENCV_FISHEYE" => Some(COLMAP_OPENCV_FISHEYE),
-        "FULL_OPENCV" => Some(COLMAP_FULL_OPENCV),
-        "FOV" => Some(COLMAP_FOV),
-        "SIMPLE_RADIAL_FISHEYE" => Some(COLMAP_SIMPLE_RADIAL_FISHEYE),
-        "RADIAL_FISHEYE" => Some(COLMAP_RADIAL_FISHEYE),
-        "THIN_PRISM_FISHEYE" => Some(COLMAP_THIN_PRISM_FISHEYE),
-        "RAD_TAN_THIN_PRISM_FISHEYE" => Some(COLMAP_RAD_TAN_THIN_PRISM_FISHEYE),
-        "SIMPLE_DIVISION" => Some(COLMAP_SIMPLE_DIVISION),
-        "DIVISION" => Some(COLMAP_DIVISION),
-        "SIMPLE_FISHEYE" => Some(COLMAP_SIMPLE_FISHEYE),
-        "FISHEYE" => Some(COLMAP_FISHEYE),
-        "EUCM" => Some(COLMAP_EUCM),
-        _ => None,
-    }
+    rustscan_types::colmap::colmap_camera_model_by_name(model_name).map(|model| model.id)
 }
 
 pub fn colmap_camera_model_name(model_id: i32) -> Option<&'static str> {
-    match model_id {
-        COLMAP_SIMPLE_PINHOLE => Some("SIMPLE_PINHOLE"),
-        COLMAP_PINHOLE => Some("PINHOLE"),
-        COLMAP_SIMPLE_RADIAL => Some("SIMPLE_RADIAL"),
-        COLMAP_RADIAL => Some("RADIAL"),
-        COLMAP_OPENCV => Some("OPENCV"),
-        COLMAP_OPENCV_FISHEYE => Some("OPENCV_FISHEYE"),
-        COLMAP_FULL_OPENCV => Some("FULL_OPENCV"),
-        COLMAP_FOV => Some("FOV"),
-        COLMAP_SIMPLE_RADIAL_FISHEYE => Some("SIMPLE_RADIAL_FISHEYE"),
-        COLMAP_RADIAL_FISHEYE => Some("RADIAL_FISHEYE"),
-        COLMAP_THIN_PRISM_FISHEYE => Some("THIN_PRISM_FISHEYE"),
-        COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => Some("RAD_TAN_THIN_PRISM_FISHEYE"),
-        COLMAP_SIMPLE_DIVISION => Some("SIMPLE_DIVISION"),
-        COLMAP_DIVISION => Some("DIVISION"),
-        COLMAP_SIMPLE_FISHEYE => Some("SIMPLE_FISHEYE"),
-        COLMAP_FISHEYE => Some("FISHEYE"),
-        COLMAP_EUCM => Some("EUCM"),
-        _ => None,
-    }
+    rustscan_types::colmap::colmap_camera_model_by_id(model_id).map(|model| model.name)
 }
 
 pub fn colmap_camera_model_num_params(model_id: i32) -> Option<usize> {
-    match model_id {
-        COLMAP_SIMPLE_PINHOLE => Some(3),
-        COLMAP_PINHOLE => Some(4),
-        COLMAP_SIMPLE_RADIAL => Some(4),
-        COLMAP_RADIAL => Some(5),
-        COLMAP_OPENCV => Some(8),
-        COLMAP_OPENCV_FISHEYE => Some(8),
-        COLMAP_FULL_OPENCV => Some(12),
-        COLMAP_FOV => Some(5),
-        COLMAP_SIMPLE_RADIAL_FISHEYE => Some(4),
-        COLMAP_RADIAL_FISHEYE => Some(5),
-        COLMAP_THIN_PRISM_FISHEYE => Some(12),
-        COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => Some(16),
-        COLMAP_SIMPLE_DIVISION => Some(4),
-        COLMAP_DIVISION => Some(5),
-        COLMAP_SIMPLE_FISHEYE => Some(3),
-        COLMAP_FISHEYE => Some(4),
-        COLMAP_EUCM => Some(6),
-        _ => None,
-    }
+    rustscan_types::colmap::colmap_camera_model_by_id(model_id).map(|model| model.num_params)
 }
 
 pub fn colmap_camera_model_focal_idxs(model_id: i32) -> Option<&'static [usize]> {
-    match model_id {
-        COLMAP_SIMPLE_PINHOLE
-        | COLMAP_SIMPLE_RADIAL
-        | COLMAP_RADIAL
-        | COLMAP_SIMPLE_RADIAL_FISHEYE
-        | COLMAP_RADIAL_FISHEYE
-        | COLMAP_SIMPLE_DIVISION
-        | COLMAP_SIMPLE_FISHEYE => Some(&[0]),
-        COLMAP_PINHOLE
-        | COLMAP_OPENCV
-        | COLMAP_OPENCV_FISHEYE
-        | COLMAP_FULL_OPENCV
-        | COLMAP_FOV
-        | COLMAP_THIN_PRISM_FISHEYE
-        | COLMAP_RAD_TAN_THIN_PRISM_FISHEYE
-        | COLMAP_DIVISION
-        | COLMAP_FISHEYE
-        | COLMAP_EUCM => Some(&[0, 1]),
-        _ => None,
-    }
+    rustscan_types::colmap::colmap_camera_model_by_id(model_id).map(|model| model.focal_idxs)
 }
 
 pub fn colmap_camera_model_principal_point_idxs(model_id: i32) -> Option<[usize; 2]> {
-    match model_id {
-        COLMAP_SIMPLE_PINHOLE
-        | COLMAP_SIMPLE_RADIAL
-        | COLMAP_RADIAL
-        | COLMAP_SIMPLE_RADIAL_FISHEYE
-        | COLMAP_RADIAL_FISHEYE
-        | COLMAP_SIMPLE_DIVISION
-        | COLMAP_SIMPLE_FISHEYE => Some([1, 2]),
-        COLMAP_PINHOLE
-        | COLMAP_OPENCV
-        | COLMAP_OPENCV_FISHEYE
-        | COLMAP_FULL_OPENCV
-        | COLMAP_FOV
-        | COLMAP_THIN_PRISM_FISHEYE
-        | COLMAP_RAD_TAN_THIN_PRISM_FISHEYE
-        | COLMAP_DIVISION
-        | COLMAP_FISHEYE
-        | COLMAP_EUCM => Some([2, 3]),
-        _ => None,
-    }
+    rustscan_types::colmap::colmap_camera_model_by_id(model_id)
+        .map(|model| model.principal_point_idxs)
 }
 
 pub fn colmap_camera_model_extra_idxs(model_id: i32) -> Option<&'static [usize]> {
-    match model_id {
-        COLMAP_SIMPLE_PINHOLE | COLMAP_PINHOLE | COLMAP_SIMPLE_FISHEYE | COLMAP_FISHEYE => {
-            Some(&[])
-        }
-        COLMAP_SIMPLE_RADIAL | COLMAP_SIMPLE_RADIAL_FISHEYE | COLMAP_SIMPLE_DIVISION => Some(&[3]),
-        COLMAP_RADIAL | COLMAP_RADIAL_FISHEYE | COLMAP_DIVISION => Some(&[3, 4]),
-        COLMAP_FOV => Some(&[4]),
-        COLMAP_OPENCV | COLMAP_OPENCV_FISHEYE => Some(&[4, 5, 6, 7]),
-        COLMAP_FULL_OPENCV | COLMAP_THIN_PRISM_FISHEYE => Some(&[4, 5, 6, 7, 8, 9, 10, 11]),
-        COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => Some(&[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
-        COLMAP_EUCM => Some(&[4, 5]),
-        _ => None,
-    }
+    rustscan_types::colmap::colmap_camera_model_by_id(model_id).map(|model| model.extra_idxs)
 }
 
 fn focal_lengths_from_params(
@@ -1450,6 +1332,22 @@ mod tests {
             Some([2, 3])
         );
         assert_eq!(colmap_camera_model_extra_idxs(COLMAP_FOV), Some(&[4][..]));
+    }
+
+    #[test]
+    fn division_extra_param_group_only_contains_distortion() {
+        assert_eq!(
+            colmap_camera_model_focal_idxs(COLMAP_DIVISION),
+            Some(&[0, 1][..])
+        );
+        assert_eq!(
+            colmap_camera_model_principal_point_idxs(COLMAP_DIVISION),
+            Some([2, 3])
+        );
+        assert_eq!(
+            colmap_camera_model_extra_idxs(COLMAP_DIVISION),
+            Some(&[4][..])
+        );
     }
 
     #[test]

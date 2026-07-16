@@ -108,7 +108,7 @@ pub fn compare_database_parity(
     convert_pose_priors_to_enu: bool,
 ) -> Result<ParityReport> {
     let requested_images = image_names.into_iter().collect::<BTreeSet<_>>();
-    let db = ColmapDatabase::open(database)?;
+    let db = ColmapDatabase::open_read_only(database)?;
     let raw = raw_database_stats(&db)?;
     let all_images = db.read_all_images()?;
     let keypoint_counts = db

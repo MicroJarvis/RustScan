@@ -9,7 +9,7 @@ use rustslam::SE3;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -967,6 +967,7 @@ fn write_raw_images_txt(path: &Path, sparse: &ColmapSparseFiles) -> Result<()> {
         format_f64(mean_observations(&sparse.images))
     )?;
     for image in ordered_images_for_write(sparse) {
+        validate_colmap_image_name(&image.name)?;
         writeln!(
             w,
             "{} {} {} {} {} {} {} {} {} {}",
@@ -1123,6 +1124,7 @@ fn write_raw_images_bin(path: &Path, sparse: &ColmapSparseFiles) -> Result<()> {
     let images = ordered_images_for_write(sparse);
     write_u64(&mut w, images.len() as u64)?;
     for image in images {
+        validate_colmap_image_name(&image.name)?;
         write_u32(&mut w, image.image_id)?;
         for &value in &image.qvec {
             write_f64(&mut w, value)?;
@@ -1449,10 +1451,11 @@ fn read_images_txt(path: &Path) -> Result<Vec<ColmapImage>> {
         }
         let prefix = trimmed.split_whitespace().take(9).collect::<Vec<_>>();
         if prefix.len() < 9 || prefix[0].parse::<u32>().is_err() {
-            continue;
+            bail!("invalid image record in {}: {trimmed}", path.display());
         }
         let name = parse_image_name_from_header(trimmed)
             .with_context(|| format!("missing image name in {}", path.display()))?;
+        validate_colmap_image_name(&name)?;
         let points_line = lines
             .next()
             .transpose()?
@@ -1497,6 +1500,22 @@ fn parse_image_name_from_header(line: &str) -> Option<String> {
     (tokens_seen > 9).then_some(String::new())
 }
 
+fn validate_colmap_image_name(name: &str) -> Result<()> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || name.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "unsafe COLMAP image name '{name}': expected a relative path without parent traversal"
+        );
+    }
+    Ok(())
+}
+
 fn parse_points2d_txt(line: &str, path: &Path) -> Result<Vec<ColmapPoint2D>> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -1525,6 +1544,8 @@ fn parse_optional_point3d_id_text(value: &str) -> Result<Option<u64>> {
     let signed = value.parse::<i64>()?;
     if signed == -1 {
         Ok(None)
+    } else if signed < 0 {
+        bail!("invalid negative COLMAP point3D id {signed}")
     } else {
         Ok(Some(signed as u64))
     }
@@ -1532,8 +1553,8 @@ fn parse_optional_point3d_id_text(value: &str) -> Result<Option<u64>> {
 
 fn read_images_bin(path: &Path) -> Result<Vec<ColmapImage>> {
     let mut f = File::open(path)?;
-    let n = read_u64(&mut f)? as usize;
-    let mut images = Vec::with_capacity(n);
+    let n = checked_binary_count(read_u64(&mut f)?, &mut f, 73, "images", path)?;
+    let mut images = reservable_vec(n, "images", path)?;
     for _ in 0..n {
         let image_id = read_u32(&mut f)?;
         let qvec = [
@@ -1545,8 +1566,9 @@ fn read_images_bin(path: &Path) -> Result<Vec<ColmapImage>> {
         let tvec = [read_f64(&mut f)?, read_f64(&mut f)?, read_f64(&mut f)?];
         let camera_id = read_u32(&mut f)?;
         let name = read_cstr(&mut f)?;
-        let m = read_u64(&mut f)? as usize;
-        let mut points2d = Vec::with_capacity(m);
+        validate_colmap_image_name(&name)?;
+        let m = checked_binary_count(read_u64(&mut f)?, &mut f, 24, "points2D", path)?;
+        let mut points2d = reservable_vec(m, "points2D", path)?;
         for _ in 0..m {
             let xy = [read_f64(&mut f)?, read_f64(&mut f)?];
             let raw_point3d_id = read_u64(&mut f)?;
@@ -1582,7 +1604,7 @@ fn read_cameras_txt(path: &Path) -> Result<Vec<ColmapCamera>> {
         }
         let parts: Vec<_> = trimmed.split_whitespace().collect();
         if parts.len() < 5 || parts[0].parse::<u32>().is_err() {
-            continue;
+            bail!("invalid camera record in {}: {trimmed}", path.display());
         }
         let camera_id = parts[0].parse()?;
         let model_id = colmap_camera_model_id(parts[1])
@@ -1620,16 +1642,18 @@ fn read_cameras_txt(path: &Path) -> Result<Vec<ColmapCamera>> {
 
 fn read_cameras_bin(path: &Path) -> Result<Vec<ColmapCamera>> {
     let mut f = File::open(path)?;
-    let n = read_u64(&mut f)?;
+    let n = checked_binary_count(read_u64(&mut f)?, &mut f, 24, "cameras", path)?;
     if n == 0 {
         bail!("empty camera file {}", path.display());
     }
-    let mut cameras = Vec::with_capacity(n as usize);
+    let mut cameras = reservable_vec(n, "cameras", path)?;
     for _ in 0..n {
         let camera_id = read_u32(&mut f)?;
         let model_id = read_i32(&mut f)?;
-        let width = read_u64(&mut f)? as u32;
-        let height = read_u64(&mut f)? as u32;
+        let width = u32::try_from(read_u64(&mut f)?)
+            .with_context(|| format!("camera width exceeds u32 in {}", path.display()))?;
+        let height = u32::try_from(read_u64(&mut f)?)
+            .with_context(|| format!("camera height exceeds u32 in {}", path.display()))?;
         let num_params = colmap_camera_model_num_params(model_id)
             .with_context(|| format!("unsupported COLMAP camera model id {model_id}"))?;
         let mut params = Vec::with_capacity(num_params);
@@ -1658,7 +1682,7 @@ fn read_points3d_txt(path: &Path) -> Result<Vec<ColmapPoint3D>> {
         }
         let parts = trimmed.split_whitespace().collect::<Vec<_>>();
         if parts.len() < 8 || parts[0].parse::<u64>().is_err() {
-            continue;
+            bail!("invalid point3D record in {}: {trimmed}", path.display());
         }
         let mut track = Vec::new();
         for chunk in parts[8..].chunks(2) {
@@ -1686,15 +1710,16 @@ fn read_points3d_txt(path: &Path) -> Result<Vec<ColmapPoint3D>> {
 
 fn read_points3d_bin(path: &Path) -> Result<Vec<ColmapPoint3D>> {
     let mut f = File::open(path)?;
-    let n = read_u64(&mut f)? as usize;
-    let mut points = Vec::with_capacity(n);
+    let n = checked_binary_count(read_u64(&mut f)?, &mut f, 51, "points3D", path)?;
+    let mut points = reservable_vec(n, "points3D", path)?;
     for _ in 0..n {
         let point3d_id = read_u64(&mut f)?;
         let xyz = [read_f64(&mut f)?, read_f64(&mut f)?, read_f64(&mut f)?];
         let color = [read_u8(&mut f)?, read_u8(&mut f)?, read_u8(&mut f)?];
         let error = read_f64(&mut f)?;
-        let track_length = read_u64(&mut f)? as usize;
-        let mut track = Vec::with_capacity(track_length);
+        let track_length =
+            checked_binary_count(read_u64(&mut f)?, &mut f, 8, "point3D track", path)?;
+        let mut track = reservable_vec(track_length, "point3D track", path)?;
         for _ in 0..track_length {
             track.push(ColmapTrackElement {
                 image_id: read_u32(&mut f)?,
@@ -1723,11 +1748,29 @@ fn read_rigs_txt(path: &Path) -> Result<Vec<ColmapRig>> {
         }
         let parts = trimmed.split_whitespace().collect::<Vec<_>>();
         if parts.len() < 2 || parts[0].parse::<u32>().is_err() {
-            continue;
+            bail!("invalid rig record in {}: {trimmed}", path.display());
         }
         let rig_id = parts[0].parse()?;
         let num_sensors = parts[1].parse::<usize>()?;
         let mut cursor = 2usize;
+        let min_sensor_fields = if num_sensors == 0 {
+            0
+        } else {
+            2usize
+                .checked_add(
+                    num_sensors
+                        .saturating_sub(1)
+                        .checked_mul(3)
+                        .context("rig sensor count overflows the minimum text field calculation")?,
+                )
+                .context("rig sensor count overflows the minimum text field calculation")?
+        };
+        if min_sensor_fields > parts.len().saturating_sub(cursor) {
+            bail!(
+                "rig declares {num_sensors} sensors but has too few fields in {}",
+                path.display()
+            );
+        }
         let ref_sensor_id = if num_sensors > 0 {
             Some(parse_sensor_id(&parts, &mut cursor, path)?)
         } else {
@@ -1770,14 +1813,20 @@ fn read_frames_txt(path: &Path) -> Result<Vec<ColmapFrame>> {
         }
         let parts = trimmed.split_whitespace().collect::<Vec<_>>();
         if parts.len() < 10 || parts[0].parse::<u32>().is_err() {
-            continue;
+            bail!("invalid frame record in {}: {trimmed}", path.display());
         }
         let mut cursor = 0usize;
         let frame_id = parse_next(&parts, &mut cursor, path)?;
         let rig_id = parse_next(&parts, &mut cursor, path)?;
         let rig_from_world = parse_rigid3(&parts, &mut cursor, path)?;
         let num_data_ids = parse_next::<usize>(&parts, &mut cursor, path)?;
-        let mut data_ids = Vec::with_capacity(num_data_ids);
+        if num_data_ids > parts.len().saturating_sub(cursor) / 3 {
+            bail!(
+                "frame declares {num_data_ids} data ids but has too few fields in {}",
+                path.display()
+            );
+        }
+        let mut data_ids = reservable_vec(num_data_ids, "frame data ids", path)?;
         for _ in 0..num_data_ids {
             let sensor_id = parse_sensor_id(&parts, &mut cursor, path)?;
             let data_id = parse_next(&parts, &mut cursor, path)?;
@@ -1798,17 +1847,22 @@ fn read_frames_txt(path: &Path) -> Result<Vec<ColmapFrame>> {
 
 fn read_rigs_bin(path: &Path) -> Result<Vec<ColmapRig>> {
     let mut f = File::open(path)?;
-    let n = read_u64(&mut f)? as usize;
-    let mut rigs = Vec::with_capacity(n);
+    let n = checked_binary_count(read_u64(&mut f)?, &mut f, 8, "rigs", path)?;
+    let mut rigs = reservable_vec(n, "rigs", path)?;
     for _ in 0..n {
         let rig_id = read_u32(&mut f)?;
-        let num_sensors = read_u32(&mut f)? as usize;
+        let num_sensors =
+            checked_binary_count(u64::from(read_u32(&mut f)?), &mut f, 8, "rig sensors", path)?;
         let ref_sensor_id = if num_sensors > 0 {
             Some(read_sensor_id_bin(&mut f)?)
         } else {
             None
         };
-        let mut sensors = Vec::with_capacity(num_sensors.saturating_sub(1));
+        let mut sensors = reservable_vec(
+            num_sensors.saturating_sub(1),
+            "non-reference rig sensors",
+            path,
+        )?;
         for _ in 0..num_sensors.saturating_sub(1) {
             let sensor_id = read_sensor_id_bin(&mut f)?;
             let has_pose = read_u8(&mut f)? != 0;
@@ -1833,14 +1887,20 @@ fn read_rigs_bin(path: &Path) -> Result<Vec<ColmapRig>> {
 
 fn read_frames_bin(path: &Path) -> Result<Vec<ColmapFrame>> {
     let mut f = File::open(path)?;
-    let n = read_u64(&mut f)? as usize;
-    let mut frames = Vec::with_capacity(n);
+    let n = checked_binary_count(read_u64(&mut f)?, &mut f, 68, "frames", path)?;
+    let mut frames = reservable_vec(n, "frames", path)?;
     for _ in 0..n {
         let frame_id = read_u32(&mut f)?;
         let rig_id = read_u32(&mut f)?;
         let rig_from_world = read_rigid3_bin(&mut f)?;
-        let num_data_ids = read_u32(&mut f)? as usize;
-        let mut data_ids = Vec::with_capacity(num_data_ids);
+        let num_data_ids = checked_binary_count(
+            u64::from(read_u32(&mut f)?),
+            &mut f,
+            16,
+            "frame data ids",
+            path,
+        )?;
+        let mut data_ids = reservable_vec(num_data_ids, "frame data ids", path)?;
         for _ in 0..num_data_ids {
             data_ids.push(ColmapDataId {
                 sensor_id: read_sensor_id_bin(&mut f)?,
@@ -1934,6 +1994,44 @@ impl ColmapSensorType {
     }
 }
 
+fn checked_binary_count(
+    raw_count: u64,
+    file: &mut File,
+    min_record_bytes: u64,
+    label: &str,
+    path: &Path,
+) -> Result<usize> {
+    let count = usize::try_from(raw_count)
+        .with_context(|| format!("{label} count does not fit usize in {}", path.display()))?;
+    let position = file.stream_position()?;
+    let file_len = file.metadata()?.len();
+    let remaining = file_len.checked_sub(position).with_context(|| {
+        format!(
+            "reader position {position} exceeds file length {file_len} in {}",
+            path.display()
+        )
+    })?;
+    if min_record_bytes == 0 || raw_count <= remaining / min_record_bytes {
+        Ok(count)
+    } else {
+        bail!(
+            "{label} count {raw_count} cannot fit in the {remaining} remaining bytes of {}",
+            path.display()
+        )
+    }
+}
+
+fn reservable_vec<T>(count: usize, label: &str, path: &Path) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve(count).with_context(|| {
+        format!(
+            "cannot reserve capacity for {count} {label} entries from {}",
+            path.display()
+        )
+    })?;
+    Ok(values)
+}
+
 fn read_u8(r: &mut impl Read) -> std::io::Result<u8> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
@@ -2019,6 +2117,28 @@ mod tests {
     use rustslam::{tracker::PnPProblem, tracker::PnPSolver, KeyPoint, SE3};
     use std::collections::BTreeMap;
     use tempfile::tempdir;
+
+    #[test]
+    fn malformed_binary_collection_counts_return_errors_without_panicking() {
+        fn assert_rejected_without_panic<T>(path: &Path, reader: fn(&Path) -> Result<Vec<T>>) {
+            let attempt = std::panic::catch_unwind(|| reader(path));
+            assert!(attempt.is_ok(), "{} count must not panic", path.display());
+            assert!(
+                attempt.unwrap().is_err(),
+                "{} count must be rejected",
+                path.display()
+            );
+        }
+
+        let dir = tempdir().unwrap();
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, u64::MAX.to_le_bytes()).unwrap();
+        }
+        assert_rejected_without_panic(&dir.path().join("cameras.bin"), read_cameras_bin);
+        assert_rejected_without_panic(&dir.path().join("images.bin"), read_images_bin);
+        assert_rejected_without_panic(&dir.path().join("points3D.bin"), read_points3d_bin);
+    }
 
     #[test]
     fn reads_simple_pinhole_text_camera_without_param_shift() -> Result<()> {
@@ -2137,6 +2257,17 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].name, "folder with spaces/image 01.jpg");
         assert_eq!(images[0].points2d[0].xy, [10.5, 20.5]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_absolute_and_parent_traversing_image_names() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("images.txt");
+        for name in ["../escape.jpg", "/absolute.jpg", "C:\\absolute.jpg"] {
+            fs::write(&path, format!("1 1 0 0 0 0 0 0 1 {name}\n\n"))?;
+            assert!(read_images_txt(&path).is_err(), "{name}");
+        }
         Ok(())
     }
 

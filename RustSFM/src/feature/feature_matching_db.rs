@@ -151,13 +151,6 @@ pub fn match_features_to_database(
     options.sift_matching.check()?;
     let started = Instant::now();
     let db = ColmapDatabase::open(database_path)?;
-    if options.clear_existing && !options.use_existing_matches {
-        db.clear_matches()?;
-        db.clear_two_view_geometries()?;
-    } else if options.use_existing_matches {
-        db.clear_two_view_geometries()?;
-    }
-
     let mut images = db.read_all_images()?;
     if images.len() < 2 {
         bail!("database needs at least two images for matching");
@@ -184,62 +177,72 @@ pub fn match_features_to_database(
         verifier_trace,
     } = pair_batch;
 
-    let mut reports = Vec::with_capacity(pair_reports.len());
-    let mut total_matches = 0usize;
-    for (left, right, matches, geometry) in pair_reports {
-        let left_image_id = image_id_by_index[left].1;
-        let right_image_id = image_id_by_index[right].1;
-        let feature_matches = matches
-            .iter()
-            .map(|match_| FeatureMatch {
-                point2d_idx1: match_.query_idx,
-                point2d_idx2: match_.train_idx,
-            })
-            .collect::<Vec<_>>();
-        if !options.use_existing_matches {
-            if db.exists_matches(left_image_id, right_image_id)? {
-                db.delete_matches(left_image_id, right_image_id)?;
-            }
-            db.write_matches(left_image_id, right_image_id, &feature_matches)?;
-        }
-        total_matches += matches.len();
-
-        let (inliers, triangulated, config) = if let Some(geometry) = geometry.as_ref() {
-            let colmap_geometry = pair_geometry_to_colmap_two_view_geometry(geometry);
-            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-                db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-            } else {
-                db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-            }
-            (
-                geometry.inliers,
-                geometry.triangulated,
-                geometry.two_view_config,
-            )
+    let (mut reports, total_matches) = db.with_transaction(|| {
+        if options.clear_existing && !options.use_existing_matches {
+            db.clear_matches()?;
+            db.clear_two_view_geometries()?;
         } else if options.use_existing_matches {
-            let colmap_geometry = ColmapTwoViewGeometry::default();
-            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-                db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-            } else {
-                db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-            }
-            (0, 0, colmap_geometry.config)
-        } else {
-            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-                db.delete_two_view_geometry(left_image_id, right_image_id)?;
-            }
-            (0, 0, -1)
-        };
+            db.clear_two_view_geometries()?;
+        }
 
-        reports.push(MatchFeaturesPairReport {
-            left_image: frames[left].name.clone(),
-            right_image: frames[right].name.clone(),
-            num_matches: matches.len(),
-            num_inliers: inliers,
-            triangulated,
-            two_view_config: config,
-        });
-    }
+        let mut reports = Vec::with_capacity(pair_reports.len());
+        let mut total_matches = 0usize;
+        for (left, right, matches, geometry) in pair_reports {
+            let left_image_id = image_id_by_index[left].1;
+            let right_image_id = image_id_by_index[right].1;
+            let feature_matches = matches
+                .iter()
+                .map(|match_| FeatureMatch {
+                    point2d_idx1: match_.query_idx,
+                    point2d_idx2: match_.train_idx,
+                })
+                .collect::<Vec<_>>();
+            if !options.use_existing_matches {
+                if db.exists_matches(left_image_id, right_image_id)? {
+                    db.delete_matches(left_image_id, right_image_id)?;
+                }
+                db.write_matches(left_image_id, right_image_id, &feature_matches)?;
+            }
+            total_matches += matches.len();
+
+            let (inliers, triangulated, config) = if let Some(geometry) = geometry.as_ref() {
+                let colmap_geometry = pair_geometry_to_colmap_two_view_geometry(geometry);
+                if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                    db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+                } else {
+                    db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+                }
+                (
+                    geometry.inliers,
+                    geometry.triangulated,
+                    geometry.two_view_config,
+                )
+            } else if options.use_existing_matches {
+                let colmap_geometry = ColmapTwoViewGeometry::default();
+                if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                    db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+                } else {
+                    db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+                }
+                (0, 0, colmap_geometry.config)
+            } else {
+                if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                    db.delete_two_view_geometry(left_image_id, right_image_id)?;
+                }
+                (0, 0, -1)
+            };
+
+            reports.push(MatchFeaturesPairReport {
+                left_image: frames[left].name.clone(),
+                right_image: frames[right].name.clone(),
+                num_matches: matches.len(),
+                num_inliers: inliers,
+                triangulated,
+                two_view_config: config,
+            });
+        }
+        Ok((reports, total_matches))
+    })?;
     reports.sort_by(|left, right| {
         left.left_image
             .cmp(&right.left_image)
@@ -267,7 +270,7 @@ pub fn debug_two_view_database_pair(
     right_image: &str,
     options: &DebugTwoViewOptions,
 ) -> Result<DebugTwoViewReport> {
-    let db = ColmapDatabase::open(database_path)?;
+    let db = ColmapDatabase::open_read_only(database_path)?;
     let left = db
         .read_image_with_name(left_image)?
         .with_context(|| format!("missing image {left_image}"))?;
@@ -1331,6 +1334,53 @@ mod tests {
         assert_eq!(frames[0].sift.keypoints.len(), 3);
         assert!(frames[0].sift.descriptors.is_empty());
         assert!(frames[0].sift.descriptors_u8.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn matching_failure_preserves_existing_database_results() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        db.write_image(
+            &ColmapDatabaseImage {
+                image_id: 1,
+                name: "only.jpg".to_string(),
+                camera_id: 1,
+                frame_id: None,
+            },
+            true,
+        )?;
+        let original_matches = vec![FeatureMatch::new(3, 7)];
+        db.write_matches(1, 2, &original_matches)?;
+        let original_geometry = ColmapTwoViewGeometry {
+            inlier_matches: original_matches.clone(),
+            config: 2,
+            ..ColmapTwoViewGeometry::default()
+        };
+        db.write_two_view_geometry(1, 2, &original_geometry)?;
+        drop(db);
+
+        let error = match_features_to_database(&db_path, &MatchFeaturesOptions::default())
+            .expect_err("one-image database must fail validation");
+        assert!(error.to_string().contains("at least two images"));
+
+        let db = ColmapDatabase::open(&db_path)?;
+        assert_eq!(db.read_matches(1, 2)?, original_matches);
+        assert_eq!(db.read_two_view_geometry(1, 2)?, original_geometry);
         Ok(())
     }
 

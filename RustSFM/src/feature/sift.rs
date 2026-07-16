@@ -426,6 +426,11 @@ mod vlfeat_ffi {
         ) -> c_int;
 
         pub fn rustsfm_vlfeat_free_features(out: *mut RustSfmVlfeatSiftFeatures);
+
+        pub fn rustsfm_vlfeat_test_paired_allocation_failure(
+            growth_path: c_int,
+            fail_allocation: c_int,
+        ) -> c_int;
     }
 }
 
@@ -1100,6 +1105,34 @@ pub fn benchmark_sift_extraction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vlfeat_paired_buffer_growth_does_not_use_realloc() {
+        let source = include_str!("../native/vlfeat_sift.c");
+        assert!(
+            !source.contains("realloc("),
+            "paired native buffers must use allocate-copy-commit ownership"
+        );
+    }
+
+    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+    #[test]
+    fn vlfeat_paired_buffer_growth_is_failure_atomic() {
+        for growth_path in 0..=1 {
+            for fail_allocation in 0..=1 {
+                let preserved = unsafe {
+                    vlfeat_ffi::rustsfm_vlfeat_test_paired_allocation_failure(
+                        growth_path,
+                        fail_allocation,
+                    )
+                };
+                assert_eq!(
+                    preserved, 1,
+                    "growth_path={growth_path} fail_allocation={fail_allocation}"
+                );
+            }
+        }
+    }
 
     fn descriptor_with_first(value: f32) -> Descriptor {
         let mut values = [0.0; lowe_sift::DESCRIPTOR_LEN];

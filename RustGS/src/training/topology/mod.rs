@@ -1,7 +1,5 @@
 mod apply;
 mod bridge;
-mod density_controller;
-mod reference;
 mod schedule;
 mod splat_metrics;
 
@@ -12,7 +10,6 @@ pub(crate) use self::schedule::should_apply_topology_step;
 pub(crate) use apply::apply_mutations;
 pub(crate) use bridge::{plan_mutations, snapshot_for_topology};
 
-use self::density_controller::{DensityControllerConfig, PruneMode};
 use self::schedule::{plan_topology_execution, schedule_topology, TopologyStepContext};
 use self::splat_metrics::TopologySplatMetrics;
 use super::reporting::metrics::{ParityFloatDistribution, ParityTopologyMetrics, ParityTopologyStepSample};
@@ -24,24 +21,11 @@ const LITEGS_PERCENT_DENSE: f32 = 0.01;
 const BRUSH_MIN_OPACITY: f32 = 1.0 / 255.0;
 const LITEGS_OPACITY_RESET_CAP: f32 = 0.01;
 const BRUSH_MIN_SCALE: f32 = 1e-10;
-const BRUSH_REFINE_PROGRESS_LIMIT: f32 = 0.95;
 const TOPOLOGY_SELECTION_SALT: u64 = 0x6c69_7465_6773_7365;
 const TOPOLOGY_REFINE_SALT: u64 = 0x6272_7573_685f_7266;
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct RunningMoments {
-    pub(super) mean: f32,
-    pub(super) m2: f32,
-    pub(super) count: usize,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct MetalGaussianStats {
-    pub(super) mean2d_grad: RunningMoments,
-    pub(super) fragment_weight: RunningMoments,
-    pub(super) fragment_err: RunningMoments,
     pub(super) refine_weight_max: f32,
     pub(super) screen_refine_weight_max: f32,
     pub(super) abs_refine_weight_max: f32,
@@ -115,7 +99,7 @@ impl TopologyPolicy {
     pub(crate) fn from_training_config(config: &TrainingConfig, scene_extent: f32) -> Self {
         Self {
             litegs: config.litegs.clone(),
-            max_gaussian_budget: config.initialization.max_initial_gaussians.max(1),
+            max_gaussian_budget: config.litegs.topology.target_primitives.max(1),
             scene_extent,
             max_iterations: config.iterations,
         }
@@ -123,11 +107,10 @@ impl TopologyPolicy {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn litegs_total_epochs(&self, frame_count: usize) -> usize {
-        if frame_count == 0 {
-            0
-        } else {
-            (self.max_iterations / frame_count).max(1)
-        }
+        self.max_iterations
+            .checked_div(frame_count)
+            .map(|epochs| epochs.max(1))
+            .unwrap_or(0)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -163,26 +146,9 @@ impl TopologyPolicy {
         (self.scene_extent * LITEGS_PERCENT_DENSE).max(1e-4)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn density_controller_reference_config(
-        &self,
-        current_gaussians: usize,
-    ) -> DensityControllerConfig {
-        DensityControllerConfig {
-            densify_grad_threshold: self.litegs.growth.growth_grad_threshold,
-            opacity_threshold: LITEGS_OPACITY_THRESHOLD,
-            percent_dense: LITEGS_PERCENT_DENSE,
-            screen_extent: self.scene_extent.max(1e-6),
-            init_points_num: current_gaussians.max(1),
-            target_primitives: self.litegs.topology.target_primitives.max(current_gaussians.max(1)),
-            densify_from: self.litegs.topology.densify_from,
-            densify_until: self.litegs.topology.densify_until.unwrap_or(self.max_iterations),
-            densification_interval: self.litegs.topology.densification_interval.max(1),
-            prune_mode: density_controller_prune_mode(self.litegs.pruning.prune_mode),
-        }
-    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_topology_from_host_snapshot(
     config: &TrainingConfig,
     splats: &HostSplats,
@@ -606,22 +572,6 @@ pub(super) fn litegs_requested_additions(
     prune_candidates.saturating_add(grow_count.saturating_sub(prune_candidates))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn litegs_select_densify_candidates(
-    infos: &[TopologyCandidateInfo],
-    max_new: usize,
-    growth_select_fraction: f32,
-    allow_extra_growth: bool,
-) -> LiteGsDensifySelection {
-    litegs_select_densify_candidates_seeded(
-        infos,
-        max_new,
-        growth_select_fraction,
-        allow_extra_growth,
-        0,
-    )
-}
-
 fn litegs_select_densify_candidates_seeded(
     infos: &[TopologyCandidateInfo],
     max_new: usize,
@@ -720,9 +670,9 @@ pub(super) fn requested_gaussian_cap(
     current_len: usize,
     litegs_requested_additions: usize,
 ) -> usize {
-    policy
-        .max_gaussian_budget
-        .max(current_len.saturating_add(litegs_requested_additions))
+    current_len
+        .saturating_add(litegs_requested_additions)
+        .min(policy.max_gaussian_budget)
 }
 
 fn refine_decay_for_schedule(
@@ -1013,14 +963,6 @@ pub(crate) fn apply_topology_metrics_delta(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn density_controller_prune_mode(mode: LiteGsPruneMode) -> PruneMode {
-    match mode {
-        LiteGsPruneMode::Threshold => PruneMode::Threshold,
-        LiteGsPruneMode::Weight | LiteGsPruneMode::VisibilityWeight => PruneMode::Weight,
-    }
-}
-
 fn sample_weighted_indices<R: Rng + ?Sized>(
     weights: &[f32],
     count: usize,
@@ -1079,6 +1021,7 @@ fn record_topology_epoch(
     *last = Some(last.map_or(epoch, |current| current.max(epoch)));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn litegs_should_prune_candidate(
     policy: &TopologyPolicy,
     info: &TopologyCandidateInfo,
@@ -1125,6 +1068,7 @@ fn litegs_should_prune_candidate(
     contribution_prune || scale_small || scale_large || out_of_bounds || !retainable
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_host_snapshot_stats(
     len: usize,
     grad_2d_accum: &[f32],
@@ -1133,7 +1077,7 @@ fn build_host_snapshot_stats(
     abs_pixel_grad_2d_accum: &[f32],
     pixel_coverage_accum: &[f32],
     camera_depth_accum: &[f32],
-    grad_color_accum: &[f32],
+    _grad_color_accum: &[f32],
     num_observations: &[f32],
     visible_observations: &[f32],
     actual_visible_observations: &[f32],
@@ -1180,23 +1124,12 @@ fn build_host_snapshot_stats(
                 .unwrap_or_default()
                 .max(0.0);
             let camera_depth = camera_depth_accum.get(idx).copied().unwrap_or_default();
-            let grad_color = grad_color_accum.get(idx).copied().unwrap_or_default();
             let age = splat_ages.get(idx).copied().unwrap_or_default();
             let consecutive_invisible_epochs =
                 invisible_windows.get(idx).copied().unwrap_or_default();
             let coverage_denom = pixel_coverage.max(1e-6);
 
             MetalGaussianStats {
-                mean2d_grad: RunningMoments {
-                    mean: grad_2d / denom,
-                    m2: 0.0,
-                    count: visible_count,
-                },
-                fragment_weight: RunningMoments {
-                    mean: grad_color / denom,
-                    m2: 0.0,
-                    count: visible_count,
-                },
                 refine_weight_max: grad_2d / denom,
                 screen_refine_weight_max: screen_grad_2d / visible_denom,
                 abs_refine_weight_max: abs_grad_2d / visible_denom,
@@ -1208,8 +1141,85 @@ fn build_host_snapshot_stats(
                 actual_visibility_ratio,
                 age,
                 consecutive_invisible_epochs,
-                ..MetalGaussianStats::default()
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn topology_growth_is_capped_by_target_primitive_budget() {
+        let mut config = TrainingConfig::default();
+        config.initialization.max_initial_gaussians = 2;
+        config.litegs.topology.target_primitives = 5;
+        let policy = TopologyPolicy::from_training_config(&config, 1.0);
+
+        assert_eq!(policy.max_gaussian_budget, 5);
+        assert_eq!(requested_gaussian_cap(&policy, 4, 10), 5);
+        assert_eq!(requested_gaussian_cap(&policy, 5, 1), 5);
+    }
+
+    #[test]
+    fn topology_plan_rows_never_exceed_target_primitive_budget() {
+        let splats = HostSplats::from_components(
+            vec![
+                0.0, 0.0, 2.0, 0.1, 0.0, 2.0, -0.1, 0.0, 2.0, 0.0, 0.1, 2.0,
+            ],
+            vec![-4.0; 12],
+            vec![
+                1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0,
+            ],
+            vec![0.0; 4],
+            vec![0.0; 12],
+            0,
+        )
+        .unwrap();
+        let config = TrainingConfig {
+            iterations: 100,
+            litegs: LiteGsConfig {
+                topology: crate::training::LiteGsTopologyConfig {
+                    densify_from: 0,
+                    densify_until: Some(10),
+                    refine_every: 1,
+                    densification_interval: 1,
+                    target_primitives: 5,
+                    ..Default::default()
+                },
+                growth: crate::training::LiteGsGrowthConfig {
+                    growth_grad_threshold: 0.0,
+                    growth_select_fraction: 1.0,
+                    growth_stop_iter: 100,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let stats = vec![1.0; splats.len()];
+        let plan = plan_topology_from_host_snapshot(
+            &config,
+            &splats,
+            &stats,
+            &stats,
+            &stats,
+            &stats,
+            &stats,
+            &stats,
+            &stats,
+            &stats,
+            &stats,
+            &stats,
+            &vec![10; splats.len()],
+            &vec![0; splats.len()],
+            2,
+            1,
+        );
+
+        assert_eq!(plan.rows.len(), 5);
+        assert!(plan.rows.len() <= config.litegs.topology.target_primitives);
+    }
 }

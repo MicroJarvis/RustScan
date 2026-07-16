@@ -14,8 +14,8 @@ use crate::training::evaluation::scaled_dimensions;
 use crate::training::events::{
     emit_training_event, TrainingControl, TrainingEvent, TrainingEventCadence, TrainingEventRoute,
     TrainingIterationProgress, TrainingOptions, TrainingPlanSelected, TrainingRun,
-    TrainingRunCancelled, TrainingRunCompleted, TrainingRunReport, TrainingRunStarted,
-    TrainingSnapshotReady,
+    TrainingRunCancelled, TrainingRunCompleted, TrainingRunFailed, TrainingRunReport,
+    TrainingRunStarted, TrainingSnapshotReady,
 };
 use crate::training::reporting::telemetry::store_last_training_telemetry;
 use crate::training::TrainingConfig;
@@ -33,6 +33,7 @@ pub fn train_splats(
     config: &TrainingConfig,
     mut options: TrainingOptions<'_>,
 ) -> Result<TrainingRun, TrainingError> {
+    let run_started_at = Instant::now();
     let control = options.control;
     let mut noop = |_event| {};
     let emit_iteration_events = options.on_event.is_some();
@@ -54,7 +55,19 @@ pub fn train_splats(
         }),
     );
 
-    let run = run_training(dataset, config, &control, emit_iteration_events, on_event)?;
+    let run = match run_training(dataset, config, &control, emit_iteration_events, on_event) {
+        Ok(run) => run,
+        Err(error) => {
+            emit_training_event(
+                on_event,
+                TrainingEvent::RunFailed(TrainingRunFailed {
+                    error: error.to_string(),
+                    elapsed: run_started_at.elapsed(),
+                }),
+            );
+            return Err(error);
+        }
+    };
 
     if run.report.cancelled {
         emit_training_event(
@@ -175,6 +188,7 @@ where
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn warm_up_training_kernels(
     initial_splats: &HostSplats,
     config: &TrainingConfig,
@@ -209,7 +223,7 @@ async fn warm_up_training_kernels(
         scene_scale,
     );
     let started_at = Instant::now();
-    let _ = warmup_trainer
+    warmup_trainer
         .train_step(
             &mut warmup_splats,
             &cameras[0],
@@ -218,9 +232,8 @@ async fn warm_up_training_kernels(
             1,
             cameras.len(),
             false,
-            false,
         )
-        .await;
+        .await?;
     log::debug!(
         "WGPU training warmup completed in {:.3}ms",
         started_at.elapsed().as_secs_f64() * 1000.0
@@ -361,4 +374,28 @@ fn build_training_run(
     };
     store_last_training_telemetry(run.report.telemetry.clone());
     run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn training_failure_emits_run_failed_as_the_terminal_event() {
+        let dataset = TrainingDataset::new(Intrinsics::default());
+        let config = TrainingConfig::default();
+        let mut events = Vec::new();
+
+        let result = train_splats(
+            &dataset,
+            &config,
+            TrainingOptions::new().with_event_sink(|event| events.push(event)),
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(events.last(), Some(TrainingEvent::RunFailed(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TrainingEvent::RunCompleted(_))));
+    }
 }

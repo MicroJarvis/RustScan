@@ -28,7 +28,7 @@
 //!
 //! // Save the trained splats.
 //! rustgs::save_splats(
-//!     "scene.splat".as_ref(),
+//!     "scene.ply".as_ref(),
 //!     &run.splats,
 //!     &rustgs::SplatMetadata::default(),
 //! )?;
@@ -92,7 +92,7 @@ pub use crate::io::colmap_dataset::{load_colmap_dataset, ColmapConfig};
 #[cfg(feature = "gpu")]
 pub use crate::io::scene_io::{
     load_splats, load_splats_ply, load_splats_splat, save_splats, save_splats_ply,
-    save_splats_splat,
+    save_splats_splat, splat_artifact_fidelity, verify_lossless_roundtrip, SplatArtifactFidelity,
 };
 pub use crate::io::scene_io::{SceneIoError, SplatMetadata};
 #[cfg(feature = "gpu")]

@@ -44,6 +44,7 @@ pub(crate) struct ProjectUniforms {
 }
 
 impl ProjectUniforms {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_cov_blur(
         camera: &GaussianCamera,
         img_size: (u32, u32),

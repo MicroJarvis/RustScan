@@ -354,8 +354,7 @@ pub fn estimate_triangulation(
     for i in 0..num_samples {
         let cam_point = cameras[i]
             .cam_from_img(points[i][0], points[i][1])
-            .map(|c| Vector2::new(c[0], c[1]))
-            .unwrap_or_else(Vector2::zeros);
+            .map(|c| Vector2::new(c[0], c[1]))?;
         point_data.push(PointData {
             img_point: points[i],
             cam_point,
@@ -500,7 +499,7 @@ fn colmap_loransac_abort_after_trial(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::COLMAP_PINHOLE;
+    use crate::types::{COLMAP_PINHOLE, COLMAP_RADIAL};
     use nalgebra::{Rotation3, Unit};
 
     fn rot(axis: Vector3<f64>, angle: f64) -> Matrix3<f64> {
@@ -670,6 +669,28 @@ mod tests {
             ..EstimateTriangulationOptions::default()
         };
         assert!(estimate_triangulation(&options, &points, &cams, &cameras).is_none());
+    }
+
+    #[test]
+    fn estimate_triangulation_propagates_undistortion_failure() {
+        let (cams, mut cameras, truth) = three_view_setup();
+        let mut points = cams
+            .iter()
+            .zip(cameras.iter())
+            .map(|(cam, camera)| project_pixel(camera, cam, &truth))
+            .collect::<Vec<_>>();
+        cameras[0] =
+            CameraModel::from_colmap(COLMAP_RADIAL, 800, 600, &[700.0, 400.0, 300.0, -10.0, 0.0])
+                .unwrap();
+        points[0] = Vector2::new(1400.0, 300.0);
+
+        assert!(estimate_triangulation(
+            &EstimateTriangulationOptions::default(),
+            &points,
+            &cams,
+            &cameras
+        )
+        .is_none());
     }
 
     #[test]

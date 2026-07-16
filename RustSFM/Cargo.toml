@@ -12,6 +12,7 @@ ceres-ba = ["dep:ceres-solver"]
 vlfeat-sift = []
 
 [dependencies]
+rustscan-types = { path = "../rustscan-types" }
 ceres-solver = { version = "0.5", optional = true, features = ["source"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

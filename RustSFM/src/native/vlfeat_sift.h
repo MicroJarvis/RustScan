@@ -55,6 +55,10 @@ int rustsfm_vlfeat_extract_sift(
 
 void rustsfm_vlfeat_free_features(RustSfmVlfeatSiftFeatures* features);
 
+int rustsfm_vlfeat_test_paired_allocation_failure(
+    int growth_path,
+    int fail_allocation);
+
 #ifdef __cplusplus
 }
 #endif
