@@ -657,7 +657,7 @@ git commit -m "feat(rustsfm): compute SIFT descriptors on wgpu"
 - Modify: `RustSFM/src/gpu/sift/mod.rs`
 - Modify: `RustSFM/src/feature/sift.rs`
 
-- [ ] **Step 1: Write end-to-end extractor contract tests**
+- [x] **Step 1: Write end-to-end extractor contract tests**
 
 ```rust
 #[test]
@@ -697,13 +697,13 @@ fn wgpu_sift_constant_image_returns_no_features() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run end-to-end tests and verify placeholder failure**
+- [x] **Step 2: Run end-to-end tests and verify placeholder failure**
 
 Run: `cargo test -p rustsfm --lib wgpu_sift_ --features gpu-wgpu -- --nocapture`
 
 Expected: FAIL because `WgpuSiftExtractor` still returns the placeholder error.
 
-- [ ] **Step 3: Implement octave streaming and output construction**
+- [x] **Step 3: Implement octave streaming and output construction**
 
 Replace the placeholder with:
 
@@ -742,7 +742,7 @@ orientation. Convert coordinates from octave space to the resized input image. P
 `KeyPoint`, `ColmapKeypoint::from_scale_orientation`, `Descriptor`, and `u8[128]` in the same
 order. Return empty aligned vectors for featureless images.
 
-- [ ] **Step 4: Run all GPU SIFT tests**
+- [x] **Step 4: Run all GPU SIFT tests**
 
 Run: `cargo test -p rustsfm --lib gpu_ --features gpu-wgpu -- --nocapture`
 
@@ -750,7 +750,7 @@ Run: `cargo test -p rustsfm --lib wgpu_sift_ --features gpu-wgpu -- --nocapture`
 
 Expected: PASS on Metal with no validation errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/gpu RustSFM/src/feature/sift.rs

@@ -640,8 +640,7 @@ impl SiftPyramid {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn gaussian_for_test(
+    pub(crate) fn gaussian(
         &self,
         input: &[f32],
         width: u32,
@@ -734,8 +733,7 @@ impl SiftPyramid {
         self.context.read_buffer(&output, input.len())
     }
 
-    #[cfg(test)]
-    pub(crate) fn dog_for_test(
+    pub(crate) fn dog(
         &self,
         lower: &[f32],
         upper: &[f32],
@@ -795,13 +793,7 @@ impl SiftPyramid {
         self.context.read_buffer(&output, lower.len())
     }
 
-    #[cfg(test)]
-    pub(crate) fn downsample_for_test(
-        &self,
-        input: &[f32],
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<f32>> {
+    pub(crate) fn downsample(&self, input: &[f32], width: u32, height: u32) -> Result<Vec<f32>> {
         validate_level(input, width, height)?;
         let output_width = width / 2;
         let output_height = height / 2;
@@ -1063,7 +1055,7 @@ mod tests {
         };
         let pyramid = SiftPyramid::new(context)?;
         let input = vec![0.25f32; 17 * 13];
-        let output = pyramid.gaussian_for_test(&input, 17, 13, 1.6)?;
+        let output = pyramid.gaussian(&input, 17, 13, 1.6)?;
         assert!(
             output.iter().all(|value| (value - 0.25).abs() < 2.0e-5),
             "constant Gaussian output range: {:?}",
@@ -1084,7 +1076,7 @@ mod tests {
         };
         let pyramid = SiftPyramid::new(context)?;
         let level = vec![0.75f32; 11 * 9];
-        let dog = pyramid.dog_for_test(&level, &level, 11, 9)?;
+        let dog = pyramid.dog(&level, &level, 11, 9)?;
         assert!(dog.iter().all(|value| value.abs() < 1.0e-7));
         Ok(())
     }
@@ -1096,7 +1088,7 @@ mod tests {
         };
         let pyramid = SiftPyramid::new(context)?;
         let input = (0..16).map(|value| value as f32).collect::<Vec<_>>();
-        let output = pyramid.downsample_for_test(&input, 4, 4)?;
+        let output = pyramid.downsample(&input, 4, 4)?;
         assert_eq!(output, vec![0.0, 2.0, 8.0, 10.0]);
         Ok(())
     }
