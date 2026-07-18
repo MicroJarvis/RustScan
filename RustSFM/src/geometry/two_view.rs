@@ -1,6 +1,8 @@
 use crate::colmap_eigen;
 use crate::five_point::estimate_five_point_essential;
 use crate::geometry::relative_rotation_deg;
+#[cfg(feature = "gpu-wgpu")]
+use crate::gpu::{GpuModelSupport, TwoViewModelKind, WgpuModelScorer, WgpuModelScoringSession};
 use crate::types::CameraModel;
 use glam::{Quat, Vec3};
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
@@ -230,6 +232,13 @@ struct PoseCandidateScore {
     median_angle_deg: f64,
 }
 
+#[derive(Clone, Copy)]
+enum TwoViewScoringBackend<'a> {
+    Cpu(std::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "gpu-wgpu")]
+    Wgpu(&'a WgpuModelScorer),
+}
+
 pub fn estimate_calibrated_two_view(
     pts1: &[[f32; 2]],
     pts2: &[[f32; 2]],
@@ -239,6 +248,30 @@ pub fn estimate_calibrated_two_view(
     let obs1_px = normalized_observations_to_pixels(pts1, camera);
     let obs2_px = normalized_observations_to_pixels(pts2, camera);
     estimate_calibrated_two_view_with_observations(pts1, pts2, &obs1_px, &obs2_px, camera, options)
+}
+
+#[cfg(all(feature = "gpu-wgpu", test))]
+pub(crate) fn estimate_calibrated_two_view_gpu(
+    scorer: &WgpuModelScorer,
+    pts1: &[[f32; 2]],
+    pts2: &[[f32; 2]],
+    camera: CameraModel,
+    options: &TwoViewOptions,
+) -> anyhow::Result<Option<TwoViewEstimate>> {
+    let obs1_px = normalized_observations_to_pixels(pts1, camera);
+    let obs2_px = normalized_observations_to_pixels(pts2, camera);
+    estimate_calibrated_two_view_impl(
+        pts1,
+        pts2,
+        &obs1_px,
+        &obs2_px,
+        None,
+        None,
+        camera,
+        camera,
+        options,
+        TwoViewScoringBackend::Wgpu(scorer),
+    )
 }
 
 pub fn estimate_calibrated_two_view_with_observations(
@@ -280,9 +313,65 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
     camera2: CameraModel,
     options: &TwoViewOptions,
 ) -> Option<TwoViewEstimate> {
+    estimate_calibrated_two_view_impl(
+        pts1,
+        pts2,
+        obs1_px,
+        obs2_px,
+        rays1,
+        rays2,
+        camera1,
+        camera2,
+        options,
+        TwoViewScoringBackend::Cpu(std::marker::PhantomData),
+    )
+    .expect("CPU two-view scoring backend is infallible")
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu(
+    scorer: &WgpuModelScorer,
+    pts1: &[[f32; 2]],
+    pts2: &[[f32; 2]],
+    obs1_px: &[[f32; 2]],
+    obs2_px: &[[f32; 2]],
+    rays1: Option<&[[f64; 3]]>,
+    rays2: Option<&[[f64; 3]]>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+    options: &TwoViewOptions,
+) -> anyhow::Result<Option<TwoViewEstimate>> {
+    estimate_calibrated_two_view_impl(
+        pts1,
+        pts2,
+        obs1_px,
+        obs2_px,
+        rays1,
+        rays2,
+        camera1,
+        camera2,
+        options,
+        TwoViewScoringBackend::Wgpu(scorer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_calibrated_two_view_impl(
+    pts1: &[[f32; 2]],
+    pts2: &[[f32; 2]],
+    obs1_px: &[[f32; 2]],
+    obs2_px: &[[f32; 2]],
+    rays1: Option<&[[f64; 3]]>,
+    rays2: Option<&[[f64; 3]]>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+    options: &TwoViewOptions,
+    scoring_backend: TwoViewScoringBackend<'_>,
+) -> anyhow::Result<Option<TwoViewEstimate>> {
     let n = pts1.len().min(pts2.len());
     if n < options.min_inliers.max(5) {
-        return None;
+        return Ok(None);
     }
     let obs1_px = if obs1_px.len() >= n { obs1_px } else { pts1 };
     let obs2_px = if obs2_px.len() >= n { obs2_px } else { pts2 };
@@ -294,20 +383,26 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
         options.stationary_matches_max_error_px,
     );
     if active_indices.len() < options.min_inliers.max(5) {
-        return None;
+        return Ok(None);
     }
     if options.multiple_models {
-        return estimate_multiple_calibrated_two_view_with_observations_and_cameras(
-            pts1,
-            pts2,
-            obs1_px,
-            obs2_px,
-            rays1,
-            rays2,
-            camera1,
-            camera2,
-            &active_indices,
-            options,
+        #[cfg(feature = "gpu-wgpu")]
+        if matches!(scoring_backend, TwoViewScoringBackend::Wgpu(_)) {
+            anyhow::bail!("wgpu RANSAC scoring does not support multiple_models");
+        }
+        return Ok(
+            estimate_multiple_calibrated_two_view_with_observations_and_cameras(
+                pts1,
+                pts2,
+                obs1_px,
+                obs2_px,
+                rays1,
+                rays2,
+                camera1,
+                camera2,
+                &active_indices,
+                options,
+            ),
         );
     }
 
@@ -350,7 +445,11 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
         .map(|p| Vector3::new(p[0] as f64, p[1] as f64, 1.0))
         .collect::<Vec<_>>();
     if options.force_h_use {
-        return estimate_force_h_two_view(
+        #[cfg(feature = "gpu-wgpu")]
+        if matches!(scoring_backend, TwoViewScoringBackend::Wgpu(_)) {
+            anyhow::bail!("wgpu RANSAC scoring does not support force_h_use");
+        }
+        return Ok(estimate_force_h_two_view(
             &ray_pts1,
             &ray_pts2,
             &img_pts1,
@@ -361,7 +460,7 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
             camera1,
             camera2,
             options,
-        );
+        ));
     }
     let support_limit = ransac_support_limit();
     let _support_indices = if active_indices.len() > support_limit {
@@ -375,142 +474,101 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
     let sampler_seed = two_view_sampler_seed(options);
     let shared_stream = colmap_shared_ransac_stream_enabled(options);
     let essential_sample_size = if options.use_five_point { 5 } else { 8 };
-    let essential_ransac_options =
-        two_view_ransac_options(options.ransac_threshold, options, essential_sample_size)?;
-    let mut sampler = make_two_view_ransac_sampler(
-        sampler_seed,
-        &essential_ransac_options,
-        0x9e37_79b9_7f4a_7c15,
-        n,
-        &active_indices,
-        shared_stream,
-    );
-    let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
-    let max_iterations = essential_ransac_options.max_num_trials.max(1);
-    let mut dynamic_max_trials = max_iterations;
-    let mut iteration = 0usize;
-    let mut abort = false;
-    while iteration < max_iterations && !abort {
-        let curr_thread_trial = iteration;
-        iteration += 1;
-        let (sample_size, models) = if options.use_five_point {
-            let sample = sampler.sample(5);
-            if sample.len() != 5 {
-                break;
-            }
-            (
-                5,
-                estimate_essential_five_point_indexed(&ray_pts1, &ray_pts2, &sample),
-            )
-        } else {
-            let sample = sampler.sample(8);
-            if sample.len() != 8 {
-                break;
-            }
-            let model =
-                estimate_essential_eight_point_indexed_lightweight(&ray_pts1, &ray_pts2, &sample);
-            (8, model.into_iter().collect::<Vec<_>>())
-        };
-        for model in models {
-            let support = model_support_indexed(
-                &ray_pts1,
-                &ray_pts2,
-                &active_indices,
-                &model,
-                options.ransac_threshold,
-            );
-            if support.inliers >= sample_size
-                && is_better_support(&support, best.as_ref().map(|(_, s)| s))
-            {
-                let (model, support) = local_optimize_essential_support(
-                    &ray_pts1,
-                    &ray_pts2,
-                    &active_indices,
-                    options.ransac_threshold,
-                    model,
-                    support,
-                    COLMAP_LORANSAC_LOCAL_TRIALS,
-                    options.use_five_point,
-                    options.use_hartley_refinement,
-                );
-                if support.inliers >= sample_size
-                    && is_better_support(&support, best.as_ref().map(|(_, s)| s))
-                {
-                    dynamic_max_trials = dynamic_ransac_num_trials(
-                        support.inliers,
-                        active_indices.len(),
-                        &essential_ransac_options,
-                        sample_size,
-                    );
-                    best = Some((model, support));
-                }
-            }
-            if update_abort_after_model(
-                curr_thread_trial,
-                dynamic_max_trials,
-                essential_ransac_options.min_num_trials,
-                &mut abort,
-            ) {
-                break;
-            }
-        }
-    }
+    let Some(essential_ransac_options) =
+        two_view_ransac_options(options.ransac_threshold, options, essential_sample_size)
+    else {
+        return Ok(None);
+    };
+    let essential_result = match scoring_backend {
+        TwoViewScoringBackend::Cpu(_) => estimate_essential_ransac(
+            &ray_pts1,
+            &ray_pts2,
+            &active_indices,
+            n,
+            essential_ransac_options,
+            sampler_seed,
+            options.loransac_num_lo_steps,
+            shared_stream,
+            options.use_five_point,
+            options.use_hartley_refinement,
+        ),
+        #[cfg(feature = "gpu-wgpu")]
+        TwoViewScoringBackend::Wgpu(scorer) => estimate_essential_ransac_gpu(
+            scorer,
+            &ray_pts1,
+            &ray_pts2,
+            &active_indices,
+            n,
+            essential_ransac_options,
+            sampler_seed,
+            options.loransac_num_lo_steps,
+            shared_stream,
+            options.use_five_point,
+            options.use_hartley_refinement,
+        )?,
+    };
+    let Some((essential, support, e_ransac_success)) = essential_result else {
+        return Ok(None);
+    };
 
-    let e_ransac_success = best.is_some();
-    let (mut essential, _) = best.or_else(|| {
-        estimate_essential_eight_point_indexed(&ray_pts1, &ray_pts2, &active_indices).map(|model| {
-            let support = model_support_indexed(
-                &ray_pts1,
-                &ray_pts2,
-                &active_indices,
-                &model,
-                options.ransac_threshold,
-            );
-            (model, support)
-        })
-    })?;
-    let mut support = model_support_indexed(
-        &ray_pts1,
-        &ray_pts2,
-        &active_indices,
-        &essential,
-        options.ransac_threshold,
-    );
-
-    (essential, support) = refine_essential_support(
-        &ray_pts1,
-        &ray_pts2,
-        &active_indices,
-        options.ransac_threshold,
-        essential,
-        support,
-        options.loransac_num_lo_steps,
-        options.use_five_point,
-        options.use_hartley_refinement,
-    );
-
-    let f_support = estimate_fundamental_ransac(
-        &img_pts1,
-        &img_pts2,
-        &active_indices,
-        two_view_ransac_options(options.ransac_max_error_px, options, 7)?,
-        sampler_seed,
-        options.loransac_num_lo_steps,
-        shared_stream,
-    );
+    let Some(fundamental_ransac_options) =
+        two_view_ransac_options(options.ransac_max_error_px, options, 7)
+    else {
+        return Ok(None);
+    };
+    let f_support = match scoring_backend {
+        TwoViewScoringBackend::Cpu(_) => estimate_fundamental_ransac(
+            &img_pts1,
+            &img_pts2,
+            &active_indices,
+            fundamental_ransac_options,
+            sampler_seed,
+            options.loransac_num_lo_steps,
+            shared_stream,
+        ),
+        #[cfg(feature = "gpu-wgpu")]
+        TwoViewScoringBackend::Wgpu(scorer) => estimate_fundamental_ransac_gpu(
+            scorer,
+            &img_pts1,
+            &img_pts2,
+            &active_indices,
+            fundamental_ransac_options,
+            sampler_seed,
+            options.loransac_num_lo_steps,
+            shared_stream,
+        )?,
+    };
     let f_ransac_success = f_support
         .as_ref()
         .map(|(_, _, success)| *success)
         .unwrap_or(false);
-    let h_support = estimate_homography_ransac(
-        &img_pts1,
-        &img_pts2,
-        &active_indices,
-        two_view_ransac_options(options.ransac_max_error_px, options, 4)?,
-        sampler_seed,
-        options.loransac_num_lo_steps,
-        shared_stream,
-    );
+    let Some(homography_ransac_options) =
+        two_view_ransac_options(options.ransac_max_error_px, options, 4)
+    else {
+        return Ok(None);
+    };
+    let h_support = match scoring_backend {
+        TwoViewScoringBackend::Cpu(_) => estimate_homography_ransac(
+            &img_pts1,
+            &img_pts2,
+            &active_indices,
+            homography_ransac_options,
+            sampler_seed,
+            options.loransac_num_lo_steps,
+            shared_stream,
+        ),
+        #[cfg(feature = "gpu-wgpu")]
+        TwoViewScoringBackend::Wgpu(scorer) => estimate_homography_ransac_gpu(
+            scorer,
+            &img_pts1,
+            &img_pts2,
+            &active_indices,
+            homography_ransac_options,
+            sampler_seed,
+            options.loransac_num_lo_steps,
+            shared_stream,
+        )?,
+    };
     let h_ransac_success = h_support
         .as_ref()
         .map(|(_, _, success)| *success)
@@ -524,12 +582,12 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
         h_ransac_success,
         options,
     ) else {
-        return None;
+        return Ok(None);
     };
     if options.min_inlier_ratio > 0.0
         && selected_inliers as f64 / (active_indices.len().max(1) as f64) < options.min_inlier_ratio
     {
-        return None;
+        return Ok(None);
     }
     if two_view_config == crate::database::COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC {
         if let Some((homography, _, _)) = h_support.as_ref() {
@@ -592,7 +650,7 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
     let pose_score = if let Some(score) = homography_pose_score {
         score
     } else {
-        choose_pose_from_essential(
+        let Some(score) = choose_pose_from_essential(
             &pose_essential,
             &ray_pts1,
             &ray_pts2,
@@ -601,14 +659,17 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
             &pose_mask,
             camera1,
             camera2,
-        )?
+        ) else {
+            return Ok(None);
+        };
+        score
     };
     if pose_score.triangulated < options.min_triangulated {
-        return None;
+        return Ok(None);
     }
     let pose_rigid = rigid3_from_se3(pose_score.pose);
 
-    Some(TwoViewEstimate {
+    Ok(Some(TwoViewEstimate {
         essential: pose_essential,
         fundamental: f_support.as_ref().map(|(model, _, _)| *model),
         homography: h_support.as_ref().map(|(model, _, _)| *model),
@@ -622,7 +683,7 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
         mean_reprojection_error_px: pose_score.mean_reprojection_error_px,
         rotation_deg: relative_rotation_deg(pose_score.pose, SE3::identity()),
         median_triangulation_angle_deg: pose_score.median_angle_deg as f32,
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1328,6 +1389,272 @@ fn vector3_from_homogeneous_ray(ray: &Vector3<f64>) -> Vector3<f64> {
 
 const COLMAP_LORANSAC_LOCAL_TRIALS: usize = 10;
 
+#[allow(clippy::too_many_arguments)]
+fn estimate_essential_ransac(
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    num_observations: usize,
+    ransac_options: ColmapRansacOptions,
+    random_seed: u64,
+    lo_steps: usize,
+    shared_stream: bool,
+    use_five_point: bool,
+    use_hartley_refinement: bool,
+) -> Option<(Matrix3<f64>, ModelSupport, bool)> {
+    let sample_size = if use_five_point { 5 } else { 8 };
+    if active_indices.len() < sample_size {
+        return None;
+    }
+    let mut sampler = make_two_view_ransac_sampler(
+        random_seed,
+        &ransac_options,
+        0x9e37_79b9_7f4a_7c15,
+        num_observations,
+        active_indices,
+        shared_stream,
+    );
+    let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let max_iterations = ransac_options.max_num_trials.max(1);
+    let mut dynamic_max_trials = max_iterations;
+    let mut iteration = 0usize;
+    let mut abort = false;
+    while iteration < max_iterations && !abort {
+        let curr_thread_trial = iteration;
+        iteration += 1;
+        let models = if use_five_point {
+            let sample = sampler.sample(5);
+            if sample.len() != 5 {
+                break;
+            }
+            estimate_essential_five_point_indexed(pts1, pts2, &sample)
+        } else {
+            let sample = sampler.sample(8);
+            if sample.len() != 8 {
+                break;
+            }
+            estimate_essential_eight_point_indexed_lightweight(pts1, pts2, &sample)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        for model in models {
+            let support =
+                model_support_indexed(pts1, pts2, active_indices, &model, ransac_options.max_error);
+            if support.inliers >= sample_size
+                && is_better_support(&support, best.as_ref().map(|(_, support)| support))
+            {
+                let (model, support) = local_optimize_essential_support(
+                    pts1,
+                    pts2,
+                    active_indices,
+                    ransac_options.max_error,
+                    model,
+                    support,
+                    COLMAP_LORANSAC_LOCAL_TRIALS,
+                    use_five_point,
+                    use_hartley_refinement,
+                );
+                if support.inliers >= sample_size
+                    && is_better_support(&support, best.as_ref().map(|(_, support)| support))
+                {
+                    dynamic_max_trials = dynamic_ransac_num_trials(
+                        support.inliers,
+                        active_indices.len(),
+                        &ransac_options,
+                        sample_size,
+                    );
+                    best = Some((model, support));
+                }
+            }
+            if update_abort_after_model(
+                curr_thread_trial,
+                dynamic_max_trials,
+                ransac_options.min_num_trials,
+                &mut abort,
+            ) {
+                break;
+            }
+        }
+    }
+
+    let ransac_success = best.is_some();
+    let (model, _) = best.or_else(|| {
+        estimate_essential_eight_point_indexed(pts1, pts2, active_indices).map(|model| {
+            let support =
+                model_support_indexed(pts1, pts2, active_indices, &model, ransac_options.max_error);
+            (model, support)
+        })
+    })?;
+    let support =
+        model_support_indexed(pts1, pts2, active_indices, &model, ransac_options.max_error);
+    let (model, support) = refine_essential_support(
+        pts1,
+        pts2,
+        active_indices,
+        ransac_options.max_error,
+        model,
+        support,
+        lo_steps,
+        use_five_point,
+        use_hartley_refinement,
+    );
+    Some((model, support, ransac_success))
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn estimate_essential_ransac_gpu(
+    scorer: &WgpuModelScorer,
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    num_observations: usize,
+    ransac_options: ColmapRansacOptions,
+    random_seed: u64,
+    lo_steps: usize,
+    shared_stream: bool,
+    use_five_point: bool,
+    use_hartley_refinement: bool,
+) -> anyhow::Result<Option<(Matrix3<f64>, ModelSupport, bool)>> {
+    let sample_size = if use_five_point { 5 } else { 8 };
+    if active_indices.len() < sample_size {
+        return Ok(None);
+    }
+    let gpu_points1 = gpu_ransac_points(pts1, active_indices)?;
+    let gpu_points2 = gpu_ransac_points(pts2, active_indices)?;
+    let session: WgpuModelScoringSession<'_> =
+        scorer.prepare_homogeneous_session(&gpu_points1, &gpu_points2)?;
+    let threshold = gpu_ransac_threshold(ransac_options.max_error)?;
+    let mut sampler = make_two_view_ransac_sampler(
+        random_seed,
+        &ransac_options,
+        0x9e37_79b9_7f4a_7c15,
+        num_observations,
+        active_indices,
+        shared_stream,
+    );
+    let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let max_iterations = ransac_options.max_num_trials.max(1);
+    let mut dynamic_max_trials = max_iterations;
+    let mut iteration = 0usize;
+    let mut sampler_exhausted = false;
+
+    while iteration < max_iterations {
+        let chunk_end = gpu_ransac_chunk_end(
+            iteration,
+            max_iterations,
+            dynamic_max_trials,
+            ransac_options.min_num_trials,
+        );
+        if iteration >= chunk_end {
+            break;
+        }
+        let mut candidates = Vec::<Matrix3<f64>>::new();
+        while iteration < chunk_end {
+            iteration += 1;
+            let sample = sampler.sample(sample_size);
+            if sample.len() != sample_size {
+                sampler_exhausted = true;
+                break;
+            }
+            if use_five_point {
+                candidates.extend(estimate_essential_five_point_indexed(pts1, pts2, &sample));
+            } else if let Some(model) =
+                estimate_essential_eight_point_indexed_lightweight(pts1, pts2, &sample)
+            {
+                candidates.push(model);
+            }
+        }
+
+        if !candidates.is_empty() {
+            let gpu_models = candidates
+                .iter()
+                .map(gpu_ransac_model)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let summaries =
+                session.score_two_view_models(&gpu_models, threshold, TwoViewModelKind::Sampson)?;
+            if summaries.len() != candidates.len() {
+                anyhow::bail!(
+                    "GPU Essential RANSAC returned {} summaries for {} candidates",
+                    summaries.len(),
+                    candidates.len()
+                );
+            }
+            for ((model, gpu_model), summary) in
+                candidates.into_iter().zip(gpu_models).zip(summaries)
+            {
+                let summary_support = gpu_summary_support(summary)?;
+                if summary_support.inliers >= sample_size
+                    && is_better_support(
+                        &summary_support,
+                        best.as_ref().map(|(_, support)| support),
+                    )
+                {
+                    let local_mask =
+                        session.inlier_mask(&gpu_model, threshold, TwoViewModelKind::Sampson)?;
+                    let raw_support = gpu_masked_support(
+                        summary,
+                        local_mask,
+                        active_indices,
+                        pts1.len().min(pts2.len()),
+                    )?;
+                    let (model, support) = local_optimize_essential_support(
+                        pts1,
+                        pts2,
+                        active_indices,
+                        ransac_options.max_error,
+                        model,
+                        raw_support,
+                        COLMAP_LORANSAC_LOCAL_TRIALS,
+                        use_five_point,
+                        use_hartley_refinement,
+                    );
+                    if support.inliers >= sample_size
+                        && is_better_support(&support, best.as_ref().map(|(_, support)| support))
+                    {
+                        dynamic_max_trials = dynamic_ransac_num_trials(
+                            support.inliers,
+                            active_indices.len(),
+                            &ransac_options,
+                            sample_size,
+                        );
+                        best = Some((model, support));
+                    }
+                }
+            }
+        }
+        if sampler_exhausted {
+            break;
+        }
+    }
+
+    let ransac_success = best.is_some();
+    let model = match best {
+        Some((model, _)) => model,
+        None => {
+            let Some(model) = estimate_essential_eight_point_indexed(pts1, pts2, active_indices)
+            else {
+                return Ok(None);
+            };
+            model
+        }
+    };
+    let support =
+        model_support_indexed(pts1, pts2, active_indices, &model, ransac_options.max_error);
+    let (model, support) = refine_essential_support(
+        pts1,
+        pts2,
+        active_indices,
+        ransac_options.max_error,
+        model,
+        support,
+        lo_steps,
+        use_five_point,
+        use_hartley_refinement,
+    );
+    Ok(Some((model, support, ransac_success)))
+}
+
 fn local_optimize_essential_support(
     pts1: &[Vector3<f64>],
     pts2: &[Vector3<f64>],
@@ -1800,6 +2127,127 @@ fn dynamic_ransac_num_trials(
     )
 }
 
+#[cfg(feature = "gpu-wgpu")]
+const GPU_RANSAC_CHUNK_TRIALS: usize = 64;
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_chunk_end(
+    iteration: usize,
+    max_num_trials: usize,
+    dynamic_max_trials: usize,
+    min_num_trials: usize,
+) -> usize {
+    let effective_end = dynamic_max_trials
+        .max(min_num_trials)
+        .saturating_add(1)
+        .min(max_num_trials);
+    iteration
+        .saturating_add(GPU_RANSAC_CHUNK_TRIALS)
+        .min(effective_end)
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_points(
+    points: &[Vector3<f64>],
+    active_indices: &[usize],
+) -> anyhow::Result<Vec<[f32; 3]>> {
+    active_indices
+        .iter()
+        .map(|&index| {
+            let point = points.get(index).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GPU RANSAC active observation index {index} exceeds {} points",
+                    points.len()
+                )
+            })?;
+            let converted = [point.x as f32, point.y as f32, point.z as f32];
+            if converted.iter().all(|value| value.is_finite()) {
+                Ok(converted)
+            } else {
+                anyhow::bail!("GPU RANSAC observation {index} is not finite in f32")
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_model(model: &Matrix3<f64>) -> anyhow::Result<[f32; 9]> {
+    let values = [
+        model[(0, 0)] as f32,
+        model[(0, 1)] as f32,
+        model[(0, 2)] as f32,
+        model[(1, 0)] as f32,
+        model[(1, 1)] as f32,
+        model[(1, 2)] as f32,
+        model[(2, 0)] as f32,
+        model[(2, 1)] as f32,
+        model[(2, 2)] as f32,
+    ];
+    if values.iter().all(|value| value.is_finite()) {
+        Ok(values)
+    } else {
+        anyhow::bail!("GPU RANSAC model is not finite in f32")
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_threshold(threshold: f64) -> anyhow::Result<f32> {
+    let threshold = threshold as f32;
+    if threshold.is_finite() && threshold >= 0.0 {
+        Ok(threshold)
+    } else {
+        anyhow::bail!("GPU RANSAC threshold must be finite and non-negative in f32")
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_summary_support(summary: GpuModelSupport) -> anyhow::Result<ModelSupport> {
+    if !summary.residual_sum.is_finite() {
+        anyhow::bail!("GPU RANSAC support residual sum is not finite")
+    }
+    Ok(ModelSupport {
+        inlier_mask: Vec::new(),
+        inliers: summary.inliers as usize,
+        residual_sum: summary.residual_sum as f64,
+    })
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_masked_support(
+    summary: GpuModelSupport,
+    local_mask: Vec<bool>,
+    active_indices: &[usize],
+    observation_count: usize,
+) -> anyhow::Result<ModelSupport> {
+    if local_mask.len() != active_indices.len() {
+        anyhow::bail!(
+            "GPU RANSAC mask has {} entries for {} active observations",
+            local_mask.len(),
+            active_indices.len()
+        );
+    }
+    let mask_inliers = local_mask.iter().filter(|&&value| value).count();
+    if mask_inliers != summary.inliers as usize {
+        anyhow::bail!(
+            "GPU RANSAC summary/mask inlier mismatch: {} != {}",
+            summary.inliers,
+            mask_inliers
+        );
+    }
+    let mut inlier_mask = vec![false; observation_count];
+    for (&index, is_inlier) in active_indices.iter().zip(local_mask) {
+        let output = inlier_mask.get_mut(index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "GPU RANSAC active observation index {index} exceeds mask length {observation_count}"
+            )
+        })?;
+        *output = is_inlier;
+    }
+    let mut support = gpu_summary_support(summary)?;
+    support.inlier_mask = inlier_mask;
+    Ok(support)
+}
+
 fn colmap_ransac_abort_after_trial(
     curr_thread_trial: usize,
     dynamic_max_trials: usize,
@@ -1960,6 +2408,148 @@ fn estimate_fundamental_ransac(
         shared_stream,
     )
     .map(|(model, support, ransac_success, _trace)| (model, support, ransac_success))
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn estimate_fundamental_ransac_gpu(
+    scorer: &WgpuModelScorer,
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    ransac_options: ColmapRansacOptions,
+    random_seed: u64,
+    lo_steps: usize,
+    shared_stream: bool,
+) -> anyhow::Result<Option<(Matrix3<f64>, ModelSupport, bool)>> {
+    if active_indices.len() < 7 {
+        return Ok(None);
+    }
+    let gpu_points1 = gpu_ransac_points(pts1, active_indices)?;
+    let gpu_points2 = gpu_ransac_points(pts2, active_indices)?;
+    let session: WgpuModelScoringSession<'_> =
+        scorer.prepare_homogeneous_session(&gpu_points1, &gpu_points2)?;
+    let threshold = gpu_ransac_threshold(ransac_options.max_error)?;
+    let mut sampler = make_two_view_ransac_sampler(
+        random_seed,
+        &ransac_options,
+        0x517c_c1b7_2722_0a95,
+        active_indices.len(),
+        active_indices,
+        shared_stream,
+    );
+    let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let max_iterations = ransac_options.max_num_trials.max(1);
+    let mut dynamic_max_trials = max_iterations;
+    let mut iteration = 0usize;
+    let mut sampler_exhausted = false;
+
+    while iteration < max_iterations {
+        let chunk_end = gpu_ransac_chunk_end(
+            iteration,
+            max_iterations,
+            dynamic_max_trials,
+            ransac_options.min_num_trials,
+        );
+        if iteration >= chunk_end {
+            break;
+        }
+        let mut candidates = Vec::<Matrix3<f64>>::new();
+        while iteration < chunk_end {
+            iteration += 1;
+            let sample = sampler.sample(7);
+            if sample.len() != 7 {
+                sampler_exhausted = true;
+                break;
+            }
+            candidates.extend(estimate_fundamental_seven_point_indexed(
+                pts1, pts2, &sample,
+            ));
+        }
+
+        if !candidates.is_empty() {
+            let gpu_models = candidates
+                .iter()
+                .map(gpu_ransac_model)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let summaries =
+                session.score_two_view_models(&gpu_models, threshold, TwoViewModelKind::Sampson)?;
+            if summaries.len() != candidates.len() {
+                anyhow::bail!(
+                    "GPU Fundamental RANSAC returned {} summaries for {} candidates",
+                    summaries.len(),
+                    candidates.len()
+                );
+            }
+            for ((model, gpu_model), summary) in
+                candidates.into_iter().zip(gpu_models).zip(summaries)
+            {
+                let summary_support = gpu_summary_support(summary)?;
+                if summary_support.inliers >= 7
+                    && is_better_support(
+                        &summary_support,
+                        best.as_ref().map(|(_, support)| support),
+                    )
+                {
+                    let local_mask =
+                        session.inlier_mask(&gpu_model, threshold, TwoViewModelKind::Sampson)?;
+                    let raw_support = gpu_masked_support(
+                        summary,
+                        local_mask,
+                        active_indices,
+                        pts1.len().min(pts2.len()),
+                    )?;
+                    let (model, support) = refine_fundamental_support(
+                        pts1,
+                        pts2,
+                        active_indices,
+                        ransac_options.max_error,
+                        model,
+                        raw_support,
+                        COLMAP_LORANSAC_LOCAL_TRIALS,
+                    );
+                    if support.inliers >= 7
+                        && is_better_support(&support, best.as_ref().map(|(_, support)| support))
+                    {
+                        dynamic_max_trials = dynamic_ransac_num_trials(
+                            support.inliers,
+                            active_indices.len(),
+                            &ransac_options,
+                            7,
+                        );
+                        best = Some((model, support));
+                    }
+                }
+            }
+        }
+        if sampler_exhausted {
+            break;
+        }
+    }
+
+    let ransac_success = best.is_some();
+    let (model, support) = match best {
+        Some(best) => best,
+        None => {
+            let Some(model) = estimate_fundamental_eight_point_indexed(pts1, pts2, active_indices)
+            else {
+                return Ok(None);
+            };
+            let support =
+                model_support_indexed(pts1, pts2, active_indices, &model, ransac_options.max_error);
+            (model, support)
+        }
+    };
+    let (model, support) = refine_fundamental_support(
+        pts1,
+        pts2,
+        active_indices,
+        ransac_options.max_error,
+        model,
+        support,
+        lo_steps,
+    );
+    Ok(Some((model, support, ransac_success)))
 }
 
 fn estimate_fundamental_ransac_with_trace(
@@ -2437,6 +3027,157 @@ fn estimate_homography_ransac(
         shared_stream,
     )
     .map(|(model, support, ransac_success, _trace)| (model, support, ransac_success))
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn estimate_homography_ransac_gpu(
+    scorer: &WgpuModelScorer,
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    ransac_options: ColmapRansacOptions,
+    random_seed: u64,
+    lo_steps: usize,
+    shared_stream: bool,
+) -> anyhow::Result<Option<(Matrix3<f64>, ModelSupport, bool)>> {
+    if active_indices.len() < 4 {
+        return Ok(None);
+    }
+    let gpu_points1 = gpu_ransac_points(pts1, active_indices)?;
+    let gpu_points2 = gpu_ransac_points(pts2, active_indices)?;
+    let session = scorer.prepare_homogeneous_session(&gpu_points1, &gpu_points2)?;
+    let threshold = gpu_ransac_threshold(ransac_options.max_error)?;
+    let mut sampler = make_two_view_ransac_sampler(
+        random_seed,
+        &ransac_options,
+        0x94d0_49bb_1331_11eb,
+        active_indices.len(),
+        active_indices,
+        shared_stream,
+    );
+    let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let max_iterations = ransac_options.max_num_trials.max(1);
+    let mut dynamic_max_trials = max_iterations;
+    let mut iteration = 0usize;
+    let mut sampler_exhausted = false;
+
+    while iteration < max_iterations {
+        let chunk_end = gpu_ransac_chunk_end(
+            iteration,
+            max_iterations,
+            dynamic_max_trials,
+            ransac_options.min_num_trials,
+        );
+        if iteration >= chunk_end {
+            break;
+        }
+        let mut candidates = Vec::<Matrix3<f64>>::with_capacity(chunk_end - iteration);
+        while iteration < chunk_end {
+            iteration += 1;
+            let sample = sampler.sample(4);
+            if sample.len() != 4 {
+                sampler_exhausted = true;
+                break;
+            }
+            if let Some(model) = estimate_homography_dlt_indexed(pts1, pts2, &sample) {
+                candidates.push(model);
+            }
+        }
+
+        if !candidates.is_empty() {
+            let gpu_models = candidates
+                .iter()
+                .map(gpu_ransac_model)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let summaries = session.score_two_view_models(
+                &gpu_models,
+                threshold,
+                TwoViewModelKind::HomographyForward,
+            )?;
+            if summaries.len() != candidates.len() {
+                anyhow::bail!(
+                    "GPU Homography RANSAC returned {} summaries for {} candidates",
+                    summaries.len(),
+                    candidates.len()
+                );
+            }
+            for ((model, gpu_model), summary) in
+                candidates.into_iter().zip(gpu_models).zip(summaries)
+            {
+                let summary_support = gpu_summary_support(summary)?;
+                if summary_support.inliers >= 4
+                    && is_better_support(
+                        &summary_support,
+                        best.as_ref().map(|(_, support)| support),
+                    )
+                {
+                    let local_mask = session.inlier_mask(
+                        &gpu_model,
+                        threshold,
+                        TwoViewModelKind::HomographyForward,
+                    )?;
+                    let raw_support = gpu_masked_support(
+                        summary,
+                        local_mask,
+                        active_indices,
+                        pts1.len().min(pts2.len()),
+                    )?;
+                    let (model, support) = refine_homography_support(
+                        pts1,
+                        pts2,
+                        active_indices,
+                        ransac_options.max_error,
+                        model,
+                        raw_support,
+                        COLMAP_LORANSAC_LOCAL_TRIALS,
+                    );
+                    if support.inliers >= 4
+                        && is_better_support(&support, best.as_ref().map(|(_, support)| support))
+                    {
+                        dynamic_max_trials = dynamic_ransac_num_trials(
+                            support.inliers,
+                            active_indices.len(),
+                            &ransac_options,
+                            4,
+                        );
+                        best = Some((model, support));
+                    }
+                }
+            }
+        }
+        if sampler_exhausted {
+            break;
+        }
+    }
+
+    let ransac_success = best.is_some();
+    let (model, support) = match best {
+        Some(best) => best,
+        None => {
+            let Some(model) = estimate_homography_dlt_indexed(pts1, pts2, active_indices) else {
+                return Ok(None);
+            };
+            let support = homography_support_indexed(
+                pts1,
+                pts2,
+                active_indices,
+                &model,
+                ransac_options.max_error,
+            );
+            (model, support)
+        }
+    };
+    let (model, support) = refine_homography_support(
+        pts1,
+        pts2,
+        active_indices,
+        ransac_options.max_error,
+        model,
+        support,
+        lo_steps,
+    );
+    Ok(Some((model, support, ransac_success)))
 }
 
 fn estimate_homography_ransac_with_trace(
@@ -3933,6 +4674,125 @@ mod tests {
         assert_eq!(dynamic_ransac_num_trials(50, 100, &options, 5), 726);
         assert_eq!(dynamic_ransac_num_trials(50, 100, &options, 8), 7173);
         assert_eq!(dynamic_ransac_num_trials(90, 100, &options, 5), 24);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_chunk_end_applies_dynamic_limits_at_boundaries() {
+        assert_eq!(gpu_ransac_chunk_end(0, 10_000, 10_000, 100), 64);
+        assert_eq!(gpu_ransac_chunk_end(64, 10_000, 24, 100), 101);
+        assert_eq!(gpu_ransac_chunk_end(96, 10_000, 24, 100), 101);
+        assert_eq!(gpu_ransac_chunk_end(101, 10_000, 24, 100), 101);
+        assert_eq!(gpu_ransac_chunk_end(9_980, 10_000, usize::MAX, 100), 10_000);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_homography_ransac_recovers_grid_deterministically() -> anyhow::Result<()> {
+        let Some(context) = crate::gpu::WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU Homography RANSAC test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = crate::gpu::WgpuModelScorer::from_context(context)?;
+        let mut points1 = Vec::new();
+        let mut points2 = Vec::new();
+        for y in 0..4 {
+            for x in 0..5 {
+                points1.push(Vector3::new(x as f64, y as f64, 1.0));
+                points2.push(Vector3::new(x as f64 + 2.0, y as f64 - 1.0, 1.0));
+            }
+        }
+        for index in 0..4 {
+            points1.push(Vector3::new(-10.0 + index as f64, 8.0, 1.0));
+            points2.push(Vector3::new(20.0, -15.0 + 3.0 * index as f64, 1.0));
+        }
+        let active_indices = (0..points1.len()).collect::<Vec<_>>();
+        let mut options = test_ransac_options(0, 128, 0.999);
+        options.max_error = 0.01;
+        let first = estimate_homography_ransac_gpu(
+            &scorer,
+            &points1,
+            &points2,
+            &active_indices,
+            options.clone(),
+            42,
+            0,
+            false,
+        )?
+        .expect("GPU Homography RANSAC estimate");
+        let second = estimate_homography_ransac_gpu(
+            &scorer,
+            &points1,
+            &points2,
+            &active_indices,
+            options,
+            42,
+            0,
+            false,
+        )?
+        .expect("repeated GPU Homography RANSAC estimate");
+        assert!(first.1.inliers >= 20);
+        assert!(first.1.residual_sum.is_finite());
+        assert_eq!(first.1.inlier_mask, second.1.inlier_mask);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_batched_two_view_preserves_cpu_geometric_support() -> anyhow::Result<()> {
+        let Some(context) = crate::gpu::WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU two-view RANSAC test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = crate::gpu::WgpuModelScorer::from_context(context)?;
+        let rotation = Rotation3::from_euler_angles(0.03, -0.04, 0.02).into_inner();
+        let translation = Vector3::new(0.2, -0.03, 0.05);
+        let mut points1 = Vec::new();
+        let mut points2 = Vec::new();
+        for index in 0..24 {
+            let point = Vector3::new(
+                (index % 6) as f64 * 0.25 - 0.6,
+                (index / 6) as f64 * 0.22 - 0.35,
+                3.0 + (index % 5) as f64 * 0.35,
+            );
+            points1.push([
+                point.x as f32 / point.z as f32,
+                point.y as f32 / point.z as f32,
+            ]);
+            let transformed = rotation * point + translation;
+            let mut observation = [
+                transformed.x as f32 / transformed.z as f32,
+                transformed.y as f32 / transformed.z as f32,
+            ];
+            if index >= 20 {
+                observation[0] += 0.4 + 0.05 * (index - 20) as f32;
+                observation[1] -= 0.3;
+            }
+            points2.push(observation);
+        }
+        let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let mut options = default_test_options();
+        options.ransac_random_seed = 17;
+        options.random_seed = 17;
+        options.ransac_max_iterations = 256;
+        options.min_inliers = 15;
+        options.min_triangulated = 8;
+        options.use_five_point = false;
+        let cpu = estimate_calibrated_two_view(&points1, &points2, camera, &options)
+            .expect("CPU two-view estimate");
+        let first =
+            estimate_calibrated_two_view_gpu(&scorer, &points1, &points2, camera, &options)?
+                .expect("GPU two-view estimate");
+        let second =
+            estimate_calibrated_two_view_gpu(&scorer, &points1, &points2, camera, &options)?
+                .expect("repeated GPU two-view estimate");
+        let cpu_inliers = cpu.inlier_mask.iter().filter(|&&value| value).count();
+        let gpu_inliers = first.inlier_mask.iter().filter(|&&value| value).count();
+        assert!(gpu_inliers * 10 >= cpu_inliers * 9);
+        assert!(first.two_view_config >= 0);
+        assert_eq!(first.inlier_mask, second.inlier_mask);
+        assert!(essential_distance(first.essential, second.essential) < 1.0e-6);
+        Ok(())
     }
 
     #[test]

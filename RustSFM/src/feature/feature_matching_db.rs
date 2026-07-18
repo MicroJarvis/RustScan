@@ -4,9 +4,11 @@ use crate::database::{
     ColmapDatabase, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint, ColmapTwoViewGeometry,
 };
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
+#[cfg(feature = "gpu-wgpu")]
+use crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu;
 use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions};
 #[cfg(feature = "gpu-wgpu")]
-use crate::gpu::WgpuSiftMatcher;
+use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher};
 use crate::mapper::pair_geometry_to_colmap_two_view_geometry;
 use crate::sift::{match_sift_with_options, SiftFeatures, SiftMatchingOptions};
 use crate::two_view::{
@@ -41,6 +43,7 @@ pub struct MatchFeaturesPairReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchFeaturesReport {
     pub database: PathBuf,
+    pub backend: String,
     pub pair_count: usize,
     pub matched_pairs: usize,
     pub verified_pairs: usize,
@@ -143,6 +146,14 @@ impl Default for MatchFeaturesOptions {
             use_existing_matches: false,
             existing_match_batch_size: COLMAP_EXISTING_MATCH_BATCH_SIZE,
         }
+    }
+}
+
+fn matching_backend_name(options: &SiftMatchingOptions) -> &'static str {
+    if options.use_gpu {
+        "wgpu_match_and_score"
+    } else {
+        "cpu_match_and_score"
     }
 }
 
@@ -253,6 +264,7 @@ pub fn match_features_to_database(
 
     Ok(MatchFeaturesReport {
         database: database_path.to_path_buf(),
+        backend: matching_backend_name(&options.sift_matching).to_string(),
         pair_count,
         matched_pairs: reports.len(),
         verified_pairs: reports
@@ -566,8 +578,12 @@ fn computed_match_pair_reports(
     };
     let pair_count = pairs.len();
     #[cfg(feature = "gpu-wgpu")]
-    let gpu_matcher = if options.sift_matching.use_gpu {
-        Some(WgpuSiftMatcher::try_new()?)
+    let gpu_backend = if options.sift_matching.use_gpu {
+        let context = WgpuContext::try_new()?;
+        Some((
+            WgpuSiftMatcher::from_context(context.clone())?,
+            WgpuModelScorer::from_context(context)?,
+        ))
     } else {
         None
     };
@@ -577,7 +593,7 @@ fn computed_match_pair_reports(
     }
 
     #[cfg(feature = "gpu-wgpu")]
-    let reports = if let Some(matcher) = gpu_matcher.as_ref() {
+    let reports = if let Some((matcher, scorer)) = gpu_backend.as_ref() {
         let mut reports = Vec::with_capacity(pairs.len());
         for &(left, right) in &pairs {
             let matches = matcher.match_descriptors(
@@ -585,9 +601,9 @@ fn computed_match_pair_reports(
                 &frames[right].sift.descriptors_u8,
                 &options.sift_matching,
             )?;
-            if let Some(report) =
-                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
-            {
+            if let Some(report) = estimate_existing_or_computed_pair_gpu(
+                scorer, left, right, matches, frames, cameras, options,
+            )? {
                 reports.push(report);
             }
         }
@@ -654,6 +670,27 @@ fn existing_match_pair_reports(
         pairs.push((left, right, matches));
     }
     let pair_count = pairs.len();
+    #[cfg(feature = "gpu-wgpu")]
+    if options.sift_matching.use_gpu {
+        let scorer = WgpuModelScorer::try_new()?;
+        let mut reports = Vec::with_capacity(pairs.len());
+        for (left, right, matches) in pairs {
+            if let Some(report) = estimate_existing_or_computed_pair_gpu(
+                &scorer, left, right, matches, frames, cameras, options,
+            )? {
+                reports.push(report);
+            }
+        }
+        return Ok(PairReportBatch {
+            pair_count,
+            reports,
+            verifier_trace: None,
+        });
+    }
+    #[cfg(not(feature = "gpu-wgpu"))]
+    if options.sift_matching.use_gpu {
+        bail!("RustSFM was built without gpu-wgpu support");
+    }
     let (reports, verifier_trace) = if colmap_fifo_verifier_enabled(options) {
         colmap_fifo_existing_match_pair_reports(pairs, frames, cameras, options)?
     } else {
@@ -1191,6 +1228,52 @@ fn estimate_existing_or_computed_pair(
     Some((left, right, matches, geometry))
 }
 
+#[cfg(feature = "gpu-wgpu")]
+fn estimate_existing_or_computed_pair_gpu(
+    scorer: &WgpuModelScorer,
+    left: usize,
+    right: usize,
+    matches: Vec<rustslam::Match>,
+    frames: &[ImageFrame],
+    cameras: &[CameraModel],
+    options: &MatchFeaturesOptions,
+) -> Result<Option<PairReportInput>> {
+    let min_matches_for_estimation = if options.use_existing_matches {
+        options.min_inliers
+    } else {
+        options.min_num_matches
+    };
+    if matches.len() < min_matches_for_estimation {
+        return Ok(if options.use_existing_matches {
+            Some((left, right, matches, None))
+        } else {
+            None
+        });
+    }
+    let geometry = estimate_pair_geometry_with_options_and_cameras_gpu(
+        scorer,
+        left,
+        right,
+        &frames[left],
+        &frames[right],
+        &matches,
+        cameras[left],
+        cameras[right],
+        options.essential_threshold_px,
+        options.essential_iterations,
+        options.min_inliers,
+        options.min_triangulated,
+        PairEstimationOptions {
+            max_pose_matches: 0,
+            refine_sampson: !options.use_existing_matches,
+            ransac_random_seed: options.random_seed,
+            expand_dense_inliers: !options.use_existing_matches,
+            ..PairEstimationOptions::default()
+        },
+    )?;
+    Ok(Some((left, right, matches, geometry)))
+}
+
 /// Build vocabulary-tree candidate pairs from the in-memory frame descriptors.
 ///
 /// Frames are keyed by their slice index, so the returned `(i32, i32)` image-id
@@ -1322,6 +1405,134 @@ mod tests {
         let features = sift_features_from_database(&keypoints, &descriptors)?;
         assert_eq!(features.keypoints.len(), 2);
         assert_eq!(features.descriptors_u8.len(), 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_matching_routes_model_scoring() {
+        let options = SiftMatchingOptions {
+            use_gpu: true,
+            ..SiftMatchingOptions::default()
+        };
+        assert_eq!(matching_backend_name(&options), "wgpu_match_and_score");
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_matching_persists_gpu_scored_two_view_geometry() -> Result<()> {
+        if crate::gpu::WgpuContext::try_new_optional()?.is_none() {
+            eprintln!("skipping GPU matching database test: no compatible adapter");
+            return Ok(());
+        }
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![80.0, 80.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(1, "left.jpg"), (2, "right.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+        }
+        let rotation = nalgebra::Rotation3::from_euler_angles(0.03, -0.04, 0.02).into_inner();
+        let translation = nalgebra::Vector3::new(0.2, -0.03, 0.05);
+        let mut left_keypoints = Vec::new();
+        let mut right_keypoints = Vec::new();
+        let mut descriptor_data = Vec::new();
+        for index in 0..24usize {
+            let point = nalgebra::Vector3::new(
+                (index % 6) as f64 * 0.25 - 0.6,
+                (index / 6) as f64 * 0.22 - 0.35,
+                3.0 + (index % 5) as f64 * 0.35,
+            );
+            left_keypoints.push(ColmapKeypoint::new(
+                (80.0 * point.x / point.z + 50.0) as f32,
+                (80.0 * point.y / point.z + 50.0) as f32,
+            ));
+            let transformed = rotation * point + translation;
+            right_keypoints.push(ColmapKeypoint::new(
+                (80.0 * transformed.x / transformed.z + 50.0) as f32,
+                (80.0 * transformed.y / transformed.z + 50.0) as f32,
+            ));
+            descriptor_data.extend(
+                (0..128usize).map(|lane| ((index * 17 + lane * 3 + index * lane) % 256) as u8),
+            );
+        }
+        db.write_keypoints(1, &left_keypoints)?;
+        db.write_keypoints(2, &right_keypoints)?;
+        let descriptors = ColmapDescriptors::new(
+            crate::database::COLMAP_FEATURE_SIFT,
+            24,
+            128,
+            descriptor_data,
+        )?;
+        db.write_descriptors(1, &descriptors)?;
+        db.write_descriptors(2, &descriptors)?;
+        drop(db);
+
+        let report = match_features_to_database(
+            &db_path,
+            &MatchFeaturesOptions {
+                pair_strategy: MatchingPairStrategy::Exhaustive,
+                sift_matching: SiftMatchingOptions {
+                    use_gpu: true,
+                    max_num_matches: 128,
+                    ..SiftMatchingOptions::default()
+                },
+                essential_threshold_px: 2.0,
+                essential_iterations: 256,
+                min_inliers: 15,
+                min_triangulated: 8,
+                min_num_matches: 15,
+                random_seed: 17,
+                ..MatchFeaturesOptions::default()
+            },
+        )?;
+        assert_eq!(report.backend, "wgpu_match_and_score");
+        assert_eq!(report.pair_count, 1);
+        assert_eq!(report.pairs.len(), 1);
+        assert!(report.pairs[0].num_inliers >= 15);
+        let db = ColmapDatabase::open_read_only(&db_path)?;
+        assert!(db.read_two_view_geometry(1, 2)?.inlier_matches.len() >= 15);
+        drop(db);
+
+        let existing_report = match_features_to_database(
+            &db_path,
+            &MatchFeaturesOptions {
+                sift_matching: SiftMatchingOptions {
+                    use_gpu: true,
+                    ..SiftMatchingOptions::default()
+                },
+                essential_threshold_px: 2.0,
+                essential_iterations: 256,
+                min_inliers: 15,
+                min_triangulated: 8,
+                random_seed: 17,
+                use_existing_matches: true,
+                ..MatchFeaturesOptions::default()
+            },
+        )?;
+        assert_eq!(existing_report.backend, "wgpu_match_and_score");
+        assert_eq!(existing_report.pairs.len(), 1);
+        assert!(existing_report.pairs[0].num_inliers >= 15);
         Ok(())
     }
 

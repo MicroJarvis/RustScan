@@ -177,6 +177,7 @@ impl WgpuModelScorer {
             .score_two_view_models(models, threshold, kind)
     }
 
+    #[cfg(test)]
     pub(crate) fn score_homogeneous_two_view_models(
         &self,
         models: &[[f32; 9]],

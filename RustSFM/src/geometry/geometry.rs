@@ -1,8 +1,13 @@
+#[cfg(feature = "gpu-wgpu")]
+use crate::gpu::WgpuModelScorer;
+#[cfg(feature = "gpu-wgpu")]
+use crate::two_view::estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu;
 use crate::two_view::{
     essential_to_fundamental, estimate_calibrated_two_view_with_observations_rays_and_cameras,
     squared_sampson_error, triangulate_world_point, TwoViewOptions,
 };
 use crate::types::{CameraModel, ImageFrame, PairGeometry};
+use anyhow::Result;
 use glam::{Quat, Vec3};
 use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
 use rustslam::{Match, SE3};
@@ -126,6 +131,13 @@ impl Default for PairEstimationOptions {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PairGeometryScoringBackend<'a> {
+    Cpu(std::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "gpu-wgpu")]
+    Wgpu(&'a WgpuModelScorer),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_pair_geometry_with_options(
     left_idx: usize,
@@ -171,8 +183,76 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
     min_triangulated: usize,
     options: PairEstimationOptions,
 ) -> Option<PairGeometry> {
+    estimate_pair_geometry_with_options_and_cameras_impl(
+        left_idx,
+        right_idx,
+        left,
+        right,
+        matches,
+        left_camera,
+        right_camera,
+        essential_threshold,
+        essential_iterations,
+        min_inliers,
+        min_triangulated,
+        options,
+        PairGeometryScoringBackend::Cpu(std::marker::PhantomData),
+    )
+    .expect("CPU pair-geometry scoring backend is infallible")
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu(
+    scorer: &WgpuModelScorer,
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+    options: PairEstimationOptions,
+) -> Result<Option<PairGeometry>> {
+    estimate_pair_geometry_with_options_and_cameras_impl(
+        left_idx,
+        right_idx,
+        left,
+        right,
+        matches,
+        left_camera,
+        right_camera,
+        essential_threshold,
+        essential_iterations,
+        min_inliers,
+        min_triangulated,
+        options,
+        PairGeometryScoringBackend::Wgpu(scorer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_pair_geometry_with_options_and_cameras_impl(
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+    options: PairEstimationOptions,
+    scoring_backend: PairGeometryScoringBackend<'_>,
+) -> Result<Option<PairGeometry>> {
     if matches.len() < min_inliers.max(8) {
-        return None;
+        return Ok(None);
     }
     let pose_matches = select_pose_matches(matches, left, options.max_pose_matches);
     let mut norm_left = Vec::with_capacity(pose_matches.len());
@@ -211,46 +291,69 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         valid_matches.push(m.clone());
     }
     if valid_matches.len() < min_inliers.max(8) {
-        return None;
+        return Ok(None);
     }
     let normalized_threshold =
         mean_cam_from_img_threshold(left_camera, right_camera, essential_threshold as f64);
-    let estimate = estimate_calibrated_two_view_with_observations_rays_and_cameras(
-        &norm_left,
-        &norm_right,
-        &obs_left_px,
-        &obs_right_px,
-        Some(&ray_left),
-        Some(&ray_right),
-        left_camera,
-        right_camera,
-        &TwoViewOptions {
-            ransac_max_error_px: essential_threshold as f64,
-            ransac_threshold: normalized_threshold,
-            ransac_min_inlier_ratio: 0.25,
-            ransac_min_iterations: 100,
-            ransac_max_iterations: essential_iterations,
-            ransac_random_seed: options.ransac_random_seed,
-            random_seed: ((left_idx as u64) << 32) ^ right_idx as u64 ^ 0x243f_6a88_85a3_08d3,
-            loransac_num_lo_steps: 0,
-            min_inliers,
-            min_inlier_ratio: 0.0,
-            min_triangulated,
-            min_e_f_inlier_ratio: 0.95,
-            max_h_inlier_ratio: 0.8,
-            force_h_use: false,
-            multiple_models: false,
-            multiple_ignore_watermark: true,
-            detect_watermark: true,
-            watermark_min_inlier_ratio: 0.7,
-            watermark_border_size: 0.1,
-            watermark_detection_max_error_px: 4.0,
-            filter_stationary_matches: false,
-            stationary_matches_max_error_px: 4.0,
-            use_hartley_refinement: options.use_hartley_refinement,
-            use_five_point: options.use_five_point,
-        },
-    )?;
+    let two_view_options = TwoViewOptions {
+        ransac_max_error_px: essential_threshold as f64,
+        ransac_threshold: normalized_threshold,
+        ransac_min_inlier_ratio: 0.25,
+        ransac_min_iterations: 100,
+        ransac_max_iterations: essential_iterations,
+        ransac_random_seed: options.ransac_random_seed,
+        random_seed: ((left_idx as u64) << 32) ^ right_idx as u64 ^ 0x243f_6a88_85a3_08d3,
+        loransac_num_lo_steps: 0,
+        min_inliers,
+        min_inlier_ratio: 0.0,
+        min_triangulated,
+        min_e_f_inlier_ratio: 0.95,
+        max_h_inlier_ratio: 0.8,
+        force_h_use: false,
+        multiple_models: false,
+        multiple_ignore_watermark: true,
+        detect_watermark: true,
+        watermark_min_inlier_ratio: 0.7,
+        watermark_border_size: 0.1,
+        watermark_detection_max_error_px: 4.0,
+        filter_stationary_matches: false,
+        stationary_matches_max_error_px: 4.0,
+        use_hartley_refinement: options.use_hartley_refinement,
+        use_five_point: options.use_five_point,
+    };
+    let estimate = match scoring_backend {
+        PairGeometryScoringBackend::Cpu(_) => {
+            estimate_calibrated_two_view_with_observations_rays_and_cameras(
+                &norm_left,
+                &norm_right,
+                &obs_left_px,
+                &obs_right_px,
+                Some(&ray_left),
+                Some(&ray_right),
+                left_camera,
+                right_camera,
+                &two_view_options,
+            )
+        }
+        #[cfg(feature = "gpu-wgpu")]
+        PairGeometryScoringBackend::Wgpu(scorer) => {
+            estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu(
+                scorer,
+                &norm_left,
+                &norm_right,
+                &obs_left_px,
+                &obs_right_px,
+                Some(&ray_left),
+                Some(&ray_right),
+                left_camera,
+                right_camera,
+                &two_view_options,
+            )?
+        }
+    };
+    let Some(estimate) = estimate else {
+        return Ok(None);
+    };
     let inlier_mask = estimate.inlier_mask.clone();
     let mut pose_inlier_matches = Vec::new();
     let mut in_left = Vec::new();
@@ -263,7 +366,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         }
     }
     if pose_inlier_matches.len() < min_inliers {
-        return None;
+        return Ok(None);
     }
     let mut relative_pose = estimate.pose;
     let mut best_count = estimate.triangulated;
@@ -335,7 +438,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         }
     }
     if best_count < min_triangulated {
-        return None;
+        return Ok(None);
     }
     let mut output_inlier_matches = pose_inlier_matches;
     if options.expand_dense_inliers || std::env::var_os("RUSTSFM_DENSE_PAIR_INLIERS").is_some() {
@@ -353,7 +456,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
             output_inlier_matches = expanded;
         }
     }
-    Some(PairGeometry {
+    Ok(Some(PairGeometry {
         left: left_idx,
         right: right_idx,
         two_view_config: estimate.two_view_config,
@@ -371,7 +474,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         rotation_deg: best_rotation_deg,
         median_triangulation_angle_deg: estimate.median_triangulation_angle_deg,
         pose_graph_only: false,
-    })
+    }))
 }
 
 fn matrix3_to_row_array(matrix: nalgebra::Matrix3<f64>) -> [f64; 9] {
