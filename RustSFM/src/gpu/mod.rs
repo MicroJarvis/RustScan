@@ -8,6 +8,8 @@ use anyhow::{bail, Result};
 
 #[cfg(feature = "gpu-wgpu")]
 mod context;
+#[cfg(feature = "gpu-wgpu")]
+mod sift;
 
 #[cfg(feature = "gpu-wgpu")]
 pub use context::WgpuContext;

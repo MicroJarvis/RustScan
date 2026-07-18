@@ -253,7 +253,7 @@ git commit -m "feat(rustsfm): initialize persistent wgpu context"
 - Create: `RustSFM/src/gpu/sift/types.rs`
 - Modify: `RustSFM/src/gpu/mod.rs`
 
-- [ ] **Step 1: Write deterministic octave-plan tests**
+- [x] **Step 1: Write deterministic octave-plan tests**
 
 ```rust
 #[test]
@@ -274,18 +274,23 @@ fn octave_plan_matches_sift_level_and_sigma_schedule() {
 
 #[test]
 fn octave_plan_stops_before_images_become_too_small() {
-    let plan = SiftPlan::new(33, 33, &SiftExtractionOptions::default()).unwrap();
+    let options = SiftExtractionOptions {
+        first_octave: 0,
+        num_octaves: 4,
+        ..SiftExtractionOptions::default()
+    };
+    let plan = SiftPlan::new(33, 33, &options).unwrap();
     assert_eq!(plan.octaves.len(), 1);
 }
 ```
 
-- [ ] **Step 2: Run tests and verify missing plan types**
+- [x] **Step 2: Run tests and verify missing plan types**
 
 Run: `cargo test -p rustsfm --lib octave_plan_ --features gpu-wgpu -- --nocapture`
 
 Expected: FAIL because `SiftPlan` is undefined.
 
-- [ ] **Step 3: Implement validated plans and POD records**
+- [x] **Step 3: Implement validated plans and POD records**
 
 Use checked pixel-count arithmetic and these stable ABI records:
 
@@ -328,13 +333,13 @@ pub(crate) struct SiftPlan {
 binding ceiling, uses `octave_resolution + 3` Gaussian levels and
 `octave_resolution + 2` DoG levels, and stops once either side is below 32 pixels.
 
-- [ ] **Step 4: Run plan and layout tests**
+- [x] **Step 4: Run plan and layout tests**
 
 Run: `cargo test -p rustsfm --lib octave_plan_ --features gpu-wgpu -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/gpu/mod.rs RustSFM/src/gpu/sift
