@@ -123,6 +123,7 @@ pub(super) struct ResolvedColmapMapperArgs {
     pub(super) abs_pose_max_error: f32,
     pub(super) abs_pose_min_num_inliers: usize,
     pub(super) abs_pose_min_inlier_ratio: f32,
+    pub(super) use_gpu_pnp: Option<i32>,
     pub(super) max_reg_trials: usize,
     pub(super) local_ba_num_images: usize,
     pub(super) global_ba_images_ratio: f32,
@@ -292,6 +293,12 @@ pub(super) fn resolve_colmap_mapper_args(
                 "Mapper.abs_pose_min_inlier_ratio",
             )?)
             .unwrap_or(0.25),
+        use_gpu_pnp: args
+            .use_gpu_pnp
+            .or(colmap_project_bool_to_i32(parse_project_bool(
+                &project,
+                "Mapper.use_gpu_pnp",
+            )?)),
         max_reg_trials: args
             .max_reg_trials
             .or(parse_project_value(&project, "Mapper.max_reg_trials")?)
@@ -463,6 +470,7 @@ mod tests {
             abs_pose_max_error: None,
             abs_pose_min_num_inliers: None,
             abs_pose_min_inlier_ratio: None,
+            use_gpu_pnp: None,
             max_reg_trials: None,
             local_ba_num_images: None,
             global_ba_images_ratio: None,
@@ -504,6 +512,7 @@ output_path=/tmp/sparse
 ba_refine_focal_length=false
 ba_refine_extra_params=false
 multiple_models=false
+use_gpu_pnp=true
 extract_colors=false
 filter_max_reproj_error=4
 tri_ignore_two_view_tracks=true
@@ -519,6 +528,7 @@ num_threads=-1
         assert_eq!(resolved.ba_refine_focal_length, 0);
         assert_eq!(resolved.ba_refine_extra_params, 0);
         assert_eq!(resolved.multiple_models, 0);
+        assert_eq!(resolved.use_gpu_pnp, Some(1));
         assert_eq!(resolved.extract_colors, 0);
         assert_eq!(resolved.filter_max_reproj_error, 4.0);
         assert_eq!(resolved.tri_ignore_two_view_tracks, 1);
@@ -539,6 +549,7 @@ output_path=/tmp/sparse
 [Mapper]
 ba_refine_focal_length=false
 extract_colors=false
+use_gpu_pnp=true
 num_threads=-1
 ",
         )?;
@@ -546,6 +557,7 @@ num_threads=-1
         args.database_path = Some(PathBuf::from("/tmp/cli.db"));
         args.ba_refine_focal_length = Some(1);
         args.extract_colors = Some(1);
+        args.use_gpu_pnp = Some(0);
         args.num_threads = Some(4);
 
         let resolved = resolve_colmap_mapper_args(&args)?;
@@ -553,6 +565,7 @@ num_threads=-1
         assert_eq!(resolved.database_path, PathBuf::from("/tmp/cli.db"));
         assert_eq!(resolved.ba_refine_focal_length, 1);
         assert_eq!(resolved.extract_colors, 1);
+        assert_eq!(resolved.use_gpu_pnp, Some(0));
         assert_eq!(resolved.num_threads, Some(4));
         Ok(())
     }

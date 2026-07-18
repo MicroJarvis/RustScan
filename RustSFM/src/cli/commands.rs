@@ -83,6 +83,7 @@ fn run_reconstruct(args: ReconstructArgs) -> Result<()> {
         essential_iterations: args.essential_iterations,
         pnp_threshold_px: args.pnp_threshold_px,
         pnp_iterations: args.pnp_iterations,
+        use_gpu_pnp: args.use_gpu_pnp,
         abs_pose_min_num_inliers: args.abs_pose_min_num_inliers,
         abs_pose_min_inlier_ratio: args.abs_pose_min_inlier_ratio,
         image_selection_method: args.image_selection_method,
@@ -354,6 +355,8 @@ fn run_colmap_mapper(args: ColmapMapperArgs) -> Result<()> {
         resolved.tri_ignore_two_view_tracks,
         "Mapper.tri_ignore_two_view_tracks",
     )?;
+    let use_gpu_pnp =
+        colmap_optional_bool(resolved.use_gpu_pnp, "Mapper.use_gpu_pnp")?.unwrap_or(false);
     let reconstruct_args = ReconstructArgs {
         input: resolved.image_path,
         output: resolved.output_path,
@@ -404,6 +407,7 @@ fn run_colmap_mapper(args: ColmapMapperArgs) -> Result<()> {
         essential_iterations: 10_000,
         pnp_threshold_px: resolved.abs_pose_max_error,
         pnp_iterations: 10_000,
+        use_gpu_pnp,
         abs_pose_min_num_inliers: resolved.abs_pose_min_num_inliers,
         abs_pose_min_inlier_ratio: resolved.abs_pose_min_inlier_ratio,
         image_selection_method: ImageSelectionMethod::MinUncertainty,

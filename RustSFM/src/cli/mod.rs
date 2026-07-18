@@ -138,6 +138,8 @@ struct ReconstructArgs {
     pnp_threshold_px: f32,
     #[arg(long, default_value = "10000")]
     pnp_iterations: u32,
+    #[arg(long, default_value_t = false)]
+    use_gpu_pnp: bool,
     #[arg(long, default_value = "30")]
     abs_pose_min_num_inliers: usize,
     #[arg(long, default_value = "0.25")]
@@ -503,6 +505,8 @@ struct ColmapMapperArgs {
     abs_pose_min_num_inliers: Option<usize>,
     #[arg(long = "Mapper.abs_pose_min_inlier_ratio")]
     abs_pose_min_inlier_ratio: Option<f32>,
+    #[arg(long = "Mapper.use_gpu_pnp")]
+    use_gpu_pnp: Option<i32>,
     #[arg(long = "Mapper.max_reg_trials")]
     max_reg_trials: Option<usize>,
     #[arg(long = "Mapper.ba_local_num_images")]
@@ -691,5 +695,33 @@ mod tests {
             panic!("wrong command")
         };
         assert!(args.use_gpu);
+    }
+
+    #[test]
+    fn native_reconstruct_parses_gpu_pnp() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "reconstruct",
+            "--input",
+            "in",
+            "--output",
+            "out",
+            "--use-gpu-pnp",
+        ])
+        .expect("native GPU PnP flag");
+        let Commands::Reconstruct(args) = cli.command else {
+            panic!("reconstruct command")
+        };
+        assert!(args.use_gpu_pnp);
+    }
+
+    #[test]
+    fn colmap_mapper_parses_gpu_pnp() {
+        let cli = Cli::try_parse_from(["rustsfm", "mapper", "--Mapper.use_gpu_pnp", "1"])
+            .expect("COLMAP GPU PnP flag");
+        let Commands::Mapper(args) = cli.command else {
+            panic!("mapper command")
+        };
+        assert_eq!(args.use_gpu_pnp, Some(1));
     }
 }
