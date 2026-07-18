@@ -13,6 +13,8 @@ mod context;
 #[cfg(feature = "gpu-wgpu")]
 mod matcher;
 #[cfg(feature = "gpu-wgpu")]
+mod pnp_scorer;
+#[cfg(feature = "gpu-wgpu")]
 mod scorer;
 #[cfg(feature = "gpu-wgpu")]
 mod sift;
@@ -21,6 +23,10 @@ mod sift;
 pub use context::WgpuContext;
 #[cfg(feature = "gpu-wgpu")]
 pub use matcher::WgpuSiftMatcher;
+#[cfg(feature = "gpu-wgpu")]
+pub use pnp_scorer::WgpuPnpModelScorer;
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) use pnp_scorer::{GpuPnpImagePoint, GpuPnpModel, GpuPnpObjectPoint};
 #[cfg(feature = "gpu-wgpu")]
 pub(crate) use scorer::WgpuModelScoringSession;
 #[cfg(feature = "gpu-wgpu")]
@@ -723,6 +729,37 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("finite and non-negative"));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_abi_records_are_wgsl_aligned() {
+        assert_eq!(std::mem::size_of::<GpuPnpImagePoint>(), 16);
+        assert_eq!(std::mem::size_of::<GpuPnpObjectPoint>(), 16);
+        assert_eq!(std::mem::size_of::<GpuPnpModel>(), 48);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_scorer_matches_cpu_projection_and_mask() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let mut scorer = WgpuPnpModelScorer::from_context(context)?;
+        let image = [[0.0, 0.0], [0.1, 0.0], [-0.2, 0.2], [0.0, 0.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [-0.4, 0.4, 2.0],
+            [0.0, 0.0, -1.0],
+        ];
+        scorer.prepare(&image, &world, 0.01)?;
+        let supports = scorer.score_models(&[rustslam::SE3::identity()])?;
+        let mask = scorer.inlier_mask(&rustslam::SE3::identity())?;
+        assert_eq!(supports[0].inliers, 4);
+        assert_eq!(mask, vec![true, true, true, true]);
         Ok(())
     }
 
