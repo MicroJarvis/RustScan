@@ -3,7 +3,7 @@ mod types;
 
 pub(crate) use plan::SiftPlan;
 pub(crate) use types::{
-    DetectorParams, GpuKeypoint, OrientationParams, PyramidParams, SiftUniforms,
+    DescriptorParams, DetectorParams, GpuKeypoint, OrientationParams, PyramidParams, SiftUniforms,
 };
 
 use crate::gpu::WgpuContext;
@@ -14,6 +14,7 @@ use wgpu::util::DeviceExt;
 const PYRAMID_SHADER: &str = include_str!("../shaders/sift_pyramid.wgsl");
 const DETECT_SHADER: &str = include_str!("../shaders/sift_detect.wgsl");
 const ORIENTATION_SHADER: &str = include_str!("../shaders/sift_orientation.wgsl");
+const DESCRIPTOR_SHADER: &str = include_str!("../shaders/sift_descriptor.wgsl");
 const WORKGROUP_SIZE: u32 = 16;
 
 pub(crate) struct SiftPyramid {
@@ -194,6 +195,176 @@ fn assign_orientations_for_test(
         max_orientations,
         upright,
     )
+}
+
+pub(crate) struct SiftDescriptorComputer {
+    context: Arc<WgpuContext>,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+impl SiftDescriptorComputer {
+    pub(crate) fn new(context: Arc<WgpuContext>) -> Result<Self> {
+        let device = context.device();
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rustsfm SIFT descriptor bind group layout"),
+            entries: &[
+                storage_layout_entry(0, true),
+                storage_layout_entry(1, true),
+                storage_layout_entry(2, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rustsfm SIFT descriptor shader"),
+            source: wgpu::ShaderSource::Wgsl(DESCRIPTOR_SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rustsfm SIFT descriptor pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rustsfm SIFT descriptor pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("descriptor_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        Ok(Self {
+            context,
+            bind_group_layout,
+            pipeline,
+        })
+    }
+
+    pub(crate) fn compute(
+        &self,
+        image: &[f32],
+        width: u32,
+        height: u32,
+        keypoints: &[GpuKeypoint],
+        root_sift: bool,
+    ) -> Result<Vec<[f32; 128]>> {
+        validate_level(image, width, height)?;
+        if keypoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keypoint_count =
+            u32::try_from(keypoints.len()).context("GPU SIFT keypoint count exceeds u32")?;
+        let descriptor_count = keypoints
+            .len()
+            .checked_mul(128)
+            .context("GPU SIFT descriptor count overflow")?;
+        let params = DescriptorParams {
+            width,
+            height,
+            keypoint_count,
+            root_sift: u32::from(root_sift),
+            ..DescriptorParams::default()
+        };
+        let device = self.context.device();
+        let image_buffer = storage_buffer_from_slice(
+            device,
+            "rustsfm SIFT descriptor image",
+            image,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let keypoint_buffer = storage_buffer_from_slice(
+            device,
+            "rustsfm SIFT descriptor keypoints",
+            keypoints,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let output = storage_buffer(
+            device,
+            "rustsfm SIFT descriptor output",
+            descriptor_count,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        )?;
+        let params_buffer = uniform_buffer(device, "rustsfm SIFT descriptor params", &params);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rustsfm SIFT descriptor bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                entire_buffer_entry(0, &image_buffer),
+                entire_buffer_entry(1, &keypoint_buffer),
+                entire_buffer_entry(2, &output),
+                entire_buffer_entry(3, &params_buffer),
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rustsfm SIFT descriptor encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rustsfm SIFT descriptor pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(keypoint_count.div_ceil(64), 1, 1);
+        }
+        self.context.queue().submit(Some(encoder.finish()));
+        let values = self.context.read_buffer::<f32>(&output, descriptor_count)?;
+        values
+            .chunks_exact(128)
+            .map(|chunk| {
+                chunk
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("GPU SIFT descriptor readback has invalid size"))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+fn descriptor_for_test(
+    context: Arc<WgpuContext>,
+    image: &[f32],
+    width: u32,
+    height: u32,
+    keypoints: &[GpuKeypoint],
+    root_sift: bool,
+) -> Result<Vec<[f32; 128]>> {
+    SiftDescriptorComputer::new(context)?.compute(image, width, height, keypoints, root_sift)
+}
+
+pub(crate) fn normalize_gpu_descriptor(mut values: [f32; 128], root_sift: bool) -> [f32; 128] {
+    if root_sift {
+        let l1 = values.iter().map(|value| value.max(0.0)).sum::<f32>();
+        for value in &mut values {
+            *value = (*value).max(0.0).sqrt() / l1.max(1.0e-12).sqrt();
+        }
+    }
+    let l2 = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    for value in &mut values {
+        *value /= l2.max(1.0e-12);
+        *value = value.min(0.2);
+    }
+    let clipped_l2 = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    for value in &mut values {
+        *value /= clipped_l2.max(1.0e-12);
+    }
+    values
+}
+
+pub(crate) fn quantize_gpu_descriptor(values: &[f32; 128]) -> [u8; 128] {
+    let mut quantized = [0u8; 128];
+    for (source, destination) in values.iter().zip(quantized.iter_mut()) {
+        *destination = (source.clamp(0.0, 1.0) * 512.0).round() as u8;
+    }
+    quantized
 }
 
 impl SiftDetector {
@@ -1067,6 +1238,51 @@ mod tests {
         assert_eq!(oriented.len(), 1);
         assert_eq!(oriented[0].angle, 0.0);
         Ok(())
+    }
+
+    #[test]
+    fn gpu_descriptor_is_finite_nonnegative_and_l2_normalized() -> anyhow::Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let image = (0..65)
+            .flat_map(|y| (0..65).map(move |x| if ((x / 4 + y / 4) % 2) == 0 { 0.0 } else { 1.0 }))
+            .collect::<Vec<_>>();
+        let keypoint = GpuKeypoint {
+            x: 32.0,
+            y: 32.0,
+            sigma: 2.0,
+            response: 1.0,
+            angle: 0.0,
+            octave: 0,
+            level: 2,
+            valid: 1,
+        };
+        let descriptor = descriptor_for_test(context, &image, 65, 65, &[keypoint], false)?[0];
+        assert!(descriptor
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0));
+        let norm = descriptor
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 2.0e-4);
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_root_sift_quantization_matches_colmap_rule() {
+        let mut values = [0.0f32; 128];
+        values[0] = 0.25;
+        values[1] = 0.5;
+        let normalized = normalize_gpu_descriptor(values, true);
+        let quantized = quantize_gpu_descriptor(&normalized);
+        assert_eq!(
+            quantized[0],
+            (normalized[0].clamp(0.0, 1.0) * 512.0).round() as u8
+        );
+        assert_eq!(quantized[1], 255);
     }
 
     fn wrapped_angle_distance(left: f32, right: f32) -> f32 {

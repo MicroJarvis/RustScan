@@ -64,3 +64,16 @@ pub(crate) struct OrientationParams {
     pub(crate) peak_ratio: f32,
     pub(crate) pad0: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub(crate) struct DescriptorParams {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) keypoint_count: u32,
+    pub(crate) root_sift: u32,
+    pub(crate) pad0: u32,
+    pub(crate) pad1: u32,
+    pub(crate) pad2: u32,
+    pub(crate) pad3: u32,
+}

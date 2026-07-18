@@ -579,7 +579,7 @@ git commit -m "feat(rustsfm): assign SIFT orientations on wgpu"
 - Modify: `RustSFM/src/gpu/sift/mod.rs`
 - Modify: `RustSFM/src/gpu/sift/types.rs`
 
-- [ ] **Step 1: Write descriptor contract tests**
+- [x] **Step 1: Write descriptor contract tests**
 
 ```rust
 #[test]
@@ -605,7 +605,7 @@ fn gpu_root_sift_quantization_matches_colmap_rule() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify descriptor path is incomplete**
+- [x] **Step 2: Run tests and verify descriptor path is incomplete**
 
 Run: `cargo test -p rustsfm --lib gpu_descriptor --features gpu-wgpu -- --nocapture`
 
@@ -613,7 +613,7 @@ Run: `cargo test -p rustsfm --lib gpu_root_sift --features gpu-wgpu -- --nocaptu
 
 Expected: FAIL.
 
-- [ ] **Step 3: Implement 4x4x8 trilinear descriptors**
+- [x] **Step 3: Implement 4x4x8 trilinear descriptors**
 
 For each oriented keypoint, rotate samples into descriptor coordinates, apply the standard
 descriptor Gaussian window, and trilinearly distribute magnitude into spatial and circular
@@ -635,7 +635,7 @@ Keep float descriptors for `lowe_sift::Descriptor::new` and quantize on the host
 existing exact `round(clamp(value, 0, 1) * 512)` rule. This host loop is serial and bounded by
 `max_num_features`; it is representation conversion, not feature extraction.
 
-- [ ] **Step 4: Run descriptor tests**
+- [x] **Step 4: Run descriptor tests**
 
 Run: `cargo test -p rustsfm --lib gpu_descriptor --features gpu-wgpu -- --nocapture`
 
@@ -643,7 +643,7 @@ Run: `cargo test -p rustsfm --lib gpu_root_sift --features gpu-wgpu -- --nocaptu
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/gpu/sift RustSFM/src/gpu/shaders/sift_descriptor.wgsl
