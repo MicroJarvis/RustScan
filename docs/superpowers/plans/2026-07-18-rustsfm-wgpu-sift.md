@@ -763,7 +763,7 @@ git commit -m "feat(rustsfm): expose complete wgpu SIFT extractor"
 - Modify: `RustSFM/src/feature/feature_extraction.rs`
 - Modify: `RustSFM/src/feature/sift.rs`
 
-- [ ] **Step 1: Write backend routing and persistence tests**
+- [x] **Step 1: Write backend routing and persistence tests**
 
 ```rust
 #[test]
@@ -790,7 +790,7 @@ fn gpu_database_extraction_reuses_one_backend() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify current database loop always calls CPU extraction**
+- [x] **Step 2: Run tests and verify current database loop always calls CPU extraction**
 
 Run: `cargo test -p rustsfm --lib extraction_backend_name_reports_wgpu --features gpu-wgpu -- --nocapture`
 
@@ -798,7 +798,7 @@ Run: `cargo test -p rustsfm --lib gpu_database_extraction_reuses_one_backend --f
 
 Expected: FAIL because the loop has no injected persistent backend.
 
-- [ ] **Step 3: Add a backend enum created once per command**
+- [x] **Step 3: Add a backend enum created once per command**
 
 ```rust
 enum SiftExtractionBackend {
@@ -834,13 +834,13 @@ Create this enum once before iterating database images. Keep database persistenc
 failure-atomic. Update `ExtractFeaturesReport.backend` from the selected backend rather than
 compile-time CPU features.
 
-- [ ] **Step 4: Run feature extraction tests**
+- [x] **Step 4: Run feature extraction tests**
 
 Run: `cargo test -p rustsfm --lib feature_extraction::tests --features gpu-wgpu -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/feature/feature_extraction.rs RustSFM/src/feature/sift.rs

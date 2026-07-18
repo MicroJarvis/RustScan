@@ -1,6 +1,8 @@
 use crate::colmap_image::load_colmap_grayscale_u8;
 use crate::compare::{compare_feature_counts, FeaturesCompareReport};
 use crate::database::{ColmapDatabase, ColmapDescriptors, ColmapKeypoint, COLMAP_FEATURE_SIFT};
+#[cfg(feature = "gpu-wgpu")]
+use crate::gpu::WgpuSiftExtractor;
 use crate::sift::{extract_sift_from_grayscale_u8, SiftExtractionOptions, SiftFeatures};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
@@ -26,6 +28,99 @@ pub struct ExtractFeaturesReport {
     pub mean_keypoints: f64,
     pub extraction_seconds: f64,
     pub images: Vec<ExtractFeaturesImageReport>,
+}
+
+pub trait SiftFeatureExtractor {
+    fn backend_name(&self) -> &'static str;
+
+    fn extract_grayscale(
+        &self,
+        gray: &[u8],
+        width: u32,
+        height: u32,
+        options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures>;
+}
+
+struct CpuSiftExtractor;
+
+impl SiftFeatureExtractor for CpuSiftExtractor {
+    fn backend_name(&self) -> &'static str {
+        sift_backend_name(&SiftExtractionOptions::default())
+    }
+
+    fn extract_grayscale(
+        &self,
+        gray: &[u8],
+        width: u32,
+        height: u32,
+        options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures> {
+        extract_sift_from_grayscale_u8(gray, width, height, options)
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl SiftFeatureExtractor for WgpuSiftExtractor {
+    fn backend_name(&self) -> &'static str {
+        "wgpu"
+    }
+
+    fn extract_grayscale(
+        &self,
+        gray: &[u8],
+        width: u32,
+        height: u32,
+        options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures> {
+        self.extract_grayscale(gray, width, height, options)
+    }
+}
+
+enum SiftExtractionBackend {
+    Cpu(CpuSiftExtractor),
+    #[cfg(feature = "gpu-wgpu")]
+    Wgpu(WgpuSiftExtractor),
+}
+
+impl SiftExtractionBackend {
+    fn from_options(options: &SiftExtractionOptions) -> Result<Self> {
+        if options.use_gpu {
+            #[cfg(feature = "gpu-wgpu")]
+            {
+                return Ok(Self::Wgpu(WgpuSiftExtractor::try_new()?));
+            }
+            #[cfg(not(feature = "gpu-wgpu"))]
+            {
+                bail!("RustSFM was built without gpu-wgpu support");
+            }
+        }
+        Ok(Self::Cpu(CpuSiftExtractor))
+    }
+}
+
+impl SiftFeatureExtractor for SiftExtractionBackend {
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Cpu(extractor) => extractor.backend_name(),
+            #[cfg(feature = "gpu-wgpu")]
+            Self::Wgpu(extractor) => extractor.backend_name(),
+        }
+    }
+
+    fn extract_grayscale(
+        &self,
+        gray: &[u8],
+        width: u32,
+        height: u32,
+        options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures> {
+        match self {
+            Self::Cpu(extractor) => extractor.extract_grayscale(gray, width, height, options),
+            #[cfg(feature = "gpu-wgpu")]
+            Self::Wgpu(extractor) => extractor.extract_grayscale(gray, width, height, options),
+        }
+    }
 }
 
 pub fn sift_features_to_colmap_keypoints(features: &SiftFeatures) -> Vec<ColmapKeypoint> {
@@ -55,6 +150,16 @@ pub fn extract_features_to_database(
     images_dir: &Path,
     options: &SiftExtractionOptions,
 ) -> Result<ExtractFeaturesReport> {
+    let backend = SiftExtractionBackend::from_options(options)?;
+    extract_features_to_database_with_extractor(database_path, images_dir, options, &backend)
+}
+
+pub fn extract_features_to_database_with_extractor<E: SiftFeatureExtractor>(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    extractor: &E,
+) -> Result<ExtractFeaturesReport> {
     options.check()?;
     let db = ColmapDatabase::open(database_path)?;
     let images = db.read_all_images()?;
@@ -77,7 +182,7 @@ pub fn extract_features_to_database(
         let decoded = load_colmap_grayscale_u8(&image_path)
             .with_context(|| format!("failed to load {}", image_path.display()))?;
         let features =
-            extract_sift_from_grayscale_u8(&decoded.data, decoded.width, decoded.height, options)?;
+            extractor.extract_grayscale(&decoded.data, decoded.width, decoded.height, options)?;
         let keypoints = sift_features_to_colmap_keypoints(&features);
         let descriptors = sift_features_to_colmap_descriptors(&features)?;
         db.upsert_keypoints(image.image_id, &keypoints)?;
@@ -104,7 +209,7 @@ pub fn extract_features_to_database(
     Ok(ExtractFeaturesReport {
         database: database_path.to_path_buf(),
         images_dir: images_dir.to_path_buf(),
-        backend: sift_backend_name(),
+        backend: extractor.backend_name(),
         image_count,
         total_keypoints,
         mean_keypoints,
@@ -177,7 +282,10 @@ fn extracted_keypoint_counts(
         .collect()
 }
 
-fn sift_backend_name() -> &'static str {
+fn sift_backend_name(options: &SiftExtractionOptions) -> &'static str {
+    if options.use_gpu {
+        return "wgpu";
+    }
     if cfg!(all(
         feature = "vlfeat-sift",
         not(feature = "lowe-sift-backend")
@@ -193,8 +301,74 @@ mod tests {
     use super::*;
     use crate::colmap::ColmapCamera;
     use crate::database::{ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage};
+    #[cfg(feature = "gpu-wgpu")]
+    use crate::gpu::{WgpuContext, WgpuSiftExtractor};
     use crate::types::COLMAP_PINHOLE;
     use tempfile::tempdir;
+
+    #[test]
+    fn extraction_backend_name_reports_wgpu_for_gpu_options() {
+        let options = SiftExtractionOptions {
+            use_gpu: true,
+            ..Default::default()
+        };
+        assert_eq!(sift_backend_name(&options), "wgpu");
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_database_extraction_reuses_one_backend() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU database test: no compatible adapter");
+            return Ok(());
+        };
+        let dir = tempdir()?;
+        let images_dir = dir.path().join("images");
+        std::fs::create_dir_all(&images_dir)?;
+        write_checkerboard_image(&images_dir.join("left.jpg"), 256, 256)?;
+        write_checkerboard_image(&images_dir.join("right.jpg"), 256, 256)?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: COLMAP_PINHOLE,
+                    width: 256,
+                    height: 256,
+                    params: vec![200.0, 200.0, 128.0, 128.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(1, "left.jpg"), (2, "right.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+        }
+        let extractor = WgpuSiftExtractor::from_context(context)?;
+        let report = extract_features_to_database_with_extractor(
+            &db_path,
+            &images_dir,
+            &SiftExtractionOptions {
+                use_gpu: true,
+                max_num_features: 256,
+                ..Default::default()
+            },
+            &extractor,
+        )?;
+        assert_eq!(report.backend, "wgpu");
+        assert_eq!(report.image_count, 2);
+        assert!(report.total_keypoints > 0);
+        Ok(())
+    }
 
     #[test]
     fn extract_features_to_database_updates_existing_rows() -> Result<()> {
