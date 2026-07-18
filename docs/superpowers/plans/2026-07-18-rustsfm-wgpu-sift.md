@@ -353,7 +353,7 @@ git commit -m "feat(rustsfm): define GPU SIFT octave plan"
 - Modify: `RustSFM/src/gpu/sift/mod.rs`
 - Modify: `RustSFM/src/gpu/sift/types.rs`
 
-- [ ] **Step 1: Write GPU pyramid reference tests**
+- [x] **Step 1: Write GPU pyramid reference tests**
 
 ```rust
 #[test]
@@ -377,7 +377,7 @@ fn gpu_dog_is_zero_for_equal_levels() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify missing pyramid implementation**
+- [x] **Step 2: Run tests and verify missing pyramid implementation**
 
 Run: `cargo test -p rustsfm --lib gpu_gaussian --features gpu-wgpu -- --nocapture`
 
@@ -385,7 +385,7 @@ Run: `cargo test -p rustsfm --lib gpu_dog --features gpu-wgpu -- --nocapture`
 
 Expected: FAIL because `SiftPyramid` is undefined.
 
-- [ ] **Step 3: Implement separable Gaussian, downsample, and DoG passes**
+- [x] **Step 3: Implement separable Gaussian, downsample, and DoG passes**
 
 The WGSL module contains separate entry points and clamps convolution reads at image edges:
 
@@ -413,7 +413,7 @@ and use ping-pong buffers for horizontal and vertical passes. Build incremental 
 `sqrt(sigma_next^2 - sigma_previous^2)`. Downsample Gaussian level
 `octave_resolution` by reading every second pixel for the next octave base.
 
-- [ ] **Step 4: Run pyramid tests**
+- [x] **Step 4: Run pyramid tests**
 
 Run: `cargo test -p rustsfm --lib gpu_gaussian --features gpu-wgpu -- --nocapture`
 
@@ -421,7 +421,7 @@ Run: `cargo test -p rustsfm --lib gpu_dog --features gpu-wgpu -- --nocapture`
 
 Expected: PASS on Metal; clean skip with no adapter.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/gpu/sift RustSFM/src/gpu/shaders/sift_pyramid.wgsl

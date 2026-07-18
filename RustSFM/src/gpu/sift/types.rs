@@ -25,3 +25,12 @@ pub(crate) struct GpuKeypoint {
     pub(crate) level: i32,
     pub(crate) valid: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub(crate) struct PyramidParams {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) radius: u32,
+    pub(crate) direction: u32,
+}

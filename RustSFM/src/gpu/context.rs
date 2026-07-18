@@ -64,6 +64,10 @@ impl WgpuContext {
         &self.device
     }
 
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     pub(crate) fn wait_for(&self, submission: wgpu::SubmissionIndex) -> Result<()> {
         self.device
             .poll(wgpu::PollType::Wait {
