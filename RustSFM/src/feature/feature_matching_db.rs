@@ -5,6 +5,8 @@ use crate::database::{
 };
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions};
+#[cfg(feature = "gpu-wgpu")]
+use crate::gpu::WgpuSiftMatcher;
 use crate::mapper::pair_geometry_to_colmap_two_view_geometry;
 use crate::sift::{match_sift_with_options, SiftFeatures, SiftMatchingOptions};
 use crate::two_view::{
@@ -169,7 +171,7 @@ pub fn match_features_to_database(
     let pair_batch = if options.use_existing_matches {
         existing_match_pair_reports(&db, &frames, &cameras, &images, options)?
     } else {
-        computed_match_pair_reports(&frames, &cameras, options)
+        computed_match_pair_reports(&frames, &cameras, options)?
     };
     let PairReportBatch {
         pair_count,
@@ -555,7 +557,7 @@ fn computed_match_pair_reports(
     frames: &[ImageFrame],
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
-) -> PairReportBatch {
+) -> Result<PairReportBatch> {
     let pairs = match options.pair_strategy {
         MatchingPairStrategy::VocabTree { num_images } => {
             vocab_tree_pairs_from_frames(frames, num_images, options.random_seed)
@@ -563,6 +565,47 @@ fn computed_match_pair_reports(
         strategy => generate_matching_pairs(frames.len(), strategy),
     };
     let pair_count = pairs.len();
+    #[cfg(feature = "gpu-wgpu")]
+    let gpu_matcher = if options.sift_matching.use_gpu {
+        Some(WgpuSiftMatcher::try_new()?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu-wgpu"))]
+    if options.sift_matching.use_gpu {
+        bail!("RustSFM was built without gpu-wgpu support");
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    let reports = if let Some(matcher) = gpu_matcher.as_ref() {
+        let mut reports = Vec::with_capacity(pairs.len());
+        for &(left, right) in &pairs {
+            let matches = matcher.match_descriptors(
+                &frames[left].sift.descriptors_u8,
+                &frames[right].sift.descriptors_u8,
+                &options.sift_matching,
+            )?;
+            if let Some(report) =
+                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
+            {
+                reports.push(report);
+            }
+        }
+        reports
+    } else {
+        pairs
+            .par_iter()
+            .filter_map(|&(left, right)| {
+                let matches = match_sift_with_options(
+                    &frames[left].sift,
+                    &frames[right].sift,
+                    &options.sift_matching,
+                );
+                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
+            })
+            .collect()
+    };
+    #[cfg(not(feature = "gpu-wgpu"))]
     let reports = pairs
         .par_iter()
         .filter_map(|&(left, right)| {
@@ -574,11 +617,11 @@ fn computed_match_pair_reports(
             estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
         })
         .collect();
-    PairReportBatch {
+    Ok(PairReportBatch {
         pair_count,
         reports,
         verifier_trace: None,
-    }
+    })
 }
 
 fn existing_match_pair_reports(

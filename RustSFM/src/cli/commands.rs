@@ -5,7 +5,7 @@ use super::support::{
     sift_extraction_from_args, sift_matching_from_args,
 };
 use super::*;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use rustsfm::colmap::{read_colmap_sparse_files, write_colmap_sparse_model};
 use rustsfm::feature_matching::MatchingPairStrategy;
@@ -156,10 +156,10 @@ fn run_match_features(args: MatchFeaturesArgs) -> Result<()> {
                 args.sequential_loop_detection_period,
                 args.vocab_tree_num_images,
             ),
-            sift_matching: sift_matching_from_args(
-                args.match_ratio,
-                args.sift_cpu_brute_force_matcher,
-            ),
+            sift_matching: SiftMatchingOptions {
+                use_gpu: args.use_gpu,
+                ..sift_matching_from_args(args.match_ratio, args.sift_cpu_brute_force_matcher)
+            },
             min_num_matches: args.min_num_matches,
             min_inliers: args.min_num_matches,
             essential_threshold_px: args.essential_threshold_px,
@@ -243,9 +243,6 @@ fn run_colmap_matcher(
     log_level: String,
 ) -> Result<()> {
     let use_gpu = colmap_optional_bool(use_gpu, "SiftMatching.use_gpu")?;
-    if use_gpu == Some(true) {
-        bail!("SiftMatching.use_gpu is not implemented in RustSFM; use CPU matching");
-    }
     let guided_matching = colmap_bool(guided_matching, "SiftMatching.guided_matching")?;
     let args = MatchFeaturesArgs {
         database: database_path,
@@ -257,6 +254,7 @@ fn run_colmap_matcher(
         vocab_tree_num_images: 100,
         match_ratio: max_ratio,
         sift_cpu_brute_force_matcher: false,
+        use_gpu: use_gpu.unwrap_or(false),
         min_num_matches: min_num_inliers,
         essential_threshold_px: max_error,
         essential_iterations: max_num_trials,
@@ -272,6 +270,7 @@ fn run_colmap_matcher(
         sift_matching: SiftMatchingOptions {
             guided_matching,
             max_ratio: max_ratio as f32,
+            use_gpu: args.use_gpu,
             ..Default::default()
         },
         min_num_matches: min_num_inliers,

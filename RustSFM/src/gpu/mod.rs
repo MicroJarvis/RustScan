@@ -11,10 +11,14 @@ use anyhow::{bail, Result};
 #[cfg(feature = "gpu-wgpu")]
 mod context;
 #[cfg(feature = "gpu-wgpu")]
+mod matcher;
+#[cfg(feature = "gpu-wgpu")]
 mod sift;
 
 #[cfg(feature = "gpu-wgpu")]
 pub use context::WgpuContext;
+#[cfg(feature = "gpu-wgpu")]
+pub use matcher::WgpuSiftMatcher;
 
 #[cfg(feature = "gpu-wgpu")]
 use self::sift::{SiftDescriptorComputer, SiftDetector, SiftOrientationAssigner, SiftPyramid};
@@ -504,6 +508,41 @@ mod tests {
         assert!(features.descriptors.is_empty());
         assert!(features.colmap_keypoints.is_empty());
         assert!(features.descriptors_u8.is_empty());
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_sift_matcher_applies_ratio_distance_and_cross_check() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU matcher test: no compatible adapter");
+            return Ok(());
+        };
+        let mut zero = [0u8; 128];
+        let mut full = [255u8; 128];
+        let mut middle = [128u8; 128];
+        zero[0] = 1;
+        full[0] = 254;
+        middle[0] = 127;
+        let left = [zero, full];
+        let right = [zero, full, middle];
+        let options = crate::sift::SiftMatchingOptions {
+            use_gpu: true,
+            max_ratio: 0.8,
+            max_distance: 0.7,
+            cross_check: true,
+            max_num_matches: 16,
+            ..Default::default()
+        };
+        let matches =
+            WgpuSiftMatcher::from_context(context)?.match_descriptors(&left, &right, &options)?;
+        assert_eq!(
+            matches
+                .iter()
+                .map(|value| (value.query_idx, value.train_idx))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 1)]
+        );
         Ok(())
     }
 

@@ -133,6 +133,7 @@ pub struct SiftMatchingOptions {
     pub guided_matching: bool,
     pub max_guided_epipolar_error_px: f32,
     pub cpu_brute_force_matcher: bool,
+    pub use_gpu: bool,
 }
 
 impl Default for SiftMatchingOptions {
@@ -145,6 +146,7 @@ impl Default for SiftMatchingOptions {
             guided_matching: false,
             max_guided_epipolar_error_px: 2.0,
             cpu_brute_force_matcher: false,
+            use_gpu: false,
         }
     }
 }
@@ -1250,6 +1252,7 @@ mod tests {
                 guided_matching: true,
                 max_guided_epipolar_error_px: 2.0,
                 cpu_brute_force_matcher: true,
+                use_gpu: false,
             },
         );
         assert_eq!(matches.len(), 1);
@@ -1349,6 +1352,7 @@ mod tests {
                 guided_matching: false,
                 max_guided_epipolar_error_px: 2.0,
                 cpu_brute_force_matcher: true,
+                use_gpu: false,
             },
         );
         assert_eq!(accepted.len(), 1);
@@ -1375,6 +1379,7 @@ mod tests {
             guided_matching: false,
             max_guided_epipolar_error_px: 2.0,
             cpu_brute_force_matcher: false,
+            use_gpu: false,
         };
         let brute = match_sift_colmap_one_way_brute(&left_set, &right_set, &options);
         let indexed = match_sift_colmap_one_way_indexed(
@@ -1410,6 +1415,7 @@ mod tests {
                 guided_matching: false,
                 max_guided_epipolar_error_px: 2.0,
                 cpu_brute_force_matcher: true,
+                use_gpu: false,
             },
         );
         let rejected = match_sift_with_options(
@@ -1423,6 +1429,7 @@ mod tests {
                 guided_matching: false,
                 max_guided_epipolar_error_px: 2.0,
                 cpu_brute_force_matcher: true,
+                use_gpu: false,
             },
         );
 

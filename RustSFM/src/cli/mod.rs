@@ -302,6 +302,8 @@ struct MatchFeaturesArgs {
     match_ratio: f64,
     #[arg(long, default_value_t = false)]
     sift_cpu_brute_force_matcher: bool,
+    #[arg(long, default_value_t = false)]
+    use_gpu: bool,
     #[arg(long, default_value = "15")]
     min_num_matches: usize,
     #[arg(long, default_value = "4.0")]
@@ -670,6 +672,22 @@ mod tests {
         ])
         .unwrap();
         let Commands::ExtractFeatures(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert!(args.use_gpu);
+    }
+
+    #[test]
+    fn native_match_features_parses_use_gpu() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "match-features",
+            "--database",
+            "database.db",
+            "--use-gpu",
+        ])
+        .unwrap();
+        let Commands::MatchFeatures(args) = cli.command else {
             panic!("wrong command")
         };
         assert!(args.use_gpu);
