@@ -134,7 +134,7 @@ git commit -m "feat(rustsfm): add wgpu SIFT feature gate"
 - Create: `RustSFM/src/gpu/context.rs`
 - Modify: `RustSFM/src/gpu/mod.rs`
 
-- [ ] **Step 1: Write a hardware-capability smoke test**
+- [x] **Step 1: Write a hardware-capability smoke test**
 
 ```rust
 #[cfg(feature = "gpu-wgpu")]
@@ -150,13 +150,13 @@ fn wgpu_context_reports_a_real_adapter_when_available() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run test and verify it fails to compile**
+- [x] **Step 2: Run test and verify it fails to compile**
 
 Run: `cargo test -p rustsfm --lib wgpu_context_reports_a_real_adapter_when_available --features gpu-wgpu -- --nocapture`
 
 Expected: FAIL because `WgpuContext` is undefined.
 
-- [ ] **Step 3: Implement persistent context creation**
+- [x] **Step 3: Implement persistent context creation**
 
 Define the context with shared handles and a synchronous wait helper:
 
@@ -180,7 +180,9 @@ impl WgpuContext {
     }
 
     async fn new_async() -> Result<Option<Arc<Self>>> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+        );
         let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -230,13 +232,13 @@ Expose `device`, `queue`, and `capabilities` through read-only methods. Add a bo
 `read_buffer<T: Pod>` helper that copies into a `MAP_READ` staging buffer, maps it, waits,
 copies into a `Vec<T>`, and unmaps before returning.
 
-- [ ] **Step 4: Run smoke test on Metal**
+- [x] **Step 4: Run smoke test on Metal**
 
 Run: `cargo test -p rustsfm --lib wgpu_context_reports_a_real_adapter_when_available --features gpu-wgpu -- --nocapture`
 
 Expected on the target Mac: PASS and a non-empty Apple GPU adapter name.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/gpu/context.rs RustSFM/src/gpu/mod.rs

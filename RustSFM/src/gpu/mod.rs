@@ -6,6 +6,12 @@
 use crate::sift::{SiftExtractionOptions, SiftFeatures};
 use anyhow::{bail, Result};
 
+#[cfg(feature = "gpu-wgpu")]
+mod context;
+
+#[cfg(feature = "gpu-wgpu")]
+pub use context::WgpuContext;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuBackendKind {
     Wgpu,
@@ -78,6 +84,41 @@ impl GpuSiftExtractor for WgpuSiftExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gpu-wgpu")]
+    use wgpu::util::DeviceExt;
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_context_reports_a_real_adapter_when_available() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU smoke test: no compatible adapter");
+            return Ok(());
+        };
+        assert!(!context.capabilities().device_name.trim().is_empty());
+        assert_eq!(context.capabilities().backend, GpuBackendKind::Wgpu);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_context_reads_back_a_storage_buffer() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU readback test: no compatible adapter");
+            return Ok(());
+        };
+        let expected = [3u32, 5, 8, 13];
+        let buffer = context
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rustsfm readback test input"),
+                contents: bytemuck::cast_slice(&expected),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+        let actual = context.read_buffer::<u32>(&buffer, expected.len())?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
