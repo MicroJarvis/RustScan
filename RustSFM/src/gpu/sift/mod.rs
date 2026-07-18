@@ -2,8 +2,10 @@ mod plan;
 mod types;
 
 pub(crate) use plan::SiftPlan;
+#[cfg(test)]
+use types::SiftUniforms;
 pub(crate) use types::{
-    DescriptorParams, DetectorParams, GpuKeypoint, OrientationParams, PyramidParams, SiftUniforms,
+    DescriptorParams, DetectorParams, GpuKeypoint, OrientationParams, PyramidParams,
 };
 
 use crate::gpu::WgpuContext;

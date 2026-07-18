@@ -853,7 +853,7 @@ git commit -m "feat(rustsfm): persist wgpu extractor across images"
 - Modify: `RustSFM/src/cli/mod.rs`
 - Modify: `RustSFM/src/cli/commands.rs`
 
-- [ ] **Step 1: Write CLI parsing tests**
+- [x] **Step 1: Write CLI parsing tests**
 
 ```rust
 #[test]
@@ -881,7 +881,7 @@ fn native_extract_features_parses_use_gpu() {
 }
 ```
 
-- [ ] **Step 2: Run CLI tests and verify native flag/routing is missing**
+- [x] **Step 2: Run CLI tests and verify native flag/routing is missing**
 
 Run: `cargo test -p rustsfm --bin rustsfm colmap_feature_extractor_accepts_gpu_one --features gpu-wgpu -- --nocapture`
 
@@ -889,7 +889,7 @@ Run: `cargo test -p rustsfm --bin rustsfm native_extract_features_parses_use_gpu
 
 Expected: FAIL because native `--use-gpu` is absent and COLMAP command rejects GPU execution.
 
-- [ ] **Step 3: Route CLI flags into extraction options**
+- [x] **Step 3: Route CLI flags into extraction options**
 
 Add `#[arg(long, default_value_t = false)] use_gpu: bool` to native extraction and benchmark
 arguments. Remove the command-level `bail!` for COLMAP `use_gpu=1`, then assign:
@@ -908,7 +908,7 @@ For native commands, assign `options.use_gpu = args.use_gpu`. Preserve `use_gpu=
 When compiled without `gpu-wgpu`, return `RustSFM was built without gpu-wgpu support` before
 opening the database for mutation.
 
-- [ ] **Step 4: Run CLI and library tests**
+- [x] **Step 4: Run CLI and library tests**
 
 Run: `cargo test -p rustsfm --bin rustsfm --features gpu-wgpu -- --nocapture`
 
@@ -918,7 +918,7 @@ Run: `cargo test -p rustsfm --lib feature_extraction::tests --features gpu-wgpu 
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/cli/mod.rs RustSFM/src/cli/commands.rs

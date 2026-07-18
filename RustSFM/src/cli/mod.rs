@@ -274,6 +274,8 @@ struct ExtractFeaturesArgs {
     sift_domain_size_pooling: bool,
     #[arg(long, default_value_t = false)]
     sift_force_covariant: bool,
+    #[arg(long, default_value_t = false)]
+    use_gpu: bool,
     #[arg(long)]
     output_json: Option<PathBuf>,
     #[arg(long, default_value = "info")]
@@ -621,10 +623,55 @@ struct BenchmarkSiftArgs {
     sift_domain_size_pooling: bool,
     #[arg(long, default_value_t = false)]
     sift_force_covariant: bool,
+    #[arg(long, default_value_t = false)]
+    use_gpu: bool,
     #[arg(long, default_value = "info")]
     log_level: String,
 }
 
 pub fn run() -> anyhow::Result<()> {
     commands::run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn colmap_feature_extractor_accepts_gpu_one() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "feature_extractor",
+            "--database_path",
+            "database.db",
+            "--image_path",
+            "images",
+            "--SiftExtraction.use_gpu",
+            "1",
+        ])
+        .unwrap();
+        let Commands::FeatureExtractor(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.use_gpu, Some(1));
+    }
+
+    #[test]
+    fn native_extract_features_parses_use_gpu() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "extract-features",
+            "--database",
+            "database.db",
+            "--images",
+            "images",
+            "--use-gpu",
+        ])
+        .unwrap();
+        let Commands::ExtractFeatures(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert!(args.use_gpu);
+    }
 }

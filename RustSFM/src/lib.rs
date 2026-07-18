@@ -99,7 +99,8 @@ pub use compare::{
     CompareStagesReport,
 };
 pub use feature_extraction::{
-    compare_extracted_sift_features, extract_features_to_database, ExtractFeaturesReport,
+    compare_extracted_sift_features, extract_features_to_database,
+    extract_features_to_database_with_extractor, ExtractFeaturesReport, SiftFeatureExtractor,
 };
 pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use feature_matching_db::{

@@ -190,9 +190,6 @@ fn run_colmap_feature_extractor(args: ColmapFeatureExtractorArgs) -> Result<()> 
         .parse_filters(&args.log_level)
         .init();
     let use_gpu = colmap_optional_bool(args.use_gpu, "SiftExtraction.use_gpu")?;
-    if use_gpu == Some(true) {
-        bail!("SiftExtraction.use_gpu is not implemented in RustSFM; use CPU extraction");
-    }
     let single_camera = colmap_bool(args.single_camera, "ImageReader.single_camera")?;
     let estimate_affine_shape = colmap_bool(
         args.estimate_affine_shape,
@@ -202,18 +199,22 @@ fn run_colmap_feature_extractor(args: ColmapFeatureExtractorArgs) -> Result<()> 
         args.domain_size_pooling,
         "SiftExtraction.domain_size_pooling",
     )?;
+    let mut options = sift_extraction_from_args(
+        args.max_num_features,
+        estimate_affine_shape,
+        domain_size_pooling,
+        estimate_affine_shape || domain_size_pooling,
+    );
+    options.use_gpu = use_gpu.unwrap_or(false);
+    if options.use_gpu {
+        rustsfm::gpu::validate_gpu_sift_options(&options)?;
+    }
     ensure_feature_extractor_database(
         &args.database_path,
         &args.image_path,
         &args.camera_model,
         single_camera,
     )?;
-    let options = sift_extraction_from_args(
-        args.max_num_features,
-        estimate_affine_shape,
-        domain_size_pooling,
-        estimate_affine_shape || domain_size_pooling,
-    );
     let report = extract_features_to_database(&args.database_path, &args.image_path, &options)?;
     println!(
         "feature_extractor: database={} images={} total_keypoints={} seconds={:.3}",
@@ -601,12 +602,13 @@ pub(super) fn run() -> Result<()> {
             env_logger::Builder::new()
                 .parse_filters(&args.log_level)
                 .init();
-            let options = sift_extraction_from_args(
+            let mut options = sift_extraction_from_args(
                 args.max_features,
                 args.sift_estimate_affine_shape,
                 args.sift_domain_size_pooling,
                 args.sift_force_covariant,
             );
+            options.use_gpu = args.use_gpu;
             let report = benchmark_sift_extraction(&args.input, &options)?;
             println!(
                 "SIFT benchmark: backend={} images={} total_features={} mean_features={:.1} seconds={:.3} covariant={}",
@@ -650,12 +652,13 @@ pub(super) fn run() -> Result<()> {
             env_logger::Builder::new()
                 .parse_filters(&args.log_level)
                 .init();
-            let options = sift_extraction_from_args(
+            let mut options = sift_extraction_from_args(
                 args.max_features,
                 args.sift_estimate_affine_shape,
                 args.sift_domain_size_pooling,
                 args.sift_force_covariant,
             );
+            options.use_gpu = args.use_gpu;
             let report = extract_features_to_database(&args.database, &args.images, &options)?;
             println!(
                 "extract-features: backend={} images={} total_keypoints={} mean_keypoints={:.1} seconds={:.3}",
