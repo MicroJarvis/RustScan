@@ -1035,6 +1035,16 @@ pub fn benchmark_sift_extraction(
     use std::time::Instant;
 
     options.check()?;
+    #[cfg(feature = "gpu-wgpu")]
+    let gpu_extractor = if options.use_gpu {
+        Some(crate::gpu::WgpuSiftExtractor::try_new()?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu-wgpu"))]
+    if options.use_gpu {
+        bail!("RustSFM was built without gpu-wgpu support");
+    }
     let mut paths = std::fs::read_dir(input)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
@@ -1057,6 +1067,13 @@ pub fn benchmark_sift_extraction(
     for path in paths {
         let decoded = load_colmap_grayscale_u8(&path)
             .with_context(|| format!("failed to load {}", path.display()))?;
+        #[cfg(feature = "gpu-wgpu")]
+        let features = if let Some(extractor) = gpu_extractor.as_ref() {
+            extractor.extract_grayscale(&decoded.data, decoded.width, decoded.height, options)?
+        } else {
+            extract_sift_from_grayscale_u8(&decoded.data, decoded.width, decoded.height, options)?
+        };
+        #[cfg(not(feature = "gpu-wgpu"))]
         let features =
             extract_sift_from_grayscale_u8(&decoded.data, decoded.width, decoded.height, options)?;
         total_features += features.keypoints.len();
@@ -1079,7 +1096,9 @@ pub fn benchmark_sift_extraction(
     };
 
     Ok(SiftBenchmarkReport {
-        backend: if cfg!(all(
+        backend: if options.use_gpu {
+            "wgpu"
+        } else if cfg!(all(
             feature = "vlfeat-sift",
             not(feature = "lowe-sift-backend")
         )) {
@@ -1160,6 +1179,22 @@ mod tests {
             ..SiftExtractionOptions::default()
         };
         assert!(options.check().is_ok());
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn benchmark_reports_wgpu_for_explicit_gpu_options() -> Result<()> {
+        let input = tempfile::tempdir()?;
+        let report = benchmark_sift_extraction(
+            input.path(),
+            &SiftExtractionOptions {
+                use_gpu: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(report.backend, "wgpu");
+        assert_eq!(report.image_count, 0);
+        Ok(())
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! intentionally out of scope.
 
 use crate::sift::{SiftExtractionOptions, SiftFeatures};
-use anyhow::{bail, Context, Result};
+#[cfg(feature = "gpu-wgpu")]
+use anyhow::Context;
+use anyhow::{bail, Result};
 
 #[cfg(feature = "gpu-wgpu")]
 mod context;
