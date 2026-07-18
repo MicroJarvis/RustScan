@@ -435,7 +435,7 @@ git commit -m "feat(rustsfm): build SIFT pyramid on wgpu"
 - Modify: `RustSFM/src/gpu/sift/mod.rs`
 - Modify: `RustSFM/src/gpu/sift/types.rs`
 
-- [ ] **Step 1: Write synthetic extrema tests**
+- [x] **Step 1: Write synthetic extrema tests**
 
 ```rust
 #[test]
@@ -460,13 +460,13 @@ fn gpu_detector_rejects_edge_like_response() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run tests and confirm detector is absent**
+- [x] **Step 2: Run tests and confirm detector is absent**
 
 Run: `cargo test -p rustsfm --lib gpu_detector_ --features gpu-wgpu -- --nocapture`
 
 Expected: FAIL because the detection path is undefined.
 
-- [ ] **Step 3: Implement candidate append and fixed-budget localization**
+- [x] **Step 3: Implement candidate append and fixed-budget localization**
 
 The first kernel performs the 26-neighbor strict comparison and appends candidate indices:
 
@@ -491,13 +491,13 @@ set `valid=0`; compaction occurs before readback.
 Host code reads the count and overflow words first. It retries with doubled capacity until
 the checked ceiling, then returns `GPU SIFT candidate buffer overflow`.
 
-- [ ] **Step 4: Run detector tests**
+- [x] **Step 4: Run detector tests**
 
 Run: `cargo test -p rustsfm --lib gpu_detector_ --features gpu-wgpu -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/gpu/sift RustSFM/src/gpu/shaders/sift_detect.wgsl

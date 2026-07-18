@@ -2,7 +2,7 @@ mod plan;
 mod types;
 
 pub(crate) use plan::SiftPlan;
-pub(crate) use types::{GpuKeypoint, PyramidParams, SiftUniforms};
+pub(crate) use types::{DetectorParams, GpuKeypoint, PyramidParams, SiftUniforms};
 
 use crate::gpu::WgpuContext;
 use anyhow::{bail, Context, Result};
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 const PYRAMID_SHADER: &str = include_str!("../shaders/sift_pyramid.wgsl");
+const DETECT_SHADER: &str = include_str!("../shaders/sift_detect.wgsl");
 const WORKGROUP_SIZE: u32 = 16;
 
 pub(crate) struct SiftPyramid {
@@ -19,6 +20,214 @@ pub(crate) struct SiftPyramid {
     dog_pipeline: wgpu::ComputePipeline,
     downsample_pipeline: wgpu::ComputePipeline,
     dummy_buffer: wgpu::Buffer,
+}
+
+pub(crate) struct SiftDetector {
+    context: Arc<WgpuContext>,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+impl SiftDetector {
+    pub(crate) fn new(context: Arc<WgpuContext>) -> Result<Self> {
+        let device = context.device();
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rustsfm SIFT detector bind group layout"),
+            entries: &[
+                storage_layout_entry(0, true),
+                storage_layout_entry(1, false),
+                storage_layout_entry(2, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rustsfm SIFT detector shader"),
+            source: wgpu::ShaderSource::Wgsl(DETECT_SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rustsfm SIFT detector pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rustsfm SIFT detector pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("detect_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        Ok(Self {
+            context,
+            bind_group_layout,
+            pipeline,
+        })
+    }
+
+    pub(crate) fn detect_volume(
+        &self,
+        dogs: &[f32],
+        params: DetectorParams,
+    ) -> Result<Vec<GpuKeypoint>> {
+        let (points, overflow) = self.detect_volume_once(dogs, params)?;
+        if overflow {
+            bail!(
+                "GPU SIFT candidate buffer overflow at capacity {}",
+                params.capacity
+            );
+        }
+        Ok(points)
+    }
+
+    pub(crate) fn detect_volume_with_retry(
+        &self,
+        dogs: &[f32],
+        mut params: DetectorParams,
+        max_capacity: u32,
+    ) -> Result<Vec<GpuKeypoint>> {
+        if params.capacity > max_capacity {
+            bail!(
+                "GPU SIFT initial candidate capacity {} exceeds maximum {}",
+                params.capacity,
+                max_capacity
+            );
+        }
+        loop {
+            let (points, overflow) = self.detect_volume_once(dogs, params)?;
+            if !overflow {
+                return Ok(points);
+            }
+            let next_capacity = params.capacity.saturating_mul(2).min(max_capacity);
+            if next_capacity <= params.capacity {
+                bail!(
+                    "GPU SIFT candidate buffer overflow at maximum capacity {}",
+                    max_capacity
+                );
+            }
+            params.capacity = next_capacity;
+        }
+    }
+
+    fn detect_volume_once(
+        &self,
+        dogs: &[f32],
+        params: DetectorParams,
+    ) -> Result<(Vec<GpuKeypoint>, bool)> {
+        if params.levels < 3 {
+            bail!("GPU SIFT detection requires at least three DoG levels");
+        }
+        if params.capacity == 0 {
+            bail!("GPU SIFT candidate capacity must be positive");
+        }
+        let level_pixels = u64::from(params.width) * u64::from(params.height);
+        let expected = level_pixels
+            .checked_mul(u64::from(params.levels))
+            .and_then(|count| usize::try_from(count).ok())
+            .context("GPU SIFT DoG volume size overflow")?;
+        if dogs.len() != expected {
+            bail!(
+                "GPU SIFT DoG volume has {} elements, expected {}",
+                dogs.len(),
+                expected
+            );
+        }
+
+        let device = self.context.device();
+        let dogs_buffer = storage_buffer_from_slice(
+            device,
+            "rustsfm SIFT DoG volume",
+            dogs,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let candidates = typed_storage_buffer::<GpuKeypoint>(
+            device,
+            "rustsfm SIFT detector candidates",
+            params.capacity as usize,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        )?;
+        let counters = storage_buffer_from_slice(
+            device,
+            "rustsfm SIFT detector counters",
+            &[0u32; 4],
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let params_buffer = uniform_buffer(device, "rustsfm SIFT detector params", &params);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rustsfm SIFT detector bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                entire_buffer_entry(0, &dogs_buffer),
+                entire_buffer_entry(1, &candidates),
+                entire_buffer_entry(2, &counters),
+                entire_buffer_entry(3, &params_buffer),
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rustsfm SIFT detector encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rustsfm SIFT detector pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                params.width.div_ceil(8),
+                params.height.div_ceil(8),
+                params.levels - 2,
+            );
+        }
+        self.context.queue().submit(Some(encoder.finish()));
+        let counter_values = self.context.read_buffer::<u32>(&counters, 4)?;
+        let overflow = counter_values[1] != 0;
+        if overflow {
+            return Ok((Vec::new(), true));
+        }
+        let count = (counter_values[0] as usize).min(params.capacity as usize);
+        Ok((self.context.read_buffer(&candidates, count)?, false))
+    }
+}
+
+#[cfg(test)]
+fn detect_test_dog(
+    context: Arc<WgpuContext>,
+    dogs: &[f32],
+    width: u32,
+    height: u32,
+    levels: u32,
+    peak_threshold: f32,
+    edge_threshold: f32,
+) -> Result<Vec<GpuKeypoint>> {
+    let capacity = u32::try_from(dogs.len()).context("test DoG volume exceeds u32")?;
+    SiftDetector::new(context)?.detect_volume(
+        dogs,
+        DetectorParams {
+            width,
+            height,
+            levels,
+            capacity,
+            peak_threshold,
+            edge_threshold,
+            sigma0: 1.6,
+            octave_scale: 1.0,
+            octave: 0,
+            octave_resolution: 3,
+            pad0: 0,
+            pad1: 0,
+        },
+    )
 }
 
 impl SiftPyramid {
@@ -393,6 +602,27 @@ fn storage_buffer(
     }))
 }
 
+fn typed_storage_buffer<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    label: &str,
+    element_count: usize,
+    usage: wgpu::BufferUsages,
+) -> Result<wgpu::Buffer> {
+    let size = element_count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .context("GPU SIFT typed buffer size overflow")?;
+    if size == 0 {
+        bail!("GPU SIFT typed buffers must not be empty");
+    }
+    Ok(device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    }))
+}
+
 fn dispatch_2d(
     encoder: &mut wgpu::CommandEncoder,
     pipeline: &wgpu::ComputePipeline,
@@ -529,6 +759,91 @@ mod tests {
         let input = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let output = pyramid.downsample_for_test(&input, 4, 4)?;
         assert_eq!(output, vec![0.0, 2.0, 8.0, 10.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_detector_finds_one_strict_scale_space_maximum() -> anyhow::Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let mut dogs = vec![0.0f32; 5 * 9 * 9];
+        dogs[(2 * 9 + 4) * 9 + 4] = 1.0;
+        let points = detect_test_dog(context, &dogs, 9, 9, 5, 0.01, 10.0)?;
+        assert_eq!(points.len(), 1);
+        assert!((points[0].x - 4.0).abs() < 1.0e-4);
+        assert!((points[0].y - 4.0).abs() < 1.0e-4);
+        assert_eq!(points[0].level, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_detector_rejects_edge_like_response() -> anyhow::Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let width = 11;
+        let height = 11;
+        let levels = 5;
+        let mut dogs = vec![0.0f32; levels * width * height];
+        for ds in -1i32..=1 {
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let value = 1.0
+                        - 0.5 * (dx * dx) as f32
+                        - 0.005 * (dy * dy) as f32
+                        - 0.2 * (ds * ds) as f32;
+                    let level = usize::try_from(2 + ds).unwrap();
+                    let y = usize::try_from(5 + dy).unwrap();
+                    let x = usize::try_from(5 + dx).unwrap();
+                    dogs[(level * height + y) * width + x] = value;
+                }
+            }
+        }
+        let points = detect_test_dog(
+            context,
+            &dogs,
+            width as u32,
+            height as u32,
+            levels as u32,
+            0.01,
+            10.0,
+        )?;
+        assert!(points.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_detector_retries_after_candidate_overflow() -> anyhow::Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let width = 11;
+        let height = 11;
+        let levels = 5;
+        let mut dogs = vec![0.0f32; levels * width * height];
+        dogs[(2 * height + 3) * width + 3] = 1.0;
+        dogs[(2 * height + 7) * width + 7] = 0.8;
+        let detector = SiftDetector::new(context)?;
+        let points = detector.detect_volume_with_retry(
+            &dogs,
+            DetectorParams {
+                width: width as u32,
+                height: height as u32,
+                levels: levels as u32,
+                capacity: 1,
+                peak_threshold: 0.01,
+                edge_threshold: 10.0,
+                sigma0: 1.6,
+                octave_scale: 1.0,
+                octave: 0,
+                octave_resolution: 3,
+                pad0: 0,
+                pad1: 0,
+            },
+            4,
+        )?;
+        assert_eq!(points.len(), 2);
         Ok(())
     }
 }

@@ -34,3 +34,20 @@ pub(crate) struct PyramidParams {
     pub(crate) radius: u32,
     pub(crate) direction: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub(crate) struct DetectorParams {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) levels: u32,
+    pub(crate) capacity: u32,
+    pub(crate) peak_threshold: f32,
+    pub(crate) edge_threshold: f32,
+    pub(crate) sigma0: f32,
+    pub(crate) octave_scale: f32,
+    pub(crate) octave: i32,
+    pub(crate) octave_resolution: u32,
+    pub(crate) pad0: u32,
+    pub(crate) pad1: u32,
+}
