@@ -28,7 +28,7 @@ pub(crate) struct GpuPnpObjectPoint {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub(crate) struct GpuPnpModel {
     pub(crate) row0: [f32; 4],
     pub(crate) row1: [f32; 4],
@@ -72,6 +72,8 @@ pub struct WgpuPnpModelScorer {
     object_buffer: Option<wgpu::Buffer>,
     observation_count: usize,
     threshold: f32,
+    last_scored_models: Vec<GpuPnpModel>,
+    last_supports: Vec<PnPModelSupport>,
 }
 
 impl WgpuPnpModelScorer {
@@ -140,6 +142,8 @@ impl WgpuPnpModelScorer {
             object_buffer: None,
             observation_count: 0,
             threshold: 0.0,
+            last_scored_models: Vec::new(),
+            last_supports: Vec::new(),
         })
     }
 
@@ -190,6 +194,8 @@ impl WgpuPnpModelScorer {
         );
         self.observation_count = normalized_points.len();
         self.threshold = threshold;
+        self.last_scored_models.clear();
+        self.last_supports.clear();
         Ok(())
     }
 
@@ -198,16 +204,22 @@ impl WgpuPnpModelScorer {
             .iter()
             .map(GpuPnpModel::from_se3)
             .collect::<Result<Vec<_>>>()?;
-        self.score_gpu_models(&models)
+        self.last_scored_models.clear();
+        self.last_supports.clear();
+        let supports = self.score_gpu_models(&models)?;
+        self.last_scored_models = models;
+        self.last_supports = supports.clone();
+        Ok(supports)
     }
 
     pub fn inlier_mask(&mut self, model: &SE3) -> Result<Vec<bool>> {
         let model = GpuPnpModel::from_se3(model)?;
         let expected = self
-            .score_gpu_models(std::slice::from_ref(&model))?
-            .into_iter()
-            .next()
-            .context("gpu pnp selected model summary missing")?;
+            .last_scored_models
+            .iter()
+            .zip(&self.last_supports)
+            .find_map(|(scored_model, support)| (*scored_model == model).then_some(*support))
+            .context("gpu pnp selected model is missing from the latest scoring batch")?;
         let mask = self.read_gpu_mask(&model)?;
         let mask_inliers = mask.iter().filter(|&&value| value).count();
         if mask_inliers != expected.inliers {
@@ -248,7 +260,7 @@ impl WgpuPnpModelScorer {
             models,
             &params,
             buffer_size::<super::GpuModelSupport>(models.len())?,
-            buffer_size::<u32>(observation_count)?,
+            std::mem::size_of::<u32>() as u64,
         )?;
         let device = self.context.device();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

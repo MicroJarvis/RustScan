@@ -7,8 +7,8 @@ mod tests {
     use crate::colmap_rng::ColmapMt19937;
     use crate::core::SE3;
     use crate::tracker::solver::{
-        compute_ransac_num_trials, pnp_ransac_chunk_end, EssentialSolver, PnPModelScorer,
-        PnPModelSupport, PnPProblem, PnPSolver, Sim3Solver, Triangulator,
+        compute_ransac_num_trials, format_pnp_ransac_timing, pnp_ransac_chunk_end, EssentialSolver,
+        PnPModelScorer, PnPModelSupport, PnPProblem, PnPSolver, Sim3Solver, Triangulator,
     };
     use glam::{Mat3, Vec3};
 
@@ -199,6 +199,24 @@ mod tests {
         assert_eq!(pnp_ransac_chunk_end(64, 200, 9, 0, 64), 10);
         assert_eq!(pnp_ransac_chunk_end(64, 200, 9, 100, 64), 101);
         assert_eq!(pnp_ransac_chunk_end(192, 200, 200, 0, 64), 200);
+    }
+
+    #[test]
+    fn pnp_timing_log_names_all_backend_stages() {
+        let log = format_pnp_ransac_timing("batch64", 32, 64, 128, [1.0, 2.0, 3.0, 4.0, 5.0]);
+        for field in [
+            "backend=batch64",
+            "observations=32",
+            "trials=64",
+            "models=128",
+            "prepare_ms=1.00",
+            "p3p_ms=2.00",
+            "score_ms=3.00",
+            "mask_ms=4.00",
+            "local_opt_ms=5.00",
+        ] {
+            assert!(log.contains(field), "timing log missing {field}: {log}");
+        }
     }
 
     #[test]

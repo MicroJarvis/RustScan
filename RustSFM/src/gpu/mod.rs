@@ -764,6 +764,39 @@ mod tests {
     }
 
     #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_mask_requires_model_from_latest_scoring_batch() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let mut scorer = WgpuPnpModelScorer::from_context(context)?;
+        let image = [[0.0, 0.0], [0.1, 0.0], [0.0, 0.1], [-0.1, 0.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [0.0, 0.2, 2.0],
+            [-0.2, 0.0, 2.0],
+        ];
+        let model = rustslam::SE3::identity();
+        scorer.prepare(&image, &world, 0.01)?;
+
+        let error = scorer
+            .inlier_mask(&model)
+            .expect_err("mask lookup must not rescore an unscored model");
+        assert!(error.to_string().contains("latest scoring batch"));
+
+        scorer.score_models(&[model])?;
+        assert_eq!(scorer.inlier_mask(&model)?, vec![true; 4]);
+        scorer.prepare(&image, &world, 0.01)?;
+        let error = scorer
+            .inlier_mask(&model)
+            .expect_err("prepare must invalidate the previous scoring batch");
+        assert!(error.to_string().contains("latest scoring batch"));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
     fn checkerboard_u8(width: u32, height: u32, tile: u32) -> Vec<u8> {
         (0..height)
             .flat_map(|y| {

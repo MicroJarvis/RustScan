@@ -12,6 +12,7 @@ use nalgebra::{
     DMatrix, Matrix3, Matrix4, SMatrix, SVector, SymmetricEigen, Vector3 as NaVec3, Vector4,
 };
 use std::f32::consts::PI;
+use std::time::Instant;
 
 type Vec3d = nalgebra::Vector3<f64>;
 type Vec4d = Vector4<f64>;
@@ -69,6 +70,7 @@ pub struct PnPModelSupport {
 pub trait PnPModelScorer {
     type Error;
 
+    /// Prepare one PnP problem. Success invalidates summaries from the previous problem.
     fn prepare(
         &mut self,
         normalized_points: &[[f32; 2]],
@@ -76,8 +78,10 @@ pub trait PnPModelScorer {
         threshold: f32,
     ) -> Result<(), Self::Error>;
 
+    /// Return one support per input model, preserving model order.
     fn score_models(&mut self, models: &[SE3]) -> Result<Vec<PnPModelSupport>, Self::Error>;
 
+    /// Return one mask value per prepared observation for a model in the latest scored batch.
     fn inlier_mask(&mut self, model: &SE3) -> Result<Vec<bool>, Self::Error>;
 }
 
@@ -95,6 +99,19 @@ pub(crate) fn pnp_ransac_chunk_end(
         .saturating_add(1)
         .min(max_trials)
         .min(iteration.saturating_add(chunk_trials))
+}
+
+pub(crate) fn format_pnp_ransac_timing(
+    backend: &str,
+    observations: usize,
+    trials: usize,
+    models: usize,
+    stages_ms: [f64; 5],
+) -> String {
+    let [prepare_ms, p3p_ms, score_ms, mask_ms, local_opt_ms] = stages_ms;
+    format!(
+        "pnp_timing backend={backend} observations={observations} trials={trials} models={models} prepare_ms={prepare_ms:.2} p3p_ms={p3p_ms:.2} score_ms={score_ms:.2} mask_ms={mask_ms:.2} local_opt_ms={local_opt_ms:.2}",
+    )
 }
 
 /// RANSAC-based PnP solver using P3P + RANSAC
@@ -278,7 +295,9 @@ impl PnPSolver {
             .collect();
 
         let threshold = (self.ransac_threshold / self.fx.max(self.fy).max(1.0)).max(1.0e-6);
+        let prepare_start = Instant::now();
         scorer.prepare(&normalized_pts, &problem.object_points, threshold)?;
+        let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
         let seed = self
             .ransac_random_seed
             .unwrap_or_else(|| deterministic_pnp_seed(&normalized_pts, &problem.object_points));
@@ -292,6 +311,11 @@ impl PnPSolver {
         let max_iterations = self.initial_max_iterations(sample_size);
         let mut dynamic_max_trials = max_iterations as usize;
         let mut iteration = 0usize;
+        let mut p3p_ms = 0.0;
+        let mut score_ms = 0.0;
+        let mut mask_ms = 0.0;
+        let mut local_opt_ms = 0.0;
+        let mut model_count = 0usize;
 
         loop {
             let chunk_end = pnp_ransac_chunk_end(
@@ -305,6 +329,7 @@ impl PnPSolver {
                 break;
             }
 
+            let p3p_start = Instant::now();
             let mut models = Vec::new();
             for _ in iteration..chunk_end {
                 let indices = self.random_indices(&mut rng, n, sample_size);
@@ -314,18 +339,25 @@ impl PnPSolver {
                     models.extend(poses);
                 }
             }
+            p3p_ms += p3p_start.elapsed().as_secs_f64() * 1000.0;
+            model_count += models.len();
 
+            let score_start = Instant::now();
             let supports = scorer.score_models(&models)?;
+            score_ms += score_start.elapsed().as_secs_f64() * 1000.0;
             for (pose, support) in models.into_iter().zip(supports) {
                 let support = InlierSupport {
                     num_inliers: support.inliers,
                     residual_sum: support.residual_sum,
                 };
                 if support.is_better_than(&best_support) {
+                    let mask_start = Instant::now();
                     let eval = PoseEvaluation {
                         inliers: scorer.inlier_mask(&pose)?,
                         support,
                     };
+                    mask_ms += mask_start.elapsed().as_secs_f64() * 1000.0;
+                    let local_opt_start = Instant::now();
                     let (local_pose, local_eval) = self.local_optimize_pose(
                         pose,
                         eval,
@@ -333,6 +365,7 @@ impl PnPSolver {
                         &problem.object_points,
                         threshold,
                     );
+                    local_opt_ms += local_opt_start.elapsed().as_secs_f64() * 1000.0;
 
                     if local_eval.support.is_better_than(&best_support) {
                         best_support = local_eval.support;
@@ -350,10 +383,21 @@ impl PnPSolver {
         }
 
         if best_pose.is_none() {
+            log::debug!(
+                "{}",
+                format_pnp_ransac_timing(
+                    if chunk_trials > 1 { "batch64" } else { "cpu" },
+                    n,
+                    iteration,
+                    model_count,
+                    [prepare_ms, p3p_ms, score_ms, mask_ms, local_opt_ms],
+                )
+            );
             return Ok(None);
         }
 
         // Refine pose with all inliers
+        let final_refine_start = Instant::now();
         if let Some(ref mut pose) = best_pose {
             if best_support.num_inliers >= 4 {
                 *pose =
@@ -365,6 +409,17 @@ impl PnPSolver {
                 }
             }
         }
+        let final_refine_ms = final_refine_start.elapsed().as_secs_f64() * 1000.0;
+        log::debug!(
+            "{} final_refine_ms={final_refine_ms:.2}",
+            format_pnp_ransac_timing(
+                if chunk_trials > 1 { "batch64" } else { "cpu" },
+                n,
+                iteration,
+                model_count,
+                [prepare_ms, p3p_ms, score_ms, mask_ms, local_opt_ms],
+            )
+        );
 
         Ok(Some((best_pose.unwrap_or(SE3::identity()), best_inliers)))
     }
