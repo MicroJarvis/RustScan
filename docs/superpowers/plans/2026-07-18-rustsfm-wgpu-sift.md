@@ -40,7 +40,7 @@ contracts.
 - Modify: `RustSFM/src/feature/sift.rs`
 - Modify: `RustSFM/src/gpu/mod.rs`
 
-- [ ] **Step 1: Write failing generic and backend validation tests**
+- [x] **Step 1: Write failing generic and backend validation tests**
 
 Add these tests under `sift::tests` and `gpu::tests`:
 
@@ -68,7 +68,7 @@ fn gpu_sift_rejects_covariant_modes_before_device_creation() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify the old placeholder rejects GPU use**
+- [x] **Step 2: Run tests and verify the old placeholder rejects GPU use**
 
 Run: `cargo test -p rustsfm --lib generic_sift_options_allow_explicit_gpu_selection --features gpu-wgpu -- --nocapture`
 
@@ -77,7 +77,7 @@ Run: `cargo test -p rustsfm --lib gpu_sift_rejects_covariant_modes_before_device
 Expected: FAIL because `gpu-wgpu` and `validate_gpu_sift_options` do not exist and generic
 validation still rejects `use_gpu=true`.
 
-- [ ] **Step 3: Add the feature and narrow backend validation**
+- [x] **Step 3: Add the feature and narrow backend validation**
 
 Use this Cargo feature shape:
 
@@ -113,7 +113,7 @@ pub fn validate_gpu_sift_options(options: &SiftExtractionOptions) -> Result<()> 
 }
 ```
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run: `cargo test -p rustsfm --lib generic_sift_options_allow_explicit_gpu_selection --features gpu-wgpu -- --nocapture`
 
@@ -121,7 +121,7 @@ Run: `cargo test -p rustsfm --lib gpu_sift_rejects_covariant_modes_before_device
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/Cargo.toml Cargo.lock RustSFM/src/feature/sift.rs RustSFM/src/gpu/mod.rs

@@ -97,12 +97,6 @@ impl SiftExtractionOptions {
                 bail!("SiftExtraction.dsp_num_scales must be > 0");
             }
         }
-        if self.use_gpu {
-            bail!(
-                "GPU SIFT extraction is not implemented yet; enable the planned wgpu backend \
-                 (COLMAP use_gpu equivalent) or use the default VLFeat CPU backend"
-            );
-        }
         Ok(())
     }
 
@@ -1156,6 +1150,16 @@ mod tests {
         assert_eq!(matching.max_distance, 0.7);
         assert!(matching.cross_check);
         assert_eq!(matching.max_num_matches, 32768);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn generic_sift_options_allow_explicit_gpu_selection() {
+        let options = SiftExtractionOptions {
+            use_gpu: true,
+            ..SiftExtractionOptions::default()
+        };
+        assert!(options.check().is_ok());
     }
 
     #[test]

@@ -6930,6 +6930,7 @@ name = "rustsfm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "cc",
  "ceres-solver",
  "clap",
@@ -6939,6 +6940,7 @@ dependencies = [
  "log",
  "lowe-sift",
  "nalgebra",
+ "pollster 0.3.0",
  "rand 0.8.5",
  "rayon",
  "rusqlite",
@@ -6947,6 +6949,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "wgpu",
 ]
 
 [[package]]

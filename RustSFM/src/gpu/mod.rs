@@ -29,6 +29,22 @@ pub trait GpuSiftExtractor {
     ) -> Result<SiftFeatures>;
 }
 
+pub fn validate_gpu_sift_options(options: &SiftExtractionOptions) -> Result<()> {
+    if options.estimate_affine_shape {
+        bail!("wgpu SIFT does not support affine shape estimation");
+    }
+    if options.domain_size_pooling {
+        bail!("wgpu SIFT does not support domain-size pooling");
+    }
+    if options.force_covariant_extractor {
+        bail!("wgpu SIFT does not support the covariant extractor");
+    }
+    if options.first_octave < -1 {
+        bail!("wgpu SIFT first_octave must be >= -1");
+    }
+    Ok(())
+}
+
 /// Placeholder wgpu backend. Phase 2 will replace this with a real implementation.
 #[derive(Debug, Default)]
 pub struct WgpuSiftExtractor;
@@ -56,5 +72,22 @@ impl GpuSiftExtractor for WgpuSiftExtractor {
         _options: &SiftExtractionOptions,
     ) -> Result<SiftFeatures> {
         bail!("wgpu SIFT extraction is not implemented yet")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_sift_rejects_covariant_modes_before_device_creation() {
+        let options = SiftExtractionOptions {
+            use_gpu: true,
+            estimate_affine_shape: true,
+            ..SiftExtractionOptions::default()
+        };
+        let error = validate_gpu_sift_options(&options).unwrap_err();
+        assert!(error.to_string().contains("affine shape"));
     }
 }

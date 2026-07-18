@@ -5,7 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = ["ceres-ba", "vlfeat-sift"]
+default = ["ceres-ba", "vlfeat-sift", "gpu-wgpu"]
+gpu-wgpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
 lowe-sift-backend = []
 poselib = []
 ceres-ba = ["dep:ceres-solver"]
@@ -15,6 +16,7 @@ vlfeat-sift = []
 rustscan-types = { path = "../rustscan-types" }
 ceres-solver = { version = "0.5", optional = true, features = ["source"] }
 anyhow = "1"
+bytemuck = { version = "1.25", features = ["derive"], optional = true }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 glam = "0.25"
@@ -22,6 +24,7 @@ image = "0.25"
 log = "0.4"
 lowe-sift = "0.2.1"
 nalgebra = "0.33"
+pollster = { version = "0.3", optional = true }
 rand = "0.8"
 rayon = "1.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -29,6 +32,7 @@ rustslam = { path = "../RustSLAM", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+wgpu = { version = "29.0.1", features = ["wgsl"], optional = true }
 
 [build-dependencies]
 cc = "1"
