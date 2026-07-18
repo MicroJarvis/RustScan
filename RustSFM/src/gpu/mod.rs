@@ -25,7 +25,7 @@ pub use context::WgpuContext;
 pub use matcher::WgpuSiftMatcher;
 #[cfg(feature = "gpu-wgpu")]
 pub use pnp_scorer::WgpuPnpModelScorer;
-#[cfg(feature = "gpu-wgpu")]
+#[cfg(all(feature = "gpu-wgpu", test))]
 pub(crate) use pnp_scorer::{GpuPnpImagePoint, GpuPnpModel, GpuPnpObjectPoint};
 #[cfg(feature = "gpu-wgpu")]
 pub(crate) use scorer::WgpuModelScoringSession;

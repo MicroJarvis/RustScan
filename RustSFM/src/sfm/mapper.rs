@@ -44,7 +44,7 @@ use image::ImageReader;
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, SMatrix, SVector, Vector3};
 use rayon::prelude::*;
 use rustslam::features::HammingMatcher;
-use rustslam::tracker::{PnPProblem, PnPSolver};
+use rustslam::tracker::{PnPModelScorer, PnPProblem, PnPSolver};
 use rustslam::{FeatureMatcher, SE3};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
@@ -93,6 +93,23 @@ pub use reconstruction_input::{reference_camera_setup, ReconstructionSeed, Refer
 pub use state::InitialPairFailure;
 use state::{IncrementalMapperSession, InitialPairSelectionState, RegistrationStats};
 
+type DynPnPModelScorer = dyn PnPModelScorer<Error = anyhow::Error>;
+
+#[derive(Debug)]
+struct GpuPnpMapperError(String);
+
+impl std::fmt::Display for GpuPnpMapperError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GpuPnpMapperError {}
+
+fn gpu_pnp_mapper_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(GpuPnpMapperError(message.into()))
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabasePairMatches {
     pub left: usize,
@@ -102,6 +119,59 @@ pub struct DatabasePairMatches {
 
 pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary> {
     run_reconstruction_with_callbacks(config, None)
+}
+
+fn validate_gpu_pnp_config(config: &MapperConfig, has_global_mapper: bool) -> Result<()> {
+    if !config.use_gpu_pnp {
+        return Ok(());
+    }
+    if has_global_mapper {
+        bail!("gpu pnp is only supported by the incremental mapper, not the global mapper");
+    }
+    #[cfg(not(feature = "gpu-wgpu"))]
+    bail!("gpu pnp requires RustSFM to be compiled with the gpu-wgpu feature");
+    #[cfg(feature = "gpu-wgpu")]
+    Ok(())
+}
+
+fn validate_gpu_pnp_route(
+    estimate_focal: bool,
+    generalized: bool,
+    structureless: bool,
+) -> Result<()> {
+    if estimate_focal {
+        return Err(gpu_pnp_mapper_error(
+            "gpu pnp does not support focal length estimation",
+        ));
+    }
+    if generalized {
+        return Err(gpu_pnp_mapper_error(
+            "gpu pnp does not support generalized rig absolute pose",
+        ));
+    }
+    if structureless {
+        return Err(gpu_pnp_mapper_error(
+            "gpu pnp does not support structureless absolute pose",
+        ));
+    }
+    Ok(())
+}
+
+fn create_gpu_pnp_scorer(config: &MapperConfig) -> Result<Option<Box<DynPnPModelScorer>>> {
+    if !config.use_gpu_pnp {
+        return Ok(None);
+    }
+    #[cfg(feature = "gpu-wgpu")]
+    {
+        let scorer = crate::gpu::WgpuPnpModelScorer::try_new().map_err(|error| {
+            gpu_pnp_mapper_error(format!("failed to initialize gpu pnp scorer: {error:#}"))
+        })?;
+        Ok(Some(Box::new(scorer)))
+    }
+    #[cfg(not(feature = "gpu-wgpu"))]
+    {
+        bail!("gpu pnp requires RustSFM to be compiled with the gpu-wgpu feature")
+    }
 }
 
 pub fn run_reconstruction_with_callbacks(
@@ -117,6 +187,8 @@ fn run_reconstruction_impl(
 ) -> Result<ReconstructionSummary> {
     let mut runtime_config = config.clone();
     let config = &mut runtime_config;
+    validate_gpu_pnp_config(config, config.global_mapper)?;
+    let mut pnp_scorer = create_gpu_pnp_scorer(config)?;
     if let Some(threads) = config.threads {
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(threads.max(1))
@@ -379,33 +451,43 @@ fn run_reconstruction_impl(
             .cloned()
             .context("global mapper kept no reconstruction")?;
         (reconstructions, reconstruction, pipeline_debug)
-    } else if let Some(callback_sink) = callback_sink {
-        let pipeline_result = incremental_pipeline_map_with_callbacks(
-            &frames,
-            camera,
-            reference_camera_setup.as_ref(),
-            &pairs,
-            config,
-            Some(callback_sink),
-        )?;
-        let reconstruction = pipeline_result
-            .reconstructions
-            .first()
-            .cloned()
-            .context("incremental pipeline kept no reconstruction")?;
-        (
-            pipeline_result.reconstructions,
-            reconstruction,
-            pipeline_result.debug_log,
-        )
     } else {
-        let pipeline_result = incremental_pipeline_map(
-            &frames,
-            camera,
-            reference_camera_setup.as_ref(),
-            &pairs,
-            config,
-        )?;
+        let pipeline_result = match (callback_sink, pnp_scorer.as_deref_mut()) {
+            (None, None) => incremental_pipeline_map(
+                &frames,
+                camera,
+                reference_camera_setup.as_ref(),
+                &pairs,
+                config,
+            ),
+            (None, Some(scorer)) => incremental_pipeline_map_with_pnp_scorer(
+                &frames,
+                camera,
+                reference_camera_setup.as_ref(),
+                &pairs,
+                config,
+                Some(scorer),
+            ),
+            (Some(callback), None) => incremental_pipeline_map_with_callbacks(
+                &frames,
+                camera,
+                reference_camera_setup.as_ref(),
+                &pairs,
+                config,
+                Some(callback),
+            ),
+            (Some(callback), Some(scorer)) => {
+                incremental_pipeline_map_with_pnp_scorer_and_callbacks(
+                    &frames,
+                    camera,
+                    reference_camera_setup.as_ref(),
+                    &pairs,
+                    config,
+                    Some(callback),
+                    Some(scorer),
+                )
+            }
+        }?;
         let reconstruction = pipeline_result
             .reconstructions
             .first()
@@ -1750,7 +1832,7 @@ fn incremental_pipeline_map(
     pairs: &[PairGeometry],
     config: &MapperConfig,
 ) -> Result<IncrementalPipelineMapResult> {
-    incremental_pipeline_map_with_callbacks(
+    incremental_pipeline_map_with_pnp_scorer(
         frames,
         camera,
         reference_camera_setup,
@@ -1760,14 +1842,57 @@ fn incremental_pipeline_map(
     )
 }
 
+fn incremental_pipeline_map_with_pnp_scorer(
+    frames: &[ImageFrame],
+    camera: CameraModel,
+    reference_camera_setup: Option<&ReferenceCameraSetup>,
+    pairs: &[PairGeometry],
+    config: &MapperConfig,
+    pnp_scorer: Option<&mut DynPnPModelScorer>,
+) -> Result<IncrementalPipelineMapResult> {
+    incremental_pipeline_map_with_pnp_scorer_and_callbacks(
+        frames,
+        camera,
+        reference_camera_setup,
+        pairs,
+        config,
+        None,
+        pnp_scorer,
+    )
+}
+
 fn incremental_pipeline_map_with_callbacks(
     frames: &[ImageFrame],
     camera: CameraModel,
     reference_camera_setup: Option<&ReferenceCameraSetup>,
     pairs: &[PairGeometry],
     config: &MapperConfig,
-    mut callback_sink: Option<&mut dyn PipelineCallbackSink>,
+    callback_sink: Option<&mut dyn PipelineCallbackSink>,
 ) -> Result<IncrementalPipelineMapResult> {
+    incremental_pipeline_map_with_pnp_scorer_and_callbacks(
+        frames,
+        camera,
+        reference_camera_setup,
+        pairs,
+        config,
+        callback_sink,
+        None,
+    )
+}
+
+fn incremental_pipeline_map_with_pnp_scorer_and_callbacks(
+    frames: &[ImageFrame],
+    camera: CameraModel,
+    reference_camera_setup: Option<&ReferenceCameraSetup>,
+    pairs: &[PairGeometry],
+    config: &MapperConfig,
+    mut callback_sink: Option<&mut dyn PipelineCallbackSink>,
+    pnp_scorer: Option<&mut DynPnPModelScorer>,
+) -> Result<IncrementalPipelineMapResult> {
+    if config.use_gpu_pnp && pnp_scorer.is_none() {
+        bail!("gpu pnp was requested but no gpu scorer is available");
+    }
+    let mut pnp_scorer = pnp_scorer;
     let mut session = IncrementalMapperSession::default();
     let mut reconstructions = Vec::new();
     let mut debug_log = Vec::new();
@@ -1796,7 +1921,7 @@ fn incremental_pipeline_map_with_callbacks(
             let attempt_setup =
                 setup_for_reconstruction_attempt(reference_camera_setup, attempt_uses_seed);
             let model_index = reconstructions.len();
-            match incremental_map_single_attempt(
+            match incremental_map_single_attempt_with_pnp_scorer(
                 frames,
                 camera,
                 attempt_setup.as_ref(),
@@ -1805,6 +1930,7 @@ fn incremental_pipeline_map_with_callbacks(
                 &mut session,
                 model_index,
                 &mut callback_sink,
+                &mut pnp_scorer,
             ) {
                 Ok((reconstruction, mut attempt_log)) => {
                     let registered_images = registered_image_count(&reconstruction);
@@ -1856,6 +1982,9 @@ fn incremental_pipeline_map_with_callbacks(
                     }
                 }
                 Err(err) => {
+                    if err.downcast_ref::<GpuPnpMapperError>().is_some() {
+                        return Err(err);
+                    }
                     let message = err.to_string();
                     let initial_failure = err.downcast_ref::<InitialPairFailure>().copied();
                     debug_log.push(format!(
@@ -2134,6 +2263,32 @@ fn incremental_map_single_attempt(
     model_index: usize,
     callback_sink: &mut Option<&mut dyn PipelineCallbackSink>,
 ) -> Result<(Reconstruction, Vec<String>)> {
+    let mut pnp_scorer = None;
+    incremental_map_single_attempt_with_pnp_scorer(
+        frames,
+        camera,
+        reference_camera_setup,
+        pairs,
+        config,
+        session,
+        model_index,
+        callback_sink,
+        &mut pnp_scorer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incremental_map_single_attempt_with_pnp_scorer(
+    frames: &[ImageFrame],
+    camera: CameraModel,
+    reference_camera_setup: Option<&ReferenceCameraSetup>,
+    pairs: &[PairGeometry],
+    config: &MapperConfig,
+    session: &mut IncrementalMapperSession,
+    model_index: usize,
+    callback_sink: &mut Option<&mut dyn PipelineCallbackSink>,
+    pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
+) -> Result<(Reconstruction, Vec<String>)> {
     let mut debug_log = Vec::new();
     let (
         cameras,
@@ -2325,7 +2480,7 @@ fn incremental_map_single_attempt(
         let NextRegistrationSelection {
             choice,
             failed_attempts,
-        } = choose_next_registration_with_failures(
+        } = choose_next_registration_with_failures_and_pnp_scorer(
             frames,
             pairs,
             &reconstruction,
@@ -2337,7 +2492,8 @@ fn incremental_map_single_attempt(
             &camera_has_prior_focal_length,
             &registration_stats,
             triangulation_state.observation_manager(),
-        );
+            pnp_scorer,
+        )?;
         for (failed_image, mode) in failed_attempts {
             increment_registration_unit_trials_for_mode(
                 &reconstruction,
@@ -2609,7 +2765,7 @@ fn incremental_map_single_attempt(
             &mut reg_trials,
             &mut structureless_reg_trials,
         );
-        mark_unregistered_images_with_no_absolute_pose(
+        mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
             frames,
             pairs,
             &reconstruction,
@@ -2619,7 +2775,8 @@ fn incremental_map_single_attempt(
             &camera_has_prior_focal_length,
             &registration_stats,
             triangulation_state.observation_manager(),
-        );
+            pnp_scorer,
+        )?;
     }
     if should_run_final_global_ba(&global_ba_schedule, &reconstruction, config) {
         refine_global_bundle_with_postprocessing(
@@ -2877,6 +3034,7 @@ fn choose_next_registration(
     .choice
 }
 
+#[cfg(test)]
 fn choose_next_registration_with_failures(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
@@ -2890,6 +3048,39 @@ fn choose_next_registration_with_failures(
     registration_stats: &RegistrationStats,
     obs_manager: &ObservationManager,
 ) -> NextRegistrationSelection {
+    let mut pnp_scorer = None;
+    choose_next_registration_with_failures_and_pnp_scorer(
+        frames,
+        pairs,
+        reconstruction,
+        reg_trials,
+        structureless_reg_trials,
+        filtered_units,
+        config,
+        camera_priors,
+        camera_has_prior_focal_length,
+        registration_stats,
+        obs_manager,
+        &mut pnp_scorer,
+    )
+    .expect("CPU absolute pose routes are infallible")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_next_registration_with_failures_and_pnp_scorer(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    reg_trials: &[usize],
+    structureless_reg_trials: &[usize],
+    filtered_units: &HashSet<RegistrationUnitKey>,
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
+    obs_manager: &ObservationManager,
+    pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
+) -> Result<NextRegistrationSelection> {
     let correspondence_graph = obs_manager.correspondence_graph();
     let mut failed_attempts = Vec::new();
     for mode in next_registration_modes(config) {
@@ -2903,7 +3094,7 @@ fn choose_next_registration_with_failures(
             mode,
         );
         for image in next_images {
-            if let Some(choice) = registration_choice_for_image(
+            if let Some(choice) = registration_choice_for_image_with_pnp_scorer(
                 image,
                 frames,
                 pairs,
@@ -2915,20 +3106,21 @@ fn choose_next_registration_with_failures(
                 obs_manager,
                 correspondence_graph,
                 mode,
-            ) {
-                return NextRegistrationSelection {
+                pnp_scorer,
+            )? {
+                return Ok(NextRegistrationSelection {
                     choice: Some(choice),
                     failed_attempts,
-                };
+                });
             } else {
                 failed_attempts.push((image, mode));
             }
         }
     }
-    NextRegistrationSelection {
+    Ok(NextRegistrationSelection {
         choice: None,
         failed_attempts,
-    }
+    })
 }
 
 fn next_registration_modes(config: &MapperConfig) -> Vec<NextImageRegistrationMode> {
@@ -3041,7 +3233,8 @@ fn sort_and_append_next_images(mut image_ranks: Vec<(usize, f32)>, ranked_images
     ranked_images.extend(image_ranks.into_iter().map(|(image, _)| image));
 }
 
-fn registration_choice_for_image(
+#[allow(clippy::too_many_arguments)]
+fn registration_choice_for_image_with_pnp_scorer(
     image: usize,
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
@@ -3053,7 +3246,8 @@ fn registration_choice_for_image(
     obs_manager: &ObservationManager,
     correspondence_graph: Option<&CorrespondenceGraph>,
     mode: NextImageRegistrationMode,
-) -> Option<RegistrationChoice> {
+    pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
+) -> Result<Option<RegistrationChoice>> {
     let registration_reconstruction =
         reconstruction_with_reset_frame_cameras(reconstruction, image, config, camera_priors);
     let (abs_pose, source) = match mode {
@@ -3066,7 +3260,10 @@ fn registration_choice_for_image(
                 camera_has_prior_focal_length,
                 registration_stats,
             ) {
-                let abs_pose = solve_generalized_frame_absolute_pose(
+                if pnp_scorer.is_some() {
+                    validate_gpu_pnp_route(false, true, false)?;
+                }
+                let Some(abs_pose) = solve_generalized_frame_absolute_pose(
                     image,
                     frames,
                     pairs,
@@ -3076,9 +3273,11 @@ fn registration_choice_for_image(
                     camera_has_prior_focal_length,
                     registration_stats,
                     correspondence_graph,
-                )?;
+                ) else {
+                    return Ok(None);
+                };
                 (abs_pose, "generalized_frame")
-            } else if let Some(abs_pose) = solve_absolute_pose(
+            } else if let Some(abs_pose) = solve_absolute_pose_with_pnp_scorer(
                 image,
                 frames,
                 pairs,
@@ -3088,14 +3287,18 @@ fn registration_choice_for_image(
                 camera_has_prior_focal_length,
                 registration_stats,
                 correspondence_graph,
-            ) {
+                pnp_scorer.as_deref_mut(),
+            )? {
                 (abs_pose, "pnp")
             } else {
-                return None;
+                return Ok(None);
             }
         }
         NextImageRegistrationMode::StructureLess => {
-            let abs_pose = solve_structureless_absolute_pose(
+            if pnp_scorer.is_some() {
+                validate_gpu_pnp_route(false, false, true)?;
+            }
+            let Some(abs_pose) = solve_structureless_absolute_pose(
                 image,
                 frames,
                 pairs,
@@ -3105,19 +3308,21 @@ fn registration_choice_for_image(
                 camera_priors,
                 registration_stats,
                 correspondence_graph,
-            )?;
+            ) else {
+                return Ok(None);
+            };
             (abs_pose, "structureless")
         }
     };
     let pair_rot_error =
         registered_pair_rotation_error(image, abs_pose.pose, pairs, reconstruction);
     if !pair_rot_error.is_finite() || pair_rot_error > absolute_pose_pair_rotation_limit_deg() {
-        return None;
+        return Ok(None);
     }
     let visible_points = obs_manager.num_visible_points3d(image);
     let num_observations = obs_manager.num_observations(image).max(1);
     let visible_points_ratio = visible_points as f32 / num_observations as f32;
-    Some(RegistrationChoice {
+    Ok(Some(RegistrationChoice {
         image,
         pose: abs_pose.pose,
         camera: abs_pose.camera,
@@ -3131,7 +3336,7 @@ fn registration_choice_for_image(
         structureless_inliers: abs_pose.structureless_inliers,
         frame_image_poses: abs_pose.frame_image_poses,
         generalized_inliers: abs_pose.generalized_inliers,
-    })
+    }))
 }
 
 fn next_image_rank(
@@ -3191,6 +3396,7 @@ fn registration_rank(
     next_image_rank(reconstruction, choice.image, obs_manager, config)
 }
 
+#[cfg(test)]
 fn mark_unregistered_images_with_no_absolute_pose(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
@@ -3202,6 +3408,35 @@ fn mark_unregistered_images_with_no_absolute_pose(
     registration_stats: &RegistrationStats,
     obs_manager: &ObservationManager,
 ) {
+    let mut pnp_scorer = None;
+    mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
+        frames,
+        pairs,
+        reconstruction,
+        reg_trials,
+        config,
+        camera_priors,
+        camera_has_prior_focal_length,
+        registration_stats,
+        obs_manager,
+        &mut pnp_scorer,
+    )
+    .expect("CPU absolute pose routes are infallible");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    reg_trials: &mut [usize],
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
+    obs_manager: &ObservationManager,
+    pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
+) -> Result<()> {
     let mut marked_units = HashSet::new();
     for image in 0..reconstruction.poses.len() {
         if registration_unit_is_registered(reconstruction, image)
@@ -3218,23 +3453,26 @@ fn mark_unregistered_images_with_no_absolute_pose(
             image,
             reconstruction,
             config,
-            &obs_manager,
+            obs_manager,
             camera_has_prior_focal_length,
             registration_stats,
         ) {
+            if pnp_scorer.is_some() {
+                validate_gpu_pnp_route(false, true, false)?;
+            }
             solve_generalized_frame_absolute_pose(
                 image,
                 frames,
                 pairs,
                 reconstruction,
                 config,
-                &obs_manager,
+                obs_manager,
                 camera_has_prior_focal_length,
                 registration_stats,
                 obs_manager.correspondence_graph(),
             )
         } else {
-            solve_absolute_pose(
+            solve_absolute_pose_with_pnp_scorer(
                 image,
                 frames,
                 pairs,
@@ -3244,22 +3482,28 @@ fn mark_unregistered_images_with_no_absolute_pose(
                 camera_has_prior_focal_length,
                 registration_stats,
                 obs_manager.correspondence_graph(),
+                pnp_scorer.as_deref_mut(),
+            )?
+        };
+        let pose = if structure_based_pose.is_some() {
+            structure_based_pose
+        } else {
+            if pnp_scorer.is_some() {
+                validate_gpu_pnp_route(false, false, true)?;
+            }
+            solve_structureless_absolute_pose(
+                image,
+                frames,
+                pairs,
+                reconstruction,
+                config,
+                obs_manager,
+                camera_priors,
+                registration_stats,
+                obs_manager.correspondence_graph(),
             )
         };
-        let has_pose = structure_based_pose
-            .or_else(|| {
-                solve_structureless_absolute_pose(
-                    image,
-                    frames,
-                    pairs,
-                    reconstruction,
-                    config,
-                    &obs_manager,
-                    camera_priors,
-                    registration_stats,
-                    obs_manager.correspondence_graph(),
-                )
-            })
+        let has_pose = pose
             .map(|pose| {
                 let pair_rot_error =
                     registered_pair_rotation_error(image, pose.pose, pairs, reconstruction);
@@ -3271,6 +3515,7 @@ fn mark_unregistered_images_with_no_absolute_pose(
             increment_registration_unit_trials(reconstruction, image, reg_trials);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7064,6 +7309,7 @@ fn collect_absolute_pose_observations_from_pairs(
     pose_observations
 }
 
+#[cfg(test)]
 fn solve_absolute_pose(
     image: usize,
     frames: &[ImageFrame],
@@ -7075,6 +7321,34 @@ fn solve_absolute_pose(
     registration_stats: &RegistrationStats,
     graph: Option<&CorrespondenceGraph>,
 ) -> Option<AbsolutePose> {
+    solve_absolute_pose_with_pnp_scorer(
+        image,
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        camera_priors,
+        camera_has_prior_focal_length,
+        registration_stats,
+        graph,
+        None,
+    )
+    .expect("CPU absolute pose route is infallible")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_absolute_pose_with_pnp_scorer(
+    image: usize,
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+    camera_priors: &[CameraModel],
+    camera_has_prior_focal_length: &[bool],
+    registration_stats: &RegistrationStats,
+    graph: Option<&CorrespondenceGraph>,
+    pnp_scorer: Option<&mut DynPnPModelScorer>,
+) -> Result<Option<AbsolutePose>> {
     let camera = registration_camera_for_image(
         image,
         reconstruction,
@@ -7083,13 +7357,13 @@ fn solve_absolute_pose(
         registration_stats,
     );
     if camera_has_bogus_params(camera, config) {
-        return None;
+        return Ok(None);
     }
     let pose_observations =
         collect_absolute_pose_observations(image, frames, pairs, reconstruction, config, graph);
     let num_correspondences = pose_observations.len();
     if num_correspondences < config.abs_pose_min_num_inliers.max(4) {
-        return None;
+        return Ok(None);
     }
     let estimate_focal = absolute_pose_estimate_focal_length_enabled(
         image,
@@ -7099,22 +7373,29 @@ fn solve_absolute_pose(
         camera_has_prior_focal_length,
         registration_stats,
     );
-    let (pose, inliers, camera) = solve_absolute_pose_with_camera_hypotheses(
+    let Some((pose, inliers, camera)) = solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
         &pose_observations,
         camera,
         estimate_focal,
         config,
-    )?;
-    let initial_eval =
-        evaluate_absolute_pose(pose, &pose_observations, Some(&inliers), camera, config)?;
+        pnp_scorer,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(initial_eval) =
+        evaluate_absolute_pose(pose, &pose_observations, Some(&inliers), camera, config)
+    else {
+        return Ok(None);
+    };
     if !accept_absolute_pose_eval(initial_eval, num_correspondences, config) {
-        return None;
+        return Ok(None);
     }
     let refinement_observations = inlier_absolute_pose_observations(&pose_observations, &inliers);
     if refinement_observations.len() < config.abs_pose_min_num_inliers {
-        return None;
+        return Ok(None);
     }
-    let (pose, camera) = refine_absolute_pose_reprojection(
+    let Some((pose, camera)) = refine_absolute_pose_reprojection(
         pose,
         image,
         frames,
@@ -7129,12 +7410,17 @@ fn solve_absolute_pose(
             registration_stats,
         ),
         config,
-    )?;
-    let final_eval = evaluate_absolute_pose(pose, &pose_observations, None, camera, config)?;
+    ) else {
+        return Ok(None);
+    };
+    let Some(final_eval) = evaluate_absolute_pose(pose, &pose_observations, None, camera, config)
+    else {
+        return Ok(None);
+    };
     if !accept_absolute_pose_eval(final_eval, num_correspondences, config) {
-        return None;
+        return Ok(None);
     }
-    Some(AbsolutePose {
+    Ok(Some(AbsolutePose {
         pose,
         camera,
         inliers: final_eval.inliers,
@@ -7143,7 +7429,7 @@ fn solve_absolute_pose(
         structureless_inliers: Vec::new(),
         frame_image_poses: Vec::new(),
         generalized_inliers: Vec::new(),
-    })
+    }))
 }
 
 fn inlier_absolute_pose_observations(
@@ -7163,27 +7449,54 @@ fn inlier_absolute_pose_observations(
         .collect()
 }
 
+#[cfg(test)]
 fn solve_absolute_pose_with_camera_hypotheses(
     observations: &[AbsolutePoseObservation],
     camera: CameraModel,
     estimate_focal: bool,
     config: &MapperConfig,
 ) -> Option<(SE3, Vec<bool>, CameraModel)> {
+    solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
+        observations,
+        camera,
+        estimate_focal,
+        config,
+        None,
+    )
+    .expect("CPU absolute pose route is infallible")
+}
+
+fn solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    estimate_focal: bool,
+    config: &MapperConfig,
+    pnp_scorer: Option<&mut DynPnPModelScorer>,
+) -> Result<Option<(SE3, Vec<bool>, CameraModel)>> {
     if estimate_focal {
-        return solve_absolute_pose_with_focal_estimation(observations, camera, config);
+        if pnp_scorer.is_some() {
+            validate_gpu_pnp_route(true, false, false)?;
+        }
+        return Ok(solve_absolute_pose_with_focal_estimation(
+            observations,
+            camera,
+            config,
+        ));
     }
     let mut best = None::<(AbsolutePoseEval, SE3, Vec<bool>, CameraModel)>;
-    let Some((pose, inliers)) = solve_absolute_pose_for_camera(observations, camera, config) else {
-        return None;
+    let Some((pose, inliers)) =
+        solve_absolute_pose_for_camera_with_pnp_scorer(observations, camera, config, pnp_scorer)?
+    else {
+        return Ok(None);
     };
     let Some(eval) = evaluate_absolute_pose(pose, observations, Some(&inliers), camera, config)
     else {
-        return None;
+        return Ok(None);
     };
     if accept_absolute_pose_eval(eval, observations.len(), config) {
         best = Some((eval, pose, inliers, camera));
     }
-    best.map(|(_, pose, inliers, camera)| (pose, inliers, camera))
+    Ok(best.map(|(_, pose, inliers, camera)| (pose, inliers, camera)))
 }
 
 fn solve_absolute_pose_with_focal_estimation(
@@ -7239,6 +7552,16 @@ fn solve_absolute_pose_for_camera(
     camera: CameraModel,
     config: &MapperConfig,
 ) -> Option<(SE3, Vec<bool>)> {
+    solve_absolute_pose_for_camera_with_pnp_scorer(observations, camera, config, None)
+        .expect("CPU PnP scorer is infallible")
+}
+
+fn solve_absolute_pose_for_camera_with_pnp_scorer(
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    config: &MapperConfig,
+    pnp_scorer: Option<&mut DynPnPModelScorer>,
+) -> Result<Option<(SE3, Vec<bool>)>> {
     let solver = PnPSolver {
         ransac_threshold: camera.cam_from_img_threshold(config.pnp_threshold_px as f64) as f32,
         ransac_confidence: 0.99999,
@@ -7250,10 +7573,20 @@ fn solve_absolute_pose_for_camera(
     };
     let mut problem = PnPProblem::new();
     for observation in observations {
-        let norm_xy = camera.cam_from_img_f32(observation.xy[0], observation.xy[1])?;
+        let Some(norm_xy) = camera.cam_from_img_f32(observation.xy[0], observation.xy[1]) else {
+            return Ok(None);
+        };
         problem.add_correspondence(norm_xy, observation.xyz);
     }
-    solver.solve(&problem)
+    if let Some(scorer) = pnp_scorer {
+        solver
+            .solve_with_model_scorer(&problem, scorer)
+            .map_err(|error| {
+                gpu_pnp_mapper_error(format!("gpu pnp absolute pose scoring failed: {error:#}"))
+            })
+    } else {
+        Ok(solver.solve(&problem))
+    }
 }
 
 fn absolute_pose_ransac_seed(config: &MapperConfig) -> u64 {
@@ -9389,6 +9722,170 @@ mod tests {
             experimental_structureless_pair_pose_fallback: true,
             ..MapperConfig::default()
         }
+    }
+
+    #[test]
+    fn mapper_gpu_pnp_is_disabled_by_default() {
+        assert!(!MapperConfig::default().use_gpu_pnp);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn mapper_gpu_pnp_rejects_focal_estimation_route() {
+        let error =
+            validate_gpu_pnp_route(true, false, false).expect_err("focal route must reject");
+        assert!(error.to_string().contains("focal"));
+        assert!(error.downcast_ref::<GpuPnpMapperError>().is_some());
+
+        let error =
+            validate_gpu_pnp_route(false, true, false).expect_err("generalized route must reject");
+        assert!(error.to_string().contains("generalized"));
+        let error = validate_gpu_pnp_route(false, false, true)
+            .expect_err("structureless route must reject");
+        assert!(error.to_string().contains("structureless"));
+    }
+
+    #[test]
+    fn mapper_gpu_pnp_rejects_global_mapper() {
+        let config = MapperConfig {
+            use_gpu_pnp: true,
+            global_mapper: true,
+            ..MapperConfig::default()
+        };
+        let error = validate_gpu_pnp_config(&config, true).expect_err("global route must reject");
+        assert!(error.to_string().contains("global mapper"));
+    }
+
+    #[cfg(not(feature = "gpu-wgpu"))]
+    #[test]
+    fn mapper_gpu_pnp_requires_compiled_backend() {
+        let config = MapperConfig {
+            use_gpu_pnp: true,
+            ..MapperConfig::default()
+        };
+        let error =
+            validate_gpu_pnp_config(&config, false).expect_err("missing backend must reject");
+        assert!(error.to_string().contains("gpu-wgpu"));
+    }
+
+    struct FailingMapperPnpScorer;
+
+    impl PnPModelScorer for FailingMapperPnpScorer {
+        type Error = anyhow::Error;
+
+        fn prepare(
+            &mut self,
+            _normalized_points: &[[f32; 2]],
+            _object_points: &[[f32; 3]],
+            _threshold: f32,
+        ) -> Result<(), Self::Error> {
+            bail!("simulated device loss")
+        }
+
+        fn score_models(
+            &mut self,
+            _models: &[SE3],
+        ) -> Result<Vec<rustslam::tracker::PnPModelSupport>, Self::Error> {
+            unreachable!("prepare must fail")
+        }
+
+        fn inlier_mask(&mut self, _model: &SE3) -> Result<Vec<bool>, Self::Error> {
+            unreachable!("prepare must fail")
+        }
+    }
+
+    #[test]
+    fn mapper_gpu_pnp_scorer_errors_keep_gpu_marker() {
+        let camera = CameraModel::new_pinhole(640, 480, 700.0, 700.0, 320.0, 240.0);
+        let observations = [
+            AbsolutePoseObservation {
+                feature: 0,
+                xy: [320.0, 240.0],
+                xyz: [0.0, 0.0, 4.0],
+            },
+            AbsolutePoseObservation {
+                feature: 1,
+                xy: [390.0, 240.0],
+                xyz: [0.4, 0.0, 4.0],
+            },
+            AbsolutePoseObservation {
+                feature: 2,
+                xy: [320.0, 310.0],
+                xyz: [0.0, 0.4, 4.0],
+            },
+            AbsolutePoseObservation {
+                feature: 3,
+                xy: [376.0, 296.0],
+                xyz: [0.4, 0.4, 5.0],
+            },
+        ];
+        let mut scorer = FailingMapperPnpScorer;
+        let error = solve_absolute_pose_for_camera_with_pnp_scorer(
+            &observations,
+            camera,
+            &MapperConfig::default(),
+            Some(&mut scorer),
+        )
+        .expect_err("GPU scorer error must propagate");
+
+        assert!(error.to_string().contains("simulated device loss"));
+        assert!(error.downcast_ref::<GpuPnpMapperError>().is_some());
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn mapper_gpu_pnp_matches_known_intrinsics_cpu_mask() -> Result<()> {
+        let Some(context) = crate::gpu::WgpuContext::try_new_optional()? else {
+            eprintln!("skipping mapper GPU PnP test: no compatible adapter");
+            return Ok(());
+        };
+        let camera = CameraModel::new_pinhole(640, 480, 700.0, 700.0, 320.0, 240.0);
+        let expected_pose = SE3::from_axis_angle(&[0.015, -0.01, 0.02], &[0.3, -0.12, 0.55]);
+        let observations = (0..32)
+            .map(|index| {
+                let xyz = [
+                    ((index % 8) as f32 - 3.5) * 0.22,
+                    ((index / 8) as f32 - 1.5) * 0.27,
+                    4.2 + (index % 5) as f32 * 0.3,
+                ];
+                let point = expected_pose.transform_point(&xyz);
+                let mut xy = [
+                    camera.fx * point[0] / point[2] + camera.cx,
+                    camera.fy * point[1] / point[2] + camera.cy,
+                ];
+                if index >= 26 {
+                    xy[0] += 80.0;
+                    xy[1] -= 60.0;
+                }
+                AbsolutePoseObservation {
+                    feature: index,
+                    xy,
+                    xyz,
+                }
+            })
+            .collect::<Vec<_>>();
+        let config = MapperConfig {
+            pnp_threshold_px: 2.0,
+            pnp_iterations: 512,
+            abs_pose_min_inlier_ratio: 0.0,
+            random_seed: 7,
+            ..MapperConfig::default()
+        };
+        let cpu = solve_absolute_pose_for_camera(&observations, camera, &config)
+            .expect("CPU known-intrinsics PnP");
+        let mut scorer = crate::gpu::WgpuPnpModelScorer::from_context(context)?;
+        let gpu = solve_absolute_pose_for_camera_with_pnp_scorer(
+            &observations,
+            camera,
+            &config,
+            Some(&mut scorer),
+        )?
+        .expect("GPU known-intrinsics PnP");
+        let cpu_inliers = cpu.1.iter().filter(|&&value| value).count();
+        let gpu_inliers = gpu.1.iter().filter(|&&value| value).count();
+        assert_eq!(gpu.1, cpu.1);
+        assert!(gpu_inliers * 10 >= cpu_inliers * 9);
+        Ok(())
     }
 
     fn assert_vec3_near(actual: glam::Vec3, expected: glam::Vec3, tolerance: f32) {
