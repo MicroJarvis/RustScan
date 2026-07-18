@@ -31,7 +31,7 @@
 - Modify: `RustSLAM/src/tracker/mod.rs`
 - Test: `RustSLAM/src/tracker/solver.rs` test module
 
-- [ ] **Step 1: Write the failing contract and ordering tests**
+- [x] **Step 1: Write the failing contract and ordering tests**
 
 Add the following public backend-neutral types in `solver.rs` before `PnPSolver`:
 
@@ -92,13 +92,13 @@ fn pnp_model_scorer_errors_propagate() {
 
 The test must fail to compile because `PnPModelScorer` and `solve_with_model_scorer` do not exist yet.
 
-- [ ] **Step 2: Run the contract tests and verify RED**
+- [x] **Step 2: Run the contract tests and verify RED**
 
 Run: `cargo test -p rustslam pnp_model_scorer -- --nocapture`
 
 Expected: FAIL with unresolved `PnPModelScorer`/`solve_with_model_scorer` symbols, not with a test typo or missing fixture.
 
-- [ ] **Step 3: Add the backend contract and public re-exports**
+- [x] **Step 3: Add the backend contract and public re-exports**
 
 Add `PnPModelSupport` and `PnPModelScorer` exactly as specified above and re-export them from `RustSLAM/src/tracker/mod.rs`:
 
@@ -108,7 +108,7 @@ pub use solver::{PnPModelScorer, PnPModelSupport, PnPFocalResult, PnPProblem, Pn
 
 Keep the trait free of wgpu, anyhow, and RustSFM types. Its associated error type lets RustSFM use `anyhow::Error` without adding anyhow to RustSLAM.
 
-- [ ] **Step 4: Add the fallible 64-trial solver path**
+- [x] **Step 4: Add the fallible 64-trial solver path**
 
 Refactor the current `PnPSolver::solve` loop into an internal generic function with the following shape:
 
@@ -157,7 +157,7 @@ pub fn solve_with_model_scorer<S: PnPModelScorer + ?Sized>(
 
 The existing CPU `solve` wrapper calls the same backend with `chunk_trials = 1`, so its per-trial dynamic abort and deterministic behavior remain unchanged. The CPU adapter must use the current `evaluate_pose` implementation, including its existing `z <= 0` projection-to-zero behavior. Do not alter focal estimation or `solve_with_estimated_focal`.
 
-- [ ] **Step 5: Run RustSLAM solver tests and commit the contract**
+- [x] **Step 5: Run RustSLAM solver tests and commit the contract**
 
 Run: `cargo test -p rustslam pnp_model_scorer -- --nocapture`
 
@@ -178,7 +178,7 @@ git commit -m "feat(rustslam): add batchable PnP scoring contract"
 - Modify: `RustSFM/src/gpu/mod.rs`
 - Test: `RustSFM/src/gpu/mod.rs` GPU tests
 
-- [ ] **Step 1: Write failing ABI and residual tests**
+- [x] **Step 1: Write failing ABI and residual tests**
 
 Add tests guarded by `#[cfg(feature = "gpu-wgpu")]` that skip when `WgpuContext::try_new_optional()` returns `None`:
 
@@ -207,13 +207,13 @@ fn wgpu_pnp_scorer_matches_cpu_projection_and_mask() -> anyhow::Result<()> {
 
 The test must fail because the scorer types and shader are not present.
 
-- [ ] **Step 2: Run the GPU scorer tests and verify RED**
+- [x] **Step 2: Run the GPU scorer tests and verify RED**
 
 Run: `cargo test -p rustsfm --lib wgpu_pnp_ --features gpu-wgpu -- --nocapture`
 
 Expected: FAIL with missing scorer symbols before any adapter-dependent assertion.
 
-- [ ] **Step 3: Implement the owned scorer and WGSL pipeline**
+- [x] **Step 3: Implement the owned scorer and WGSL pipeline**
 
 Implement `WgpuPnpModelScorer` with `from_context`, `try_new`, `prepare`, `score_models`, and `inlier_mask`. The scorer owns its observation buffers, bind-group layout, support pipeline, and mask pipeline so `prepare` can replace only the two observation buffers while retaining the device and pipelines across mapper solves. Use a 64-lane workgroup and one workgroup per model. The shader reads `[R | t]`, projects each 3D point, uses `[0, 0]` for non-positive z, and reduces only finite residuals that are below `threshold^2`.
 
@@ -245,7 +245,7 @@ impl PnPModelScorer for WgpuPnpModelScorer {
 
 Add `#[cfg(feature = "gpu-wgpu")] mod pnp_scorer;` and re-export `WgpuPnpModelScorer` from `RustSFM/src/gpu/mod.rs`. In non-GPU builds, do not expose a fake scoring implementation; explicit mapper requests must fail at configuration/runtime routing.
 
-- [ ] **Step 4: Run scorer tests and GPU feature checks**
+- [x] **Step 4: Run scorer tests and GPU feature checks**
 
 Run: `cargo test -p rustsfm --lib wgpu_pnp_ --features gpu-wgpu -- --nocapture`
 
@@ -265,7 +265,7 @@ git commit -m "feat(rustsfm): add wgpu PnP model scorer"
 - Modify: `RustSFM/src/sfm/mapper.rs`
 - Test: `RustSFM/src/sfm/mapper.rs` mapper tests
 
-- [ ] **Step 1: Write failing mapper routing/error tests**
+- [x] **Step 1: Write failing mapper routing/error tests**
 
 Add tests for the default and explicit route:
 
@@ -289,7 +289,7 @@ Run: `cargo test -p rustsfm --lib mapper::tests::mapper_gpu_pnp --features gpu-w
 
 Expected: FAIL because `use_gpu_pnp`, validation, and the backend-aware mapper helper are undefined.
 
-- [ ] **Step 2: Add config validation and persistent scorer creation**
+- [x] **Step 2: Add config validation and persistent scorer creation**
 
 Add `pub use_gpu_pnp: bool` to `MapperConfig`, defaulting to `false`. Add `validate_gpu_pnp_config(config: &MapperConfig, has_global_mapper: bool) -> anyhow::Result<()>` that rejects GPU PnP with the global mapper and returns a clear error when the crate lacks `gpu-wgpu`. Add `validate_gpu_pnp_route(estimate_focal: bool, generalized: bool, structureless: bool) -> anyhow::Result<()>` for route-specific rejection. Under `gpu-wgpu`, `run_reconstruction_impl` creates one `WgpuPnpModelScorer` after configuration validation and passes it only to the incremental pipeline. The global mapper branch never receives it.
 
@@ -308,7 +308,7 @@ fn incremental_pipeline_map_with_pnp_scorer(
 
 Thread the optional scorer through registration selection only; triangulation, BA, global mapper, and structureless registration remain unchanged.
 
-- [ ] **Step 3: Add fallible known-intrinsics absolute-pose backend**
+- [x] **Step 3: Add fallible known-intrinsics absolute-pose backend**
 
 Preserve existing `Option` helpers as CPU wrappers and add an internal fallible helper with an optional scorer. For the known-camera path, build the same normalized `PnPProblem` and call `PnPSolver::solve_with_model_scorer` when a scorer is supplied. For the CPU path call the existing `solve` method. Keep `evaluate_absolute_pose`, inlier-only reprojection refinement, camera parameter refinement, and acceptance thresholds shared.
 
@@ -316,7 +316,7 @@ When `use_gpu_pnp=true`, return an error instead of entering `solve_with_estimat
 
 Thread `Result<Option<AbsolutePose>>` through the scorer-aware registration choice and `mark_unregistered_images_with_no_absolute_pose` wrappers. Existing CPU test helpers continue to call the infallible wrappers and retain their signatures.
 
-- [ ] **Step 4: Run mapper parity and CPU regression tests**
+- [x] **Step 4: Run mapper parity and CPU regression tests**
 
 Run: `cargo test -p rustsfm --lib mapper::tests --features gpu-wgpu -- --nocapture`
 
@@ -337,7 +337,7 @@ git commit -m "feat(rustsfm): route mapper PnP scoring through wgpu"
 - Modify: `RustSFM/src/cli/commands.rs`
 - Test: `RustSFM/src/cli/mod.rs` and `RustSFM/src/cli/commands.rs` tests
 
-- [ ] **Step 1: Write failing CLI parsing tests**
+- [x] **Step 1: Write failing CLI parsing tests**
 
 Add parser tests for both native and COLMAP-compatible forms:
 
@@ -363,13 +363,13 @@ Run: `cargo test -p rustsfm --bin rustsfm cli::tests:: -- --nocapture`
 
 Expected: FAIL because both fields are undefined.
 
-- [ ] **Step 2: Implement flag mapping and command validation**
+- [x] **Step 2: Implement flag mapping and command validation**
 
 Add `use_gpu_pnp: bool` to native `ReconstructArgs`, `use_gpu_pnp: Option<i32>` to `ColmapMapperArgs`, and the corresponding optional field to the resolved mapper project options. Map `--use-gpu-pnp` directly into `MapperConfig`. Parse `--Mapper.use_gpu_pnp` with the existing `colmap_optional_bool` helper and pass it through `run_colmap_mapper`.
 
 The command must report the scorer's contextual error and exit nonzero when the feature is not compiled, no adapter exists, or an unsupported mapper route is selected. It must not print a successful reconstruction summary after a GPU PnP error.
 
-- [ ] **Step 3: Run CLI tests and CPU-only command compilation**
+- [x] **Step 3: Run CLI tests and CPU-only command compilation**
 
 Run: `cargo test -p rustsfm --bin rustsfm --features gpu-wgpu -- --nocapture`
 
@@ -390,7 +390,7 @@ git commit -m "feat(rustsfm): expose explicit GPU PnP mapper flag"
 - Modify: `docs/superpowers/plans/2026-07-18-rustsfm-wgpu-pnp.md`
 - Modify: mapper debug reporting only if timing fields are not already available.
 
-- [ ] **Step 1: Run focused GPU and CPU verification**
+- [x] **Step 1: Run focused GPU and CPU verification**
 
 Run:
 
@@ -405,13 +405,13 @@ cargo fmt -p rustsfm -- --check
 
 Expected: all focused tests pass or skip only for unavailable GPU adapters; CPU-only compile and formatting succeed.
 
-- [ ] **Step 2: Run the full non-fixture library suite and record known baseline failures**
+- [x] **Step 2: Run the full non-fixture library suite and record known baseline failures**
 
 Run: `cargo test -p rustsfm --lib --features gpu-wgpu -- --skip real_colmap_sparse`
 
 Expected: the existing non-fixture suite passes. The local ignored `flowers2_colmap` symlink currently has zero image observations/point tracks, so the 19 `real_colmap_sparse` tests remain a data-fixture blocker documented by the previous plan.
 
-- [ ] **Step 3: Run static checks and review changed-file diagnostics**
+- [x] **Step 3: Run static checks and review changed-file diagnostics**
 
 Run: `cargo clippy -p rustslam --lib --no-deps -- -D warnings`
 
@@ -419,11 +419,19 @@ Run: `cargo clippy -p rustsfm --lib --features gpu-wgpu --no-deps --message-form
 
 Record repository baseline diagnostics, and fix any diagnostic introduced in the new or modified lines. Run `git diff --check` and inspect every staged hunk before committing.
 
-- [ ] **Step 4: Benchmark the real dataset without changing user data**
+Observed baseline: strict clippy reports 105 existing RustSLAM diagnostics and 138 existing RustSFM diagnostics. The new timing helper initially triggered `too_many_arguments`; its stage values were subsequently grouped into a fixed array, and the modified lines no longer add that diagnostic.
+
+- [x] **Step 4: Benchmark the real dataset without changing user data**
 
 Use separate output directories and fixed seeds for CPU and GPU mapper runs on `/Users/tfjiang/Projects/RustScan/test_data/flowers2`. Record the existing debug timing lines plus P3P candidate generation, GPU summary/mask readback, local optimization, registered image count, and point count. Compare GPU quality against the CPU run and require at least 95% of CPU registered images and points before calling the acceleration usable.
 
-- [ ] **Step 5: Review and commit the completed plan**
+Observed results:
+
+- CPU baseline on 16 consecutive images: `registered_images=16`, `points=4674`, `pairs=49`, `elapsed_ms=5567.68`; mapper timings were `extract=4591.70 ms`, `pairs=5.35 ms`, and `incremental=911.33 ms`.
+- The same GPU command selected the Apple M5 Max Metal adapter and emitted `pnp_timing backend=batch64` for known-intrinsics PnP solves. Final review removed a redundant summary dispatch/readback from every mask request and reduced the unused score-only mask allocation to a four-byte binding placeholder; repeated timings were approximately `score_ms=2.6-2.7` and `mask_ms=1.3-1.5` for the representative solves. The run then reached the explicit unsupported `structureless absolute pose` route and returned an error without CPU fallback (`real=5.46 s`), so no GPU quality/count comparison is valid yet. End-to-end acceleration is therefore not called usable until that route is implemented or excluded by configuration.
+- The 19 `real_colmap_sparse` tests remain a fixture blocker: `test_data/flowers2_colmap` points to a sparse export with zero image observations and zero point tracks.
+
+- [x] **Step 5: Review and commit the completed plan**
 
 After fresh verification, update all checkboxes and the observed baseline note in this plan. Use `superpowers:requesting-code-review` for a final review, then commit only the plan/status update if it is not already included in the implementation commits:
 
