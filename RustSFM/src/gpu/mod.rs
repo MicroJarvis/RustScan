@@ -13,12 +13,16 @@ mod context;
 #[cfg(feature = "gpu-wgpu")]
 mod matcher;
 #[cfg(feature = "gpu-wgpu")]
+mod scorer;
+#[cfg(feature = "gpu-wgpu")]
 mod sift;
 
 #[cfg(feature = "gpu-wgpu")]
 pub use context::WgpuContext;
 #[cfg(feature = "gpu-wgpu")]
 pub use matcher::WgpuSiftMatcher;
+#[cfg(feature = "gpu-wgpu")]
+pub use scorer::{GpuModelSupport, TwoViewModelKind, WgpuModelScorer};
 
 #[cfg(feature = "gpu-wgpu")]
 use self::sift::{SiftDescriptorComputer, SiftDetector, SiftOrientationAssigner, SiftPyramid};
@@ -543,6 +547,149 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 0), (1, 1)]
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_scores_homographies_and_reads_mask() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let points1 = [[0.0, 0.0], [1.0, 2.0], [-3.0, 4.0]];
+        let points2 = points1;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let translated = [1.0, 0.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let summaries = scorer.score_two_view_models(
+            &[identity, translated],
+            &points1,
+            &points2,
+            0.1,
+            TwoViewModelKind::HomographyForward,
+        )?;
+        assert_eq!(summaries[0].inliers, 3);
+        assert!(summaries[0].residual_sum.abs() < 1.0e-6);
+        assert_eq!(summaries[1].inliers, 0);
+        assert_eq!(
+            scorer.inlier_mask(
+                &identity,
+                &points1,
+                &points2,
+                0.1,
+                TwoViewModelKind::HomographyForward,
+            )?,
+            vec![true, true, true]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_matches_sampson_support() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let model = [0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0];
+        let points1 = [[0.0, 0.0], [1.0, 2.0], [-3.0, 4.0]];
+        let points2 = [[5.0, 0.0], [2.0, 2.0], [1.0, 5.0]];
+        let summaries = scorer.score_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            0.1,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(summaries[0].inliers, 2);
+        assert!(summaries[0].residual_sum.abs() < 1.0e-6);
+        assert_eq!(
+            scorer.inlier_mask(&model, &points1, &points2, 0.1, TwoViewModelKind::Sampson,)?,
+            vec![true, true, false]
+        );
+        let boundary = scorer.score_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            1.0,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(boundary[0].inliers, 3);
+        assert!((boundary[0].residual_sum - 0.5).abs() < 1.0e-6);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_keeps_degenerate_models_outliers() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let support = scorer.score_two_view_models(
+            &[[0.0; 9]],
+            &[[1.0, 2.0]],
+            &[[1.0, 2.0]],
+            f32::MAX,
+            TwoViewModelKind::HomographyForward,
+        )?;
+        assert_eq!(support[0].inliers, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_validates_inputs_and_handles_empty_observations() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(
+            scorer.score_two_view_models(
+                &[identity],
+                &[],
+                &[],
+                1.0,
+                TwoViewModelKind::HomographyForward,
+            )?,
+            vec![GpuModelSupport::default()]
+        );
+        assert!(scorer
+            .inlier_mask(
+                &identity,
+                &[],
+                &[],
+                1.0,
+                TwoViewModelKind::HomographyForward,
+            )?
+            .is_empty());
+        assert!(scorer
+            .score_two_view_models(
+                &[identity],
+                &[[0.0, 0.0]],
+                &[],
+                1.0,
+                TwoViewModelKind::HomographyForward,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("point count mismatch"));
+        assert!(scorer
+            .score_two_view_models(
+                &[identity],
+                &[],
+                &[],
+                -1.0,
+                TwoViewModelKind::HomographyForward,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("finite and non-negative"));
         Ok(())
     }
 
