@@ -14,9 +14,16 @@ struct SupportSummary {
     residual_sum: f32,
 }
 
+struct HomogeneousPoint {
+    x: f32,
+    y: f32,
+    z: f32,
+    pad: f32,
+}
+
 @group(0) @binding(0) var<storage, read> models: array<f32>;
-@group(0) @binding(1) var<storage, read> points1: array<vec2<f32>>;
-@group(0) @binding(2) var<storage, read> points2: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read> points1: array<HomogeneousPoint>;
+@group(0) @binding(2) var<storage, read> points2: array<HomogeneousPoint>;
 @group(0) @binding(3) var<storage, read_write> summaries: array<SupportSummary>;
 @group(0) @binding(4) var<storage, read_write> mask: array<u32>;
 @group(0) @binding(5) var<uniform> params: ScoringParams;
@@ -40,26 +47,32 @@ fn model_value(model_index: u32, row: u32, column: u32) -> f32 {
     return models[model_index * 9u + row * 3u + column];
 }
 
+fn point_vector(point: HomogeneousPoint) -> vec3<f32> {
+    return vec3<f32>(point.x, point.y, point.z);
+}
+
 fn homography_forward_residual(
     model_index: u32,
-    point1: vec2<f32>,
-    point2: vec2<f32>,
+    point1: vec3<f32>,
+    point2: vec3<f32>,
 ) -> f32 {
-    let z = model_value(model_index, 2u, 0u) * point1.x
+    let predicted_z = model_value(model_index, 2u, 0u) * point1.x
         + model_value(model_index, 2u, 1u) * point1.y
-        + model_value(model_index, 2u, 2u);
-    if (!is_finite_f32(z) || abs(z) <= 1.0e-12) {
+        + model_value(model_index, 2u, 2u) * point1.z;
+    if (!is_finite_f32(predicted_z) || abs(predicted_z) <= 1.0e-12
+        || !is_finite_f32(point2.z) || abs(point2.z) <= 1.0e-12) {
         return invalid_residual();
     }
     let predicted = vec2<f32>(
         (model_value(model_index, 0u, 0u) * point1.x
             + model_value(model_index, 0u, 1u) * point1.y
-            + model_value(model_index, 0u, 2u)) / z,
+            + model_value(model_index, 0u, 2u) * point1.z) / predicted_z,
         (model_value(model_index, 1u, 0u) * point1.x
             + model_value(model_index, 1u, 1u) * point1.y
-            + model_value(model_index, 1u, 2u)) / z,
+            + model_value(model_index, 1u, 2u) * point1.z) / predicted_z,
     );
-    let delta = predicted - point2;
+    let observed = point2.xy / point2.z;
+    let delta = predicted - observed;
     let residual = dot(delta, delta);
     if (!is_finite_f32(residual)) {
         return invalid_residual();
@@ -69,32 +82,32 @@ fn homography_forward_residual(
 
 fn sampson_residual(
     model_index: u32,
-    point1: vec2<f32>,
-    point2: vec2<f32>,
+    point1: vec3<f32>,
+    point2: vec3<f32>,
 ) -> f32 {
     let fx1 = vec3<f32>(
         model_value(model_index, 0u, 0u) * point1.x
             + model_value(model_index, 0u, 1u) * point1.y
-            + model_value(model_index, 0u, 2u),
+            + model_value(model_index, 0u, 2u) * point1.z,
         model_value(model_index, 1u, 0u) * point1.x
             + model_value(model_index, 1u, 1u) * point1.y
-            + model_value(model_index, 1u, 2u),
+            + model_value(model_index, 1u, 2u) * point1.z,
         model_value(model_index, 2u, 0u) * point1.x
             + model_value(model_index, 2u, 1u) * point1.y
-            + model_value(model_index, 2u, 2u),
+            + model_value(model_index, 2u, 2u) * point1.z,
     );
     let ftx2 = vec3<f32>(
         model_value(model_index, 0u, 0u) * point2.x
             + model_value(model_index, 1u, 0u) * point2.y
-            + model_value(model_index, 2u, 0u),
+            + model_value(model_index, 2u, 0u) * point2.z,
         model_value(model_index, 0u, 1u) * point2.x
             + model_value(model_index, 1u, 1u) * point2.y
-            + model_value(model_index, 2u, 1u),
+            + model_value(model_index, 2u, 1u) * point2.z,
         model_value(model_index, 0u, 2u) * point2.x
             + model_value(model_index, 1u, 2u) * point2.y
-            + model_value(model_index, 2u, 2u),
+            + model_value(model_index, 2u, 2u) * point2.z,
     );
-    let numerator = point2.x * fx1.x + point2.y * fx1.y + fx1.z;
+    let numerator = point2.x * fx1.x + point2.y * fx1.y + point2.z * fx1.z;
     let denominator = fx1.x * fx1.x + fx1.y * fx1.y
         + ftx2.x * ftx2.x + ftx2.y * ftx2.y;
     if (!is_finite_f32(denominator) || denominator <= 1.0e-24) {
@@ -111,15 +124,15 @@ fn model_residual(model_index: u32, observation_index: u32) -> f32 {
     if (params.model_kind == MODEL_HOMOGRAPHY_FORWARD) {
         return homography_forward_residual(
             model_index,
-            points1[observation_index],
-            points2[observation_index],
+            point_vector(points1[observation_index]),
+            point_vector(points2[observation_index]),
         );
     }
     if (params.model_kind == MODEL_SAMPSON) {
         return sampson_residual(
             model_index,
-            points1[observation_index],
-            points2[observation_index],
+            point_vector(points1[observation_index]),
+            point_vector(points2[observation_index]),
         );
     }
     return invalid_residual();

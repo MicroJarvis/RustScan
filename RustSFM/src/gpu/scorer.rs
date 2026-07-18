@@ -42,11 +42,48 @@ struct ScoringParams {
     pad2: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuHomogeneousPoint {
+    x: f32,
+    y: f32,
+    z: f32,
+    pad: f32,
+}
+
+impl GpuHomogeneousPoint {
+    fn from_xy(point: [f32; 2]) -> Self {
+        Self {
+            x: point[0],
+            y: point[1],
+            z: 1.0,
+            pad: 0.0,
+        }
+    }
+
+    fn from_xyz(point: [f32; 3]) -> Self {
+        Self {
+            x: point[0],
+            y: point[1],
+            z: point[2],
+            pad: 0.0,
+        }
+    }
+}
+
 pub struct WgpuModelScorer {
     context: Arc<WgpuContext>,
     bind_group_layout: wgpu::BindGroupLayout,
     score_pipeline: wgpu::ComputePipeline,
     mask_pipeline: wgpu::ComputePipeline,
+}
+
+pub(crate) struct WgpuModelScoringSession<'a> {
+    scorer: &'a WgpuModelScorer,
+    points1: wgpu::Buffer,
+    points2: wgpu::Buffer,
+    observation_count: u32,
+    observation_len: usize,
 }
 
 impl WgpuModelScorer {
@@ -118,56 +155,96 @@ impl WgpuModelScorer {
         threshold: f32,
         kind: TwoViewModelKind,
     ) -> Result<Vec<GpuModelSupport>> {
-        let observation_count = validate_observations(points1, points2, threshold)?;
-        let model_count = u32::try_from(models.len()).context("GPU model count exceeds u32")?;
+        validate_point_counts(points1.len(), points2.len())?;
+        validate_threshold(threshold)?;
         if models.is_empty() {
             return Ok(Vec::new());
         }
-        self.validate_dispatch_count(model_count, "model")?;
         if points1.is_empty() {
             return Ok(vec![GpuModelSupport::default(); models.len()]);
         }
-        self.validate_storage_slice("models", models)?;
+        let points1 = points1
+            .iter()
+            .copied()
+            .map(GpuHomogeneousPoint::from_xy)
+            .collect::<Vec<_>>();
+        let points2 = points2
+            .iter()
+            .copied()
+            .map(GpuHomogeneousPoint::from_xy)
+            .collect::<Vec<_>>();
+        self.prepare_session(&points1, &points2)?
+            .score_two_view_models(models, threshold, kind)
+    }
+
+    pub(crate) fn score_homogeneous_two_view_models(
+        &self,
+        models: &[[f32; 9]],
+        points1: &[[f32; 3]],
+        points2: &[[f32; 3]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> Result<Vec<GpuModelSupport>> {
+        validate_point_counts(points1.len(), points2.len())?;
+        validate_threshold(threshold)?;
+        if models.is_empty() {
+            return Ok(Vec::new());
+        }
+        if points1.is_empty() {
+            return Ok(vec![GpuModelSupport::default(); models.len()]);
+        }
+        self.prepare_homogeneous_session(points1, points2)?
+            .score_two_view_models(models, threshold, kind)
+    }
+
+    pub(crate) fn prepare_homogeneous_session(
+        &self,
+        points1: &[[f32; 3]],
+        points2: &[[f32; 3]],
+    ) -> Result<WgpuModelScoringSession<'_>> {
+        validate_point_counts(points1.len(), points2.len())?;
+        if points1.is_empty() {
+            bail!("GPU model scoring session requires at least one observation");
+        }
+        let points1 = points1
+            .iter()
+            .copied()
+            .map(GpuHomogeneousPoint::from_xyz)
+            .collect::<Vec<_>>();
+        let points2 = points2
+            .iter()
+            .copied()
+            .map(GpuHomogeneousPoint::from_xyz)
+            .collect::<Vec<_>>();
+        self.prepare_session(&points1, &points2)
+    }
+
+    fn prepare_session(
+        &self,
+        points1: &[GpuHomogeneousPoint],
+        points2: &[GpuHomogeneousPoint],
+    ) -> Result<WgpuModelScoringSession<'_>> {
+        let observation_count = validate_point_counts(points1.len(), points2.len())?;
         self.validate_storage_slice("first points", points1)?;
         self.validate_storage_slice("second points", points2)?;
-        self.validate_storage_elements::<GpuModelSupport>("support summaries", models.len())?;
-
-        let params = ScoringParams {
-            model_count,
+        let device = self.context.device();
+        let points1_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rustsfm model scorer first points"),
+            contents: bytemuck::cast_slice(points1),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let points2_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rustsfm model scorer second points"),
+            contents: bytemuck::cast_slice(points2),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        Ok(WgpuModelScoringSession {
+            scorer: self,
+            points1: points1_buffer,
+            points2: points2_buffer,
             observation_count,
-            model_kind: kind.shader_value(),
-            selected_model: 0,
-            max_residual: squared_threshold(threshold),
-            pad0: 0.0,
-            pad1: 0.0,
-            pad2: 0.0,
-        };
-        let (bind_group, summaries, _mask) = self.create_bind_group(
-            models,
-            points1,
-            points2,
-            &params,
-            buffer_size::<GpuModelSupport>(models.len())?,
-            std::mem::size_of::<u32>() as u64,
-        );
-        let mut encoder =
-            self.context
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("rustsfm model scorer support encoder"),
-                });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rustsfm model scorer support pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.score_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(model_count, 1, 1);
-        }
-        self.context.queue().submit(Some(encoder.finish()));
-        self.context
-            .read_buffer::<GpuModelSupport>(&summaries, models.len())
+            observation_len: points1.len(),
+        })
     }
 
     /// Returns the observation mask for one row-major model and an unsquared threshold.
@@ -179,132 +256,23 @@ impl WgpuModelScorer {
         threshold: f32,
         kind: TwoViewModelKind,
     ) -> Result<Vec<bool>> {
-        let observation_count = validate_observations(points1, points2, threshold)?;
+        validate_point_counts(points1.len(), points2.len())?;
+        validate_threshold(threshold)?;
         if points1.is_empty() {
             return Ok(Vec::new());
         }
-        let workgroups = observation_count.div_ceil(64);
-        self.validate_dispatch_count(workgroups, "mask")?;
-        self.validate_storage_slice("model", std::slice::from_ref(model))?;
-        self.validate_storage_slice("first points", points1)?;
-        self.validate_storage_slice("second points", points2)?;
-        self.validate_storage_elements::<u32>("inlier mask", points1.len())?;
-
-        let params = ScoringParams {
-            model_count: 1,
-            observation_count,
-            model_kind: kind.shader_value(),
-            selected_model: 0,
-            max_residual: squared_threshold(threshold),
-            pad0: 0.0,
-            pad1: 0.0,
-            pad2: 0.0,
-        };
-        let (bind_group, _summaries, mask) = self.create_bind_group(
-            std::slice::from_ref(model),
-            points1,
-            points2,
-            &params,
-            std::mem::size_of::<GpuModelSupport>() as u64,
-            buffer_size::<u32>(points1.len())?,
-        );
-        let mut encoder =
-            self.context
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("rustsfm model scorer mask encoder"),
-                });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rustsfm model scorer mask pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.mask_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
-        }
-        self.context.queue().submit(Some(encoder.finish()));
-        Ok(self
-            .context
-            .read_buffer::<u32>(&mask, points1.len())?
-            .into_iter()
-            .map(|value| value != 0)
-            .collect())
-    }
-
-    fn create_bind_group(
-        &self,
-        models: &[[f32; 9]],
-        points1: &[[f32; 2]],
-        points2: &[[f32; 2]],
-        params: &ScoringParams,
-        summary_size: u64,
-        mask_size: u64,
-    ) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer) {
-        let device = self.context.device();
-        let model_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rustsfm model scorer models"),
-            contents: bytemuck::cast_slice(models),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let points1_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rustsfm model scorer first points"),
-            contents: bytemuck::cast_slice(points1),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let points2_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rustsfm model scorer second points"),
-            contents: bytemuck::cast_slice(points2),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let summaries = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rustsfm model scorer summaries"),
-            size: summary_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mask = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rustsfm model scorer mask"),
-            size: mask_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rustsfm model scorer params"),
-            contents: bytemuck::bytes_of(params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rustsfm model scorer bind group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: model_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: points1_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: points2_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: summaries.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: mask.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        (bind_group, summaries, mask)
+        let points1 = points1
+            .iter()
+            .copied()
+            .map(GpuHomogeneousPoint::from_xy)
+            .collect::<Vec<_>>();
+        let points2 = points2
+            .iter()
+            .copied()
+            .map(GpuHomogeneousPoint::from_xy)
+            .collect::<Vec<_>>();
+        self.prepare_session(&points1, &points2)?
+            .inlier_mask(model, threshold, kind)
     }
 
     fn validate_dispatch_count(&self, workgroups: u32, label: &str) -> Result<()> {
@@ -338,22 +306,197 @@ impl WgpuModelScorer {
     }
 }
 
-fn validate_observations(
-    points1: &[[f32; 2]],
-    points2: &[[f32; 2]],
-    threshold: f32,
-) -> Result<u32> {
-    if points1.len() != points2.len() {
+impl WgpuModelScoringSession<'_> {
+    pub(crate) fn score_two_view_models(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> Result<Vec<GpuModelSupport>> {
+        validate_threshold(threshold)?;
+        let model_count = u32::try_from(models.len()).context("GPU model count exceeds u32")?;
+        if models.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.scorer.validate_dispatch_count(model_count, "model")?;
+        self.scorer.validate_storage_slice("models", models)?;
+        self.scorer
+            .validate_storage_elements::<GpuModelSupport>("support summaries", models.len())?;
+
+        let params = ScoringParams {
+            model_count,
+            observation_count: self.observation_count,
+            model_kind: kind.shader_value(),
+            selected_model: 0,
+            max_residual: squared_threshold(threshold),
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        };
+        let (bind_group, summaries, _mask) = self.create_bind_group(
+            models,
+            &params,
+            buffer_size::<GpuModelSupport>(models.len())?,
+            std::mem::size_of::<u32>() as u64,
+        );
+        let mut encoder =
+            self.scorer
+                .context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rustsfm model scorer support encoder"),
+                });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rustsfm model scorer support pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.scorer.score_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(model_count, 1, 1);
+        }
+        self.scorer.context.queue().submit(Some(encoder.finish()));
+        self.scorer
+            .context
+            .read_buffer::<GpuModelSupport>(&summaries, models.len())
+    }
+
+    pub(crate) fn inlier_mask(
+        &self,
+        model: &[f32; 9],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> Result<Vec<bool>> {
+        validate_threshold(threshold)?;
+        let workgroups = self.observation_count.div_ceil(64);
+        self.scorer.validate_dispatch_count(workgroups, "mask")?;
+        self.scorer
+            .validate_storage_slice("model", std::slice::from_ref(model))?;
+        self.scorer
+            .validate_storage_elements::<u32>("inlier mask", self.observation_len)?;
+
+        let params = ScoringParams {
+            model_count: 1,
+            observation_count: self.observation_count,
+            model_kind: kind.shader_value(),
+            selected_model: 0,
+            max_residual: squared_threshold(threshold),
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        };
+        let (bind_group, _summaries, mask) = self.create_bind_group(
+            std::slice::from_ref(model),
+            &params,
+            std::mem::size_of::<GpuModelSupport>() as u64,
+            buffer_size::<u32>(self.observation_len)?,
+        );
+        let mut encoder =
+            self.scorer
+                .context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rustsfm model scorer mask encoder"),
+                });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rustsfm model scorer mask pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.scorer.mask_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.scorer.context.queue().submit(Some(encoder.finish()));
+        Ok(self
+            .scorer
+            .context
+            .read_buffer::<u32>(&mask, self.observation_len)?
+            .into_iter()
+            .map(|value| value != 0)
+            .collect())
+    }
+
+    fn create_bind_group(
+        &self,
+        models: &[[f32; 9]],
+        params: &ScoringParams,
+        summary_size: u64,
+        mask_size: u64,
+    ) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer) {
+        let device = self.scorer.context.device();
+        let model_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rustsfm model scorer models"),
+            contents: bytemuck::cast_slice(models),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let summaries = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rustsfm model scorer summaries"),
+            size: summary_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mask = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rustsfm model scorer mask"),
+            size: mask_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rustsfm model scorer params"),
+            contents: bytemuck::bytes_of(params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rustsfm model scorer bind group"),
+            layout: &self.scorer.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: model_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.points1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.points2.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: summaries.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: mask.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        (bind_group, summaries, mask)
+    }
+}
+
+fn validate_point_counts(points1_len: usize, points2_len: usize) -> Result<u32> {
+    if points1_len != points2_len {
         bail!(
             "GPU model scorer point count mismatch: {} != {}",
-            points1.len(),
-            points2.len()
+            points1_len,
+            points2_len
         );
     }
+    u32::try_from(points1_len).context("GPU model scorer observation count exceeds u32")
+}
+
+fn validate_threshold(threshold: f32) -> Result<()> {
     if !threshold.is_finite() || threshold < 0.0 {
         bail!("GPU model scorer threshold must be finite and non-negative");
     }
-    u32::try_from(points1.len()).context("GPU model scorer observation count exceeds u32")
+    Ok(())
 }
 
 fn squared_threshold(threshold: f32) -> f32 {

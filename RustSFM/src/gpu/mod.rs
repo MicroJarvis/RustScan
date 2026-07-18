@@ -22,6 +22,8 @@ pub use context::WgpuContext;
 #[cfg(feature = "gpu-wgpu")]
 pub use matcher::WgpuSiftMatcher;
 #[cfg(feature = "gpu-wgpu")]
+pub(crate) use scorer::WgpuModelScoringSession;
+#[cfg(feature = "gpu-wgpu")]
 pub use scorer::{GpuModelSupport, TwoViewModelKind, WgpuModelScorer};
 
 #[cfg(feature = "gpu-wgpu")]
@@ -618,6 +620,37 @@ mod tests {
         )?;
         assert_eq!(boundary[0].inliers, 3);
         assert!((boundary[0].residual_sum - 0.5).abs() < 1.0e-6);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_preserves_homogeneous_sampson_scaling() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let model = [0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0];
+        let points1 = [[1.0, 4.0, 2.0]];
+        let points2 = [[3.0, 6.0, 2.0]];
+        let rejected = scorer.score_homogeneous_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            1.0,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(rejected[0].inliers, 0);
+        let accepted = scorer.score_homogeneous_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            2.0,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(accepted[0].inliers, 1);
+        assert!((accepted[0].residual_sum - 2.0).abs() < 1.0e-6);
         Ok(())
     }
 
