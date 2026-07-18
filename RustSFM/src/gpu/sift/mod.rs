@@ -2,7 +2,9 @@ mod plan;
 mod types;
 
 pub(crate) use plan::SiftPlan;
-pub(crate) use types::{DetectorParams, GpuKeypoint, PyramidParams, SiftUniforms};
+pub(crate) use types::{
+    DetectorParams, GpuKeypoint, OrientationParams, PyramidParams, SiftUniforms,
+};
 
 use crate::gpu::WgpuContext;
 use anyhow::{bail, Context, Result};
@@ -11,6 +13,7 @@ use wgpu::util::DeviceExt;
 
 const PYRAMID_SHADER: &str = include_str!("../shaders/sift_pyramid.wgsl");
 const DETECT_SHADER: &str = include_str!("../shaders/sift_detect.wgsl");
+const ORIENTATION_SHADER: &str = include_str!("../shaders/sift_orientation.wgsl");
 const WORKGROUP_SIZE: u32 = 16;
 
 pub(crate) struct SiftPyramid {
@@ -26,6 +29,171 @@ pub(crate) struct SiftDetector {
     context: Arc<WgpuContext>,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
+}
+
+pub(crate) struct SiftOrientationAssigner {
+    context: Arc<WgpuContext>,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+impl SiftOrientationAssigner {
+    pub(crate) fn new(context: Arc<WgpuContext>) -> Result<Self> {
+        let device = context.device();
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rustsfm SIFT orientation bind group layout"),
+            entries: &[
+                storage_layout_entry(0, true),
+                storage_layout_entry(1, true),
+                storage_layout_entry(2, false),
+                storage_layout_entry(3, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rustsfm SIFT orientation shader"),
+            source: wgpu::ShaderSource::Wgsl(ORIENTATION_SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rustsfm SIFT orientation pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rustsfm SIFT orientation pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("orientation_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        Ok(Self {
+            context,
+            bind_group_layout,
+            pipeline,
+        })
+    }
+
+    pub(crate) fn assign(
+        &self,
+        image: &[f32],
+        width: u32,
+        height: u32,
+        keypoints: &[GpuKeypoint],
+        max_orientations: u32,
+        upright: bool,
+    ) -> Result<Vec<GpuKeypoint>> {
+        validate_level(image, width, height)?;
+        if keypoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        if max_orientations == 0 {
+            bail!("GPU SIFT max_num_orientations must be positive");
+        }
+        let per_keypoint = if upright { 1 } else { max_orientations };
+        let capacity = u32::try_from(keypoints.len())
+            .ok()
+            .and_then(|count| count.checked_mul(per_keypoint))
+            .context("GPU SIFT oriented keypoint capacity overflow")?;
+        let keypoint_count =
+            u32::try_from(keypoints.len()).context("GPU SIFT keypoint count exceeds u32")?;
+        let params = OrientationParams {
+            width,
+            height,
+            keypoint_count,
+            capacity,
+            max_orientations: per_keypoint,
+            upright: u32::from(upright),
+            peak_ratio: 0.8,
+            pad0: 0,
+        };
+
+        let device = self.context.device();
+        let image_buffer = storage_buffer_from_slice(
+            device,
+            "rustsfm SIFT orientation image",
+            image,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let keypoint_buffer = storage_buffer_from_slice(
+            device,
+            "rustsfm SIFT orientation keypoints",
+            keypoints,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let output = typed_storage_buffer::<GpuKeypoint>(
+            device,
+            "rustsfm SIFT oriented keypoints",
+            capacity as usize,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        )?;
+        let counters = storage_buffer_from_slice(
+            device,
+            "rustsfm SIFT orientation counters",
+            &[0u32; 4],
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let params_buffer = uniform_buffer(device, "rustsfm SIFT orientation params", &params);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rustsfm SIFT orientation bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                entire_buffer_entry(0, &image_buffer),
+                entire_buffer_entry(1, &keypoint_buffer),
+                entire_buffer_entry(2, &output),
+                entire_buffer_entry(3, &counters),
+                entire_buffer_entry(4, &params_buffer),
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rustsfm SIFT orientation encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rustsfm SIFT orientation pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(keypoint_count.div_ceil(64), 1, 1);
+        }
+        self.context.queue().submit(Some(encoder.finish()));
+        let counter_values = self.context.read_buffer::<u32>(&counters, 4)?;
+        if counter_values[1] != 0 {
+            bail!("GPU SIFT orientation output overflow at capacity {capacity}");
+        }
+        let count = (counter_values[0] as usize).min(capacity as usize);
+        self.context.read_buffer(&output, count)
+    }
+}
+
+#[cfg(test)]
+fn assign_orientations_for_test(
+    context: Arc<WgpuContext>,
+    image: &[f32],
+    width: u32,
+    height: u32,
+    keypoints: &[GpuKeypoint],
+    max_orientations: u32,
+    upright: bool,
+) -> Result<Vec<GpuKeypoint>> {
+    SiftOrientationAssigner::new(context)?.assign(
+        image,
+        width,
+        height,
+        keypoints,
+        max_orientations,
+        upright,
+    )
 }
 
 impl SiftDetector {
@@ -845,5 +1013,65 @@ mod tests {
         )?;
         assert_eq!(points.len(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn gpu_orientation_of_horizontal_ramp_is_zero() -> anyhow::Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let image = (0..41)
+            .flat_map(|_| (0..41).map(|x| x as f32 / 40.0))
+            .collect::<Vec<_>>();
+        let keypoint = GpuKeypoint {
+            x: 20.0,
+            y: 20.0,
+            sigma: 2.0,
+            response: 1.0,
+            angle: 0.0,
+            octave: 0,
+            level: 2,
+            valid: 1,
+        };
+        let oriented =
+            assign_orientations_for_test(context, &image, 41, 41, &[keypoint], 2, false)?;
+        assert_eq!(oriented.len(), 1);
+        assert!(wrapped_angle_distance(oriented[0].angle, 0.0) < 0.08);
+        Ok(())
+    }
+
+    #[test]
+    fn upright_mode_emits_exactly_one_zero_orientation() -> anyhow::Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let keypoint = GpuKeypoint {
+            x: 8.0,
+            y: 8.0,
+            sigma: 1.6,
+            response: 1.0,
+            angle: 1.0,
+            octave: 0,
+            level: 2,
+            valid: 1,
+        };
+        let oriented = assign_orientations_for_test(
+            context,
+            &vec![0.5; 17 * 17],
+            17,
+            17,
+            &[keypoint],
+            2,
+            true,
+        )?;
+        assert_eq!(oriented.len(), 1);
+        assert_eq!(oriented[0].angle, 0.0);
+        Ok(())
+    }
+
+    fn wrapped_angle_distance(left: f32, right: f32) -> f32 {
+        let tau = std::f32::consts::TAU;
+        let delta = (left - right).abs() % tau;
+        delta.min(tau - delta)
     }
 }

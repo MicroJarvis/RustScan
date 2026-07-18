@@ -511,7 +511,7 @@ git commit -m "feat(rustsfm): detect and localize SIFT extrema on wgpu"
 - Modify: `RustSFM/src/gpu/sift/mod.rs`
 - Modify: `RustSFM/src/gpu/sift/types.rs`
 
-- [ ] **Step 1: Write orientation tests**
+- [x] **Step 1: Write orientation tests**
 
 ```rust
 #[test]
@@ -535,7 +535,7 @@ fn upright_mode_emits_exactly_one_zero_orientation() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify orientation kernel is missing**
+- [x] **Step 2: Run tests and verify orientation kernel is missing**
 
 Run: `cargo test -p rustsfm --lib gpu_orientation --features gpu-wgpu -- --nocapture`
 
@@ -543,7 +543,7 @@ Run: `cargo test -p rustsfm --lib upright_mode_emits --features gpu-wgpu -- --no
 
 Expected: FAIL.
 
-- [ ] **Step 3: Implement 36-bin orientation histograms**
+- [x] **Step 3: Implement 36-bin orientation histograms**
 
 Assign one workgroup to each keypoint. Accumulate Gaussian-weighted central-difference
 gradients into 36 bins, smooth the circular histogram six times, and interpolate peaks with:
@@ -557,7 +557,7 @@ Emit peaks at least `0.8 * max_peak` in descending peak order, capped by
 `max_num_orientations`. Preserve deterministic bin-index tie-breaking. Upright mode bypasses
 the histogram and emits one zero-angle record.
 
-- [ ] **Step 4: Run orientation tests**
+- [x] **Step 4: Run orientation tests**
 
 Run: `cargo test -p rustsfm --lib gpu_orientation --features gpu-wgpu -- --nocapture`
 
@@ -565,7 +565,7 @@ Run: `cargo test -p rustsfm --lib upright_mode_emits --features gpu-wgpu -- --no
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add RustSFM/src/gpu/sift RustSFM/src/gpu/shaders/sift_descriptor.wgsl

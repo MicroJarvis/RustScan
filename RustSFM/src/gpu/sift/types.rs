@@ -51,3 +51,16 @@ pub(crate) struct DetectorParams {
     pub(crate) pad0: u32,
     pub(crate) pad1: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub(crate) struct OrientationParams {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) keypoint_count: u32,
+    pub(crate) capacity: u32,
+    pub(crate) max_orientations: u32,
+    pub(crate) upright: u32,
+    pub(crate) peak_ratio: f32,
+    pub(crate) pad0: u32,
+}
