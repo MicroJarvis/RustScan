@@ -5,5 +5,8 @@ pub mod solver;
 mod solver_tests;
 pub mod vo;
 
-pub use solver::{EssentialSolver, PnPProblem, PnPSolver, Sim3Solver, Triangulator};
+pub use solver::{
+    EssentialSolver, PnPFocalResult, PnPModelScorer, PnPModelSupport, PnPProblem, PnPSolver,
+    Sim3Solver, Triangulator,
+};
 pub use vo::{VOResult, VOState, VisualOdometry};

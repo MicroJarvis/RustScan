@@ -60,6 +60,43 @@ impl Default for PnPProblem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PnPModelSupport {
+    pub inliers: usize,
+    pub residual_sum: f64,
+}
+
+pub trait PnPModelScorer {
+    type Error;
+
+    fn prepare(
+        &mut self,
+        normalized_points: &[[f32; 2]],
+        object_points: &[[f32; 3]],
+        threshold: f32,
+    ) -> Result<(), Self::Error>;
+
+    fn score_models(&mut self, models: &[SE3]) -> Result<Vec<PnPModelSupport>, Self::Error>;
+
+    fn inlier_mask(&mut self, model: &SE3) -> Result<Vec<bool>, Self::Error>;
+}
+
+const PNP_GPU_CHUNK_TRIALS: usize = 64;
+
+pub(crate) fn pnp_ransac_chunk_end(
+    iteration: usize,
+    max_trials: usize,
+    dynamic_trials: usize,
+    min_trials: usize,
+    chunk_trials: usize,
+) -> usize {
+    dynamic_trials
+        .max(min_trials)
+        .saturating_add(1)
+        .min(max_trials)
+        .min(iteration.saturating_add(chunk_trials))
+}
+
 /// RANSAC-based PnP solver using P3P + RANSAC
 pub struct PnPSolver {
     /// Camera intrinsics
@@ -104,6 +141,73 @@ struct PoseEvaluation {
     support: InlierSupport,
 }
 
+struct CpuPnPModelScorer<'a> {
+    solver: &'a PnPSolver,
+    normalized_points: Vec<[f32; 2]>,
+    object_points: Vec<[f32; 3]>,
+    threshold: f32,
+}
+
+impl<'a> CpuPnPModelScorer<'a> {
+    fn new(solver: &'a PnPSolver) -> Self {
+        Self {
+            solver,
+            normalized_points: Vec::new(),
+            object_points: Vec::new(),
+            threshold: 0.0,
+        }
+    }
+}
+
+impl PnPModelScorer for CpuPnPModelScorer<'_> {
+    type Error = std::convert::Infallible;
+
+    fn prepare(
+        &mut self,
+        normalized_points: &[[f32; 2]],
+        object_points: &[[f32; 3]],
+        threshold: f32,
+    ) -> Result<(), Self::Error> {
+        self.normalized_points = normalized_points.to_vec();
+        self.object_points = object_points.to_vec();
+        self.threshold = threshold;
+        Ok(())
+    }
+
+    fn score_models(&mut self, models: &[SE3]) -> Result<Vec<PnPModelSupport>, Self::Error> {
+        Ok(models
+            .iter()
+            .map(|model| {
+                let support = self
+                    .solver
+                    .evaluate_pose(
+                        model,
+                        &self.normalized_points,
+                        &self.object_points,
+                        self.threshold,
+                    )
+                    .support;
+                PnPModelSupport {
+                    inliers: support.num_inliers,
+                    residual_sum: support.residual_sum,
+                }
+            })
+            .collect())
+    }
+
+    fn inlier_mask(&mut self, model: &SE3) -> Result<Vec<bool>, Self::Error> {
+        Ok(self
+            .solver
+            .evaluate_pose(
+                model,
+                &self.normalized_points,
+                &self.object_points,
+                self.threshold,
+            )
+            .inliers)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PnPFocalResult {
     pub pose: SE3,
@@ -139,8 +243,29 @@ impl PnPSolver {
     ///
     /// Returns: (pose, inlier_mask)
     pub fn solve(&self, problem: &PnPProblem) -> Option<(SE3, Vec<bool>)> {
+        let mut scorer = CpuPnPModelScorer::new(self);
+        match self.solve_with_backend(problem, &mut scorer, 1) {
+            Ok(result) => result,
+            Err(error) => match error {},
+        }
+    }
+
+    pub fn solve_with_model_scorer<S: PnPModelScorer + ?Sized>(
+        &self,
+        problem: &PnPProblem,
+        scorer: &mut S,
+    ) -> Result<Option<(SE3, Vec<bool>)>, S::Error> {
+        self.solve_with_backend(problem, scorer, PNP_GPU_CHUNK_TRIALS)
+    }
+
+    fn solve_with_backend<S: PnPModelScorer + ?Sized>(
+        &self,
+        problem: &PnPProblem,
+        scorer: &mut S,
+        chunk_trials: usize,
+    ) -> Result<Option<(SE3, Vec<bool>)>, S::Error> {
         if !problem.is_solvable() {
-            return None;
+            return Ok(None);
         }
 
         let n = problem.image_points.len();
@@ -153,6 +278,7 @@ impl PnPSolver {
             .collect();
 
         let threshold = (self.ransac_threshold / self.fx.max(self.fy).max(1.0)).max(1.0e-6);
+        scorer.prepare(&normalized_pts, &problem.object_points, threshold)?;
         let seed = self
             .ransac_random_seed
             .unwrap_or_else(|| deterministic_pnp_seed(&normalized_pts, &problem.object_points));
@@ -165,37 +291,53 @@ impl PnPSolver {
         let sample_size = 3usize; // true P3P uses exactly 3 correspondences
         let max_iterations = self.initial_max_iterations(sample_size);
         let mut dynamic_max_trials = max_iterations as usize;
+        let mut iteration = 0usize;
 
-        for iter in 0..max_iterations {
-            let curr_thread_trial = iter as usize;
-            // Randomly select 3 points for true P3P hypothesis
-            let indices = self.random_indices(&mut rng, n, sample_size);
+        loop {
+            let chunk_end = pnp_ransac_chunk_end(
+                iteration,
+                max_iterations as usize,
+                dynamic_max_trials,
+                self.ransac_min_iterations as usize,
+                chunk_trials.max(1),
+            );
+            if chunk_end <= iteration {
+                break;
+            }
 
-            // Solve for this sample
-            if let Some(poses) = self.solve_p3p(&normalized_pts, &problem.object_points, &indices) {
-                // For each P3P solution, check all points
-                for pose in poses {
-                    let eval = self.evaluate_pose(
-                        &pose,
+            let mut models = Vec::new();
+            for _ in iteration..chunk_end {
+                let indices = self.random_indices(&mut rng, n, sample_size);
+                if let Some(poses) =
+                    self.solve_p3p(&normalized_pts, &problem.object_points, &indices)
+                {
+                    models.extend(poses);
+                }
+            }
+
+            let supports = scorer.score_models(&models)?;
+            for (pose, support) in models.into_iter().zip(supports) {
+                let support = InlierSupport {
+                    num_inliers: support.inliers,
+                    residual_sum: support.residual_sum,
+                };
+                if support.is_better_than(&best_support) {
+                    let eval = PoseEvaluation {
+                        inliers: scorer.inlier_mask(&pose)?,
+                        support,
+                    };
+                    let (local_pose, local_eval) = self.local_optimize_pose(
+                        pose,
+                        eval,
                         &normalized_pts,
                         &problem.object_points,
                         threshold,
                     );
 
-                    if eval.support.is_better_than(&best_support) {
-                        let (local_pose, local_eval) = self.local_optimize_pose(
-                            pose,
-                            eval,
-                            &normalized_pts,
-                            &problem.object_points,
-                            threshold,
-                        );
-
-                        if local_eval.support.is_better_than(&best_support) {
-                            best_support = local_eval.support;
-                            best_inliers = local_eval.inliers;
-                            best_pose = Some(local_pose);
-                        }
+                    if local_eval.support.is_better_than(&best_support) {
+                        best_support = local_eval.support;
+                        best_inliers = local_eval.inliers;
+                        best_pose = Some(local_pose);
                     }
                 }
             }
@@ -204,14 +346,11 @@ impl PnPSolver {
                 dynamic_max_trials =
                     self.dynamic_num_trials(best_support.num_inliers, n, sample_size);
             }
-
-            if self.colmap_ransac_abort_after_trial(curr_thread_trial, dynamic_max_trials) {
-                break;
-            }
+            iteration = chunk_end;
         }
 
         if best_pose.is_none() {
-            return None;
+            return Ok(None);
         }
 
         // Refine pose with all inliers
@@ -227,7 +366,7 @@ impl PnPSolver {
             }
         }
 
-        Some((best_pose.unwrap_or(SE3::identity()), best_inliers))
+        Ok(Some((best_pose.unwrap_or(SE3::identity()), best_inliers)))
     }
 
     /// Solve absolute pose while estimating a shared focal length.

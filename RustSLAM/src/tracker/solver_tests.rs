@@ -7,7 +7,8 @@ mod tests {
     use crate::colmap_rng::ColmapMt19937;
     use crate::core::SE3;
     use crate::tracker::solver::{
-        compute_ransac_num_trials, EssentialSolver, PnPProblem, PnPSolver, Sim3Solver, Triangulator,
+        compute_ransac_num_trials, pnp_ransac_chunk_end, EssentialSolver, PnPModelScorer,
+        PnPModelSupport, PnPProblem, PnPSolver, Sim3Solver, Triangulator,
     };
     use glam::{Mat3, Vec3};
 
@@ -27,6 +28,177 @@ mod tests {
         assert_eq!(solver.ransac_dyn_num_trials_multiplier, 3.0);
         assert_eq!(solver.ransac_min_iterations, 0);
         assert_eq!(solver.ransac_random_seed, None);
+    }
+
+    #[derive(Default)]
+    struct RecordingPnPScorer {
+        normalized_points: Vec<[f32; 2]>,
+        object_points: Vec<[f32; 3]>,
+        threshold: f32,
+        models: Vec<SE3>,
+        mask_calls: usize,
+    }
+
+    impl RecordingPnPScorer {
+        fn evaluate(&self, model: &SE3) -> (PnPModelSupport, Vec<bool>) {
+            let mut support = PnPModelSupport {
+                inliers: 0,
+                residual_sum: 0.0,
+            };
+            let mut mask = Vec::with_capacity(self.normalized_points.len());
+            let max_residual = self.threshold * self.threshold;
+
+            for (point, object) in self.normalized_points.iter().zip(self.object_points.iter()) {
+                let transformed = model.transform_point(object);
+                let projected = if transformed[2] > 0.0 {
+                    [
+                        transformed[0] / transformed[2],
+                        transformed[1] / transformed[2],
+                    ]
+                } else {
+                    [0.0, 0.0]
+                };
+                let dx = point[0] - projected[0];
+                let dy = point[1] - projected[1];
+                let residual = dx * dx + dy * dy;
+                let is_inlier = residual <= max_residual;
+                mask.push(is_inlier);
+                if is_inlier {
+                    support.inliers += 1;
+                    support.residual_sum += residual as f64;
+                }
+            }
+
+            (support, mask)
+        }
+    }
+
+    impl PnPModelScorer for RecordingPnPScorer {
+        type Error = std::convert::Infallible;
+
+        fn prepare(
+            &mut self,
+            normalized_points: &[[f32; 2]],
+            object_points: &[[f32; 3]],
+            threshold: f32,
+        ) -> Result<(), Self::Error> {
+            self.normalized_points = normalized_points.to_vec();
+            self.object_points = object_points.to_vec();
+            self.threshold = threshold;
+            Ok(())
+        }
+
+        fn score_models(&mut self, models: &[SE3]) -> Result<Vec<PnPModelSupport>, Self::Error> {
+            self.models.extend_from_slice(models);
+            Ok(models.iter().map(|model| self.evaluate(model).0).collect())
+        }
+
+        fn inlier_mask(&mut self, model: &SE3) -> Result<Vec<bool>, Self::Error> {
+            self.mask_calls += 1;
+            Ok(self.evaluate(model).1)
+        }
+    }
+
+    struct FailingPnPScorer;
+
+    impl PnPModelScorer for FailingPnPScorer {
+        type Error = &'static str;
+
+        fn prepare(
+            &mut self,
+            _normalized_points: &[[f32; 2]],
+            _object_points: &[[f32; 3]],
+            _threshold: f32,
+        ) -> Result<(), Self::Error> {
+            Err("scorer prepare failed")
+        }
+
+        fn score_models(&mut self, _models: &[SE3]) -> Result<Vec<PnPModelSupport>, Self::Error> {
+            unreachable!("prepare must fail before scoring")
+        }
+
+        fn inlier_mask(&mut self, _model: &SE3) -> Result<Vec<bool>, Self::Error> {
+            unreachable!("prepare must fail before mask readback")
+        }
+    }
+
+    fn synthetic_pnp_problem_with_fixed_outliers() -> PnPProblem {
+        let pose = SE3::from_axis_angle(&[0.01, -0.02, 0.015], &[0.25, -0.1, 0.45]);
+        let mut problem = PnPProblem::new();
+        for index in 0..32 {
+            let object = [
+                ((index % 8) as f32 - 3.5) * 0.24,
+                ((index / 8) as f32 - 1.5) * 0.28,
+                4.0 + (index % 5) as f32 * 0.31,
+            ];
+            let camera = pose.transform_point(&object);
+            let mut image = [camera[0] / camera[2], camera[1] / camera[2]];
+            if index >= 24 {
+                image[0] += 0.2 + index as f32 * 0.003;
+                image[1] -= 0.15;
+            }
+            problem.add_correspondence(image, object);
+        }
+        problem
+    }
+
+    #[test]
+    fn pnp_model_scorer_receives_stable_trial_order_and_selected_masks() {
+        let problem = synthetic_pnp_problem_with_fixed_outliers();
+        let solver = PnPSolver {
+            ransac_threshold: 0.01,
+            ransac_max_iterations: 128,
+            ransac_random_seed: Some(7),
+            ..PnPSolver::new(1.0, 1.0, 0.0, 0.0)
+        };
+
+        let mut first_scorer = RecordingPnPScorer::default();
+        let first = solver
+            .solve_with_model_scorer(&problem, &mut first_scorer)
+            .expect("scored PnP")
+            .expect("pose");
+        let mut second_scorer = RecordingPnPScorer::default();
+        let second = solver
+            .solve_with_model_scorer(&problem, &mut second_scorer)
+            .expect("second scored PnP")
+            .expect("second pose");
+
+        assert!(first.1.iter().filter(|&&value| value).count() >= 24);
+        assert_eq!(first.1, second.1);
+        assert_eq!(
+            first_scorer
+                .models
+                .iter()
+                .map(SE3::to_matrix)
+                .collect::<Vec<_>>(),
+            second_scorer
+                .models
+                .iter()
+                .map(SE3::to_matrix)
+                .collect::<Vec<_>>(),
+        );
+        assert!(first_scorer.mask_calls > 0);
+        assert!(first_scorer.mask_calls < first_scorer.models.len());
+    }
+
+    #[test]
+    fn pnp_model_scorer_errors_propagate() {
+        let problem = synthetic_pnp_problem_with_fixed_outliers();
+        let solver = PnPSolver::new(1.0, 1.0, 0.0, 0.0);
+        let mut scorer = FailingPnPScorer;
+
+        assert!(matches!(
+            solver.solve_with_model_scorer(&problem, &mut scorer),
+            Err("scorer prepare failed")
+        ));
+    }
+
+    #[test]
+    fn pnp_model_scorer_chunk_end_respects_dynamic_and_minimum_trials() {
+        assert_eq!(pnp_ransac_chunk_end(0, 200, 200, 0, 64), 64);
+        assert_eq!(pnp_ransac_chunk_end(64, 200, 9, 0, 64), 10);
+        assert_eq!(pnp_ransac_chunk_end(64, 200, 9, 100, 64), 101);
+        assert_eq!(pnp_ransac_chunk_end(192, 200, 200, 0, 64), 200);
     }
 
     #[test]
