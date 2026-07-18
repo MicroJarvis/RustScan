@@ -932,7 +932,7 @@ git commit -m "feat(rustsfm): enable wgpu SIFT from CLI"
 - Modify: `RustSFM/src/gpu/sift/mod.rs`
 - Create: `RustSFM/tests/wgpu_sift_quality.rs`
 
-- [ ] **Step 1: Add a deterministic CPU/GPU quality comparison**
+- [x] **Step 1: Add a deterministic CPU/GPU quality comparison**
 
 ```rust
 #[test]
@@ -951,20 +951,20 @@ fn gpu_sift_preserves_checkerboard_geometric_content() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run comparison and record initial variance**
+- [x] **Step 2: Run comparison and record initial variance**
 
 Run: `cargo test -p rustsfm --test wgpu_sift_quality --features gpu-wgpu -- --nocapture`
 
 Expected before final tuning: FAIL with measured count/repeatability diagnostics.
 
-- [ ] **Step 3: Correct coordinate, sigma, threshold, or descriptor discrepancies**
+- [x] **Step 3: Correct coordinate, sigma, threshold, or descriptor discrepancies**
 
 Use diagnostics to adjust only SIFT-semantic differences: first-octave coordinate scale,
 incremental sigma, contrast scaling by octave resolution, edge Hessian ratio, orientation
 window, descriptor sample radius, and RootSIFT normalization. Do not weaken the final
 repeatability threshold to hide a systematic error.
 
-- [ ] **Step 4: Run the complete GPU and CPU-compatible suite**
+- [x] **Step 4: Run the complete GPU and CPU-compatible suite**
 
 Run: `cargo test -p rustsfm --lib gpu_ --features gpu-wgpu -- --nocapture`
 
