@@ -1125,17 +1125,26 @@ fn complete_estimate_options(
 
 fn average_color(observations: &[TrackObservation], frames: &[ImageFrame]) -> [u8; 3] {
     let mut color = [0usize; 3];
+    let mut count = 0usize;
     for obs in observations {
-        let c = frames[obs.image].colors[obs.feature];
+        let Some(c) = frames
+            .get(obs.image)
+            .and_then(|frame| frame.colors.get(obs.feature))
+        else {
+            continue;
+        };
         color[0] += c[0] as usize;
         color[1] += c[1] as usize;
         color[2] += c[2] as usize;
+        count += 1;
     }
-    let n = observations.len().max(1);
+    if count == 0 {
+        return [0, 0, 0];
+    }
     [
-        (color[0] / n) as u8,
-        (color[1] / n) as u8,
-        (color[2] / n) as u8,
+        (color[0] / count) as u8,
+        (color[1] / count) as u8,
+        (color[2] / count) as u8,
     ]
 }
 
@@ -1145,6 +1154,41 @@ mod tests {
     use crate::types::{CameraModel, ImageFrame, PairGeometry, Reconstruction};
     use rustslam::{Descriptors, Match};
     use std::path::PathBuf;
+
+    #[test]
+    fn average_color_returns_black_when_frame_colors_are_lazy() {
+        let mut frames = vec![frame(0)];
+        frames[0].colors.clear();
+        let observations = [TrackObservation {
+            image: 0,
+            feature: 0,
+        }];
+
+        assert_eq!(average_color(&observations, &frames), [0, 0, 0]);
+    }
+
+    #[test]
+    fn average_color_averages_only_available_colors() {
+        let mut frames = vec![frame(0), frame(1)];
+        frames[0].colors.clear();
+        frames[1].colors = vec![[10, 20, 30], [30, 40, 50]];
+        let observations = [
+            TrackObservation {
+                image: 0,
+                feature: 0,
+            },
+            TrackObservation {
+                image: 1,
+                feature: 0,
+            },
+            TrackObservation {
+                image: 1,
+                feature: 1,
+            },
+        ];
+
+        assert_eq!(average_color(&observations, &frames), [20, 30, 40]);
+    }
 
     #[test]
     fn mapper_triangulator_options_keep_colmap_ignore_two_view_tracks_default() {

@@ -14,7 +14,6 @@ vlfeat-sift = []
 
 [dependencies]
 rustscan-types = { path = "../rustscan-types" }
-ceres-solver = { version = "0.5", optional = true, features = ["source"] }
 anyhow = "1"
 bytemuck = { version = "1.25", features = ["derive"], optional = true }
 clap = { version = "4", features = ["derive"] }
@@ -33,6 +32,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 wgpu = { version = "29.0.1", features = ["wgsl"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ceres-solver = { version = "0.5", optional = true, default-features = false, features = ["system"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ceres-solver = { version = "0.5", optional = true, default-features = false, features = ["source"] }
 
 [build-dependencies]
 cc = "1"

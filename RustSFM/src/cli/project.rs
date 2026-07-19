@@ -313,14 +313,14 @@ pub(super) fn resolve_colmap_mapper_args(
                 &project,
                 "Mapper.ba_global_frames_ratio",
             )?)
-            .unwrap_or(1.1),
+            .unwrap_or(1.5),
         global_ba_points_ratio: args
             .global_ba_points_ratio
             .or(parse_project_value(
                 &project,
                 "Mapper.ba_global_points_ratio",
             )?)
-            .unwrap_or(1.1),
+            .unwrap_or(1.5),
         global_ba_images_freq: args
             .global_ba_images_freq
             .or(parse_project_value(
@@ -516,6 +516,8 @@ use_gpu_pnp=true
 extract_colors=false
 filter_max_reproj_error=4
 tri_ignore_two_view_tracks=true
+ba_global_frames_ratio=1.25
+ba_global_points_ratio=1.35
 num_threads=-1
 ",
         )?;
@@ -532,7 +534,25 @@ num_threads=-1
         assert_eq!(resolved.extract_colors, 0);
         assert_eq!(resolved.filter_max_reproj_error, 4.0);
         assert_eq!(resolved.tri_ignore_two_view_tracks, 1);
+        assert_eq!(resolved.global_ba_images_ratio, 1.25);
+        assert_eq!(resolved.global_ba_points_ratio, 1.35);
         assert_eq!(resolved.num_threads, None);
+        Ok(())
+    }
+
+    #[test]
+    fn colmap_mapper_uses_native_global_ba_ratio_defaults_when_unspecified() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project_path = dir.path().join("project.ini");
+        std::fs::write(
+            &project_path,
+            "database_path=/tmp/project.db\nimage_path=/tmp/images\noutput_path=/tmp/sparse\n",
+        )?;
+
+        let resolved = resolve_colmap_mapper_args(&base_mapper_args(project_path))?;
+
+        assert_eq!(resolved.global_ba_images_ratio, 1.5);
+        assert_eq!(resolved.global_ba_points_ratio, 1.5);
         Ok(())
     }
 

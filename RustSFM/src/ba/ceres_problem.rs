@@ -1649,9 +1649,12 @@ fn map_bundle_adjustment_preconditioner(
     }
 }
 
-fn ceres_has_sparse_backend() -> bool {
+fn ceres_sparse_backend() -> SparseLinearAlgebraLibraryType {
     SolverOptions::builder().current_sparse_linear_algebra_library_type()
-        != SparseLinearAlgebraLibraryType::NO_SPARSE
+}
+
+fn ceres_has_sparse_backend() -> bool {
+    ceres_sparse_backend() != SparseLinearAlgebraLibraryType::NO_SPARSE
 }
 
 fn ceres_num_threads(options: &BundleAdjustmentOptions, num_residuals: usize) -> i32 {
@@ -2111,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn ceres_options_match_colmap_solver_type_thresholds() {
+    fn ceres_solver_policy_matches_colmap_solver_type_thresholds() {
         let policy = ceres_solver_policy(50, true);
         assert!(policy.linear_solver == LinearSolverType::DENSE_SCHUR);
         assert!(policy.preconditioner.is_none());
@@ -2132,7 +2135,7 @@ mod tests {
     }
 
     #[test]
-    fn ceres_options_match_colmap_sparse_backend_gate() {
+    fn ceres_solver_policy_matches_colmap_sparse_backend_gate() {
         let policy = ceres_solver_policy(51, false);
         assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
         assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
@@ -2140,6 +2143,18 @@ mod tests {
         let policy = ceres_solver_policy(1000, false);
         assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
         assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ceres_sparse_backend_uses_optimized_macos_build() {
+        let backend = ceres_sparse_backend();
+
+        assert!(matches!(
+            backend,
+            SparseLinearAlgebraLibraryType::SUITE_SPARSE
+                | SparseLinearAlgebraLibraryType::ACCELERATE_SPARSE
+        ));
     }
 
     #[test]

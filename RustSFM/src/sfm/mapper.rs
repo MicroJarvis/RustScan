@@ -46,6 +46,7 @@ use rayon::prelude::*;
 use rustslam::features::HammingMatcher;
 use rustslam::tracker::{PnPModelScorer, PnPProblem, PnPSolver};
 use rustslam::{FeatureMatcher, SE3};
+use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs;
@@ -82,12 +83,15 @@ pub use pipeline_types::{
     IncrementalPipelineCallback, IncrementalPipelineMapResult, IncrementalPipelineResult,
     IncrementalPipelineStatus, PipelineCallbackEvent, PipelineCallbackSink,
 };
-#[cfg(test)]
-use reconstruction_input::default_database_candidates;
 use reconstruction_input::{
-    apply_color_extraction_policy, apply_database_keypoints, collect_images, database_camera_setup,
-    fallback_camera, load_mapper_database, local_image_camera_setup, resolve_mapper_database_path,
-    sensor_id_from_colmap, setup_for_reconstruction_attempt,
+    apply_color_extraction_policy, collect_images, database_camera_setup, database_frames,
+    fallback_camera, load_mapper_database_for_paths, local_image_camera_setup,
+    resolve_mapper_database_path, sample_keypoint_colors, sensor_id_from_colmap,
+    setup_for_reconstruction_attempt,
+};
+#[cfg(test)]
+use reconstruction_input::{
+    apply_database_keypoints, default_database_candidates, load_mapper_database,
 };
 pub use reconstruction_input::{reference_camera_setup, ReconstructionSeed, ReferenceCameraSetup};
 pub use state::InitialPairFailure;
@@ -257,20 +261,23 @@ fn run_reconstruction_impl(
     sift_extraction.max_num_features = config.max_features;
     let mut sift_matching = config.sift_matching.clone();
     sift_matching.max_ratio = config.match_ratio as f32;
-    let mut frames = extract_frames(
-        &paths,
-        config.max_features,
-        config.feature_type,
-        &sift_extraction,
-    )?;
     let database_path = resolve_mapper_database_path(config)?;
     let mapper_database = if database_path.as_ref().is_some_and(|path| path.exists()) {
-        load_mapper_database(database_path.as_deref(), &frames, config.min_matches)?
+        load_mapper_database_for_paths(database_path.as_deref(), &paths, config.min_matches)?
     } else {
         None
     };
+    let mut frames = if let Some(database) = mapper_database.as_ref() {
+        database_frames(&paths, database)?
+    } else {
+        extract_frames(
+            &paths,
+            config.max_features,
+            config.feature_type,
+            &sift_extraction,
+        )?
+    };
     if let Some(database) = mapper_database.as_ref() {
-        apply_database_keypoints(&mut frames, &database.keypoints_by_name);
         config.pose_priors = database.cache.pose_priors.clone();
         if reference_camera_setup.is_none() {
             reference_camera_setup = database_camera_setup(&database.cache, &paths).ok();
@@ -886,36 +893,38 @@ fn estimate_database_pair_geometries(
                     )
                 })
                 .flatten();
-            stored_pair.filter(keep_stored_database_pair).or_else(|| {
-                let stored_geometry =
-                    stored_database_geometry_for_pair(pair, frames, cache, stored_geometries);
-                let mut estimated = estimate_pair_geometry_with_options_and_cameras(
-                    pair.left,
-                    pair.right,
-                    &frames[pair.left],
-                    &frames[pair.right],
-                    &pair.matches,
-                    left_camera,
-                    right_camera,
-                    config.essential_threshold_px,
-                    config.essential_iterations,
-                    config.min_inliers,
-                    config.min_triangulated,
-                    PairEstimationOptions {
-                        ransac_random_seed: config.random_seed,
-                        ..PairEstimationOptions::default()
-                    },
-                )?;
-                if let Some(geometry) = stored_geometry {
-                    estimated.two_view_config = geometry.config;
-                    estimated.f_matrix = geometry.f_matrix.or(estimated.f_matrix);
-                    estimated.e_matrix = geometry.e_matrix.or(estimated.e_matrix);
-                    estimated.h_matrix = geometry.h_matrix.or(estimated.h_matrix);
-                    keep_stored_database_pair(&estimated).then_some(estimated)
-                } else {
-                    keep_verified_pair(&estimated).then_some(estimated)
-                }
-            })
+            stored_pair
+                .filter(|pair| keep_pair_for_mapping(pair, config))
+                .or_else(|| {
+                    let stored_geometry =
+                        stored_database_geometry_for_pair(pair, frames, cache, stored_geometries);
+                    let mut estimated = estimate_pair_geometry_with_options_and_cameras(
+                        pair.left,
+                        pair.right,
+                        &frames[pair.left],
+                        &frames[pair.right],
+                        &pair.matches,
+                        left_camera,
+                        right_camera,
+                        config.essential_threshold_px,
+                        config.essential_iterations,
+                        config.min_inliers,
+                        config.min_triangulated,
+                        PairEstimationOptions {
+                            ransac_random_seed: config.random_seed,
+                            ..PairEstimationOptions::default()
+                        },
+                    )?;
+                    if let Some(geometry) = stored_geometry {
+                        estimated.two_view_config = geometry.config;
+                        estimated.f_matrix = geometry.f_matrix.or(estimated.f_matrix);
+                        estimated.e_matrix = geometry.e_matrix.or(estimated.e_matrix);
+                        estimated.h_matrix = geometry.h_matrix.or(estimated.h_matrix);
+                        keep_pair_for_mapping(&estimated, config).then_some(estimated)
+                    } else {
+                        keep_pair_for_mapping(&estimated, config).then_some(estimated)
+                    }
+                })
         })
         .collect::<Vec<_>>();
     Ok(pairs)
@@ -1232,7 +1241,7 @@ fn estimate_candidate_pair(
     if is_ring_bridge_candidate(left, right) {
         pair.pose_graph_only = true;
     }
-    keep_verified_pair(&pair).then_some(pair)
+    keep_pair_for_mapping(&pair, config).then_some(pair)
 }
 
 fn database_pair_geometry_from_stored_pose(
@@ -1295,7 +1304,7 @@ fn limited_indices(indices: &[usize], limit: usize) -> &[usize] {
     &indices[..indices.len().min(limit)]
 }
 
-fn keep_verified_pair(pair: &PairGeometry) -> bool {
+fn keep_pair_for_mapping(pair: &PairGeometry, config: &MapperConfig) -> bool {
     if matches!(
         pair.two_view_config,
         crate::database::COLMAP_TWO_VIEW_UNDEFINED
@@ -1305,33 +1314,24 @@ fn keep_verified_pair(pair: &PairGeometry) -> bool {
     ) {
         return false;
     }
-    let offset = pair.right.abs_diff(pair.left);
-    if offset <= 1 || is_ring_bridge_candidate(pair.left, pair.right) {
-        if is_ring_bridge_candidate(pair.left, pair.right) {
-            return pair.inliers >= 40
-                && pair.mean_reprojection_error_px <= 1.0
-                && pair.median_triangulation_angle_deg >= 0.75
-                && pair.rotation_deg <= 8.0;
-        }
-        return pair.inliers >= 15 && pair.mean_reprojection_error_px <= 8.0;
+    if !pair.mean_reprojection_error_px.is_finite()
+        || pair.inliers < config.min_inliers
+        || pair.triangulated < config.min_triangulated
+    {
+        return false;
     }
-    let min_inliers = 40 + offset.saturating_sub(2) * 12;
-    pair.inliers >= min_inliers
-        && pair.mean_reprojection_error_px <= 1.8
-        && pair.rotation_deg <= 20.0
-}
 
-fn keep_stored_database_pair(pair: &PairGeometry) -> bool {
-    if matches!(
-        pair.two_view_config,
-        crate::database::COLMAP_TWO_VIEW_UNDEFINED
-            | crate::database::COLMAP_TWO_VIEW_DEGENERATE
-            | crate::database::COLMAP_TWO_VIEW_WATERMARK
-            | crate::database::COLMAP_TWO_VIEW_MULTIPLE
-    ) {
-        return false;
+    let offset = pair.right.abs_diff(pair.left);
+    if is_ring_bridge_candidate(pair.left, pair.right) {
+        return pair.inliers >= config.min_inliers.max(40)
+            && pair.mean_reprojection_error_px <= config.max_reprojection_error_px.min(1.0)
+            && pair.median_triangulation_angle_deg >= 0.75;
     }
-    pair.inliers > 0 && pair.mean_reprojection_error_px.is_finite()
+    if offset <= 1 {
+        return pair.mean_reprojection_error_px <= config.max_reprojection_error_px;
+    }
+    pair.inliers >= config.min_inliers.max(40)
+        && pair.mean_reprojection_error_px <= config.max_reprojection_error_px.min(1.8)
 }
 
 fn retain_best_ring_closures(pairs: &mut Vec<PairGeometry>) {
@@ -2879,9 +2879,13 @@ fn extract_colors_for_image(
     reconstruction: &mut Reconstruction,
     image: usize,
 ) -> usize {
+    let Some(frame) = frames.get(image) else {
+        return 0;
+    };
     let Some(observations) = reconstruction.observations.get(image) else {
         return 0;
     };
+    let colors = colors_for_frame(frame);
     let mut updates = Vec::new();
     for (feature, point_id) in observations.iter().copied().enumerate() {
         let Some(point_id) = point_id else {
@@ -2893,11 +2897,7 @@ fn extract_colors_for_image(
         if point.color != [0, 0, 0] {
             continue;
         }
-        let Some(color) = frames
-            .get(image)
-            .and_then(|frame| frame.colors.get(feature))
-            .copied()
-        else {
+        let Some(color) = colors.get(feature).copied() else {
             continue;
         };
         updates.push((point_id, color));
@@ -2916,6 +2916,14 @@ fn extract_colors_for_image(
     updated
 }
 
+fn colors_for_frame(frame: &ImageFrame) -> Cow<'_, [[u8; 3]]> {
+    if frame.colors.len() == frame.keypoints.len() {
+        Cow::Borrowed(frame.colors.as_slice())
+    } else {
+        Cow::Owned(sample_keypoint_colors(frame))
+    }
+}
+
 fn extract_colors_for_all_registered_images(
     frames: &[ImageFrame],
     reconstruction: &mut Reconstruction,
@@ -2929,6 +2937,17 @@ fn extract_colors_for_all_registered_images(
         .iter()
         .filter(|pose| pose.is_some())
         .count();
+    let colors_by_image = frames
+        .iter()
+        .enumerate()
+        .map(|(image, frame)| {
+            reconstruction
+                .poses
+                .get(image)
+                .is_some_and(|pose| pose.is_some())
+                .then(|| colors_for_frame(frame))
+        })
+        .collect::<Vec<_>>();
     let mut updated_points = 0usize;
     for point in &mut reconstruction.points {
         let mut sum = [0usize; 3];
@@ -2943,9 +2962,10 @@ fn extract_colors_for_all_registered_images(
             {
                 continue;
             }
-            let Some(color) = frames
+            let Some(color) = colors_by_image
                 .get(obs.image)
-                .and_then(|frame| frame.colors.get(obs.feature))
+                .and_then(Option::as_ref)
+                .and_then(|colors| colors.get(obs.feature))
                 .copied()
             else {
                 continue;
@@ -4091,8 +4111,14 @@ fn should_run_global_ba(
     let point_ratio_hit = config.global_ba_points_ratio > 1.0
         && schedule.prev_points > 0
         && points as f32 >= schedule.prev_points as f32 * config.global_ba_points_ratio;
-    image_freq_hit || point_freq_hit || image_ratio_hit || point_ratio_hit
+    let ratio_growth_ready = registered
+        >= schedule
+            .prev_registered_frames
+            .saturating_add(MIN_GLOBAL_BA_RATIO_FRAME_GROWTH);
+    image_freq_hit || point_freq_hit || (ratio_growth_ready && (image_ratio_hit || point_ratio_hit))
 }
+
+const MIN_GLOBAL_BA_RATIO_FRAME_GROWTH: usize = 5;
 
 fn should_run_final_global_ba(
     schedule: &GlobalBaSchedule,
@@ -10245,6 +10271,87 @@ mod tests {
     }
 
     #[test]
+    fn database_frame_fast_path_does_not_extract_descriptors_or_colors() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let paths = [dir.path().join("left.png"), dir.path().join("right.png")];
+        for path in &paths {
+            image::RgbImage::from_pixel(16, 12, image::Rgb([12, 34, 56])).save(path)?;
+        }
+
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 5,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 16,
+                    height: 12,
+                    params: vec![10.0, 10.0, 8.0, 6.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(11, "left.png"), (12, "right.png")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 5,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(
+                image_id,
+                &[
+                    ColmapKeypoint::new(1.0, 2.0),
+                    ColmapKeypoint::new(3.0, 4.0),
+                    ColmapKeypoint::new(5.0, 6.0),
+                    ColmapKeypoint::new(7.0, 8.0),
+                ],
+            )?;
+        }
+        db.write_two_view_geometry(
+            11,
+            12,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: (0..4)
+                    .map(|index| FeatureMatch::new(index, index))
+                    .collect(),
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let lookup_frames = paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| {
+                let mut frame = minimal_frame(id, path.file_name().unwrap().to_str().unwrap());
+                frame.path = path.clone();
+                frame
+            })
+            .collect::<Vec<_>>();
+        let database =
+            load_mapper_database(Some(&db_path), &lookup_frames, 0)?.expect("database input");
+
+        let mut frames = reconstruction_input::database_frames(&paths, &database)?;
+        apply_color_extraction_policy(&mut frames, true);
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].width, frames[0].height), (16, 12));
+        assert_eq!(frames[0].keypoints.len(), 4);
+        assert_eq!(frames[0].keypoints[2].x(), 5.0);
+        assert!(frames[0].descriptors.is_empty());
+        assert!(frames[0].sift.descriptors_u8.is_empty());
+        assert!(frames[0].wide_descriptors.data.is_empty());
+        assert!(frames[0].strong_feature_indices.is_empty());
+        assert!(frames[0].colors.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn database_camera_setup_preserves_prior_focal_flags() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("database.db");
@@ -10454,6 +10561,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_colors_for_image_reads_empty_database_frame_lazily() -> Result<()> {
+        let dir = tempdir()?;
+        let image_path = dir.path().join("registered.png");
+        let mut image = image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]));
+        image.put_pixel(1, 1, image::Rgb([40, 50, 60]));
+        image.save(&image_path)?;
+
+        let mut frames = vec![minimal_frame(0, "registered.png")];
+        frames[0].path = image_path;
+        frames[0].width = 2;
+        frames[0].height = 2;
+        frames[0].colors.clear();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.observations[0][1] = Some(0);
+        reconstruction.point_ids = vec![1];
+        reconstruction.points = vec![Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 0,
+                feature: 1,
+            }],
+        }];
+
+        let updated = extract_colors_for_image(&frames, &mut reconstruction, 0);
+
+        assert_eq!(updated, 1);
+        assert_eq!(reconstruction.points[0].color, [40, 50, 60]);
+        Ok(())
+    }
+
+    #[test]
     fn final_all_image_color_extraction_averages_registered_track_colors_like_colmap() {
         let mut frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
         frames[0].colors = vec![[10, 20, 30], [40, 50, 60]];
@@ -10525,6 +10666,8 @@ mod tests {
         assert_eq!(config.local_ba_max_refinements, 2);
         assert_eq!(config.local_ba_max_refinement_change, 0.001);
         assert_eq!(config.global_ba_iterations, 50);
+        assert_eq!(config.global_ba_images_ratio, 1.5);
+        assert_eq!(config.global_ba_points_ratio, 1.5);
 
         let options = mapper_ba_options(
             &config,
@@ -10558,6 +10701,39 @@ mod tests {
             None,
         );
         assert_eq!(threaded_options.num_threads, 4);
+    }
+
+    #[test]
+    fn global_ba_iteration_budget_does_not_grow_with_observations() {
+        let frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.points = vec![
+            Point3D {
+                xyz: [0.0, 0.0, 2.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![
+                    TrackObservation {
+                        image: 0,
+                        feature: 0,
+                    },
+                    TrackObservation {
+                        image: 1,
+                        feature: 0,
+                    },
+                ],
+            };
+            10_001
+        ];
+        let config = MapperConfig {
+            global_ba_iterations: 50,
+            ..MapperConfig::default()
+        };
+
+        assert_eq!(
+            global_ba_iterations_for_reconstruction(&config, &reconstruction),
+            50
+        );
     }
 
     #[test]
@@ -10654,7 +10830,7 @@ mod tests {
     }
 
     #[test]
-    fn global_ba_options_tighten_small_reconstructions_like_colmap() {
+    fn global_ba_options_keep_configured_iteration_budget_for_small_reconstructions() {
         let frames = (0..10)
             .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
             .collect::<Vec<_>>();
@@ -10662,7 +10838,10 @@ mod tests {
         for image in 0..9 {
             reconstruction.poses[image] = Some(SE3::identity());
         }
-        let config = MapperConfig::default();
+        let config = MapperConfig {
+            global_ba_iterations: 50,
+            ..MapperConfig::default()
+        };
 
         let small_options = mapper_global_ba_options(
             &config,
@@ -10674,7 +10853,7 @@ mod tests {
             None,
         );
         assert_eq!(registered_frame_count(&reconstruction), 9);
-        assert_eq!(small_options.iterations, 100);
+        assert_eq!(small_options.iterations, 50);
         assert_eq!(small_options.function_tolerance, 0.0);
         assert_eq!(small_options.gradient_tolerance, 0.1);
         assert_eq!(small_options.parameter_tolerance, 0.0);
@@ -14013,7 +14192,7 @@ mod tests {
     }
 
     #[test]
-    fn global_ba_schedule_triggers_on_image_or_point_growth() {
+    fn global_ba_schedule_absolute_frequency_triggers_on_image_or_point_growth() {
         let frames = vec![
             minimal_frame(0, "a.jpg"),
             minimal_frame(1, "b.jpg"),
@@ -14040,10 +14219,10 @@ mod tests {
         reconstruction.point_ids.push(1);
         let mut schedule = GlobalBaSchedule::new(&reconstruction);
         let config = MapperConfig {
-            global_ba_images_freq: 999,
-            global_ba_points_freq: 999,
-            global_ba_images_ratio: 1.1,
-            global_ba_points_ratio: 1.1,
+            global_ba_images_freq: 1,
+            global_ba_points_freq: 1,
+            global_ba_images_ratio: 10.0,
+            global_ba_points_ratio: 10.0,
             ..MapperConfig::default()
         };
 
@@ -14071,6 +14250,51 @@ mod tests {
 
         schedule.mark(&reconstruction);
         assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+    }
+
+    #[test]
+    fn global_ba_schedule_ratio_waits_for_five_new_frames() {
+        let frames = (0..7)
+            .map(|image| minimal_frame(image, &format!("image_{image}.jpg")))
+            .collect::<Vec<_>>();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::identity());
+        let point = Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        };
+        reconstruction.points.push(point.clone());
+        let schedule = GlobalBaSchedule::new(&reconstruction);
+        let config = MapperConfig {
+            global_ba_images_freq: 0,
+            global_ba_points_freq: 0,
+            global_ba_images_ratio: 1.1,
+            global_ba_points_ratio: 1.1,
+            ..MapperConfig::default()
+        };
+
+        reconstruction.points.push(point);
+        assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+
+        for image in 2..6 {
+            reconstruction.poses[image] = Some(SE3::identity());
+            assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+        }
+
+        reconstruction.poses[6] = Some(SE3::identity());
+        assert!(should_run_global_ba(&schedule, &reconstruction, &config));
     }
 
     #[test]
@@ -14408,7 +14632,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_database_pair_geometries_keeps_stored_pose_without_wide_baseline_gate() -> Result<()>
+    fn estimate_database_pair_geometries_rejects_under_supported_stored_wide_baseline() -> Result<()>
     {
         let dir = tempdir()?;
         let db_path = dir.path().join("database.db");
@@ -14495,12 +14719,35 @@ mod tests {
             },
         )?;
 
-        assert_eq!(pairs.len(), 1);
-        assert_eq!((pairs[0].left, pairs[0].right), (0, 4));
-        assert_eq!(pairs[0].inliers, 4);
-        assert!(!keep_verified_pair(&pairs[0]));
-        assert!(keep_stored_database_pair(&pairs[0]));
+        assert!(pairs.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn stored_database_pair_rejects_high_reprojection_error() {
+        let mut pair = test_pair(0, 20, 60, 50, 12.0, [1.0, 0.0, 0.0]);
+        pair.mean_reprojection_error_px = 2.0;
+        let config = MapperConfig {
+            max_reprojection_error_px: 1.5,
+            ..MapperConfig::default()
+        };
+
+        assert!(!keep_pair_for_mapping(&pair, &config));
+    }
+
+    #[test]
+    fn stored_database_pair_rejects_weak_triangulated_support() {
+        let pair = test_pair(0, 20, 60, 3, 12.0, [1.0, 0.0, 0.0]);
+
+        assert!(!keep_pair_for_mapping(&pair, &MapperConfig::default()));
+    }
+
+    #[test]
+    fn stored_database_pair_accepts_supported_wide_baseline_rotation() {
+        let mut pair = test_pair(0, 20, 60, 50, 12.0, [1.0, 0.0, 0.0]);
+        pair.rotation_deg = 135.0;
+
+        assert!(keep_pair_for_mapping(&pair, &MapperConfig::default()));
     }
 
     #[test]
@@ -14584,13 +14831,7 @@ mod tests {
                 ..ColmapTwoViewGeometry::default()
             },
         )?;
-        let mut frames = vec![
-            minimal_frame(0, "left.jpg"),
-            minimal_frame(1, "middle_1.jpg"),
-            minimal_frame(2, "middle_2.jpg"),
-            minimal_frame(3, "middle_3.jpg"),
-            minimal_frame(4, "right.jpg"),
-        ];
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
         let database = load_mapper_database(Some(&db_path), &frames, 0)?.expect("database input");
         apply_database_keypoints(&mut frames, &database.keypoints_by_name);
 
@@ -14609,7 +14850,7 @@ mod tests {
         )?;
 
         assert_eq!(pairs.len(), 1);
-        assert_eq!((pairs[0].left, pairs[0].right), (0, 4));
+        assert_eq!((pairs[0].left, pairs[0].right), (0, 1));
         assert_eq!(
             pairs[0].two_view_config,
             crate::database::COLMAP_TWO_VIEW_UNCALIBRATED
@@ -14617,8 +14858,14 @@ mod tests {
         assert_eq!(pairs[0].inliers, points.len());
         assert!(pairs[0].qvec.is_some());
         assert!(pairs[0].tvec.is_some());
-        assert!(!keep_verified_pair(&pairs[0]));
-        assert!(keep_stored_database_pair(&pairs[0]));
+        assert!(keep_pair_for_mapping(
+            &pairs[0],
+            &MapperConfig {
+                min_inliers: points.len(),
+                min_triangulated: points.len(),
+                ..MapperConfig::default()
+            }
+        ));
         Ok(())
     }
 

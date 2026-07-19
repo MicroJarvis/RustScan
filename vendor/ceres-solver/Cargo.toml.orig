@@ -24,6 +24,7 @@ default = ["system"]
 [dependencies.ceres-solver-sys]
 version = "0.5.3"
 path = "./ceres-solver-sys"
+default-features = false
 
 [dependencies.thiserror]
 version = "2"

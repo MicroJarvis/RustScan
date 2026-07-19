@@ -316,18 +316,40 @@ pub(super) fn seed_reconstruction_from_reference(
     })
 }
 
+#[cfg(test)]
 pub(super) fn load_mapper_database(
     database: Option<&Path>,
     frames: &[ImageFrame],
     min_num_matches: usize,
 ) -> Result<Option<MapperDatabaseInput>> {
-    let Some(database) = database else {
-        return Ok(None);
-    };
     let image_names = frames
         .iter()
         .map(|frame| frame.name.clone())
         .collect::<BTreeSet<_>>();
+    load_mapper_database_for_names(database, image_names, min_num_matches)
+}
+
+pub(super) fn load_mapper_database_for_paths(
+    database: Option<&Path>,
+    paths: &[PathBuf],
+    min_num_matches: usize,
+) -> Result<Option<MapperDatabaseInput>> {
+    let image_names = paths
+        .iter()
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    load_mapper_database_for_names(database, image_names, min_num_matches)
+}
+
+fn load_mapper_database_for_names(
+    database: Option<&Path>,
+    image_names: BTreeSet<String>,
+    min_num_matches: usize,
+) -> Result<Option<MapperDatabaseInput>> {
+    let Some(database) = database else {
+        return Ok(None);
+    };
     let db = ColmapDatabase::open_read_only(database)?;
     let cache = db.load_cache(&DatabaseCacheOptions {
         min_num_matches,
@@ -354,6 +376,65 @@ pub(super) fn load_mapper_database(
         keypoints_by_name,
         two_view_geometries,
     }))
+}
+
+pub(super) fn database_frames(
+    paths: &[PathBuf],
+    database: &MapperDatabaseInput,
+) -> Result<Vec<ImageFrame>> {
+    let images_by_name = database
+        .cache
+        .images
+        .values()
+        .map(|image| (image.name.as_str(), image))
+        .collect::<HashMap<_, _>>();
+
+    paths
+        .iter()
+        .enumerate()
+        .map(|(id, path)| {
+            let name = path
+                .file_name()
+                .with_context(|| format!("image path has no file name: {}", path.display()))?
+                .to_string_lossy()
+                .into_owned();
+            let database_dimensions = images_by_name
+                .get(name.as_str())
+                .and_then(|image| database.cache.cameras.get(&image.camera_id))
+                .map(|camera| (camera.camera.width, camera.camera.height));
+            let (width, height) = match database_dimensions {
+                Some(dimensions) => dimensions,
+                None => ImageReader::open(path)
+                    .with_context(|| format!("failed to open {}", path.display()))?
+                    .with_guessed_format()
+                    .with_context(|| format!("failed to detect format for {}", path.display()))?
+                    .into_dimensions()
+                    .with_context(|| format!("failed to read dimensions for {}", path.display()))?,
+            };
+            let keypoints = database
+                .keypoints_by_name
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or_default();
+            Ok(ImageFrame {
+                id,
+                name,
+                path: path.clone(),
+                width,
+                height,
+                keypoints,
+                descriptors: rustslam::Descriptors::new(),
+                sift: crate::sift::SiftFeatures::default(),
+                wide_descriptors: crate::wide::WideDescriptors {
+                    data: Vec::new(),
+                    dim: 0,
+                    count: 0,
+                },
+                strong_feature_indices: Vec::new(),
+                colors: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 pub(super) fn database_camera_setup(
@@ -541,6 +622,7 @@ pub(super) fn data_id_from_colmap(data_id: &ColmapDataId) -> DataId {
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_database_keypoints(
     frames: &mut [ImageFrame],
     keypoints_by_name: &HashMap<String, Vec<rustslam::KeyPoint>>,
@@ -586,13 +668,7 @@ pub(super) fn sample_keypoint_colors(frame: &ImageFrame) -> Vec<[u8; 3]> {
 }
 
 pub(super) fn apply_color_extraction_policy(frames: &mut [ImageFrame], extract_colors: bool) {
-    if extract_colors {
-        for frame in frames {
-            if frame.colors.len() != frame.keypoints.len() {
-                frame.colors = sample_keypoint_colors(frame);
-            }
-        }
-    } else {
+    if !extract_colors {
         for frame in frames {
             frame.colors = vec![[0, 0, 0]; frame.keypoints.len()];
         }

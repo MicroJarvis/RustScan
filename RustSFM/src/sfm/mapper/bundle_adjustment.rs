@@ -124,17 +124,9 @@ pub(super) fn global_ba_iterations(config: &MapperConfig) -> usize {
 
 pub(super) fn global_ba_iterations_for_reconstruction(
     config: &MapperConfig,
-    reconstruction: &Reconstruction,
+    _reconstruction: &Reconstruction,
 ) -> usize {
-    let base = global_ba_iterations(config);
-    let observations = reconstruction_num_observations(reconstruction);
-    if observations >= 20_000 {
-        base.saturating_mul(3)
-    } else if observations >= 10_000 {
-        base.saturating_mul(2)
-    } else {
-        base
-    }
+    global_ba_iterations(config)
 }
 
 pub(super) fn global_ba_huber_delta_px() -> f64 {
@@ -399,7 +391,6 @@ pub(super) fn apply_colmap_small_reconstruction_global_ba_solver_options(
     options.function_tolerance /= 10.0;
     options.gradient_tolerance /= 10.0;
     options.parameter_tolerance /= 10.0;
-    options.iterations = options.iterations.saturating_mul(2);
     options.max_linear_solver_iterations = 200;
 }
 

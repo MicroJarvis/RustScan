@@ -166,9 +166,9 @@ struct ReconstructArgs {
     no_global_ba: bool,
     #[arg(long, default_value = "50")]
     global_ba_iterations: usize,
-    #[arg(long, default_value = "1.1")]
+    #[arg(long, default_value = "1.5")]
     global_ba_images_ratio: f32,
-    #[arg(long, default_value = "1.1")]
+    #[arg(long, default_value = "1.5")]
     global_ba_points_ratio: f32,
     #[arg(long, default_value = "500")]
     global_ba_images_freq: usize,
@@ -713,6 +713,19 @@ mod tests {
             panic!("reconstruct command")
         };
         assert!(args.use_gpu_pnp);
+    }
+
+    #[test]
+    fn native_reconstruct_uses_less_aggressive_global_ba_ratio_defaults() {
+        let cli =
+            Cli::try_parse_from(["rustsfm", "reconstruct", "--input", "in", "--output", "out"])
+                .expect("native reconstruct defaults");
+        let Commands::Reconstruct(args) = cli.command else {
+            panic!("reconstruct command")
+        };
+
+        assert_eq!(args.global_ba_images_ratio, 1.5);
+        assert_eq!(args.global_ba_points_ratio, 1.5);
     }
 
     #[test]
