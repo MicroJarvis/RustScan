@@ -16,7 +16,7 @@
 - Modify: `RustSFM/src/sfm/observation_manager.rs`
 - Test: `RustSFM/src/sfm/observation_manager.rs`
 
-- [ ] **Step 1: Write the failing shared-allocation test**
+- [x] **Step 1: Write the failing shared-allocation test**
 
 Add a module-private test that clones the installed handle and requires `Arc::ptr_eq`:
 
@@ -34,7 +34,7 @@ fn correspondence_graph_clones_share_one_allocation() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -44,7 +44,7 @@ cargo test -p rustsfm correspondence_graph_clones_share_one_allocation
 
 Expected: compilation fails because the field contains `CorrespondenceGraph`, not `Arc<CorrespondenceGraph>`.
 
-- [ ] **Step 3: Store the graph in `Arc`**
+- [x] **Step 3: Store the graph in `Arc`**
 
 Import `Arc`, change the field and installation path, and preserve the public borrowed accessor:
 
@@ -70,7 +70,7 @@ pub fn correspondence_graph(&self) -> Option<&CorrespondenceGraph> {
 
 Existing `self.correspondence_graph.clone()` mutation paths remain structurally unchanged but now clone only an `Arc`.
 
-- [ ] **Step 4: Verify graph behavior and manager regressions**
+- [x] **Step 4: Verify graph behavior and manager regressions**
 
 Run:
 
@@ -81,7 +81,7 @@ cargo test -p rustsfm incremental_triangulator
 
 Expected: PASS, including existing visibility, add, delete, merge, register, and rollback tests.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add RustSFM/src/sfm/observation_manager.rs
@@ -94,7 +94,7 @@ git commit -m "perf(rustsfm): share mapper correspondence graph"
 - Modify: `RustSFM/src/sfm/observation_manager.rs`
 - Test: `RustSFM/src/sfm/observation_manager.rs`
 
-- [ ] **Step 1: Write failing point-ID behavior tests**
+- [x] **Step 1: Write failing point-ID behavior tests**
 
 Add one test that creates a point with external ID 41, deletes it, and adds a new valid point. Assert the new external ID is 42 rather than reusing 41. Add a second fixture with two points but only one `point_ids` entry and assert the cold repair path produces unique IDs before appending a new point.
 
@@ -108,7 +108,7 @@ assert_eq!(reconstruction.point_ids.len(), reconstruction.points.len());
 assert_eq!(reconstruction.point_ids.iter().copied().collect::<HashSet<_>>().len(), reconstruction.point_ids.len());
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -118,7 +118,7 @@ cargo test -p rustsfm point3d_id_allocator
 
 Expected: the delete/add test fails because the current maximum scan reuses the deleted highest ID, and the allocator API does not exist.
 
-- [ ] **Step 3: Add the monotonic allocator state**
+- [x] **Step 3: Add the monotonic allocator state**
 
 Add an internal allocator whose normal path does not inspect `point_ids`:
 
@@ -158,7 +158,7 @@ impl Point3DIdAllocator {
 
 Store it in `ObservationManager`, initialize it in `new`, and preserve its monotonic value across `rebuild` and rollback by only increasing it when imported IDs are larger.
 
-- [ ] **Step 4: Make legacy repair cold and allocation constant-time**
+- [x] **Step 4: Make legacy repair cold and allocation constant-time**
 
 Replace unconditional table scans in `add_point3d` with:
 
@@ -173,7 +173,7 @@ reconstruction.points.push(point);
 
 `repair_point_id_table` may scan existing IDs once only while the vectors are mismatched. Remove `next_point3d_id` and keep delete/merge external-ID semantics unchanged.
 
-- [ ] **Step 5: Verify point and triangulation suites**
+- [x] **Step 5: Verify point and triangulation suites**
 
 Run:
 
@@ -185,7 +185,7 @@ cargo test -p rustsfm incremental_triangulator
 
 Expected: PASS, with unique non-reused external IDs and unchanged track statistics.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 ```bash
 git add RustSFM/src/sfm/observation_manager.rs
@@ -198,7 +198,7 @@ git commit -m "perf(rustsfm): allocate point ids in constant time"
 - Modify: `RustSFM/src/sfm/mapper.rs`
 - Test: `RustSFM/src/sfm/mapper.rs`
 
-- [ ] **Step 1: Write failing retry-state tests**
+- [x] **Step 1: Write failing retry-state tests**
 
 Add tests around a new `RegistrationRetryState` with separate structure-based and structureless support. Cover unchanged suppression, support growth, rig-unit propagation, and fallback:
 
@@ -212,7 +212,7 @@ assert!(state.is_eligible(&reconstruction, 2, NextImageRegistrationMode::Structu
 assert!(state.is_eligible(&reconstruction, 2, NextImageRegistrationMode::StructureBased, 30, 3, true));
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -222,7 +222,7 @@ cargo test -p rustsfm registration_retry_state
 
 Expected: compilation fails because `RegistrationRetryState` does not exist.
 
-- [ ] **Step 3: Implement unit-aware retry state**
+- [x] **Step 3: Implement unit-aware retry state**
 
 Add:
 
@@ -242,7 +242,7 @@ struct RegistrationRetryState {
 
 Methods use `image_indices_for_registration_unit` to read and update all rig siblings. A support increase resets trials before eligibility is evaluated. `record_failure` stores the current support and increments trials for the whole unit. Success clears the chosen mode for the whole unit.
 
-- [ ] **Step 4: Route candidate selection through retry state**
+- [x] **Step 4: Route candidate selection through retry state**
 
 Replace the two raw trial vectors in `incremental_map_single_attempt_with_pnp_scorer` and candidate helpers with `RegistrationRetryState`. `find_next_registration_images` receives a pass enum:
 
@@ -256,7 +256,7 @@ enum RegistrationPass {
 
 Normal selection respects support-aware `max_reg_trials`. Fallback ignores exhausted trials but retains minimum support, filtered-unit ordering, deterministic rank ordering, and registration-unit deduplication.
 
-- [ ] **Step 5: Remove the eager all-image PnP sweep**
+- [x] **Step 5: Remove the eager all-image PnP sweep**
 
 Delete the production call sequence:
 
@@ -267,7 +267,7 @@ mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(...)?;
 
 When normal selection returns no choice, immediately run one `ExhaustiveFallback` selection. If it also returns no choice, terminate the model. If it succeeds, register the image and return to normal selection. Failed attempts from either pass are recorded with the support used for that attempt.
 
-- [ ] **Step 6: Verify retry and mapper registration regressions**
+- [x] **Step 6: Verify retry and mapper registration regressions**
 
 Run:
 
@@ -280,7 +280,7 @@ cargo test -p rustsfm mapper_pnp
 
 Expected: PASS. Existing deterministic queue ordering remains unchanged, and the fallback test proves a bridge candidate is attempted before termination.
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 ```bash
 git add RustSFM/src/sfm/mapper.rs
@@ -293,7 +293,7 @@ git commit -m "perf(rustsfm): retry registration candidates lazily"
 - Modify: `RustSFM/src/sfm/mapper.rs`
 - Test: `RustSFM/src/sfm/mapper.rs`
 
-- [ ] **Step 1: Write the failing telemetry-format test**
+- [x] **Step 1: Write the failing telemetry-format test**
 
 Define the expected stable keys before implementation:
 
@@ -318,7 +318,7 @@ fn incremental_registration_telemetry_reports_hot_path_stages() {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -328,7 +328,7 @@ cargo test -p rustsfm incremental_registration_telemetry_reports_hot_path_stages
 
 Expected: compilation fails because the telemetry type is missing.
 
-- [ ] **Step 3: Add session-scoped counters and timers**
+- [x] **Step 3: Add session-scoped counters and timers**
 
 Create `IncrementalRegistrationTelemetry` in `mapper.rs`. Pass one mutable instance through candidate selection. Time observation collection inside `solve_absolute_pose_with_pnp_scorer`, time the remaining pose solve/refinement separately, and time observation updates and triangulation blocks in the registration loop with `Instant`.
 
@@ -340,7 +340,7 @@ incremental_registration candidate_units=... skipped_unchanged=... structure_bas
 
 Append it to `debug_log` once when the incremental mapping attempt exits. Do not alter existing `pnp_timing` output.
 
-- [ ] **Step 4: Verify telemetry and full RustSFM library tests**
+- [x] **Step 4: Verify telemetry and full RustSFM library tests**
 
 Run:
 
@@ -351,7 +351,7 @@ cargo test -p rustsfm --lib -- --skip real_colmap_sparse
 
 Expected: PASS with the repository's known real-fixture exclusions only.
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```bash
 git add RustSFM/src/sfm/mapper.rs
@@ -363,7 +363,7 @@ git commit -m "perf(rustsfm): report registration hot-path timings"
 **Files:**
 - Modify: `docs/superpowers/plans/2026-07-19-rustsfm-incremental-registration-hot-path.md`
 
-- [ ] **Step 1: Run static and regression verification**
+- [x] **Step 1: Run static and regression verification**
 
 Run:
 
@@ -376,7 +376,7 @@ cargo check -p rustgs
 
 Expected: all commands pass; the RustSFM test count is at least the pre-change 562 passing tests with only 19 known fixture tests filtered.
 
-- [ ] **Step 2: Run a fixed-seed 200-image benchmark**
+- [x] **Step 2: Run a fixed-seed 200-image benchmark**
 
 Build release and run against the existing `flowers2` database in a new `/tmp` output directory, preserving single-thread mapper behavior:
 
@@ -395,7 +395,7 @@ target/release/rustsfm reconstruct \
 
 Expected: 200/200 images register, poses are finite, output contains `sparse/0`, and telemetry shows materially fewer pose attempts than the old eager sweep.
 
-- [ ] **Step 3: Probe RustGS input compatibility**
+- [x] **Step 3: Probe RustGS input compatibility**
 
 Run a one-frame, one-iteration training probe against the optimized output:
 
@@ -411,11 +411,11 @@ cargo run -p rustgs --release --bin rustgs -- train \
 
 Expected: RustGS resolves `sparse/0`, reports zero missing registered images, initializes from a non-empty sparse point cloud, and writes the probe PLY.
 
-- [ ] **Step 4: Record benchmark evidence in this plan**
+- [x] **Step 4: Record benchmark evidence in this plan**
 
 Append the before/after wall time, registered images, points, pose-attempt count, fallback epochs, and hot-path timing totals. Do not commit `/tmp` outputs or logs.
 
-- [ ] **Step 5: Final review and commit**
+- [x] **Step 5: Final review and commit**
 
 Review `git diff`, run `git diff --check`, and commit only the benchmark record if all correctness gates pass:
 
@@ -423,3 +423,37 @@ Review `git diff`, run `git diff --check`, and commit only the benchmark record 
 git add docs/superpowers/plans/2026-07-19-rustsfm-incremental-registration-hot-path.md
 git commit -m "docs(rustsfm): record registration hot-path benchmark"
 ```
+
+## Execution Record (2026-07-19)
+
+All commands ran from the `feat/rustsfm-wgpu` linked worktree on an Apple M5 Max. The mapper
+benchmark used `--threads 1`, fixed random seed `0`, and the existing `flowers2` database.
+
+The pre-change profile covered all 960 images rather than this bounded 200-image sample, so its
+approximately 4.5 hour wall time and 42,697 PnP calls are retained as motivation only. No direct
+wall-time speedup ratio is reported across the different input sizes. The old PnP internals
+accounted for 57.3 seconds, or less than 0.4 percent of that run.
+
+The bounded post-change benchmark produced:
+
+- wall time: 362.31 seconds (`summary.elapsed_ms=361673.86`);
+- registered images: 200/200, with 200 finite exported poses and no non-finite pose values;
+- sparse points and pairs: 91,894 points and 993 pairs;
+- pose work: 5,542 ranked candidate-unit entries, 200 structure-based attempts, 0
+  structureless attempts, and 0 fallback epochs;
+- retry behavior: 2 failed attempts, 198 successful registrations after the initial pair, no
+  registration rollback, and no unchanged-support skips;
+- hot-path totals: 54.89 ms collecting observations, 2,251.72 ms solving/refining poses,
+  31.57 ms updating observations, and 39,203.18 ms in per-registration triangulation;
+- outputs: a COLMAP-compatible `sparse/0` text model plus the 200 selected images.
+
+The bounded run therefore used approximately one PnP attempt per input image. Observation
+collection plus pose solve/refinement consumed about 0.64 percent of wall time, while measured
+per-registration triangulation consumed about 10.84 percent. The remaining runtime is dominated
+by local and scheduled/final global BA and their postprocessing rather than PnP.
+
+The RustGS compatibility probe resolved `sparse/0`, reported zero missing images, loaded 91,894
+initialization points, and trained one selected frame for one iteration through wgpu/Metal. It
+exported 1,000 Gaussians to `rustgs-probe.ply` in 0.81 seconds, and the parity report passed its
+no-NaN, no-OOM, and export-roundtrip gates. Benchmark artifacts and logs remain under
+`/tmp/rustsfm-registration-hot-path-20260719` and are not committed.
