@@ -48,6 +48,41 @@ impl ImageStat {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Point3DIdAllocator {
+    next: Option<u64>,
+}
+
+impl Default for Point3DIdAllocator {
+    fn default() -> Self {
+        Self { next: Some(1) }
+    }
+}
+
+impl Point3DIdAllocator {
+    fn observe_reconstruction(&mut self, reconstruction: &Reconstruction) {
+        if let Some(max_id) = reconstruction.point_ids.iter().copied().max() {
+            self.observe(max_id);
+        }
+    }
+
+    fn observe(&mut self, point3d_id: u64) {
+        let Some(observed_next) = point3d_id.checked_add(1) else {
+            self.next = None;
+            return;
+        };
+        if let Some(next) = self.next.as_mut() {
+            *next = (*next).max(observed_next);
+        }
+    }
+
+    fn allocate(&mut self) -> Option<u64> {
+        let point3d_id = self.next?;
+        self.next = point3d_id.checked_add(1);
+        Some(point3d_id)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ObservationManager {
     image_stats: Vec<ImageStat>,
@@ -55,6 +90,7 @@ pub struct ObservationManager {
     point3d_correspondence_counts: Vec<Vec<usize>>,
     modified_point3d_ids: HashSet<usize>,
     correspondence_graph: Option<Arc<CorrespondenceGraph>>,
+    point3d_id_allocator: Point3DIdAllocator,
 }
 
 impl ObservationManager {
@@ -64,6 +100,9 @@ impl ObservationManager {
         reconstruction: &Reconstruction,
     ) -> Self {
         let mut manager = Self::default();
+        manager
+            .point3d_id_allocator
+            .observe_reconstruction(reconstruction);
         manager.install_correspondence_graph(build_correspondence_graph_from_pairs(frames, pairs));
         manager.rebuild(frames, pairs, reconstruction);
         manager
@@ -83,6 +122,8 @@ impl ObservationManager {
         pairs: &[PairGeometry],
         reconstruction: &Reconstruction,
     ) {
+        self.point3d_id_allocator
+            .observe_reconstruction(reconstruction);
         let modified_point3d_ids = std::mem::take(&mut self.modified_point3d_ids);
         let mut image_stats = frames
             .iter()
@@ -363,14 +404,15 @@ impl ObservationManager {
             return None;
         }
 
-        ensure_point_id_table(reconstruction);
+        if !repair_point_id_table(reconstruction, &mut self.point3d_id_allocator) {
+            return None;
+        }
+        let external_point3d_id = self.point3d_id_allocator.allocate()?;
         let point_id = reconstruction.points.len();
         for obs in &point.track {
             reconstruction.observations[obs.image][obs.feature] = Some(point_id);
         }
-        reconstruction
-            .point_ids
-            .push(next_point3d_id(reconstruction));
+        reconstruction.point_ids.push(external_point3d_id);
         reconstruction.points.push(point);
         self.mark_point3d_modified(point_id);
 
@@ -576,7 +618,9 @@ impl ObservationManager {
         }
 
         let (keep_id, remove_id) = ordered_pair(point_id1, point_id2);
-        ensure_point_id_table(reconstruction);
+        if !repair_point_id_table(reconstruction, &mut self.point3d_id_allocator) {
+            return None;
+        }
         reconstruction.points[keep_id] = merged_point;
         for obs in &reconstruction.points[keep_id].track {
             reconstruction.observations[obs.image][obs.feature] = Some(keep_id);
@@ -779,7 +823,9 @@ impl ObservationManager {
             return false;
         }
 
-        ensure_point_id_table(reconstruction);
+        if !repair_point_id_table(reconstruction, &mut self.point3d_id_allocator) {
+            return false;
+        }
         reconstruction.points.remove(point_id);
         if point_id < reconstruction.point_ids.len() {
             reconstruction.point_ids.remove(point_id);
@@ -918,33 +964,21 @@ fn track_observations_are_valid(
     })
 }
 
-fn ensure_point_id_table(reconstruction: &mut Reconstruction) {
-    let mut used = reconstruction
-        .point_ids
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
+fn repair_point_id_table(
+    reconstruction: &mut Reconstruction,
+    allocator: &mut Point3DIdAllocator,
+) -> bool {
+    if reconstruction.point_ids.len() >= reconstruction.points.len() {
+        return true;
+    }
+    allocator.observe_reconstruction(reconstruction);
     while reconstruction.point_ids.len() < reconstruction.points.len() {
-        let mut point3d_id = reconstruction.point_ids.len() as u64 + 1;
-        while used.contains(&point3d_id) {
-            point3d_id += 1;
-        }
+        let Some(point3d_id) = allocator.allocate() else {
+            return false;
+        };
         reconstruction.point_ids.push(point3d_id);
-        used.insert(point3d_id);
     }
-}
-
-fn next_point3d_id(reconstruction: &Reconstruction) -> u64 {
-    let mut point3d_id = reconstruction.point_ids.iter().copied().max().unwrap_or(0) + 1;
-    let used = reconstruction
-        .point_ids
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    while used.contains(&point3d_id) {
-        point3d_id += 1;
-    }
-    point3d_id
+    true
 }
 
 #[cfg(test)]
@@ -968,6 +1002,145 @@ mod tests {
         let second = first.clone();
 
         assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn point3d_id_allocator_does_not_reuse_deleted_highest_id() {
+        let frames = vec![frame(0, 100, 100), frame(1, 100, 100)];
+        let pairs = vec![pair(0, 1, &[(0, 0), (1, 1)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses.fill(Some(SE3::identity()));
+        reconstruction.observations[0][0] = Some(0);
+        reconstruction.observations[1][0] = Some(0);
+        reconstruction.point_ids.push(41);
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 1.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        });
+        let mut manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+
+        assert!(manager.delete_point3d(&frames, &pairs, &mut reconstruction, 0));
+        let point_id = manager
+            .add_point3d(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                Point3D {
+                    xyz: [0.1, 0.0, 1.0],
+                    color: [0, 0, 0],
+                    error: 0.0,
+                    track: vec![
+                        TrackObservation {
+                            image: 0,
+                            feature: 1,
+                        },
+                        TrackObservation {
+                            image: 1,
+                            feature: 1,
+                        },
+                    ],
+                },
+            )
+            .expect("replacement point");
+
+        assert_eq!(reconstruction.point_ids[point_id], 42);
+    }
+
+    #[test]
+    fn point3d_id_allocator_repairs_short_legacy_table_above_maximum() {
+        let frames = vec![
+            frame(0, 100, 100),
+            frame(1, 100, 100),
+            frame(2, 100, 100),
+            frame(3, 100, 100),
+        ];
+        let pairs = vec![pair(0, 1, &[(0, 0), (1, 1)]), pair(2, 3, &[(0, 0)])];
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses.fill(Some(SE3::identity()));
+        for &(image, point_id) in &[(0, 0), (1, 0), (2, 1), (3, 1)] {
+            reconstruction.observations[image][0] = Some(point_id);
+        }
+        reconstruction.point_ids.push(41);
+        reconstruction.points.extend([
+            Point3D {
+                xyz: [0.0, 0.0, 1.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![
+                    TrackObservation {
+                        image: 0,
+                        feature: 0,
+                    },
+                    TrackObservation {
+                        image: 1,
+                        feature: 0,
+                    },
+                ],
+            },
+            Point3D {
+                xyz: [0.2, 0.0, 1.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![
+                    TrackObservation {
+                        image: 2,
+                        feature: 0,
+                    },
+                    TrackObservation {
+                        image: 3,
+                        feature: 0,
+                    },
+                ],
+            },
+        ]);
+        let mut manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+
+        let point_id = manager
+            .add_point3d(
+                &frames,
+                &pairs,
+                &mut reconstruction,
+                Point3D {
+                    xyz: [0.1, 0.1, 1.0],
+                    color: [0, 0, 0],
+                    error: 0.0,
+                    track: vec![
+                        TrackObservation {
+                            image: 0,
+                            feature: 1,
+                        },
+                        TrackObservation {
+                            image: 1,
+                            feature: 1,
+                        },
+                    ],
+                },
+            )
+            .expect("new point after legacy repair");
+
+        assert_eq!(reconstruction.point_ids, vec![41, 42, 43]);
+        assert_eq!(point_id, 2);
+        assert_eq!(reconstruction.point_ids.len(), reconstruction.points.len());
+        assert_eq!(
+            reconstruction
+                .point_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            reconstruction.point_ids.len()
+        );
     }
 
     #[test]
