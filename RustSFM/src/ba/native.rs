@@ -5,9 +5,10 @@ use super::shared::{
 use super::{
     camera_center_pose_jacobian, camera_center_world, compute_pose_covariances,
     position_prior_information_matrix, BundleAdjustmentCovariance, BundleAdjustmentGauge,
-    BundleAdjustmentLinearSolver, BundleAdjustmentLoss, BundleAdjustmentOptions,
-    BundleAdjustmentPreconditioner, BundleAdjustmentReport, BundleAdjustmentTerminationReason,
-    BundleAdjustmentTerminationType, CovariancePoseBlock, POSE_PRIOR_JACOBIAN_EPS,
+    BundleAdjustmentLinearSolver, BundleAdjustmentLinearSolverPreference, BundleAdjustmentLoss,
+    BundleAdjustmentOptions, BundleAdjustmentPreconditioner, BundleAdjustmentReport,
+    BundleAdjustmentTerminationReason, BundleAdjustmentTerminationType, CovariancePoseBlock,
+    POSE_PRIOR_JACOBIAN_EPS,
 };
 use crate::sparse_cholesky::{
     schur_jacobi_preconditioner, solve_symmetric_pcg, SchurParameterBlock, SymmetricSparseMatrix,
@@ -110,7 +111,8 @@ pub(crate) fn refine_bundle_adjustment_native(
         );
     }
     let pose_entities = pose_blocks.blocks.len() + sensor_pose_specs.len();
-    let (linear_solver, preconditioner) = native_linear_solver_policy(pose_entities);
+    let (linear_solver, preconditioner) =
+        native_linear_solver_policy_for_preference(options.linear_solver, pose_entities);
     let schur_blocks =
         schur_parameter_blocks(&pose_blocks, &sensor_pose_specs, &camera_param_specs);
     if observations.len() * 2 < nonpoint_dim {
@@ -701,15 +703,42 @@ fn native_linear_solver_policy(
     BundleAdjustmentLinearSolver,
     Option<BundleAdjustmentPreconditioner>,
 ) {
-    if pose_entities <= DENSE_SCHUR_MAX_POSE_ENTITIES {
-        (BundleAdjustmentLinearSolver::DenseSchur, None)
-    } else if pose_entities <= SPARSE_SCHUR_MAX_POSE_ENTITIES {
-        (BundleAdjustmentLinearSolver::SparseSchur, None)
-    } else {
-        (
+    native_linear_solver_policy_for_preference(
+        BundleAdjustmentLinearSolverPreference::Auto,
+        pose_entities,
+    )
+}
+
+fn native_linear_solver_policy_for_preference(
+    preference: BundleAdjustmentLinearSolverPreference,
+    pose_entities: usize,
+) -> (
+    BundleAdjustmentLinearSolver,
+    Option<BundleAdjustmentPreconditioner>,
+) {
+    match preference {
+        BundleAdjustmentLinearSolverPreference::DenseSchur => {
+            (BundleAdjustmentLinearSolver::DenseSchur, None)
+        }
+        BundleAdjustmentLinearSolverPreference::SparseSchur => {
+            (BundleAdjustmentLinearSolver::SparseSchur, None)
+        }
+        BundleAdjustmentLinearSolverPreference::IterativeSchur => (
             BundleAdjustmentLinearSolver::IterativeSchur,
             Some(BundleAdjustmentPreconditioner::SchurJacobi),
-        )
+        ),
+        BundleAdjustmentLinearSolverPreference::Auto => {
+            if pose_entities <= DENSE_SCHUR_MAX_POSE_ENTITIES {
+                (BundleAdjustmentLinearSolver::DenseSchur, None)
+            } else if pose_entities <= SPARSE_SCHUR_MAX_POSE_ENTITIES {
+                (BundleAdjustmentLinearSolver::SparseSchur, None)
+            } else {
+                (
+                    BundleAdjustmentLinearSolver::IterativeSchur,
+                    Some(BundleAdjustmentPreconditioner::SchurJacobi),
+                )
+            }
+        }
     }
 }
 
@@ -3844,6 +3873,29 @@ mod tests {
         );
         let (solver, preconditioner) =
             native_linear_solver_policy(SPARSE_SCHUR_MAX_POSE_ENTITIES + 1);
+        assert_eq!(solver, BundleAdjustmentLinearSolver::IterativeSchur);
+        assert_eq!(
+            preconditioner,
+            Some(BundleAdjustmentPreconditioner::SchurJacobi)
+        );
+    }
+
+    #[test]
+    fn native_linear_solver_policy_honors_explicit_preference() {
+        use crate::ba::BundleAdjustmentLinearSolverPreference as Preference;
+
+        assert_eq!(
+            native_linear_solver_policy_for_preference(Preference::DenseSchur, 1001).0,
+            BundleAdjustmentLinearSolver::DenseSchur
+        );
+        assert_eq!(
+            native_linear_solver_policy_for_preference(Preference::SparseSchur, 10).0,
+            BundleAdjustmentLinearSolver::SparseSchur
+        );
+        let (solver, preconditioner) = native_linear_solver_policy_for_preference(
+            Preference::IterativeSchur,
+            10,
+        );
         assert_eq!(solver, BundleAdjustmentLinearSolver::IterativeSchur);
         assert_eq!(
             preconditioner,

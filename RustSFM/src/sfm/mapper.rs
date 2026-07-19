@@ -10688,6 +10688,28 @@ mod tests {
         assert_eq!(options.max_linear_solver_iterations, 100);
         assert_eq!(options.num_threads, -1);
 
+        let preferred = mapper_ba_options(
+            &MapperConfig {
+                ba_linear_solver: crate::ba::BundleAdjustmentLinearSolverPreference::IterativeSchur,
+                ba_sparse_backend: crate::ba::BundleAdjustmentSparseLinearAlgebra::AccelerateSparse,
+                ..MapperConfig::default()
+            },
+            &reconstruction,
+            3,
+            Some(vec![0]),
+            Vec::new(),
+            None,
+            None,
+        );
+        assert_eq!(
+            preferred.linear_solver,
+            crate::ba::BundleAdjustmentLinearSolverPreference::IterativeSchur
+        );
+        assert_eq!(
+            preferred.sparse_linear_algebra,
+            crate::ba::BundleAdjustmentSparseLinearAlgebra::AccelerateSparse
+        );
+
         let threaded_options = mapper_ba_options(
             &MapperConfig {
                 threads: Some(4),

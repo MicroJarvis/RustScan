@@ -250,6 +250,8 @@ pub(super) fn mapper_ba_options(
     );
     let mut options = crate::ba::BundleAdjustmentOptions {
         iterations,
+        linear_solver: config.ba_linear_solver,
+        sparse_linear_algebra: config.ba_sparse_backend,
         loss_function: mapper_global_ba_loss_function(),
         max_observation_error_px: global_ba_max_observation_error_px(config),
         variable_images,

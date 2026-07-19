@@ -12,8 +12,9 @@ use super::shared::{
 };
 use super::{
     camera_center_world, position_prior_information_matrix, BundleAdjustmentGauge,
-    BundleAdjustmentLinearSolver, BundleAdjustmentLoss, BundleAdjustmentOptions,
-    BundleAdjustmentPreconditioner, BundleAdjustmentReport, BundleAdjustmentTerminationReason,
+    BundleAdjustmentLinearSolver, BundleAdjustmentLinearSolverPreference, BundleAdjustmentLoss,
+    BundleAdjustmentOptions, BundleAdjustmentPreconditioner, BundleAdjustmentReport,
+    BundleAdjustmentSparseLinearAlgebra, BundleAdjustmentTerminationReason,
     BundleAdjustmentTerminationType, POSE_PRIOR_JACOBIAN_EPS,
 };
 use crate::types::{CameraModel, ImageFrame, Reconstruction, Rigid3};
@@ -370,8 +371,8 @@ pub fn solve_bundle_adjustment_ceres(
         problem.set_parameter_block_constant(storage_idx).ok()?;
     }
 
-    let solver_policy = ceres_solver_policy(pose_entity_registry.len(), ceres_has_sparse_backend());
-    let solver_options = ceres_solver_options(&options, pose_entity_registry.len(), bindings * 2)?;
+    let (solver_options, solver_policy, _sparse_backend) =
+        ceres_solver_options(&options, pose_entity_registry.len(), bindings * 2)?;
     let solution = problem.solve(&solver_options).ok()?;
 
     write_back_solution(
@@ -1578,8 +1579,22 @@ fn ceres_solver_options(
     options: &BundleAdjustmentOptions,
     num_pose_entities: usize,
     num_residuals: usize,
-) -> Option<SolverOptions> {
-    let solver_policy = ceres_solver_policy(num_pose_entities, ceres_has_sparse_backend());
+) -> Option<(
+    SolverOptions,
+    CeresSolverPolicy,
+    Option<BundleAdjustmentSparseLinearAlgebra>,
+)> {
+    let has_sparse_backend = match options.sparse_linear_algebra {
+        BundleAdjustmentSparseLinearAlgebra::Auto => ceres_has_sparse_backend(),
+        BundleAdjustmentSparseLinearAlgebra::SuiteSparse
+        | BundleAdjustmentSparseLinearAlgebra::AccelerateSparse
+        | BundleAdjustmentSparseLinearAlgebra::EigenSparse => true,
+    };
+    let solver_policy = ceres_solver_policy_for_preference(
+        options.linear_solver,
+        num_pose_entities,
+        has_sparse_backend,
+    );
     let max_num_iterations = ceres_i32_option(options.iterations)?;
     let max_linear_solver_iterations = ceres_i32_option(options.max_linear_solver_iterations)?;
     let max_num_consecutive_invalid_steps =
@@ -1599,7 +1614,14 @@ fn ceres_solver_options(
     if let Some(preconditioner) = solver_policy.preconditioner {
         builder = builder.preconditioner_type(preconditioner);
     }
-    builder.build().ok()
+    if let Some(sparse_backend) = ceres_sparse_backend_for_preference(options.sparse_linear_algebra)
+    {
+        builder = builder.sparse_linear_algebra_library_type(sparse_backend);
+    }
+    let selected_sparse_backend =
+        map_ceres_sparse_backend(builder.current_sparse_linear_algebra_library_type());
+    let solver_options = builder.build().ok()?;
+    Some((solver_options, solver_policy, selected_sparse_backend))
 }
 
 fn ceres_i32_option(value: usize) -> Option<i32> {
@@ -1613,21 +1635,85 @@ struct CeresSolverPolicy {
 }
 
 fn ceres_solver_policy(num_pose_entities: usize, has_sparse_backend: bool) -> CeresSolverPolicy {
-    if num_pose_entities <= 50 {
-        CeresSolverPolicy {
+    ceres_solver_policy_for_preference(
+        BundleAdjustmentLinearSolverPreference::Auto,
+        num_pose_entities,
+        has_sparse_backend,
+    )
+}
+
+fn ceres_solver_policy_for_preference(
+    preference: BundleAdjustmentLinearSolverPreference,
+    num_pose_entities: usize,
+    has_sparse_backend: bool,
+) -> CeresSolverPolicy {
+    match preference {
+        BundleAdjustmentLinearSolverPreference::DenseSchur => CeresSolverPolicy {
             linear_solver: LinearSolverType::DENSE_SCHUR,
             preconditioner: None,
-        }
-    } else if has_sparse_backend && num_pose_entities <= 1000 {
-        CeresSolverPolicy {
+        },
+        BundleAdjustmentLinearSolverPreference::SparseSchur => CeresSolverPolicy {
             linear_solver: LinearSolverType::SPARSE_SCHUR,
             preconditioner: None,
-        }
-    } else {
-        CeresSolverPolicy {
+        },
+        BundleAdjustmentLinearSolverPreference::IterativeSchur => CeresSolverPolicy {
             linear_solver: LinearSolverType::ITERATIVE_SCHUR,
             preconditioner: Some(PreconditionerType::SCHUR_JACOBI),
+        },
+        BundleAdjustmentLinearSolverPreference::Auto => {
+            if num_pose_entities <= 50 {
+                CeresSolverPolicy {
+                    linear_solver: LinearSolverType::DENSE_SCHUR,
+                    preconditioner: None,
+                }
+            } else if has_sparse_backend && num_pose_entities <= 1000 {
+                CeresSolverPolicy {
+                    linear_solver: LinearSolverType::SPARSE_SCHUR,
+                    preconditioner: None,
+                }
+            } else {
+                CeresSolverPolicy {
+                    linear_solver: LinearSolverType::ITERATIVE_SCHUR,
+                    preconditioner: Some(PreconditionerType::SCHUR_JACOBI),
+                }
+            }
         }
+    }
+}
+
+fn ceres_sparse_backend_for_preference(
+    preference: BundleAdjustmentSparseLinearAlgebra,
+) -> Option<SparseLinearAlgebraLibraryType> {
+    match preference {
+        BundleAdjustmentSparseLinearAlgebra::Auto => None,
+        BundleAdjustmentSparseLinearAlgebra::SuiteSparse => {
+            Some(SparseLinearAlgebraLibraryType::SUITE_SPARSE)
+        }
+        BundleAdjustmentSparseLinearAlgebra::AccelerateSparse => {
+            Some(SparseLinearAlgebraLibraryType::ACCELERATE_SPARSE)
+        }
+        BundleAdjustmentSparseLinearAlgebra::EigenSparse => {
+            Some(SparseLinearAlgebraLibraryType::EIGEN_SPARSE)
+        }
+    }
+}
+
+fn map_ceres_sparse_backend(
+    backend: SparseLinearAlgebraLibraryType,
+) -> Option<BundleAdjustmentSparseLinearAlgebra> {
+    match backend {
+        SparseLinearAlgebraLibraryType::SUITE_SPARSE => {
+            Some(BundleAdjustmentSparseLinearAlgebra::SuiteSparse)
+        }
+        SparseLinearAlgebraLibraryType::ACCELERATE_SPARSE => {
+            Some(BundleAdjustmentSparseLinearAlgebra::AccelerateSparse)
+        }
+        SparseLinearAlgebraLibraryType::EIGEN_SPARSE => {
+            Some(BundleAdjustmentSparseLinearAlgebra::EigenSparse)
+        }
+        SparseLinearAlgebraLibraryType::CUDA_SPARSE
+        | SparseLinearAlgebraLibraryType::NO_SPARSE => None,
+        _ => None,
     }
 }
 
@@ -2143,6 +2229,43 @@ mod tests {
         let policy = ceres_solver_policy(1000, false);
         assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
         assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
+    }
+
+    #[test]
+    fn ceres_solver_policy_honors_explicit_preferences() {
+        use crate::ba::BundleAdjustmentLinearSolverPreference as Preference;
+
+        let dense = ceres_solver_policy_for_preference(Preference::DenseSchur, 1001, true);
+        assert!(dense.linear_solver == LinearSolverType::DENSE_SCHUR);
+        assert!(dense.preconditioner.is_none());
+
+        let sparse = ceres_solver_policy_for_preference(Preference::SparseSchur, 10, true);
+        assert!(sparse.linear_solver == LinearSolverType::SPARSE_SCHUR);
+        assert!(sparse.preconditioner.is_none());
+
+        let iterative =
+            ceres_solver_policy_for_preference(Preference::IterativeSchur, 10, true);
+        assert!(iterative.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
+        assert!(iterative.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
+    }
+
+    #[test]
+    fn ceres_sparse_backend_preference_maps_to_ceres() {
+        use crate::ba::BundleAdjustmentSparseLinearAlgebra as Backend;
+
+        assert!(
+            ceres_sparse_backend_for_preference(Backend::SuiteSparse)
+                == Some(SparseLinearAlgebraLibraryType::SUITE_SPARSE)
+        );
+        assert!(
+            ceres_sparse_backend_for_preference(Backend::AccelerateSparse)
+                == Some(SparseLinearAlgebraLibraryType::ACCELERATE_SPARSE)
+        );
+        assert!(
+            ceres_sparse_backend_for_preference(Backend::EigenSparse)
+                == Some(SparseLinearAlgebraLibraryType::EIGEN_SPARSE)
+        );
+        assert!(ceres_sparse_backend_for_preference(Backend::Auto).is_none());
     }
 
     #[cfg(target_os = "macos")]
