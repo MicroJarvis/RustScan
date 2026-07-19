@@ -3,6 +3,7 @@ use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObser
 use crate::visibility_pyramid::VisibilityPyramid;
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImagePairStat {
@@ -53,7 +54,7 @@ pub struct ObservationManager {
     image_pair_stats: HashMap<(usize, usize), ImagePairStat>,
     point3d_correspondence_counts: Vec<Vec<usize>>,
     modified_point3d_ids: HashSet<usize>,
-    correspondence_graph: Option<CorrespondenceGraph>,
+    correspondence_graph: Option<Arc<CorrespondenceGraph>>,
 }
 
 impl ObservationManager {
@@ -69,11 +70,11 @@ impl ObservationManager {
     }
 
     pub fn install_correspondence_graph(&mut self, graph: CorrespondenceGraph) {
-        self.correspondence_graph = Some(graph);
+        self.correspondence_graph = Some(Arc::new(graph));
     }
 
     pub fn correspondence_graph(&self) -> Option<&CorrespondenceGraph> {
-        self.correspondence_graph.as_ref()
+        self.correspondence_graph.as_deref()
     }
 
     pub fn rebuild(
@@ -955,6 +956,19 @@ mod tests {
     };
     use rustslam::{Descriptors, Match, SE3};
     use std::path::PathBuf;
+
+    #[test]
+    fn correspondence_graph_clones_share_one_allocation() {
+        let frames = vec![frame(0, 100, 100), frame(1, 100, 100)];
+        let pairs = vec![pair(0, 1, &[(0, 0)])];
+        let reconstruction = reconstruction(&frames);
+        let manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+
+        let first = manager.correspondence_graph.clone().expect("graph");
+        let second = first.clone();
+
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
 
     #[test]
     fn counts_visible_points_for_unregistered_images() {
