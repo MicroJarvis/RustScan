@@ -2474,8 +2474,8 @@ fn incremental_map_single_attempt_with_pnp_scorer(
     }
 
     let mut snapshot_state = PipelineSnapshotState::new(&reconstruction);
-    let mut reg_trials = vec![0usize; frames.len()];
-    let mut structureless_reg_trials = vec![0usize; frames.len()];
+    let mut retry_state = RegistrationRetryState::new(frames.len());
+    let mut fallback_available = true;
     while reconstruction.poses.iter().any(|p| p.is_none()) {
         let NextRegistrationSelection {
             choice,
@@ -2484,8 +2484,8 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             frames,
             pairs,
             &reconstruction,
-            &reg_trials,
-            &structureless_reg_trials,
+            &retry_state,
+            RegistrationPass::Normal,
             &filtered_units,
             config,
             &camera_priors,
@@ -2494,21 +2494,63 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             triangulation_state.observation_manager(),
             pnp_scorer,
         )?;
+        let normal_attempted_candidates = !failed_attempts.is_empty();
         for (failed_image, mode) in failed_attempts {
-            increment_registration_unit_trials_for_mode(
+            let support = registration_unit_support(
                 &reconstruction,
                 failed_image,
+                triangulation_state.observation_manager(),
                 mode,
-                &mut reg_trials,
-                &mut structureless_reg_trials,
             );
+            retry_state.record_failure(&reconstruction, failed_image, mode, support);
             debug_log.push(format!(
                 "registration_attempt_failed {} mode={:?}",
                 frames[failed_image].name, mode
             ));
         }
-        let Some(choice) = choice else {
-            break;
+        let choice = if let Some(choice) = choice {
+            choice
+        } else if normal_attempted_candidates {
+            continue;
+        } else {
+            if !fallback_available {
+                break;
+            }
+            fallback_available = false;
+            let NextRegistrationSelection {
+                choice,
+                failed_attempts,
+            } = choose_next_registration_with_failures_and_pnp_scorer(
+                frames,
+                pairs,
+                &reconstruction,
+                &retry_state,
+                RegistrationPass::ExhaustiveFallback,
+                &filtered_units,
+                config,
+                &camera_priors,
+                &camera_has_prior_focal_length,
+                &registration_stats,
+                triangulation_state.observation_manager(),
+                pnp_scorer,
+            )?;
+            for (failed_image, mode) in failed_attempts {
+                let support = registration_unit_support(
+                    &reconstruction,
+                    failed_image,
+                    triangulation_state.observation_manager(),
+                    mode,
+                );
+                retry_state.record_failure(&reconstruction, failed_image, mode, support);
+                debug_log.push(format!(
+                    "registration_attempt_failed {} mode={:?} fallback=true",
+                    frames[failed_image].name, mode
+                ));
+            }
+            let Some(choice) = choice else {
+                break;
+            };
+            choice
         };
         let registration_snapshot = reconstruction.clone();
         let registration_log = format!(
@@ -2652,13 +2694,14 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         if let Some(reason) = rollback_reason {
             reconstruction = registration_snapshot;
             triangulation_state.sync_after_reconstruction_rollback(frames, pairs, &reconstruction);
-            increment_registration_unit_trials_for_mode(
+            let mode = registration_mode_for_choice(&choice);
+            let support = registration_unit_support(
                 &reconstruction,
                 choice.image,
-                registration_mode_for_choice(&choice),
-                &mut reg_trials,
-                &mut structureless_reg_trials,
+                triangulation_state.observation_manager(),
+                mode,
             );
+            retry_state.record_failure(&reconstruction, choice.image, mode, support);
             debug_log.push(format!(
                 "registration_rollback {} reason={reason}",
                 frames[choice.image].name
@@ -2666,13 +2709,12 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             continue;
         }
         registration_stats.register_frame_for_image_event(&reconstruction, choice.image);
-        reset_registration_unit_trials_for_mode(
+        retry_state.record_success(
             &reconstruction,
             choice.image,
             registration_mode_for_choice(&choice),
-            &mut reg_trials,
-            &mut structureless_reg_trials,
         );
+        fallback_available = true;
         filtered_units.remove(&registration_unit_key(&reconstruction, choice.image));
         let filtered_frames = filter_registered_frames(
             frames,
@@ -2767,23 +2809,6 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 points: reconstruction.points.len(),
             },
         );
-        reset_unregistered_registration_trials(
-            &reconstruction,
-            &mut reg_trials,
-            &mut structureless_reg_trials,
-        );
-        mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
-            frames,
-            pairs,
-            &reconstruction,
-            &mut reg_trials,
-            config,
-            &camera_priors,
-            &camera_has_prior_focal_length,
-            &registration_stats,
-            triangulation_state.observation_manager(),
-            pnp_scorer,
-        )?;
     }
     if should_run_final_global_ba(&global_ba_schedule, &reconstruction, config) {
         refine_global_bundle_with_postprocessing(
@@ -3025,6 +3050,148 @@ enum NextImageRegistrationMode {
     StructureLess,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationPass {
+    Normal,
+    ExhaustiveFallback,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RegistrationModeAttempt {
+    trials: usize,
+    last_support: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RegistrationRetryState {
+    structure_based: Vec<RegistrationModeAttempt>,
+    structureless: Vec<RegistrationModeAttempt>,
+}
+
+impl RegistrationRetryState {
+    fn new(num_images: usize) -> Self {
+        Self {
+            structure_based: vec![RegistrationModeAttempt::default(); num_images],
+            structureless: vec![RegistrationModeAttempt::default(); num_images],
+        }
+    }
+
+    #[cfg(test)]
+    fn from_trial_vectors(
+        structure_based_trials: &[usize],
+        structureless_trials: &[usize],
+    ) -> Self {
+        let num_images = structure_based_trials.len().max(structureless_trials.len());
+        let mut state = Self::new(num_images);
+        for (attempt, &trials) in state.structure_based.iter_mut().zip(structure_based_trials) {
+            attempt.trials = trials;
+            if trials > 0 {
+                attempt.last_support = usize::MAX;
+            }
+        }
+        for (attempt, &trials) in state.structureless.iter_mut().zip(structureless_trials) {
+            attempt.trials = trials;
+            if trials > 0 {
+                attempt.last_support = usize::MAX;
+            }
+        }
+        state
+    }
+
+    fn attempts(&self, mode: NextImageRegistrationMode) -> &[RegistrationModeAttempt] {
+        match mode {
+            NextImageRegistrationMode::StructureBased => &self.structure_based,
+            NextImageRegistrationMode::StructureLess => &self.structureless,
+        }
+    }
+
+    fn attempts_mut(&mut self, mode: NextImageRegistrationMode) -> &mut [RegistrationModeAttempt] {
+        match mode {
+            NextImageRegistrationMode::StructureBased => &mut self.structure_based,
+            NextImageRegistrationMode::StructureLess => &mut self.structureless,
+        }
+    }
+
+    fn unit_attempt(
+        &self,
+        reconstruction: &Reconstruction,
+        image: usize,
+        mode: NextImageRegistrationMode,
+    ) -> RegistrationModeAttempt {
+        let attempts = self.attempts(mode);
+        reconstruction
+            .image_indices_for_registration_unit(image)
+            .into_iter()
+            .filter_map(|frame_image| attempts.get(frame_image).copied())
+            .max_by_key(|attempt| attempt.trials)
+            .unwrap_or_else(|| attempts.get(image).copied().unwrap_or_default())
+    }
+
+    fn num_trials(
+        &self,
+        reconstruction: &Reconstruction,
+        image: usize,
+        mode: NextImageRegistrationMode,
+        support: usize,
+    ) -> usize {
+        let attempt = self.unit_attempt(reconstruction, image, mode);
+        if support > attempt.last_support {
+            0
+        } else {
+            attempt.trials
+        }
+    }
+
+    fn is_eligible(
+        &self,
+        reconstruction: &Reconstruction,
+        image: usize,
+        mode: NextImageRegistrationMode,
+        support: usize,
+        max_trials: usize,
+        pass: RegistrationPass,
+    ) -> bool {
+        pass == RegistrationPass::ExhaustiveFallback
+            || self.num_trials(reconstruction, image, mode, support) < max_trials
+    }
+
+    fn record_failure(
+        &mut self,
+        reconstruction: &Reconstruction,
+        image: usize,
+        mode: NextImageRegistrationMode,
+        support: usize,
+    ) {
+        let trials = self
+            .num_trials(reconstruction, image, mode, support)
+            .saturating_add(1);
+        let attempt = RegistrationModeAttempt {
+            trials,
+            last_support: support,
+        };
+        let attempts = self.attempts_mut(mode);
+        for frame_image in reconstruction.image_indices_for_registration_unit(image) {
+            if let Some(slot) = attempts.get_mut(frame_image) {
+                *slot = attempt;
+            }
+        }
+    }
+
+    fn record_success(
+        &mut self,
+        reconstruction: &Reconstruction,
+        image: usize,
+        mode: NextImageRegistrationMode,
+    ) {
+        let attempts = self.attempts_mut(mode);
+        for frame_image in reconstruction.image_indices_for_registration_unit(image) {
+            if let Some(slot) = attempts.get_mut(frame_image) {
+                *slot = RegistrationModeAttempt::default();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NextRegistrationSelection {
     choice: Option<RegistrationChoice>,
@@ -3076,12 +3243,14 @@ fn choose_next_registration_with_failures(
     obs_manager: &ObservationManager,
 ) -> NextRegistrationSelection {
     let mut pnp_scorer = None;
+    let retry_state =
+        RegistrationRetryState::from_trial_vectors(reg_trials, structureless_reg_trials);
     choose_next_registration_with_failures_and_pnp_scorer(
         frames,
         pairs,
         reconstruction,
-        reg_trials,
-        structureless_reg_trials,
+        &retry_state,
+        RegistrationPass::Normal,
         filtered_units,
         config,
         camera_priors,
@@ -3098,8 +3267,8 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
     reconstruction: &Reconstruction,
-    reg_trials: &[usize],
-    structureless_reg_trials: &[usize],
+    retry_state: &RegistrationRetryState,
+    pass: RegistrationPass,
     filtered_units: &HashSet<RegistrationUnitKey>,
     config: &MapperConfig,
     camera_priors: &[CameraModel],
@@ -3111,14 +3280,14 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
     let correspondence_graph = obs_manager.correspondence_graph();
     let mut failed_attempts = Vec::new();
     for mode in next_registration_modes(config) {
-        let next_images = find_next_registration_images(
+        let next_images = find_next_registration_images_with_retry_state(
             reconstruction,
-            reg_trials,
-            structureless_reg_trials,
+            retry_state,
             filtered_units,
             config,
             obs_manager,
             mode,
+            pass,
         );
         for image in next_images {
             if let Some(choice) = registration_choice_for_image_with_pnp_scorer(
@@ -3187,6 +3356,23 @@ fn registration_unit_num_visible_correspondences(
         .sum()
 }
 
+fn registration_unit_support(
+    reconstruction: &Reconstruction,
+    image: usize,
+    obs_manager: &ObservationManager,
+    mode: NextImageRegistrationMode,
+) -> usize {
+    match mode {
+        NextImageRegistrationMode::StructureBased => {
+            registration_unit_num_visible_points3d(reconstruction, image, obs_manager)
+        }
+        NextImageRegistrationMode::StructureLess => {
+            registration_unit_num_visible_correspondences(reconstruction, image, obs_manager)
+        }
+    }
+}
+
+#[cfg(test)]
 fn find_next_registration_images(
     reconstruction: &Reconstruction,
     reg_trials: &[usize],
@@ -3195,6 +3381,28 @@ fn find_next_registration_images(
     config: &MapperConfig,
     obs_manager: &ObservationManager,
     mode: NextImageRegistrationMode,
+) -> Vec<usize> {
+    let retry_state =
+        RegistrationRetryState::from_trial_vectors(reg_trials, structureless_reg_trials);
+    find_next_registration_images_with_retry_state(
+        reconstruction,
+        &retry_state,
+        filtered_units,
+        config,
+        obs_manager,
+        mode,
+        RegistrationPass::Normal,
+    )
+}
+
+fn find_next_registration_images_with_retry_state(
+    reconstruction: &Reconstruction,
+    retry_state: &RegistrationRetryState,
+    filtered_units: &HashSet<RegistrationUnitKey>,
+    config: &MapperConfig,
+    obs_manager: &ObservationManager,
+    mode: NextImageRegistrationMode,
+    pass: RegistrationPass,
 ) -> Vec<usize> {
     let mut image_ranks = Vec::<(usize, f32)>::new();
     let mut other_image_ranks = Vec::<(usize, f32)>::new();
@@ -3207,34 +3415,29 @@ fn find_next_registration_images(
         if registration_unit_is_registered(reconstruction, image) {
             continue;
         }
-        let num_trials = registration_unit_num_trials_for_mode(
-            reconstruction,
-            image,
-            reg_trials,
-            structureless_reg_trials,
-            mode,
-        );
-        if num_trials >= config.max_reg_trials {
+        let support = registration_unit_support(reconstruction, image, obs_manager, mode);
+        let min_support = match mode {
+            NextImageRegistrationMode::StructureBased => config.abs_pose_min_num_inliers,
+            NextImageRegistrationMode::StructureLess => structureless_min_num_inliers(config),
+        };
+        if support < min_support
+            || !retry_state.is_eligible(
+                reconstruction,
+                image,
+                mode,
+                support,
+                config.max_reg_trials,
+                pass,
+            )
+        {
             continue;
         }
+        let num_trials = retry_state.num_trials(reconstruction, image, mode, support);
         let rank = match mode {
             NextImageRegistrationMode::StructureBased => {
-                if registration_unit_num_visible_points3d(reconstruction, image, obs_manager)
-                    < config.abs_pose_min_num_inliers
-                {
-                    continue;
-                }
                 next_image_rank(reconstruction, image, obs_manager, config)
             }
-            NextImageRegistrationMode::StructureLess => {
-                if registration_unit_num_visible_correspondences(reconstruction, image, obs_manager)
-                    < structureless_min_num_inliers(config)
-                {
-                    continue;
-                }
-                registration_unit_num_visible_correspondences(reconstruction, image, obs_manager)
-                    as f32
-            }
+            NextImageRegistrationMode::StructureLess => support as f32,
         };
         if filtered_units.contains(&registration_unit_key(reconstruction, image)) || num_trials > 0
         {
@@ -3452,6 +3655,7 @@ fn mark_unregistered_images_with_no_absolute_pose(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
@@ -3597,6 +3801,7 @@ fn registration_unit_is_registered(reconstruction: &Reconstruction, image: usize
         })
 }
 
+#[cfg(test)]
 fn reset_registration_unit_trials(
     reconstruction: &Reconstruction,
     image: usize,
@@ -3609,6 +3814,7 @@ fn reset_registration_unit_trials(
     }
 }
 
+#[cfg(test)]
 fn increment_registration_unit_trials(
     reconstruction: &Reconstruction,
     image: usize,
@@ -3621,6 +3827,7 @@ fn increment_registration_unit_trials(
     }
 }
 
+#[cfg(test)]
 fn registration_unit_num_trials(
     reconstruction: &Reconstruction,
     image: usize,
@@ -3634,6 +3841,7 @@ fn registration_unit_num_trials(
         .unwrap_or_else(|| reg_trials.get(image).copied().unwrap_or(0))
 }
 
+#[cfg(test)]
 fn registration_unit_num_trials_for_mode(
     reconstruction: &Reconstruction,
     image: usize,
@@ -3651,6 +3859,7 @@ fn registration_unit_num_trials_for_mode(
     }
 }
 
+#[cfg(test)]
 fn increment_registration_unit_trials_for_mode(
     reconstruction: &Reconstruction,
     image: usize,
@@ -3668,26 +3877,10 @@ fn increment_registration_unit_trials_for_mode(
     }
 }
 
-fn reset_registration_unit_trials_for_mode(
-    reconstruction: &Reconstruction,
-    image: usize,
-    mode: NextImageRegistrationMode,
-    reg_trials: &mut [usize],
-    structureless_reg_trials: &mut [usize],
-) {
-    match mode {
-        NextImageRegistrationMode::StructureBased => {
-            reset_registration_unit_trials(reconstruction, image, reg_trials)
-        }
-        NextImageRegistrationMode::StructureLess => {
-            reset_registration_unit_trials(reconstruction, image, structureless_reg_trials)
-        }
-    }
-}
-
 /// COLMAP retries unregistered images as the reconstruction grows. Reset trial
 /// counters after each successful registration so tail frames are not excluded
 /// because they were probed too early with insufficient 2D-3D visibility.
+#[cfg(test)]
 fn reset_unregistered_registration_trials(
     reconstruction: &Reconstruction,
     reg_trials: &mut [usize],
@@ -10470,6 +10663,132 @@ mod tests {
                 PathBuf::from("images/database.db"),
                 PathBuf::from("database.db")
             ]
+        );
+    }
+
+    #[test]
+    fn registration_retry_state_suppresses_unchanged_support_until_fallback() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let reconstruction = test_reconstruction(&frames);
+        let mut state = RegistrationRetryState::new(frames.len());
+
+        for _ in 0..3 {
+            state.record_failure(
+                &reconstruction,
+                1,
+                NextImageRegistrationMode::StructureBased,
+                30,
+            );
+        }
+
+        assert!(!state.is_eligible(
+            &reconstruction,
+            1,
+            NextImageRegistrationMode::StructureBased,
+            30,
+            3,
+            RegistrationPass::Normal,
+        ));
+        assert!(state.is_eligible(
+            &reconstruction,
+            1,
+            NextImageRegistrationMode::StructureBased,
+            30,
+            3,
+            RegistrationPass::ExhaustiveFallback,
+        ));
+        assert!(state.is_eligible(
+            &reconstruction,
+            1,
+            NextImageRegistrationMode::StructureBased,
+            31,
+            3,
+            RegistrationPass::Normal,
+        ));
+        assert_eq!(
+            state.num_trials(
+                &reconstruction,
+                1,
+                NextImageRegistrationMode::StructureBased,
+                31,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn registration_retry_state_keeps_modes_independent() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let reconstruction = test_reconstruction(&frames);
+        let mut state = RegistrationRetryState::new(frames.len());
+        for _ in 0..3 {
+            state.record_failure(
+                &reconstruction,
+                1,
+                NextImageRegistrationMode::StructureBased,
+                30,
+            );
+        }
+
+        assert!(!state.is_eligible(
+            &reconstruction,
+            1,
+            NextImageRegistrationMode::StructureBased,
+            30,
+            3,
+            RegistrationPass::Normal,
+        ));
+        assert!(state.is_eligible(
+            &reconstruction,
+            1,
+            NextImageRegistrationMode::StructureLess,
+            30,
+            3,
+            RegistrationPass::Normal,
+        ));
+    }
+
+    #[test]
+    fn registration_retry_state_shares_rig_sibling_attempts() {
+        let frames = vec![
+            minimal_frame(0, "registered.jpg"),
+            minimal_frame(1, "rig_ref.jpg"),
+            minimal_frame(2, "rig_aux.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        attach_two_image_rig_frame(&mut reconstruction, 1, 2);
+        let mut state = RegistrationRetryState::new(frames.len());
+        for _ in 0..3 {
+            state.record_failure(
+                &reconstruction,
+                1,
+                NextImageRegistrationMode::StructureBased,
+                30,
+            );
+        }
+
+        assert!(!state.is_eligible(
+            &reconstruction,
+            2,
+            NextImageRegistrationMode::StructureBased,
+            30,
+            3,
+            RegistrationPass::Normal,
+        ));
+        assert_eq!(
+            state.num_trials(
+                &reconstruction,
+                2,
+                NextImageRegistrationMode::StructureBased,
+                30,
+            ),
+            3
         );
     }
 
@@ -17786,6 +18105,66 @@ mod tests {
         );
 
         assert_eq!(ranked, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn find_next_registration_images_fallback_retries_exhausted_candidate() {
+        let mut frames = vec![
+            minimal_frame(0, "seed.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        for frame in &mut frames {
+            frame.keypoints = vec![
+                rustslam::KeyPoint::new(10.0, 10.0),
+                rustslam::KeyPoint::new(20.0, 20.0),
+            ];
+        }
+        let pairs = vec![pair_with_inliers(0, 1, &[(0, 0), (1, 1)])];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        for idx in 0..2 {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.point_ids.push(idx as u64 + 1);
+            reconstruction.points.push(Point3D {
+                xyz: [idx as f32 * 0.1, 0.0, 2.0],
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: idx,
+                }],
+            });
+        }
+        let obs_manager = ObservationManager::new(&frames, &pairs, &reconstruction);
+        let retry_state = RegistrationRetryState::from_trial_vectors(&[0, 3], &[0, 0]);
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 2,
+            max_reg_trials: 3,
+            image_selection_method: ImageSelectionMethod::MaxVisiblePointsNum,
+            ..MapperConfig::default()
+        };
+
+        let normal = find_next_registration_images_with_retry_state(
+            &reconstruction,
+            &retry_state,
+            &HashSet::new(),
+            &config,
+            &obs_manager,
+            NextImageRegistrationMode::StructureBased,
+            RegistrationPass::Normal,
+        );
+        let fallback = find_next_registration_images_with_retry_state(
+            &reconstruction,
+            &retry_state,
+            &HashSet::new(),
+            &config,
+            &obs_manager,
+            NextImageRegistrationMode::StructureBased,
+            RegistrationPass::ExhaustiveFallback,
+        );
+
+        assert!(normal.is_empty());
+        assert_eq!(fallback, vec![1]);
     }
 
     #[test]
