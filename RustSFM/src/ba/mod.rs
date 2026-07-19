@@ -1,4 +1,7 @@
 use crate::types::{ImageFrame, Reconstruction, SensorId};
+use anyhow::anyhow;
+use std::fmt;
+use std::str::FromStr;
 
 mod covariance;
 mod native;
@@ -99,9 +102,95 @@ impl BundleAdjustmentLoss {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleAdjustmentLinearSolverPreference {
+    Auto,
+    DenseSchur,
+    SparseSchur,
+    IterativeSchur,
+}
+
+impl Default for BundleAdjustmentLinearSolverPreference {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl fmt::Display for BundleAdjustmentLinearSolverPreference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Auto => "auto",
+            Self::DenseSchur => "dense-schur",
+            Self::SparseSchur => "sparse-schur",
+            Self::IterativeSchur => "iterative-schur",
+        };
+        formatter.write_str(value)
+    }
+}
+
+impl FromStr for BundleAdjustmentLinearSolverPreference {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "auto" => Ok(Self::Auto),
+            "dense_schur" => Ok(Self::DenseSchur),
+            "sparse_schur" => Ok(Self::SparseSchur),
+            "iterative_schur" => Ok(Self::IterativeSchur),
+            _ => Err(anyhow!(
+                "unsupported BA linear solver '{value}', expected auto, dense-schur, sparse-schur, or iterative-schur"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleAdjustmentSparseLinearAlgebra {
+    Auto,
+    SuiteSparse,
+    AccelerateSparse,
+    EigenSparse,
+}
+
+impl Default for BundleAdjustmentSparseLinearAlgebra {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl fmt::Display for BundleAdjustmentSparseLinearAlgebra {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Auto => "auto",
+            Self::SuiteSparse => "suite-sparse",
+            Self::AccelerateSparse => "accelerate-sparse",
+            Self::EigenSparse => "eigen-sparse",
+        };
+        formatter.write_str(value)
+    }
+}
+
+impl FromStr for BundleAdjustmentSparseLinearAlgebra {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "auto" => Ok(Self::Auto),
+            "suite_sparse" => Ok(Self::SuiteSparse),
+            "accelerate_sparse" => Ok(Self::AccelerateSparse),
+            "eigen_sparse" => Ok(Self::EigenSparse),
+            _ => Err(anyhow!(
+                "unsupported BA sparse backend '{value}', expected auto, suite-sparse, accelerate-sparse, or eigen-sparse"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BundleAdjustmentOptions {
     pub iterations: usize,
+    pub linear_solver: BundleAdjustmentLinearSolverPreference,
+    pub sparse_linear_algebra: BundleAdjustmentSparseLinearAlgebra,
     pub function_tolerance: f64,
     pub gradient_tolerance: f64,
     pub parameter_tolerance: f64,
@@ -134,6 +223,8 @@ impl Default for BundleAdjustmentOptions {
     fn default() -> Self {
         Self {
             iterations: 100,
+            linear_solver: BundleAdjustmentLinearSolverPreference::Auto,
+            sparse_linear_algebra: BundleAdjustmentSparseLinearAlgebra::Auto,
             function_tolerance: 0.0,
             gradient_tolerance: 1.0e-4,
             parameter_tolerance: 0.0,
@@ -285,7 +376,41 @@ pub fn refine_bundle_adjustment(
 
 #[cfg(test)]
 mod tests {
-    use super::BundleAdjustmentLoss;
+    use super::{
+        BundleAdjustmentLinearSolverPreference, BundleAdjustmentLoss,
+        BundleAdjustmentSparseLinearAlgebra,
+    };
+
+    #[test]
+    fn bundle_adjustment_preference_parsing_accepts_cli_spellings() {
+        assert!(matches!(
+            "accelerate-sparse".parse(),
+            Ok(BundleAdjustmentSparseLinearAlgebra::AccelerateSparse)
+        ));
+        assert!(matches!(
+            "ACCELERATE_SPARSE".parse(),
+            Ok(BundleAdjustmentSparseLinearAlgebra::AccelerateSparse)
+        ));
+        assert!(matches!(
+            "iterative_schur".parse(),
+            Ok(BundleAdjustmentLinearSolverPreference::IterativeSchur)
+        ));
+        assert!("cuda"
+            .parse::<BundleAdjustmentSparseLinearAlgebra>()
+            .is_err());
+    }
+
+    #[test]
+    fn bundle_adjustment_preference_defaults_are_auto() {
+        assert_eq!(
+            BundleAdjustmentLinearSolverPreference::default(),
+            BundleAdjustmentLinearSolverPreference::Auto
+        );
+        assert_eq!(
+            BundleAdjustmentSparseLinearAlgebra::default(),
+            BundleAdjustmentSparseLinearAlgebra::Auto
+        );
+    }
 
     #[test]
     fn loss_scale_check_matches_colmap_ceres_options() {

@@ -1,3 +1,6 @@
+use crate::ba::{
+    BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra,
+};
 use crate::database::ColmapPosePrior;
 use crate::feature_matching::MatchingPairStrategy;
 use crate::sift::{SiftExtractionOptions, SiftMatchingOptions};
@@ -105,6 +108,8 @@ pub struct MapperConfig {
     pub local_ba_max_refinements: usize,
     pub local_ba_max_refinement_change: f32,
     pub global_ba: bool,
+    pub ba_linear_solver: BundleAdjustmentLinearSolverPreference,
+    pub ba_sparse_backend: BundleAdjustmentSparseLinearAlgebra,
     pub global_ba_iterations: usize,
     pub global_ba_images_ratio: f32,
     pub global_ba_points_ratio: f32,
@@ -192,6 +197,8 @@ impl Default for MapperConfig {
             local_ba_max_refinements: 2,
             local_ba_max_refinement_change: 0.001,
             global_ba: true,
+            ba_linear_solver: BundleAdjustmentLinearSolverPreference::Auto,
+            ba_sparse_backend: BundleAdjustmentSparseLinearAlgebra::Auto,
             global_ba_iterations: 50,
             global_ba_images_ratio: 1.5,
             global_ba_points_ratio: 1.5,

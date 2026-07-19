@@ -1,5 +1,9 @@
 pub mod ba;
 
+pub use ba::{
+    BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra,
+};
+
 // I/O, COLMAP compatibility, and persistent graph/cache formats.
 #[path = "io/colmap.rs"]
 pub mod colmap;
