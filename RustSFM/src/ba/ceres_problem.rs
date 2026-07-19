@@ -29,6 +29,7 @@ use glam::{Quat, Vec3};
 use nalgebra::SMatrix;
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 type Mat3 = SMatrix<f64, 3, 3>;
 type Mat3x7 = SMatrix<f64, 3, 7>;
@@ -89,6 +90,8 @@ pub fn solve_bundle_adjustment_ceres(
     reconstruction: &mut Reconstruction,
     options: BundleAdjustmentOptions,
 ) -> Option<BundleAdjustmentReport> {
+    let ba_started = Instant::now();
+    let setup_started = Instant::now();
     if reconstruction.points.is_empty() {
         return None;
     }
@@ -371,9 +374,13 @@ pub fn solve_bundle_adjustment_ceres(
         problem.set_parameter_block_constant(storage_idx).ok()?;
     }
 
-    let (solver_options, solver_policy, _sparse_backend) =
+    let (solver_options, solver_policy, sparse_backend) =
         ceres_solver_options(&options, pose_entity_registry.len(), bindings * 2)?;
+    let setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
+    let solve_started = Instant::now();
     let solution = problem.solve(&solver_options).ok()?;
+    let solve_ms = solve_started.elapsed().as_secs_f64() * 1000.0;
+    let postprocess_started = Instant::now();
 
     write_back_solution(
         reconstruction,
@@ -415,6 +422,8 @@ pub fn solve_bundle_adjustment_ceres(
         map_ceres_summary(&summary);
     let residuals_reduced = summary.num_residuals_reduced().max(0) as usize;
     let effective_parameters_reduced = summary.num_effective_parameters_reduced().max(0) as usize;
+    let postprocess_ms = postprocess_started.elapsed().as_secs_f64() * 1000.0;
+    let elapsed_ms = ba_started.elapsed().as_secs_f64() * 1000.0;
     Some(BundleAdjustmentReport {
         iterations: successful_steps,
         attempted_iterations: successful_steps + unsuccessful_steps,
@@ -436,6 +445,11 @@ pub fn solve_bundle_adjustment_ceres(
         damping,
         linear_solver: map_bundle_adjustment_linear_solver(solver_policy),
         preconditioner: map_bundle_adjustment_preconditioner(solver_policy),
+        sparse_backend,
+        setup_ms,
+        solve_ms,
+        postprocess_ms,
+        elapsed_ms,
         covariance,
         termination_type,
         termination_reason,
@@ -1711,8 +1725,9 @@ fn map_ceres_sparse_backend(
         SparseLinearAlgebraLibraryType::EIGEN_SPARSE => {
             Some(BundleAdjustmentSparseLinearAlgebra::EigenSparse)
         }
-        SparseLinearAlgebraLibraryType::CUDA_SPARSE
-        | SparseLinearAlgebraLibraryType::NO_SPARSE => None,
+        SparseLinearAlgebraLibraryType::CUDA_SPARSE | SparseLinearAlgebraLibraryType::NO_SPARSE => {
+            None
+        }
         _ => None,
     }
 }
@@ -2243,8 +2258,7 @@ mod tests {
         assert!(sparse.linear_solver == LinearSolverType::SPARSE_SCHUR);
         assert!(sparse.preconditioner.is_none());
 
-        let iterative =
-            ceres_solver_policy_for_preference(Preference::IterativeSchur, 10, true);
+        let iterative = ceres_solver_policy_for_preference(Preference::IterativeSchur, 10, true);
         assert!(iterative.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
         assert!(iterative.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
     }

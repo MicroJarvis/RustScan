@@ -1,6 +1,4 @@
-use crate::ba::{
-    BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra,
-};
+use crate::ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
 use crate::database::ColmapPosePrior;
 use crate::feature_matching::MatchingPairStrategy;
 use crate::sift::{SiftExtractionOptions, SiftMatchingOptions};

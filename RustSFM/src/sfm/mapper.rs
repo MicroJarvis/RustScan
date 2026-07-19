@@ -2694,7 +2694,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         }
         if let Some(report) = local_ba_report {
             debug_log.push(format!(
-                "local_ba image={} refinements={} local_images={} variable_images={} points={} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} reason={:?} merged={} completed={} image_completed={} filtered={} changed={:.6}",
+                "local_ba image={} refinements={} local_images={} variable_images={} points={} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} reason={:?} merged={} completed={} image_completed={} filtered={} changed={:.6} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}",
                 frames[choice.image].name,
                 report.refinements,
                 report.local_images,
@@ -2712,7 +2712,14 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 report.completed_observations,
                 report.completed_image_observations,
                 report.filtered_observations,
-                report.changed_observation_ratio
+                report.changed_observation_ratio,
+                report.report.linear_solver,
+                report.report.preconditioner,
+                report.report.sparse_backend,
+                report.report.setup_ms,
+                report.report.solve_ms,
+                report.report.postprocess_ms,
+                report.report.elapsed_ms
             ));
         }
         if filtered_frames > 0 {
@@ -3855,7 +3862,7 @@ fn refine_initial_global_bundle(
     };
     let changed = filtered as f32 / observations_before.max(1) as f32;
     debug_log.push(format!(
-        "global_ba reason=initial round=1 size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed=0 merged=0 filtered={} filtered_frames={} changed={:.6}",
+        "global_ba reason=initial round=1 size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed=0 merged=0 filtered={} filtered_frames={} changed={:.6} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}",
         global_ba_size_tag(reconstruction, config),
         gauge_images,
         report.observations,
@@ -3868,7 +3875,14 @@ fn refine_initial_global_bundle(
         report.termination_reason,
         filtered,
         filtered_frames,
-        changed
+        changed,
+        report.linear_solver,
+        report.preconditioner,
+        report.sparse_backend,
+        report.setup_ms,
+        report.solve_ms,
+        report.postprocess_ms,
+        report.elapsed_ms
     ));
     if let Some(transform) = normalization {
         debug_log.push(format!(
@@ -4000,7 +4014,7 @@ fn refine_global_bundle_with_postprocessing(
                 }
             };
             debug_log.push(format!(
-                "global_ba_redundant_points reason={reason} round={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?}",
+                "global_ba_redundant_points reason={reason} round={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}",
                 round + 1,
                 redundant_report.residuals,
                 redundant_report.initial_cost,
@@ -4008,7 +4022,14 @@ fn refine_global_bundle_with_postprocessing(
                 redundant_report.iterations,
                 redundant_report.attempted_iterations,
                 redundant_report.termination_type,
-                redundant_report.termination_reason
+                redundant_report.termination_reason,
+                redundant_report.linear_solver,
+                redundant_report.preconditioner,
+                redundant_report.sparse_backend,
+                redundant_report.setup_ms,
+                redundant_report.solve_ms,
+                redundant_report.postprocess_ms,
+                redundant_report.elapsed_ms
             ));
         }
         let normalization = if normalize_reconstruction && !uses_prior_position {
@@ -4046,7 +4067,7 @@ fn refine_global_bundle_with_postprocessing(
         };
         let changed = (completed + merged + filtered) as f32 / observations_before.max(1) as f32;
         debug_log.push(format!(
-            "global_ba reason={reason} round={} size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed={} merged={} filtered={} filtered_frames={} changed={:.6}",
+            "global_ba reason={reason} round={} size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed={} merged={} filtered={} filtered_frames={} changed={:.6} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}",
             round + 1,
             global_ba_size_tag(reconstruction, config),
             gauge_images,
@@ -4062,7 +4083,14 @@ fn refine_global_bundle_with_postprocessing(
             merged,
             filtered,
             filtered_frames,
-            changed
+            changed,
+            report.linear_solver,
+            report.preconditioner,
+            report.sparse_backend,
+            report.setup_ms,
+            report.solve_ms,
+            report.postprocess_ms,
+            report.elapsed_ms
         ));
         if let Some(transform) = normalization {
             debug_log.push(format!(
@@ -16436,6 +16464,25 @@ mod tests {
             "initial incremental global BA should still run: {:?}",
             result.debug_log
         );
+        let initial_global_ba = result
+            .debug_log
+            .iter()
+            .find(|line| line.starts_with("global_ba reason=initial round=1"))
+            .expect("initial global BA log");
+        for field in [
+            "solver=",
+            "preconditioner=",
+            "sparse_backend=",
+            "setup_ms=",
+            "solve_ms=",
+            "postprocess_ms=",
+            "ba_elapsed_ms=",
+        ] {
+            assert!(
+                initial_global_ba.contains(field),
+                "missing {field} in {initial_global_ba}"
+            );
+        }
         assert!(
             result
                 .debug_log

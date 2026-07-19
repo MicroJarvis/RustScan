@@ -171,6 +171,10 @@ mod tests {
         assert!((quaternion_norm(reconstruction.poses[1].unwrap()) - 1.0).abs() < 1.0e-6);
         assert!(report.final_cost <= report.initial_cost);
         assert!(report.gradient_max_norm.is_finite());
+        assert!(report.setup_ms.is_finite() && report.setup_ms >= 0.0);
+        assert!(report.solve_ms.is_finite() && report.solve_ms >= 0.0);
+        assert!(report.postprocess_ms.is_finite() && report.postprocess_ms >= 0.0);
+        assert!(report.elapsed_ms >= report.solve_ms);
     }
 
     fn translation_distance(left: SE3, right: SE3) -> f32 {

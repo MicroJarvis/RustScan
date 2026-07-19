@@ -357,6 +357,11 @@ pub(crate) fn refine_bundle_adjustment_native(
         damping: trust_region.radius,
         linear_solver,
         preconditioner,
+        sparse_backend: None,
+        setup_ms: 0.0,
+        solve_ms: 0.0,
+        postprocess_ms: 0.0,
+        elapsed_ms: 0.0,
         covariance,
         termination_type,
         termination_reason,
@@ -607,6 +612,11 @@ fn refine_point_only_bundle_adjustment_native(
         damping: trust_region.radius,
         linear_solver: BundleAdjustmentLinearSolver::DenseSchur,
         preconditioner: None,
+        sparse_backend: None,
+        setup_ms: 0.0,
+        solve_ms: 0.0,
+        postprocess_ms: 0.0,
+        elapsed_ms: 0.0,
         covariance: None,
         termination_type,
         termination_reason,
@@ -3892,10 +3902,8 @@ mod tests {
             native_linear_solver_policy_for_preference(Preference::SparseSchur, 10).0,
             BundleAdjustmentLinearSolver::SparseSchur
         );
-        let (solver, preconditioner) = native_linear_solver_policy_for_preference(
-            Preference::IterativeSchur,
-            10,
-        );
+        let (solver, preconditioner) =
+            native_linear_solver_policy_for_preference(Preference::IterativeSchur, 10);
         assert_eq!(solver, BundleAdjustmentLinearSolver::IterativeSchur);
         assert_eq!(
             preconditioner,

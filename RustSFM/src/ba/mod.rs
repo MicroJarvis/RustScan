@@ -329,6 +329,11 @@ pub struct BundleAdjustmentReport {
     pub damping: f64,
     pub linear_solver: BundleAdjustmentLinearSolver,
     pub preconditioner: Option<BundleAdjustmentPreconditioner>,
+    pub sparse_backend: Option<BundleAdjustmentSparseLinearAlgebra>,
+    pub setup_ms: f64,
+    pub solve_ms: f64,
+    pub postprocess_ms: f64,
+    pub elapsed_ms: f64,
     pub covariance: Option<BundleAdjustmentCovariance>,
     pub termination_type: BundleAdjustmentTerminationType,
     pub termination_reason: BundleAdjustmentTerminationReason,
@@ -341,10 +346,11 @@ impl BundleAdjustmentReport {
 
     pub fn brief_report(&self) -> String {
         format!(
-            "termination={:?} reason={:?} solver={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6}",
+            "termination={:?} reason={:?} solver={:?} sparse_backend={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} elapsed_ms={:.2}",
             self.termination_type,
             self.termination_reason,
             self.linear_solver,
+            self.sparse_backend,
             self.residuals,
             self.effective_parameters,
             self.iterations,
@@ -352,7 +358,11 @@ impl BundleAdjustmentReport {
             self.linear_solver_iterations,
             self.initial_cost,
             self.final_cost,
-            self.step_quality
+            self.step_quality,
+            self.setup_ms,
+            self.solve_ms,
+            self.postprocess_ms,
+            self.elapsed_ms
         )
     }
 }
