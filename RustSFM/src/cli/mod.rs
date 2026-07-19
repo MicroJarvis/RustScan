@@ -4,7 +4,10 @@ mod project;
 mod support;
 
 use clap::{Parser, Subcommand};
-use rustsfm::{FeatureType, ImageSelectionMethod};
+use rustsfm::{
+    BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra, FeatureType,
+    ImageSelectionMethod,
+};
 use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "rustsfm")]
@@ -164,6 +167,10 @@ struct ReconstructArgs {
     local_ba_max_refinement_change: f32,
     #[arg(long, default_value_t = false)]
     no_global_ba: bool,
+    #[arg(long, default_value = "auto")]
+    ba_linear_solver: BundleAdjustmentLinearSolverPreference,
+    #[arg(long, default_value = "auto")]
+    ba_sparse_backend: BundleAdjustmentSparseLinearAlgebra,
     #[arg(long, default_value = "50")]
     global_ba_iterations: usize,
     #[arg(long, default_value = "1.5")]
@@ -471,6 +478,10 @@ struct ColmapMapperArgs {
     ba_refine_principal_point: Option<i32>,
     #[arg(long = "Mapper.ba_refine_extra_params")]
     ba_refine_extra_params: Option<i32>,
+    #[arg(long = "Mapper.ba_linear_solver")]
+    ba_linear_solver: Option<String>,
+    #[arg(long = "Mapper.ba_sparse_backend")]
+    ba_sparse_backend: Option<String>,
     #[arg(long = "Mapper.multiple_models")]
     multiple_models: Option<i32>,
     #[arg(long = "Mapper.min_num_matches")]
@@ -716,6 +727,34 @@ mod tests {
     }
 
     #[test]
+    fn native_reconstruct_parses_ba_backend_options() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "reconstruct",
+            "--input",
+            "in",
+            "--output",
+            "out",
+            "--ba-linear-solver",
+            "iterative_schur",
+            "--ba-sparse-backend",
+            "accelerate-sparse",
+        ])
+        .expect("native BA backend flags");
+        let Commands::Reconstruct(args) = cli.command else {
+            panic!("reconstruct command")
+        };
+        assert_eq!(
+            args.ba_linear_solver,
+            BundleAdjustmentLinearSolverPreference::IterativeSchur
+        );
+        assert_eq!(
+            args.ba_sparse_backend,
+            BundleAdjustmentSparseLinearAlgebra::AccelerateSparse
+        );
+    }
+
+    #[test]
     fn native_reconstruct_uses_less_aggressive_global_ba_ratio_defaults() {
         let cli =
             Cli::try_parse_from(["rustsfm", "reconstruct", "--input", "in", "--output", "out"])
@@ -736,5 +775,23 @@ mod tests {
             panic!("mapper command")
         };
         assert_eq!(args.use_gpu_pnp, Some(1));
+    }
+
+    #[test]
+    fn colmap_mapper_parses_ba_backend_options() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "mapper",
+            "--Mapper.ba_linear_solver",
+            "iterative_schur",
+            "--Mapper.ba_sparse_backend",
+            "accelerate-sparse",
+        ])
+        .expect("COLMAP BA backend flags");
+        let Commands::Mapper(args) = cli.command else {
+            panic!("mapper command")
+        };
+        assert_eq!(args.ba_linear_solver.as_deref(), Some("iterative_schur"));
+        assert_eq!(args.ba_sparse_backend.as_deref(), Some("accelerate-sparse"));
     }
 }

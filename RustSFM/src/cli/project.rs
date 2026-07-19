@@ -106,6 +106,8 @@ pub(super) struct ResolvedColmapMapperArgs {
     pub(super) ba_refine_focal_length: i32,
     pub(super) ba_refine_principal_point: i32,
     pub(super) ba_refine_extra_params: i32,
+    pub(super) ba_linear_solver: String,
+    pub(super) ba_sparse_backend: String,
     pub(super) multiple_models: i32,
     pub(super) min_num_matches: usize,
     pub(super) max_num_models: usize,
@@ -207,6 +209,16 @@ pub(super) fn resolve_colmap_mapper_args(
                 "Mapper.ba_refine_extra_params",
             )?))
             .unwrap_or(1),
+        ba_linear_solver: args
+            .ba_linear_solver
+            .clone()
+            .or_else(|| project_value(&project, "Mapper.ba_linear_solver").map(str::to_owned))
+            .unwrap_or_else(|| "auto".to_string()),
+        ba_sparse_backend: args
+            .ba_sparse_backend
+            .clone()
+            .or_else(|| project_value(&project, "Mapper.ba_sparse_backend").map(str::to_owned))
+            .unwrap_or_else(|| "auto".to_string()),
         multiple_models: args
             .multiple_models
             .or(colmap_project_bool_to_i32(parse_project_bool(
@@ -453,6 +465,8 @@ mod tests {
             ba_refine_focal_length: None,
             ba_refine_principal_point: None,
             ba_refine_extra_params: None,
+            ba_linear_solver: None,
+            ba_sparse_backend: None,
             multiple_models: None,
             min_num_matches: None,
             max_num_models: None,
@@ -518,6 +532,8 @@ filter_max_reproj_error=4
 tri_ignore_two_view_tracks=true
 ba_global_frames_ratio=1.25
 ba_global_points_ratio=1.35
+ba_linear_solver=iterative_schur
+ba_sparse_backend=accelerate-sparse
 num_threads=-1
 ",
         )?;
@@ -536,6 +552,8 @@ num_threads=-1
         assert_eq!(resolved.tri_ignore_two_view_tracks, 1);
         assert_eq!(resolved.global_ba_images_ratio, 1.25);
         assert_eq!(resolved.global_ba_points_ratio, 1.35);
+        assert_eq!(resolved.ba_linear_solver, "iterative_schur");
+        assert_eq!(resolved.ba_sparse_backend, "accelerate-sparse");
         assert_eq!(resolved.num_threads, None);
         Ok(())
     }
@@ -553,6 +571,8 @@ num_threads=-1
 
         assert_eq!(resolved.global_ba_images_ratio, 1.5);
         assert_eq!(resolved.global_ba_points_ratio, 1.5);
+        assert_eq!(resolved.ba_linear_solver, "auto");
+        assert_eq!(resolved.ba_sparse_backend, "auto");
         Ok(())
     }
 
@@ -570,6 +590,8 @@ output_path=/tmp/sparse
 ba_refine_focal_length=false
 extract_colors=false
 use_gpu_pnp=true
+ba_linear_solver=dense-schur
+ba_sparse_backend=suite-sparse
 num_threads=-1
 ",
         )?;
@@ -579,6 +601,8 @@ num_threads=-1
         args.extract_colors = Some(1);
         args.use_gpu_pnp = Some(0);
         args.num_threads = Some(4);
+        args.ba_linear_solver = Some("iterative_schur".to_string());
+        args.ba_sparse_backend = Some("accelerate-sparse".to_string());
 
         let resolved = resolve_colmap_mapper_args(&args)?;
 
@@ -586,6 +610,8 @@ num_threads=-1
         assert_eq!(resolved.ba_refine_focal_length, 1);
         assert_eq!(resolved.extract_colors, 1);
         assert_eq!(resolved.use_gpu_pnp, Some(0));
+        assert_eq!(resolved.ba_linear_solver, "iterative_schur");
+        assert_eq!(resolved.ba_sparse_backend, "accelerate-sparse");
         assert_eq!(resolved.num_threads, Some(4));
         Ok(())
     }

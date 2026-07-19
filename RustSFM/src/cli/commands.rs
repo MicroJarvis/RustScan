@@ -96,6 +96,8 @@ fn run_reconstruct(args: ReconstructArgs) -> Result<()> {
         local_ba_max_refinements: args.local_ba_max_refinements,
         local_ba_max_refinement_change: args.local_ba_max_refinement_change,
         global_ba: !args.no_global_ba,
+        ba_linear_solver: args.ba_linear_solver,
+        ba_sparse_backend: args.ba_sparse_backend,
         global_ba_iterations: args.global_ba_iterations,
         global_ba_images_ratio: args.global_ba_images_ratio,
         global_ba_points_ratio: args.global_ba_points_ratio,
@@ -331,6 +333,14 @@ fn run_colmap_geometric_verifier(args: ColmapGeometricVerifierArgs) -> Result<()
 
 fn run_colmap_mapper(args: ColmapMapperArgs) -> Result<()> {
     let resolved = resolve_colmap_mapper_args(&args)?;
+    let ba_linear_solver = resolved
+        .ba_linear_solver
+        .parse()
+        .context("invalid Mapper.ba_linear_solver")?;
+    let ba_sparse_backend = resolved
+        .ba_sparse_backend
+        .parse()
+        .context("invalid Mapper.ba_sparse_backend")?;
     let ba_refine_focal_length = colmap_bool(
         resolved.ba_refine_focal_length,
         "Mapper.ba_refine_focal_length",
@@ -420,6 +430,8 @@ fn run_colmap_mapper(args: ColmapMapperArgs) -> Result<()> {
         local_ba_max_refinements: resolved.local_ba_max_refinements,
         local_ba_max_refinement_change: resolved.local_ba_max_refinement_change,
         no_global_ba: false,
+        ba_linear_solver,
+        ba_sparse_backend,
         global_ba_iterations: resolved.global_ba_iterations,
         global_ba_images_ratio: resolved.global_ba_images_ratio,
         global_ba_points_ratio: resolved.global_ba_points_ratio,
