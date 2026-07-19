@@ -2475,6 +2475,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
 
     let mut snapshot_state = PipelineSnapshotState::new(&reconstruction);
     let mut retry_state = RegistrationRetryState::new(frames.len());
+    let mut telemetry = IncrementalRegistrationTelemetry::default();
     let mut fallback_available = true;
     while reconstruction.poses.iter().any(|p| p.is_none()) {
         let NextRegistrationSelection {
@@ -2492,6 +2493,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             &camera_has_prior_focal_length,
             &registration_stats,
             triangulation_state.observation_manager(),
+            &mut telemetry,
             pnp_scorer,
         )?;
         let normal_attempted_candidates = !failed_attempts.is_empty();
@@ -2517,6 +2519,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 break;
             }
             fallback_available = false;
+            telemetry.fallback_epochs += 1;
             let NextRegistrationSelection {
                 choice,
                 failed_attempts,
@@ -2532,6 +2535,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 &camera_has_prior_focal_length,
                 &registration_stats,
                 triangulation_state.observation_manager(),
+                &mut telemetry,
                 pnp_scorer,
             )?;
             for (failed_image, mode) in failed_attempts {
@@ -2582,6 +2586,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             config,
             &camera_priors,
         );
+        let observation_update_start = Instant::now();
         {
             triangulation_state
                 .observation_manager_mut()
@@ -2626,6 +2631,9 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                     );
             }
         }
+        telemetry.observation_update_ms +=
+            observation_update_start.elapsed().as_secs_f64() * 1000.0;
+        let triangulation_start = Instant::now();
         let structureless_track_report = if !choice.structureless_inliers.is_empty() {
             continue_or_triangulate_structureless_tracks(
                 frames,
@@ -2662,6 +2670,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             triangulator.merge_tracks(&tri_options, &modified);
             triangulator.retriangulate(&tri_options);
         }
+        telemetry.triangulation_ms += triangulation_start.elapsed().as_secs_f64() * 1000.0;
         filter_reprojection_tracks_with_state(
             frames,
             pairs,
@@ -2834,6 +2843,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         ));
     }
     sync_registered_frame_poses_from_images(&mut reconstruction);
+    debug_log.push(telemetry.format_log());
     Ok((reconstruction, debug_log))
 }
 
@@ -3192,6 +3202,36 @@ impl RegistrationRetryState {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct IncrementalRegistrationTelemetry {
+    candidate_units: usize,
+    skipped_unchanged: usize,
+    structure_based_attempts: usize,
+    structureless_attempts: usize,
+    fallback_epochs: usize,
+    collect_observations_ms: f64,
+    pose_solve_refine_ms: f64,
+    observation_update_ms: f64,
+    triangulation_ms: f64,
+}
+
+impl IncrementalRegistrationTelemetry {
+    fn format_log(&self) -> String {
+        format!(
+            "incremental_registration candidate_units={} skipped_unchanged={} structure_based_attempts={} structureless_attempts={} fallback_epochs={} collect_observations_ms={:.2} pose_solve_refine_ms={:.2} observation_update_ms={:.2} triangulation_ms={:.2}",
+            self.candidate_units,
+            self.skipped_unchanged,
+            self.structure_based_attempts,
+            self.structureless_attempts,
+            self.fallback_epochs,
+            self.collect_observations_ms,
+            self.pose_solve_refine_ms,
+            self.observation_update_ms,
+            self.triangulation_ms,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NextRegistrationSelection {
     choice: Option<RegistrationChoice>,
@@ -3245,6 +3285,7 @@ fn choose_next_registration_with_failures(
     let mut pnp_scorer = None;
     let retry_state =
         RegistrationRetryState::from_trial_vectors(reg_trials, structureless_reg_trials);
+    let mut telemetry = IncrementalRegistrationTelemetry::default();
     choose_next_registration_with_failures_and_pnp_scorer(
         frames,
         pairs,
@@ -3257,6 +3298,7 @@ fn choose_next_registration_with_failures(
         camera_has_prior_focal_length,
         registration_stats,
         obs_manager,
+        &mut telemetry,
         &mut pnp_scorer,
     )
     .expect("CPU absolute pose routes are infallible")
@@ -3275,6 +3317,7 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
     camera_has_prior_focal_length: &[bool],
     registration_stats: &RegistrationStats,
     obs_manager: &ObservationManager,
+    telemetry: &mut IncrementalRegistrationTelemetry,
     pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
 ) -> Result<NextRegistrationSelection> {
     let correspondence_graph = obs_manager.correspondence_graph();
@@ -3288,8 +3331,18 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
             obs_manager,
             mode,
             pass,
+            telemetry,
         );
+        telemetry.candidate_units += next_images.len();
         for image in next_images {
+            match mode {
+                NextImageRegistrationMode::StructureBased => {
+                    telemetry.structure_based_attempts += 1;
+                }
+                NextImageRegistrationMode::StructureLess => {
+                    telemetry.structureless_attempts += 1;
+                }
+            }
             if let Some(choice) = registration_choice_for_image_with_pnp_scorer(
                 image,
                 frames,
@@ -3302,6 +3355,7 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
                 obs_manager,
                 correspondence_graph,
                 mode,
+                telemetry,
                 pnp_scorer,
             )? {
                 return Ok(NextRegistrationSelection {
@@ -3384,6 +3438,7 @@ fn find_next_registration_images(
 ) -> Vec<usize> {
     let retry_state =
         RegistrationRetryState::from_trial_vectors(reg_trials, structureless_reg_trials);
+    let mut telemetry = IncrementalRegistrationTelemetry::default();
     find_next_registration_images_with_retry_state(
         reconstruction,
         &retry_state,
@@ -3392,6 +3447,7 @@ fn find_next_registration_images(
         obs_manager,
         mode,
         RegistrationPass::Normal,
+        &mut telemetry,
     )
 }
 
@@ -3403,6 +3459,7 @@ fn find_next_registration_images_with_retry_state(
     obs_manager: &ObservationManager,
     mode: NextImageRegistrationMode,
     pass: RegistrationPass,
+    telemetry: &mut IncrementalRegistrationTelemetry,
 ) -> Vec<usize> {
     let mut image_ranks = Vec::<(usize, f32)>::new();
     let mut other_image_ranks = Vec::<(usize, f32)>::new();
@@ -3420,16 +3477,18 @@ fn find_next_registration_images_with_retry_state(
             NextImageRegistrationMode::StructureBased => config.abs_pose_min_num_inliers,
             NextImageRegistrationMode::StructureLess => structureless_min_num_inliers(config),
         };
-        if support < min_support
-            || !retry_state.is_eligible(
-                reconstruction,
-                image,
-                mode,
-                support,
-                config.max_reg_trials,
-                pass,
-            )
-        {
+        if support < min_support {
+            continue;
+        }
+        if !retry_state.is_eligible(
+            reconstruction,
+            image,
+            mode,
+            support,
+            config.max_reg_trials,
+            pass,
+        ) {
+            telemetry.skipped_unchanged += 1;
             continue;
         }
         let num_trials = retry_state.num_trials(reconstruction, image, mode, support);
@@ -3476,6 +3535,7 @@ fn registration_choice_for_image_with_pnp_scorer(
     obs_manager: &ObservationManager,
     correspondence_graph: Option<&CorrespondenceGraph>,
     mode: NextImageRegistrationMode,
+    telemetry: &mut IncrementalRegistrationTelemetry,
     pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
 ) -> Result<Option<RegistrationChoice>> {
     let registration_reconstruction =
@@ -3518,6 +3578,7 @@ fn registration_choice_for_image_with_pnp_scorer(
                 registration_stats,
                 correspondence_graph,
                 pnp_scorer.as_deref_mut(),
+                telemetry,
             )? {
                 (abs_pose, "pnp")
             } else {
@@ -3669,6 +3730,7 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
     pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
 ) -> Result<()> {
     let mut marked_units = HashSet::new();
+    let mut telemetry = IncrementalRegistrationTelemetry::default();
     for image in 0..reconstruction.poses.len() {
         if registration_unit_is_registered(reconstruction, image)
             || registration_unit_num_trials(reconstruction, image, reg_trials)
@@ -3714,6 +3776,7 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
                 registration_stats,
                 obs_manager.correspondence_graph(),
                 pnp_scorer.as_deref_mut(),
+                &mut telemetry,
             )?
         };
         let pose = if structure_based_pose.is_some() {
@@ -7568,6 +7631,7 @@ fn solve_absolute_pose(
     registration_stats: &RegistrationStats,
     graph: Option<&CorrespondenceGraph>,
 ) -> Option<AbsolutePose> {
+    let mut telemetry = IncrementalRegistrationTelemetry::default();
     solve_absolute_pose_with_pnp_scorer(
         image,
         frames,
@@ -7579,6 +7643,7 @@ fn solve_absolute_pose(
         registration_stats,
         graph,
         None,
+        &mut telemetry,
     )
     .expect("CPU absolute pose route is infallible")
 }
@@ -7595,6 +7660,7 @@ fn solve_absolute_pose_with_pnp_scorer(
     registration_stats: &RegistrationStats,
     graph: Option<&CorrespondenceGraph>,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
+    telemetry: &mut IncrementalRegistrationTelemetry,
 ) -> Result<Option<AbsolutePose>> {
     let camera = registration_camera_for_image(
         image,
@@ -7606,77 +7672,88 @@ fn solve_absolute_pose_with_pnp_scorer(
     if camera_has_bogus_params(camera, config) {
         return Ok(None);
     }
+    let collect_observations_start = Instant::now();
     let pose_observations =
         collect_absolute_pose_observations(image, frames, pairs, reconstruction, config, graph);
-    let num_correspondences = pose_observations.len();
-    if num_correspondences < config.abs_pose_min_num_inliers.max(4) {
-        return Ok(None);
-    }
-    let estimate_focal = absolute_pose_estimate_focal_length_enabled(
-        image,
-        camera,
-        reconstruction,
-        config,
-        camera_has_prior_focal_length,
-        registration_stats,
-    );
-    let Some((pose, inliers, camera)) = solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
-        &pose_observations,
-        camera,
-        estimate_focal,
-        config,
-        pnp_scorer,
-    )?
-    else {
-        return Ok(None);
-    };
-    let Some(initial_eval) =
-        evaluate_absolute_pose(pose, &pose_observations, Some(&inliers), camera, config)
-    else {
-        return Ok(None);
-    };
-    if !accept_absolute_pose_eval(initial_eval, num_correspondences, config) {
-        return Ok(None);
-    }
-    let refinement_observations = inlier_absolute_pose_observations(&pose_observations, &inliers);
-    if refinement_observations.len() < config.abs_pose_min_num_inliers {
-        return Ok(None);
-    }
-    let Some((pose, camera)) = refine_absolute_pose_reprojection(
-        pose,
-        image,
-        frames,
-        reconstruction,
-        &refinement_observations,
-        camera,
-        absolute_pose_refine_camera_params_enabled(
+    telemetry.collect_observations_ms +=
+        collect_observations_start.elapsed().as_secs_f64() * 1000.0;
+    let pose_solve_refine_start = Instant::now();
+    let result = (|| -> Result<Option<AbsolutePose>> {
+        let num_correspondences = pose_observations.len();
+        if num_correspondences < config.abs_pose_min_num_inliers.max(4) {
+            return Ok(None);
+        }
+        let estimate_focal = absolute_pose_estimate_focal_length_enabled(
             image,
             camera,
             reconstruction,
             config,
+            camera_has_prior_focal_length,
             registration_stats,
-        ),
-        config,
-    ) else {
-        return Ok(None);
-    };
-    let Some(final_eval) = evaluate_absolute_pose(pose, &pose_observations, None, camera, config)
-    else {
-        return Ok(None);
-    };
-    if !accept_absolute_pose_eval(final_eval, num_correspondences, config) {
-        return Ok(None);
-    }
-    Ok(Some(AbsolutePose {
-        pose,
-        camera,
-        inliers: final_eval.inliers,
-        inlier_ratio: final_eval.inliers as f32 / num_correspondences.max(1) as f32,
-        mean_error_px: final_eval.mean_error_px,
-        structureless_inliers: Vec::new(),
-        frame_image_poses: Vec::new(),
-        generalized_inliers: Vec::new(),
-    }))
+        );
+        let Some((pose, inliers, camera)) =
+            solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
+                &pose_observations,
+                camera,
+                estimate_focal,
+                config,
+                pnp_scorer,
+            )?
+        else {
+            return Ok(None);
+        };
+        let Some(initial_eval) =
+            evaluate_absolute_pose(pose, &pose_observations, Some(&inliers), camera, config)
+        else {
+            return Ok(None);
+        };
+        if !accept_absolute_pose_eval(initial_eval, num_correspondences, config) {
+            return Ok(None);
+        }
+        let refinement_observations =
+            inlier_absolute_pose_observations(&pose_observations, &inliers);
+        if refinement_observations.len() < config.abs_pose_min_num_inliers {
+            return Ok(None);
+        }
+        let Some((pose, camera)) = refine_absolute_pose_reprojection(
+            pose,
+            image,
+            frames,
+            reconstruction,
+            &refinement_observations,
+            camera,
+            absolute_pose_refine_camera_params_enabled(
+                image,
+                camera,
+                reconstruction,
+                config,
+                registration_stats,
+            ),
+            config,
+        ) else {
+            return Ok(None);
+        };
+        let Some(final_eval) =
+            evaluate_absolute_pose(pose, &pose_observations, None, camera, config)
+        else {
+            return Ok(None);
+        };
+        if !accept_absolute_pose_eval(final_eval, num_correspondences, config) {
+            return Ok(None);
+        }
+        Ok(Some(AbsolutePose {
+            pose,
+            camera,
+            inliers: final_eval.inliers,
+            inlier_ratio: final_eval.inliers as f32 / num_correspondences.max(1) as f32,
+            mean_error_px: final_eval.mean_error_px,
+            structureless_inliers: Vec::new(),
+            frame_image_poses: Vec::new(),
+            generalized_inliers: Vec::new(),
+        }))
+    })();
+    telemetry.pose_solve_refine_ms += pose_solve_refine_start.elapsed().as_secs_f64() * 1000.0;
+    result
 }
 
 fn inlier_absolute_pose_observations(
@@ -10790,6 +10867,37 @@ mod tests {
             ),
             3
         );
+    }
+
+    #[test]
+    fn incremental_registration_telemetry_reports_hot_path_stages() {
+        let telemetry = IncrementalRegistrationTelemetry {
+            candidate_units: 7,
+            skipped_unchanged: 3,
+            structure_based_attempts: 4,
+            structureless_attempts: 2,
+            fallback_epochs: 1,
+            collect_observations_ms: 1.25,
+            pose_solve_refine_ms: 2.5,
+            observation_update_ms: 3.75,
+            triangulation_ms: 4.5,
+        };
+
+        let line = telemetry.format_log();
+
+        for key in [
+            "candidate_units=7",
+            "skipped_unchanged=3",
+            "structure_based_attempts=4",
+            "structureless_attempts=2",
+            "fallback_epochs=1",
+            "collect_observations_ms=1.25",
+            "pose_solve_refine_ms=2.50",
+            "observation_update_ms=3.75",
+            "triangulation_ms=4.50",
+        ] {
+            assert!(line.contains(key), "missing {key}: {line}");
+        }
     }
 
     #[test]
@@ -18143,6 +18251,8 @@ mod tests {
             image_selection_method: ImageSelectionMethod::MaxVisiblePointsNum,
             ..MapperConfig::default()
         };
+        let mut normal_telemetry = IncrementalRegistrationTelemetry::default();
+        let mut fallback_telemetry = IncrementalRegistrationTelemetry::default();
 
         let normal = find_next_registration_images_with_retry_state(
             &reconstruction,
@@ -18152,6 +18262,7 @@ mod tests {
             &obs_manager,
             NextImageRegistrationMode::StructureBased,
             RegistrationPass::Normal,
+            &mut normal_telemetry,
         );
         let fallback = find_next_registration_images_with_retry_state(
             &reconstruction,
@@ -18161,10 +18272,13 @@ mod tests {
             &obs_manager,
             NextImageRegistrationMode::StructureBased,
             RegistrationPass::ExhaustiveFallback,
+            &mut fallback_telemetry,
         );
 
         assert!(normal.is_empty());
+        assert_eq!(normal_telemetry.skipped_unchanged, 1);
         assert_eq!(fallback, vec![1]);
+        assert_eq!(fallback_telemetry.skipped_unchanged, 0);
     }
 
     #[test]
