@@ -18,7 +18,7 @@
 - Modify: `.github/workflows/ci.yml:10,53`
 - Verify: `scripts/setup_rustsfm_deps.sh`
 
-- [ ] **Step 1: Record the failing dependency state**
+- [x] **Step 1: Record the failing dependency state**
 
 Run:
 
@@ -30,7 +30,7 @@ test -f third_party/PoseLib/PoseLib/solvers/gen_relpose_6pt.cc
 
 Expected: the first command reports gitlink `7e9f5f53372e43f89655040d4dfc4a00e5ace11c`, while the two `test` commands fail because the submodule mapping and checkout are absent.
 
-- [ ] **Step 2: Restore the submodule mapping**
+- [x] **Step 2: Restore the submodule mapping**
 
 Create `.gitmodules` with the exact pinned dependency path and upstream URL:
 
@@ -50,7 +50,7 @@ git -C third_party/PoseLib rev-parse HEAD
 
 Expected: the final command prints `7e9f5f53372e43f89655040d4dfc4a00e5ace11c`.
 
-- [ ] **Step 3: Make PoseLib part of the normal RustSFM build**
+- [x] **Step 3: Make PoseLib part of the normal RustSFM build**
 
 Change the feature table to:
 
@@ -64,7 +64,7 @@ ceres-ba = ["dep:ceres-solver"]
 vlfeat-sift = []
 ```
 
-- [ ] **Step 4: Make CI initialize the dependency**
+- [x] **Step 4: Make CI initialize the dependency**
 
 Change both checkout steps in `.github/workflows/ci.yml` to:
 
@@ -76,7 +76,7 @@ Change both checkout steps in `.github/workflows/ci.yml` to:
 
 Keep the existing default, explicit `--features poselib`, and `--no-default-features` matrix commands. The explicit feature build remains useful because it documents the supported feature name even though it is now in the default set.
 
-- [ ] **Step 5: Verify default and dependency-minimal feature resolution**
+- [x] **Step 5: Verify default and dependency-minimal feature resolution**
 
 Run:
 
@@ -89,7 +89,7 @@ cargo test -p rustsfm --lib --no-default-features structureless_estimator_report
 
 Expected: metadata contains `poselib` in the default list, the default build runs and passes the PoseLib solver test, and the no-default build passes its missing-solver test.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```bash
 git add .gitmodules RustSFM/Cargo.toml .github/workflows/ci.yml

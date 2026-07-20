@@ -5,7 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = ["ceres-ba", "vlfeat-sift", "gpu-wgpu"]
+default = ["ceres-ba", "vlfeat-sift", "gpu-wgpu", "poselib"]
 gpu-wgpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
 lowe-sift-backend = []
 poselib = []
