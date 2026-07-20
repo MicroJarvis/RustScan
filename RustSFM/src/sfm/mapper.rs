@@ -2671,7 +2671,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             triangulator.retriangulate(&tri_options);
         }
         telemetry.triangulation_ms += triangulation_start.elapsed().as_secs_f64() * 1000.0;
-        filter_reprojection_tracks_with_state(
+        filter_modified_reprojection_tracks_with_state(
             frames,
             pairs,
             &mut reconstruction,
@@ -2843,6 +2843,11 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         ));
     }
     sync_registered_frame_poses_from_images(&mut reconstruction);
+    debug_log.push(
+        triangulation_state
+            .observation_manager()
+            .sparse_maintenance_log(),
+    );
     debug_log.push(telemetry.format_log());
     Ok((reconstruction, debug_log))
 }
@@ -5059,27 +5064,24 @@ fn refine_local_bundle_round(
     ba_options.loss_function = loss_function;
     let report =
         refine_bundle_adjustment_checked(frames, reconstruction, config, ba_options).ok()?;
-    let post_ba_stable_point_ids = local_bundle.stable_point_ids.clone();
-    let mut post_ba_point_ids =
-        point_indices_for_stable_point_ids(reconstruction, &post_ba_stable_point_ids);
-    let (merged_observations, modified_after_merge) = {
+    let post_ba_point_ids =
+        point_indices_for_stable_point_ids(reconstruction, &local_bundle.stable_point_ids);
+    for &point_id in &post_ba_point_ids {
+        triangulation_state
+            .observation_manager_mut()
+            .mark_point3d_modified(point_id);
+    }
+    let (merged_observations, completed_observations, completed_image_observations) = {
         let mut triangulator =
             IncrementalTriangulator::new(frames, pairs, reconstruction, triangulation_state);
-        let merged = triangulator.merge_tracks(tri_options, &post_ba_point_ids);
         let modified = triangulator.get_modified_points3d().clone();
-        (merged, modified)
-    };
-    post_ba_point_ids =
-        point_indices_for_stable_point_ids(reconstruction, &post_ba_stable_point_ids);
-    post_ba_point_ids.extend(modified_after_merge);
-    let (completed_observations, completed_image_observations) = {
-        let mut triangulator =
-            IncrementalTriangulator::new(frames, pairs, reconstruction, triangulation_state);
-        let completed = triangulator.complete_tracks(tri_options, &post_ba_point_ids);
+        let merged = triangulator.merge_tracks(tri_options, &modified);
+        let modified = triangulator.get_modified_points3d().clone();
+        let completed = triangulator.complete_tracks(tri_options, &modified);
         let complete_report = triangulator.complete_image(tri_options, registered_image);
-        (completed, complete_report.total_observations())
+        (merged, completed, complete_report.total_observations())
     };
-    let filtered_observations = filter_reprojection_tracks_with_state(
+    let filtered_observations = filter_modified_reprojection_tracks_with_state(
         frames,
         pairs,
         reconstruction,
@@ -8719,7 +8721,7 @@ fn filter_reprojection_tracks_with_state(
     let max_error = track_filter_max_error_px(config);
     let min_tri_angle = track_filter_min_tri_angle_deg(config);
     let min_track_length = track_filter_min_track_length();
-    filter_reprojection_tracks_with_policy(
+    let removed = filter_reprojection_tracks_with_policy(
         frames,
         pairs,
         reconstruction,
@@ -8728,7 +8730,11 @@ fn filter_reprojection_tracks_with_state(
         max_error,
         min_tri_angle,
         min_track_length,
-    )
+    );
+    let _ = triangulation_state
+        .observation_manager_mut()
+        .take_modified_point3d_ids();
+    removed
 }
 
 fn filter_reprojection_tracks_subset_with_state(
@@ -8750,6 +8756,31 @@ fn filter_reprojection_tracks_subset_with_state(
         track_filter_min_tri_angle_deg(config),
         track_filter_min_track_length(),
     )
+}
+
+fn filter_modified_reprojection_tracks_with_state(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+    triangulation_state: &mut IncrementalTriangulatorState,
+) -> usize {
+    let point_ids = triangulation_state
+        .observation_manager()
+        .modified_point3d_ids()
+        .clone();
+    let removed = filter_reprojection_tracks_subset_with_state(
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        triangulation_state,
+        &point_ids,
+    );
+    let _ = triangulation_state
+        .observation_manager_mut()
+        .take_modified_point3d_ids();
+    removed
 }
 
 fn filter_reprojection_tracks_with_policy(
@@ -17476,6 +17507,15 @@ mod tests {
         assert!(log
             .iter()
             .any(|line| line.starts_with("register image_2.jpg source=pnp")));
+        let maintenance = log
+            .iter()
+            .find(|line| line.starts_with("sparse_maintenance "))
+            .expect("sparse maintenance telemetry");
+        assert!(
+            maintenance.contains("full_filter_calls=0")
+                && maintenance.contains("subset_filter_calls=1"),
+            "{maintenance}"
+        );
         assert!(reconstruction.poses.iter().all(Option::is_some));
         assert_eq!(reconstruction.point_ids[0], 100);
         assert!(reconstruction
@@ -19147,6 +19187,158 @@ mod tests {
         ] {
             assert!(log.contains(expected), "missing {expected}: {log}");
         }
+    }
+
+    #[test]
+    fn modified_track_filter_consumes_frontier_without_full_scan() {
+        let mut frames = (0..4)
+            .map(|id| minimal_frame(id, &format!("{id}.jpg")))
+            .collect::<Vec<_>>();
+        for frame in &mut frames {
+            frame.keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        }
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses.fill(Some(SE3::identity()));
+        add_test_point3d(
+            &mut reconstruction,
+            11,
+            vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        );
+        add_test_point3d(
+            &mut reconstruction,
+            22,
+            vec![
+                TrackObservation {
+                    image: 2,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 3,
+                    feature: 0,
+                },
+            ],
+        );
+        reconstruction.points[0].xyz = [0.0, 0.0, -1.0];
+        reconstruction.points[1].xyz = [0.0, 0.0, -1.0];
+        let mut state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+        state.observation_manager_mut().mark_point3d_modified(0);
+
+        assert_eq!(
+            filter_modified_reprojection_tracks_with_state(
+                &frames,
+                &[],
+                &mut reconstruction,
+                &MapperConfig::default(),
+                &mut state,
+            ),
+            2
+        );
+
+        assert_eq!(reconstruction.point_ids, vec![22]);
+        assert!(state
+            .observation_manager()
+            .modified_point3d_ids()
+            .is_empty());
+        let log = state.observation_manager().sparse_maintenance_log();
+        assert!(log.contains("full_filter_calls=0"), "{log}");
+        assert!(log.contains("subset_filter_calls=1"), "{log}");
+        assert!(log.contains("frontier_cycles=1"), "{log}");
+    }
+
+    #[test]
+    fn synthetic_local_ba_filters_only_its_modified_frontier() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.03),
+                glam::Vec3::new(-0.35, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.02),
+                glam::Vec3::new(0.45, 0.0, 0.0),
+            ),
+        ];
+        let points = (0..12)
+            .map(|idx| {
+                let col = (idx % 4) as f32;
+                let row = (idx / 4) as f32;
+                [-0.3 + col * 0.2, -0.2 + row * 0.18, 3.0 + idx as f32 * 0.03]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = (0..3)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+            frames[image].colors = vec![[image as u8, 0, 0]; points.len()];
+        }
+        let pairs = vec![
+            initial_pair_from_projected_points(0, 1, poses[0], poses[1], points.len()),
+            initial_pair_from_projected_points(0, 2, poses[0], poses[2], points.len()),
+            initial_pair_from_projected_points(1, 2, poses[1], poses[2], points.len()),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.camera = camera;
+        reconstruction.cameras = vec![camera];
+        reconstruction.poses = poses.into_iter().map(Some).collect();
+        for (point_id, xyz) in points.into_iter().enumerate() {
+            let track = (0..3)
+                .map(|image| TrackObservation {
+                    image,
+                    feature: point_id,
+                })
+                .collect();
+            add_test_point3d(&mut reconstruction, point_id as u64 + 1, track);
+            reconstruction.points[point_id].xyz = xyz;
+        }
+        let mut state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        let stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let config = MapperConfig {
+            local_ba: true,
+            local_ba_num_images: 2,
+            local_ba_min_shared_points: 4,
+            local_ba_iterations: 1,
+            local_ba_max_refinements: 1,
+            global_ba: false,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        refine_local_bundle_after_registration(
+            &frames,
+            &pairs,
+            &mut reconstruction,
+            2,
+            0,
+            &mapper_triangulator_options(&config),
+            &config,
+            &stats,
+            &mut state,
+        )
+        .expect("synthetic local BA");
+
+        assert!(state
+            .observation_manager()
+            .modified_point3d_ids()
+            .is_empty());
+        let log = state.observation_manager().sparse_maintenance_log();
+        assert!(log.contains("full_filter_calls=0"), "{log}");
+        assert!(log.contains("subset_filter_calls=1"), "{log}");
     }
 
     #[test]
