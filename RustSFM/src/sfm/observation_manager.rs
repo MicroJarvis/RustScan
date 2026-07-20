@@ -4,6 +4,7 @@ use crate::visibility_pyramid::VisibilityPyramid;
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImagePairStat {
@@ -101,6 +102,25 @@ impl Point3DIndexRemap {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SparseMaintenanceTelemetry {
+    complete_calls: usize,
+    complete_frontier_points: usize,
+    completed_observations: usize,
+    complete_ms: f64,
+    merge_calls: usize,
+    merge_frontier_points: usize,
+    merged_observations: usize,
+    merge_ms: f64,
+    point_deletes: usize,
+    moved_points: usize,
+    rewritten_observations: usize,
+    delete_ms: f64,
+    frontier_peak: usize,
+    frontier_cycles: usize,
+    frontier_points_consumed: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ObservationManager {
     image_stats: Vec<ImageStat>,
@@ -109,6 +129,7 @@ pub struct ObservationManager {
     modified_point3d_ids: HashSet<usize>,
     correspondence_graph: Option<Arc<CorrespondenceGraph>>,
     point3d_id_allocator: Point3DIdAllocator,
+    maintenance: SparseMaintenanceTelemetry,
 }
 
 impl ObservationManager {
@@ -779,14 +800,61 @@ impl ObservationManager {
 
     pub fn mark_point3d_modified(&mut self, point_id: usize) {
         self.modified_point3d_ids.insert(point_id);
+        self.maintenance.frontier_peak = self
+            .maintenance
+            .frontier_peak
+            .max(self.modified_point3d_ids.len());
     }
 
     pub fn modified_point3d_ids(&self) -> &HashSet<usize> {
         &self.modified_point3d_ids
     }
 
+    pub fn take_modified_point3d_ids(&mut self) -> HashSet<usize> {
+        let frontier = std::mem::take(&mut self.modified_point3d_ids);
+        self.maintenance.frontier_cycles += 1;
+        self.maintenance.frontier_points_consumed += frontier.len();
+        frontier
+    }
+
     pub fn clear_modified_point3d_ids(&mut self) {
         self.modified_point3d_ids.clear();
+    }
+
+    pub fn record_complete(&mut self, frontier: usize, changed: usize, elapsed_ms: f64) {
+        self.maintenance.complete_calls += 1;
+        self.maintenance.complete_frontier_points += frontier;
+        self.maintenance.completed_observations += changed;
+        self.maintenance.complete_ms += elapsed_ms;
+    }
+
+    pub fn record_merge(&mut self, frontier: usize, changed: usize, elapsed_ms: f64) {
+        self.maintenance.merge_calls += 1;
+        self.maintenance.merge_frontier_points += frontier;
+        self.maintenance.merged_observations += changed;
+        self.maintenance.merge_ms += elapsed_ms;
+    }
+
+    pub fn sparse_maintenance_log(&self) -> String {
+        let maintenance = &self.maintenance;
+        format!(
+            "sparse_maintenance complete_calls={} complete_frontier_points={} completed_observations={} complete_ms={:.2} merge_calls={} merge_frontier_points={} merged_observations={} merge_ms={:.2} point_deletes={} moved_points={} rewritten_observations={} delete_ms={:.2} frontier_peak={} frontier_cycles={} frontier_points_consumed={}",
+            maintenance.complete_calls,
+            maintenance.complete_frontier_points,
+            maintenance.completed_observations,
+            maintenance.complete_ms,
+            maintenance.merge_calls,
+            maintenance.merge_frontier_points,
+            maintenance.merged_observations,
+            maintenance.merge_ms,
+            maintenance.point_deletes,
+            maintenance.moved_points,
+            maintenance.rewritten_observations,
+            maintenance.delete_ms,
+            maintenance.frontier_peak,
+            maintenance.frontier_cycles,
+            maintenance.frontier_points_consumed,
+        )
     }
 
     pub fn image_pairs(&self) -> &HashMap<(usize, usize), ImagePairStat> {
@@ -847,6 +915,8 @@ impl ObservationManager {
             return None;
         }
 
+        let started = Instant::now();
+        let mut rewritten_observations = 0usize;
         let last_point_id = reconstruction.points.len() - 1;
         let remap = Point3DIndexRemap {
             removed: point_id,
@@ -859,6 +929,7 @@ impl ObservationManager {
             let slot = &mut reconstruction.observations[obs.image][obs.feature];
             if *slot == Some(point_id) {
                 *slot = None;
+                rewritten_observations += 1;
             }
         }
         if let Some(moved_from) = remap.moved_from {
@@ -866,6 +937,7 @@ impl ObservationManager {
                 let slot = &mut reconstruction.observations[obs.image][obs.feature];
                 if *slot == Some(moved_from) {
                     *slot = Some(point_id);
+                    rewritten_observations += 1;
                 }
             }
         }
@@ -875,6 +947,10 @@ impl ObservationManager {
             .iter()
             .filter_map(|&id| remap.remap_existing(id))
             .collect();
+        self.maintenance.point_deletes += 1;
+        self.maintenance.moved_points += if remap.moved_from.is_some() { 1 } else { 0 };
+        self.maintenance.rewritten_observations += rewritten_observations;
+        self.maintenance.delete_ms += started.elapsed().as_secs_f64() * 1_000.0;
         Some(remap)
     }
 }
@@ -1019,6 +1095,64 @@ mod tests {
         let second = first.clone();
 
         assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn take_modified_points_consumes_only_the_current_frontier() {
+        let frames = vec![frame(0, 100, 100), frame(1, 100, 100)];
+        let reconstruction = reconstruction(&frames);
+        let mut manager = ObservationManager::new(&frames, &[], &reconstruction);
+        manager.mark_point3d_modified(3);
+        manager.mark_point3d_modified(7);
+
+        assert_eq!(manager.take_modified_point3d_ids(), HashSet::from([3, 7]));
+        assert!(manager.modified_point3d_ids().is_empty());
+
+        manager.mark_point3d_modified(9);
+        assert_eq!(manager.take_modified_point3d_ids(), HashSet::from([9]));
+        let log = manager.sparse_maintenance_log();
+        assert!(log.contains("frontier_peak=2"), "{log}");
+        assert!(log.contains("frontier_cycles=2"), "{log}");
+        assert!(log.contains("frontier_points_consumed=3"), "{log}");
+    }
+
+    #[test]
+    fn delete_tail_records_no_move_and_preserves_unrelated_tracks() {
+        let frames = (0..4).map(|id| frame(id, 100, 100)).collect::<Vec<_>>();
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses.fill(Some(SE3::identity()));
+        let mut manager = ObservationManager::new(&frames, &[], &reconstruction);
+        for image_pair in [[0, 1], [2, 3]] {
+            manager
+                .add_point3d(
+                    &frames,
+                    &[],
+                    &mut reconstruction,
+                    Point3D {
+                        xyz: [0.0, 0.0, 2.0],
+                        color: [0, 0, 0],
+                        error: 0.0,
+                        track: image_pair
+                            .into_iter()
+                            .map(|image| TrackObservation { image, feature: 0 })
+                            .collect(),
+                    },
+                )
+                .expect("point");
+        }
+        manager.clear_modified_point3d_ids();
+
+        assert!(manager.delete_point3d(&frames, &[], &mut reconstruction, 1));
+
+        assert_eq!(reconstruction.points.len(), 1);
+        assert_eq!(reconstruction.observations[0][0], Some(0));
+        assert_eq!(reconstruction.observations[1][0], Some(0));
+        assert_eq!(reconstruction.observations[2][0], None);
+        assert_eq!(reconstruction.observations[3][0], None);
+        let log = manager.sparse_maintenance_log();
+        assert!(log.contains("point_deletes=1"), "{log}");
+        assert!(log.contains("moved_points=0"), "{log}");
+        assert!(log.contains("rewritten_observations=2"), "{log}");
     }
 
     #[test]

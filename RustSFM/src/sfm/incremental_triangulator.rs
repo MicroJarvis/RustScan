@@ -12,6 +12,7 @@ use crate::types::{
 use nalgebra::{Matrix3x4, Vector2, Vector3};
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 const EXHAUSTIVE_TRIANGULATION_SAMPLING_THRESHOLD: usize = 15;
 const MIN_RECURSIVE_CREATE_TRACK_LENGTH: usize = 3;
@@ -148,6 +149,7 @@ impl IncrementalTriangulatorState {
         pairs: &[PairGeometry],
         reconstruction: &Reconstruction,
     ) {
+        self.observation_manager.clear_modified_point3d_ids();
         self.observation_manager
             .rebuild(frames, pairs, reconstruction);
         self.observation_manager
@@ -374,17 +376,31 @@ impl<'a> IncrementalTriangulator<'a> {
         self.state.observation_manager().modified_point3d_ids()
     }
 
+    pub fn take_modified_points3d(&mut self) -> HashSet<usize> {
+        self.state
+            .observation_manager_mut()
+            .take_modified_point3d_ids()
+    }
+
     pub fn complete_tracks(
         &mut self,
         options: &IncrementalTriangulatorOptions,
         point_ids: &HashSet<usize>,
     ) -> usize {
+        let started = Instant::now();
+        let frontier_points = point_ids.len();
         self.clear_triangulate_caches();
-        point_ids
+        let changed = point_ids
             .iter()
             .copied()
             .map(|point_id| self.complete_track(options, point_id))
-            .sum()
+            .sum();
+        self.state.observation_manager_mut().record_complete(
+            frontier_points,
+            changed,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        changed
     }
 
     pub fn complete_all_tracks(&mut self, options: &IncrementalTriangulatorOptions) -> usize {
@@ -397,13 +413,21 @@ impl<'a> IncrementalTriangulator<'a> {
         options: &IncrementalTriangulatorOptions,
         point_ids: &HashSet<usize>,
     ) -> usize {
+        let started = Instant::now();
+        let frontier_points = point_ids.len();
         self.clear_triangulate_caches();
         let mut point_ids = point_ids.iter().copied().collect::<Vec<_>>();
         point_ids.sort_unstable_by(|a, b| b.cmp(a));
-        point_ids
+        let changed = point_ids
             .into_iter()
             .map(|point_id| self.merge_track(options, point_id))
-            .sum()
+            .sum();
+        self.state.observation_manager_mut().record_merge(
+            frontier_points,
+            changed,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        changed
     }
 
     pub fn merge_all_tracks(&mut self, options: &IncrementalTriangulatorOptions) -> usize {
@@ -1409,6 +1433,31 @@ mod tests {
     }
 
     #[test]
+    fn complete_and_merge_record_frontier_work() {
+        let frames = vec![frame(0), frame(1)];
+        let pairs = vec![pair(0, 1, &[])];
+        let mut reconstruction = reconstruction(&frames);
+        let mut state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
+        let mut triangulator =
+            IncrementalTriangulator::new(&frames, &pairs, &mut reconstruction, &mut state);
+
+        triangulator.complete_tracks(&IncrementalTriangulatorOptions::default(), &HashSet::new());
+        triangulator.merge_tracks(&IncrementalTriangulatorOptions::default(), &HashSet::new());
+        triangulator
+            .state
+            .observation_manager_mut()
+            .mark_point3d_modified(7);
+        assert_eq!(triangulator.take_modified_points3d(), HashSet::from([7]));
+
+        let log = triangulator
+            .state
+            .observation_manager()
+            .sparse_maintenance_log();
+        assert!(log.contains("complete_calls=1"), "{log}");
+        assert!(log.contains("merge_calls=1"), "{log}");
+    }
+
+    #[test]
     fn complete_image_creates_track_for_untriangulated_two_view_cluster() {
         let mut frames = vec![frame(0), frame(1), frame(2)];
         frames[1].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
@@ -1985,6 +2034,10 @@ mod tests {
         reconstruction = rollback_reconstruction;
         tri_state.sync_after_reconstruction_rollback(&frames, &pairs, &reconstruction);
 
+        assert!(tri_state
+            .observation_manager()
+            .modified_point3d_ids()
+            .is_empty());
         assert_eq!(
             tri_state
                 .retriangulation_trials()
