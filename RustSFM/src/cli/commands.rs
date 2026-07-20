@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rustsfm::colmap::{read_colmap_sparse_files, write_colmap_sparse_model};
 use rustsfm::feature_matching::MatchingPairStrategy;
+use rustsfm::generalized_pose::generalized_pose_capabilities;
 use rustsfm::sift::SiftMatchingOptions;
 use rustsfm::{
     benchmark_sift_extraction, compare_colmap_stages, compare_database_parity,
@@ -21,6 +22,7 @@ fn run_reconstruct(args: ReconstructArgs) -> Result<()> {
     env_logger::Builder::new()
         .parse_filters(&args.log_level)
         .init();
+    println!("{}", generalized_pose_capabilities().format_log());
     let matching_pair_strategy = matching_pair_strategy_from_name(
         &args.matching_strategy,
         args.local_window,

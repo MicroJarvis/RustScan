@@ -6722,10 +6722,8 @@ fn solve_colmap_structureless_absolute_pose(
     ) {
         Ok(Some(estimate)) => estimate,
         Ok(None) => return None,
-        Err(GeneralizedPoseError::MissingGeneralizedRelativePoseSolver) => {
-            log::debug!(
-                "COLMAP structure-less registration skipped: GR6P/GR8P solver is not ported yet"
-            );
+        Err(err @ GeneralizedPoseError::MissingGeneralizedRelativePoseSolver) => {
+            log::debug!("COLMAP structure-less registration skipped: {err}");
             return None;
         }
         Err(err) => {

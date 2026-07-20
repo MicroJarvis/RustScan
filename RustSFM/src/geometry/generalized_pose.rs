@@ -247,6 +247,28 @@ pub struct GeneralizedRelativePoseEstimate {
     pub inlier_mask: Vec<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneralizedPoseCapabilities {
+    pub poselib: bool,
+    pub structureless_gr6p_gr8p: bool,
+}
+
+impl GeneralizedPoseCapabilities {
+    pub fn format_log(self) -> String {
+        format!(
+            "rustsfm_capabilities poselib={} structureless_gr6p_gr8p={}",
+            self.poselib, self.structureless_gr6p_gr8p
+        )
+    }
+}
+
+pub const fn generalized_pose_capabilities() -> GeneralizedPoseCapabilities {
+    GeneralizedPoseCapabilities {
+        poselib: cfg!(feature = "poselib"),
+        structureless_gr6p_gr8p: cfg!(feature = "poselib"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeneralizedPoseError {
     InvalidOptions(&'static str),
@@ -1581,6 +1603,24 @@ mod poselib_ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generalized_pose_capabilities_report_compile_time_solver_state() {
+        let capabilities = generalized_pose_capabilities();
+        assert_eq!(capabilities.poselib, cfg!(feature = "poselib"));
+        assert_eq!(
+            capabilities.structureless_gr6p_gr8p,
+            cfg!(feature = "poselib")
+        );
+        assert_eq!(
+            capabilities.format_log(),
+            format!(
+                "rustsfm_capabilities poselib={} structureless_gr6p_gr8p={}",
+                cfg!(feature = "poselib"),
+                cfg!(feature = "poselib")
+            )
+        );
+    }
 
     #[test]
     fn structureless_options_match_colmap_defaults() {

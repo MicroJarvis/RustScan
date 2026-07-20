@@ -104,7 +104,7 @@ git commit -m "build(rustsfm): enable PoseLib solvers by default"
 - Modify: `RustSFM/src/sfm/mapper.rs:6720-6735`
 - Test: `RustSFM/src/geometry/generalized_pose.rs`
 
-- [ ] **Step 1: Write the failing capability-format test**
+- [x] **Step 1: Write the failing capability-format test**
 
 Add this test to `generalized_pose.rs` before adding the production type:
 
@@ -128,7 +128,7 @@ fn generalized_pose_capabilities_report_compile_time_solver_state() {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -138,7 +138,7 @@ cargo test -p rustsfm generalized_pose_capabilities_report_compile_time_solver_s
 
 Expected: compilation fails because `generalized_pose_capabilities` and its return type do not exist.
 
-- [ ] **Step 3: Implement the compile-time capability value**
+- [x] **Step 3: Implement the compile-time capability value**
 
 Add above `GeneralizedPoseError`:
 
@@ -166,7 +166,7 @@ pub const fn generalized_pose_capabilities() -> GeneralizedPoseCapabilities {
 }
 ```
 
-- [ ] **Step 4: Print the capability once for both CLI mapper routes**
+- [x] **Step 4: Print the capability once for both CLI mapper routes**
 
 Import `rustsfm::generalized_pose::generalized_pose_capabilities` in `commands.rs`. Immediately after logger initialization in `run_reconstruct`, add:
 
@@ -176,7 +176,7 @@ println!("{}", generalized_pose_capabilities().format_log());
 
 `run_colmap_mapper` delegates to `run_reconstruct`, so both `reconstruct` and COLMAP-compatible `mapper` commands produce exactly one line.
 
-- [ ] **Step 5: Replace the inaccurate mapper diagnostic**
+- [x] **Step 5: Replace the inaccurate mapper diagnostic**
 
 Change the missing-solver arm in `solve_colmap_structureless_absolute_pose` to:
 
@@ -190,7 +190,7 @@ Err(err @ GeneralizedPoseError::MissingGeneralizedRelativePoseSolver) => {
 The existing `Display` message names `--features poselib`. No source string may contain
 `GR6P/GR8P solver is not ported yet` after this change.
 
-- [ ] **Step 6: Verify GREEN in enabled and disabled builds**
+- [x] **Step 6: Verify GREEN in enabled and disabled builds**
 
 Run:
 
@@ -202,7 +202,7 @@ cargo test -p rustsfm --no-default-features generalized_pose_capabilities_report
 
 Expected: both capability tests pass with their compile-time values and the obsolete diagnostic search returns no matches.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```bash
 git add RustSFM/src/geometry/generalized_pose.rs RustSFM/src/cli/commands.rs RustSFM/src/sfm/mapper.rs
