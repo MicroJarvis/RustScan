@@ -5,6 +5,7 @@ target/
 
 # Local development worktrees and Python caches
 .worktrees/
+.superpowers/
 __pycache__/
 *.py[cod]
 
