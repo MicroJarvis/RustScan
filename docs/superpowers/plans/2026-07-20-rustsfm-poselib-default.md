@@ -215,7 +215,7 @@ git commit -m "fix(rustsfm): expose generalized pose capabilities"
 - Modify: `RustSFM/src/sfm/mapper.rs:3206-3235,3560-3620,6632-6755`
 - Test: `RustSFM/src/sfm/mapper.rs:10870-10910`
 
-- [ ] **Step 1: Extend the telemetry test first**
+- [x] **Step 1: Extend the telemetry test first**
 
 Add fields to the existing test fixture only, before production code:
 
@@ -233,7 +233,7 @@ Require these stable keys:
 "structureless_solver_ms=6.25",
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -243,7 +243,7 @@ cargo test -p rustsfm incremental_registration_telemetry_reports_hot_path_stages
 
 Expected: compilation fails because the three telemetry fields do not exist.
 
-- [ ] **Step 3: Add fields and stable formatting**
+- [x] **Step 3: Add fields and stable formatting**
 
 Extend `IncrementalRegistrationTelemetry`:
 
@@ -259,7 +259,7 @@ Place the new keys immediately after `structureless_attempts` in `format_log`:
 structureless_attempts={} structureless_estimates={} structureless_accepted={} structureless_solver_ms={:.2}
 ```
 
-- [ ] **Step 4: Time and count solver estimates**
+- [x] **Step 4: Time and count solver estimates**
 
 Pass `&mut IncrementalRegistrationTelemetry` through `solve_structureless_absolute_pose` and `solve_colmap_structureless_absolute_pose`. Measure only the call to `estimate_structureless_absolute_pose`:
 
@@ -286,7 +286,7 @@ let estimate = match estimate_result {
 
 Update all production and test-only callers with the session telemetry value already in scope or a local default in test compatibility helpers.
 
-- [ ] **Step 5: Count accepted structureless choices after all gates**
+- [x] **Step 5: Count accepted structureless choices after all gates**
 
 In `registration_choice_for_image_with_pnp_scorer`, after pair-rotation validation and immediately before returning a structureless `RegistrationChoice`, add:
 
@@ -298,7 +298,7 @@ if mode == NextImageRegistrationMode::StructureLess {
 
 This counts only choices that passed solver inlier checks and mapper pair-rotation validation.
 
-- [ ] **Step 6: Verify GREEN and mapper integration**
+- [x] **Step 6: Verify GREEN and mapper integration**
 
 Run:
 
@@ -310,7 +310,7 @@ cargo test -p rustsfm --no-default-features default_structureless_path_uses_pair
 
 Expected: all tests pass; the default build uses PoseLib and the no-default build retains its fallback behavior.
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 ```bash
 git add RustSFM/src/sfm/mapper.rs

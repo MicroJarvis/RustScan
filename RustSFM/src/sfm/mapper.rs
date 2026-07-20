@@ -3208,6 +3208,9 @@ struct IncrementalRegistrationTelemetry {
     skipped_unchanged: usize,
     structure_based_attempts: usize,
     structureless_attempts: usize,
+    structureless_estimates: usize,
+    structureless_accepted: usize,
+    structureless_solver_ms: f64,
     fallback_epochs: usize,
     collect_observations_ms: f64,
     pose_solve_refine_ms: f64,
@@ -3218,11 +3221,14 @@ struct IncrementalRegistrationTelemetry {
 impl IncrementalRegistrationTelemetry {
     fn format_log(&self) -> String {
         format!(
-            "incremental_registration candidate_units={} skipped_unchanged={} structure_based_attempts={} structureless_attempts={} fallback_epochs={} collect_observations_ms={:.2} pose_solve_refine_ms={:.2} observation_update_ms={:.2} triangulation_ms={:.2}",
+            "incremental_registration candidate_units={} skipped_unchanged={} structure_based_attempts={} structureless_attempts={} structureless_estimates={} structureless_accepted={} structureless_solver_ms={:.2} fallback_epochs={} collect_observations_ms={:.2} pose_solve_refine_ms={:.2} observation_update_ms={:.2} triangulation_ms={:.2}",
             self.candidate_units,
             self.skipped_unchanged,
             self.structure_based_attempts,
             self.structureless_attempts,
+            self.structureless_estimates,
+            self.structureless_accepted,
+            self.structureless_solver_ms,
             self.fallback_epochs,
             self.collect_observations_ms,
             self.pose_solve_refine_ms,
@@ -3540,6 +3546,7 @@ fn registration_choice_for_image_with_pnp_scorer(
 ) -> Result<Option<RegistrationChoice>> {
     let registration_reconstruction =
         reconstruction_with_reset_frame_cameras(reconstruction, image, config, camera_priors);
+    let structureless_estimates_before = telemetry.structureless_estimates;
     let (abs_pose, source) = match mode {
         NextImageRegistrationMode::StructureBased => {
             if generalized_frame_registration_applicable(
@@ -3599,6 +3606,7 @@ fn registration_choice_for_image_with_pnp_scorer(
                 camera_priors,
                 registration_stats,
                 correspondence_graph,
+                telemetry,
             ) else {
                 return Ok(None);
             };
@@ -3609,6 +3617,11 @@ fn registration_choice_for_image_with_pnp_scorer(
         registered_pair_rotation_error(image, abs_pose.pose, pairs, reconstruction);
     if !pair_rot_error.is_finite() || pair_rot_error > absolute_pose_pair_rotation_limit_deg() {
         return Ok(None);
+    }
+    if mode == NextImageRegistrationMode::StructureLess
+        && telemetry.structureless_estimates > structureless_estimates_before
+    {
+        telemetry.structureless_accepted += 1;
     }
     let visible_points = obs_manager.num_visible_points3d(image);
     let num_observations = obs_manager.num_observations(image).max(1);
@@ -3795,6 +3808,7 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
                 camera_priors,
                 registration_stats,
                 obs_manager.correspondence_graph(),
+                &mut telemetry,
             )
         };
         let has_pose = pose
@@ -6639,6 +6653,7 @@ fn solve_structureless_absolute_pose(
     camera_priors: &[CameraModel],
     registration_stats: &RegistrationStats,
     graph: Option<&CorrespondenceGraph>,
+    telemetry: &mut IncrementalRegistrationTelemetry,
 ) -> Option<AbsolutePose> {
     if config.experimental_structureless_pair_pose_fallback {
         if let Some(abs_pose) = solve_experimental_structureless_pair_pose_fallback(
@@ -6664,6 +6679,7 @@ fn solve_structureless_absolute_pose(
         camera_priors,
         registration_stats,
         graph,
+        telemetry,
     )
 }
 
@@ -6677,6 +6693,7 @@ fn solve_colmap_structureless_absolute_pose(
     camera_priors: &[CameraModel],
     registration_stats: &RegistrationStats,
     graph: Option<&CorrespondenceGraph>,
+    telemetry: &mut IncrementalRegistrationTelemetry,
 ) -> Option<AbsolutePose> {
     if registered_image_count(reconstruction) < 2 {
         return None;
@@ -6709,7 +6726,8 @@ fn solve_colmap_structureless_absolute_pose(
     options.ransac_options.num_threads =
         config.threads.map(|threads| threads as isize).unwrap_or(1);
 
-    let estimate = match estimate_structureless_absolute_pose(
+    let solve_started = Instant::now();
+    let estimate_result = estimate_structureless_absolute_pose(
         &options,
         StructureLessAbsolutePoseProblem {
             query_points2d: &problem.query_points2d,
@@ -6719,8 +6737,13 @@ fn solve_colmap_structureless_absolute_pose(
             world_cameras: &problem.world_cameras,
             query_camera: camera,
         },
-    ) {
-        Ok(Some(estimate)) => estimate,
+    );
+    telemetry.structureless_solver_ms += solve_started.elapsed().as_secs_f64() * 1_000.0;
+    let estimate = match estimate_result {
+        Ok(Some(estimate)) => {
+            telemetry.structureless_estimates += 1;
+            estimate
+        }
         Ok(None) => return None,
         Err(err @ GeneralizedPoseError::MissingGeneralizedRelativePoseSolver) => {
             log::debug!("COLMAP structure-less registration skipped: {err}");
@@ -10874,6 +10897,9 @@ mod tests {
             skipped_unchanged: 3,
             structure_based_attempts: 4,
             structureless_attempts: 2,
+            structureless_estimates: 2,
+            structureless_accepted: 1,
+            structureless_solver_ms: 6.25,
             fallback_epochs: 1,
             collect_observations_ms: 1.25,
             pose_solve_refine_ms: 2.5,
@@ -10888,6 +10914,9 @@ mod tests {
             "skipped_unchanged=3",
             "structure_based_attempts=4",
             "structureless_attempts=2",
+            "structureless_estimates=2",
+            "structureless_accepted=1",
+            "structureless_solver_ms=6.25",
             "fallback_epochs=1",
             "collect_observations_ms=1.25",
             "pose_solve_refine_ms=2.50",
