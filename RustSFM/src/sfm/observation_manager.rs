@@ -83,6 +83,24 @@ impl Point3DIdAllocator {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Point3DIndexRemap {
+    removed: usize,
+    moved_from: Option<usize>,
+}
+
+impl Point3DIndexRemap {
+    fn remap_existing(self, point_id: usize) -> Option<usize> {
+        if point_id == self.removed {
+            None
+        } else if self.moved_from == Some(point_id) {
+            Some(self.removed)
+        } else {
+            Some(point_id)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ObservationManager {
     image_stats: Vec<ImageStat>,
@@ -493,10 +511,16 @@ impl ObservationManager {
                     true,
                 );
             }
-            if !self.delete_point3d_internal(reconstruction, point_id) {
+            if self
+                .delete_point3d_internal(reconstruction, point_id)
+                .is_none()
+            {
                 return false;
             }
-        } else if !self.delete_point3d_internal(reconstruction, point_id) {
+        } else if self
+            .delete_point3d_internal(reconstruction, point_id)
+            .is_none()
+        {
             return false;
         } else {
             self.rebuild(frames, pairs, reconstruction);
@@ -625,9 +649,7 @@ impl ObservationManager {
         for obs in &reconstruction.points[keep_id].track {
             reconstruction.observations[obs.image][obs.feature] = Some(keep_id);
         }
-        if !self.delete_point3d_internal(reconstruction, remove_id) {
-            return None;
-        }
+        self.delete_point3d_internal(reconstruction, remove_id)?;
         self.mark_point3d_modified(keep_id);
 
         if let Some(graph) = self.correspondence_graph.clone() {
@@ -818,47 +840,42 @@ impl ObservationManager {
         &mut self,
         reconstruction: &mut Reconstruction,
         point_id: usize,
-    ) -> bool {
-        if point_id >= reconstruction.points.len() {
-            return false;
+    ) -> Option<Point3DIndexRemap> {
+        if point_id >= reconstruction.points.len()
+            || !repair_point_id_table(reconstruction, &mut self.point3d_id_allocator)
+        {
+            return None;
         }
 
-        if !repair_point_id_table(reconstruction, &mut self.point3d_id_allocator) {
-            return false;
+        let last_point_id = reconstruction.points.len() - 1;
+        let remap = Point3DIndexRemap {
+            removed: point_id,
+            moved_from: (point_id != last_point_id).then_some(last_point_id),
+        };
+        let removed_point = reconstruction.points.swap_remove(point_id);
+        reconstruction.point_ids.swap_remove(point_id);
+
+        for obs in removed_point.track {
+            let slot = &mut reconstruction.observations[obs.image][obs.feature];
+            if *slot == Some(point_id) {
+                *slot = None;
+            }
         }
-        reconstruction.points.remove(point_id);
-        if point_id < reconstruction.point_ids.len() {
-            reconstruction.point_ids.remove(point_id);
-        }
-        for observations in &mut reconstruction.observations {
-            for observation in observations {
-                if let Some(id) = *observation {
-                    if id == point_id {
-                        *observation = None;
-                    } else if id > point_id {
-                        *observation = Some(id - 1);
-                    }
+        if let Some(moved_from) = remap.moved_from {
+            for obs in &reconstruction.points[point_id].track {
+                let slot = &mut reconstruction.observations[obs.image][obs.feature];
+                if *slot == Some(moved_from) {
+                    *slot = Some(point_id);
                 }
             }
         }
-        self.shift_modified_point_ids_after_delete(point_id);
-        true
-    }
 
-    fn shift_modified_point_ids_after_delete(&mut self, point_id: usize) {
         self.modified_point3d_ids = self
             .modified_point3d_ids
             .iter()
-            .filter_map(|&id| {
-                if id == point_id {
-                    None
-                } else if id > point_id {
-                    Some(id - 1)
-                } else {
-                    Some(id)
-                }
-            })
+            .filter_map(|&id| remap.remap_existing(id))
             .collect();
+        Some(remap)
     }
 }
 
@@ -1002,6 +1019,50 @@ mod tests {
         let second = first.clone();
 
         assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn delete_middle_point_swap_removes_tail_and_remaps_tracks() {
+        let frames = (0..8).map(|id| frame(id, 100, 100)).collect::<Vec<_>>();
+        let mut reconstruction = reconstruction(&frames);
+        reconstruction.poses.fill(Some(SE3::identity()));
+        for point_id in 0..4 {
+            let track = vec![
+                TrackObservation {
+                    image: point_id * 2,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: point_id * 2 + 1,
+                    feature: 0,
+                },
+            ];
+            for obs in &track {
+                reconstruction.observations[obs.image][obs.feature] = Some(point_id);
+            }
+            reconstruction.point_ids.push(100 + point_id as u64);
+            reconstruction.points.push(Point3D {
+                xyz: [point_id as f32, 0.0, 2.0],
+                color: [point_id as u8, 0, 0],
+                error: 0.0,
+                track,
+            });
+        }
+        let mut manager = ObservationManager::new(&frames, &[], &reconstruction);
+        manager.mark_point3d_modified(3);
+
+        assert!(manager.delete_point3d(&frames, &[], &mut reconstruction, 1));
+
+        assert_eq!(reconstruction.point_ids, vec![100, 103, 102]);
+        assert_eq!(reconstruction.points[1].color, [3, 0, 0]);
+        assert_eq!(reconstruction.points[2].color, [2, 0, 0]);
+        assert_eq!(reconstruction.observations[2][0], None);
+        assert_eq!(reconstruction.observations[3][0], None);
+        assert_eq!(reconstruction.observations[6][0], Some(1));
+        assert_eq!(reconstruction.observations[7][0], Some(1));
+        assert_eq!(reconstruction.observations[4][0], Some(2));
+        assert_eq!(reconstruction.observations[5][0], Some(2));
+        assert_eq!(manager.modified_point3d_ids(), &HashSet::from([1]));
     }
 
     #[test]
