@@ -3620,7 +3620,9 @@ fn registration_choice_for_image_with_pnp_scorer(
     };
     let pair_rot_error =
         registered_pair_rotation_error(image, abs_pose.pose, pairs, reconstruction);
-    if !pair_rot_error.is_finite() || pair_rot_error > absolute_pose_pair_rotation_limit_deg() {
+    if mode == NextImageRegistrationMode::StructureLess
+        && (!pair_rot_error.is_finite() || pair_rot_error > absolute_pose_pair_rotation_limit_deg())
+    {
         return Ok(None);
     }
     if mode == NextImageRegistrationMode::StructureLess
@@ -13717,6 +13719,84 @@ mod tests {
             good_camera.fy
         );
         assert!(crate::geometry::relative_rotation_deg(choice.pose, candidate_pose) < 5.0);
+    }
+
+    #[test]
+    fn high_quality_pnp_is_not_rejected_by_pair_rotation_diagnostic() {
+        let mut frames = vec![
+            minimal_frame(0, "provider.jpg"),
+            minimal_frame(1, "candidate.jpg"),
+        ];
+        let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let provider_pose = SE3::identity();
+        let candidate_pose = SE3::from_quat_translation(
+            glam::Quat::from_rotation_y(0.06),
+            glam::Vec3::new(-0.2, 0.03, 0.02),
+        );
+        let points = (0..32)
+            .map(|idx| {
+                let col = (idx % 8) as f32;
+                let row = (idx / 8) as f32;
+                [-0.5 + col * 0.15, -0.3 + row * 0.2, 3.0 + idx as f32 * 0.02]
+            })
+            .collect::<Vec<_>>();
+        frames[0].keypoints = points
+            .iter()
+            .map(|&point| project_test_point(camera, provider_pose, point))
+            .collect();
+        frames[1].keypoints = points
+            .iter()
+            .map(|&point| project_test_point(camera, candidate_pose, point))
+            .collect();
+
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![camera];
+        reconstruction.camera_ids = vec![1];
+        reconstruction.image_camera_indices = vec![0, 0];
+        reconstruction.poses[0] = Some(provider_pose);
+        for (idx, &xyz) in points.iter().enumerate() {
+            reconstruction.observations[0][idx] = Some(idx);
+            reconstruction.points.push(Point3D {
+                xyz,
+                color: [0, 0, 0],
+                error: 0.0,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: idx,
+                }],
+            });
+            reconstruction.point_ids.push(idx as u64 + 1);
+        }
+        let matches = (0..points.len() as u32)
+            .map(|idx| (idx, idx))
+            .collect::<Vec<_>>();
+        let mut pair = pair_with_inliers(0, 1, &matches);
+        pair.relative_pose =
+            SE3::from_quat_translation(glam::Quat::from_rotation_y(0.8), glam::Vec3::X);
+        let config = MapperConfig {
+            abs_pose_min_num_inliers: 24,
+            random_seed: 0,
+            ..MapperConfig::default()
+        };
+
+        let choice = choose_next_registration(
+            &frames,
+            &[pair],
+            &reconstruction,
+            &[0; 2],
+            &[0; 2],
+            &HashSet::new(),
+            &config,
+            &camera_priors(&reconstruction),
+            &[true],
+            &registration_stats(&reconstruction),
+        )
+        .expect("COLMAP accepts a refined absolute pose independently of pair rotation metadata");
+
+        assert_eq!(choice.source, "pnp");
+        assert!(choice.inlier_ratio > 0.9);
+        assert!(choice.mean_error_px < 1.0);
+        assert!(choice.pair_rot_error > absolute_pose_pair_rotation_limit_deg());
     }
 
     #[cfg(feature = "poselib")]
