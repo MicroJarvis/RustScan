@@ -173,7 +173,12 @@ impl IncrementalTriangulatorState {
         &self.retriangulation_trials
     }
 
-    fn sync_merge_trials_after_point_merge(&mut self, keep_id: usize, remove_id: usize) {
+    fn sync_merge_trials_after_point_merge(
+        &mut self,
+        keep_id: usize,
+        remove_id: usize,
+        moved_from: Option<usize>,
+    ) {
         self.merge_trials = self
             .merge_trials
             .iter()
@@ -181,10 +186,16 @@ impl IncrementalTriangulatorState {
                 if left == keep_id || right == keep_id || left == remove_id || right == remove_id {
                     return None;
                 }
-                let shifted_left = if left > remove_id { left - 1 } else { left };
-                let shifted_right = if right > remove_id { right - 1 } else { right };
-                (shifted_left != shifted_right)
-                    .then_some(ordered_point_pair(shifted_left, shifted_right))
+                let remap = |point_id| {
+                    if moved_from == Some(point_id) {
+                        remove_id
+                    } else {
+                        point_id
+                    }
+                };
+                let left = remap(left);
+                let right = remap(right);
+                (left != right).then_some(ordered_point_pair(left, right))
             })
             .collect();
     }
@@ -955,6 +966,8 @@ impl<'a> IncrementalTriangulator<'a> {
             self.reconstruction,
         )
         .unwrap_or(0.0);
+        let last_point_id = self.reconstruction.points.len() - 1;
+        let moved_from = (remove_id != last_point_id).then_some(last_point_id);
         let merged = self
             .state
             .observation_manager_mut()
@@ -974,7 +987,7 @@ impl<'a> IncrementalTriangulator<'a> {
             .is_some();
         if merged {
             self.state
-                .sync_merge_trials_after_point_merge(keep_id, remove_id);
+                .sync_merge_trials_after_point_merge(keep_id, remove_id, moved_from);
         }
         merged
     }
@@ -1506,6 +1519,18 @@ mod tests {
         assert_eq!(triangulator.reconstruction.observations[0][0], Some(0));
         assert_eq!(triangulator.reconstruction.observations[1][0], Some(0));
         assert_eq!(triangulator.get_modified_points3d(), &HashSet::from([0]));
+    }
+
+    #[test]
+    fn merge_trial_cache_remaps_only_the_swapped_tail_point() {
+        let frames = vec![frame(0), frame(1)];
+        let reconstruction = reconstruction(&frames);
+        let mut state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+        state.merge_trials = HashSet::from([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
+
+        state.sync_merge_trials_after_point_merge(0, 2, Some(5));
+
+        assert_eq!(state.merge_trials, HashSet::from([(2, 4), (3, 4)]));
     }
 
     #[test]
