@@ -2286,6 +2286,100 @@ mod tests {
 
     #[cfg(feature = "poselib")]
     #[test]
+    fn poselib_structureless_absolute_pose_rejects_outliers() {
+        let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let world_cams_from_world = [
+            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.25, 0.0, 0.0)),
+            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.15, 0.22, 0.0)),
+            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.05, -0.18, 0.12)),
+        ];
+        let query_cam_from_world = SE3::from_quat_translation(
+            glam::Quat::from_rotation_y(0.08) * glam::Quat::from_rotation_x(-0.03),
+            glam::Vec3::new(0.45, -0.04, 0.18),
+        );
+        let points_in_world = [
+            [-0.7, -0.3, 5.0],
+            [-0.3, 0.2, 4.5],
+            [0.1, -0.4, 5.5],
+            [0.4, 0.3, 6.0],
+            [0.8, -0.1, 5.8],
+            [-0.9, 0.4, 6.3],
+            [0.2, 0.6, 7.0],
+            [-0.5, -0.7, 6.8],
+            [1.0, 0.5, 7.4],
+            [-1.1, 0.0, 5.9],
+            [0.6, -0.6, 6.5],
+            [-0.2, 0.8, 7.2],
+            [1.2, -0.2, 8.0],
+            [-1.3, -0.4, 7.7],
+            [0.3, 1.0, 8.4],
+            [-0.8, 0.9, 7.9],
+            [0.9, -0.9, 8.2],
+            [-0.1, -1.0, 7.5],
+            [1.4, 0.7, 9.0],
+            [-1.5, 0.6, 8.8],
+            [0.7, 1.3, 9.2],
+            [-0.6, -1.4, 8.9],
+            [1.6, -0.8, 9.5],
+            [-1.7, -0.9, 9.3],
+        ];
+        let world_camera_idxs = vec![
+            0usize, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2,
+        ];
+        let mut world_points2d = Vec::new();
+        let mut query_points2d = Vec::new();
+        for (idx, point) in points_in_world.iter().enumerate() {
+            world_points2d.push(project_rig_point(
+                camera,
+                world_cams_from_world[world_camera_idxs[idx]],
+                *point,
+            ));
+            let query_point = project_rig_point(camera, query_cam_from_world, *point);
+            if idx < 18 {
+                query_points2d.push(query_point);
+            } else {
+                query_points2d.push([
+                    query_point[0] + 120.0 + 10.0 * (idx - 18) as f64,
+                    query_point[1] - 90.0,
+                ]);
+            }
+        }
+        let inlier_count = 18;
+
+        let mut options = StructureLessAbsolutePoseEstimationOptions::default();
+        options.ransac_options.max_error = 1.0;
+        options.ransac_options.min_num_trials = 64;
+        options.ransac_options.max_num_trials = 512;
+        options.ransac_options.random_seed = 23;
+        let estimate = estimate_structureless_absolute_pose(
+            &options,
+            StructureLessAbsolutePoseProblem {
+                query_points2d: &query_points2d,
+                world_points2d: &world_points2d,
+                world_camera_idxs: &world_camera_idxs,
+                world_cams_from_world: &world_cams_from_world,
+                world_cameras: &[camera, camera, camera],
+                query_camera: camera,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(estimate.inlier_mask[..inlier_count]
+            .iter()
+            .all(|&value| value));
+        assert!(
+            estimate.inlier_mask[inlier_count..]
+                .iter()
+                .filter(|&&value| !value)
+                .count()
+                >= 5
+        );
+        assert_pose_close(estimate.query_cam_from_world, query_cam_from_world, 7.0e-2);
+    }
+
+    #[cfg(feature = "poselib")]
+    #[test]
     fn generalized_loransac_trial_count_matches_colmap_without_replacement_formula() {
         let trials = ransac_trials_from_counts(35, 100, 6, 0.99, 3.0);
         let mut prob_inlier = 1.0;

@@ -152,12 +152,12 @@ The official COLMAP source tree is organized roughly as follows:
   loading, sparse model codecs, two-view geometry metadata, generalized pose
   bridges, registration scheduling, triangulation, observation bookkeeping, and
   BA orchestration all have partial implementations.
-- The PoseLib solver bridge now builds. PoseLib v2.0.5 is vendored under
-  `third_party/PoseLib` and `build.rs` resolves it automatically, so the
-  `--features poselib` GR6P/GR8P/GP3P paths are test-verified (414 tests).
-  PoseLib remains an optional feature (not in default build), but when enabled
-  COLMAP structureless registration is active via `cfg!(feature = "poselib")`
-  without requiring the experimental pair-pose fallback flag.
+- The PoseLib solver bridge now builds by default. PoseLib v2.0.5 is pinned as
+  the `third_party/PoseLib` submodule and `build.rs` resolves it automatically,
+  so the GR6P/GR8P/GP3P paths and COLMAP structureless registration are active
+  without requiring the experimental pair-pose fallback flag. The
+  `--no-default-features` matrix continues to verify the intentional
+  dependency-minimal missing-solver path.
 - The highest-confidence completed areas are file/database compatibility
   boundaries, not numerical reconstruction behavior. Mapper, solver, and BA
   percentages should stay conservative until they are backed by COLMAP parity

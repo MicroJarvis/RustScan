@@ -21,16 +21,24 @@ The local-matching fallback can also create a full COLMAP-style SQLite database
 (cameras, images, keypoints, descriptors, matches, two-view geometries) with
 `--local-matching --write-database [--database path/to/database.db]`.
 Generalized rig relative/absolute pose now follows COLMAP's panoramic-rig
-branches and can optionally use PoseLib's GR6P/GP3P minimal solvers plus a
-COLMAP-derived GR8P local refit bridge for non-panoramic rigs, with
+branches and uses PoseLib's GR6P/GP3P minimal solvers plus a COLMAP-derived
+GR8P local refit bridge for non-panoramic rigs in default builds, with
 BA-backed pose-only generalized absolute-pose refinement for rig frames and
 COLMAP-style fallback to central PnP when a rig camera still needs focal-length
-estimation, by building with `--features poselib`. PoseLib v2.0.5 is fetched
-automatically from `third_party/PoseLib` when present, or via:
+estimation. PoseLib v2.0.5 is pinned as the `third_party/PoseLib` submodule.
+Initialize dependencies and run the default solver tests with:
 
 ```bash
-./scripts/setup_rustsfm_deps.sh
-cargo test -p rustsfm --features poselib --lib
+git submodule update --init --recursive
+cargo test -p rustsfm --lib
+```
+
+Existing clones can also run `./scripts/setup_rustsfm_deps.sh` to bootstrap
+RustSFM's native dependencies. The intentional dependency-minimal build keeps
+the explicit missing-solver fallback available:
+
+```bash
+cargo test -p rustsfm --lib --no-default-features
 ```
 Incremental registration is absolute-pose driven with COLMAP-style next-image
 ranking methods, registration trial bookkeeping, inlier-ratio checks, and
