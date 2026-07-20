@@ -8678,6 +8678,19 @@ fn rebuild_tracks_from_pair_graph(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct TrackFilterReport {
+    removed_observations: usize,
+    examined_points: usize,
+    examined_observations: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrackFilterScope<'a> {
+    Full,
+    Subset(&'a HashSet<usize>),
+}
+
 fn filter_reprojection_tracks(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
@@ -8718,6 +8731,27 @@ fn filter_reprojection_tracks_with_state(
     )
 }
 
+fn filter_reprojection_tracks_subset_with_state(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+    triangulation_state: &mut IncrementalTriangulatorState,
+    point_ids: &HashSet<usize>,
+) -> usize {
+    filter_reprojection_tracks_with_policy_in_scope(
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        Some(triangulation_state.observation_manager_mut()),
+        TrackFilterScope::Subset(point_ids),
+        track_filter_max_error_px(config),
+        track_filter_min_tri_angle_deg(config),
+        track_filter_min_track_length(),
+    )
+}
+
 fn filter_reprojection_tracks_with_policy(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
@@ -8728,10 +8762,34 @@ fn filter_reprojection_tracks_with_policy(
     min_tri_angle: f32,
     min_track_length: usize,
 ) -> usize {
+    filter_reprojection_tracks_with_policy_in_scope(
+        frames,
+        pairs,
+        reconstruction,
+        config,
+        observation_manager,
+        TrackFilterScope::Full,
+        max_error,
+        min_tri_angle,
+        min_track_length,
+    )
+}
+
+fn filter_reprojection_tracks_with_policy_in_scope(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+    observation_manager: Option<&mut ObservationManager>,
+    scope: TrackFilterScope<'_>,
+    max_error: f32,
+    min_tri_angle: f32,
+    min_track_length: usize,
+) -> usize {
+    let started = Instant::now();
     let image_cameras = (0..reconstruction.poses.len())
         .map(|image| reconstruction.camera_for_image(image))
         .collect::<Vec<_>>();
-    let mut removed = 0usize;
     let mut temporary_manager;
     let observation_manager = if let Some(observation_manager) = observation_manager {
         observation_manager
@@ -8739,94 +8797,167 @@ fn filter_reprojection_tracks_with_policy(
         temporary_manager = ObservationManager::new(frames, pairs, reconstruction);
         &mut temporary_manager
     };
-    let mut point_id = 0usize;
-    while point_id < reconstruction.points.len() {
-        let point_xyz = reconstruction.points[point_id].xyz;
-        let track = reconstruction.points[point_id].track.clone();
-        let observations_to_delete = track
-            .iter()
-            .filter(|obs| {
-                let Some(pose) = reconstruction.poses.get(obs.image).copied().flatten() else {
-                    return true;
-                };
-                let Some(kp) = frames
-                    .get(obs.image)
-                    .and_then(|frame| frame.keypoints.get(obs.feature))
-                else {
-                    return true;
-                };
-                if !point_has_positive_depth(point_xyz, pose) {
-                    return true;
-                }
-                let Some(camera) = image_cameras.get(obs.image).copied() else {
-                    return true;
-                };
-                if camera_has_bogus_params(camera, config) {
-                    return true;
-                }
-                let err = crate::geometry::reprojection_error_px(
-                    point_xyz,
-                    pose,
-                    [kp.x(), kp.y()],
-                    camera,
+    let mut report = TrackFilterReport::default();
+    match scope {
+        TrackFilterScope::Full => {
+            let mut point_id = 0usize;
+            while point_id < reconstruction.points.len() {
+                let (removed, examined, deleted) = filter_reprojection_point(
+                    frames,
+                    pairs,
+                    reconstruction,
+                    config,
+                    observation_manager,
+                    &image_cameras,
+                    point_id,
+                    max_error,
+                    min_tri_angle,
+                    min_track_length,
                 );
-                !err.is_finite() || err > max_error
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if observations_to_delete.len() >= track.len().saturating_sub(1) {
-            removed += reconstruction.points[point_id].track.len();
-            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
-            continue;
-        }
-
-        for obs in observations_to_delete {
-            if observation_manager.delete_observation(
-                frames,
-                pairs,
-                reconstruction,
-                obs.image,
-                obs.feature,
-            ) {
-                removed += 1;
+                report.removed_observations += removed;
+                report.examined_points += 1;
+                report.examined_observations += examined;
+                if !deleted {
+                    point_id += 1;
+                }
             }
         }
-
-        if point_id >= reconstruction.points.len() {
-            continue;
+        TrackFilterScope::Subset(point_ids) => {
+            let mut point_ids = point_ids
+                .iter()
+                .copied()
+                .filter(|&point_id| point_id < reconstruction.points.len())
+                .collect::<Vec<_>>();
+            point_ids.sort_unstable_by(|left, right| right.cmp(left));
+            for point_id in point_ids {
+                if point_id >= reconstruction.points.len() {
+                    continue;
+                }
+                let (removed, examined, _) = filter_reprojection_point(
+                    frames,
+                    pairs,
+                    reconstruction,
+                    config,
+                    observation_manager,
+                    &image_cameras,
+                    point_id,
+                    max_error,
+                    min_tri_angle,
+                    min_track_length,
+                );
+                report.removed_observations += removed;
+                report.examined_points += 1;
+                report.examined_observations += examined;
+            }
         }
-        let track = reconstruction.points[point_id].track.clone();
-        if track.len() < min_track_length {
-            removed += track.len();
-            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
-            continue;
-        }
-        if !track_has_min_triangulation_angle(
-            reconstruction.points[point_id].xyz,
-            &track,
-            reconstruction,
-            min_tri_angle,
-        ) {
-            removed += track.len();
-            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
-            continue;
-        }
-        if let Some(error) = mean_track_reprojection_error(
-            reconstruction.points[point_id].xyz,
-            &track,
-            frames,
-            reconstruction,
-        ) {
-            reconstruction.points[point_id].error = error;
-        } else {
-            removed += track.len();
-            observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
-            continue;
-        }
-        point_id += 1;
     }
-    removed
+    observation_manager.record_filter(
+        matches!(scope, TrackFilterScope::Subset(_)),
+        report.examined_points,
+        report.examined_observations,
+        report.removed_observations,
+        started.elapsed().as_secs_f64() * 1_000.0,
+    );
+    report.removed_observations
+}
+
+fn filter_reprojection_point(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+    observation_manager: &mut ObservationManager,
+    image_cameras: &[CameraModel],
+    point_id: usize,
+    max_error: f32,
+    min_tri_angle: f32,
+    min_track_length: usize,
+) -> (usize, usize, bool) {
+    if point_id >= reconstruction.points.len() {
+        return (0, 0, false);
+    }
+    let point_xyz = reconstruction.points[point_id].xyz;
+    let track = reconstruction.points[point_id].track.clone();
+    let examined = track.len();
+    let observations_to_delete = track
+        .iter()
+        .filter(|obs| {
+            let Some(pose) = reconstruction.poses.get(obs.image).copied().flatten() else {
+                return true;
+            };
+            let Some(kp) = frames
+                .get(obs.image)
+                .and_then(|frame| frame.keypoints.get(obs.feature))
+            else {
+                return true;
+            };
+            if !point_has_positive_depth(point_xyz, pose) {
+                return true;
+            }
+            let Some(camera) = image_cameras.get(obs.image).copied() else {
+                return true;
+            };
+            if camera_has_bogus_params(camera, config) {
+                return true;
+            }
+            let err =
+                crate::geometry::reprojection_error_px(point_xyz, pose, [kp.x(), kp.y()], camera);
+            !err.is_finite() || err > max_error
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if observations_to_delete.len() >= track.len().saturating_sub(1) {
+        let removed = track.len();
+        let deleted = observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+        return (removed, examined, deleted);
+    }
+
+    let mut removed = 0usize;
+    for obs in observations_to_delete {
+        if observation_manager.delete_observation(
+            frames,
+            pairs,
+            reconstruction,
+            obs.image,
+            obs.feature,
+        ) {
+            removed += 1;
+        }
+    }
+
+    if point_id >= reconstruction.points.len() {
+        return (removed, examined, true);
+    }
+    let track = reconstruction.points[point_id].track.clone();
+    if track.len() < min_track_length {
+        removed += track.len();
+        let deleted = observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+        return (removed, examined, deleted);
+    }
+    if !track_has_min_triangulation_angle(
+        reconstruction.points[point_id].xyz,
+        &track,
+        reconstruction,
+        min_tri_angle,
+    ) {
+        removed += track.len();
+        let deleted = observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+        return (removed, examined, deleted);
+    }
+    if let Some(error) = mean_track_reprojection_error(
+        reconstruction.points[point_id].xyz,
+        &track,
+        frames,
+        reconstruction,
+    ) {
+        reconstruction.points[point_id].error = error;
+        (removed, examined, false)
+    } else {
+        removed += track.len();
+        let deleted = observation_manager.delete_point3d(frames, pairs, reconstruction, point_id);
+        (removed, examined, deleted)
+    }
 }
 
 fn track_filter_max_error_px(config: &MapperConfig) -> f32 {
@@ -18926,6 +19057,96 @@ mod tests {
 
         assert_eq!(removed, 2);
         assert!(reconstruction.points.is_empty());
+    }
+
+    #[test]
+    fn subset_track_filter_leaves_unselected_invalid_points_for_full_boundary() {
+        let mut frames = (0..6)
+            .map(|id| minimal_frame(id, &format!("{id}.jpg")))
+            .collect::<Vec<_>>();
+        for frame in &mut frames {
+            frame.keypoints[0] = rustslam::KeyPoint::new(50.0, 50.0);
+        }
+        frames[5].keypoints[0] = rustslam::KeyPoint::new(75.0, 50.0);
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses.fill(Some(SE3::identity()));
+        reconstruction.poses[5] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        let tracks = [
+            vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+            vec![
+                TrackObservation {
+                    image: 2,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 3,
+                    feature: 0,
+                },
+            ],
+            vec![
+                TrackObservation {
+                    image: 4,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 5,
+                    feature: 0,
+                },
+            ],
+        ];
+        add_test_point3d(&mut reconstruction, 11, tracks[0].clone());
+        add_test_point3d(&mut reconstruction, 22, tracks[1].clone());
+        add_test_point3d(&mut reconstruction, 33, tracks[2].clone());
+        reconstruction.points[0].xyz = [0.0, 0.0, -1.0];
+        reconstruction.points[1].xyz = [0.0, 0.0, -1.0];
+        reconstruction.points[2].xyz = [0.0, 0.0, 2.0];
+        let mut state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+
+        let removed = filter_reprojection_tracks_subset_with_state(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut state,
+            &HashSet::from([0]),
+        );
+
+        assert_eq!(removed, 2);
+        assert_eq!(reconstruction.point_ids, vec![33, 22]);
+        assert!(reconstruction.points[1].xyz[2] < 0.0);
+        assert_eq!(
+            filter_reprojection_tracks_with_state(
+                &frames,
+                &[],
+                &mut reconstruction,
+                &MapperConfig::default(),
+                &mut state,
+            ),
+            2
+        );
+        assert_eq!(reconstruction.point_ids, vec![33]);
+        let log = state.observation_manager().sparse_maintenance_log();
+        for expected in [
+            "full_filter_calls=1",
+            "subset_filter_calls=1",
+            "filter_points=3",
+            "filter_observations=6",
+            "filtered_observations=4",
+        ] {
+            assert!(log.contains(expected), "missing {expected}: {log}");
+        }
     }
 
     #[test]

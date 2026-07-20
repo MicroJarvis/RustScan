@@ -112,6 +112,12 @@ pub struct SparseMaintenanceTelemetry {
     merge_frontier_points: usize,
     merged_observations: usize,
     merge_ms: f64,
+    full_filter_calls: usize,
+    subset_filter_calls: usize,
+    filter_points: usize,
+    filter_observations: usize,
+    filtered_observations: usize,
+    filter_ms: f64,
     point_deletes: usize,
     moved_points: usize,
     rewritten_observations: usize,
@@ -835,10 +841,29 @@ impl ObservationManager {
         self.maintenance.merge_ms += elapsed_ms;
     }
 
+    pub fn record_filter(
+        &mut self,
+        is_subset: bool,
+        points: usize,
+        observations: usize,
+        removed: usize,
+        elapsed_ms: f64,
+    ) {
+        if is_subset {
+            self.maintenance.subset_filter_calls += 1;
+        } else {
+            self.maintenance.full_filter_calls += 1;
+        }
+        self.maintenance.filter_points += points;
+        self.maintenance.filter_observations += observations;
+        self.maintenance.filtered_observations += removed;
+        self.maintenance.filter_ms += elapsed_ms;
+    }
+
     pub fn sparse_maintenance_log(&self) -> String {
         let maintenance = &self.maintenance;
         format!(
-            "sparse_maintenance complete_calls={} complete_frontier_points={} completed_observations={} complete_ms={:.2} merge_calls={} merge_frontier_points={} merged_observations={} merge_ms={:.2} point_deletes={} moved_points={} rewritten_observations={} delete_ms={:.2} frontier_peak={} frontier_cycles={} frontier_points_consumed={}",
+            "sparse_maintenance complete_calls={} complete_frontier_points={} completed_observations={} complete_ms={:.2} merge_calls={} merge_frontier_points={} merged_observations={} merge_ms={:.2} full_filter_calls={} subset_filter_calls={} filter_points={} filter_observations={} filtered_observations={} filter_ms={:.2} point_deletes={} moved_points={} rewritten_observations={} delete_ms={:.2} frontier_peak={} frontier_cycles={} frontier_points_consumed={}",
             maintenance.complete_calls,
             maintenance.complete_frontier_points,
             maintenance.completed_observations,
@@ -847,6 +872,12 @@ impl ObservationManager {
             maintenance.merge_frontier_points,
             maintenance.merged_observations,
             maintenance.merge_ms,
+            maintenance.full_filter_calls,
+            maintenance.subset_filter_calls,
+            maintenance.filter_points,
+            maintenance.filter_observations,
+            maintenance.filtered_observations,
+            maintenance.filter_ms,
             maintenance.point_deletes,
             maintenance.moved_points,
             maintenance.rewritten_observations,
