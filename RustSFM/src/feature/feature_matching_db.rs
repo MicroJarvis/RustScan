@@ -11,6 +11,7 @@ use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstim
 use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher};
 use crate::mapper::pair_geometry_to_colmap_two_view_geometry;
 use crate::sift::{match_sift_with_options, SiftFeatures, SiftMatchingOptions};
+use crate::task::{SfmTaskContext, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage};
 use crate::two_view::{
     diagnose_calibrated_two_view_with_observations_rays_and_cameras,
     diagnose_stored_two_view_models, TwoViewDiagnostics, TwoViewOptions,
@@ -89,6 +90,7 @@ pub struct MatchFeaturesOptions {
     pub clear_existing: bool,
     pub use_existing_matches: bool,
     pub existing_match_batch_size: usize,
+    pub task_pair_batch_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +147,7 @@ impl Default for MatchFeaturesOptions {
             clear_existing: true,
             use_existing_matches: false,
             existing_match_batch_size: COLMAP_EXISTING_MATCH_BATCH_SIZE,
+            task_pair_batch_size: 32,
         }
     }
 }
@@ -161,7 +164,19 @@ pub fn match_features_to_database(
     database_path: &Path,
     options: &MatchFeaturesOptions,
 ) -> Result<MatchFeaturesReport> {
+    let control = crate::task::SfmTaskControl::new();
+    let mut sink = |_event: SfmTaskEvent| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+    match_features_to_database_with_task(database_path, options, &mut task)
+}
+
+pub fn match_features_to_database_with_task(
+    database_path: &Path,
+    options: &MatchFeaturesOptions,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<MatchFeaturesReport> {
     options.sift_matching.check()?;
+    task.checkpoint()?;
     let started = Instant::now();
     let db = ColmapDatabase::open(database_path)?;
     let mut images = db.read_all_images()?;
@@ -179,83 +194,124 @@ pub fn match_features_to_database(
         .map(|(idx, image)| (idx, image.image_id))
         .collect::<Vec<_>>();
 
-    let pair_batch = if options.use_existing_matches {
-        existing_match_pair_reports(&db, &frames, &cameras, &images, options)?
+    let input_pairs = if options.use_existing_matches {
+        existing_match_inputs(&db, &images)?
     } else {
-        computed_match_pair_reports(&frames, &cameras, options)?
+        computed_match_inputs(frames.len(), &frames, options)
+            .into_iter()
+            .map(|(left, right)| MatchPairInput::Computed { left, right })
+            .collect::<Vec<_>>()
     };
-    let PairReportBatch {
-        pair_count,
-        reports: pair_reports,
-        verifier_trace,
-    } = pair_batch;
+    let pair_count = input_pairs.len();
+    let batch_size = options.task_pair_batch_size.max(1);
 
-    let (mut reports, total_matches) = db.with_transaction(|| {
-        if options.clear_existing && !options.use_existing_matches {
-            db.clear_matches()?;
-            db.clear_two_view_geometries()?;
-        } else if options.use_existing_matches {
-            db.clear_two_view_geometries()?;
-        }
+    #[cfg(feature = "gpu-wgpu")]
+    let computed_backend = if !options.use_existing_matches && options.sift_matching.use_gpu {
+        Some(ComputedGpuBackend::new()?)
+    } else {
+        None
+    };
+    #[cfg(feature = "gpu-wgpu")]
+    let existing_backend = if options.use_existing_matches && options.sift_matching.use_gpu {
+        Some(ExistingGpuBackend::new()?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu-wgpu"))]
+    if options.sift_matching.use_gpu {
+        bail!("RustSFM was built without gpu-wgpu support");
+    }
 
-        let mut reports = Vec::with_capacity(pair_reports.len());
-        let mut total_matches = 0usize;
-        for (left, right, matches, geometry) in pair_reports {
-            let left_image_id = image_id_by_index[left].1;
-            let right_image_id = image_id_by_index[right].1;
-            let feature_matches = matches
-                .iter()
-                .map(|match_| FeatureMatch {
-                    point2d_idx1: match_.query_idx,
-                    point2d_idx2: match_.train_idx,
-                })
-                .collect::<Vec<_>>();
-            if !options.use_existing_matches {
-                if db.exists_matches(left_image_id, right_image_id)? {
-                    db.delete_matches(left_image_id, right_image_id)?;
-                }
-                db.write_matches(left_image_id, right_image_id, &feature_matches)?;
-            }
-            total_matches += matches.len();
+    let fifo_enabled = options.use_existing_matches
+        && !options.sift_matching.use_gpu
+        && colmap_fifo_verifier_enabled(options);
 
-            let (inliers, triangulated, config) = if let Some(geometry) = geometry.as_ref() {
-                let colmap_geometry = pair_geometry_to_colmap_two_view_geometry(geometry);
-                if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-                    db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-                } else {
-                    db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-                }
-                (
-                    geometry.inliers,
-                    geometry.triangulated,
-                    geometry.two_view_config,
-                )
-            } else if options.use_existing_matches {
-                let colmap_geometry = ColmapTwoViewGeometry::default();
-                if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-                    db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-                } else {
-                    db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
-                }
-                (0, 0, colmap_geometry.config)
+    let mut reports = Vec::new();
+    let mut total_matches = 0usize;
+    let mut completed = 0usize;
+    let mut did_clear = false;
+    let verifier_trace = if fifo_enabled {
+        let fifo_pairs = input_pairs
+            .iter()
+            .map(|pair| match pair {
+                MatchPairInput::Existing {
+                    left,
+                    right,
+                    matches,
+                } => (*left, *right, matches.clone()),
+                MatchPairInput::Computed { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        run_controlled_colmap_fifo_batches(
+            fifo_pairs,
+            &frames,
+            &cameras,
+            options,
+            batch_size,
+            pair_count,
+            &db,
+            &image_id_by_index,
+            task,
+            &mut reports,
+            &mut total_matches,
+            &mut completed,
+            &mut did_clear,
+        )?
+    } else {
+        for batch in input_pairs.chunks(batch_size) {
+            task.checkpoint()?;
+            let pair_reports = if options.use_existing_matches {
+                existing_match_pair_reports_for_inputs(
+                    batch,
+                    &frames,
+                    &cameras,
+                    options,
+                    #[cfg(feature = "gpu-wgpu")]
+                    existing_backend.as_ref(),
+                )?
             } else {
-                if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-                    db.delete_two_view_geometry(left_image_id, right_image_id)?;
-                }
-                (0, 0, -1)
+                computed_match_pair_reports_for_inputs(
+                    batch,
+                    &frames,
+                    &cameras,
+                    options,
+                    #[cfg(feature = "gpu-wgpu")]
+                    computed_backend.as_ref(),
+                )?
             };
-
-            reports.push(MatchFeaturesPairReport {
-                left_image: frames[left].name.clone(),
-                right_image: frames[right].name.clone(),
-                num_matches: matches.len(),
-                num_inliers: inliers,
-                triangulated,
-                two_view_config: config,
-            });
+            let input_indices = batch
+                .iter()
+                .map(MatchPairInput::indices)
+                .collect::<Vec<_>>();
+            commit_and_emit_pair_batch(
+                &db,
+                &frames,
+                &image_id_by_index,
+                options,
+                pair_reports,
+                &input_indices,
+                pair_count,
+                task,
+                &mut did_clear,
+                &mut reports,
+                &mut total_matches,
+                &mut completed,
+            )?;
         }
-        Ok((reports, total_matches))
-    })?;
+        None
+    };
+    if input_pairs.is_empty() {
+        task.checkpoint()?;
+        db.with_transaction(|| {
+            if options.clear_existing && !options.use_existing_matches {
+                db.clear_matches()?;
+                db.clear_two_view_geometries()?;
+            } else if options.use_existing_matches {
+                db.clear_two_view_geometries()?;
+            }
+            Ok(())
+        })?;
+    }
     reports.sort_by(|left, right| {
         left.left_image
             .cmp(&right.left_image)
@@ -504,10 +560,324 @@ fn pair_sampler_seed(left_idx: usize, right_idx: usize) -> u64 {
 
 type PairReportInput = (usize, usize, Vec<rustslam::Match>, Option<PairGeometry>);
 
-struct PairReportBatch {
+#[derive(Debug, Clone)]
+enum MatchPairInput {
+    Computed {
+        left: usize,
+        right: usize,
+    },
+    Existing {
+        left: usize,
+        right: usize,
+        matches: Vec<rustslam::Match>,
+    },
+}
+
+impl MatchPairInput {
+    fn indices(&self) -> (usize, usize) {
+        match self {
+            Self::Computed { left, right } | Self::Existing { left, right, .. } => (*left, *right),
+        }
+    }
+}
+
+fn computed_match_inputs(
+    frame_count: usize,
+    frames: &[ImageFrame],
+    options: &MatchFeaturesOptions,
+) -> Vec<(usize, usize)> {
+    match options.pair_strategy {
+        MatchingPairStrategy::VocabTree { num_images } => {
+            vocab_tree_pairs_from_frames(frames, num_images, options.random_seed)
+        }
+        strategy => generate_matching_pairs(frame_count, strategy),
+    }
+}
+
+fn existing_match_inputs(
+    db: &ColmapDatabase,
+    images: &[ColmapDatabaseImage],
+) -> Result<Vec<MatchPairInput>> {
+    let image_index_by_id = images
+        .iter()
+        .enumerate()
+        .map(|(idx, image)| (image.image_id, idx))
+        .collect::<HashMap<_, _>>();
+    let mut pairs = Vec::new();
+    for (pair_id, _) in db.read_num_matches()? {
+        let (image_id1, image_id2) =
+            pair_id_to_image_pair(pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let Some(&left) = image_index_by_id.get(&image_id1) else {
+            continue;
+        };
+        let Some(&right) = image_index_by_id.get(&image_id2) else {
+            continue;
+        };
+        let matches = db
+            .read_matches(image_id1, image_id2)?
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        pairs.push(MatchPairInput::Existing {
+            left,
+            right,
+            matches,
+        });
+    }
+    Ok(pairs)
+}
+
+fn persist_pair_reports(
+    db: &ColmapDatabase,
+    frames: &[ImageFrame],
+    image_id_by_index: &[(usize, u32)],
+    options: &MatchFeaturesOptions,
+    pair_reports: Vec<PairReportInput>,
+) -> Result<(Vec<MatchFeaturesPairReport>, usize)> {
+    let mut reports = Vec::with_capacity(pair_reports.len());
+    let mut total_matches = 0usize;
+    for (left, right, matches, geometry) in pair_reports {
+        let left_image_id = image_id_by_index[left].1;
+        let right_image_id = image_id_by_index[right].1;
+        let feature_matches = matches
+            .iter()
+            .map(|match_| FeatureMatch {
+                point2d_idx1: match_.query_idx,
+                point2d_idx2: match_.train_idx,
+            })
+            .collect::<Vec<_>>();
+        if !options.use_existing_matches {
+            if db.exists_matches(left_image_id, right_image_id)? {
+                db.delete_matches(left_image_id, right_image_id)?;
+            }
+            db.write_matches(left_image_id, right_image_id, &feature_matches)?;
+        }
+        total_matches += matches.len();
+
+        let (inliers, triangulated, config) = if let Some(geometry) = geometry.as_ref() {
+            let colmap_geometry = pair_geometry_to_colmap_two_view_geometry(geometry);
+            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+            } else {
+                db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+            }
+            (
+                geometry.inliers,
+                geometry.triangulated,
+                geometry.two_view_config,
+            )
+        } else if options.use_existing_matches {
+            let colmap_geometry = ColmapTwoViewGeometry::default();
+            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                db.update_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+            } else {
+                db.write_two_view_geometry(left_image_id, right_image_id, &colmap_geometry)?;
+            }
+            (0, 0, colmap_geometry.config)
+        } else {
+            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                db.delete_two_view_geometry(left_image_id, right_image_id)?;
+            }
+            (0, 0, -1)
+        };
+
+        reports.push(MatchFeaturesPairReport {
+            left_image: frames[left].name.clone(),
+            right_image: frames[right].name.clone(),
+            num_matches: matches.len(),
+            num_inliers: inliers,
+            triangulated,
+            two_view_config: config,
+        });
+    }
+    Ok((reports, total_matches))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_and_emit_pair_batch(
+    db: &ColmapDatabase,
+    frames: &[ImageFrame],
+    image_id_by_index: &[(usize, u32)],
+    options: &MatchFeaturesOptions,
+    pair_reports: Vec<PairReportInput>,
+    input_indices: &[(usize, usize)],
     pair_count: usize,
-    reports: Vec<PairReportInput>,
-    verifier_trace: Option<MatchFeaturesVerifierTrace>,
+    task: &mut SfmTaskContext<'_>,
+    did_clear: &mut bool,
+    reports: &mut Vec<MatchFeaturesPairReport>,
+    total_matches: &mut usize,
+    completed: &mut usize,
+) -> Result<()> {
+    let (batch_reports, batch_matches) = db.with_transaction(|| {
+        if !*did_clear {
+            if options.clear_existing && !options.use_existing_matches {
+                db.clear_matches()?;
+                db.clear_two_view_geometries()?;
+            } else if options.use_existing_matches {
+                db.clear_two_view_geometries()?;
+            }
+        }
+        persist_pair_reports(db, frames, image_id_by_index, options, pair_reports)
+    })?;
+    *did_clear = true;
+    *total_matches += batch_matches;
+    reports.extend(batch_reports);
+    *completed += input_indices.len();
+    let last_pair = input_indices
+        .last()
+        .map(|&(left, right)| (image_id_by_index[left].1, image_id_by_index[right].1));
+    task.emit(SfmTaskEvent {
+        sequence: 0,
+        elapsed_ms: 0,
+        stage: SfmTaskStage::FeatureMatching,
+        operation: SfmTaskOperation::MatchPairBatch,
+        kind: SfmTaskEventKind::Progress,
+        completed: Some(*completed),
+        total: Some(pair_count),
+        registered_images: None,
+        sparse_points: None,
+        image_id: None,
+        pair: last_pair,
+        message: None,
+        issue: None,
+    });
+    task.checkpoint()?;
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+struct ComputedGpuBackend {
+    matcher: WgpuSiftMatcher,
+    scorer: WgpuModelScorer,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl ComputedGpuBackend {
+    fn new() -> Result<Self> {
+        let context = WgpuContext::try_new()?;
+        Ok(Self {
+            matcher: WgpuSiftMatcher::from_context(context.clone())?,
+            scorer: WgpuModelScorer::from_context(context)?,
+        })
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+struct ExistingGpuBackend {
+    scorer: WgpuModelScorer,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl ExistingGpuBackend {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            scorer: WgpuModelScorer::try_new()?,
+        })
+    }
+}
+
+fn computed_match_pair_reports_for_inputs(
+    batch: &[MatchPairInput],
+    frames: &[ImageFrame],
+    cameras: &[CameraModel],
+    options: &MatchFeaturesOptions,
+    #[cfg(feature = "gpu-wgpu")] gpu_backend: Option<&ComputedGpuBackend>,
+) -> Result<Vec<PairReportInput>> {
+    let pairs = batch.iter().map(|pair| pair.indices()).collect::<Vec<_>>();
+    #[cfg(feature = "gpu-wgpu")]
+    if let Some(backend) = gpu_backend {
+        let mut reports = Vec::with_capacity(pairs.len());
+        for &(left, right) in &pairs {
+            let matches = backend.matcher.match_descriptors(
+                &frames[left].sift.descriptors_u8,
+                &frames[right].sift.descriptors_u8,
+                &options.sift_matching,
+            )?;
+            if let Some(report) = estimate_existing_or_computed_pair_gpu(
+                &backend.scorer,
+                left,
+                right,
+                matches,
+                frames,
+                cameras,
+                options,
+            )? {
+                reports.push(report);
+            }
+        }
+        return Ok(reports);
+    }
+    Ok(pairs
+        .par_iter()
+        .filter_map(|&(left, right)| {
+            let matches = match_sift_with_options(
+                &frames[left].sift,
+                &frames[right].sift,
+                &options.sift_matching,
+            );
+            estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
+        })
+        .collect())
+}
+
+fn existing_match_pair_reports_for_inputs(
+    batch: &[MatchPairInput],
+    frames: &[ImageFrame],
+    cameras: &[CameraModel],
+    options: &MatchFeaturesOptions,
+    #[cfg(feature = "gpu-wgpu")] gpu_backend: Option<&ExistingGpuBackend>,
+) -> Result<Vec<PairReportInput>> {
+    #[cfg(feature = "gpu-wgpu")]
+    if let Some(backend) = gpu_backend {
+        let mut reports = Vec::with_capacity(batch.len());
+        for pair in batch {
+            let MatchPairInput::Existing {
+                left,
+                right,
+                matches,
+            } = pair
+            else {
+                unreachable!()
+            };
+            if let Some(report) = estimate_existing_or_computed_pair_gpu(
+                &backend.scorer,
+                *left,
+                *right,
+                matches.clone(),
+                frames,
+                cameras,
+                options,
+            )? {
+                reports.push(report);
+            }
+        }
+        return Ok(reports);
+    }
+    #[cfg(not(feature = "gpu-wgpu"))]
+    if options.sift_matching.use_gpu {
+        bail!("RustSFM was built without gpu-wgpu support");
+    }
+    Ok(batch
+        .par_iter()
+        .filter_map(|pair| {
+            let MatchPairInput::Existing {
+                left,
+                right,
+                matches,
+            } = pair
+            else {
+                unreachable!()
+            };
+            estimate_existing_or_computed_pair(
+                *left,
+                *right,
+                matches.clone(),
+                frames,
+                cameras,
+                options,
+            )
+        })
+        .collect())
 }
 
 fn load_database_frames_and_cameras(
@@ -565,150 +935,6 @@ fn load_database_frames_and_cameras(
     Ok((frames, cameras))
 }
 
-fn computed_match_pair_reports(
-    frames: &[ImageFrame],
-    cameras: &[CameraModel],
-    options: &MatchFeaturesOptions,
-) -> Result<PairReportBatch> {
-    let pairs = match options.pair_strategy {
-        MatchingPairStrategy::VocabTree { num_images } => {
-            vocab_tree_pairs_from_frames(frames, num_images, options.random_seed)
-        }
-        strategy => generate_matching_pairs(frames.len(), strategy),
-    };
-    let pair_count = pairs.len();
-    #[cfg(feature = "gpu-wgpu")]
-    let gpu_backend = if options.sift_matching.use_gpu {
-        let context = WgpuContext::try_new()?;
-        Some((
-            WgpuSiftMatcher::from_context(context.clone())?,
-            WgpuModelScorer::from_context(context)?,
-        ))
-    } else {
-        None
-    };
-    #[cfg(not(feature = "gpu-wgpu"))]
-    if options.sift_matching.use_gpu {
-        bail!("RustSFM was built without gpu-wgpu support");
-    }
-
-    #[cfg(feature = "gpu-wgpu")]
-    let reports = if let Some((matcher, scorer)) = gpu_backend.as_ref() {
-        let mut reports = Vec::with_capacity(pairs.len());
-        for &(left, right) in &pairs {
-            let matches = matcher.match_descriptors(
-                &frames[left].sift.descriptors_u8,
-                &frames[right].sift.descriptors_u8,
-                &options.sift_matching,
-            )?;
-            if let Some(report) = estimate_existing_or_computed_pair_gpu(
-                scorer, left, right, matches, frames, cameras, options,
-            )? {
-                reports.push(report);
-            }
-        }
-        reports
-    } else {
-        pairs
-            .par_iter()
-            .filter_map(|&(left, right)| {
-                let matches = match_sift_with_options(
-                    &frames[left].sift,
-                    &frames[right].sift,
-                    &options.sift_matching,
-                );
-                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
-            })
-            .collect()
-    };
-    #[cfg(not(feature = "gpu-wgpu"))]
-    let reports = pairs
-        .par_iter()
-        .filter_map(|&(left, right)| {
-            let matches = match_sift_with_options(
-                &frames[left].sift,
-                &frames[right].sift,
-                &options.sift_matching,
-            );
-            estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
-        })
-        .collect();
-    Ok(PairReportBatch {
-        pair_count,
-        reports,
-        verifier_trace: None,
-    })
-}
-
-fn existing_match_pair_reports(
-    db: &ColmapDatabase,
-    frames: &[ImageFrame],
-    cameras: &[CameraModel],
-    images: &[ColmapDatabaseImage],
-    options: &MatchFeaturesOptions,
-) -> Result<PairReportBatch> {
-    let image_index_by_id = images
-        .iter()
-        .enumerate()
-        .map(|(idx, image)| (image.image_id, idx))
-        .collect::<HashMap<_, _>>();
-    let mut pairs = Vec::new();
-    for (pair_id, _) in db.read_num_matches()? {
-        let (image_id1, image_id2) =
-            pair_id_to_image_pair(pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
-        let Some(&left) = image_index_by_id.get(&image_id1) else {
-            continue;
-        };
-        let Some(&right) = image_index_by_id.get(&image_id2) else {
-            continue;
-        };
-        let matches = db
-            .read_matches(image_id1, image_id2)?
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>();
-        pairs.push((left, right, matches));
-    }
-    let pair_count = pairs.len();
-    #[cfg(feature = "gpu-wgpu")]
-    if options.sift_matching.use_gpu {
-        let scorer = WgpuModelScorer::try_new()?;
-        let mut reports = Vec::with_capacity(pairs.len());
-        for (left, right, matches) in pairs {
-            if let Some(report) = estimate_existing_or_computed_pair_gpu(
-                &scorer, left, right, matches, frames, cameras, options,
-            )? {
-                reports.push(report);
-            }
-        }
-        return Ok(PairReportBatch {
-            pair_count,
-            reports,
-            verifier_trace: None,
-        });
-    }
-    #[cfg(not(feature = "gpu-wgpu"))]
-    if options.sift_matching.use_gpu {
-        bail!("RustSFM was built without gpu-wgpu support");
-    }
-    let (reports, verifier_trace) = if colmap_fifo_verifier_enabled(options) {
-        colmap_fifo_existing_match_pair_reports(pairs, frames, cameras, options)?
-    } else {
-        let reports = pairs
-            .into_par_iter()
-            .filter_map(|(left, right, matches)| {
-                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
-            })
-            .collect();
-        (reports, None)
-    };
-    Ok(PairReportBatch {
-        pair_count,
-        reports,
-        verifier_trace,
-    })
-}
-
 type ExistingMatchPairInput = (usize, usize, Vec<rustslam::Match>);
 
 fn colmap_fifo_verifier_enabled(options: &MatchFeaturesOptions) -> bool {
@@ -731,45 +957,55 @@ fn colmap_fifo_verifier_threads() -> usize {
     requested
 }
 
-fn colmap_fifo_existing_match_pair_reports(
+#[allow(clippy::too_many_arguments)]
+fn run_controlled_colmap_fifo_batches(
     pairs: Vec<ExistingMatchPairInput>,
     frames: &[ImageFrame],
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
-) -> Result<(Vec<PairReportInput>, Option<MatchFeaturesVerifierTrace>)> {
+    task_batch_size: usize,
+    pair_count: usize,
+    db: &ColmapDatabase,
+    image_id_by_index: &[(usize, u32)],
+    task: &mut SfmTaskContext<'_>,
+    reports: &mut Vec<MatchFeaturesPairReport>,
+    total_matches: &mut usize,
+    completed: &mut usize,
+    did_clear: &mut bool,
+) -> Result<Option<MatchFeaturesVerifierTrace>> {
     if let Some(trace_path) = colmap_fifo_replay_trace_path() {
-        return colmap_replay_existing_match_pair_reports(
+        return run_controlled_colmap_replay_batches(
             pairs,
             frames,
             cameras,
             options,
+            task_batch_size,
+            pair_count,
+            db,
+            image_id_by_index,
+            task,
+            reports,
+            total_matches,
+            completed,
+            did_clear,
             &trace_path,
         );
     }
 
+    let trace_enabled = std::env::var_os("RUSTSFM_COLMAP_FIFO_VERIFIER_TRACE").is_some();
     if pairs.is_empty() {
-        return Ok((
-            Vec::new(),
-            if std::env::var_os("RUSTSFM_COLMAP_FIFO_VERIFIER_TRACE").is_some() {
-                Some(MatchFeaturesVerifierTrace {
-                    mode: "colmap_fifo_shared_ransac_stream".to_string(),
-                    worker_count: 0,
-                    events: Vec::new(),
-                })
-            } else {
-                None
-            },
-        ));
+        return Ok(trace_enabled.then(|| MatchFeaturesVerifierTrace {
+            mode: "colmap_fifo_shared_ransac_stream".to_string(),
+            worker_count: 0,
+            events: Vec::new(),
+        }));
     }
 
     let input_queue = Arc::new(ColmapFifoVerifierQueue::new());
     let output_queue = Arc::new(ColmapFifoVerifierOutputQueue::new());
     let worker_count = colmap_fifo_verifier_threads();
-    let trace_enabled = std::env::var_os("RUSTSFM_COLMAP_FIFO_VERIFIER_TRACE").is_some();
-    let batch_size = options.existing_match_batch_size.max(2);
-    let mut worker_results = Vec::<ColmapFifoWorkerResult>::with_capacity(pairs.len());
-
-    thread::scope(|scope| {
+    let mut events = Vec::new();
+    thread::scope(|scope| -> Result<()> {
         for worker_id in 0..worker_count {
             let input_queue = Arc::clone(&input_queue);
             let output_queue = Arc::clone(&output_queue);
@@ -784,57 +1020,56 @@ fn colmap_fifo_existing_match_pair_reports(
             });
         }
 
-        let mut batch = Vec::with_capacity(batch_size);
-        for pair in pairs {
-            batch.push(pair);
-            if batch.len() == batch_size {
-                for pair in batch.drain(..) {
-                    input_queue.push(pair);
-                }
-                for _ in 0..batch_size {
-                    if let Some(result) = output_queue.pop() {
-                        worker_results.push(result);
+        let result = (|| -> Result<()> {
+            for batch in pairs.chunks(task_batch_size) {
+                task.checkpoint()?;
+                let mut pair_reports = Vec::with_capacity(batch.len());
+                for verifier_batch in batch.chunks(options.existing_match_batch_size.max(2)) {
+                    for pair in verifier_batch.iter().cloned() {
+                        input_queue.push(pair);
+                    }
+                    for _ in 0..verifier_batch.len() {
+                        let mut result = output_queue
+                            .pop()
+                            .context("COLMAP FIFO verifier output queue stopped unexpectedly")?;
+                        if let Some(report) = result.report.take() {
+                            pair_reports.push(report);
+                        }
+                        if let Some(event) = result.event.take() {
+                            events.push(event);
+                        }
                     }
                 }
+                let input_indices = batch
+                    .iter()
+                    .map(|pair| (pair.0, pair.1))
+                    .collect::<Vec<_>>();
+                commit_and_emit_pair_batch(
+                    db,
+                    frames,
+                    image_id_by_index,
+                    options,
+                    pair_reports,
+                    &input_indices,
+                    pair_count,
+                    task,
+                    did_clear,
+                    reports,
+                    total_matches,
+                    completed,
+                )?;
             }
-        }
-        if !batch.is_empty() {
-            let batch_len = batch.len();
-            for pair in batch.drain(..) {
-                input_queue.push(pair);
-            }
-            for _ in 0..batch_len {
-                if let Some(result) = output_queue.pop() {
-                    worker_results.push(result);
-                }
-            }
-        }
+            Ok(())
+        })();
         input_queue.stop();
-    });
+        result
+    })?;
 
-    let mut reports = Vec::new();
-    let mut events = Vec::new();
-    for mut result in worker_results {
-        if let Some(report) = result.report.take() {
-            reports.push(report);
-        }
-        if let Some(event) = result.event.take() {
-            events.push(event);
-        }
-    }
-
-    Ok((
-        reports,
-        if trace_enabled {
-            Some(MatchFeaturesVerifierTrace {
-                mode: "colmap_fifo_shared_ransac_stream".to_string(),
-                worker_count,
-                events,
-            })
-        } else {
-            None
-        },
-    ))
+    Ok(trace_enabled.then(|| MatchFeaturesVerifierTrace {
+        mode: "colmap_fifo_shared_ransac_stream".to_string(),
+        worker_count,
+        events,
+    }))
 }
 
 fn colmap_fifo_replay_trace_path() -> Option<PathBuf> {
@@ -918,13 +1153,74 @@ struct ColmapReplayWorkerJob {
     pair: ExistingMatchPairInput,
 }
 
-fn colmap_replay_existing_match_pair_reports(
+struct ColmapReplayWorkerQueue {
+    state: Mutex<ColmapReplayWorkerQueueState>,
+    condvar: Condvar,
+}
+
+struct ColmapReplayWorkerQueueState {
+    stopped: bool,
+    jobs: VecDeque<ColmapReplayWorkerJob>,
+}
+
+impl ColmapReplayWorkerQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ColmapReplayWorkerQueueState {
+                stopped: false,
+                jobs: VecDeque::new(),
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn push(&self, job: ColmapReplayWorkerJob) {
+        if let Ok(mut state) = self.state.lock() {
+            if !state.stopped {
+                state.jobs.push_back(job);
+                self.condvar.notify_one();
+            }
+        }
+    }
+
+    fn pop(&self) -> Option<ColmapReplayWorkerJob> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            if state.stopped {
+                return None;
+            }
+            state = self.condvar.wait(state).ok()?;
+        }
+    }
+
+    fn stop(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stopped = true;
+        }
+        self.condvar.notify_all();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_controlled_colmap_replay_batches(
     pairs: Vec<ExistingMatchPairInput>,
     frames: &[ImageFrame],
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
+    task_batch_size: usize,
+    pair_count: usize,
+    db: &ColmapDatabase,
+    image_id_by_index: &[(usize, u32)],
+    task: &mut SfmTaskContext<'_>,
+    reports: &mut Vec<MatchFeaturesPairReport>,
+    total_matches: &mut usize,
+    completed: &mut usize,
+    did_clear: &mut bool,
     trace_path: &Path,
-) -> Result<(Vec<PairReportInput>, Option<MatchFeaturesVerifierTrace>)> {
+) -> Result<Option<MatchFeaturesVerifierTrace>> {
     let schedule = load_colmap_fifo_replay_schedule(trace_path)?;
     if schedule.events.len() != pairs.len() {
         bail!(
@@ -934,99 +1230,125 @@ fn colmap_replay_existing_match_pair_reports(
         );
     }
 
-    let mut pairs_by_index = HashMap::<(usize, usize), ExistingMatchPairInput>::new();
-    for pair in pairs {
-        let key = (pair.0, pair.1);
-        if pairs_by_index.insert(key, pair).is_some() {
+    let mut events_by_pair = HashMap::<(usize, usize), ColmapVerifierReplayEvent>::new();
+    for event in schedule.events {
+        let key = (event.left_index, event.right_index);
+        if events_by_pair.insert(key, event).is_some() {
             bail!(
-                "duplicate existing-match pair in database for frame indices {}-{}",
+                "duplicate COLMAP verifier replay event for frame indices {}-{}",
                 key.0,
                 key.1
             );
         }
     }
+    for pair in &pairs {
+        if !events_by_pair.contains_key(&(pair.0, pair.1)) {
+            bail!(
+                "COLMAP verifier replay trace is missing database pair {}-{}",
+                pair.0,
+                pair.1
+            );
+        }
+    }
 
-    let mut events = schedule.events;
-    events.sort_by_key(|event| event.dequeue_order);
-    let mut worker_jobs = (0..schedule.worker_count)
-        .map(|_| Vec::<ColmapReplayWorkerJob>::new())
+    let worker_queues = (0..schedule.worker_count)
+        .map(|_| Arc::new(ColmapReplayWorkerQueue::new()))
         .collect::<Vec<_>>();
-    for event in events {
-        let key = (event.left_index, event.right_index);
-        let pair = pairs_by_index.remove(&key).with_context(|| {
-            format!(
-                "COLMAP verifier replay event references missing pair {}-{} ({} / {})",
-                event.left_index, event.right_index, event.left_image, event.right_image
-            )
-        })?;
-        worker_jobs[event.worker_id].push(ColmapReplayWorkerJob { event, pair });
-    }
-    if !pairs_by_index.is_empty() {
-        let mut missing = pairs_by_index.keys().copied().collect::<Vec<_>>();
-        missing.sort_unstable();
-        bail!(
-            "COLMAP verifier replay trace is missing {} database pairs, first missing frame indices {:?}",
-            missing.len(),
-            missing.first()
-        );
-    }
-
-    let worker_results = Arc::new(Mutex::new(Vec::<ColmapFifoWorkerResult>::new()));
-    thread::scope(|scope| {
-        for (worker_id, jobs) in worker_jobs.into_iter().enumerate() {
-            let worker_results = Arc::clone(&worker_results);
-            scope.spawn(move || {
-                for job in jobs {
-                    let report = estimate_existing_or_computed_pair(
-                        job.pair.0, job.pair.1, job.pair.2, frames, cameras, options,
-                    );
-                    let event = report.as_ref().map(|report| {
-                        verifier_event_from_report(
-                            worker_id,
-                            job.event.dequeue_order,
-                            job.event.complete_order,
-                            report,
-                            frames,
-                        )
-                    });
-                    if let Ok(mut results) = worker_results.lock() {
-                        results.push(ColmapFifoWorkerResult { report, event });
-                    }
-                }
+    let output_queue = Arc::new(ColmapFifoVerifierOutputQueue::new());
+    let mut trace_events = Vec::new();
+    thread::scope(|scope| -> Result<()> {
+        for (worker_id, worker_queue) in worker_queues.iter().enumerate() {
+            let worker_queue = Arc::clone(worker_queue);
+            let output_queue = Arc::clone(&output_queue);
+            scope.spawn(move || loop {
+                let Some(job) = worker_queue.pop() else {
+                    return;
+                };
+                let report = estimate_existing_or_computed_pair(
+                    job.pair.0, job.pair.1, job.pair.2, frames, cameras, options,
+                );
+                output_queue.push_replay(worker_id, &job.event, report, frames);
             });
         }
-    });
 
-    let mut worker_results = Arc::try_unwrap(worker_results)
-        .map_err(|_| anyhow::anyhow!("COLMAP replay worker results still shared"))?
-        .into_inner()
-        .map_err(|_| anyhow::anyhow!("COLMAP replay worker results lock poisoned"))?;
-    worker_results.sort_by_key(|result| {
+        let result = (|| -> Result<()> {
+            for batch in pairs.chunks(task_batch_size) {
+                task.checkpoint()?;
+                let mut jobs = batch
+                    .iter()
+                    .map(|pair| {
+                        let event = events_by_pair
+                            .get(&(pair.0, pair.1))
+                            .expect("replay pairs validated")
+                            .clone();
+                        ColmapReplayWorkerJob {
+                            event,
+                            pair: pair.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                jobs.sort_by_key(|job| job.event.dequeue_order);
+                for job in jobs {
+                    worker_queues[job.event.worker_id].push(job);
+                }
+
+                let mut worker_results = Vec::with_capacity(batch.len());
+                for _ in 0..batch.len() {
+                    worker_results.push(
+                        output_queue
+                            .pop()
+                            .context("COLMAP replay verifier output queue stopped unexpectedly")?,
+                    );
+                }
+                worker_results.sort_by_key(|result| {
+                    result
+                        .event
+                        .as_ref()
+                        .map(|event| event.complete_order)
+                        .unwrap_or(usize::MAX)
+                });
+                let mut pair_reports = Vec::with_capacity(batch.len());
+                for mut result in worker_results {
+                    if let Some(report) = result.report.take() {
+                        pair_reports.push(report);
+                    }
+                    if let Some(event) = result.event.take() {
+                        trace_events.push(event);
+                    }
+                }
+                let input_indices = batch
+                    .iter()
+                    .map(|pair| (pair.0, pair.1))
+                    .collect::<Vec<_>>();
+                commit_and_emit_pair_batch(
+                    db,
+                    frames,
+                    image_id_by_index,
+                    options,
+                    pair_reports,
+                    &input_indices,
+                    pair_count,
+                    task,
+                    did_clear,
+                    reports,
+                    total_matches,
+                    completed,
+                )?;
+            }
+            Ok(())
+        })();
+        for queue in &worker_queues {
+            queue.stop();
+        }
         result
-            .event
-            .as_ref()
-            .map(|event| event.complete_order)
-            .unwrap_or(usize::MAX)
-    });
+    })?;
+    trace_events.sort_by_key(|event| event.complete_order);
 
-    let mut reports = Vec::new();
-    let mut trace_events = Vec::new();
-    for mut result in worker_results {
-        if let Some(report) = result.report.take() {
-            reports.push(report);
-        }
-        if let Some(event) = result.event.take() {
-            trace_events.push(event);
-        }
-    }
-    Ok((
-        reports,
-        Some(MatchFeaturesVerifierTrace {
-            mode: "colmap_fifo_shared_ransac_stream_replay".to_string(),
-            worker_count: schedule.worker_count,
-            events: trace_events,
-        }),
-    ))
+    Ok(Some(MatchFeaturesVerifierTrace {
+        mode: "colmap_fifo_shared_ransac_stream_replay".to_string(),
+        worker_count: schedule.worker_count,
+        events: trace_events,
+    }))
 }
 
 #[derive(Debug)]
@@ -1094,6 +1416,30 @@ impl ColmapFifoVerifierOutputQueue {
                 return Some(job);
             }
             state = self.condvar.wait(state).ok()?;
+        }
+    }
+
+    fn push_replay(
+        &self,
+        worker_id: usize,
+        replay_event: &ColmapVerifierReplayEvent,
+        report: Option<PairReportInput>,
+        frames: &[ImageFrame],
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            let event = report.as_ref().map(|report| {
+                verifier_event_from_report(
+                    worker_id,
+                    replay_event.dequeue_order,
+                    replay_event.complete_order,
+                    report,
+                    frames,
+                )
+            });
+            state
+                .jobs
+                .push_back(ColmapFifoWorkerResult { report, event });
+            self.condvar.notify_one();
         }
     }
 }
@@ -1392,6 +1738,237 @@ mod tests {
     use crate::colmap::ColmapCamera;
     use crate::database::{ColmapDatabaseCamera, ColmapDatabaseImage};
     use tempfile::tempdir;
+
+    #[test]
+    fn controlled_matching_honors_pre_requested_cancellation() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
+
+        let (_dir, db_path, _) = controlled_matching_fixture()?;
+        let original_geometry = ColmapTwoViewGeometry {
+            config: 5,
+            ..ColmapTwoViewGeometry::default()
+        };
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_two_view_geometry(1, 2, &original_geometry)?;
+        drop(db);
+        let control = SfmTaskControl::new();
+        control.request_cancel();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| events.push(event);
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let error = match_features_to_database_with_task(
+            &db_path,
+            &controlled_matching_options(2),
+            &mut task,
+        )
+        .expect_err("pre-requested cancellation");
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Cancelled)
+        );
+        assert!(events.is_empty());
+        let db = ColmapDatabase::open_read_only(&db_path)?;
+        assert_eq!(db.read_two_view_geometry(1, 2)?, original_geometry);
+        assert_eq!(db.read_num_matches()?.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_matching_reports_bounded_pair_progress() -> Result<()> {
+        use crate::task::{
+            SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation,
+            SfmTaskStage,
+        };
+
+        let (_dir, db_path, input_pairs) = controlled_matching_fixture()?;
+        let control = SfmTaskControl::new();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| events.push(event);
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let report = match_features_to_database_with_task(
+            &db_path,
+            &controlled_matching_options(2),
+            &mut task,
+        )?;
+
+        assert_eq!(report.pair_count, 5);
+        assert_eq!(report.matched_pairs, 5);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.completed)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(4), Some(5)]
+        );
+        assert!(events.iter().all(|event| event.total == Some(5)));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(events.iter().all(|event| {
+            event.stage == SfmTaskStage::FeatureMatching
+                && event.operation == SfmTaskOperation::MatchPairBatch
+                && event.kind == SfmTaskEventKind::Progress
+        }));
+        assert_eq!(
+            events.last().and_then(|event| event.pair),
+            input_pairs.last().copied()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_matching_pause_keeps_only_committed_pair_prefix() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
+
+        let (_dir, db_path, input_pairs) = controlled_matching_fixture()?;
+        let control = SfmTaskControl::new();
+        let sink_control = control.clone();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| {
+            if event.completed == Some(2) {
+                sink_control.request_pause();
+            }
+            events.push(event);
+        };
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let error = match_features_to_database_with_task(
+            &db_path,
+            &controlled_matching_options(2),
+            &mut task,
+        )
+        .expect_err("pause requested after first pair batch");
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Paused)
+        );
+        assert_eq!(events.len(), 1);
+
+        let db = ColmapDatabase::open_read_only(&db_path)?;
+        for (index, &(left, right)) in input_pairs.iter().enumerate() {
+            assert_eq!(
+                db.exists_two_view_geometry(left, right)?,
+                index < 2,
+                "unexpected committed geometry for pair {left}-{right}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_matching_rolls_back_failed_batch_and_keeps_prior_batch() -> Result<()> {
+        use crate::correspondence_graph::image_pair_to_pair_id;
+        use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent};
+        use rusqlite::Connection;
+
+        let (_dir, db_path, input_pairs) = controlled_matching_fixture()?;
+        let failed_pair = input_pairs[3];
+        let failed_pair_id = image_pair_to_pair_id(failed_pair.0, failed_pair.1)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let trigger_connection = Connection::open(&db_path)?;
+        trigger_connection.execute_batch(&format!(
+            "CREATE TRIGGER fail_second_geometry_in_batch
+             BEFORE INSERT ON two_view_geometries
+             WHEN NEW.pair_id = {failed_pair_id}
+             BEGIN
+                 SELECT RAISE(ABORT, 'second geometry write failed');
+             END;"
+        ))?;
+        drop(trigger_connection);
+
+        let control = SfmTaskControl::new();
+        let mut sink = |_event: SfmTaskEvent| {};
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let error = match_features_to_database_with_task(
+            &db_path,
+            &controlled_matching_options(2),
+            &mut task,
+        )
+        .expect_err("second geometry write in the second batch must fail");
+        assert!(error.to_string().contains("second geometry write failed"));
+
+        let db = ColmapDatabase::open_read_only(&db_path)?;
+        for (index, &(left, right)) in input_pairs.iter().enumerate() {
+            assert_eq!(
+                db.exists_two_view_geometry(left, right)?,
+                index < 2,
+                "unexpected geometry after failed batch for pair {left}-{right}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_matching_zero_batch_size_behaves_as_one() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent};
+
+        let (_dir, db_path, _) = controlled_matching_fixture()?;
+        let control = SfmTaskControl::new();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| events.push(event);
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        match_features_to_database_with_task(&db_path, &controlled_matching_options(0), &mut task)?;
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.completed)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
+        );
+        Ok(())
+    }
+
+    fn controlled_matching_options(task_pair_batch_size: usize) -> MatchFeaturesOptions {
+        MatchFeaturesOptions {
+            use_existing_matches: true,
+            min_inliers: 2,
+            min_num_matches: 2,
+            random_seed: 0,
+            task_pair_batch_size,
+            ..MatchFeaturesOptions::default()
+        }
+    }
+
+    fn controlled_matching_fixture() -> Result<(tempfile::TempDir, PathBuf, Vec<(u32, u32)>)> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg"), (4, "d.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(image_id, &[ColmapKeypoint::new(50.0, 50.0)])?;
+        }
+        let input_pairs = vec![(1, 2), (1, 3), (1, 4), (2, 3), (2, 4)];
+        for &(left, right) in &input_pairs {
+            db.write_matches(left, right, &[FeatureMatch::new(0, 0)])?;
+        }
+        drop(db);
+        Ok((dir, db_path, input_pairs))
+    }
 
     #[test]
     fn sift_features_from_database_roundtrips_rows() -> Result<()> {
