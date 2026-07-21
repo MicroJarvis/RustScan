@@ -1,10 +1,11 @@
 use rustsfm::colmap::{
-    export_colmap, read_colmap_sparse_files, read_colmap_sparse_model, write_colmap_sparse_binary,
-    ColmapCamera,
+    export_colmap, export_colmap_sparse_snapshot, read_colmap_sparse_files,
+    read_colmap_sparse_model, write_colmap_sparse_binary, ColmapCamera,
 };
+use rustsfm::correspondence_graph::FeatureMatch;
 use rustsfm::database::{
     ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint,
-    COLMAP_FEATURE_SIFT,
+    ColmapTwoViewGeometry, COLMAP_FEATURE_SIFT, COLMAP_TWO_VIEW_CALIBRATED,
 };
 use rustsfm::types::{CameraModel, Point3D, Reconstruction, TrackObservation, COLMAP_PINHOLE};
 use rustsfm::{
@@ -17,11 +18,53 @@ use rustsfm::{
     MAX_TOTAL_SUPPORT_ENTRIES,
 };
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 const SYNTHETIC_KEYFRAME_INDICES: [usize; 4] = [0, 2, 4, 5];
+
+fn snapshot_flat_directory(root: &Path) -> anyhow::Result<BTreeMap<PathBuf, Vec<u8>>> {
+    std::fs::read_dir(root)?
+        .map(|entry| {
+            let path = entry?.path();
+            Ok((path.file_name().unwrap().into(), std::fs::read(&path)?))
+        })
+        .collect()
+}
+
+fn overwrite_sparse_binary(
+    destination: &Path,
+    reconstruction: &Reconstruction,
+) -> anyhow::Result<()> {
+    let temporary = tempdir()?;
+    export_colmap_sparse_snapshot(temporary.path(), reconstruction)?;
+    let files = read_colmap_sparse_files(temporary.path())?;
+    write_colmap_sparse_binary(destination, &files)
+}
+
+fn remaining_stage_error_before_checkpoint(
+    frames: &[SequenceFrame],
+    keyframes: &KeyframeReconstructionResult,
+    mapper_config: &MapperConfig,
+    output: &Path,
+) -> anyhow::Error {
+    let control = SfmTaskControl::new();
+    control.request_pause();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+    register_remaining_sequence_frames(
+        frames,
+        &keyframes.keyframe_ids,
+        keyframes,
+        mapper_config,
+        &synthetic_sequence_config(),
+        output,
+        &mut task,
+    )
+    .unwrap_err()
+}
 
 fn synthetic_sequence_fixture(
     blank_frame: Option<usize>,
@@ -371,6 +414,32 @@ fn keyframe_stage_rejects_unknown_u32_keyframe_id_before_io() {
 }
 
 #[test]
+fn keyframe_stage_rejects_vocab_tree_before_touching_the_database() {
+    let frames = vec![SequenceFrame {
+        id: 42,
+        image_path: PathBuf::from("missing.png"),
+        timestamp_us: Some(0),
+    }];
+    let output = tempdir().unwrap();
+    let mut mapper_config = MapperConfig::default();
+    mapper_config.matching_pair_strategy =
+        rustsfm::MatchingPairStrategy::VocabTree { num_images: 8 };
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error =
+        run_keyframe_reconstruction(&frames, &[42], &mapper_config, output.path(), &mut task)
+            .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "keyframe-only vocabulary-tree matching is unsupported"
+    );
+    assert!(!output.path().join("Cache").exists());
+}
+
+#[test]
 fn keyframe_stage_prepares_fixed_database_and_stable_keyframe_links() {
     let input = tempdir().unwrap();
     let output = tempdir().unwrap();
@@ -464,8 +533,84 @@ fn remaining_stage_rejects_mismatched_keyframe_artifacts_before_io() {
 }
 
 #[test]
+fn remaining_stage_requires_the_fixed_keyframe_sparse_path() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let reconstruction = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+    let relocated = output.join("Cache/relocated-keyframes");
+    export_colmap_sparse_snapshot(&relocated, &reconstruction)?;
+    let relocated_files = read_colmap_sparse_files(&relocated)?;
+    write_colmap_sparse_binary(&relocated, &relocated_files)?;
+    keyframes.sparse_model = relocated;
+
+    let error =
+        remaining_stage_error_before_checkpoint(&frames, &keyframes, &mapper_config, &output);
+
+    assert!(error
+        .to_string()
+        .contains("keyframe sparse model must remain at"));
+    Ok(())
+}
+
+#[test]
+fn remaining_stage_rejects_stale_binary_names_ids_and_extra_images() -> anyhow::Result<()> {
+    for mutation in ["name", "id", "extra"] {
+        let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+        let mut reconstruction = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+        match mutation {
+            "name" => reconstruction.image_names[0] = "stale-name.png".to_owned(),
+            "id" => reconstruction.image_ids[0] = 999_999,
+            "extra" => {
+                reconstruction.image_names.push("frame-0001.png".to_owned());
+                reconstruction
+                    .image_paths
+                    .push(frames[1].image_path.clone());
+                reconstruction.image_ids.push(2);
+                reconstruction.image_camera_indices.push(0);
+                reconstruction.image_frame_indices.push(None);
+                reconstruction.poses.push(reconstruction.poses[0]);
+                reconstruction.observations.push(Vec::new());
+                reconstruction.keypoints.push(Vec::new());
+            }
+            _ => unreachable!(),
+        }
+        overwrite_sparse_binary(&keyframes.sparse_model, &reconstruction)?;
+
+        let error =
+            remaining_stage_error_before_checkpoint(&frames, &keyframes, &mapper_config, &output);
+
+        assert!(
+            error
+                .to_string()
+                .contains("keyframe sparse image names/IDs do not match database"),
+            "mutation={mutation} error={error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn remaining_stage_rejects_mismatched_keyframe_database_camera() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let connection = rusqlite::Connection::open(&keyframes.database)?;
+    connection.execute(
+        "UPDATE cameras SET width = width + 1 WHERE camera_id = 1",
+        [],
+    )?;
+    drop(connection);
+
+    let error =
+        remaining_stage_error_before_checkpoint(&frames, &keyframes, &mapper_config, &output);
+
+    assert!(error
+        .to_string()
+        .contains("keyframe database camera metadata does not match frame"));
+    Ok(())
+}
+
+#[test]
 fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    std::fs::write(keyframes.sparse_model.join("obsolete.bin"), b"stale")?;
     let control = SfmTaskControl::new();
     let mut events = Vec::new();
     let mut sink = |event| events.push(event);
@@ -486,8 +631,11 @@ fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::R
     assert_eq!(result.frame_ids, vec![101, 202, 303, 404, 505, 606]);
     assert_eq!(result.diagnostics.len(), 6);
     assert!(output.join("sparse/0/images.bin").is_file());
+    assert!(!output.join("sparse/0/obsolete.bin").exists());
     assert!(output.join("registration.json").is_file());
     assert!(!output.join("registration.json.tmp").exists());
+    assert!(!output.join("sparse/0.tmp").exists());
+    assert!(!output.join("sparse/0.backup").exists());
     let attempts = events
         .iter()
         .filter(|event| event.operation == rustsfm::SfmTaskOperation::RegisterFrameAttempt)
@@ -511,6 +659,234 @@ fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::R
             .len(),
         6
     );
+    Ok(())
+}
+
+#[test]
+fn pause_before_sparse_publish_preserves_old_model_byte_for_byte() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    std::fs::write(keyframes.sparse_model.join("old.marker"), b"keyframe-model")?;
+    let before = snapshot_flat_directory(&keyframes.sparse_model)?;
+    let control = SfmTaskControl::new();
+    let pause_control = control.clone();
+    let mut sink = move |event: rustsfm::SfmTaskEvent| {
+        if event.stage == rustsfm::SfmTaskStage::Export
+            && event.operation == rustsfm::SfmTaskOperation::ValidateArtifacts
+        {
+            pause_control.request_pause();
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<rustsfm::SfmTaskStop>(),
+        Some(&rustsfm::SfmTaskStop::Paused)
+    );
+    assert_eq!(snapshot_flat_directory(&keyframes.sparse_model)?, before);
+    assert!(!output.join("registration.json").exists());
+    assert!(!output.join("sparse/0.tmp").exists());
+    assert!(!output.join("sparse/0.backup").exists());
+    Ok(())
+}
+
+#[test]
+fn pause_after_sparse_publish_keeps_new_model_and_defers_json() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    std::fs::write(keyframes.sparse_model.join("old.marker"), b"keyframe-model")?;
+    let control = SfmTaskControl::new();
+    let pause_control = control.clone();
+    let mut sink = move |event: rustsfm::SfmTaskEvent| {
+        if event.stage == rustsfm::SfmTaskStage::Export
+            && event.operation == rustsfm::SfmTaskOperation::WriteArtifacts
+        {
+            pause_control.request_pause();
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<rustsfm::SfmTaskStop>(),
+        Some(&rustsfm::SfmTaskStop::Paused)
+    );
+    let published = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+    assert_eq!(published.poses.iter().flatten().count(), 6);
+    assert!(keyframes.sparse_model.join("images.txt").is_file());
+    assert!(keyframes.sparse_model.join("images.bin").is_file());
+    assert!(!keyframes.sparse_model.join("old.marker").exists());
+    assert!(!output.join("registration.json").exists());
+    assert!(!output.join("sparse/0.tmp").exists());
+    assert!(!output.join("sparse/0.backup").exists());
+    Ok(())
+}
+
+#[test]
+fn narrow_round_does_not_publish_same_round_registrations_as_support() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert!(result.has_complete_coverage());
+
+    let second_target_attempt = events
+        .iter()
+        .find(|event| {
+            event.operation == rustsfm::SfmTaskOperation::RegisterFrameAttempt
+                && event.image_id == Some(404)
+        })
+        .expect("second target attempt event");
+    assert!(second_target_attempt
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("round=Narrow")));
+    assert!(
+        !second_target_attempt
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("202")),
+        "same-round frame leaked into support: {:?}",
+        second_target_attempt.message
+    );
+    let database = ColmapDatabase::open_read_only(&keyframes.database)?;
+    assert!(!database.exists_matches(2, 4)?);
+    assert!(!database.exists_two_view_geometry(2, 4)?);
+    Ok(())
+}
+
+#[test]
+fn default_pnp_seed_is_stable_across_intervening_registration_calls() -> anyhow::Result<()> {
+    let (_temp_a, output_a, frames_a, keyframes_a, mut mapper_a) =
+        synthetic_sequence_fixture(None)?;
+    mapper_a.random_seed = -1;
+    let control_a = SfmTaskControl::new();
+    let mut events_a = Vec::new();
+    let mut sink_a = |event| events_a.push(event);
+    let mut task_a = SfmTaskContext::new(&control_a, &mut sink_a);
+    let result_a = register_remaining_sequence_frames(
+        &frames_a,
+        &keyframes_a.keyframe_ids,
+        &keyframes_a,
+        &mapper_a,
+        &synthetic_sequence_config(),
+        &output_a,
+        &mut task_a,
+    )?;
+
+    let (_temp_perturb, output_perturb, frames_perturb, keyframes_perturb, mut mapper_perturb) =
+        synthetic_sequence_fixture(None)?;
+    mapper_perturb.random_seed = -1;
+    let control_perturb = SfmTaskControl::new();
+    let mut sink_perturb = |_| {};
+    let mut task_perturb = SfmTaskContext::new(&control_perturb, &mut sink_perturb);
+    register_remaining_sequence_frames(
+        &frames_perturb,
+        &keyframes_perturb.keyframe_ids,
+        &keyframes_perturb,
+        &mapper_perturb,
+        &synthetic_sequence_config(),
+        &output_perturb,
+        &mut task_perturb,
+    )?;
+
+    let (_temp_b, output_b, frames_b, keyframes_b, mut mapper_b) =
+        synthetic_sequence_fixture(None)?;
+    mapper_b.random_seed = -1;
+    let control_b = SfmTaskControl::new();
+    let mut events_b = Vec::new();
+    let mut sink_b = |event| events_b.push(event);
+    let mut task_b = SfmTaskContext::new(&control_b, &mut sink_b);
+    let result_b = register_remaining_sequence_frames(
+        &frames_b,
+        &keyframes_b.keyframe_ids,
+        &keyframes_b,
+        &mapper_b,
+        &synthetic_sequence_config(),
+        &output_b,
+        &mut task_b,
+    )?;
+
+    let seed_from_events = |events: &[rustsfm::SfmTaskEvent]| -> anyhow::Result<i32> {
+        let event = events
+            .iter()
+            .find(|event| {
+                event.operation == rustsfm::SfmTaskOperation::RegisterFrameAttempt
+                    && event.image_id == Some(404)
+            })
+            .expect("target attempt event");
+        event
+            .message
+            .as_deref()
+            .and_then(|message| {
+                message
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix("seed="))
+            })
+            .ok_or_else(|| anyhow::anyhow!("attempt event has no deterministic seed"))?
+            .parse()
+            .map_err(Into::into)
+    };
+    let seed_a = seed_from_events(&events_a)?;
+    let seed_b = seed_from_events(&events_b)?;
+    assert!(seed_a >= 0);
+    assert_eq!(seed_a, seed_b);
+
+    let diagnostic_a = result_a
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 404)
+        .unwrap();
+    let diagnostic_b = result_b
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 404)
+        .unwrap();
+    assert_eq!(diagnostic_a, diagnostic_b);
+    let model_a = read_colmap_sparse_model(&result_a.sparse_model)?.reconstruction;
+    let model_b = read_colmap_sparse_model(&result_b.sparse_model)?.reconstruction;
+    let pose_for_target = |model: &Reconstruction| {
+        let index = model
+            .image_names
+            .iter()
+            .position(|name| name == "frame-0003.png")
+            .unwrap();
+        model.poses[index].unwrap()
+    };
+    let pose_a = pose_for_target(&model_a);
+    let pose_b = pose_for_target(&model_b);
+    assert_eq!(pose_a.translation(), pose_b.translation());
+    assert_eq!(pose_a.quaternion(), pose_b.quaternion());
     Ok(())
 }
 
@@ -589,7 +965,7 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
     let (_temp, output, frames, old_keyframes, mut mapper_config) =
         synthetic_sequence_fixture(None)?;
     let database = ColmapDatabase::open(&old_keyframes.database)?;
-    let pending_rows = [2u32, 4u32]
+    let pending_rows_before = [2u32, 4u32]
         .into_iter()
         .map(|image_id| {
             Ok((
@@ -599,12 +975,20 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let sentinel_matches = vec![FeatureMatch::new(7, 11), FeatureMatch::new(13, 17)];
+    let sentinel_geometry = ColmapTwoViewGeometry {
+        config: COLMAP_TWO_VIEW_CALIBRATED,
+        inlier_matches: sentinel_matches.clone(),
+        e_matrix: Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]),
+        qvec: Some([1.0, 0.0, 0.0, 0.0]),
+        tvec: Some([0.25, -0.5, 0.75]),
+        ..ColmapTwoViewGeometry::default()
+    };
+    database.write_matches(2, 4, &sentinel_matches)?;
+    database.write_two_view_geometry(2, 4, &sentinel_geometry)?;
+    let matches_before = database.read_matches_blob(2, 4)?;
+    let geometry_before = database.read_two_view_geometry(2, 4)?;
     drop(database);
-    let connection = rusqlite::Connection::open(&old_keyframes.database)?;
-    connection.execute("DELETE FROM descriptors WHERE image_id IN (2, 4)", [])?;
-    connection.execute("DELETE FROM keypoints WHERE image_id IN (2, 4)", [])?;
-    connection.execute("DELETE FROM images WHERE image_id IN (2, 4)", [])?;
-    drop(connection);
     std::fs::remove_dir_all(output.join("sparse"))?;
 
     mapper_config.multiple_models = false;
@@ -639,11 +1023,34 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
         0,
         "preseeded keyframe features must be reused"
     );
-    let database = ColmapDatabase::open(&keyframes.database)?;
-    for (image, keypoints, descriptors) in pending_rows {
-        database.write_image(&image, true)?;
-        database.write_keypoints(image.image_id, &keypoints)?;
-        database.write_descriptors(image.image_id, &descriptors)?;
+    let keyframe_database_ids = [1u32, 3, 5, 6]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let pair_events = events
+        .iter()
+        .filter(|event| event.operation == rustsfm::SfmTaskOperation::MatchPairBatch)
+        .collect::<Vec<_>>();
+    assert_eq!(pair_events.len(), 6, "one event per keyframe-only pair");
+    assert!(pair_events.iter().all(|event| event
+        .pair
+        .is_some_and(|(left, right)| keyframe_database_ids.contains(&left)
+            && keyframe_database_ids.contains(&right))));
+    let database = ColmapDatabase::open_read_only(&keyframes.database)?;
+    let pending_rows_after = [2u32, 4u32]
+        .into_iter()
+        .map(|image_id| {
+            Ok((
+                database.read_image(image_id)?.unwrap(),
+                database.read_keypoints(image_id)?,
+                database.read_descriptors(image_id)?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(pending_rows_after, pending_rows_before);
+    assert_eq!(database.read_matches_blob(2, 4)?, matches_before);
+    assert_eq!(database.read_two_view_geometry(2, 4)?, geometry_before);
+    for image_id in [2u32, 4u32] {
+        assert!(database.read_image(image_id)?.is_some());
     }
     drop(database);
 

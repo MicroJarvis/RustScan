@@ -6,14 +6,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::colmap::{
-    export_colmap, read_colmap_sparse_files_with_format, read_colmap_sparse_model,
-    write_colmap_sparse_binary, ColmapCamera, ColmapSparseFormat,
+    export_colmap, export_colmap_sparse_snapshot, read_colmap_sparse_files_with_format,
+    read_colmap_sparse_model, write_colmap_sparse_binary, ColmapCamera, ColmapSparseFormat,
 };
 use crate::database::{ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage};
 use crate::feature_extraction::extract_selected_features_to_database_with_task;
+use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::feature_matching_db::{
-    match_explicit_image_pairs_to_database_with_task, match_features_to_database_with_task,
-    MatchFeaturesOptions,
+    match_explicit_image_pairs_to_database_with_task, MatchFeaturesOptions,
 };
 use crate::mapper::{
     register_single_target_from_database, run_reconstruction_with_task, FeatureType, MapperConfig,
@@ -169,6 +169,12 @@ pub fn run_keyframe_reconstruction(
     if mapper_config.feature_type != FeatureType::Sift {
         anyhow::bail!("sequence registration requires SIFT features");
     }
+    if matches!(
+        mapper_config.matching_pair_strategy,
+        MatchingPairStrategy::VocabTree { .. }
+    ) {
+        anyhow::bail!("keyframe-only vocabulary-tree matching is unsupported");
+    }
     task.checkpoint().map_err(anyhow::Error::new)?;
 
     let cache = output.join("Cache");
@@ -179,12 +185,13 @@ pub fn run_keyframe_reconstruction(
         link_or_copy_stable_image(&frames[index].image_path, &keyframe_input)?;
     }
     import_database_images(frames, &keyframe_indices, mapper_config, &database)?;
+    let keyframe_database_ids =
+        database_image_ids_for_indices(frames, &keyframe_indices, &database)?;
 
     let mut sift_extraction = mapper_config.sift_extraction.clone();
     sift_extraction.max_num_features = mapper_config.max_features;
     let mut missing_feature_image_ids = Vec::new();
-    for &index in &keyframe_indices {
-        let image_id = u32::try_from(index + 1)?;
+    for &image_id in &keyframe_database_ids {
         if !database_features_exist(&database, image_id)? {
             missing_feature_image_ids.push(image_id);
         }
@@ -199,22 +206,19 @@ pub fn run_keyframe_reconstruction(
         )?;
     }
 
-    let mut sift_matching = mapper_config.sift_matching.clone();
-    sift_matching.max_ratio = mapper_config.match_ratio as f32;
-    match_features_to_database_with_task(
+    let keyframe_pairs = generate_matching_pairs(
+        keyframe_database_ids.len(),
+        mapper_config.matching_pair_strategy,
+    )
+    .into_iter()
+    .map(|(left, right)| (keyframe_database_ids[left], keyframe_database_ids[right]))
+    .collect::<Vec<_>>();
+    let mut match_options = sequence_match_options(mapper_config);
+    match_options.task_pair_batch_size = 1;
+    match_explicit_image_pairs_to_database_with_task(
         &database,
-        &MatchFeaturesOptions {
-            pair_strategy: mapper_config.matching_pair_strategy,
-            sift_matching,
-            essential_threshold_px: mapper_config.essential_threshold_px,
-            essential_iterations: mapper_config.essential_iterations,
-            min_inliers: mapper_config.min_inliers,
-            min_triangulated: mapper_config.min_triangulated,
-            min_num_matches: mapper_config.min_matches,
-            random_seed: mapper_config.random_seed,
-            clear_existing: false,
-            ..MatchFeaturesOptions::default()
-        },
+        &keyframe_pairs,
+        &match_options,
         task,
     )?;
 
@@ -305,33 +309,12 @@ fn import_database_images(
     for &index in indices {
         let frame = &frames[index];
         let image_id = u32::try_from(index + 1)?;
-        let (width, height) = image::image_dimensions(&frame.image_path)?;
-        let focal = width.max(height) as f64 * 1.2;
-        let fx = mapper_config.fx.map(f64::from).unwrap_or(focal);
-        let fy = mapper_config.fy.map(f64::from).unwrap_or(focal);
-        let cx = mapper_config
-            .cx
-            .map(f64::from)
-            .unwrap_or(width as f64 * 0.5);
-        let cy = mapper_config
-            .cy
-            .map(f64::from)
-            .unwrap_or(height as f64 * 0.5);
         let expected_name = frame
             .image_path
             .file_name()
             .and_then(|name| name.to_str())
             .expect("stable file name was validated");
-        let expected_camera = ColmapDatabaseCamera {
-            camera: ColmapCamera {
-                camera_id: image_id,
-                model_id: COLMAP_PINHOLE,
-                width,
-                height,
-                params: vec![fx, fy, cx, cy],
-            },
-            has_prior_focal_length: mapper_config.fx.is_some() && mapper_config.fy.is_some(),
-        };
+        let expected_camera = expected_database_camera(frame, mapper_config, image_id)?;
         if let Some(existing_image) = db.read_image(image_id)? {
             if existing_image.name != expected_name || existing_image.frame_id.is_some() {
                 anyhow::bail!("database image_id={image_id} metadata does not match frame");
@@ -368,6 +351,35 @@ fn import_database_images(
     Ok(())
 }
 
+fn expected_database_camera(
+    frame: &SequenceFrame,
+    mapper_config: &MapperConfig,
+    camera_id: u32,
+) -> anyhow::Result<ColmapDatabaseCamera> {
+    let (width, height) = image::image_dimensions(&frame.image_path)?;
+    let focal = width.max(height) as f64 * 1.2;
+    let fx = mapper_config.fx.map(f64::from).unwrap_or(focal);
+    let fy = mapper_config.fy.map(f64::from).unwrap_or(focal);
+    let cx = mapper_config
+        .cx
+        .map(f64::from)
+        .unwrap_or(width as f64 * 0.5);
+    let cy = mapper_config
+        .cy
+        .map(f64::from)
+        .unwrap_or(height as f64 * 0.5);
+    Ok(ColmapDatabaseCamera {
+        camera: ColmapCamera {
+            camera_id,
+            model_id: COLMAP_PINHOLE,
+            width,
+            height,
+            params: vec![fx, fy, cx, cy],
+        },
+        has_prior_focal_length: mapper_config.fx.is_some() && mapper_config.fy.is_some(),
+    })
+}
+
 fn database_camera_metadata_matches(
     actual: &ColmapDatabaseCamera,
     expected: &ColmapDatabaseCamera,
@@ -377,6 +389,103 @@ fn database_camera_metadata_matches(
         && actual.camera.height == expected.camera.height
         && actual.camera.params == expected.camera.params
         && actual.has_prior_focal_length == expected.has_prior_focal_length
+}
+
+fn database_image_ids_for_indices(
+    frames: &[SequenceFrame],
+    indices: &[usize],
+    database: &Path,
+) -> anyhow::Result<Vec<u32>> {
+    let database = ColmapDatabase::open_read_only(database)?;
+    indices
+        .iter()
+        .map(|&index| {
+            let name = stable_image_name(&frames[index])?;
+            database
+                .read_image_with_name(name)?
+                .map(|image| image.image_id)
+                .ok_or_else(|| anyhow::anyhow!("database is missing image '{name}'"))
+        })
+        .collect()
+}
+
+fn validate_keyframe_artifacts(
+    frames: &[SequenceFrame],
+    keyframe_indices: &[usize],
+    keyframe_result: &KeyframeReconstructionResult,
+    mapper_config: &MapperConfig,
+    output: &Path,
+) -> anyhow::Result<Reconstruction> {
+    let expected_sparse_model = output.join("sparse").join("0");
+    if keyframe_result.sparse_model != expected_sparse_model {
+        anyhow::bail!(
+            "keyframe sparse model must remain at {}",
+            expected_sparse_model.display()
+        );
+    }
+    if !keyframe_result.sparse_model.is_dir() {
+        anyhow::bail!(
+            "missing keyframe sparse model {}",
+            keyframe_result.sparse_model.display()
+        );
+    }
+
+    let database = ColmapDatabase::open_read_only(&keyframe_result.database)?;
+    let mut expected_sparse_images = BTreeSet::<(String, u32)>::new();
+    for &index in keyframe_indices {
+        let frame = &frames[index];
+        let name = stable_image_name(frame)?;
+        let image = database
+            .read_image_with_name(name)?
+            .ok_or_else(|| anyhow::anyhow!("keyframe database is missing image '{name}'"))?;
+        if image.frame_id.is_some() {
+            anyhow::bail!("keyframe database image '{name}' has unexpected rig frame metadata");
+        }
+        let camera = database.read_camera(image.camera_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "keyframe database image '{name}' references missing camera_id={}",
+                image.camera_id
+            )
+        })?;
+        let expected_camera = expected_database_camera(frame, mapper_config, image.camera_id)?;
+        if !database_camera_metadata_matches(&camera, &expected_camera) {
+            anyhow::bail!(
+                "keyframe database camera metadata does not match frame {}",
+                frame.id
+            );
+        }
+        expected_sparse_images.insert((name.to_owned(), image.image_id));
+    }
+    drop(database);
+
+    let model = read_colmap_sparse_model(&keyframe_result.sparse_model)?;
+    validate_sparse_reconstruction(&model.reconstruction)?;
+    if model.reconstruction.image_names.len() != model.reconstruction.image_ids.len() {
+        anyhow::bail!("keyframe sparse image name/ID metadata length mismatch");
+    }
+    let actual_sparse_images = model
+        .reconstruction
+        .image_names
+        .iter()
+        .cloned()
+        .zip(model.reconstruction.image_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if actual_sparse_images.len() != model.reconstruction.image_names.len()
+        || actual_sparse_images != expected_sparse_images
+    {
+        anyhow::bail!("keyframe sparse image names/IDs do not match database");
+    }
+    let registered_keyframes = model.reconstruction.poses.iter().flatten().count();
+    if keyframe_result.registered_keyframes != registered_keyframes {
+        anyhow::bail!(
+            "keyframe artifacts do not match registered keyframe count: result={} sparse={registered_keyframes}",
+            keyframe_result.registered_keyframes
+        );
+    }
+    if registered_keyframes != expected_sparse_images.len() {
+        anyhow::bail!("keyframe sparse model does not contain a finite pose for every keyframe");
+    }
+    Ok(model.reconstruction)
 }
 
 fn validate_sparse_reconstruction(reconstruction: &Reconstruction) -> anyhow::Result<()> {
@@ -484,26 +593,13 @@ pub fn register_remaining_sequence_frames(
             keyframe_result.database.display()
         );
     }
-    let initial_model = read_colmap_sparse_model(&keyframe_result.sparse_model)?;
-    validate_sparse_reconstruction(&initial_model.reconstruction)?;
-    let actual_registered_keyframes = initial_model
-        .reconstruction
-        .image_names
-        .iter()
-        .zip(&initial_model.reconstruction.poses)
-        .filter(|(name, pose)| {
-            pose.is_some()
-                && keyframe_indices.iter().any(|&index| {
-                    stable_image_name(&frames[index]).is_ok_and(|candidate| candidate == *name)
-                })
-        })
-        .count();
-    if keyframe_result.registered_keyframes != actual_registered_keyframes {
-        anyhow::bail!(
-            "keyframe artifacts do not match registered keyframe count: result={} sparse={actual_registered_keyframes}",
-            keyframe_result.registered_keyframes
-        );
-    }
+    let initial_reconstruction = validate_keyframe_artifacts(
+        frames,
+        &keyframe_indices,
+        keyframe_result,
+        mapper_config,
+        output,
+    )?;
     let plan = SequenceRegistrationPlan::build_from_frames(
         frames,
         &keyframe_indices,
@@ -523,7 +619,7 @@ pub fn register_remaining_sequence_frames(
             FrameRegistrationDiagnostic::new(frame.id, FrameRegistrationStatus::Unresolved)
         })
         .collect::<Vec<_>>();
-    let initial_registered_names = registered_image_names(&initial_model.reconstruction);
+    let initial_registered_names = registered_image_names(&initial_reconstruction);
     for &keyframe in &keyframe_indices {
         let name = stable_image_name(&frames[keyframe])?;
         if initial_registered_names.contains(name) {
@@ -541,16 +637,16 @@ pub fn register_remaining_sequence_frames(
         completed: Some(0),
         total: Some(plan.pending_frames().len()),
         registered_images: Some(initial_registered_names.len()),
-        sparse_points: Some(initial_model.reconstruction.points.len()),
+        sparse_points: Some(initial_reconstruction.points.len()),
         image_id: None,
         pair: None,
         message: None,
         issue: None,
     });
 
-    let mut current_reconstruction = initial_model.reconstruction;
+    let mut current_reconstruction = initial_reconstruction;
     let mut current_reference = keyframe_result.sparse_model.clone();
-    let mut accepted_non_keyframes = Vec::<usize>::new();
+    let mut available_from_prior_rounds = Vec::<usize>::new();
     let mut extracted_targets = HashSet::<usize>::new();
     let match_options = sequence_match_options(mapper_config);
     let mut target_mapper_config = mapper_config.clone();
@@ -563,6 +659,7 @@ pub fn register_remaining_sequence_frames(
     target_mapper_config.fix_existing_frames = true;
 
     for round in [RegistrationRound::Narrow, RegistrationRound::Wide] {
+        let mut accepted_this_round = Vec::<usize>::new();
         for &target in plan.pending_frames() {
             if diagnostics[target].status == FrameRegistrationStatus::Registered {
                 continue;
@@ -588,7 +685,7 @@ pub fn register_remaining_sequence_frames(
                 }
             }
             let mut support =
-                plan.attempts_for_with_sorted_support(target, round, &accepted_non_keyframes)?;
+                plan.attempts_for_with_sorted_support(target, round, &available_from_prior_rounds)?;
             let registered_names = registered_image_names(&current_reconstruction);
             support.retain(|&index| {
                 stable_image_name(&frames[index])
@@ -599,6 +696,8 @@ pub fn register_remaining_sequence_frames(
                 .iter()
                 .map(|&index| frames[index].id)
                 .collect::<Vec<_>>();
+            let attempt_seed =
+                sequence_attempt_random_seed(mapper_config.random_seed, frames[target].id, round);
             task.checkpoint().map_err(anyhow::Error::new)?;
             task.emit(SfmTaskEvent {
                 sequence: 0,
@@ -612,7 +711,9 @@ pub fn register_remaining_sequence_frames(
                 sparse_points: Some(current_reconstruction.points.len()),
                 image_id: Some(frames[target].id),
                 pair: None,
-                message: Some(format!("round={round:?} support={support_frame_ids:?}")),
+                message: Some(format!(
+                    "round={round:?} seed={attempt_seed} support={support_frame_ids:?}"
+                )),
                 issue: None,
             });
             if support.is_empty() {
@@ -632,10 +733,12 @@ pub fn register_remaining_sequence_frames(
                 .iter()
                 .map(|&index| Ok((target_database_id, u32::try_from(index + 1)?)))
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            let mut attempt_match_options = match_options.clone();
+            attempt_match_options.random_seed = attempt_seed;
             match_explicit_image_pairs_to_database_with_task(
                 &keyframe_result.database,
                 &pairs,
-                &match_options,
+                &attempt_match_options,
                 task,
             )?;
             let target_name = stable_image_name(&frames[target])?;
@@ -643,13 +746,15 @@ pub fn register_remaining_sequence_frames(
                 .iter()
                 .map(|&index| stable_image_name(&frames[index]).map(str::to_owned))
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            let mut attempt_mapper_config = target_mapper_config.clone();
+            attempt_mapper_config.random_seed = attempt_seed;
             let candidate = register_single_target_from_database(
                 &sequence_input,
                 &keyframe_result.database,
                 &current_reference,
                 target_name,
                 &support_names,
-                &target_mapper_config,
+                &attempt_mapper_config,
             )?;
             let (inlier_count, inlier_ratio, mean_error) = candidate
                 .as_ref()
@@ -702,20 +807,21 @@ pub fn register_remaining_sequence_frames(
             current_reference = accepted_sparse;
             diagnostics[target].status = FrameRegistrationStatus::Registered;
             diagnostics[target].message = Some(format!("registered in {round:?} round"));
-            match accepted_non_keyframes.binary_search(&target) {
+            match accepted_this_round.binary_search(&target) {
                 Ok(_) => {}
-                Err(position) => accepted_non_keyframes.insert(position, target),
+                Err(position) => accepted_this_round.insert(position, target),
             }
         }
+        available_from_prior_rounds = merge_sorted_support(
+            &available_from_prior_rounds,
+            &accepted_this_round,
+            usize::MAX,
+        );
     }
 
     validate_sparse_reconstruction(&current_reconstruction)
         .map_err(|error| error.context("invalid merged sequence model"))?;
-    export_colmap(output, &current_reconstruction, false)?;
-    let sparse_model = output.join("sparse").join("0");
-    let merged_files =
-        read_colmap_sparse_files_with_format(&sparse_model, ColmapSparseFormat::Text)?;
-    write_colmap_sparse_binary(&sparse_model, &merged_files)?;
+    let sparse_model = publish_sparse_model_atomic(output, &current_reconstruction, task)?;
     let merged_model = read_colmap_sparse_model(&sparse_model)?;
     validate_sparse_reconstruction(&merged_model.reconstruction)
         .map_err(|error| error.context("invalid exported merged sequence model"))?;
@@ -747,6 +853,156 @@ pub fn register_remaining_sequence_frames(
         issue: None,
     });
     Ok(result)
+}
+
+fn publish_sparse_model_atomic(
+    output: &Path,
+    reconstruction: &Reconstruction,
+    task: &mut SfmTaskContext<'_>,
+) -> anyhow::Result<PathBuf> {
+    let sparse_root = output.join("sparse");
+    let destination = sparse_root.join("0");
+    let temporary = sparse_root.join("0.tmp");
+    let backup = sparse_root.join("0.backup");
+    std::fs::create_dir_all(&sparse_root)?;
+    recover_sparse_publish_paths(&destination, &temporary, &backup)?;
+
+    let stage_result = (|| -> anyhow::Result<()> {
+        export_colmap_sparse_snapshot(&temporary, reconstruction)?;
+        let text_files =
+            read_colmap_sparse_files_with_format(&temporary, ColmapSparseFormat::Text)?;
+        write_colmap_sparse_binary(&temporary, &text_files)?;
+        sync_directory_files(&temporary)?;
+        let staged = read_colmap_sparse_model(&temporary)?;
+        validate_sparse_reconstruction(&staged.reconstruction)
+            .map_err(|error| error.context("invalid staged merged sequence model"))?;
+        Ok(())
+    })();
+    if let Err(error) = stage_result {
+        let _ = remove_file_or_directory(&temporary);
+        return Err(error);
+    }
+
+    task.emit(SfmTaskEvent {
+        sequence: 0,
+        elapsed_ms: 0,
+        stage: SfmTaskStage::Export,
+        operation: SfmTaskOperation::ValidateArtifacts,
+        kind: SfmTaskEventKind::Progress,
+        completed: None,
+        total: None,
+        registered_images: Some(reconstruction.poses.iter().flatten().count()),
+        sparse_points: Some(reconstruction.points.len()),
+        image_id: None,
+        pair: None,
+        message: Some("validated staged sparse model".to_owned()),
+        issue: None,
+    });
+    if let Err(stop) = task.checkpoint() {
+        let _ = remove_file_or_directory(&temporary);
+        return Err(anyhow::Error::new(stop));
+    }
+
+    replace_sparse_directory(&destination, &temporary, &backup)?;
+    task.emit(SfmTaskEvent {
+        sequence: 0,
+        elapsed_ms: 0,
+        stage: SfmTaskStage::Export,
+        operation: SfmTaskOperation::WriteArtifacts,
+        kind: SfmTaskEventKind::Progress,
+        completed: None,
+        total: None,
+        registered_images: Some(reconstruction.poses.iter().flatten().count()),
+        sparse_points: Some(reconstruction.points.len()),
+        image_id: None,
+        pair: None,
+        message: Some("published sparse model".to_owned()),
+        issue: None,
+    });
+    task.checkpoint().map_err(anyhow::Error::new)?;
+    Ok(destination)
+}
+
+fn recover_sparse_publish_paths(
+    destination: &Path,
+    temporary: &Path,
+    backup: &Path,
+) -> anyhow::Result<()> {
+    if backup.exists() {
+        if destination.exists() {
+            remove_file_or_directory(backup)?;
+        } else {
+            std::fs::rename(backup, destination)?;
+        }
+    }
+    if temporary.exists() {
+        remove_file_or_directory(temporary)?;
+    }
+    Ok(())
+}
+
+fn replace_sparse_directory(
+    destination: &Path,
+    temporary: &Path,
+    backup: &Path,
+) -> anyhow::Result<()> {
+    let had_destination = destination.exists();
+    if had_destination {
+        std::fs::rename(destination, backup)?;
+    }
+    if let Err(publish_error) = std::fs::rename(temporary, destination) {
+        let restore_result = if had_destination {
+            std::fs::rename(backup, destination)
+        } else {
+            Ok(())
+        };
+        let _ = remove_file_or_directory(temporary);
+        return match restore_result {
+            Ok(()) => Err(publish_error.into()),
+            Err(restore_error) => anyhow::bail!(
+                "failed to publish sparse model ({publish_error}) and restore backup ({restore_error})"
+            ),
+        };
+    }
+    if had_destination {
+        if let Err(cleanup_error) = remove_file_or_directory(backup) {
+            let moved_new_model = std::fs::rename(destination, temporary);
+            let restored_old_model = std::fs::rename(backup, destination);
+            if moved_new_model.is_ok() && restored_old_model.is_ok() {
+                let _ = remove_file_or_directory(temporary);
+                return Err(cleanup_error.into());
+            }
+            anyhow::bail!(
+                "published sparse model but failed to remove backup ({cleanup_error}); rollback new={moved_new_model:?} old={restored_old_model:?}"
+            );
+        }
+    }
+    std::fs::File::open(
+        destination
+            .parent()
+            .expect("sparse destination has a parent"),
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
+fn sync_directory_files(root: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_file() {
+            std::fs::File::open(path)?.sync_all()?;
+        }
+    }
+    std::fs::File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+fn remove_file_or_directory(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 pub fn run_sequence_registration(
@@ -804,6 +1060,25 @@ fn sequence_match_options(mapper_config: &MapperConfig) -> MatchFeaturesOptions 
         task_pair_batch_size: 1,
         ..MatchFeaturesOptions::default()
     }
+}
+
+fn sequence_attempt_random_seed(
+    configured_seed: i32,
+    frame_id: u32,
+    round: RegistrationRound,
+) -> i32 {
+    if configured_seed >= 0 {
+        return configured_seed;
+    }
+    let round_tag = match round {
+        RegistrationRound::Narrow => 0x9e37_79b9_7f4a_7c15,
+        RegistrationRound::Wide => 0xbf58_476d_1ce4_e5b9,
+    };
+    let mut value = u64::from(frame_id) ^ round_tag;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value & i32::MAX as u64) as i32
 }
 
 fn database_features_exist(database: &Path, image_id: u32) -> anyhow::Result<bool> {
@@ -1809,6 +2084,32 @@ mod task6_tests {
     }
 
     #[test]
+    fn registration_json_failure_preserves_existing_destination() -> anyhow::Result<()> {
+        let output = tempfile::tempdir()?;
+        let destination = output.path().join("registration.json");
+        let temporary = output.path().join("registration.json.tmp");
+        std::fs::write(&destination, b"previous-valid-json\n")?;
+        std::fs::create_dir(&temporary)?;
+        let result = SequenceRegistrationResult {
+            imported_frames: 1,
+            registered_frames: 1,
+            frame_ids: vec![42],
+            diagnostics: vec![FrameRegistrationDiagnostic::new(
+                42,
+                FrameRegistrationStatus::Keyframe,
+            )],
+            sparse_model: output.path().join("sparse/0"),
+        };
+
+        let error = write_registration_result_atomic(output.path(), &result).unwrap_err();
+
+        assert!(error.to_string().contains("Is a directory"));
+        assert_eq!(std::fs::read(&destination)?, b"previous-valid-json\n");
+        assert!(temporary.is_dir());
+        Ok(())
+    }
+
+    #[test]
     fn stable_image_reuse_rejects_different_existing_contents() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let source_dir = temp.path().join("source");
@@ -1869,6 +2170,28 @@ mod task6_tests {
         assert!(error
             .to_string()
             .contains("image_id=1 metadata does not match"));
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_directory_replace_restores_destination_when_staged_rename_fails() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("0");
+        let missing_staged = temp.path().join("0.tmp");
+        let backup = temp.path().join("0.backup");
+        std::fs::create_dir(&destination)?;
+        std::fs::write(destination.join("marker"), b"original-model")?;
+
+        let error = replace_sparse_directory(&destination, &missing_staged, &backup).unwrap_err();
+
+        assert!(error.to_string().contains("No such file"));
+        assert_eq!(
+            std::fs::read(destination.join("marker"))?,
+            b"original-model"
+        );
+        assert!(!backup.exists());
+        assert!(!missing_staged.exists());
         Ok(())
     }
 }
