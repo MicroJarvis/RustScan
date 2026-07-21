@@ -101,11 +101,17 @@ pub struct SfmTaskControl {
     state: Arc<AtomicU8>,
 }
 
-impl SfmTaskControl {
-    pub fn new() -> Self {
+impl Default for SfmTaskControl {
+    fn default() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(SfmControlState::Running as u8)),
         }
+    }
+}
+
+impl SfmTaskControl {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn request_pause(&self) {
