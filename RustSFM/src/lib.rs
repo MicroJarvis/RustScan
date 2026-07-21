@@ -1,7 +1,13 @@
 pub mod ba;
+pub mod sequence_registration;
 pub mod task;
 
 pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
+pub use sequence_registration::{
+    FrameRegistrationDiagnostic, FrameRegistrationStatus, RegistrationRound, SequenceFrame,
+    SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
+    SequenceRegistrationResult,
+};
 pub use task::{
     SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,
     SfmTaskEventSink, SfmTaskIssue, SfmTaskOperation, SfmTaskStage, SfmTaskStop,
