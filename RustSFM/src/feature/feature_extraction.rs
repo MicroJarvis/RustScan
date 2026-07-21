@@ -184,15 +184,21 @@ pub fn extract_features_to_database_with_extractor_and_task<E: SiftFeatureExtrac
 ) -> Result<ExtractFeaturesReport> {
     options.check()?;
     let db = ColmapDatabase::open(database_path)?;
-    let images = db.read_all_images()?;
+    let mut images = db.read_all_images()?;
     if images.is_empty() {
         bail!("database has no images; import images before feature extraction");
     }
+    images.sort_unstable_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.image_id.cmp(&right.image_id))
+    });
 
     let started = Instant::now();
     let image_count = images.len();
     let mut reports = Vec::with_capacity(images.len());
     for image in images {
+        task.checkpoint()?;
         let image_path = images_dir.join(&image.name);
         if !image_path.exists() {
             bail!(
@@ -201,7 +207,6 @@ pub fn extract_features_to_database_with_extractor_and_task<E: SiftFeatureExtrac
                 image_path.display()
             );
         }
-        task.checkpoint()?;
         let extract_started = Instant::now();
         let decoded = load_colmap_grayscale_u8(&image_path)
             .with_context(|| format!("failed to load {}", image_path.display()))?;
@@ -476,7 +481,7 @@ mod tests {
             SfmTaskStop,
         };
 
-        let (dir, db_path, images_dir) = two_image_fixture()?;
+        let (_dir, db_path, images_dir) = two_image_fixture()?;
         let extractor = DeterministicExtractor;
         let control = SfmTaskControl::new();
         let sink_control = control.clone();
@@ -502,19 +507,20 @@ mod tests {
         );
 
         let db = ColmapDatabase::open(&db_path)?;
-        assert_eq!(db.read_keypoints(1)?.len(), 1);
-        assert_eq!(db.read_descriptors(1)?.rows, 1);
-        assert!(db.read_keypoints(2)?.is_empty());
-        assert_eq!(db.read_descriptors(2)?.rows, 0);
+        assert!(db.exists_keypoints(2)?);
+        assert!(db.exists_descriptors(2)?);
+        assert!(!db.exists_keypoints(1)?);
+        assert!(!db.exists_descriptors(1)?);
+        assert_eq!(db.read_keypoints(2)?.len(), 1);
+        assert_eq!(db.read_descriptors(2)?.rows, 1);
         let event = events.last().expect("first image progress event");
         assert_eq!(event.stage, SfmTaskStage::FeatureExtraction);
         assert_eq!(event.operation, SfmTaskOperation::ExtractImage);
         assert_eq!(event.kind, SfmTaskEventKind::Progress);
         assert_eq!(event.completed, Some(1));
         assert_eq!(event.total, Some(2));
-        assert_eq!(event.image_id, Some(1));
+        assert_eq!(event.image_id, Some(2));
         assert_eq!(event.message.as_deref(), Some("left.jpg"));
-        drop(dir);
         Ok(())
     }
 
@@ -522,7 +528,7 @@ mod tests {
     fn controlled_extraction_honors_pre_requested_cancellation() -> Result<()> {
         use crate::task::{SfmTaskControl, SfmTaskEvent, SfmTaskStop};
 
-        let (dir, db_path, images_dir) = two_image_fixture()?;
+        let (_dir, db_path, images_dir) = two_image_fixture()?;
         let extractor = DeterministicExtractor;
         let control = SfmTaskControl::new();
         control.request_cancel();
@@ -544,11 +550,73 @@ mod tests {
 
         let db = ColmapDatabase::open(&db_path)?;
         for image_id in [1, 2] {
-            assert!(db.read_keypoints(image_id)?.is_empty());
-            assert_eq!(db.read_descriptors(image_id)?.rows, 0);
+            assert!(!db.exists_keypoints(image_id)?);
+            assert!(!db.exists_descriptors(image_id)?);
         }
         assert!(events.is_empty());
-        drop(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_extraction_checks_cancellation_before_missing_file_validation() -> Result<()> {
+        use crate::task::{SfmTaskControl, SfmTaskEvent, SfmTaskStop};
+
+        let (_dir, db_path, images_dir) = two_image_fixture()?;
+        std::fs::remove_file(images_dir.join("right.jpg"))?;
+        let extractor = DeterministicExtractor;
+        let control = SfmTaskControl::new();
+        control.request_cancel();
+        let mut events = Vec::new();
+        let mut sink = |event: SfmTaskEvent| events.push(event);
+        let mut task = crate::task::SfmTaskContext::new(&control, &mut sink);
+        let error = extract_features_to_database_with_extractor_and_task(
+            &db_path,
+            &images_dir,
+            &SiftExtractionOptions::default(),
+            &extractor,
+            &mut task,
+        )
+        .expect_err("pre-requested cancellation");
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Cancelled)
+        );
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_extraction_rolls_back_keypoints_when_descriptor_upsert_fails() -> Result<()> {
+        use crate::task::SfmTaskEvent;
+        use rusqlite::Connection;
+
+        let (_dir, db_path, images_dir) = two_image_fixture()?;
+        let trigger_connection = Connection::open(&db_path)?;
+        trigger_connection.execute_batch(
+            "CREATE TRIGGER fail_descriptor_insert
+             BEFORE INSERT ON descriptors
+             WHEN NEW.image_id = 2
+             BEGIN
+                 SELECT RAISE(ABORT, 'descriptor insert failed');
+             END;",
+        )?;
+        let extractor = DeterministicExtractor;
+        let control = SfmTaskControl::new();
+        let mut sink = |_event: SfmTaskEvent| {};
+        let mut task = crate::task::SfmTaskContext::new(&control, &mut sink);
+        let error = extract_features_to_database_with_extractor_and_task(
+            &db_path,
+            &images_dir,
+            &SiftExtractionOptions::default(),
+            &extractor,
+            &mut task,
+        )
+        .expect_err("descriptor trigger failure");
+        assert!(error.to_string().contains("descriptor insert failed"));
+
+        let db = ColmapDatabase::open(&db_path)?;
+        assert!(!db.exists_keypoints(2)?);
+        assert!(!db.exists_descriptors(2)?);
         Ok(())
     }
 
@@ -595,7 +663,7 @@ mod tests {
             },
             true,
         )?;
-        for (image_id, name) in [(1, "left.jpg"), (2, "right.jpg")] {
+        for (image_id, name) in [(1, "right.jpg"), (2, "left.jpg")] {
             db.write_image(
                 &ColmapDatabaseImage {
                     image_id,
