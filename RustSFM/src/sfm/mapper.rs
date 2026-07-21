@@ -99,7 +99,7 @@ pub use reconstruction_input::{reference_camera_setup, ReconstructionSeed, Refer
 pub use state::InitialPairFailure;
 use state::{IncrementalMapperSession, InitialPairSelectionState, RegistrationStats};
 
-type DynPnPModelScorer = dyn PnPModelScorer<Error = anyhow::Error>;
+pub(crate) type DynPnPModelScorer = dyn PnPModelScorer<Error = anyhow::Error>;
 
 #[derive(Debug)]
 struct GpuPnpMapperError(String);
@@ -243,6 +243,18 @@ pub(crate) fn register_single_target_from_seed(
         target_image,
         absolute_pose.pose,
     );
+    for inlier in &absolute_pose.point_inliers {
+        observation_manager.add_observation(
+            frames,
+            pairs,
+            &mut reconstruction,
+            inlier.point_id,
+            TrackObservation {
+                image: target_image,
+                feature: inlier.feature,
+            },
+        );
+    }
     Ok(Some(SingleTargetRegistrationCandidate {
         reconstruction,
         inlier_count: absolute_pose.inliers,
@@ -251,13 +263,14 @@ pub(crate) fn register_single_target_from_seed(
     }))
 }
 
-pub(crate) fn register_single_target_from_database(
+pub(crate) fn register_single_target_from_database_with_pnp_scorer(
     input: &Path,
     database: &Path,
     reference: &Path,
     target_name: &str,
     support_names: &[String],
     config: &MapperConfig,
+    pnp_scorer: Option<&mut DynPnPModelScorer>,
 ) -> Result<Option<SingleTargetRegistrationCandidate>> {
     let reference_model = read_colmap_sparse_model(reference)?;
     let registered_names = reference_model
@@ -357,14 +370,13 @@ pub(crate) fn register_single_target_from_database(
     target_config.local_ba = false;
     target_config.global_ba = false;
     validate_gpu_pnp_config(&target_config, false)?;
-    let mut scorer = create_gpu_pnp_scorer(&target_config)?;
     register_single_target_from_seed(
         &frames,
         &pairs,
         &setup,
         target_image,
         &target_config,
-        scorer.as_deref_mut(),
+        pnp_scorer,
     )
 }
 
@@ -409,7 +421,9 @@ fn validate_gpu_pnp_route(
     Ok(())
 }
 
-fn create_gpu_pnp_scorer(config: &MapperConfig) -> Result<Option<Box<DynPnPModelScorer>>> {
+pub(crate) fn create_gpu_pnp_scorer(
+    config: &MapperConfig,
+) -> Result<Option<Box<DynPnPModelScorer>>> {
     if !config.use_gpu_pnp {
         return Ok(None);
     }
@@ -6281,9 +6295,16 @@ struct AbsolutePose {
     inliers: usize,
     inlier_ratio: f32,
     mean_error_px: f32,
+    point_inliers: Vec<AbsolutePosePointInlier>,
     structureless_inliers: Vec<StructurelessInlier>,
     frame_image_poses: Vec<(usize, SE3)>,
     generalized_inliers: Vec<GeneralizedFrameInlier>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AbsolutePosePointInlier {
+    feature: usize,
+    point_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -6453,6 +6474,7 @@ fn solve_generalized_frame_absolute_pose(
         inliers: unique_inliers,
         inlier_ratio: unique_inliers as f32 / problem.points2d.len().max(1) as f32,
         mean_error_px: refinement.mean_error_px,
+        point_inliers: Vec::new(),
         structureless_inliers: Vec::new(),
         frame_image_poses,
         generalized_inliers: refinement.inliers,
@@ -7109,6 +7131,7 @@ fn solve_colmap_structureless_absolute_pose(
         inliers: structureless_inliers.len(),
         inlier_ratio: structureless_inliers.len() as f32 / problem.world_points2d.len() as f32,
         mean_error_px: 0.0,
+        point_inliers: Vec::new(),
         structureless_inliers,
         frame_image_poses: Vec::new(),
         generalized_inliers: Vec::new(),
@@ -7325,6 +7348,7 @@ fn solve_experimental_structureless_pair_pose_fallback(
             inliers,
             inlier_ratio,
             mean_error_px,
+            point_inliers: Vec::new(),
             structureless_inliers,
             frame_image_poses: Vec::new(),
             generalized_inliers: Vec::new(),
@@ -7852,6 +7876,7 @@ fn distinct_structureless_neighbors(constraints: &[StructurelessPairConstraint])
 #[derive(Debug, Clone, Copy)]
 struct AbsolutePoseObservation {
     feature: usize,
+    point_id: usize,
     xy: [f32; 2],
     xyz: [f32; 3],
 }
@@ -7913,6 +7938,7 @@ fn collect_absolute_pose_observations_from_graph(
             let kp = &frames[image].keypoints[feature];
             pose_observations.push(AbsolutePoseObservation {
                 feature,
+                point_id,
                 xy: [kp.x(), kp.y()],
                 xyz: reconstruction.points[point_id].xyz,
             });
@@ -7967,6 +7993,7 @@ fn collect_absolute_pose_observations_from_pairs(
             let kp = &frames[image].keypoints[feature];
             pose_observations.push(AbsolutePoseObservation {
                 feature,
+                point_id,
                 xy: [kp.x(), kp.y()],
                 xyz: reconstruction.points[point_id].xyz,
             });
@@ -8097,12 +8124,20 @@ fn solve_absolute_pose_with_pnp_scorer(
         if !accept_absolute_pose_eval(final_eval, num_correspondences, config) {
             return Ok(None);
         }
+        let point_inliers = final_absolute_pose_point_inliers(
+            pose,
+            &pose_observations,
+            camera,
+            config.pnp_threshold_px,
+        );
+        debug_assert_eq!(point_inliers.len(), final_eval.inliers);
         Ok(Some(AbsolutePose {
             pose,
             camera,
             inliers: final_eval.inliers,
             inlier_ratio: final_eval.inliers as f32 / num_correspondences.max(1) as f32,
             mean_error_px: final_eval.mean_error_px,
+            point_inliers,
             structureless_inliers: Vec::new(),
             frame_image_poses: Vec::new(),
             generalized_inliers: Vec::new(),
@@ -8110,6 +8145,29 @@ fn solve_absolute_pose_with_pnp_scorer(
     })();
     telemetry.pose_solve_refine_ms += pose_solve_refine_start.elapsed().as_secs_f64() * 1000.0;
     result
+}
+
+fn final_absolute_pose_point_inliers(
+    pose: SE3,
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    threshold_px: f32,
+) -> Vec<AbsolutePosePointInlier> {
+    observations
+        .iter()
+        .filter_map(|observation| {
+            let error = crate::geometry::reprojection_error_px(
+                observation.xyz,
+                pose,
+                observation.xy,
+                camera,
+            );
+            (error.is_finite() && error <= threshold_px).then_some(AbsolutePosePointInlier {
+                feature: observation.feature,
+                point_id: observation.point_id,
+            })
+        })
+        .collect()
 }
 
 fn inlier_absolute_pose_observations(
@@ -10640,21 +10698,25 @@ mod tests {
         let observations = [
             AbsolutePoseObservation {
                 feature: 0,
+                point_id: 0,
                 xy: [320.0, 240.0],
                 xyz: [0.0, 0.0, 4.0],
             },
             AbsolutePoseObservation {
                 feature: 1,
+                point_id: 1,
                 xy: [390.0, 240.0],
                 xyz: [0.4, 0.0, 4.0],
             },
             AbsolutePoseObservation {
                 feature: 2,
+                point_id: 2,
                 xy: [320.0, 310.0],
                 xyz: [0.0, 0.4, 4.0],
             },
             AbsolutePoseObservation {
                 feature: 3,
+                point_id: 3,
                 xy: [376.0, 296.0],
                 xyz: [0.4, 0.4, 5.0],
             },
@@ -10699,6 +10761,7 @@ mod tests {
                 }
                 AbsolutePoseObservation {
                     feature: index,
+                    point_id: index,
                     xy,
                     xyz,
                 }
@@ -13714,6 +13777,7 @@ mod tests {
                     .unwrap();
                 AbsolutePoseObservation {
                     feature,
+                    point_id: feature,
                     xy: [xy[0] as f32, xy[1] as f32],
                     xyz,
                 }
@@ -14483,11 +14547,13 @@ mod tests {
         let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
         let good = AbsolutePoseObservation {
             feature: 0,
+            point_id: 0,
             xy: [50.0, 50.0],
             xyz: [0.0, 0.0, 3.0],
         };
         let outlier = AbsolutePoseObservation {
             feature: 1,
+            point_id: 1,
             xy: [95.0, 95.0],
             xyz: [0.0, 0.0, 3.0],
         };
@@ -15241,6 +15307,7 @@ mod tests {
                     .unwrap();
                 AbsolutePoseObservation {
                     feature,
+                    point_id: feature,
                     xy: [xy[0] as f32, xy[1] as f32],
                     xyz,
                 }
@@ -16524,11 +16591,36 @@ mod tests {
         assert!(pose_translation_error(estimated, target_pose) < 0.05);
         assert_eq!(candidate.reconstruction.point_ids, seed_point_ids);
         assert_eq!(candidate.reconstruction.points.len(), seed_points.len());
-        for (actual, expected) in candidate.reconstruction.points.iter().zip(&seed_points) {
+        let committed_target_observations = candidate.reconstruction.observations[1]
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(committed_target_observations.len(), candidate.inlier_count);
+        for (feature, point_id) in candidate.reconstruction.observations[1]
+            .iter()
+            .enumerate()
+            .filter_map(|(feature, point_id)| point_id.map(|point_id| (feature, point_id)))
+        {
+            assert_eq!(point_id, feature);
+            assert!(candidate.reconstruction.points[point_id]
+                .track
+                .contains(&TrackObservation { image: 1, feature }));
+        }
+        for (point_id, (actual, expected)) in candidate
+            .reconstruction
+            .points
+            .iter()
+            .zip(&seed_points)
+            .enumerate()
+        {
             assert_eq!(actual.xyz, expected.xyz);
             assert_eq!(actual.color, expected.color);
             assert_eq!(actual.error, expected.error);
             assert!(actual.track.starts_with(&expected.track));
+            if !committed_target_observations.contains(&point_id) {
+                assert_eq!(actual.track, expected.track);
+            }
         }
         Ok(())
     }

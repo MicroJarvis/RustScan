@@ -337,21 +337,90 @@ pub fn match_features_to_database_with_task(
     })
 }
 
+pub(crate) struct ExplicitPairMatchingSession {
+    use_gpu: bool,
+    #[cfg(feature = "gpu-wgpu")]
+    computed_backend: Option<ComputedGpuBackend>,
+}
+
+impl ExplicitPairMatchingSession {
+    pub(crate) fn new(options: &MatchFeaturesOptions) -> Result<Self> {
+        options.sift_matching.check()?;
+        #[cfg(feature = "gpu-wgpu")]
+        let computed_backend = if options.sift_matching.use_gpu {
+            Some(ComputedGpuBackend::new()?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "gpu-wgpu"))]
+        if options.sift_matching.use_gpu {
+            bail!("RustSFM was built without gpu-wgpu support");
+        }
+        Ok(Self {
+            use_gpu: options.sift_matching.use_gpu,
+            #[cfg(feature = "gpu-wgpu")]
+            computed_backend,
+        })
+    }
+}
+
 pub(crate) fn match_explicit_image_pairs_to_database_with_task(
     database_path: &Path,
     image_pairs: &[(u32, u32)],
     options: &MatchFeaturesOptions,
     task: &mut SfmTaskContext<'_>,
 ) -> Result<MatchFeaturesReport> {
+    let session = ExplicitPairMatchingSession::new(options)?;
+    match_explicit_image_pairs_to_database_with_session(
+        database_path,
+        image_pairs,
+        options,
+        &session,
+        task,
+    )
+}
+
+pub(crate) fn match_explicit_image_pairs_to_database_with_session(
+    database_path: &Path,
+    image_pairs: &[(u32, u32)],
+    options: &MatchFeaturesOptions,
+    session: &ExplicitPairMatchingSession,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<MatchFeaturesReport> {
     options.sift_matching.check()?;
     if options.use_existing_matches {
         bail!("explicit image-pair matching requires computed matches");
     }
+    if session.use_gpu != options.sift_matching.use_gpu {
+        bail!("explicit matching session backend does not match the requested options");
+    }
     task.checkpoint()?;
     let started = Instant::now();
     let db = ColmapDatabase::open(database_path)?;
-    let mut images = db.read_all_images()?;
-    images.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut endpoint_ids = std::collections::BTreeSet::new();
+    for &(left_id, right_id) in image_pairs {
+        if left_id == right_id {
+            bail!("explicit image pair repeats image_id={left_id}");
+        }
+        let key = (left_id.min(right_id), left_id.max(right_id));
+        if !seen.insert(key) {
+            bail!("duplicate explicit image pair {}-{}", key.0, key.1);
+        }
+        endpoint_ids.extend([left_id, right_id]);
+    }
+    let mut images = endpoint_ids
+        .into_iter()
+        .map(|image_id| {
+            db.read_image(image_id)?
+                .with_context(|| format!("explicit pair references missing image_id={image_id}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    images.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.image_id.cmp(&right.image_id))
+    });
     let (frames, cameras) = load_database_frames_and_cameras(&db, &images, true)?;
     let index_by_image_id = images
         .iter()
@@ -363,16 +432,8 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_task(
         .enumerate()
         .map(|(index, image)| (index, image.image_id))
         .collect::<Vec<_>>();
-    let mut seen = std::collections::BTreeSet::new();
     let mut inputs = Vec::with_capacity(image_pairs.len());
     for &(left_id, right_id) in image_pairs {
-        if left_id == right_id {
-            bail!("explicit image pair repeats image_id={left_id}");
-        }
-        let key = (left_id.min(right_id), left_id.max(right_id));
-        if !seen.insert(key) {
-            bail!("duplicate explicit image pair {}-{}", key.0, key.1);
-        }
         let left = index_by_image_id
             .get(&left_id)
             .copied()
@@ -382,17 +443,6 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_task(
             .copied()
             .with_context(|| format!("explicit pair references missing image_id={right_id}"))?;
         inputs.push(MatchPairInput::Computed { left, right });
-    }
-
-    #[cfg(feature = "gpu-wgpu")]
-    let computed_backend = if options.sift_matching.use_gpu {
-        Some(ComputedGpuBackend::new()?)
-    } else {
-        None
-    };
-    #[cfg(not(feature = "gpu-wgpu"))]
-    if options.sift_matching.use_gpu {
-        bail!("RustSFM was built without gpu-wgpu support");
     }
 
     let pair_count = inputs.len();
@@ -408,7 +458,7 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_task(
             &cameras,
             options,
             #[cfg(feature = "gpu-wgpu")]
-            computed_backend.as_ref(),
+            session.computed_backend.as_ref(),
         )?;
         let indices = batch
             .iter()
@@ -2323,23 +2373,62 @@ mod tests {
     }
 
     #[test]
-    fn controlled_explicit_matching_commits_only_requested_database_pairs() -> Result<()> {
+    fn controlled_explicit_matching_session_reuses_only_requested_database_pairs() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent};
 
         let (_dir, db_path, input_pairs) = controlled_computed_matching_fixture()?;
         let requested = vec![input_pairs[1], input_pairs[4]];
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_image(
+            &ColmapDatabaseImage {
+                image_id: 99,
+                name: "unrelated-with-missing-features.jpg".to_owned(),
+                camera_id: 1,
+                frame_id: None,
+            },
+            true,
+        )?;
+        drop(db);
         let control = SfmTaskControl::new();
         let mut events = Vec::<SfmTaskEvent>::new();
         let mut sink = |event: SfmTaskEvent| events.push(event);
         let mut task = SfmTaskContext::new(&control, &mut sink);
-        let report = match_explicit_image_pairs_to_database_with_task(
-            &db_path,
-            &requested,
-            &controlled_computed_matching_options(1),
-            &mut task,
-        )?;
+        let mut options = controlled_computed_matching_options(1);
+        options.clear_existing = false;
+        let session = ExplicitPairMatchingSession::new(&options)?;
+        let mut reports = Vec::new();
+        for pair in &requested {
+            reports.push(match_explicit_image_pairs_to_database_with_session(
+                &db_path,
+                &[*pair],
+                &options,
+                &session,
+                &mut task,
+            )?);
+        }
 
-        assert_eq!(report.pair_count, requested.len());
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.pair_count)
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.matched_pairs)
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .flat_map(|report| report.pairs.iter())
+                .map(|pair| (pair.left_image.as_str(), pair.right_image.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a.jpg", "c.jpg"), ("b.jpg", "d.jpg")]
+        );
         assert_eq!(events.len(), requested.len());
         let db = ColmapDatabase::open_read_only(&db_path)?;
         for pair in input_pairs {

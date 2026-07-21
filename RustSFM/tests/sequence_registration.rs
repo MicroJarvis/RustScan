@@ -1,6 +1,6 @@
 use rustsfm::colmap::{
-    export_colmap, export_colmap_sparse_snapshot, read_colmap_sparse_files,
-    read_colmap_sparse_model, write_colmap_sparse_binary, ColmapCamera,
+    export_colmap_sparse_snapshot, read_colmap_sparse_files, read_colmap_sparse_model,
+    write_colmap_sparse_binary, ColmapCamera,
 };
 use rustsfm::correspondence_graph::FeatureMatch;
 use rustsfm::database::{
@@ -24,6 +24,45 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 const SYNTHETIC_KEYFRAME_INDICES: [usize; 4] = [0, 2, 4, 5];
+
+fn synthetic_descriptor_rows(inverted: bool) -> Vec<[u8; 128]> {
+    (0..64)
+        .map(|feature| {
+            let mut descriptor = [0u8; 128];
+            for (offset, value) in descriptor.iter_mut().enumerate() {
+                let original = ((feature * 37 + offset * 17 + feature * offset * 3) % 251) as u8;
+                *value = if inverted { 255 - original } else { original };
+            }
+            descriptor
+        })
+        .collect()
+}
+
+fn write_synthetic_descriptors(
+    database: &ColmapDatabase,
+    image_id: u32,
+    inverted: bool,
+) -> anyhow::Result<()> {
+    let data = synthetic_descriptor_rows(inverted)
+        .into_iter()
+        .flatten()
+        .collect();
+    database.write_descriptors(
+        image_id,
+        &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 64, 128, data)?,
+    )
+}
+
+fn rewrite_synthetic_descriptor_variants(
+    database: &ColmapDatabase,
+    inverted_image_ids: &[u32],
+) -> anyhow::Result<()> {
+    database.clear_descriptors()?;
+    for image_id in 1..=6 {
+        write_synthetic_descriptors(database, image_id, inverted_image_ids.contains(&image_id))?;
+    }
+    Ok(())
+}
 
 fn snapshot_flat_directory(root: &Path) -> anyhow::Result<BTreeMap<PathBuf, Vec<u8>>> {
     std::fs::read_dir(root)?
@@ -145,15 +184,7 @@ fn synthetic_sequence_fixture(
         },
         true,
     )?;
-    let descriptor_rows = (0..points.len())
-        .map(|feature| {
-            let mut descriptor = [0u8; 128];
-            for (offset, value) in descriptor.iter_mut().enumerate() {
-                *value = ((feature * 37 + offset * 17 + feature * offset * 3) % 251) as u8;
-            }
-            descriptor
-        })
-        .collect::<Vec<_>>();
+    let descriptor_rows = synthetic_descriptor_rows(false);
     for (index, frame) in frames.iter().enumerate() {
         database.write_image(
             &ColmapDatabaseImage {
@@ -260,8 +291,8 @@ fn synthetic_sequence_fixture(
             .collect(),
         points: sparse_points,
     };
-    export_colmap(&output, &reconstruction, false)?;
-    let sparse_model = output.join("sparse/0");
+    let sparse_model = output.join("Cache/keyframe-sparse/0");
+    export_colmap_sparse_snapshot(&sparse_model, &reconstruction)?;
     let sparse_files = read_colmap_sparse_files(&sparse_model)?;
     write_colmap_sparse_binary(&sparse_model, &sparse_files)?;
 
@@ -326,7 +357,7 @@ fn keyframe_reconstruction_result_round_trips_through_json() {
         keyframe_ids: vec![101, 700, 42, u32::MAX],
         registered_keyframes: 4,
         database: PathBuf::from("output/Cache/database.db"),
-        sparse_model: PathBuf::from("output/sparse/0"),
+        sparse_model: PathBuf::from("output/Cache/keyframe-sparse/0"),
     };
 
     assert_json_round_trip(&result);
@@ -684,6 +715,7 @@ fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::R
     assert_eq!(result.diagnostics.len(), 6);
     assert!(output.join("sparse/0/images.bin").is_file());
     assert!(!output.join("sparse/0/obsolete.bin").exists());
+    assert!(keyframes.sparse_model.join("obsolete.bin").exists());
     assert!(output.join("registration.json").is_file());
     assert!(!output.join("registration.json.tmp").exists());
     assert!(!output.join("sparse/0.tmp").exists());
@@ -753,9 +785,10 @@ fn pause_before_sparse_publish_preserves_old_model_byte_for_byte() -> anyhow::Re
 }
 
 #[test]
-fn pause_after_sparse_publish_keeps_new_model_and_defers_json() -> anyhow::Result<()> {
+fn pause_after_sparse_publish_resumes_from_immutable_keyframes() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
     std::fs::write(keyframes.sparse_model.join("old.marker"), b"keyframe-model")?;
+    let keyframe_snapshot = snapshot_flat_directory(&keyframes.sparse_model)?;
     let control = SfmTaskControl::new();
     let pause_control = control.clone();
     let mut sink = move |event: rustsfm::SfmTaskEvent| {
@@ -782,14 +815,42 @@ fn pause_after_sparse_publish_keeps_new_model_and_defers_json() -> anyhow::Resul
         error.downcast_ref::<rustsfm::SfmTaskStop>(),
         Some(&rustsfm::SfmTaskStop::Paused)
     );
-    let published = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+    let published = read_colmap_sparse_model(&output.join("sparse/0"))?.reconstruction;
     assert_eq!(published.poses.iter().flatten().count(), 6);
-    assert!(keyframes.sparse_model.join("images.txt").is_file());
-    assert!(keyframes.sparse_model.join("images.bin").is_file());
-    assert!(!keyframes.sparse_model.join("old.marker").exists());
+    assert_eq!(
+        snapshot_flat_directory(&keyframes.sparse_model)?,
+        keyframe_snapshot
+    );
     assert!(!output.join("registration.json").exists());
     assert!(!output.join("sparse/0.tmp").exists());
     assert!(!output.join("sparse/0.backup").exists());
+
+    drop(task);
+    drop(sink);
+    let resume_control = SfmTaskControl::new();
+    let mut resume_events = Vec::new();
+    let mut resume_sink = |event| resume_events.push(event);
+    let mut resume_task = SfmTaskContext::new(&resume_control, &mut resume_sink);
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut resume_task,
+    )?;
+
+    assert!(result.has_complete_coverage());
+    assert!(output.join("registration.json").is_file());
+    assert_eq!(
+        snapshot_flat_directory(&keyframes.sparse_model)?,
+        keyframe_snapshot
+    );
+    assert!(resume_events.iter().all(|event| {
+        event.stage != rustsfm::SfmTaskStage::IncrementalMapping
+            || event.operation != rustsfm::SfmTaskOperation::Begin
+    }));
     Ok(())
 }
 
@@ -834,6 +895,58 @@ fn narrow_round_does_not_publish_same_round_registrations_as_support() -> anyhow
     let database = ColmapDatabase::open_read_only(&keyframes.database)?;
     assert!(!database.exists_matches(2, 4)?);
     assert!(!database.exists_two_view_geometry(2, 4)?);
+    Ok(())
+}
+
+#[test]
+fn wide_round_can_use_tracks_committed_by_narrow_non_keyframe() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let database = ColmapDatabase::open(&keyframes.database)?;
+    rewrite_synthetic_descriptor_variants(&database, &[4])?;
+    drop(database);
+
+    let control = SfmTaskControl::new();
+    let database_path = keyframes.database.clone();
+    let mut switched_narrow_support = false;
+    let mut sink = |event: rustsfm::SfmTaskEvent| {
+        if !switched_narrow_support
+            && event.operation == rustsfm::SfmTaskOperation::RegisterFrameAttempt
+            && event.image_id == Some(404)
+            && event
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("round=Narrow"))
+        {
+            let database = ColmapDatabase::open(&database_path).unwrap();
+            rewrite_synthetic_descriptor_variants(&database, &[2, 4]).unwrap();
+            switched_narrow_support = true;
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+
+    assert!(switched_narrow_support);
+    let dynamic_target = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 404)
+        .expect("dynamic-support target diagnostic");
+    assert_eq!(dynamic_target.status, FrameRegistrationStatus::Registered);
+    assert_eq!(dynamic_target.attempts, 2);
+    assert_eq!(
+        dynamic_target.message.as_deref(),
+        Some("registered in Wide round")
+    );
+    assert!(dynamic_target.support_frame_ids.contains(&202));
     Ok(())
 }
 
@@ -978,7 +1091,7 @@ fn pause_between_stages_does_not_repeat_or_modify_keyframe_work() -> anyhow::Res
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
     let database = ColmapDatabase::open_read_only(&keyframes.database)?;
     let keypoints_before = database.read_keypoints(1)?;
-    let sparse_before = std::fs::read(output.join("sparse/0/images.bin"))?;
+    let sparse_before = std::fs::read(keyframes.sparse_model.join("images.bin"))?;
     drop(database);
     let control = SfmTaskControl::new();
     control.request_pause();
@@ -1004,9 +1117,10 @@ fn pause_between_stages_does_not_repeat_or_modify_keyframe_work() -> anyhow::Res
     let database = ColmapDatabase::open_read_only(&keyframes.database)?;
     assert_eq!(database.read_keypoints(1)?, keypoints_before);
     assert_eq!(
-        std::fs::read(output.join("sparse/0/images.bin"))?,
+        std::fs::read(keyframes.sparse_model.join("images.bin"))?,
         sparse_before
     );
+    assert!(!output.join("sparse/0").exists());
     assert!(events.is_empty());
     Ok(())
 }
@@ -1041,7 +1155,9 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
     let matches_before = database.read_matches_blob(2, 4)?;
     let geometry_before = database.read_two_view_geometry(2, 4)?;
     drop(database);
-    std::fs::remove_dir_all(output.join("sparse"))?;
+    if output.join("sparse").exists() {
+        std::fs::remove_dir_all(output.join("sparse"))?;
+    }
 
     mapper_config.multiple_models = false;
     mapper_config.copy_images = false;
@@ -1066,7 +1182,23 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
 
     assert_eq!(keyframes.registered_keyframes, 4);
     assert_eq!(keyframes.database, output.join("Cache/database.db"));
-    assert!(keyframes.sparse_model.join("images.bin").is_file());
+    assert_eq!(
+        keyframes.sparse_model,
+        output.join("Cache/keyframe-sparse/0")
+    );
+    for file in [
+        "cameras.txt",
+        "images.txt",
+        "points3D.txt",
+        "cameras.bin",
+        "images.bin",
+        "points3D.bin",
+    ] {
+        assert!(
+            keyframes.sparse_model.join(file).is_file(),
+            "missing {file}"
+        );
+    }
     assert_eq!(
         events
             .iter()

@@ -13,10 +13,13 @@ use crate::database::{ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage}
 use crate::feature_extraction::extract_selected_features_to_database_with_task;
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::feature_matching_db::{
-    match_explicit_image_pairs_to_database_with_task, MatchFeaturesOptions,
+    match_explicit_image_pairs_to_database_with_session,
+    match_explicit_image_pairs_to_database_with_task, ExplicitPairMatchingSession,
+    MatchFeaturesOptions,
 };
 use crate::mapper::{
-    register_single_target_from_database, run_reconstruction_with_task, FeatureType, MapperConfig,
+    create_gpu_pnp_scorer, register_single_target_from_database_with_pnp_scorer,
+    run_reconstruction_with_task, FeatureType, MapperConfig,
 };
 use crate::task::{SfmTaskContext, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage};
 use crate::types::{Reconstruction, COLMAP_PINHOLE};
@@ -230,11 +233,11 @@ pub fn run_keyframe_reconstruction(
     reconstruction_config.local_matching = false;
     reconstruction_config.write_database = false;
     let summary = run_reconstruction_with_task(&reconstruction_config, task)?;
-    let sparse_model = output.join("sparse").join("0");
+    let published_sparse_model = output.join("sparse").join("0");
     let sparse_files =
-        read_colmap_sparse_files_with_format(&sparse_model, ColmapSparseFormat::Text)?;
-    write_colmap_sparse_binary(&sparse_model, &sparse_files)?;
-    let model = read_colmap_sparse_model(&sparse_model)?;
+        read_colmap_sparse_files_with_format(&published_sparse_model, ColmapSparseFormat::Text)?;
+    write_colmap_sparse_binary(&published_sparse_model, &sparse_files)?;
+    let model = read_colmap_sparse_model(&published_sparse_model)?;
     validate_sparse_reconstruction(&model.reconstruction)?;
     let registered_keyframes = model.reconstruction.poses.iter().flatten().count();
     if summary.registered_images != registered_keyframes {
@@ -243,6 +246,7 @@ pub fn run_keyframe_reconstruction(
             summary.registered_images
         );
     }
+    let sparse_model = persist_keyframe_sparse_snapshot(output, &model.reconstruction)?;
 
     Ok(KeyframeReconstructionResult {
         imported_frames: frames.len(),
@@ -254,6 +258,39 @@ pub fn run_keyframe_reconstruction(
         database,
         sparse_model,
     })
+}
+
+fn persist_keyframe_sparse_snapshot(
+    output: &Path,
+    reconstruction: &Reconstruction,
+) -> anyhow::Result<PathBuf> {
+    let cache = output.join("Cache");
+    let snapshot_root = cache.join("keyframe-sparse");
+    let destination = snapshot_root.join("0");
+    let temporary = snapshot_root.join("0.tmp");
+    let backup = snapshot_root.join("0.backup");
+    std::fs::create_dir_all(&snapshot_root)?;
+    std::fs::File::open(&cache)?.sync_all()?;
+    recover_sparse_publish_paths(&destination, &temporary, &backup)?;
+
+    let stage_result = (|| -> anyhow::Result<()> {
+        export_colmap_sparse_snapshot(&temporary, reconstruction)?;
+        let text_files =
+            read_colmap_sparse_files_with_format(&temporary, ColmapSparseFormat::Text)?;
+        write_colmap_sparse_binary(&temporary, &text_files)?;
+        sync_directory_files(&temporary)?;
+        let staged = read_colmap_sparse_model(&temporary)?;
+        validate_sparse_reconstruction(&staged.reconstruction)
+            .map_err(|error| error.context("invalid staged keyframe sparse model"))?;
+        Ok(())
+    })();
+    if let Err(error) = stage_result {
+        let _ = remove_file_or_directory(&temporary);
+        return Err(error);
+    }
+
+    replace_sparse_directory(&destination, &temporary, &backup)?;
+    Ok(destination)
 }
 
 fn link_or_copy_stable_image(source: &Path, destination_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -416,7 +453,7 @@ fn validate_keyframe_artifacts(
     mapper_config: &MapperConfig,
     output: &Path,
 ) -> anyhow::Result<Reconstruction> {
-    let expected_sparse_model = output.join("sparse").join("0");
+    let expected_sparse_model = output.join("Cache").join("keyframe-sparse").join("0");
     if keyframe_result.sparse_model != expected_sparse_model {
         anyhow::bail!(
             "keyframe sparse model must remain at {}",
@@ -654,6 +691,15 @@ pub fn register_remaining_sequence_frames(
     target_mapper_config.local_ba = false;
     target_mapper_config.global_ba = false;
     target_mapper_config.fix_existing_frames = true;
+    let has_pending_frames = !plan.pending_frames().is_empty();
+    let matching_session = has_pending_frames
+        .then(|| ExplicitPairMatchingSession::new(&match_options))
+        .transpose()?;
+    let mut pnp_scorer = if has_pending_frames {
+        create_gpu_pnp_scorer(&target_mapper_config)?
+    } else {
+        None
+    };
 
     for round in [RegistrationRound::Narrow, RegistrationRound::Wide] {
         let mut accepted_this_round = Vec::<usize>::new();
@@ -732,10 +778,13 @@ pub fn register_remaining_sequence_frames(
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let mut attempt_match_options = match_options.clone();
             attempt_match_options.random_seed = attempt_seed;
-            match_explicit_image_pairs_to_database_with_task(
+            match_explicit_image_pairs_to_database_with_session(
                 &keyframe_result.database,
                 &pairs,
                 &attempt_match_options,
+                matching_session
+                    .as_ref()
+                    .expect("pending frames initialized a matching session"),
                 task,
             )?;
             let target_name = stable_image_name(&frames[target])?;
@@ -745,13 +794,14 @@ pub fn register_remaining_sequence_frames(
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let mut attempt_mapper_config = target_mapper_config.clone();
             attempt_mapper_config.random_seed = attempt_seed;
-            let candidate = register_single_target_from_database(
+            let candidate = register_single_target_from_database_with_pnp_scorer(
                 &sequence_input,
                 &keyframe_result.database,
                 &current_reference,
                 target_name,
                 &support_names,
                 &attempt_mapper_config,
+                pnp_scorer.as_deref_mut(),
             )?;
             let (inlier_count, inlier_ratio, mean_error) = candidate
                 .as_ref()
@@ -943,6 +993,20 @@ fn replace_sparse_directory(
     temporary: &Path,
     backup: &Path,
 ) -> anyhow::Result<()> {
+    replace_sparse_directory_with_sync(destination, temporary, backup, |parent| {
+        std::fs::File::open(parent)?.sync_all()
+    })
+}
+
+fn replace_sparse_directory_with_sync<F>(
+    destination: &Path,
+    temporary: &Path,
+    backup: &Path,
+    mut sync_parent: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
     let had_destination = destination.exists();
     if had_destination {
         std::fs::rename(destination, backup)?;
@@ -954,6 +1018,11 @@ fn replace_sparse_directory(
             Ok(())
         };
         let _ = remove_file_or_directory(temporary);
+        let _ = sync_parent(
+            destination
+                .parent()
+                .expect("sparse destination has a parent"),
+        );
         return match restore_result {
             Ok(()) => Err(publish_error.into()),
             Err(restore_error) => anyhow::bail!(
@@ -961,25 +1030,30 @@ fn replace_sparse_directory(
             ),
         };
     }
-    if had_destination {
-        if let Err(cleanup_error) = remove_file_or_directory(backup) {
-            let moved_new_model = std::fs::rename(destination, temporary);
-            let restored_old_model = std::fs::rename(backup, destination);
-            if moved_new_model.is_ok() && restored_old_model.is_ok() {
-                let _ = remove_file_or_directory(temporary);
-                return Err(cleanup_error.into());
-            }
-            anyhow::bail!(
-                "published sparse model but failed to remove backup ({cleanup_error}); rollback new={moved_new_model:?} old={restored_old_model:?}"
-            );
+    let parent = destination
+        .parent()
+        .expect("sparse destination has a parent");
+    if let Err(sync_error) = sync_parent(parent) {
+        let remove_new_result = remove_file_or_directory(destination);
+        let restore_result = if had_destination {
+            std::fs::rename(backup, destination)
+        } else {
+            Ok(())
+        };
+        let _ = remove_file_or_directory(temporary);
+        let _ = sync_parent(parent);
+        if remove_new_result.is_ok() && restore_result.is_ok() {
+            return Err(sync_error.into());
         }
+        anyhow::bail!(
+            "failed to sync published sparse model ({sync_error}) and roll back new={remove_new_result:?} old={restore_result:?}"
+        );
     }
-    std::fs::File::open(
-        destination
-            .parent()
-            .expect("sparse destination has a parent"),
-    )?
-    .sync_all()?;
+
+    if had_destination {
+        let _ = remove_file_or_directory(backup);
+        let _ = sync_parent(parent);
+    }
     Ok(())
 }
 
@@ -1109,6 +1183,19 @@ fn write_registration_result_atomic(
     output: &Path,
     result: &SequenceRegistrationResult,
 ) -> anyhow::Result<()> {
+    write_registration_result_atomic_with_sync(output, result, |parent| {
+        std::fs::File::open(parent)?.sync_all()
+    })
+}
+
+fn write_registration_result_atomic_with_sync<F>(
+    output: &Path,
+    result: &SequenceRegistrationResult,
+    mut sync_parent: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
     use std::io::Write;
 
     std::fs::create_dir_all(output)?;
@@ -1121,6 +1208,7 @@ fn write_registration_result_atomic(
         file.flush()?;
         file.sync_all()?;
         std::fs::rename(&temporary, &destination)?;
+        sync_parent(output)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -2081,6 +2169,33 @@ mod task6_tests {
     }
 
     #[test]
+    fn registration_json_syncs_parent_after_rename() -> anyhow::Result<()> {
+        let output = tempfile::tempdir()?;
+        let destination = output.path().join("registration.json");
+        let result = SequenceRegistrationResult {
+            imported_frames: 1,
+            registered_frames: 1,
+            frame_ids: vec![42],
+            diagnostics: vec![FrameRegistrationDiagnostic::new(
+                42,
+                FrameRegistrationStatus::Keyframe,
+            )],
+            sparse_model: output.path().join("sparse/0"),
+        };
+        let mut sync_calls = 0usize;
+
+        write_registration_result_atomic_with_sync(output.path(), &result, |parent| {
+            sync_calls += 1;
+            assert_eq!(parent, output.path());
+            assert!(destination.is_file(), "rename must precede parent sync");
+            Ok(())
+        })?;
+
+        assert_eq!(sync_calls, 1);
+        Ok(())
+    }
+
+    #[test]
     fn registration_json_failure_preserves_existing_destination() -> anyhow::Result<()> {
         let output = tempfile::tempdir()?;
         let destination = output.path().join("registration.json");
@@ -2189,6 +2304,45 @@ mod task6_tests {
         );
         assert!(!backup.exists());
         assert!(!missing_staged.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_directory_replace_rolls_back_when_precommit_parent_sync_fails() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("0");
+        let staged = temp.path().join("0.tmp");
+        let backup = temp.path().join("0.backup");
+        std::fs::create_dir(&destination)?;
+        std::fs::write(destination.join("marker"), b"original-model")?;
+        std::fs::create_dir(&staged)?;
+        std::fs::write(staged.join("marker"), b"staged-model")?;
+        let mut sync_calls = 0usize;
+
+        let error = replace_sparse_directory_with_sync(&destination, &staged, &backup, |_| {
+            sync_calls += 1;
+            if sync_calls == 1 {
+                Err(std::io::Error::other("injected precommit sync failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected precommit sync failure"));
+        assert_eq!(
+            std::fs::read(destination.join("marker"))?,
+            b"original-model"
+        );
+        assert!(!backup.exists());
+        assert!(!staged.exists());
+        assert!(
+            sync_calls >= 2,
+            "rollback should sync the restored directory"
+        );
         Ok(())
     }
 }
