@@ -1,9 +1,36 @@
+use rustsfm::sift::SiftFeatures;
 use rustsfm::{
-    SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,
-    SfmTaskOperation, SfmTaskStage, SfmTaskStop,
+    extract_features_to_database_with_extractor_and_task, extract_features_to_database_with_task,
+    match_features_to_database_with_task, register_remaining_sequence_frames,
+    run_keyframe_reconstruction, run_reconstruction, run_reconstruction_with_callbacks,
+    run_reconstruction_with_task, run_sequence_registration, ExtractFeaturesReport,
+    KeyframeReconstructionResult, MapperConfig, MatchFeaturesOptions, MatchFeaturesReport,
+    PipelineCallbackSink, ReconstructionSummary, SequenceFrame, SequenceRegistrationConfig,
+    SequenceRegistrationResult, SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent,
+    SfmTaskEventKind, SfmTaskOperation, SfmTaskStage, SfmTaskStop, SiftExtractionOptions,
+    SiftFeatureExtractor,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
+use std::path::Path;
+
+struct PublicApiExtractor;
+
+impl SiftFeatureExtractor for PublicApiExtractor {
+    fn backend_name(&self) -> &'static str {
+        "public-api-test"
+    }
+
+    fn extract_grayscale(
+        &self,
+        _gray: &[u8],
+        _width: u32,
+        _height: u32,
+        _options: &SiftExtractionOptions,
+    ) -> anyhow::Result<SiftFeatures> {
+        unreachable!("compile-time API test does not extract features")
+    }
+}
 
 fn assert_wire_round_trips<T>(cases: &[(T, &str)])
 where
@@ -168,4 +195,89 @@ fn context_assigns_monotonic_event_metadata() {
 #[test]
 fn controlled_mapper_entry_point_is_public() {
     let _entry = rustsfm::run_reconstruction_with_task;
+}
+
+#[test]
+fn legacy_and_controlled_public_entry_points_keep_their_signatures() {
+    type LegacyMapperApi = fn(&MapperConfig) -> anyhow::Result<ReconstructionSummary>;
+    type LegacyCallbackMapperApi = for<'config, 'sink> fn(
+        &'config MapperConfig,
+        Option<&'sink mut dyn PipelineCallbackSink>,
+    )
+        -> anyhow::Result<ReconstructionSummary>;
+    type ControlledExtractionApi =
+        for<'database, 'images, 'options, 'context, 'task> fn(
+            &'database Path,
+            &'images Path,
+            &'options SiftExtractionOptions,
+            &'context mut SfmTaskContext<'task>,
+        ) -> anyhow::Result<
+            ExtractFeaturesReport,
+        >;
+    type ControlledExtractorApi =
+        for<'database, 'images, 'options, 'extractor, 'context, 'task> fn(
+            &'database Path,
+            &'images Path,
+            &'options SiftExtractionOptions,
+            &'extractor PublicApiExtractor,
+            &'context mut SfmTaskContext<'task>,
+        )
+            -> anyhow::Result<
+            ExtractFeaturesReport,
+        >;
+    type ControlledMatchingApi =
+        for<'database, 'options, 'context, 'task> fn(
+            &'database Path,
+            &'options MatchFeaturesOptions,
+            &'context mut SfmTaskContext<'task>,
+        )
+            -> anyhow::Result<MatchFeaturesReport>;
+    type ControlledMapperApi =
+        for<'config, 'context, 'task> fn(
+            &'config MapperConfig,
+            &'context mut SfmTaskContext<'task>,
+        ) -> anyhow::Result<ReconstructionSummary>;
+    type ControlledKeyframeApi =
+        for<'frames, 'keyframes, 'mapper, 'output, 'context, 'task> fn(
+            &'frames [SequenceFrame],
+            &'keyframes [u32],
+            &'mapper MapperConfig,
+            &'output Path,
+            &'context mut SfmTaskContext<'task>,
+        ) -> anyhow::Result<
+            KeyframeReconstructionResult,
+        >;
+    type ControlledRemainingSequenceApi =
+        for<'frames, 'keyframes, 'result, 'mapper, 'config, 'output, 'context, 'task> fn(
+            &'frames [SequenceFrame],
+            &'keyframes [u32],
+            &'result KeyframeReconstructionResult,
+            &'mapper MapperConfig,
+            &'config SequenceRegistrationConfig,
+            &'output Path,
+            &'context mut SfmTaskContext<'task>,
+        ) -> anyhow::Result<SequenceRegistrationResult>;
+    type ControlledSequenceApi =
+        for<'frames, 'keyframes, 'mapper, 'config, 'output, 'context, 'task> fn(
+            &'frames [SequenceFrame],
+            &'keyframes [u32],
+            &'mapper MapperConfig,
+            &'config SequenceRegistrationConfig,
+            &'output Path,
+            &'context mut SfmTaskContext<'task>,
+        )
+            -> anyhow::Result<
+            SequenceRegistrationResult,
+        >;
+
+    let _: LegacyMapperApi = run_reconstruction;
+    let _: LegacyCallbackMapperApi = run_reconstruction_with_callbacks;
+    let _: ControlledExtractionApi = extract_features_to_database_with_task;
+    let _: ControlledExtractorApi =
+        extract_features_to_database_with_extractor_and_task::<PublicApiExtractor>;
+    let _: ControlledMatchingApi = match_features_to_database_with_task;
+    let _: ControlledMapperApi = run_reconstruction_with_task;
+    let _: ControlledKeyframeApi = run_keyframe_reconstruction;
+    let _: ControlledRemainingSequenceApi = register_remaining_sequence_frames;
+    let _: ControlledSequenceApi = run_sequence_registration;
 }
