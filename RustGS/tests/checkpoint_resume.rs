@@ -10,7 +10,7 @@ use rustgs::{
     TrainingConfig, TrainingDataset, TrainingError, TrainingIdentity,
     MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
     MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
-    MAX_TRAINING_IDENTITY_BYTES, SE3, TRAINING_CHECKPOINT_FORMAT_VERSION,
+    MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3, TRAINING_CHECKPOINT_FORMAT_VERSION,
     TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
 };
 use serde::Serialize;
@@ -565,6 +565,13 @@ fn checkpoint_validation_rejects_adam_step_after_completed_iterations() {
         checkpoint.validate().unwrap_err(),
         "optimizer.sh_coeffs.step must not exceed completed iterations",
     );
+}
+
+#[test]
+fn checkpoint_validation_rejects_step_beyond_i32_boundary() {
+    let checkpoint = checkpoint_fixture(MAX_TRAINING_ITERATIONS + 1);
+
+    assert_invalid_input_contains(checkpoint.validate().unwrap_err(), "maximum safe step");
 }
 
 #[test]

@@ -5,6 +5,7 @@ use crate::TrainingError;
 
 const MIN_RENDER_SCALE: f32 = 0.0625;
 pub const DEFAULT_RASTER_COV_BLUR: f32 = 0.3;
+pub const MAX_TRAINING_ITERATIONS: usize = i32::MAX as usize - 1;
 
 /// Training backend selection.
 ///
@@ -884,6 +885,11 @@ impl TrainingConfig {
         if self.iterations == 0 {
             invalid.push("iterations must be >= 1".to_string());
         }
+        if self.iterations > MAX_TRAINING_ITERATIONS {
+            invalid.push(format!(
+                "iterations must not exceed maximum supported value {MAX_TRAINING_ITERATIONS}"
+            ));
+        }
         self.initialization.validate(&mut invalid);
         self.data.validate(&mut invalid);
         self.raster.validate(&mut invalid);
@@ -945,6 +951,20 @@ mod tests {
         assert!(config.validate().is_ok());
         config.litegs.rendering.sh_degree = 4;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn training_iterations_are_limited_to_the_safe_adam_step_range() {
+        let config = TrainingConfig {
+            iterations: MAX_TRAINING_ITERATIONS + 1,
+            ..TrainingConfig::default()
+        };
+
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            TrainingError::InvalidInput(message) if message.contains("maximum supported value")
+        ));
     }
 
     #[test]

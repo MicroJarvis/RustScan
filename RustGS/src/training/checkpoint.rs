@@ -12,6 +12,8 @@ use tempfile::{NamedTempFile, TempPath};
 
 use crate::{HostSplats, TrainingConfig, TrainingDataset, TrainingError};
 
+use super::config::MAX_TRAINING_ITERATIONS;
+
 pub const TRAINING_CHECKPOINT_VERSION: u32 = 1;
 pub const TRAINING_CHECKPOINT_MAGIC: [u8; 8] = *b"RGSCPBIN";
 pub const TRAINING_CHECKPOINT_FORMAT_VERSION: u32 = 1;
@@ -357,6 +359,12 @@ impl TrainingCheckpoint {
         validate_identity_field("config", &self.identity.config)?;
         if self.latest_loss.is_some_and(|loss| !loss.is_finite()) {
             return Err(invalid_checkpoint("latest loss must be finite"));
+        }
+        if self.completed_iterations > MAX_TRAINING_ITERATIONS {
+            return Err(invalid_checkpoint(format!(
+                "completed iterations {} exceeds maximum safe step {MAX_TRAINING_ITERATIONS}",
+                self.completed_iterations
+            )));
         }
         if self.splats.len() > MAX_TRAINING_CHECKPOINT_SPLATS {
             return Err(invalid_checkpoint(format!(

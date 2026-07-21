@@ -71,7 +71,7 @@ pub use config::{
     LiteGsRenderingConfig, LiteGsSplitScoreMode, LiteGsTileSize, LiteGsTopologyConfig,
     LiteGsTrainingProfile, TrainingBackend, TrainingConfig, TrainingDataConfig,
     TrainingInitializationConfig, TrainingLossConfig, TrainingOptimizerConfig,
-    TrainingRasterConfig, TrainingResult, DEFAULT_RASTER_COV_BLUR,
+    TrainingRasterConfig, TrainingResult, DEFAULT_RASTER_COV_BLUR, MAX_TRAINING_ITERATIONS,
 };
 #[cfg(feature = "gpu")]
 pub use reporting::telemetry::{

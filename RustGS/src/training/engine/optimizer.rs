@@ -7,7 +7,9 @@ use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElemen
 use burn_wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime};
 use bytemuck::{Pod, Zeroable};
 
-use crate::training::{AdamCheckpoint, AdamParameterCheckpoint, TensorCheckpoint};
+use crate::training::{
+    AdamCheckpoint, AdamParameterCheckpoint, TensorCheckpoint, MAX_TRAINING_ITERATIONS,
+};
 use crate::TrainingError;
 
 use super::splats::DeviceSplats;
@@ -345,6 +347,12 @@ impl<B: Backend> AdamScaled<B> {
                 checkpoint.transforms.step,
                 checkpoint.sh_coeffs.step,
                 checkpoint.raw_opacities.step
+            )));
+        }
+        if checkpoint.transforms.step > MAX_TRAINING_ITERATIONS {
+            return Err(invalid_optimizer_checkpoint(format!(
+                "optimizer step {} exceeds maximum safe step {MAX_TRAINING_ITERATIONS}",
+                checkpoint.transforms.step
             )));
         }
 
@@ -813,6 +821,28 @@ mod tests {
             restored.checkpoint().await.expect("re-export checkpoint"),
             before
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn optimizer_checkpoint_restore_rejects_step_beyond_i32_boundary() {
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut splats = test_splats(&device);
+        let mut optimizer = optimizer_with_scaling(&device);
+        optimizer_step(&mut optimizer, &mut splats, &device);
+        let mut checkpoint = optimizer.checkpoint().await.expect("export checkpoint");
+        let unsafe_step = MAX_TRAINING_ITERATIONS + 1;
+        checkpoint.transforms.step = unsafe_step;
+        checkpoint.sh_coeffs.step = unsafe_step;
+        checkpoint.raw_opacities.step = unsafe_step;
+
+        let mut restored = AdamScaled::<GsBackendBase>::new(AdamScaledConfig::default());
+        let error = restored
+            .restore(&checkpoint, &splats, &device)
+            .expect_err("step beyond the safe Adam boundary must be rejected");
+        assert!(matches!(
+            error,
+            TrainingError::InvalidInput(message) if message.contains("maximum safe step")
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
