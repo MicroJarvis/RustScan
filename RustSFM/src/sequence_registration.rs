@@ -1,5 +1,5 @@
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -31,6 +31,22 @@ impl Default for SequenceRegistrationConfig {
             max_reprojection_error: 4.0,
             use_gpu_pnp: true,
         }
+    }
+}
+
+impl SequenceRegistrationConfig {
+    pub fn validate(&self) -> Result<(), SequenceRegistrationError> {
+        if !self.min_inlier_ratio.is_finite() || !(0.0..=1.0).contains(&self.min_inlier_ratio) {
+            return Err(SequenceRegistrationError::InvalidConfigMetric {
+                field: "min_inlier_ratio",
+            });
+        }
+        if !self.max_reprojection_error.is_finite() || self.max_reprojection_error < 0.0 {
+            return Err(SequenceRegistrationError::InvalidConfigMetric {
+                field: "max_reprojection_error",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -105,6 +121,7 @@ impl FrameRegistrationDiagnostic {
 pub struct SequenceRegistrationResult {
     pub imported_frames: usize,
     pub registered_frames: usize,
+    pub frame_ids: Vec<u32>,
     pub diagnostics: Vec<FrameRegistrationDiagnostic>,
     pub sparse_model: PathBuf,
 }
@@ -115,31 +132,60 @@ impl SequenceRegistrationResult {
     }
 
     pub fn validate_complete_coverage(&self) -> Result<(), SequenceRegistrationError> {
+        if self.imported_frames == 0 {
+            return Err(SequenceRegistrationError::EmptySequence);
+        }
+        if self.diagnostics.len() != self.imported_frames {
+            return Err(SequenceRegistrationError::DiagnosticCountMismatch {
+                imported_frames: self.imported_frames,
+                diagnostic_count: self.diagnostics.len(),
+            });
+        }
         if self.imported_frames as u128 > u32::MAX as u128 + 1 {
             return Err(SequenceRegistrationError::FrameCountExceedsFrameIdRange {
                 imported_frames: self.imported_frames,
             });
         }
+        if self.frame_ids.len() != self.imported_frames {
+            return Err(SequenceRegistrationError::InvalidFrameIds {
+                imported_frames: self.imported_frames,
+                frame_id_count: self.frame_ids.len(),
+                duplicate_frame_ids: Vec::new(),
+            });
+        }
+
+        let mut expected_frame_ids = BTreeSet::new();
+        let mut duplicate_expected_frame_ids = BTreeSet::new();
+        for frame_id in self.frame_ids.iter().copied() {
+            if !expected_frame_ids.insert(frame_id) {
+                duplicate_expected_frame_ids.insert(frame_id);
+            }
+        }
+        if !duplicate_expected_frame_ids.is_empty() {
+            return Err(SequenceRegistrationError::InvalidFrameIds {
+                imported_frames: self.imported_frames,
+                frame_id_count: self.frame_ids.len(),
+                duplicate_frame_ids: duplicate_expected_frame_ids.into_iter().collect(),
+            });
+        }
 
         let mut observed_frame_ids = BTreeSet::new();
         let mut duplicate_frame_ids = BTreeSet::new();
-        let mut unexpected_frame_ids = BTreeSet::new();
         for diagnostic in &self.diagnostics {
-            if diagnostic.frame_id as u128 >= self.imported_frames as u128 {
-                unexpected_frame_ids.insert(diagnostic.frame_id);
-            }
             if !observed_frame_ids.insert(diagnostic.frame_id) {
                 duplicate_frame_ids.insert(diagnostic.frame_id);
             }
         }
-        let missing_frame_ids: Vec<_> = (0..self.imported_frames)
-            .map(|frame| frame as u32)
-            .filter(|frame| !observed_frame_ids.contains(frame))
+        let missing_frame_ids: Vec<_> = expected_frame_ids
+            .difference(&observed_frame_ids)
+            .copied()
             .collect();
         let duplicate_frame_ids: Vec<_> = duplicate_frame_ids.into_iter().collect();
-        let unexpected_frame_ids: Vec<_> = unexpected_frame_ids.into_iter().collect();
-        if self.diagnostics.len() != self.imported_frames
-            || !missing_frame_ids.is_empty()
+        let unexpected_frame_ids: Vec<_> = observed_frame_ids
+            .difference(&expected_frame_ids)
+            .copied()
+            .collect();
+        if !missing_frame_ids.is_empty()
             || !duplicate_frame_ids.is_empty()
             || !unexpected_frame_ids.is_empty()
         {
@@ -150,6 +196,26 @@ impl SequenceRegistrationResult {
                 duplicate_frame_ids,
                 unexpected_frame_ids,
             });
+        }
+
+        for diagnostic in &self.diagnostics {
+            if !diagnostic.inlier_ratio.is_finite()
+                || !(0.0..=1.0).contains(&diagnostic.inlier_ratio)
+            {
+                return Err(SequenceRegistrationError::InvalidDiagnosticMetric {
+                    frame_id: diagnostic.frame_id,
+                    field: "inlier_ratio",
+                });
+            }
+            if diagnostic
+                .mean_reprojection_error
+                .is_some_and(|error| !error.is_finite() || error < 0.0)
+            {
+                return Err(SequenceRegistrationError::InvalidDiagnosticMetric {
+                    frame_id: diagnostic.frame_id,
+                    field: "mean_reprojection_error",
+                });
+            }
         }
 
         let unresolved_frame_ids = self
@@ -181,6 +247,10 @@ impl SequenceRegistrationResult {
 pub enum SequenceRegistrationError {
     EmptySequence,
     EmptyKeyframes,
+    TooManyKeyframes {
+        frame_count: usize,
+        keyframe_count: usize,
+    },
     DuplicateKeyframe {
         frame: usize,
     },
@@ -194,6 +264,30 @@ pub enum SequenceRegistrationError {
     },
     FrameCountExceedsFrameIdRange {
         imported_frames: usize,
+    },
+    InvalidFrameIds {
+        imported_frames: usize,
+        frame_id_count: usize,
+        duplicate_frame_ids: Vec<u32>,
+    },
+    TimestampCountMismatch {
+        frame_count: usize,
+        timestamp_count: usize,
+    },
+    UnsortedTimestamps {
+        previous_frame: usize,
+        current_frame: usize,
+    },
+    DiagnosticCountMismatch {
+        imported_frames: usize,
+        diagnostic_count: usize,
+    },
+    InvalidConfigMetric {
+        field: &'static str,
+    },
+    InvalidDiagnosticMetric {
+        frame_id: u32,
+        field: &'static str,
     },
     InvalidDiagnostics {
         imported_frames: usize,
@@ -221,6 +315,13 @@ impl fmt::Display for SequenceRegistrationError {
             Self::EmptyKeyframes => {
                 formatter.write_str("sequence registration requires at least one keyframe")
             }
+            Self::TooManyKeyframes {
+                frame_count,
+                keyframe_count,
+            } => write!(
+                formatter,
+                "{keyframe_count} keyframes exceed sequence length {frame_count}"
+            ),
             Self::DuplicateKeyframe { frame } => {
                 write!(formatter, "duplicate keyframe index {frame}")
             }
@@ -235,6 +336,42 @@ impl fmt::Display for SequenceRegistrationError {
             Self::FrameCountExceedsFrameIdRange { imported_frames } => write!(
                 formatter,
                 "{imported_frames} imported frames cannot be represented by u32 frame IDs"
+            ),
+            Self::InvalidFrameIds {
+                imported_frames,
+                frame_id_count,
+                duplicate_frame_ids,
+            } => write!(
+                formatter,
+                "invalid expected frame IDs: expected {imported_frames}, found {frame_id_count}; duplicate frame IDs {duplicate_frame_ids:?}"
+            ),
+            Self::TimestampCountMismatch {
+                frame_count,
+                timestamp_count,
+            } => write!(
+                formatter,
+                "timestamp count {timestamp_count} does not match frame count {frame_count}"
+            ),
+            Self::UnsortedTimestamps {
+                previous_frame,
+                current_frame,
+            } => write!(
+                formatter,
+                "frame {current_frame} timestamp precedes frame {previous_frame}"
+            ),
+            Self::DiagnosticCountMismatch {
+                imported_frames,
+                diagnostic_count,
+            } => write!(
+                formatter,
+                "diagnostic count {diagnostic_count} does not match imported frame count {imported_frames}"
+            ),
+            Self::InvalidConfigMetric { field } => {
+                write!(formatter, "sequence registration config metric {field} is invalid")
+            }
+            Self::InvalidDiagnosticMetric { frame_id, field } => write!(
+                formatter,
+                "frame {frame_id} registration diagnostic metric {field} is invalid"
             ),
             Self::InvalidDiagnostics {
                 imported_frames,
@@ -306,6 +443,8 @@ pub struct SequenceRegistrationPlan {
     keyframes: Vec<usize>,
     narrow_neighbors_each_side: usize,
     wide_neighbors_each_side: usize,
+    frame_ids: Vec<u32>,
+    timestamps_us: Option<Vec<i64>>,
     pending: Vec<usize>,
     narrow_support: Vec<Vec<usize>>,
     wide_support: Vec<Vec<usize>>,
@@ -319,19 +458,71 @@ impl SequenceRegistrationPlan {
         wide_neighbors_each_side: usize,
     ) -> Result<Self, SequenceRegistrationError> {
         validate_keyframes(frame_count, keyframes)?;
+        let frame_ids = (0..frame_count).map(|frame| frame as u32).collect();
+        Self::build_validated(
+            frame_count,
+            keyframes,
+            narrow_neighbors_each_side,
+            wide_neighbors_each_side,
+            frame_ids,
+            None,
+        )
+    }
+
+    pub fn build_from_frames(
+        frames: &[SequenceFrame],
+        keyframes: &[usize],
+        narrow_neighbors_each_side: usize,
+        wide_neighbors_each_side: usize,
+    ) -> Result<Self, SequenceRegistrationError> {
+        validate_keyframes(frames.len(), keyframes)?;
+        let frame_ids = frames.iter().map(|frame| frame.id).collect();
+        let timestamps_us = frames.iter().map(|frame| frame.timestamp_us).collect();
+        Self::build_validated(
+            frames.len(),
+            keyframes,
+            narrow_neighbors_each_side,
+            wide_neighbors_each_side,
+            frame_ids,
+            timestamps_us,
+        )
+    }
+
+    fn build_validated(
+        frame_count: usize,
+        keyframes: &[usize],
+        narrow_neighbors_each_side: usize,
+        wide_neighbors_each_side: usize,
+        frame_ids: Vec<u32>,
+        timestamps_us: Option<Vec<i64>>,
+    ) -> Result<Self, SequenceRegistrationError> {
+        validate_plan_ordering(frame_count, &frame_ids, timestamps_us.as_deref())?;
 
         let pending = (0..frame_count)
             .filter(|frame| keyframes.binary_search(frame).is_err())
             .collect();
-        let narrow_support =
-            build_support_lists(frame_count, keyframes, narrow_neighbors_each_side);
-        let wide_support = build_support_lists(frame_count, keyframes, wide_neighbors_each_side);
+        let narrow_support = build_support_lists(
+            frame_count,
+            keyframes,
+            narrow_neighbors_each_side,
+            &frame_ids,
+            timestamps_us.as_deref(),
+        );
+        let wide_support = build_support_lists(
+            frame_count,
+            keyframes,
+            wide_neighbors_each_side,
+            &frame_ids,
+            timestamps_us.as_deref(),
+        );
 
         Ok(Self {
             frame_count,
             keyframes: keyframes.to_vec(),
             narrow_neighbors_each_side,
             wide_neighbors_each_side,
+            frame_ids,
+            timestamps_us,
             pending,
             narrow_support,
             wide_support,
@@ -349,6 +540,38 @@ impl SequenceRegistrationPlan {
         };
         support.get(frame).map(Vec::as_slice).unwrap_or(&[])
     }
+
+    pub fn attempts_for_with_support(
+        &self,
+        frame: usize,
+        round: RegistrationRound,
+        registered_support: &[usize],
+    ) -> Vec<usize> {
+        if frame >= self.frame_count || self.keyframes.binary_search(&frame).is_ok() {
+            return Vec::new();
+        }
+
+        let mut candidates = self.keyframes.clone();
+        candidates.extend(
+            registered_support
+                .iter()
+                .copied()
+                .filter(|support| *support < self.frame_count && *support != frame),
+        );
+        candidates.sort_unstable();
+        candidates.dedup();
+        let neighbors_each_side = match round {
+            RegistrationRound::Narrow => self.narrow_neighbors_each_side,
+            RegistrationRound::Wide => self.wide_neighbors_each_side,
+        };
+        support_for(
+            frame,
+            &candidates,
+            neighbors_each_side,
+            &self.frame_ids,
+            self.timestamps_us.as_deref(),
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -357,6 +580,8 @@ struct SequenceRegistrationPlanRef<'a> {
     keyframes: &'a [usize],
     narrow_neighbors_each_side: usize,
     wide_neighbors_each_side: usize,
+    frame_ids: &'a [u32],
+    timestamps_us: Option<&'a [i64]>,
 }
 
 #[derive(Deserialize)]
@@ -365,6 +590,8 @@ struct SequenceRegistrationPlanWire {
     keyframes: Vec<usize>,
     narrow_neighbors_each_side: usize,
     wide_neighbors_each_side: usize,
+    frame_ids: Vec<u32>,
+    timestamps_us: Option<Vec<i64>>,
 }
 
 impl Serialize for SequenceRegistrationPlan {
@@ -377,6 +604,8 @@ impl Serialize for SequenceRegistrationPlan {
             keyframes: &self.keyframes,
             narrow_neighbors_each_side: self.narrow_neighbors_each_side,
             wide_neighbors_each_side: self.wide_neighbors_each_side,
+            frame_ids: &self.frame_ids,
+            timestamps_us: self.timestamps_us.as_deref(),
         }
         .serialize(serializer)
     }
@@ -388,11 +617,14 @@ impl<'de> Deserialize<'de> for SequenceRegistrationPlan {
         D: Deserializer<'de>,
     {
         let wire = SequenceRegistrationPlanWire::deserialize(deserializer)?;
-        Self::build(
+        validate_keyframes(wire.frame_count, &wire.keyframes).map_err(de::Error::custom)?;
+        Self::build_validated(
             wire.frame_count,
             &wire.keyframes,
             wire.narrow_neighbors_each_side,
             wire.wide_neighbors_each_side,
+            wire.frame_ids,
+            wire.timestamps_us,
         )
         .map_err(de::Error::custom)
     }
@@ -402,23 +634,42 @@ fn validate_keyframes(
     frame_count: usize,
     keyframes: &[usize],
 ) -> Result<(), SequenceRegistrationError> {
+    if frame_count as u128 > u32::MAX as u128 + 1 {
+        return Err(SequenceRegistrationError::FrameCountExceedsFrameIdRange {
+            imported_frames: frame_count,
+        });
+    }
     if frame_count == 0 {
         return Err(SequenceRegistrationError::EmptySequence);
+    }
+    if keyframes.len() > frame_count {
+        return Err(SequenceRegistrationError::TooManyKeyframes {
+            frame_count,
+            keyframe_count: keyframes.len(),
+        });
     }
     if keyframes.is_empty() {
         return Err(SequenceRegistrationError::EmptyKeyframes);
     }
 
-    for (index, frame) in keyframes.iter().copied().enumerate() {
-        if frame >= frame_count {
-            return Err(SequenceRegistrationError::KeyframeOutOfRange { frame, frame_count });
-        }
-        if keyframes[..index].contains(&frame) {
-            return Err(SequenceRegistrationError::DuplicateKeyframe { frame });
-        }
+    let first = keyframes[0];
+    if first >= frame_count {
+        return Err(SequenceRegistrationError::KeyframeOutOfRange {
+            frame: first,
+            frame_count,
+        });
     }
-
     for pair in keyframes.windows(2) {
+        let current = pair[1];
+        if current >= frame_count {
+            return Err(SequenceRegistrationError::KeyframeOutOfRange {
+                frame: current,
+                frame_count,
+            });
+        }
+        if pair[0] == current {
+            return Err(SequenceRegistrationError::DuplicateKeyframe { frame: current });
+        }
         if pair[0] > pair[1] {
             return Err(SequenceRegistrationError::UnsortedKeyframes {
                 previous: pair[0],
@@ -429,37 +680,101 @@ fn validate_keyframes(
     Ok(())
 }
 
+fn validate_plan_ordering(
+    frame_count: usize,
+    frame_ids: &[u32],
+    timestamps_us: Option<&[i64]>,
+) -> Result<(), SequenceRegistrationError> {
+    if frame_ids.len() != frame_count {
+        return Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: frame_count,
+            frame_id_count: frame_ids.len(),
+            duplicate_frame_ids: Vec::new(),
+        });
+    }
+    let mut observed = HashSet::with_capacity(frame_ids.len());
+    let mut duplicates = BTreeSet::new();
+    for frame_id in frame_ids.iter().copied() {
+        if !observed.insert(frame_id) {
+            duplicates.insert(frame_id);
+        }
+    }
+    if !duplicates.is_empty() {
+        return Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: frame_count,
+            frame_id_count: frame_ids.len(),
+            duplicate_frame_ids: duplicates.into_iter().collect(),
+        });
+    }
+    if let Some(timestamps_us) = timestamps_us {
+        if timestamps_us.len() != frame_count {
+            return Err(SequenceRegistrationError::TimestampCountMismatch {
+                frame_count,
+                timestamp_count: timestamps_us.len(),
+            });
+        }
+        for (previous_frame, timestamps) in timestamps_us.windows(2).enumerate() {
+            if timestamps[0] > timestamps[1] {
+                return Err(SequenceRegistrationError::UnsortedTimestamps {
+                    previous_frame,
+                    current_frame: previous_frame + 1,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_support_lists(
     frame_count: usize,
     keyframes: &[usize],
     neighbors_each_side: usize,
+    frame_ids: &[u32],
+    timestamps_us: Option<&[i64]>,
 ) -> Vec<Vec<usize>> {
     (0..frame_count)
         .map(|frame| {
             if keyframes.binary_search(&frame).is_ok() {
                 Vec::new()
             } else {
-                support_for(frame, keyframes, neighbors_each_side)
+                support_for(
+                    frame,
+                    keyframes,
+                    neighbors_each_side,
+                    frame_ids,
+                    timestamps_us,
+                )
             }
         })
         .collect()
 }
 
-fn support_for(frame: usize, keyframes: &[usize], neighbors_each_side: usize) -> Vec<usize> {
-    let mut support: Vec<_> = keyframes
-        .iter()
-        .rev()
-        .copied()
-        .filter(|keyframe| *keyframe < frame)
-        .take(neighbors_each_side)
-        .chain(
-            keyframes
-                .iter()
-                .copied()
-                .filter(|keyframe| *keyframe > frame)
-                .take(neighbors_each_side),
-        )
-        .collect();
-    support.sort_by_key(|keyframe| (keyframe.abs_diff(frame), *keyframe));
+fn support_for(
+    frame: usize,
+    candidates: &[usize],
+    neighbors_each_side: usize,
+    frame_ids: &[u32],
+    timestamps_us: Option<&[i64]>,
+) -> Vec<usize> {
+    let left_end = candidates.partition_point(|candidate| *candidate < frame);
+    let right_start = candidates.partition_point(|candidate| *candidate <= frame);
+    let left_start = left_end.saturating_sub(neighbors_each_side);
+    let right_end = right_start
+        .saturating_add(neighbors_each_side)
+        .min(candidates.len());
+
+    let mut support = Vec::with_capacity(
+        left_end.saturating_sub(left_start) + right_end.saturating_sub(right_start),
+    );
+    support.extend_from_slice(&candidates[left_start..left_end]);
+    support.extend_from_slice(&candidates[right_start..right_end]);
+    support.sort_by_key(|candidate| {
+        let distance = if let Some(timestamps_us) = timestamps_us {
+            timestamps_us[*candidate].abs_diff(timestamps_us[frame]) as u128
+        } else {
+            candidate.abs_diff(frame) as u128
+        };
+        (distance, frame_ids[*candidate])
+    });
     support
 }

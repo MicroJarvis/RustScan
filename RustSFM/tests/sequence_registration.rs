@@ -36,7 +36,7 @@ fn temporal_plan_json_round_trip_rebuilds_equivalent_attempts() {
 
     let json = serde_json::to_string(&plan).unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(value.as_object().unwrap().len(), 4);
+    assert_eq!(value.as_object().unwrap().len(), 6);
     assert!(value.get("pending").is_none());
     assert!(value.get("narrow_support").is_none());
     assert!(value.get("wide_support").is_none());
@@ -61,6 +61,8 @@ fn temporal_plan_json_rejects_invalid_keyframe_inputs() {
         "keyframes": [0, 2, 1],
         "narrow_neighbors_each_side": 2,
         "wide_neighbors_each_side": 4,
+        "frame_ids": [10, 20, 30, 40],
+        "timestamps_us": null,
     });
 
     assert!(serde_json::from_value::<SequenceRegistrationPlan>(invalid).is_err());
@@ -77,6 +79,120 @@ fn temporal_rounds_limit_each_side_then_sort_by_distance_and_frame_id() {
         &[7, 2, 9, 0]
     );
     assert_eq!(first, second);
+}
+
+#[test]
+fn temporal_later_round_can_add_only_explicit_registered_support() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+
+    assert_eq!(
+        plan.attempts_for_with_support(4, RegistrationRound::Wide, &[]),
+        vec![3, 6, 0, 9, 11]
+    );
+    assert_eq!(
+        plan.attempts_for_with_support(4, RegistrationRound::Wide, &[7, 5, 2, 5, 4, usize::MAX],),
+        vec![3, 5, 2, 6, 7, 0, 9]
+    );
+}
+
+#[test]
+fn temporal_frame_plan_orders_support_by_timestamp_distance_then_frame_id() {
+    let frames = [
+        SequenceFrame {
+            id: 100,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 90,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(999),
+        },
+        SequenceFrame {
+            id: 50,
+            image_path: PathBuf::from("002.jpg"),
+            timestamp_us: Some(1_000),
+        },
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("003.jpg"),
+            timestamp_us: Some(1_001),
+        },
+        SequenceFrame {
+            id: 30,
+            image_path: PathBuf::from("004.jpg"),
+            timestamp_us: Some(2_000),
+        },
+    ];
+
+    let plan = SequenceRegistrationPlan::build_from_frames(&frames, &[0, 1, 3, 4], 2, 4).unwrap();
+
+    assert_eq!(
+        plan.attempts_for(2, RegistrationRound::Narrow),
+        &[3, 1, 4, 0]
+    );
+
+    let restored: SequenceRegistrationPlan =
+        serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+    assert_eq!(restored, plan);
+    assert_eq!(
+        restored.attempts_for(2, RegistrationRound::Narrow),
+        &[3, 1, 4, 0]
+    );
+}
+
+#[test]
+fn temporal_frame_plan_rejects_unsorted_timestamps() {
+    let frames = [
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 20,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(200),
+        },
+        SequenceFrame {
+            id: 30,
+            image_path: PathBuf::from("002.jpg"),
+            timestamp_us: Some(100),
+        },
+    ];
+
+    assert!(matches!(
+        SequenceRegistrationPlan::build_from_frames(&frames, &[0, 2], 2, 4),
+        Err(SequenceRegistrationError::UnsortedTimestamps {
+            previous_frame: 1,
+            current_frame: 2,
+        })
+    ));
+}
+
+#[test]
+fn temporal_frame_plan_rejects_duplicate_frame_ids() {
+    let frames = [
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(100),
+        },
+    ];
+
+    assert!(matches!(
+        SequenceRegistrationPlan::build_from_frames(&frames, &[0, 1], 2, 4),
+        Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: 2,
+            frame_id_count: 2,
+            duplicate_frame_ids,
+        }) if duplicate_frame_ids == vec![10]
+    ));
 }
 
 #[test]
@@ -115,6 +231,40 @@ fn invalid_temporal_plan_rejects_unsorted_keyframes() {
 }
 
 #[test]
+fn invalid_temporal_plan_rejects_more_keyframes_than_frames() {
+    assert!(matches!(
+        SequenceRegistrationPlan::build(2, &[0, 1, 1], 2, 4),
+        Err(SequenceRegistrationError::TooManyKeyframes {
+            frame_count: 2,
+            keyframe_count: 3,
+        })
+    ));
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn invalid_temporal_plan_rejects_unrepresentable_frame_count_before_allocating() {
+    let frame_count = u32::MAX as usize + 2;
+
+    assert!(matches!(
+        SequenceRegistrationPlan::build(frame_count, &[0], 2, 4),
+        Err(SequenceRegistrationError::FrameCountExceedsFrameIdRange {
+            imported_frames,
+        }) if imported_frames == frame_count
+    ));
+
+    let json = serde_json::json!({
+        "frame_count": frame_count,
+        "keyframes": [0],
+        "narrow_neighbors_each_side": 2,
+        "wide_neighbors_each_side": 4,
+        "frame_ids": [0],
+        "timestamps_us": null,
+    });
+    assert!(serde_json::from_value::<SequenceRegistrationPlan>(json).is_err());
+}
+
+#[test]
 fn registration_status_identifies_pose_coverage() {
     assert!(FrameRegistrationStatus::Keyframe.is_registered());
     assert!(FrameRegistrationStatus::Registered.is_registered());
@@ -133,6 +283,31 @@ fn sequence_config_defaults_match_registration_policy() {
     assert_eq!(config.max_reprojection_error, 4.0);
     assert!(config.use_gpu_pnp);
     assert_json_round_trip(&config);
+}
+
+#[test]
+fn sequence_config_validation_rejects_non_finite_metrics() {
+    let config = SequenceRegistrationConfig {
+        min_inlier_ratio: f64::NAN,
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(SequenceRegistrationError::InvalidConfigMetric {
+            field: "min_inlier_ratio"
+        })
+    ));
+
+    let config = SequenceRegistrationConfig {
+        max_reprojection_error: f64::INFINITY,
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(SequenceRegistrationError::InvalidConfigMetric {
+            field: "max_reprojection_error"
+        })
+    ));
 }
 
 #[test]
@@ -192,6 +367,7 @@ fn sequence_result_round_trip_preserves_diagnostics() {
     let result = SequenceRegistrationResult {
         imported_frames: 2,
         registered_frames: 1,
+        frame_ids: vec![0, 1],
         diagnostics: vec![
             FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
             FrameRegistrationDiagnostic {
@@ -209,6 +385,10 @@ fn sequence_result_round_trip_preserves_diagnostics() {
     };
 
     assert_json_round_trip(&result);
+
+    let mut json = serde_json::to_value(&result).unwrap();
+    json.as_object_mut().unwrap().remove("frame_ids");
+    assert!(serde_json::from_value::<SequenceRegistrationResult>(json).is_err());
 }
 
 #[test]
@@ -216,9 +396,10 @@ fn complete_coverage_accepts_keyframes_and_registered_frames() {
     let result = SequenceRegistrationResult {
         imported_frames: 2,
         registered_frames: 2,
+        frame_ids: vec![10, 20],
         diagnostics: vec![
-            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
-            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+            FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(20, FrameRegistrationStatus::Registered),
         ],
         sparse_model: PathBuf::from("sparse/0"),
     };
@@ -232,6 +413,7 @@ fn incomplete_frame_count_returns_an_explicit_error() {
     let result = SequenceRegistrationResult {
         imported_frames: 3,
         registered_frames: 2,
+        frame_ids: vec![0, 1, 2],
         diagnostics: vec![
             FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
             FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
@@ -258,6 +440,7 @@ fn unresolved_diagnostic_fails_coverage_even_when_counts_match() {
     let result = SequenceRegistrationResult {
         imported_frames: 3,
         registered_frames: 3,
+        frame_ids: vec![0, 1, 2],
         diagnostics: vec![
             FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
             FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
@@ -284,6 +467,7 @@ fn complete_counts_with_missing_diagnostic_fail_coverage() {
     let result = SequenceRegistrationResult {
         imported_frames: 3,
         registered_frames: 3,
+        frame_ids: vec![0, 1, 2],
         diagnostics: vec![
             FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
             FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
@@ -294,15 +478,10 @@ fn complete_counts_with_missing_diagnostic_fail_coverage() {
     assert!(!result.has_complete_coverage());
     assert!(matches!(
         result.validate_complete_coverage(),
-        Err(SequenceRegistrationError::InvalidDiagnostics {
+        Err(SequenceRegistrationError::DiagnosticCountMismatch {
             imported_frames: 3,
             diagnostic_count: 2,
-            missing_frame_ids,
-            duplicate_frame_ids,
-            unexpected_frame_ids,
-        }) if missing_frame_ids == vec![2]
-            && duplicate_frame_ids.is_empty()
-            && unexpected_frame_ids.is_empty()
+        })
     ));
 }
 
@@ -311,6 +490,7 @@ fn complete_counts_with_duplicate_diagnostic_fail_coverage() {
     let result = SequenceRegistrationResult {
         imported_frames: 3,
         registered_frames: 3,
+        frame_ids: vec![0, 1, 2],
         diagnostics: vec![
             FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
             FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
@@ -331,5 +511,152 @@ fn complete_counts_with_duplicate_diagnostic_fail_coverage() {
         }) if missing_frame_ids == vec![2]
             && duplicate_frame_ids == vec![1]
             && unexpected_frame_ids.is_empty()
+    ));
+}
+
+#[test]
+fn arbitrary_expected_frame_ids_reject_fabricated_contiguous_diagnostics() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 2,
+        frame_ids: vec![10, 20],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidDiagnostics {
+            imported_frames: 2,
+            diagnostic_count: 2,
+            missing_frame_ids,
+            duplicate_frame_ids,
+            unexpected_frame_ids,
+        }) if missing_frame_ids == vec![10, 20]
+            && duplicate_frame_ids.is_empty()
+            && unexpected_frame_ids == vec![0, 1]
+    ));
+}
+
+#[test]
+fn duplicate_expected_frame_ids_fail_coverage() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 2,
+        frame_ids: vec![10, 10],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(20, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: 2,
+            frame_id_count: 2,
+            duplicate_frame_ids,
+        }) if duplicate_frame_ids == vec![10]
+    ));
+}
+
+#[test]
+fn expected_frame_id_count_must_match_imported_frames() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 2,
+        frame_ids: vec![10],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(20, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: 2,
+            frame_id_count: 1,
+            duplicate_frame_ids,
+        }) if duplicate_frame_ids.is_empty()
+    ));
+}
+
+#[test]
+fn empty_sequence_result_fails_coverage() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 0,
+        registered_frames: 0,
+        frame_ids: Vec::new(),
+        diagnostics: Vec::new(),
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert_eq!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::EmptySequence)
+    );
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn huge_sequence_result_rejects_diagnostic_count_without_allocating() {
+    let result = SequenceRegistrationResult {
+        imported_frames: usize::MAX,
+        registered_frames: 0,
+        frame_ids: Vec::new(),
+        diagnostics: Vec::new(),
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::DiagnosticCountMismatch {
+            imported_frames: usize::MAX,
+            diagnostic_count: 0,
+        })
+    ));
+}
+
+#[test]
+fn non_finite_diagnostic_metrics_fail_coverage() {
+    let mut diagnostic = FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Registered);
+    diagnostic.inlier_ratio = f64::NAN;
+    let result = SequenceRegistrationResult {
+        imported_frames: 1,
+        registered_frames: 1,
+        frame_ids: vec![10],
+        diagnostics: vec![diagnostic],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidDiagnosticMetric {
+            frame_id: 10,
+            field: "inlier_ratio",
+        })
+    ));
+
+    let mut diagnostic = FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Registered);
+    diagnostic.mean_reprojection_error = Some(f64::INFINITY);
+    let result = SequenceRegistrationResult {
+        imported_frames: 1,
+        registered_frames: 1,
+        frame_ids: vec![10],
+        diagnostics: vec![diagnostic],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidDiagnosticMetric {
+            frame_id: 10,
+            field: "mean_reprojection_error",
+        })
     ));
 }
