@@ -562,7 +562,7 @@ mod tests {
         use crate::task::{SfmTaskControl, SfmTaskEvent, SfmTaskStop};
 
         let (_dir, db_path, images_dir) = two_image_fixture()?;
-        std::fs::remove_file(images_dir.join("right.jpg"))?;
+        std::fs::remove_file(images_dir.join("left.jpg"))?;
         let extractor = DeterministicExtractor;
         let control = SfmTaskControl::new();
         control.request_cancel();
