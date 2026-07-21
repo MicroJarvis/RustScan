@@ -608,6 +608,58 @@ fn remaining_stage_rejects_mismatched_keyframe_database_camera() -> anyhow::Resu
 }
 
 #[test]
+fn partial_keyframe_model_keeps_missing_selected_keyframe_unresolved() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let mut reconstruction = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+    let removed_image = reconstruction.image_names.len() - 1;
+    assert_eq!(reconstruction.image_names[removed_image], "frame-0005.png");
+    reconstruction.image_names.remove(removed_image);
+    reconstruction.image_paths.remove(removed_image);
+    reconstruction.image_ids.remove(removed_image);
+    reconstruction.image_camera_indices.remove(removed_image);
+    reconstruction.image_frame_indices.remove(removed_image);
+    reconstruction.poses.remove(removed_image);
+    reconstruction.observations.remove(removed_image);
+    reconstruction.keypoints.remove(removed_image);
+    for point in &mut reconstruction.points {
+        point
+            .track
+            .retain(|observation| observation.image != removed_image);
+    }
+    overwrite_sparse_binary(&keyframes.sparse_model, &reconstruction)?;
+    keyframes.registered_keyframes = 3;
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+
+    assert!(!result.has_complete_coverage());
+    assert_eq!(result.registered_frames, 5);
+    let missing = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 606)
+        .unwrap();
+    assert_eq!(missing.status, FrameRegistrationStatus::Unresolved);
+    assert_eq!(missing.attempts, 0);
+    assert_eq!(
+        missing.message.as_deref(),
+        Some("keyframe was not registered")
+    );
+    assert!(require_complete_pose_coverage(&result).is_err());
+    Ok(())
+}
+
+#[test]
 fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
     std::fs::write(keyframes.sparse_model.join("obsolete.bin"), b"stale")?;

@@ -471,7 +471,7 @@ fn validate_keyframe_artifacts(
         .zip(model.reconstruction.image_ids.iter().copied())
         .collect::<BTreeSet<_>>();
     if actual_sparse_images.len() != model.reconstruction.image_names.len()
-        || actual_sparse_images != expected_sparse_images
+        || !actual_sparse_images.is_subset(&expected_sparse_images)
     {
         anyhow::bail!("keyframe sparse image names/IDs do not match database");
     }
@@ -481,9 +481,6 @@ fn validate_keyframe_artifacts(
             "keyframe artifacts do not match registered keyframe count: result={} sparse={registered_keyframes}",
             keyframe_result.registered_keyframes
         );
-    }
-    if registered_keyframes != expected_sparse_images.len() {
-        anyhow::bail!("keyframe sparse model does not contain a finite pose for every keyframe");
     }
     Ok(model.reconstruction)
 }
