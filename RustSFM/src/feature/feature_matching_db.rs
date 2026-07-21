@@ -1093,16 +1093,26 @@ fn run_controlled_colmap_fifo_batches(
         let scheduler_input_queue = Arc::clone(&input_queue);
         let scheduler_output_queue = Arc::clone(&output_queue);
         scope.spawn(move || {
-            'windows: for window in pairs.chunks(options.existing_match_batch_size.max(2)) {
-                for pair in window.iter().cloned() {
-                    scheduler_input_queue.push(pair);
-                }
-                for _ in 0..window.len() {
-                    let Some(result) = scheduler_output_queue.pop() else {
-                        break 'windows;
-                    };
-                    if result_sender.send(result).is_err() {
-                        break 'windows;
+            'operations: for operation in colmap_fifo_dispatch_operations(
+                pairs.len(),
+                options.existing_match_batch_size,
+                options.task_pair_batch_size,
+            ) {
+                match operation {
+                    ColmapFifoDispatchOperation::Enqueue { start, end } => {
+                        for pair in pairs[start..end].iter().cloned() {
+                            scheduler_input_queue.push(pair);
+                        }
+                    }
+                    ColmapFifoDispatchOperation::Drain { count } => {
+                        for _ in 0..count {
+                            let Some(result) = scheduler_output_queue.pop() else {
+                                break 'operations;
+                            };
+                            if result_sender.send(result).is_err() {
+                                break 'operations;
+                            }
+                        }
                     }
                 }
             }
@@ -1203,6 +1213,97 @@ struct ColmapVerifierReplaySchedule {
     events: Vec<ColmapVerifierReplayEvent>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColmapFifoDispatchOperation {
+    Enqueue { start: usize, end: usize },
+    Drain { count: usize },
+}
+
+fn colmap_fifo_dispatch_operations(
+    pair_count: usize,
+    existing_match_batch_size: usize,
+    _task_pair_batch_size: usize,
+) -> Vec<ColmapFifoDispatchOperation> {
+    let window_size = existing_match_batch_size.max(2);
+    let mut operations = Vec::new();
+    for start in (0..pair_count).step_by(window_size) {
+        let end = (start + window_size).min(pair_count);
+        operations.push(ColmapFifoDispatchOperation::Enqueue { start, end });
+        operations.push(ColmapFifoDispatchOperation::Drain { count: end - start });
+    }
+    operations
+}
+
+#[cfg(test)]
+fn colmap_fifo_dispatch_windows(
+    pair_count: usize,
+    existing_match_batch_size: usize,
+) -> Vec<(usize, usize)> {
+    colmap_fifo_dispatch_operations(pair_count, existing_match_batch_size, usize::MAX)
+        .into_iter()
+        .filter_map(|operation| match operation {
+            ColmapFifoDispatchOperation::Enqueue { start, end } => Some((start, end)),
+            ColmapFifoDispatchOperation::Drain { .. } => None,
+        })
+        .collect()
+}
+
+type ColmapReplayAssignment = (usize, usize, usize, usize, usize);
+
+fn colmap_fifo_replay_dispatch_batches(
+    pair_count: usize,
+    _task_pair_batch_size: usize,
+) -> Vec<(usize, usize)> {
+    vec![(0, pair_count)]
+}
+
+fn colmap_fifo_replay_assignments(
+    pairs: &[ExistingMatchPairInput],
+    schedule: &ColmapVerifierReplaySchedule,
+) -> Result<Vec<Vec<ColmapReplayAssignment>>> {
+    if schedule.events.len() != pairs.len() {
+        bail!(
+            "COLMAP verifier replay trace has {} events, but database has {} existing-match pairs",
+            schedule.events.len(),
+            pairs.len()
+        );
+    }
+    let pair_keys = pairs
+        .iter()
+        .map(|pair| (pair.0, pair.1))
+        .collect::<std::collections::HashSet<_>>();
+    if pair_keys.len() != pairs.len() {
+        bail!("duplicate existing-match pair in replay input");
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut events = schedule.events.clone();
+    events.sort_by_key(|event| event.dequeue_order);
+    let mut assignments = (0..schedule.worker_count)
+        .map(|_| Vec::<ColmapReplayAssignment>::new())
+        .collect::<Vec<_>>();
+    for event in events {
+        let key = (event.left_index, event.right_index);
+        if !pair_keys.contains(&key) || !seen.insert(key) {
+            bail!(
+                "COLMAP verifier replay event does not map one-to-one to input pair {}-{}",
+                key.0,
+                key.1
+            );
+        }
+        assignments[event.worker_id].push((
+            event.worker_id,
+            event.dequeue_order,
+            event.complete_order,
+            event.left_index,
+            event.right_index,
+        ));
+    }
+    if seen.len() != pairs.len() {
+        bail!("COLMAP verifier replay trace is missing input pairs");
+    }
+    Ok(assignments)
+}
+
 fn load_colmap_fifo_replay_schedule(path: &Path) -> Result<ColmapVerifierReplaySchedule> {
     let file = File::open(path)
         .with_context(|| format!("open COLMAP verifier replay trace {}", path.display()))?;
@@ -1281,6 +1382,7 @@ fn run_controlled_colmap_replay_batches(
         .iter()
         .map(|pair| (pair.0, pair.1))
         .collect::<Vec<_>>();
+    let input_pairs = pairs.clone();
     let mut pairs_by_index = HashMap::<(usize, usize), ExistingMatchPairInput>::new();
     for pair in pairs {
         let key = (pair.0, pair.1);
@@ -1294,20 +1396,44 @@ fn run_controlled_colmap_replay_batches(
     }
 
     let worker_count = schedule.worker_count;
-    let mut replay_events = schedule.events;
-    replay_events.sort_by_key(|event| event.dequeue_order);
+    let assignments = colmap_fifo_replay_assignments(&input_pairs, &schedule)?;
+    let mut events_by_pair = schedule
+        .events
+        .into_iter()
+        .map(|event| ((event.left_index, event.right_index), event))
+        .collect::<HashMap<_, _>>();
     let mut worker_jobs = (0..worker_count)
         .map(|_| Vec::<ColmapReplayWorkerJob>::new())
         .collect::<Vec<_>>();
-    for event in replay_events {
-        let key = (event.left_index, event.right_index);
-        let pair = pairs_by_index.remove(&key).with_context(|| {
-            format!(
-                "COLMAP verifier replay event references missing pair {}-{} ({} / {})",
-                event.left_index, event.right_index, event.left_image, event.right_image
-            )
-        })?;
-        worker_jobs[event.worker_id].push(ColmapReplayWorkerJob { event, pair });
+    for (batch_start, batch_end) in
+        colmap_fifo_replay_dispatch_batches(input_indices.len(), task_batch_size)
+    {
+        for worker_assignments in &assignments {
+            for (_, dequeue_order, complete_order, left, right) in worker_assignments {
+                if *dequeue_order < batch_start || *dequeue_order >= batch_end {
+                    continue;
+                }
+                let key = (*left, *right);
+                let mut event = events_by_pair.remove(&key).with_context(|| {
+                    let names = events_by_pair
+                        .get(&key)
+                        .map(|event| (event.left_image.as_str(), event.right_image.as_str()));
+                    format!(
+                        "COLMAP verifier replay event references missing pair {}-{} ({:?})",
+                        left, right, names
+                    )
+                })?;
+                event.dequeue_order = *dequeue_order;
+                event.complete_order = *complete_order;
+                let pair = pairs_by_index.remove(&key).with_context(|| {
+                    format!(
+                        "COLMAP verifier replay event references missing pair {}-{}",
+                        left, right
+                    )
+                })?;
+                worker_jobs[event.worker_id].push(ColmapReplayWorkerJob { event, pair });
+            }
+        }
     }
     if !pairs_by_index.is_empty() {
         let mut missing = pairs_by_index.keys().copied().collect::<Vec<_>>();
@@ -1813,6 +1939,72 @@ mod tests {
     }
 
     #[test]
+    fn fifo_dispatch_windows_are_independent_of_task_commit_batch_size() {
+        let expected = vec![
+            ColmapFifoDispatchOperation::Enqueue { start: 0, end: 7 },
+            ColmapFifoDispatchOperation::Drain { count: 7 },
+            ColmapFifoDispatchOperation::Enqueue { start: 7, end: 14 },
+            ColmapFifoDispatchOperation::Drain { count: 7 },
+            ColmapFifoDispatchOperation::Enqueue { start: 14, end: 21 },
+            ColmapFifoDispatchOperation::Drain { count: 7 },
+            ColmapFifoDispatchOperation::Enqueue { start: 21, end: 24 },
+            ColmapFifoDispatchOperation::Drain { count: 3 },
+        ];
+        for task_pair_batch_size in [1, 2, 32] {
+            assert_eq!(
+                colmap_fifo_dispatch_operations(24, 7, task_pair_batch_size),
+                expected,
+                "task batch size {task_pair_batch_size} changed legacy FIFO dispatch"
+            );
+        }
+        assert_eq!(
+            colmap_fifo_dispatch_windows(24, 7),
+            vec![(0, 7), (7, 14), (14, 21), (21, 24)]
+        );
+    }
+
+    #[test]
+    fn fifo_replay_assignments_preserve_every_trace_event() -> Result<()> {
+        let schedule = ColmapVerifierReplaySchedule {
+            worker_count: 2,
+            events: vec![
+                replay_test_event(1, 4, 2, 0, 1),
+                replay_test_event(0, 0, 3, 1, 2),
+                replay_test_event(1, 2, 1, 0, 2),
+                replay_test_event(0, 3, 0, 0, 3),
+            ],
+        };
+        let pairs = vec![
+            (0, 3, Vec::new()),
+            (0, 1, Vec::new()),
+            (0, 2, Vec::new()),
+            (1, 2, Vec::new()),
+        ];
+
+        let assignments = colmap_fifo_replay_assignments(&pairs, &schedule)?;
+
+        assert_eq!(
+            assignments,
+            vec![
+                vec![(0, 0, 3, 1, 2), (0, 3, 0, 0, 3)],
+                vec![(1, 2, 1, 0, 2), (1, 4, 2, 0, 1)],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fifo_replay_dispatch_is_global_across_task_commit_batches() {
+        for task_pair_batch_size in [1, 2, 32] {
+            assert_eq!(
+                colmap_fifo_replay_dispatch_batches(24, task_pair_batch_size),
+                vec![(0, 24)],
+                "task commit batch {task_pair_batch_size} split replay dispatch"
+            );
+        }
+    }
+
+    #[test]
     fn existing_match_inputs_are_sorted_by_normalized_frame_indices() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("database.db");
@@ -2020,25 +2212,28 @@ mod tests {
     #[test]
     fn controlled_fifo_trace_is_independent_of_task_commit_batch_size() -> Result<()> {
         let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
-        let (_small_dir, small_db_path, _) = controlled_matching_fixture()?;
-        let (_large_dir, large_db_path, _) = controlled_matching_fixture()?;
-        let _env = MatchingEnvGuard::fifo_trace(1);
+        let (_dir, db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
+        let _env = MatchingEnvGuard::fifo_trace(2);
 
-        let mut small_options = controlled_matching_options(1);
-        small_options.random_seed = -1;
-        let mut large_options = small_options.clone();
-        large_options.task_pair_batch_size = 32;
-        let small = match_features_to_database(&small_db_path, &small_options)?;
-        let large = match_features_to_database(&large_db_path, &large_options)?;
-
-        assert_eq!(
-            serde_json::to_value(&small.pairs)?,
-            serde_json::to_value(&large.pairs)?
-        );
-        assert_eq!(
-            serde_json::to_value(&small.verifier_trace)?,
-            serde_json::to_value(&large.verifier_trace)?
-        );
+        let expected_dispatch = colmap_fifo_dispatch_operations(input_pairs.len(), 1000, 2);
+        for task_pair_batch_size in [1, 2, 32] {
+            assert_eq!(
+                colmap_fifo_dispatch_operations(input_pairs.len(), 1000, task_pair_batch_size),
+                expected_dispatch,
+                "task commit batch {task_pair_batch_size} changed live scheduler operations"
+            );
+        }
+        let report = match_features_to_database(&db_path, &controlled_fifo_geometry_options(2))?;
+        let trace = report.verifier_trace.as_ref().expect("live FIFO trace");
+        assert_eq!(trace.worker_count, 2);
+        assert_eq!(trace.events.len(), input_pairs.len());
+        assert!(trace.events.iter().all(|event| event.num_matches == 24));
+        assert!(trace.events.iter().any(|event| event.num_inliers >= 15));
+        for &(left, right) in &input_pairs {
+            assert!(
+                ColmapDatabase::open_read_only(&db_path)?.exists_two_view_geometry(left, right)?
+            );
+        }
         Ok(())
     }
 
@@ -2052,20 +2247,20 @@ mod tests {
             r#"{
               "worker_count": 2,
               "events": [
-                {"worker_id":0,"dequeue_order":0,"complete_order":1,"left_index":0,"right_index":1,"left_image":"a.jpg","right_image":"b.jpg"},
-                {"worker_id":1,"dequeue_order":1,"complete_order":0,"left_index":0,"right_index":2,"left_image":"a.jpg","right_image":"c.jpg"},
-                {"worker_id":0,"dequeue_order":2,"complete_order":3,"left_index":0,"right_index":3,"left_image":"a.jpg","right_image":"d.jpg"},
-                {"worker_id":1,"dequeue_order":3,"complete_order":2,"left_index":1,"right_index":2,"left_image":"b.jpg","right_image":"c.jpg"},
-                {"worker_id":0,"dequeue_order":4,"complete_order":4,"left_index":1,"right_index":3,"left_image":"b.jpg","right_image":"d.jpg"}
+                {"worker_id":0,"dequeue_order":0,"complete_order":3,"left_index":0,"right_index":1,"left_image":"image-1.jpg","right_image":"image-2.jpg"},
+                {"worker_id":1,"dequeue_order":1,"complete_order":0,"left_index":0,"right_index":2,"left_image":"image-1.jpg","right_image":"image-3.jpg"},
+                {"worker_id":0,"dequeue_order":2,"complete_order":4,"left_index":0,"right_index":3,"left_image":"image-1.jpg","right_image":"image-4.jpg"},
+                {"worker_id":1,"dequeue_order":3,"complete_order":1,"left_index":1,"right_index":2,"left_image":"image-2.jpg","right_image":"image-3.jpg"},
+                {"worker_id":0,"dequeue_order":4,"complete_order":5,"left_index":1,"right_index":3,"left_image":"image-2.jpg","right_image":"image-4.jpg"},
+                {"worker_id":1,"dequeue_order":5,"complete_order":2,"left_index":2,"right_index":3,"left_image":"image-3.jpg","right_image":"image-4.jpg"}
               ]
             }"#,
         )?;
-        let (_small_dir, small_db_path, _) = controlled_matching_fixture()?;
-        let (_large_dir, large_db_path, _) = controlled_matching_fixture()?;
+        let (_small_dir, small_db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
+        let (_large_dir, large_db_path, _) = controlled_fifo_geometry_fixture()?;
         let _env = MatchingEnvGuard::fifo_replay(&trace_path);
 
-        let mut small_options = controlled_matching_options(1);
-        small_options.random_seed = -1;
+        let small_options = controlled_fifo_geometry_options(1);
         let mut large_options = small_options.clone();
         large_options.task_pair_batch_size = 32;
         let small = match_features_to_database(&small_db_path, &small_options)?;
@@ -2079,6 +2274,119 @@ mod tests {
             serde_json::to_value(&small.verifier_trace)?,
             serde_json::to_value(&large.verifier_trace)?
         );
+        let trace = small.verifier_trace.as_ref().expect("replay trace");
+        assert_eq!(
+            trace
+                .events
+                .iter()
+                .map(|event| {
+                    (
+                        event.worker_id,
+                        event.dequeue_order,
+                        event.complete_order,
+                        event.left_index,
+                        event.right_index,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 1, 0, 0, 2),
+                (1, 3, 1, 1, 2),
+                (1, 5, 2, 2, 3),
+                (0, 0, 3, 0, 1),
+                (0, 2, 4, 0, 3),
+                (0, 4, 5, 1, 3),
+            ]
+        );
+        for &(left, right) in &input_pairs {
+            let small_db = ColmapDatabase::open_read_only(&small_db_path)?;
+            let large_db = ColmapDatabase::open_read_only(&large_db_path)?;
+            assert_eq!(
+                small_db.read_two_view_geometry(left, right)?,
+                large_db.read_two_view_geometry(left, right)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_live_fifo_cancel_commits_only_first_prefix() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
+
+        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let (_dir, db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
+        let _env = MatchingEnvGuard::fifo_trace(2);
+        let control = SfmTaskControl::new();
+        let sink_control = control.clone();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| {
+            if event.completed == Some(2) {
+                sink_control.request_cancel();
+            }
+            events.push(event);
+        };
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let error = match_features_to_database_with_task(
+            &db_path,
+            &controlled_fifo_geometry_options(2),
+            &mut task,
+        )
+        .expect_err("live FIFO cancellation after first committed prefix");
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Cancelled)
+        );
+        assert_eq!(events.len(), 1);
+        let db = ColmapDatabase::open_read_only(&db_path)?;
+        for (index, &(left, right)) in input_pairs.iter().enumerate() {
+            assert_eq!(
+                db.exists_two_view_geometry(left, right)?,
+                index < 2,
+                "unexpected live FIFO geometry after cancellation for {left}-{right}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_replay_fifo_cancel_commits_only_first_prefix() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
+
+        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let trace_dir = tempdir()?;
+        let trace_path = trace_dir.path().join("trace.json");
+        write_fifo_replay_trace(&trace_path)?;
+        let (_dir, db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
+        let _env = MatchingEnvGuard::fifo_replay(&trace_path);
+        let control = SfmTaskControl::new();
+        let sink_control = control.clone();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| {
+            if event.completed == Some(2) {
+                sink_control.request_cancel();
+            }
+            events.push(event);
+        };
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let error = match_features_to_database_with_task(
+            &db_path,
+            &controlled_fifo_geometry_options(2),
+            &mut task,
+        )
+        .expect_err("replay FIFO cancellation after first committed prefix");
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Cancelled)
+        );
+        assert_eq!(events.len(), 1);
+        let db = ColmapDatabase::open_read_only(&db_path)?;
+        for (index, &(left, right)) in input_pairs.iter().enumerate() {
+            assert_eq!(
+                db.exists_two_view_geometry(left, right)?,
+                index < 2,
+                "unexpected replay FIFO geometry after cancellation for {left}-{right}"
+            );
+        }
         Ok(())
     }
 
@@ -2195,6 +2503,42 @@ mod tests {
         }
     }
 
+    fn replay_test_event(
+        worker_id: usize,
+        dequeue_order: usize,
+        complete_order: usize,
+        left_index: usize,
+        right_index: usize,
+    ) -> ColmapVerifierReplayEvent {
+        ColmapVerifierReplayEvent {
+            worker_id,
+            dequeue_order,
+            complete_order,
+            left_index,
+            right_index,
+            left_image: format!("image-{left_index}.jpg"),
+            right_image: format!("image-{right_index}.jpg"),
+        }
+    }
+
+    fn write_fifo_replay_trace(path: &Path) -> Result<()> {
+        std::fs::write(
+            path,
+            r#"{
+              "worker_count": 2,
+              "events": [
+                {"worker_id":0,"dequeue_order":0,"complete_order":3,"left_index":0,"right_index":1,"left_image":"image-1.jpg","right_image":"image-2.jpg"},
+                {"worker_id":1,"dequeue_order":1,"complete_order":0,"left_index":0,"right_index":2,"left_image":"image-1.jpg","right_image":"image-3.jpg"},
+                {"worker_id":0,"dequeue_order":2,"complete_order":4,"left_index":0,"right_index":3,"left_image":"image-1.jpg","right_image":"image-4.jpg"},
+                {"worker_id":1,"dequeue_order":3,"complete_order":1,"left_index":1,"right_index":2,"left_image":"image-2.jpg","right_image":"image-3.jpg"},
+                {"worker_id":0,"dequeue_order":4,"complete_order":5,"left_index":1,"right_index":3,"left_image":"image-2.jpg","right_image":"image-4.jpg"},
+                {"worker_id":1,"dequeue_order":5,"complete_order":2,"left_index":2,"right_index":3,"left_image":"image-3.jpg","right_image":"image-4.jpg"}
+              ]
+            }"#,
+        )?;
+        Ok(())
+    }
+
     fn controlled_computed_matching_options(task_pair_batch_size: usize) -> MatchFeaturesOptions {
         MatchFeaturesOptions {
             pair_strategy: MatchingPairStrategy::Exhaustive,
@@ -2205,6 +2549,20 @@ mod tests {
             min_num_matches: 1,
             min_inliers: 8,
             random_seed: 0,
+            task_pair_batch_size,
+            ..MatchFeaturesOptions::default()
+        }
+    }
+
+    fn controlled_fifo_geometry_options(task_pair_batch_size: usize) -> MatchFeaturesOptions {
+        MatchFeaturesOptions {
+            use_existing_matches: true,
+            essential_threshold_px: 2.0,
+            essential_iterations: 256,
+            min_inliers: 15,
+            min_triangulated: 8,
+            min_num_matches: 15,
+            random_seed: -1,
             task_pair_batch_size,
             ..MatchFeaturesOptions::default()
         }
@@ -2298,6 +2656,87 @@ mod tests {
             db_path,
             vec![(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)],
         ))
+    }
+
+    fn controlled_fifo_geometry_fixture() -> Result<(tempfile::TempDir, PathBuf, Vec<(u32, u32)>)> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![80.0, 80.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for image_id in 1..=4 {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: format!("image-{image_id}.jpg"),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+        }
+        let transforms = [
+            (
+                nalgebra::Rotation3::identity().into_inner(),
+                nalgebra::Vector3::new(0.0, 0.0, 0.0),
+            ),
+            (
+                nalgebra::Rotation3::from_euler_angles(0.03, -0.04, 0.02).into_inner(),
+                nalgebra::Vector3::new(0.2, -0.03, 0.05),
+            ),
+            (
+                nalgebra::Rotation3::from_euler_angles(-0.02, 0.05, -0.03).into_inner(),
+                nalgebra::Vector3::new(-0.16, 0.08, 0.03),
+            ),
+            (
+                nalgebra::Rotation3::from_euler_angles(0.04, 0.01, 0.05).into_inner(),
+                nalgebra::Vector3::new(0.12, 0.14, 0.08),
+            ),
+        ];
+        let points = (0..24usize)
+            .map(|index| {
+                nalgebra::Vector3::new(
+                    (index % 6) as f64 * 0.25 - 0.6,
+                    (index / 6) as f64 * 0.22 - 0.35,
+                    3.0 + (index % 5) as f64 * 0.35,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (image_index, (rotation, translation)) in transforms.iter().enumerate() {
+            let keypoints = points
+                .iter()
+                .map(|point| {
+                    let transformed = rotation * point + translation;
+                    ColmapKeypoint::new(
+                        (80.0 * transformed.x / transformed.z + 50.0) as f32,
+                        (80.0 * transformed.y / transformed.z + 50.0) as f32,
+                    )
+                })
+                .collect::<Vec<_>>();
+            db.write_keypoints((image_index + 1) as u32, &keypoints)?;
+        }
+        let pair_matches = (0..24usize)
+            .map(|index| FeatureMatch::new(index as u32, index as u32))
+            .collect::<Vec<_>>();
+        let input_pairs = (1..=4)
+            .flat_map(|left| ((left + 1)..=4).map(move |right| (left, right)))
+            .collect::<Vec<_>>();
+        for &(left, right) in &input_pairs {
+            db.write_matches(left, right, &pair_matches)?;
+        }
+        drop(db);
+        Ok((dir, db_path, input_pairs))
     }
 
     struct MatchingEnvGuard;
