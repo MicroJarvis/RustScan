@@ -4,6 +4,9 @@ use crate::database::{ColmapDatabase, ColmapDescriptors, ColmapKeypoint, COLMAP_
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::WgpuSiftExtractor;
 use crate::sift::{extract_sift_from_grayscale_u8, SiftExtractionOptions, SiftFeatures};
+use crate::task::{
+    SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage,
+};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -160,6 +163,25 @@ pub fn extract_features_to_database_with_extractor<E: SiftFeatureExtractor>(
     options: &SiftExtractionOptions,
     extractor: &E,
 ) -> Result<ExtractFeaturesReport> {
+    let control = SfmTaskControl::new();
+    let mut sink = |_event: SfmTaskEvent| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+    extract_features_to_database_with_extractor_and_task(
+        database_path,
+        images_dir,
+        options,
+        extractor,
+        &mut task,
+    )
+}
+
+pub fn extract_features_to_database_with_extractor_and_task<E: SiftFeatureExtractor>(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    extractor: &E,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<ExtractFeaturesReport> {
     options.check()?;
     let db = ColmapDatabase::open(database_path)?;
     let images = db.read_all_images()?;
@@ -168,6 +190,7 @@ pub fn extract_features_to_database_with_extractor<E: SiftFeatureExtractor>(
     }
 
     let started = Instant::now();
+    let image_count = images.len();
     let mut reports = Vec::with_capacity(images.len());
     for image in images {
         let image_path = images_dir.join(&image.name);
@@ -178,6 +201,7 @@ pub fn extract_features_to_database_with_extractor<E: SiftFeatureExtractor>(
                 image_path.display()
             );
         }
+        task.checkpoint()?;
         let extract_started = Instant::now();
         let decoded = load_colmap_grayscale_u8(&image_path)
             .with_context(|| format!("failed to load {}", image_path.display()))?;
@@ -185,13 +209,32 @@ pub fn extract_features_to_database_with_extractor<E: SiftFeatureExtractor>(
             extractor.extract_grayscale(&decoded.data, decoded.width, decoded.height, options)?;
         let keypoints = sift_features_to_colmap_keypoints(&features);
         let descriptors = sift_features_to_colmap_descriptors(&features)?;
-        db.upsert_keypoints(image.image_id, &keypoints)?;
-        db.upsert_descriptors(image.image_id, &descriptors)?;
+        db.with_transaction(|| {
+            db.upsert_keypoints(image.image_id, &keypoints)?;
+            db.upsert_descriptors(image.image_id, &descriptors)?;
+            Ok(())
+        })?;
         reports.push(ExtractFeaturesImageReport {
             image_name: image.name.clone(),
             num_keypoints: keypoints.len(),
             elapsed_ms: extract_started.elapsed().as_secs_f64() * 1000.0,
         });
+        task.emit(SfmTaskEvent {
+            sequence: 0,
+            elapsed_ms: 0,
+            stage: SfmTaskStage::FeatureExtraction,
+            operation: SfmTaskOperation::ExtractImage,
+            kind: SfmTaskEventKind::Progress,
+            completed: Some(reports.len()),
+            total: Some(image_count),
+            registered_images: None,
+            sparse_points: None,
+            image_id: Some(image.image_id),
+            pair: None,
+            message: Some(image.name.clone()),
+            issue: None,
+        });
+        task.checkpoint()?;
     }
     reports.sort_unstable_by(|left, right| left.image_name.cmp(&right.image_name));
 
@@ -424,6 +467,146 @@ mod tests {
         let descriptors = db.read_descriptors(1)?;
         assert_eq!(descriptors.rows, report.total_keypoints);
         Ok(())
+    }
+
+    #[test]
+    fn controlled_extraction_pauses_after_committing_one_image() -> Result<()> {
+        use crate::task::{
+            SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage,
+            SfmTaskStop,
+        };
+
+        let (dir, db_path, images_dir) = two_image_fixture()?;
+        let extractor = DeterministicExtractor;
+        let control = SfmTaskControl::new();
+        let sink_control = control.clone();
+        let mut events = Vec::new();
+        let mut sink = |event: SfmTaskEvent| {
+            if event.operation == SfmTaskOperation::ExtractImage && event.completed == Some(1) {
+                sink_control.request_pause();
+            }
+            events.push(event);
+        };
+        let mut task = crate::task::SfmTaskContext::new(&control, &mut sink);
+        let error = extract_features_to_database_with_extractor_and_task(
+            &db_path,
+            &images_dir,
+            &SiftExtractionOptions::default(),
+            &extractor,
+            &mut task,
+        )
+        .expect_err("pause requested from the first progress event");
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Paused)
+        );
+
+        let db = ColmapDatabase::open(&db_path)?;
+        assert_eq!(db.read_keypoints(1)?.len(), 1);
+        assert_eq!(db.read_descriptors(1)?.rows, 1);
+        assert!(db.read_keypoints(2)?.is_empty());
+        assert_eq!(db.read_descriptors(2)?.rows, 0);
+        let event = events.last().expect("first image progress event");
+        assert_eq!(event.stage, SfmTaskStage::FeatureExtraction);
+        assert_eq!(event.operation, SfmTaskOperation::ExtractImage);
+        assert_eq!(event.kind, SfmTaskEventKind::Progress);
+        assert_eq!(event.completed, Some(1));
+        assert_eq!(event.total, Some(2));
+        assert_eq!(event.image_id, Some(1));
+        assert_eq!(event.message.as_deref(), Some("left.jpg"));
+        drop(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_extraction_honors_pre_requested_cancellation() -> Result<()> {
+        use crate::task::{SfmTaskControl, SfmTaskEvent, SfmTaskStop};
+
+        let (dir, db_path, images_dir) = two_image_fixture()?;
+        let extractor = DeterministicExtractor;
+        let control = SfmTaskControl::new();
+        control.request_cancel();
+        let mut events = Vec::new();
+        let mut sink = |event: SfmTaskEvent| events.push(event);
+        let mut task = crate::task::SfmTaskContext::new(&control, &mut sink);
+        let error = extract_features_to_database_with_extractor_and_task(
+            &db_path,
+            &images_dir,
+            &SiftExtractionOptions::default(),
+            &extractor,
+            &mut task,
+        )
+        .expect_err("pre-requested cancellation");
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Cancelled)
+        );
+
+        let db = ColmapDatabase::open(&db_path)?;
+        for image_id in [1, 2] {
+            assert!(db.read_keypoints(image_id)?.is_empty());
+            assert_eq!(db.read_descriptors(image_id)?.rows, 0);
+        }
+        assert!(events.is_empty());
+        drop(dir);
+        Ok(())
+    }
+
+    struct DeterministicExtractor;
+
+    impl SiftFeatureExtractor for DeterministicExtractor {
+        fn backend_name(&self) -> &'static str {
+            "deterministic-test"
+        }
+
+        fn extract_grayscale(
+            &self,
+            _gray: &[u8],
+            _width: u32,
+            _height: u32,
+            _options: &SiftExtractionOptions,
+        ) -> Result<SiftFeatures> {
+            Ok(SiftFeatures {
+                colmap_keypoints: vec![ColmapKeypoint::new(1.0, 1.0)],
+                descriptors_u8: vec![[7u8; 128]],
+                ..SiftFeatures::default()
+            })
+        }
+    }
+
+    fn two_image_fixture() -> Result<(tempfile::TempDir, PathBuf, PathBuf)> {
+        let dir = tempdir()?;
+        let images_dir = dir.path().join("images");
+        std::fs::create_dir_all(&images_dir)?;
+        write_checkerboard_image(&images_dir.join("left.jpg"), 32, 32)?;
+        write_checkerboard_image(&images_dir.join("right.jpg"), 32, 32)?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: COLMAP_PINHOLE,
+                    width: 32,
+                    height: 32,
+                    params: vec![20.0, 20.0, 16.0, 16.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(1, "left.jpg"), (2, "right.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+        }
+        Ok((dir, db_path, images_dir))
     }
 
     fn write_checkerboard_image(path: &Path, width: u32, height: u32) -> Result<()> {

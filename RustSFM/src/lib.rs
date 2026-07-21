@@ -107,7 +107,9 @@ pub use compare::{
 };
 pub use feature_extraction::{
     compare_extracted_sift_features, extract_features_to_database,
-    extract_features_to_database_with_extractor, ExtractFeaturesReport, SiftFeatureExtractor,
+    extract_features_to_database_with_extractor,
+    extract_features_to_database_with_extractor_and_task, ExtractFeaturesReport,
+    SiftFeatureExtractor,
 };
 pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use feature_matching_db::{
