@@ -133,10 +133,10 @@ pub use joint_global_positioning::{
 };
 pub use mapper::{
     reference_camera_setup, run_incremental_pipeline, run_reconstruction,
-    run_reconstruction_with_callbacks, FeatureType, ImageSelectionMethod,
-    IncrementalPipelineCallback, IncrementalPipelineResult, IncrementalPipelineStatus,
-    MapperConfig, PipelineCallbackEvent, PipelineCallbackSink, ReconstructionSeed,
-    ReconstructionSummary, ReferenceCameraSetup,
+    run_reconstruction_with_callbacks, run_reconstruction_with_task, FeatureType,
+    ImageSelectionMethod, IncrementalPipelineCallback, IncrementalPipelineResult,
+    IncrementalPipelineStatus, MapperConfig, PipelineCallbackEvent, PipelineCallbackSink,
+    ReconstructionSeed, ReconstructionSummary, ReferenceCameraSetup,
 };
 pub use parity::{compare_database_parity, ParityReport};
 pub use retrieval::{

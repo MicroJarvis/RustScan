@@ -29,6 +29,7 @@ use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
 use crate::rotation_averaging::RotationAveragingOptions;
 use crate::sift::{match_sift_guided_with_options, match_sift_with_options, SiftMatchingOptions};
+use crate::task::{SfmTaskContext, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage, SfmTaskStop};
 use crate::track_establishment::TrackEstablishmentOptions;
 use crate::track_triangulation::TrackTriangulationOptions;
 use crate::types::{
@@ -79,6 +80,7 @@ use diagnostics::{
     pair_reference_error_summary, pair_two_view_metadata_summary,
 };
 use image_features::extract_frames;
+use pipeline_types::MapperEventBridge;
 pub use pipeline_types::{
     IncrementalPipelineCallback, IncrementalPipelineMapResult, IncrementalPipelineResult,
     IncrementalPipelineStatus, PipelineCallbackEvent, PipelineCallbackSink,
@@ -122,7 +124,8 @@ pub struct DatabasePairMatches {
 }
 
 pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary> {
-    run_reconstruction_with_callbacks(config, None)
+    let mut events = MapperEventBridge::Silent;
+    run_reconstruction_impl(config, &mut events)
 }
 
 fn validate_gpu_pnp_config(config: &MapperConfig, has_global_mapper: bool) -> Result<()> {
@@ -182,13 +185,26 @@ pub fn run_reconstruction_with_callbacks(
     config: &MapperConfig,
     callback_sink: Option<&mut dyn PipelineCallbackSink>,
 ) -> Result<ReconstructionSummary> {
-    run_reconstruction_impl(config, callback_sink)
+    let mut events = match callback_sink {
+        Some(sink) => MapperEventBridge::Legacy(sink),
+        None => MapperEventBridge::Silent,
+    };
+    run_reconstruction_impl(config, &mut events)
+}
+
+pub fn run_reconstruction_with_task(
+    config: &MapperConfig,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<ReconstructionSummary> {
+    let mut events = MapperEventBridge::Task(task);
+    run_reconstruction_impl(config, &mut events)
 }
 
 fn run_reconstruction_impl(
     config: &MapperConfig,
-    callback_sink: Option<&mut dyn PipelineCallbackSink>,
+    events: &mut MapperEventBridge<'_, '_>,
 ) -> Result<ReconstructionSummary> {
+    events.checkpoint()?;
     let mut runtime_config = config.clone();
     let config = &mut runtime_config;
     validate_gpu_pnp_config(config, config.global_mapper)?;
@@ -459,42 +475,15 @@ fn run_reconstruction_impl(
             .context("global mapper kept no reconstruction")?;
         (reconstructions, reconstruction, pipeline_debug)
     } else {
-        let pipeline_result = match (callback_sink, pnp_scorer.as_deref_mut()) {
-            (None, None) => incremental_pipeline_map(
-                &frames,
-                camera,
-                reference_camera_setup.as_ref(),
-                &pairs,
-                config,
-            ),
-            (None, Some(scorer)) => incremental_pipeline_map_with_pnp_scorer(
-                &frames,
-                camera,
-                reference_camera_setup.as_ref(),
-                &pairs,
-                config,
-                Some(scorer),
-            ),
-            (Some(callback), None) => incremental_pipeline_map_with_callbacks(
-                &frames,
-                camera,
-                reference_camera_setup.as_ref(),
-                &pairs,
-                config,
-                Some(callback),
-            ),
-            (Some(callback), Some(scorer)) => {
-                incremental_pipeline_map_with_pnp_scorer_and_callbacks(
-                    &frames,
-                    camera,
-                    reference_camera_setup.as_ref(),
-                    &pairs,
-                    config,
-                    Some(callback),
-                    Some(scorer),
-                )
-            }
-        }?;
+        let pipeline_result = incremental_pipeline_map_with_pnp_scorer_and_events(
+            &frames,
+            camera,
+            reference_camera_setup.as_ref(),
+            &pairs,
+            config,
+            events,
+            pnp_scorer.as_deref_mut(),
+        )?;
         let reconstruction = pipeline_result
             .reconstructions
             .first()
@@ -506,6 +495,7 @@ fn run_reconstruction_impl(
             pipeline_result.debug_log,
         )
     };
+    events.checkpoint()?;
     let incremental_elapsed_ms = incremental_start.elapsed().as_secs_f64() * 1000.0;
     debug_log.push(format!("timing_incremental_ms={incremental_elapsed_ms:.2}"));
     debug_log.extend(pipeline_debug);
@@ -588,6 +578,30 @@ fn run_reconstruction_impl(
         .cloned()
         .context("pipeline kept no reconstruction after output ordering")?;
     let registered_images = reconstruction.poses.iter().filter(|p| p.is_some()).count();
+    events.checkpoint()?;
+    events.emit_operation(
+        SfmTaskStage::Export,
+        SfmTaskOperation::ValidateArtifacts,
+        SfmTaskEventKind::Started,
+    );
+    if events.is_task() {
+        for (model_index, model) in reconstructions.iter().enumerate() {
+            validate_reconstruction_for_export(model).with_context(|| {
+                format!("invalid reconstruction model {model_index} before export")
+            })?;
+        }
+    }
+    events.emit_operation(
+        SfmTaskStage::Export,
+        SfmTaskOperation::ValidateArtifacts,
+        SfmTaskEventKind::Completed,
+    );
+    events.checkpoint()?;
+    events.emit_operation(
+        SfmTaskStage::Export,
+        SfmTaskOperation::WriteArtifacts,
+        SfmTaskEventKind::Started,
+    );
     if reconstructions.len() <= 1 {
         export_colmap(&config.output, &reconstruction, config.copy_images)?;
     } else {
@@ -595,6 +609,12 @@ fn run_reconstruction_impl(
             export_colmap_with_sparse_index(&config.output, model, config.copy_images, idx)?;
         }
     }
+    events.emit_operation(
+        SfmTaskStage::Export,
+        SfmTaskOperation::WriteArtifacts,
+        SfmTaskEventKind::Completed,
+    );
+    events.checkpoint()?;
     Ok(ReconstructionSummary {
         images: frames.len(),
         registered_images,
@@ -604,6 +624,42 @@ fn run_reconstruction_impl(
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         debug_log,
     })
+}
+
+fn validate_reconstruction_for_export(reconstruction: &Reconstruction) -> Result<()> {
+    let num_images = reconstruction.image_names.len();
+    if reconstruction.poses.len() != num_images
+        || reconstruction.observations.len() != num_images
+        || reconstruction.keypoints.len() != num_images
+    {
+        bail!(
+            "image metadata lengths differ: names={} poses={} observations={} keypoints={}",
+            num_images,
+            reconstruction.poses.len(),
+            reconstruction.observations.len(),
+            reconstruction.keypoints.len()
+        );
+    }
+    if reconstruction.point_ids.len() != reconstruction.points.len() {
+        bail!(
+            "point id count {} differs from sparse point count {}",
+            reconstruction.point_ids.len(),
+            reconstruction.points.len()
+        );
+    }
+    for (image, observations) in reconstruction.observations.iter().enumerate() {
+        if observations.len() != reconstruction.keypoints[image].len() {
+            bail!("observation count differs from keypoint count for image {image}");
+        }
+        if observations
+            .iter()
+            .flatten()
+            .any(|point| *point >= reconstruction.points.len())
+        {
+            bail!("observation references a missing sparse point for image {image}");
+        }
+    }
+    Ok(())
 }
 
 fn sort_reconstructions_for_colmap_output(reconstructions: &mut [Reconstruction]) {
@@ -1803,6 +1859,7 @@ fn maybe_write_pipeline_snapshot(
     config: &MapperConfig,
     snapshot_state: &mut PipelineSnapshotState,
     debug_log: &mut Vec<String>,
+    events: &mut MapperEventBridge<'_, '_>,
 ) -> Result<()> {
     if config.snapshot_frames_freq == 0 {
         return Ok(());
@@ -1817,7 +1874,19 @@ fn maybe_write_pipeline_snapshot(
     snapshot_state.previous_registered_frames = registered_frames;
     snapshot_state.next_index += 1;
     let path = snapshot_path.join(format!("{:010}", snapshot_state.next_index));
+    events.checkpoint()?;
+    events.emit_operation(
+        SfmTaskStage::Export,
+        SfmTaskOperation::WriteArtifacts,
+        SfmTaskEventKind::Started,
+    );
     export_colmap_sparse_snapshot(&path, reconstruction)?;
+    events.emit_operation(
+        SfmTaskStage::Export,
+        SfmTaskOperation::WriteArtifacts,
+        SfmTaskEventKind::Completed,
+    );
+    events.checkpoint()?;
     debug_log.push(format!(
         "pipeline_snapshot path={} registered_frames={registered_frames}",
         path.display()
@@ -1832,61 +1901,25 @@ fn incremental_pipeline_map(
     pairs: &[PairGeometry],
     config: &MapperConfig,
 ) -> Result<IncrementalPipelineMapResult> {
-    incremental_pipeline_map_with_pnp_scorer(
+    let mut events = MapperEventBridge::Silent;
+    incremental_pipeline_map_with_pnp_scorer_and_events(
         frames,
         camera,
         reference_camera_setup,
         pairs,
         config,
+        &mut events,
         None,
     )
 }
 
-fn incremental_pipeline_map_with_pnp_scorer(
+fn incremental_pipeline_map_with_pnp_scorer_and_events(
     frames: &[ImageFrame],
     camera: CameraModel,
     reference_camera_setup: Option<&ReferenceCameraSetup>,
     pairs: &[PairGeometry],
     config: &MapperConfig,
-    pnp_scorer: Option<&mut DynPnPModelScorer>,
-) -> Result<IncrementalPipelineMapResult> {
-    incremental_pipeline_map_with_pnp_scorer_and_callbacks(
-        frames,
-        camera,
-        reference_camera_setup,
-        pairs,
-        config,
-        None,
-        pnp_scorer,
-    )
-}
-
-fn incremental_pipeline_map_with_callbacks(
-    frames: &[ImageFrame],
-    camera: CameraModel,
-    reference_camera_setup: Option<&ReferenceCameraSetup>,
-    pairs: &[PairGeometry],
-    config: &MapperConfig,
-    callback_sink: Option<&mut dyn PipelineCallbackSink>,
-) -> Result<IncrementalPipelineMapResult> {
-    incremental_pipeline_map_with_pnp_scorer_and_callbacks(
-        frames,
-        camera,
-        reference_camera_setup,
-        pairs,
-        config,
-        callback_sink,
-        None,
-    )
-}
-
-fn incremental_pipeline_map_with_pnp_scorer_and_callbacks(
-    frames: &[ImageFrame],
-    camera: CameraModel,
-    reference_camera_setup: Option<&ReferenceCameraSetup>,
-    pairs: &[PairGeometry],
-    config: &MapperConfig,
-    mut callback_sink: Option<&mut dyn PipelineCallbackSink>,
+    events: &mut MapperEventBridge<'_, '_>,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
 ) -> Result<IncrementalPipelineMapResult> {
     if config.use_gpu_pnp && pnp_scorer.is_none() {
@@ -1909,6 +1942,7 @@ fn incremental_pipeline_map_with_pnp_scorer_and_callbacks(
             session.reset_initialization_stats();
         }
         for trial in 0..stage_config.config.init_num_trials.max(1) {
+            events.checkpoint()?;
             if reconstructions.len() >= max_num_models
                 || (config.multiple_models
                     && session.num_total_registered_images() >= frames.len().saturating_sub(1))
@@ -1929,7 +1963,7 @@ fn incremental_pipeline_map_with_pnp_scorer_and_callbacks(
                 &stage_config.config,
                 &mut session,
                 model_index,
-                &mut callback_sink,
+                events,
                 &mut pnp_scorer,
             ) {
                 Ok((reconstruction, mut attempt_log)) => {
@@ -1965,7 +1999,7 @@ fn incremental_pipeline_map_with_pnp_scorer_and_callbacks(
                     }
                     push_pipeline_callback(
                         &mut debug_log,
-                        &mut callback_sink,
+                        events,
                         PipelineCallbackEvent {
                             callback: IncrementalPipelineCallback::LastImageReg,
                             model_index,
@@ -1974,6 +2008,7 @@ fn incremental_pipeline_map_with_pnp_scorer_and_callbacks(
                             points,
                         },
                     );
+                    events.checkpoint()?;
 
                     if !config.multiple_models
                         || session.num_shared_registered_image_events() >= config.max_model_overlap
@@ -1982,9 +2017,12 @@ fn incremental_pipeline_map_with_pnp_scorer_and_callbacks(
                     }
                 }
                 Err(err) => {
-                    if err.downcast_ref::<GpuPnpMapperError>().is_some() {
+                    if err.downcast_ref::<GpuPnpMapperError>().is_some()
+                        || err.downcast_ref::<SfmTaskStop>().is_some()
+                    {
                         return Err(err);
                     }
+                    events.checkpoint()?;
                     let message = err.to_string();
                     let initial_failure = err.downcast_ref::<InitialPairFailure>().copied();
                     debug_log.push(format!(
@@ -2022,13 +2060,18 @@ pub fn run_incremental_pipeline(
     config: &MapperConfig,
     callback_sink: Option<&mut dyn PipelineCallbackSink>,
 ) -> IncrementalPipelineResult {
-    match incremental_pipeline_map_with_callbacks(
+    let mut events = match callback_sink {
+        Some(sink) => MapperEventBridge::Legacy(sink),
+        None => MapperEventBridge::Silent,
+    };
+    match incremental_pipeline_map_with_pnp_scorer_and_events(
         frames,
         camera,
         reference_camera_setup,
         pairs,
         config,
-        callback_sink,
+        &mut events,
+        None,
     ) {
         Ok(result) => IncrementalPipelineResult {
             status: IncrementalPipelineStatus::Success,
@@ -2180,13 +2223,11 @@ fn initialization_stage_name(stage: InitializationRelaxationStage) -> &'static s
 
 fn push_pipeline_callback(
     debug_log: &mut Vec<String>,
-    callback_sink: &mut Option<&mut dyn PipelineCallbackSink>,
+    events: &mut MapperEventBridge<'_, '_>,
     event: PipelineCallbackEvent,
 ) {
     debug_log.push(format!("callback {}", event.callback.as_str()));
-    if let Some(callback_sink) = callback_sink.as_deref_mut() {
-        callback_sink.on_pipeline_callback(&event);
-    }
+    events.callback(event);
 }
 
 fn incremental_map_with_session(
@@ -2199,6 +2240,7 @@ fn incremental_map_with_session(
 ) -> Result<(Reconstruction, Vec<String>)> {
     let mut debug_log = Vec::new();
     let mut last_error = None;
+    let mut events = MapperEventBridge::Silent;
     for stage_config in initialization_stage_configs(config) {
         if stage_config.stage != InitializationRelaxationStage::Strict {
             session.reset_initialization_stats();
@@ -2208,7 +2250,6 @@ fn incremental_map_with_session(
                 stage_config.stage == InitializationRelaxationStage::Strict && trial == 0;
             let attempt_setup =
                 setup_for_reconstruction_attempt(reference_camera_setup, attempt_uses_seed);
-            let mut callback_sink = None;
             match incremental_map_single_attempt(
                 frames,
                 camera,
@@ -2217,7 +2258,7 @@ fn incremental_map_with_session(
                 &stage_config.config,
                 session,
                 0,
-                &mut callback_sink,
+                &mut events,
             ) {
                 Ok((reconstruction, mut attempt_log)) => {
                     debug_log.push(format!(
@@ -2261,7 +2302,7 @@ fn incremental_map_single_attempt(
     config: &MapperConfig,
     session: &mut IncrementalMapperSession,
     model_index: usize,
-    callback_sink: &mut Option<&mut dyn PipelineCallbackSink>,
+    events: &mut MapperEventBridge<'_, '_>,
 ) -> Result<(Reconstruction, Vec<String>)> {
     let mut pnp_scorer = None;
     incremental_map_single_attempt_with_pnp_scorer(
@@ -2272,7 +2313,7 @@ fn incremental_map_single_attempt(
         config,
         session,
         model_index,
-        callback_sink,
+        events,
         &mut pnp_scorer,
     )
 }
@@ -2286,7 +2327,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
     config: &MapperConfig,
     session: &mut IncrementalMapperSession,
     model_index: usize,
-    callback_sink: &mut Option<&mut dyn PipelineCallbackSink>,
+    events: &mut MapperEventBridge<'_, '_>,
     pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
 ) -> Result<(Reconstruction, Vec<String>)> {
     let mut debug_log = Vec::new();
@@ -2363,6 +2404,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
     let tri_options = mapper_triangulator_options(config);
     let mut triangulation_state = IncrementalTriangulatorState::new(frames, pairs, &reconstruction);
     let mut initial_color_images = Vec::new();
+    events.checkpoint()?;
     let gauge_image = if let Some(image) = reconstruction.poses.iter().position(Option::is_some) {
         debug_log.push(format!(
             "continue_reconstruction registered_images={} points={}",
@@ -2462,7 +2504,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
     if initial_pair_registered {
         push_pipeline_callback(
             &mut debug_log,
-            callback_sink,
+            events,
             PipelineCallbackEvent {
                 callback: IncrementalPipelineCallback::InitialImagePairReg,
                 model_index,
@@ -2472,12 +2514,14 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             },
         );
     }
+    events.checkpoint()?;
 
     let mut snapshot_state = PipelineSnapshotState::new(&reconstruction);
     let mut retry_state = RegistrationRetryState::new(frames.len());
     let mut telemetry = IncrementalRegistrationTelemetry::default();
     let mut fallback_available = true;
     while reconstruction.poses.iter().any(|p| p.is_none()) {
+        events.checkpoint()?;
         let NextRegistrationSelection {
             choice,
             failed_attempts,
@@ -2496,6 +2540,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             &mut telemetry,
             pnp_scorer,
         )?;
+        events.checkpoint()?;
         let normal_attempted_candidates = !failed_attempts.is_empty();
         for (failed_image, mode) in failed_attempts {
             let support = registration_unit_support(
@@ -2538,6 +2583,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 &mut telemetry,
                 pnp_scorer,
             )?;
+            events.checkpoint()?;
             for (failed_image, mode) in failed_attempts {
                 let support = registration_unit_support(
                     &reconstruction,
@@ -2682,6 +2728,12 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         local_registration_stats.register_frame_for_image_event(&reconstruction, choice.image);
         let local_ba_required =
             local_bundle_refinement_required(&reconstruction, choice.image, gauge_image, config);
+        events.checkpoint()?;
+        events.emit_operation(
+            SfmTaskStage::BundleAdjustment,
+            SfmTaskOperation::LocalBundleAdjustment,
+            SfmTaskEventKind::Started,
+        );
         let local_ba_report = refine_local_bundle_after_registration(
             frames,
             pairs,
@@ -2693,6 +2745,12 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             &local_registration_stats,
             &mut triangulation_state,
         );
+        events.emit_operation(
+            SfmTaskStage::BundleAdjustment,
+            SfmTaskOperation::LocalBundleAdjustment,
+            SfmTaskEventKind::Completed,
+        );
+        events.checkpoint()?;
         let rollback_reason = registration_rollback_reason(
             &reconstruction,
             choice.image,
@@ -2715,6 +2773,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 "registration_rollback {} reason={reason}",
                 frames[choice.image].name
             ));
+            events.checkpoint()?;
             continue;
         }
         registration_stats.register_frame_for_image_event(&reconstruction, choice.image);
@@ -2777,7 +2836,13 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             debug_log.push(format!("filtered_frames count={filtered_frames}"));
         }
         if should_run_global_ba(&global_ba_schedule, &reconstruction, config) {
-            if refine_global_bundle_with_postprocessing(
+            events.checkpoint()?;
+            events.emit_operation(
+                SfmTaskStage::BundleAdjustment,
+                SfmTaskOperation::GlobalBundleAdjustment,
+                SfmTaskEventKind::Started,
+            );
+            let global_ba_ran = refine_global_bundle_with_postprocessing(
                 frames,
                 pairs,
                 &mut reconstruction,
@@ -2789,7 +2854,14 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 Some(&mut registration_stats),
                 Some(&mut filtered_units),
                 &mut triangulation_state,
-            ) {
+            );
+            events.emit_operation(
+                SfmTaskStage::BundleAdjustment,
+                SfmTaskOperation::GlobalBundleAdjustment,
+                SfmTaskEventKind::Completed,
+            );
+            events.checkpoint()?;
+            if global_ba_ran {
                 global_ba_schedule.mark(&reconstruction);
             }
         }
@@ -2806,10 +2878,11 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             config,
             &mut snapshot_state,
             &mut debug_log,
+            events,
         )?;
         push_pipeline_callback(
             &mut debug_log,
-            callback_sink,
+            events,
             PipelineCallbackEvent {
                 callback: IncrementalPipelineCallback::NextImageReg,
                 model_index,
@@ -2818,8 +2891,15 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 points: reconstruction.points.len(),
             },
         );
+        events.checkpoint()?;
     }
     if should_run_final_global_ba(&global_ba_schedule, &reconstruction, config) {
+        events.checkpoint()?;
+        events.emit_operation(
+            SfmTaskStage::BundleAdjustment,
+            SfmTaskOperation::GlobalBundleAdjustment,
+            SfmTaskEventKind::Started,
+        );
         refine_global_bundle_with_postprocessing(
             frames,
             pairs,
@@ -2833,6 +2913,12 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             Some(&mut filtered_units),
             &mut triangulation_state,
         );
+        events.emit_operation(
+            SfmTaskStage::BundleAdjustment,
+            SfmTaskOperation::GlobalBundleAdjustment,
+            SfmTaskEventKind::Completed,
+        );
+        events.checkpoint()?;
     }
     let final_color_report =
         extract_colors_for_all_registered_images(frames, &mut reconstruction, config);
@@ -16022,7 +16108,7 @@ mod tests {
             &config,
             &mut session,
             0,
-            &mut None,
+            &mut MapperEventBridge::Silent,
         )?;
 
         assert!(log
@@ -16063,7 +16149,7 @@ mod tests {
             &config,
             &mut session,
             0,
-            &mut None,
+            &mut MapperEventBridge::Silent,
         )?;
 
         assert!(log
@@ -16123,7 +16209,7 @@ mod tests {
             &config,
             &mut session,
             0,
-            &mut None,
+            &mut MapperEventBridge::Silent,
         )?;
 
         assert!(log
@@ -16210,7 +16296,7 @@ mod tests {
             &config,
             &mut session,
             0,
-            &mut None,
+            &mut MapperEventBridge::Silent,
         )?;
 
         assert!(log
@@ -16409,7 +16495,7 @@ mod tests {
             &config,
             &mut session,
             0,
-            &mut None,
+            &mut MapperEventBridge::Silent,
         )?;
 
         assert!(
@@ -17301,6 +17387,244 @@ mod tests {
     }
 
     #[test]
+    fn task_callback_adapter_maps_registration_events_with_monotonic_metadata() {
+        use crate::task::{
+            SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation,
+            SfmTaskStage,
+        };
+
+        let control = SfmTaskControl::new();
+        let mut task_events = Vec::<SfmTaskEvent>::new();
+        {
+            let mut sink = |event| task_events.push(event);
+            let mut task = SfmTaskContext::new(&control, &mut sink);
+            let mut bridge = MapperEventBridge::Task(&mut task);
+
+            for (callback, registered_images, points) in [
+                (IncrementalPipelineCallback::InitialImagePairReg, 2, 11),
+                (IncrementalPipelineCallback::NextImageReg, 3, 17),
+                (IncrementalPipelineCallback::LastImageReg, 3, 17),
+            ] {
+                bridge.callback(PipelineCallbackEvent {
+                    callback,
+                    model_index: 0,
+                    registered_images,
+                    registered_frames: registered_images,
+                    points,
+                });
+            }
+        }
+
+        assert_eq!(
+            task_events
+                .iter()
+                .map(|event| event.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                SfmTaskOperation::RegisterInitialPair,
+                SfmTaskOperation::RegisterImage,
+                SfmTaskOperation::RegisterImage,
+            ]
+        );
+        assert!(task_events
+            .windows(2)
+            .all(|events| events[0].sequence < events[1].sequence));
+        assert!(task_events.iter().all(|event| {
+            event.stage == SfmTaskStage::IncrementalMapping
+                && event.kind == SfmTaskEventKind::Progress
+        }));
+        assert_eq!(task_events[0].registered_images, Some(2));
+        assert_eq!(task_events[0].sparse_points, Some(11));
+        assert_eq!(task_events.last().unwrap().registered_images, Some(3));
+        assert_eq!(task_events.last().unwrap().sparse_points, Some(17));
+    }
+
+    fn controlled_mapper_fixture() -> (CameraModel, Vec<ImageFrame>, Vec<PairGeometry>) {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(0.03),
+                glam::Vec3::new(-0.35, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                glam::Quat::from_rotation_y(-0.02),
+                glam::Vec3::new(0.45, 0.0, 0.0),
+            ),
+        ];
+        let points = (0..12)
+            .map(|idx| {
+                let col = (idx % 4) as f32;
+                let row = (idx / 4) as f32;
+                [-0.3 + col * 0.2, -0.2 + row * 0.18, 3.0 + idx as f32 * 0.03]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = (0..3)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+            frames[image].colors = vec![[(image as u8) + 1, 20, 30]; points.len()];
+        }
+        let pairs = vec![
+            initial_pair_from_projected_points(0, 1, poses[0], poses[1], points.len()),
+            initial_pair_from_projected_points(0, 2, poses[0], poses[2], points.len()),
+            initial_pair_from_projected_points(1, 2, poses[1], poses[2], points.len()),
+        ];
+        (camera, frames, pairs)
+    }
+
+    #[test]
+    fn controlled_mapper_pauses_after_committed_registration_and_keeps_snapshot_exportable() {
+        use crate::task::{
+            SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation,
+            SfmTaskStage, SfmTaskStop,
+        };
+
+        let (camera, frames, pairs) = controlled_mapper_fixture();
+        let dir = tempdir().unwrap();
+        let snapshot_root = dir.path().join("snapshots");
+        let config = MapperConfig {
+            multiple_models: false,
+            snapshot_path: Some(snapshot_root.clone()),
+            snapshot_frames_freq: 1,
+            init_num_trials: 1,
+            init_min_num_inliers: 4,
+            init_min_tri_angle_deg: 0.5,
+            min_triangulated: 0,
+            abs_pose_min_num_inliers: 4,
+            local_ba: false,
+            global_ba: false,
+            ..MapperConfig::default()
+        };
+        let control = SfmTaskControl::new();
+        let pause = control.clone();
+        let mut task_events = Vec::<SfmTaskEvent>::new();
+        let error = {
+            let mut sink = |event: SfmTaskEvent| {
+                if event.operation == SfmTaskOperation::RegisterImage {
+                    pause.request_pause();
+                }
+                task_events.push(event);
+            };
+            let mut task = SfmTaskContext::new(&control, &mut sink);
+            let mut bridge = MapperEventBridge::Task(&mut task);
+            incremental_pipeline_map_with_pnp_scorer_and_events(
+                &frames,
+                camera,
+                None,
+                &pairs,
+                &config,
+                &mut bridge,
+                None,
+            )
+            .expect_err("the task should pause after the committed registration")
+        };
+
+        assert_eq!(
+            error.downcast_ref::<SfmTaskStop>(),
+            Some(&SfmTaskStop::Paused)
+        );
+        let register_event = task_events
+            .iter()
+            .find(|event| event.operation == SfmTaskOperation::RegisterImage)
+            .expect("registered image event");
+        assert_eq!(register_event.registered_images, Some(3));
+        assert_eq!(register_event.sparse_points, Some(12));
+        assert_eq!(
+            task_events
+                .iter()
+                .filter(|event| {
+                    event.stage == SfmTaskStage::Export
+                        && event.operation == SfmTaskOperation::WriteArtifacts
+                })
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![SfmTaskEventKind::Started, SfmTaskEventKind::Completed]
+        );
+
+        let snapshot = snapshot_root.join("0000000001");
+        let exported = read_colmap_sparse_model(&snapshot).expect("committed snapshot is readable");
+        assert_eq!(
+            exported
+                .reconstruction
+                .poses
+                .iter()
+                .filter(|pose| pose.is_some())
+                .count(),
+            3
+        );
+        assert_eq!(exported.reconstruction.points.len(), 12);
+    }
+
+    #[test]
+    fn controlled_mapper_reports_local_and_global_ba_operation_boundaries() {
+        use crate::task::{
+            SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation,
+        };
+
+        let (camera, frames, pairs) = controlled_mapper_fixture();
+        let config = MapperConfig {
+            multiple_models: false,
+            init_num_trials: 1,
+            init_min_num_inliers: 4,
+            init_min_tri_angle_deg: 0.5,
+            min_triangulated: 0,
+            abs_pose_min_num_inliers: 4,
+            local_ba: true,
+            local_ba_num_images: 2,
+            local_ba_min_shared_points: 4,
+            local_ba_iterations: 1,
+            local_ba_max_refinements: 1,
+            global_ba: true,
+            global_ba_iterations: 1,
+            global_ba_max_refinements: 1,
+            global_ba_images_freq: 1,
+            global_ba_points_freq: 1,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+        let control = SfmTaskControl::new();
+        let mut task_events = Vec::<SfmTaskEvent>::new();
+        {
+            let mut sink = |event| task_events.push(event);
+            let mut task = SfmTaskContext::new(&control, &mut sink);
+            let mut bridge = MapperEventBridge::Task(&mut task);
+            incremental_pipeline_map_with_pnp_scorer_and_events(
+                &frames,
+                camera,
+                None,
+                &pairs,
+                &config,
+                &mut bridge,
+                None,
+            )
+            .expect("controlled BA pipeline");
+        }
+
+        for operation in [
+            SfmTaskOperation::LocalBundleAdjustment,
+            SfmTaskOperation::GlobalBundleAdjustment,
+        ] {
+            let boundary_kinds = task_events
+                .iter()
+                .filter(|event| event.operation == operation)
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            assert!(!boundary_kinds.is_empty(), "missing {operation:?} events");
+            assert_eq!(boundary_kinds.len() % 2, 0, "unpaired {operation:?} events");
+            assert!(boundary_kinds
+                .chunks_exact(2)
+                .all(|pair| { pair == [SfmTaskEventKind::Started, SfmTaskEventKind::Completed] }));
+        }
+    }
+
+    #[test]
     fn pipeline_callback_sink_receives_colmap_controller_events_with_payloads() {
         let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
         let poses = [
@@ -17351,13 +17675,15 @@ mod tests {
         };
         let mut collector = CallbackCollector::default();
 
-        let result = incremental_pipeline_map_with_callbacks(
+        let mut events = MapperEventBridge::Legacy(&mut collector);
+        let result = incremental_pipeline_map_with_pnp_scorer_and_events(
             &frames,
             camera,
             None,
             &pairs,
             &config,
-            Some(&mut collector),
+            &mut events,
+            None,
         )
         .expect("callback sink pipeline");
 
@@ -17566,7 +17892,7 @@ mod tests {
             ..MapperConfig::default()
         };
         let mut session = IncrementalMapperSession::default();
-        let mut callback_sink = None;
+        let mut events = MapperEventBridge::Silent;
 
         let (reconstruction, log) = incremental_map_single_attempt(
             &frames,
@@ -17576,7 +17902,7 @@ mod tests {
             &config,
             &mut session,
             0,
-            &mut callback_sink,
+            &mut events,
         )
         .expect("seeded reconstruction should continue");
 

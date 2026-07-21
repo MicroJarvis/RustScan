@@ -164,3 +164,8 @@ fn context_assigns_monotonic_event_metadata() {
     assert_ne!(events[1].elapsed_ms, u64::MAX);
     assert!(events[1].elapsed_ms >= events[0].elapsed_ms);
 }
+
+#[test]
+fn controlled_mapper_entry_point_is_public() {
+    let _entry = rustsfm::run_reconstruction_with_task;
+}
