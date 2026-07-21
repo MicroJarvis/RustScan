@@ -6,7 +6,7 @@ pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinea
 pub use sequence_registration::{
     FrameRegistrationDiagnostic, FrameRegistrationStatus, RegistrationRound, SequenceFrame,
     SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
-    SequenceRegistrationResult,
+    SequenceRegistrationResult, MAX_SEQUENCE_PLAN_FRAMES,
 };
 pub use task::{
     SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,

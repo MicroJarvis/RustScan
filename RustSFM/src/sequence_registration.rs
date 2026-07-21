@@ -1,8 +1,11 @@
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BinaryHeap;
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+
+pub const MAX_SEQUENCE_PLAN_FRAMES: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceFrame {
@@ -265,6 +268,10 @@ pub enum SequenceRegistrationError {
     FrameCountExceedsFrameIdRange {
         imported_frames: usize,
     },
+    SequencePlanTooLarge {
+        frame_count: usize,
+        max_frame_count: usize,
+    },
     InvalidFrameIds {
         imported_frames: usize,
         frame_id_count: usize,
@@ -336,6 +343,13 @@ impl fmt::Display for SequenceRegistrationError {
             Self::FrameCountExceedsFrameIdRange { imported_frames } => write!(
                 formatter,
                 "{imported_frames} imported frames cannot be represented by u32 frame IDs"
+            ),
+            Self::SequencePlanTooLarge {
+                frame_count,
+                max_frame_count,
+            } => write!(
+                formatter,
+                "sequence plan frame count {frame_count} exceeds supported maximum {max_frame_count}"
             ),
             Self::InvalidFrameIds {
                 imported_frames,
@@ -634,6 +648,12 @@ fn validate_keyframes(
     frame_count: usize,
     keyframes: &[usize],
 ) -> Result<(), SequenceRegistrationError> {
+    if frame_count > MAX_SEQUENCE_PLAN_FRAMES {
+        return Err(SequenceRegistrationError::SequencePlanTooLarge {
+            frame_count,
+            max_frame_count: MAX_SEQUENCE_PLAN_FRAMES,
+        });
+    }
     if frame_count as u128 > u32::MAX as u128 + 1 {
         return Err(SequenceRegistrationError::FrameCountExceedsFrameIdRange {
             imported_frames: frame_count,
@@ -758,23 +778,78 @@ fn support_for(
 ) -> Vec<usize> {
     let left_end = candidates.partition_point(|candidate| *candidate < frame);
     let right_start = candidates.partition_point(|candidate| *candidate <= frame);
-    let left_start = left_end.saturating_sub(neighbors_each_side);
-    let right_end = right_start
-        .saturating_add(neighbors_each_side)
-        .min(candidates.len());
-
-    let mut support = Vec::with_capacity(
-        left_end.saturating_sub(left_start) + right_end.saturating_sub(right_start),
-    );
-    support.extend_from_slice(&candidates[left_start..left_end]);
-    support.extend_from_slice(&candidates[right_start..right_end]);
-    support.sort_by_key(|candidate| {
-        let distance = if let Some(timestamps_us) = timestamps_us {
-            timestamps_us[*candidate].abs_diff(timestamps_us[frame]) as u128
-        } else {
-            candidate.abs_diff(frame) as u128
-        };
-        (distance, frame_ids[*candidate])
-    });
+    let mut support = if timestamps_us.is_some() {
+        let mut support = select_top_support(
+            frame,
+            &candidates[..left_end],
+            neighbors_each_side,
+            frame_ids,
+            timestamps_us,
+        );
+        support.extend(select_top_support(
+            frame,
+            &candidates[right_start..],
+            neighbors_each_side,
+            frame_ids,
+            timestamps_us,
+        ));
+        support
+    } else {
+        let left_start = left_end.saturating_sub(neighbors_each_side);
+        let right_end = right_start
+            .saturating_add(neighbors_each_side)
+            .min(candidates.len());
+        let mut support = Vec::with_capacity(
+            left_end.saturating_sub(left_start) + right_end.saturating_sub(right_start),
+        );
+        support.extend_from_slice(&candidates[left_start..left_end]);
+        support.extend_from_slice(&candidates[right_start..right_end]);
+        support
+    };
+    support.sort_by_key(|candidate| support_key(frame, *candidate, frame_ids, timestamps_us));
     support
+}
+
+fn select_top_support(
+    frame: usize,
+    candidates: &[usize],
+    limit: usize,
+    frame_ids: &[u32],
+    timestamps_us: Option<&[i64]>,
+) -> Vec<usize> {
+    if limit == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = BinaryHeap::with_capacity(limit.min(candidates.len()));
+    for candidate in candidates.iter().copied() {
+        let entry = (
+            support_key(frame, candidate, frame_ids, timestamps_us),
+            candidate,
+        );
+        if selected.len() < limit {
+            selected.push(entry);
+        } else if selected.peek().is_some_and(|worst| entry < *worst) {
+            selected.pop();
+            selected.push(entry);
+        }
+    }
+    selected
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+fn support_key(
+    frame: usize,
+    candidate: usize,
+    frame_ids: &[u32],
+    timestamps_us: Option<&[i64]>,
+) -> (u128, u32) {
+    let distance = if let Some(timestamps_us) = timestamps_us {
+        timestamps_us[candidate].abs_diff(timestamps_us[frame]) as u128
+    } else {
+        candidate.abs_diff(frame) as u128
+    };
+    (distance, frame_ids[candidate])
 }

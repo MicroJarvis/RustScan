@@ -1,7 +1,7 @@
 use rustsfm::{
     FrameRegistrationDiagnostic, FrameRegistrationStatus, RegistrationRound, SequenceFrame,
     SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
-    SequenceRegistrationResult,
+    SequenceRegistrationResult, MAX_SEQUENCE_PLAN_FRAMES,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
@@ -142,6 +142,51 @@ fn temporal_frame_plan_orders_support_by_timestamp_distance_then_frame_id() {
 }
 
 #[test]
+fn temporal_frame_plan_selects_each_side_by_timestamp_distance_and_frame_id() {
+    let frames = [
+        SequenceFrame {
+            id: 1,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 2,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 50,
+            image_path: PathBuf::from("002.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 40,
+            image_path: PathBuf::from("003.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 30,
+            image_path: PathBuf::from("004.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 60,
+            image_path: PathBuf::from("005.jpg"),
+            timestamp_us: Some(100),
+        },
+        SequenceFrame {
+            id: 3,
+            image_path: PathBuf::from("006.jpg"),
+            timestamp_us: Some(200),
+        },
+    ];
+    let plan =
+        SequenceRegistrationPlan::build_from_frames(&frames, &[0, 1, 2, 3, 4, 6], 2, 4).unwrap();
+
+    assert_eq!(plan.attempts_for(5, RegistrationRound::Narrow), &[0, 1, 6]);
+}
+
+#[test]
 fn temporal_frame_plan_rejects_unsorted_timestamps() {
     let frames = [
         SequenceFrame {
@@ -244,17 +289,18 @@ fn invalid_temporal_plan_rejects_more_keyframes_than_frames() {
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn invalid_temporal_plan_rejects_unrepresentable_frame_count_before_allocating() {
-    let frame_count = u32::MAX as usize + 2;
-
-    assert!(matches!(
-        SequenceRegistrationPlan::build(frame_count, &[0], 2, 4),
-        Err(SequenceRegistrationError::FrameCountExceedsFrameIdRange {
-            imported_frames,
-        }) if imported_frames == frame_count
-    ));
+    for frame_count in [MAX_SEQUENCE_PLAN_FRAMES + 1, u32::MAX as usize + 1] {
+        assert!(matches!(
+            SequenceRegistrationPlan::build(frame_count, &[0], 2, 4),
+            Err(SequenceRegistrationError::SequencePlanTooLarge {
+                frame_count: rejected,
+                max_frame_count: MAX_SEQUENCE_PLAN_FRAMES,
+            }) if rejected == frame_count
+        ));
+    }
 
     let json = serde_json::json!({
-        "frame_count": frame_count,
+        "frame_count": u32::MAX as usize + 1,
         "keyframes": [0],
         "narrow_neighbors_each_side": 2,
         "wide_neighbors_each_side": 4,
