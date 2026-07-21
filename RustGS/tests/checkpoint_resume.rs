@@ -1,10 +1,35 @@
 use std::fs;
+use std::panic::catch_unwind;
 
 use rustgs::{
     load_training_checkpoint, save_training_checkpoint, AdamCheckpoint, AdamParameterCheckpoint,
     HostSplats, Intrinsics, TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint,
     TrainingConfig, TrainingDataset, TrainingError, TrainingIdentity, TRAINING_CHECKPOINT_VERSION,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct SerializedHostSplats {
+    positions: Vec<f32>,
+    log_scales: Vec<f32>,
+    rotations: Vec<f32>,
+    opacity_logits: Vec<f32>,
+    sh_coeffs: Vec<f32>,
+    sh_degree: usize,
+}
+
+#[derive(Serialize)]
+struct SerializedTrainingCheckpoint {
+    version: u32,
+    identity: TrainingIdentity,
+    completed_iterations: usize,
+    latest_loss: Option<f32>,
+    splats: SerializedHostSplats,
+    optimizer: AdamCheckpoint,
+    topology: TopologyCheckpoint,
+    frame_shuffle_seed: u64,
+    active_sh_degree: usize,
+}
 
 fn tensor(values: &[f32]) -> TensorCheckpoint {
     TensorCheckpoint {
@@ -68,6 +93,29 @@ fn checkpoint_fixture(completed_iterations: usize) -> TrainingCheckpoint {
 
 fn write_unchecked(path: &std::path::Path, checkpoint: &TrainingCheckpoint) {
     fs::write(path, bincode::serialize(checkpoint).unwrap()).unwrap();
+}
+
+fn serialize_with_sh_degree(checkpoint: TrainingCheckpoint, sh_degree: usize) -> Vec<u8> {
+    let view = checkpoint.splats.as_view();
+    bincode::serialize(&SerializedTrainingCheckpoint {
+        version: checkpoint.version,
+        identity: checkpoint.identity,
+        completed_iterations: checkpoint.completed_iterations,
+        latest_loss: checkpoint.latest_loss,
+        splats: SerializedHostSplats {
+            positions: view.positions.to_vec(),
+            log_scales: view.log_scales.to_vec(),
+            rotations: view.rotations.to_vec(),
+            opacity_logits: view.opacity_logits.to_vec(),
+            sh_coeffs: view.sh_coeffs.to_vec(),
+            sh_degree,
+        },
+        optimizer: checkpoint.optimizer,
+        topology: checkpoint.topology,
+        frame_shuffle_seed: checkpoint.frame_shuffle_seed,
+        active_sh_degree: checkpoint.active_sh_degree,
+    })
+    .unwrap()
 }
 
 fn assert_invalid_input_contains(error: TrainingError, expected: &str) {
@@ -159,6 +207,21 @@ fn checkpoint_load_rejects_non_finite_values() {
         load_training_checkpoint(&path).unwrap_err(),
         "tensor values must be finite",
     );
+}
+
+#[test]
+fn checkpoint_load_rejects_sh_width_overflow_without_panicking() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sh-width-overflow.rgscp");
+    fs::write(
+        &path,
+        serialize_with_sh_degree(checkpoint_fixture(10), usize::MAX),
+    )
+    .unwrap();
+
+    let loaded = catch_unwind(|| load_training_checkpoint(&path))
+        .expect("loading a corrupt checkpoint must not panic");
+    assert_invalid_input_contains(loaded.unwrap_err(), "SH width overflow");
 }
 
 #[test]
