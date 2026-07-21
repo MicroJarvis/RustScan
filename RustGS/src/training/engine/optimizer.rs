@@ -337,6 +337,17 @@ impl<B: Backend> AdamScaled<B> {
     where
         AD: AutodiffBackend<InnerBackend = B>,
     {
+        if checkpoint.transforms.step != checkpoint.sh_coeffs.step
+            || checkpoint.transforms.step != checkpoint.raw_opacities.step
+        {
+            return Err(invalid_optimizer_checkpoint(format!(
+                "optimizer parameter steps must be equal, got transforms={}, sh_coeffs={}, raw_opacities={}",
+                checkpoint.transforms.step,
+                checkpoint.sh_coeffs.step,
+                checkpoint.raw_opacities.step
+            )));
+        }
+
         let transforms_shape = splats.transforms.val().dims();
         let sh_shape = splats.sh_coeffs.val().dims();
         let opacity_shape = splats.raw_opacities.val().dims();
@@ -776,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn optimizer_checkpoint_restore_preserves_reset_and_individual_steps() {
+    async fn optimizer_checkpoint_restore_rejects_divergent_steps_without_mutation() {
         let device = <GsBackendBase as Backend>::Device::default();
         let mut splats = test_splats(&device);
         let mut optimizer = optimizer_with_scaling(&device);
@@ -786,11 +797,40 @@ mod tests {
         checkpoint.transforms.step = 3;
         checkpoint.sh_coeffs.step = 5;
         checkpoint.raw_opacities.step = 7;
+        let mut restored = optimizer_with_scaling(&device);
+        let before = restored
+            .checkpoint()
+            .await
+            .expect("checkpoint before restore");
+        let error = restored
+            .restore(&checkpoint, &splats, &device)
+            .expect_err("divergent steps must be rejected");
+        assert!(matches!(
+            error,
+            TrainingError::InvalidInput(message) if message.contains("steps must be equal")
+        ));
+        assert_eq!(
+            restored.checkpoint().await.expect("re-export checkpoint"),
+            before
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn optimizer_checkpoint_restore_accepts_missing_scaling_and_reset_state() {
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut splats = test_splats(&device);
+        let mut optimizer = optimizer_with_scaling(&device);
+        optimizer_step(&mut optimizer, &mut splats, &device);
+        let mut checkpoint = optimizer.checkpoint().await.expect("export checkpoint");
+
+        checkpoint.transforms.step = 3;
+        checkpoint.sh_coeffs.step = 3;
+        checkpoint.raw_opacities.step = 3;
         checkpoint.sh_coeffs.scaling = None;
         let mut restored = AdamScaled::<GsBackendBase>::new(AdamScaledConfig::default());
         restored
             .restore(&checkpoint, &splats, &device)
-            .expect("restore independent steps and missing scaling");
+            .expect("restore equal steps and missing scaling");
         assert_eq!(
             restored.checkpoint().await.expect("re-export checkpoint"),
             checkpoint
