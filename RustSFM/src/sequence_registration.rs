@@ -6,6 +6,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub const MAX_SEQUENCE_PLAN_FRAMES: usize = 1_000_000;
+pub const MAX_SEQUENCE_NEIGHBORS: usize = 1_024;
+pub const MAX_TOTAL_SUPPORT_ENTRIES: usize = 32_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceFrame {
@@ -272,6 +274,16 @@ pub enum SequenceRegistrationError {
         frame_count: usize,
         max_frame_count: usize,
     },
+    SequenceNeighborLimitExceeded {
+        round: RegistrationRound,
+        requested: usize,
+        max_neighbors: usize,
+    },
+    SequenceSupportBudgetExceeded {
+        frame_count: usize,
+        estimated_support_entries: u128,
+        max_support_entries: usize,
+    },
     InvalidFrameIds {
         imported_frames: usize,
         frame_id_count: usize,
@@ -350,6 +362,22 @@ impl fmt::Display for SequenceRegistrationError {
             } => write!(
                 formatter,
                 "sequence plan frame count {frame_count} exceeds supported maximum {max_frame_count}"
+            ),
+            Self::SequenceNeighborLimitExceeded {
+                round,
+                requested,
+                max_neighbors,
+            } => write!(
+                formatter,
+                "{round:?} registration neighbor count {requested} exceeds supported maximum {max_neighbors}"
+            ),
+            Self::SequenceSupportBudgetExceeded {
+                frame_count,
+                estimated_support_entries,
+                max_support_entries,
+            } => write!(
+                formatter,
+                "sequence plan for {frame_count} frames may cache {estimated_support_entries} support entries, exceeding maximum {max_support_entries}"
             ),
             Self::InvalidFrameIds {
                 imported_frames,
@@ -471,6 +499,11 @@ impl SequenceRegistrationPlan {
         narrow_neighbors_each_side: usize,
         wide_neighbors_each_side: usize,
     ) -> Result<Self, SequenceRegistrationError> {
+        validate_plan_limits(
+            frame_count,
+            narrow_neighbors_each_side,
+            wide_neighbors_each_side,
+        )?;
         validate_keyframes(frame_count, keyframes)?;
         let frame_ids = (0..frame_count).map(|frame| frame as u32).collect();
         Self::build_validated(
@@ -489,6 +522,11 @@ impl SequenceRegistrationPlan {
         narrow_neighbors_each_side: usize,
         wide_neighbors_each_side: usize,
     ) -> Result<Self, SequenceRegistrationError> {
+        validate_plan_limits(
+            frames.len(),
+            narrow_neighbors_each_side,
+            wide_neighbors_each_side,
+        )?;
         validate_keyframes(frames.len(), keyframes)?;
         let frame_ids = frames.iter().map(|frame| frame.id).collect();
         let timestamps_us = frames.iter().map(|frame| frame.timestamp_us).collect();
@@ -510,6 +548,11 @@ impl SequenceRegistrationPlan {
         frame_ids: Vec<u32>,
         timestamps_us: Option<Vec<i64>>,
     ) -> Result<Self, SequenceRegistrationError> {
+        validate_plan_limits(
+            frame_count,
+            narrow_neighbors_each_side,
+            wide_neighbors_each_side,
+        )?;
         validate_plan_ordering(frame_count, &frame_ids, timestamps_us.as_deref())?;
 
         let pending = (0..frame_count)
@@ -565,15 +608,13 @@ impl SequenceRegistrationPlan {
             return Vec::new();
         }
 
-        let mut candidates = self.keyframes.clone();
-        candidates.extend(
-            registered_support
-                .iter()
-                .copied()
-                .filter(|support| *support < self.frame_count && *support != frame),
-        );
-        candidates.sort_unstable();
-        candidates.dedup();
+        let registered_support: BTreeSet<_> = registered_support
+            .iter()
+            .copied()
+            .filter(|support| *support < self.frame_count && *support != frame)
+            .collect();
+        let candidates =
+            merge_support_candidates(&self.keyframes, &registered_support, self.frame_count);
         let neighbors_each_side = match round {
             RegistrationRound::Narrow => self.narrow_neighbors_each_side,
             RegistrationRound::Wide => self.wide_neighbors_each_side,
@@ -631,6 +672,12 @@ impl<'de> Deserialize<'de> for SequenceRegistrationPlan {
         D: Deserializer<'de>,
     {
         let wire = SequenceRegistrationPlanWire::deserialize(deserializer)?;
+        validate_plan_limits(
+            wire.frame_count,
+            wire.narrow_neighbors_each_side,
+            wire.wide_neighbors_each_side,
+        )
+        .map_err(de::Error::custom)?;
         validate_keyframes(wire.frame_count, &wire.keyframes).map_err(de::Error::custom)?;
         Self::build_validated(
             wire.frame_count,
@@ -642,6 +689,71 @@ impl<'de> Deserialize<'de> for SequenceRegistrationPlan {
         )
         .map_err(de::Error::custom)
     }
+}
+
+fn validate_plan_limits(
+    frame_count: usize,
+    narrow_neighbors_each_side: usize,
+    wide_neighbors_each_side: usize,
+) -> Result<(), SequenceRegistrationError> {
+    if frame_count > MAX_SEQUENCE_PLAN_FRAMES {
+        return Err(SequenceRegistrationError::SequencePlanTooLarge {
+            frame_count,
+            max_frame_count: MAX_SEQUENCE_PLAN_FRAMES,
+        });
+    }
+    for (round, requested) in [
+        (RegistrationRound::Narrow, narrow_neighbors_each_side),
+        (RegistrationRound::Wide, wide_neighbors_each_side),
+    ] {
+        if requested > MAX_SEQUENCE_NEIGHBORS {
+            return Err(SequenceRegistrationError::SequenceNeighborLimitExceeded {
+                round,
+                requested,
+                max_neighbors: MAX_SEQUENCE_NEIGHBORS,
+            });
+        }
+    }
+
+    let estimated_support_entries = frame_count as u128
+        * 2
+        * (narrow_neighbors_each_side as u128 + wide_neighbors_each_side as u128);
+    if estimated_support_entries > MAX_TOTAL_SUPPORT_ENTRIES as u128 {
+        return Err(SequenceRegistrationError::SequenceSupportBudgetExceeded {
+            frame_count,
+            estimated_support_entries,
+            max_support_entries: MAX_TOTAL_SUPPORT_ENTRIES,
+        });
+    }
+    Ok(())
+}
+
+fn merge_support_candidates(
+    keyframes: &[usize],
+    registered_support: &BTreeSet<usize>,
+    frame_count: usize,
+) -> Vec<usize> {
+    let mut merged = Vec::with_capacity(
+        keyframes
+            .len()
+            .saturating_add(registered_support.len())
+            .min(frame_count),
+    );
+    let mut keyframe_index = 0;
+    for registered in registered_support.iter().copied() {
+        while keyframe_index < keyframes.len() && keyframes[keyframe_index] < registered {
+            merged.push(keyframes[keyframe_index]);
+            keyframe_index += 1;
+        }
+        if keyframe_index < keyframes.len() && keyframes[keyframe_index] == registered {
+            merged.push(registered);
+            keyframe_index += 1;
+        } else {
+            merged.push(registered);
+        }
+    }
+    merged.extend_from_slice(&keyframes[keyframe_index..]);
+    merged
 }
 
 fn validate_keyframes(
@@ -778,20 +890,32 @@ fn support_for(
 ) -> Vec<usize> {
     let left_end = candidates.partition_point(|candidate| *candidate < frame);
     let right_start = candidates.partition_point(|candidate| *candidate <= frame);
-    let mut support = if timestamps_us.is_some() {
+    let mut support = if let Some(timestamps_us) = timestamps_us {
+        let left_candidates = bounded_left_timestamp_candidates(
+            candidates,
+            left_end,
+            neighbors_each_side,
+            timestamps_us,
+        );
+        let right_candidates = bounded_right_timestamp_candidates(
+            candidates,
+            right_start,
+            neighbors_each_side,
+            timestamps_us,
+        );
         let mut support = select_top_support(
             frame,
-            &candidates[..left_end],
+            left_candidates,
             neighbors_each_side,
             frame_ids,
-            timestamps_us,
+            Some(timestamps_us),
         );
         support.extend(select_top_support(
             frame,
-            &candidates[right_start..],
+            right_candidates,
             neighbors_each_side,
             frame_ids,
-            timestamps_us,
+            Some(timestamps_us),
         ));
         support
     } else {
@@ -808,6 +932,41 @@ fn support_for(
     };
     support.sort_by_key(|candidate| support_key(frame, *candidate, frame_ids, timestamps_us));
     support
+}
+
+fn bounded_left_timestamp_candidates<'a>(
+    candidates: &'a [usize],
+    left_end: usize,
+    limit: usize,
+    timestamps_us: &[i64],
+) -> &'a [usize] {
+    if limit == 0 || left_end == 0 {
+        return &candidates[left_end..left_end];
+    }
+
+    let initial_start = left_end.saturating_sub(limit);
+    let cutoff_timestamp = timestamps_us[candidates[initial_start]];
+    let plateau_start = candidates[..initial_start]
+        .partition_point(|candidate| timestamps_us[*candidate] < cutoff_timestamp);
+    &candidates[plateau_start..left_end]
+}
+
+fn bounded_right_timestamp_candidates<'a>(
+    candidates: &'a [usize],
+    right_start: usize,
+    limit: usize,
+    timestamps_us: &[i64],
+) -> &'a [usize] {
+    let right_candidates = &candidates[right_start..];
+    if limit == 0 || right_candidates.is_empty() {
+        return &right_candidates[..0];
+    }
+
+    let initial_len = limit.min(right_candidates.len());
+    let cutoff_timestamp = timestamps_us[right_candidates[initial_len - 1]];
+    let plateau_end =
+        right_candidates.partition_point(|candidate| timestamps_us[*candidate] <= cutoff_timestamp);
+    &right_candidates[..plateau_end]
 }
 
 fn select_top_support(

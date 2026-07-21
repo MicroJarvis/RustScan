@@ -1,7 +1,8 @@
 use rustsfm::{
     FrameRegistrationDiagnostic, FrameRegistrationStatus, RegistrationRound, SequenceFrame,
     SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
-    SequenceRegistrationResult, MAX_SEQUENCE_PLAN_FRAMES,
+    SequenceRegistrationResult, MAX_SEQUENCE_NEIGHBORS, MAX_SEQUENCE_PLAN_FRAMES,
+    MAX_TOTAL_SUPPORT_ENTRIES,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
@@ -93,6 +94,28 @@ fn temporal_later_round_can_add_only_explicit_registered_support() {
         plan.attempts_for_with_support(4, RegistrationRound::Wide, &[7, 5, 2, 5, 4, usize::MAX],),
         vec![3, 5, 2, 6, 7, 0, 9]
     );
+}
+
+#[test]
+fn temporal_dynamic_support_remains_bounded_for_large_merged_inputs() {
+    let frame_count = 20_000;
+    let frames: Vec<_> = (0..frame_count)
+        .map(|frame| SequenceFrame {
+            id: (frame_count - frame) as u32,
+            image_path: PathBuf::new(),
+            timestamp_us: Some((frame / 64) as i64),
+        })
+        .collect();
+    let keyframes: Vec<_> = (0..frame_count).step_by(2).collect();
+    let plan = SequenceRegistrationPlan::build_from_frames(&frames, &keyframes, 4, 8).unwrap();
+    let mut registered_support: Vec<_> = (1..frame_count).step_by(2).rev().collect();
+    registered_support.extend([9_999, 9_999, usize::MAX]);
+
+    let support =
+        plan.attempts_for_with_support(10_001, RegistrationRound::Narrow, &registered_support);
+
+    assert!(support.len() <= 8);
+    assert!(!support.contains(&10_001));
 }
 
 #[test]
@@ -284,6 +307,63 @@ fn invalid_temporal_plan_rejects_more_keyframes_than_frames() {
             keyframe_count: 3,
         })
     ));
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_oversized_neighbor_rounds() {
+    for (narrow, wide, round) in [
+        (MAX_SEQUENCE_NEIGHBORS + 1, 4, RegistrationRound::Narrow),
+        (2, MAX_SEQUENCE_NEIGHBORS + 1, RegistrationRound::Wide),
+    ] {
+        assert!(matches!(
+            SequenceRegistrationPlan::build(4, &[0, 3], narrow, wide),
+            Err(SequenceRegistrationError::SequenceNeighborLimitExceeded {
+                round: rejected_round,
+                requested,
+                max_neighbors: MAX_SEQUENCE_NEIGHBORS,
+            }) if rejected_round == round && requested == MAX_SEQUENCE_NEIGHBORS + 1
+        ));
+    }
+
+    let json = serde_json::json!({
+        "frame_count": 4,
+        "keyframes": [0, 3],
+        "narrow_neighbors_each_side": MAX_SEQUENCE_NEIGHBORS + 1,
+        "wide_neighbors_each_side": 4,
+        "frame_ids": [0, 1, 2, 3],
+        "timestamps_us": null,
+    });
+    assert!(serde_json::from_value::<SequenceRegistrationPlan>(json).is_err());
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_total_support_budget_before_allocating() {
+    let narrow = MAX_SEQUENCE_NEIGHBORS;
+    let wide = MAX_SEQUENCE_NEIGHBORS;
+    let entries_per_frame = 2 * (narrow + wide);
+    let frame_count = MAX_TOTAL_SUPPORT_ENTRIES / entries_per_frame + 1;
+
+    assert!(frame_count <= MAX_SEQUENCE_PLAN_FRAMES);
+    assert!(matches!(
+        SequenceRegistrationPlan::build(frame_count, &[0], narrow, wide),
+        Err(SequenceRegistrationError::SequenceSupportBudgetExceeded {
+            frame_count: rejected_frames,
+            estimated_support_entries,
+            max_support_entries: MAX_TOTAL_SUPPORT_ENTRIES,
+        }) if rejected_frames == frame_count
+            && estimated_support_entries
+                == (frame_count as u128 * entries_per_frame as u128)
+    ));
+
+    let json = serde_json::json!({
+        "frame_count": frame_count,
+        "keyframes": [0],
+        "narrow_neighbors_each_side": narrow,
+        "wide_neighbors_each_side": wide,
+        "frame_ids": (0..frame_count as u32).collect::<Vec<_>>(),
+        "timestamps_us": null,
+    });
+    assert!(serde_json::from_value::<SequenceRegistrationPlan>(json).is_err());
 }
 
 #[cfg(target_pointer_width = "64")]
