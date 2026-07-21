@@ -451,15 +451,25 @@ fn validate_adam_parameter(
     scaling_shape: &[usize],
     completed_iterations: usize,
 ) -> Result<(), TrainingError> {
-    if parameter.step != completed_iterations {
+    if parameter.step > completed_iterations {
         return Err(invalid_checkpoint(format!(
-            "{name}.step must equal completed iterations {completed_iterations}, got {}",
+            "{name}.step must not exceed completed iterations {completed_iterations}, got {}",
             parameter.step
         )));
     }
     if parameter.moment1.is_some() != parameter.moment2.is_some() {
         return Err(invalid_checkpoint(format!(
             "{name}.moment1 and moment2 must both be present or both be absent"
+        )));
+    }
+    if parameter.step == 0 && parameter.moment1.is_some() {
+        return Err(invalid_checkpoint(format!(
+            "{name} moments must be absent when step is zero"
+        )));
+    }
+    if parameter.step > 0 && parameter.moment1.is_none() {
+        return Err(invalid_checkpoint(format!(
+            "{name} moments must be present when step is non-zero"
         )));
     }
     if let Some(moment1) = &parameter.moment1 {

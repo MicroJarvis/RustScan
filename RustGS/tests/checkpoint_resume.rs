@@ -479,13 +479,53 @@ fn checkpoint_validation_rejects_unpaired_adam_moments() {
 }
 
 #[test]
-fn checkpoint_validation_rejects_adam_step_mismatch() {
+fn checkpoint_validation_accepts_reset_adam_state_with_scaling() {
     let mut checkpoint = checkpoint_fixture(10);
-    checkpoint.optimizer.sh_coeffs.step = 9;
+    for parameter in [
+        &mut checkpoint.optimizer.transforms,
+        &mut checkpoint.optimizer.sh_coeffs,
+        &mut checkpoint.optimizer.raw_opacities,
+    ] {
+        parameter.step = 0;
+        parameter.moment1 = None;
+        parameter.moment2 = None;
+        assert!(parameter.scaling.is_some());
+    }
+
+    checkpoint.validate().unwrap();
+}
+
+#[test]
+fn checkpoint_validation_rejects_adam_step_after_completed_iterations() {
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.optimizer.sh_coeffs.step = 11;
 
     assert_invalid_input_contains(
         checkpoint.validate().unwrap_err(),
-        "optimizer.sh_coeffs.step must equal completed iterations",
+        "optimizer.sh_coeffs.step must not exceed completed iterations",
+    );
+}
+
+#[test]
+fn checkpoint_validation_rejects_adam_moments_at_step_zero() {
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.optimizer.transforms.step = 0;
+
+    assert_invalid_input_contains(
+        checkpoint.validate().unwrap_err(),
+        "optimizer.transforms moments must be absent when step is zero",
+    );
+}
+
+#[test]
+fn checkpoint_validation_rejects_missing_adam_moments_after_step_zero() {
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.optimizer.raw_opacities.moment1 = None;
+    checkpoint.optimizer.raw_opacities.moment2 = None;
+
+    assert_invalid_input_contains(
+        checkpoint.validate().unwrap_err(),
+        "optimizer.raw_opacities moments must be present when step is non-zero",
     );
 }
 
