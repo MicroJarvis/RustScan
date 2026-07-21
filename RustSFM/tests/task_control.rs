@@ -1,22 +1,26 @@
 use rustsfm::sift::SiftFeatures;
 use rustsfm::{
+    extract_features_to_database, extract_features_to_database_with_extractor,
     extract_features_to_database_with_extractor_and_task, extract_features_to_database_with_task,
-    match_features_to_database_with_task, register_remaining_sequence_frames,
-    run_keyframe_reconstruction, run_reconstruction, run_reconstruction_with_callbacks,
-    run_reconstruction_with_task, run_sequence_registration, ExtractFeaturesReport,
-    KeyframeReconstructionResult, MapperConfig, MatchFeaturesOptions, MatchFeaturesReport,
-    PipelineCallbackSink, ReconstructionSummary, SequenceFrame, SequenceRegistrationConfig,
-    SequenceRegistrationResult, SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent,
-    SfmTaskEventKind, SfmTaskOperation, SfmTaskStage, SfmTaskStop, SiftExtractionOptions,
-    SiftFeatureExtractor,
+    match_features_to_database, match_features_to_database_with_task,
+    register_remaining_sequence_frames, run_keyframe_reconstruction, run_reconstruction,
+    run_reconstruction_with_callbacks, run_reconstruction_with_task, run_sequence_registration,
+    ExtractFeaturesReport, KeyframeReconstructionResult, MapperConfig, MatchFeaturesOptions,
+    MatchFeaturesReport, PipelineCallbackSink, ReconstructionSummary, SequenceFrame,
+    SequenceRegistrationConfig, SequenceRegistrationResult, SfmControlState, SfmTaskContext,
+    SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage, SfmTaskStop,
+    SiftExtractionOptions, SiftFeatureExtractor,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
 use std::path::Path;
+use std::rc::Rc;
 
-struct PublicApiExtractor;
+struct BorrowedPublicApiExtractor<'a> {
+    _not_send_or_sync: &'a Rc<()>,
+}
 
-impl SiftFeatureExtractor for PublicApiExtractor {
+impl SiftFeatureExtractor for BorrowedPublicApiExtractor<'_> {
     fn backend_name(&self) -> &'static str {
         "public-api-test"
     }
@@ -30,6 +34,47 @@ impl SiftFeatureExtractor for PublicApiExtractor {
     ) -> anyhow::Result<SiftFeatures> {
         unreachable!("compile-time API test does not extract features")
     }
+}
+
+type LegacyBorrowedExtractorApi<'a> =
+    for<'database, 'images, 'options, 'extractor> fn(
+        &'database Path,
+        &'images Path,
+        &'options SiftExtractionOptions,
+        &'extractor BorrowedPublicApiExtractor<'a>,
+    ) -> anyhow::Result<ExtractFeaturesReport>;
+type ControlledBorrowedExtractorApi<'a> =
+    for<'database, 'images, 'options, 'extractor, 'context, 'task> fn(
+        &'database Path,
+        &'images Path,
+        &'options SiftExtractionOptions,
+        &'extractor BorrowedPublicApiExtractor<'a>,
+        &'context mut SfmTaskContext<'task>,
+    ) -> anyhow::Result<
+        ExtractFeaturesReport,
+    >;
+
+fn assert_borrowed_extractor_apis<'a>(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    extractor: &BorrowedPublicApiExtractor<'a>,
+    task: &mut SfmTaskContext<'_>,
+) {
+    let _: LegacyBorrowedExtractorApi<'a> =
+        extract_features_to_database_with_extractor::<BorrowedPublicApiExtractor<'a>>;
+    let _: ControlledBorrowedExtractorApi<'a> =
+        extract_features_to_database_with_extractor_and_task::<BorrowedPublicApiExtractor<'a>>;
+
+    let _ =
+        extract_features_to_database_with_extractor(database_path, images_dir, options, extractor);
+    let _ = extract_features_to_database_with_extractor_and_task(
+        database_path,
+        images_dir,
+        options,
+        extractor,
+        task,
+    );
 }
 
 fn assert_wire_round_trips<T>(cases: &[(T, &str)])
@@ -199,6 +244,12 @@ fn controlled_mapper_entry_point_is_public() {
 
 #[test]
 fn legacy_and_controlled_public_entry_points_keep_their_signatures() {
+    type LegacyExtractionApi =
+        for<'database, 'images, 'options> fn(
+            &'database Path,
+            &'images Path,
+            &'options SiftExtractionOptions,
+        ) -> anyhow::Result<ExtractFeaturesReport>;
     type LegacyMapperApi = fn(&MapperConfig) -> anyhow::Result<ReconstructionSummary>;
     type LegacyCallbackMapperApi = for<'config, 'sink> fn(
         &'config MapperConfig,
@@ -214,17 +265,11 @@ fn legacy_and_controlled_public_entry_points_keep_their_signatures() {
         ) -> anyhow::Result<
             ExtractFeaturesReport,
         >;
-    type ControlledExtractorApi =
-        for<'database, 'images, 'options, 'extractor, 'context, 'task> fn(
-            &'database Path,
-            &'images Path,
-            &'options SiftExtractionOptions,
-            &'extractor PublicApiExtractor,
-            &'context mut SfmTaskContext<'task>,
-        )
-            -> anyhow::Result<
-            ExtractFeaturesReport,
-        >;
+    type LegacyMatchingApi = for<'database, 'options> fn(
+        &'database Path,
+        &'options MatchFeaturesOptions,
+    )
+        -> anyhow::Result<MatchFeaturesReport>;
     type ControlledMatchingApi =
         for<'database, 'options, 'context, 'task> fn(
             &'database Path,
@@ -270,11 +315,12 @@ fn legacy_and_controlled_public_entry_points_keep_their_signatures() {
             SequenceRegistrationResult,
         >;
 
-    let _: LegacyMapperApi = run_reconstruction;
+    let _: LegacyExtractionApi = extract_features_to_database;
+    let _: LegacyMatchingApi = match_features_to_database;
+    let _compile_only = assert_borrowed_extractor_apis;
     let _: LegacyCallbackMapperApi = run_reconstruction_with_callbacks;
+    let _: LegacyMapperApi = run_reconstruction;
     let _: ControlledExtractionApi = extract_features_to_database_with_task;
-    let _: ControlledExtractorApi =
-        extract_features_to_database_with_extractor_and_task::<PublicApiExtractor>;
     let _: ControlledMatchingApi = match_features_to_database_with_task;
     let _: ControlledMapperApi = run_reconstruction_with_task;
     let _: ControlledKeyframeApi = run_keyframe_reconstruction;
