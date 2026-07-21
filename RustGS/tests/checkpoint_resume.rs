@@ -184,6 +184,22 @@ fn checkpoint_store_round_trips_and_atomically_replaces() {
 }
 
 #[test]
+fn checkpoint_identity_wire_round_trips_utf8() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("identity-utf8.rgscp");
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.identity = TrainingIdentity {
+        dataset: "dataset-with-spaces".to_string(),
+        reconstruction: "reconstruction/path".to_string(),
+        config: "config-\u{2603}".to_string(),
+    };
+
+    save_training_checkpoint(&path, &checkpoint).unwrap();
+
+    assert_eq!(load_training_checkpoint(&path).unwrap(), checkpoint);
+}
+
+#[test]
 fn checkpoint_store_writes_a_versioned_format_envelope() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("envelope.rgscp");
@@ -330,19 +346,39 @@ fn checkpoint_load_rejects_oversized_file_before_decode() {
 }
 
 #[test]
-fn checkpoint_load_rejects_declared_oversized_vector_without_panicking() {
+fn checkpoint_load_rejects_declared_oversized_identity_without_allocating_payload() {
+    const DECLARED_IDENTITY_BYTES: u64 = 1024 * 1024 * 1024;
+
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("declared-oversized-vector.rgscp");
+    let path = temp.path().join("declared-oversized-identity.rgscp");
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&TRAINING_CHECKPOINT_MAGIC);
     bytes.extend_from_slice(&TRAINING_CHECKPOINT_FORMAT_VERSION.to_le_bytes());
     bytes.extend_from_slice(&TRAINING_CHECKPOINT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+    bytes.extend_from_slice(&DECLARED_IDENTITY_BYTES.to_le_bytes());
     fs::write(&path, bytes).unwrap();
 
     let loaded = catch_unwind(|| load_training_checkpoint(&path))
-        .expect("oversized declared vectors must not panic or abort");
-    assert_invalid_input_contains(loaded.unwrap_err(), "decode checkpoint");
+        .expect("oversized declared identity must not panic or abort");
+    assert_invalid_input_contains(loaded.unwrap_err(), "identity field exceeds maximum length");
+}
+
+#[test]
+fn checkpoint_load_rejects_non_utf8_identity_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("non-utf8-identity.rgscp");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TRAINING_CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(&TRAINING_CHECKPOINT_FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&TRAINING_CHECKPOINT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.push(0xff);
+    fs::write(&path, bytes).unwrap();
+
+    assert_invalid_input_contains(
+        load_training_checkpoint(&path).unwrap_err(),
+        "identity field must be valid UTF-8",
+    );
 }
 
 #[test]
@@ -440,7 +476,7 @@ fn checkpoint_load_rejects_non_finite_splat_components() {
 }
 
 #[test]
-fn checkpoint_load_rejects_sh_width_overflow_without_panicking() {
+fn checkpoint_load_rejects_unsupported_sh_degree_before_width_calculation() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("sh-width-overflow.rgscp");
     fs::write(
@@ -451,7 +487,32 @@ fn checkpoint_load_rejects_sh_width_overflow_without_panicking() {
 
     let loaded = catch_unwind(|| load_training_checkpoint(&path))
         .expect("loading a corrupt checkpoint must not panic");
-    assert_invalid_input_contains(loaded.unwrap_err(), "SH width overflow");
+    assert_invalid_input_contains(
+        loaded.unwrap_err(),
+        "stored SH degree exceeds supported maximum 3",
+    );
+}
+
+#[test]
+fn checkpoint_load_rejects_unsupported_stored_sh_degree_for_empty_splats() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unsupported-empty-sh-degree.rgscp");
+    let bytes = serialize_with_splat_mutation(checkpoint_fixture(10), |splats| {
+        splats.positions.clear();
+        splats.log_scales.clear();
+        splats.rotations.clear();
+        splats.opacity_logits.clear();
+        splats.sh_coeffs.clear();
+        splats.sh_degree = usize::MAX;
+    });
+    fs::write(&path, bytes).unwrap();
+
+    let loaded = catch_unwind(|| load_training_checkpoint(&path))
+        .expect("unsupported stored SH degree must not panic or abort");
+    assert_invalid_input_contains(
+        loaded.unwrap_err(),
+        "stored SH degree exceeds supported maximum 3",
+    );
 }
 
 #[test]
@@ -526,6 +587,21 @@ fn checkpoint_validation_rejects_missing_adam_moments_after_step_zero() {
     assert_invalid_input_contains(
         checkpoint.validate().unwrap_err(),
         "optimizer.raw_opacities moments must be present when step is non-zero",
+    );
+}
+
+#[test]
+fn checkpoint_validation_rejects_divergent_adam_steps() {
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.optimizer.transforms.step = 0;
+    checkpoint.optimizer.transforms.moment1 = None;
+    checkpoint.optimizer.transforms.moment2 = None;
+    checkpoint.optimizer.sh_coeffs.step = 7;
+    checkpoint.optimizer.raw_opacities.step = 3;
+
+    assert_invalid_input_contains(
+        checkpoint.validate().unwrap_err(),
+        "optimizer parameter steps must be equal",
     );
 }
 

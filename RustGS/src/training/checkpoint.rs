@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bincode::Options;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tempfile::{NamedTempFile, TempPath};
 
 use crate::{HostSplats, TrainingConfig, TrainingDataset, TrainingError};
@@ -23,11 +25,113 @@ const TRAINING_CHECKPOINT_ENVELOPE_BYTES: u64 =
     TRAINING_CHECKPOINT_MAGIC.len() as u64 + size_of::<u32>() as u64;
 static CHECKPOINT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingIdentity {
     pub dataset: String,
     pub reconstruction: String,
     pub config: String,
+}
+
+impl Serialize for TrainingIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("TrainingIdentity", 3)?;
+        state.serialize_field("dataset", &IdentityBytes(&self.dataset))?;
+        state.serialize_field("reconstruction", &IdentityBytes(&self.reconstruction))?;
+        state.serialize_field("config", &IdentityBytes(&self.config))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TrainingIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireIdentity {
+            dataset: IdentityString,
+            reconstruction: IdentityString,
+            config: IdentityString,
+        }
+
+        let identity = WireIdentity::deserialize(deserializer)?;
+        Ok(Self {
+            dataset: identity.dataset.0,
+            reconstruction: identity.reconstruction.0,
+            config: identity.config.0,
+        })
+    }
+}
+
+struct IdentityBytes<'a>(&'a str);
+
+impl Serialize for IdentityBytes<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let bytes = self.0.as_bytes();
+        if bytes.len() > MAX_TRAINING_IDENTITY_BYTES {
+            return Err(serde::ser::Error::custom(format!(
+                "identity field exceeds maximum length {MAX_TRAINING_IDENTITY_BYTES}"
+            )));
+        }
+        let mut sequence = serializer.serialize_seq(Some(bytes.len()))?;
+        for byte in bytes {
+            sequence.serialize_element(byte)?;
+        }
+        sequence.end()
+    }
+}
+
+struct IdentityString(String);
+
+impl<'de> Deserialize<'de> for IdentityString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_seq(IdentityStringVisitor)
+            .map(IdentityString)
+    }
+}
+
+struct IdentityStringVisitor;
+
+impl<'de> Visitor<'de> for IdentityStringVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an identity field encoded as a bounded UTF-8 byte sequence")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let declared_len = sequence
+            .size_hint()
+            .ok_or_else(|| de::Error::custom("identity field must declare its length"))?;
+        if declared_len > MAX_TRAINING_IDENTITY_BYTES {
+            return Err(de::Error::custom(format!(
+                "identity field exceeds maximum length {MAX_TRAINING_IDENTITY_BYTES}"
+            )));
+        }
+
+        let mut bytes = Vec::with_capacity(declared_len);
+        for index in 0..declared_len {
+            let byte = sequence
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(index, &self))?;
+            bytes.push(byte);
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| de::Error::custom("identity field must be valid UTF-8"))
+    }
 }
 
 impl TrainingIdentity {
@@ -259,6 +363,12 @@ impl TrainingCheckpoint {
                 "splat count exceeds maximum {MAX_TRAINING_CHECKPOINT_SPLATS}"
             )));
         }
+        if self.splats.sh_degree() > 3 {
+            return Err(invalid_checkpoint(format!(
+                "stored SH degree exceeds supported maximum 3: got {}",
+                self.splats.sh_degree()
+            )));
+        }
         self.splats.validate().map_err(|error| {
             invalid_checkpoint(format!("checkpoint splats are invalid: {error}"))
         })?;
@@ -293,6 +403,13 @@ impl TrainingCheckpoint {
             &[1],
             self.completed_iterations,
         )?;
+        if self.optimizer.transforms.step != self.optimizer.sh_coeffs.step
+            || self.optimizer.transforms.step != self.optimizer.raw_opacities.step
+        {
+            return Err(invalid_checkpoint(
+                "optimizer parameter steps must be equal",
+            ));
+        }
 
         validate_topology_tensor("topology.grad_2d", &self.topology.grad_2d, splat_count)?;
         validate_topology_tensor(
