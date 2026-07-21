@@ -337,6 +337,119 @@ pub fn match_features_to_database_with_task(
     })
 }
 
+pub(crate) fn match_explicit_image_pairs_to_database_with_task(
+    database_path: &Path,
+    image_pairs: &[(u32, u32)],
+    options: &MatchFeaturesOptions,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<MatchFeaturesReport> {
+    options.sift_matching.check()?;
+    if options.use_existing_matches {
+        bail!("explicit image-pair matching requires computed matches");
+    }
+    task.checkpoint()?;
+    let started = Instant::now();
+    let db = ColmapDatabase::open(database_path)?;
+    let mut images = db.read_all_images()?;
+    images.sort_by(|left, right| left.name.cmp(&right.name));
+    let (frames, cameras) = load_database_frames_and_cameras(&db, &images, true)?;
+    let index_by_image_id = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| (image.image_id, index))
+        .collect::<HashMap<_, _>>();
+    let image_id_by_index = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| (index, image.image_id))
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut inputs = Vec::with_capacity(image_pairs.len());
+    for &(left_id, right_id) in image_pairs {
+        if left_id == right_id {
+            bail!("explicit image pair repeats image_id={left_id}");
+        }
+        let key = (left_id.min(right_id), left_id.max(right_id));
+        if !seen.insert(key) {
+            bail!("duplicate explicit image pair {}-{}", key.0, key.1);
+        }
+        let left = index_by_image_id
+            .get(&left_id)
+            .copied()
+            .with_context(|| format!("explicit pair references missing image_id={left_id}"))?;
+        let right = index_by_image_id
+            .get(&right_id)
+            .copied()
+            .with_context(|| format!("explicit pair references missing image_id={right_id}"))?;
+        inputs.push(MatchPairInput::Computed { left, right });
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    let computed_backend = if options.sift_matching.use_gpu {
+        Some(ComputedGpuBackend::new()?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu-wgpu"))]
+    if options.sift_matching.use_gpu {
+        bail!("RustSFM was built without gpu-wgpu support");
+    }
+
+    let pair_count = inputs.len();
+    let mut reports = Vec::new();
+    let mut total_matches = 0usize;
+    let mut completed = 0usize;
+    let mut did_clear = false;
+    for batch in inputs.chunks(options.task_pair_batch_size.max(1)) {
+        task.checkpoint()?;
+        let pair_reports = computed_match_pair_reports_for_inputs(
+            batch,
+            &frames,
+            &cameras,
+            options,
+            #[cfg(feature = "gpu-wgpu")]
+            computed_backend.as_ref(),
+        )?;
+        let indices = batch
+            .iter()
+            .map(MatchPairInput::indices)
+            .collect::<Vec<_>>();
+        commit_and_emit_pair_batch(
+            &db,
+            &frames,
+            &image_id_by_index,
+            options,
+            pair_reports,
+            &indices,
+            pair_count,
+            task,
+            &mut did_clear,
+            &mut reports,
+            &mut total_matches,
+            &mut completed,
+        )?;
+    }
+    reports.sort_by(|left, right| {
+        left.left_image
+            .cmp(&right.left_image)
+            .then_with(|| left.right_image.cmp(&right.right_image))
+    });
+    Ok(MatchFeaturesReport {
+        database: database_path.to_path_buf(),
+        backend: matching_backend_name(&options.sift_matching).to_owned(),
+        pair_count,
+        matched_pairs: reports.len(),
+        verified_pairs: reports
+            .iter()
+            .filter(|pair| pair.num_inliers >= options.min_inliers)
+            .count(),
+        total_matches,
+        matching_seconds: started.elapsed().as_secs_f64(),
+        verifier_trace: None,
+        pairs: reports,
+    })
+}
+
 pub fn debug_two_view_database_pair(
     database_path: &Path,
     left_image: &str,
@@ -2206,6 +2319,35 @@ mod tests {
                 Some(input_pairs[5])
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_explicit_matching_commits_only_requested_database_pairs() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent};
+
+        let (_dir, db_path, input_pairs) = controlled_computed_matching_fixture()?;
+        let requested = vec![input_pairs[1], input_pairs[4]];
+        let control = SfmTaskControl::new();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| events.push(event);
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let report = match_explicit_image_pairs_to_database_with_task(
+            &db_path,
+            &requested,
+            &controlled_computed_matching_options(1),
+            &mut task,
+        )?;
+
+        assert_eq!(report.pair_count, requested.len());
+        assert_eq!(events.len(), requested.len());
+        let db = ColmapDatabase::open_read_only(&db_path)?;
+        for pair in input_pairs {
+            assert_eq!(
+                db.exists_matches(pair.0, pair.1)?,
+                requested.contains(&pair)
+            );
+        }
         Ok(())
     }
 

@@ -123,6 +123,251 @@ pub struct DatabasePairMatches {
     pub matches: Vec<rustslam::Match>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SingleTargetRegistrationCandidate {
+    pub reconstruction: Reconstruction,
+    pub inlier_count: usize,
+    pub inlier_ratio: f64,
+    pub mean_reprojection_error: f64,
+}
+
+pub(crate) fn register_single_target_from_seed(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    setup: &ReferenceCameraSetup,
+    target_image: usize,
+    config: &MapperConfig,
+    pnp_scorer: Option<&mut DynPnPModelScorer>,
+) -> Result<Option<SingleTargetRegistrationCandidate>> {
+    if config.reference.is_none() {
+        bail!("single-target registration requires a reference model");
+    }
+    if !config.fix_existing_frames {
+        bail!("single-target registration requires fix_existing_frames=true");
+    }
+    if target_image >= frames.len() {
+        bail!("target image index {target_image} is out of range");
+    }
+    if config.use_gpu_pnp && pnp_scorer.is_none() {
+        bail!("gpu pnp was requested but no gpu scorer is available");
+    }
+    let camera = setup
+        .cameras
+        .first()
+        .copied()
+        .with_context(|| "reference setup has no cameras")?;
+    let mut reconstruction = Reconstruction {
+        camera,
+        cameras: setup.cameras.clone(),
+        camera_ids: setup.camera_ids.clone(),
+        rigs: setup.rigs.clone(),
+        frames: setup.frames.clone(),
+        image_names: frames.iter().map(|frame| frame.name.clone()).collect(),
+        image_paths: frames.iter().map(|frame| frame.path.clone()).collect(),
+        image_ids: setup.image_ids.clone(),
+        image_camera_indices: setup.image_camera_indices.clone(),
+        image_frame_indices: setup.image_frame_indices.clone(),
+        poses: vec![None; frames.len()],
+        observations: frames
+            .iter()
+            .map(|frame| vec![None; frame.keypoints.len()])
+            .collect(),
+        keypoints: frames.iter().map(|frame| frame.keypoints.clone()).collect(),
+        point_ids: Vec::new(),
+        points: Vec::new(),
+    };
+    let seed = setup
+        .seed_reconstruction
+        .clone()
+        .with_context(|| "reference model did not provide a sparse reconstruction seed")?;
+    apply_reconstruction_seed(&mut reconstruction, seed, frames);
+    if reconstruction.poses[target_image].is_some() {
+        bail!("target image is already registered in the reference model");
+    }
+    for pair in pairs {
+        if pair.left != target_image && pair.right != target_image {
+            bail!("single-target pair set contains a pair that omits the target");
+        }
+        let support = if pair.left == target_image {
+            pair.right
+        } else {
+            pair.left
+        };
+        if reconstruction
+            .poses
+            .get(support)
+            .and_then(|pose| *pose)
+            .is_none()
+        {
+            bail!("single-target pair references unregistered support image {support}");
+        }
+    }
+
+    let mut registration_stats = RegistrationStats::from_reconstruction(&reconstruction);
+    registration_stats.set_existing_registration_units_from_reconstruction(&reconstruction);
+    let mut observation_manager = ObservationManager::new(frames, pairs, &reconstruction);
+    let graph = observation_manager.correspondence_graph();
+    let mut telemetry = IncrementalRegistrationTelemetry::default();
+    let Some(absolute_pose) = solve_absolute_pose_with_pnp_scorer(
+        target_image,
+        frames,
+        pairs,
+        &reconstruction,
+        config,
+        &setup.cameras,
+        &setup.camera_has_prior_focal_length,
+        &registration_stats,
+        graph,
+        pnp_scorer,
+        &mut telemetry,
+    )?
+    else {
+        return Ok(None);
+    };
+    if absolute_pose
+        .pose
+        .translation()
+        .iter()
+        .chain(absolute_pose.pose.quaternion().iter())
+        .any(|value| !value.is_finite())
+        || !absolute_pose.inlier_ratio.is_finite()
+        || !absolute_pose.mean_error_px.is_finite()
+    {
+        return Ok(None);
+    }
+    apply_image_camera(&mut reconstruction, target_image, absolute_pose.camera);
+    observation_manager.register_image(
+        frames,
+        pairs,
+        &mut reconstruction,
+        target_image,
+        absolute_pose.pose,
+    );
+    Ok(Some(SingleTargetRegistrationCandidate {
+        reconstruction,
+        inlier_count: absolute_pose.inliers,
+        inlier_ratio: f64::from(absolute_pose.inlier_ratio),
+        mean_reprojection_error: f64::from(absolute_pose.mean_error_px),
+    }))
+}
+
+pub(crate) fn register_single_target_from_database(
+    input: &Path,
+    database: &Path,
+    reference: &Path,
+    target_name: &str,
+    support_names: &[String],
+    config: &MapperConfig,
+) -> Result<Option<SingleTargetRegistrationCandidate>> {
+    let reference_model = read_colmap_sparse_model(reference)?;
+    let registered_names = reference_model
+        .reconstruction
+        .image_names
+        .iter()
+        .zip(&reference_model.reconstruction.poses)
+        .filter_map(|(name, pose)| pose.is_some().then_some(name.clone()))
+        .collect::<BTreeSet<_>>();
+    for support in support_names {
+        if !registered_names.contains(support) {
+            bail!("support image '{support}' is not registered in the reference model");
+        }
+    }
+    if registered_names.contains(target_name) {
+        bail!("target image '{target_name}' is already registered");
+    }
+    let mut names = registered_names.into_iter().collect::<Vec<_>>();
+    names.push(target_name.to_owned());
+    let paths = names
+        .iter()
+        .map(|name| input.join(name))
+        .collect::<Vec<_>>();
+    for path in &paths {
+        if !path.is_file() {
+            bail!("missing registration input image {}", path.display());
+        }
+    }
+    let database_input =
+        load_mapper_database_for_paths(Some(database), &paths, config.min_matches)?
+            .with_context(|| "single-target registration database was not loaded")?;
+    let frames = database_frames(&paths, &database_input)?;
+    let mut setup = reference_camera_setup(reference, &paths)?;
+    let database_setup = database_camera_setup(&database_input.cache, &paths)?;
+    let target_image = names.len() - 1;
+    let database_camera_index = database_setup.image_camera_indices[target_image];
+    let database_camera_id = database_setup.camera_ids[database_camera_index];
+    let target_camera_index = if let Some(index) = setup
+        .camera_ids
+        .iter()
+        .position(|&camera_id| camera_id == database_camera_id)
+    {
+        index
+    } else {
+        setup.camera_ids.push(database_camera_id);
+        setup
+            .cameras
+            .push(database_setup.cameras[database_camera_index]);
+        setup
+            .camera_has_prior_focal_length
+            .push(database_setup.camera_has_prior_focal_length[database_camera_index]);
+        setup.cameras.len() - 1
+    };
+    setup.image_ids[target_image] = database_setup.image_ids[target_image];
+    setup.image_camera_indices[target_image] = target_camera_index;
+    setup.image_frame_indices[target_image] = database_setup.image_frame_indices[target_image];
+    let camera = setup
+        .cameras
+        .first()
+        .copied()
+        .with_context(|| "reference setup has no cameras")?;
+    let all_pairs = estimate_database_pair_geometries(
+        &frames,
+        &database_input.cache,
+        &database_input.two_view_geometries,
+        camera,
+        Some(&setup),
+        config,
+    )?;
+    if frames[target_image].name != target_name {
+        bail!("target image '{target_name}' is missing from database frames");
+    }
+    let support_names = support_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let pairs = all_pairs
+        .into_iter()
+        .filter(|pair| {
+            let other = if pair.left == target_image {
+                Some(pair.right)
+            } else if pair.right == target_image {
+                Some(pair.left)
+            } else {
+                None
+            };
+            other.is_some_and(|other| support_names.contains(frames[other].name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let mut target_config = config.clone();
+    target_config.reference = Some(reference.to_path_buf());
+    target_config.database = Some(database.to_path_buf());
+    target_config.fix_existing_frames = true;
+    target_config.local_ba = false;
+    target_config.global_ba = false;
+    validate_gpu_pnp_config(&target_config, false)?;
+    let mut scorer = create_gpu_pnp_scorer(&target_config)?;
+    register_single_target_from_seed(
+        &frames,
+        &pairs,
+        &setup,
+        target_image,
+        &target_config,
+        scorer.as_deref_mut(),
+    )
+}
+
 pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary> {
     let mut events = MapperEventBridge::Silent;
     run_reconstruction_impl(config, &mut events)
@@ -16180,6 +16425,111 @@ mod tests {
             estimated.translation(),
             reference_pose.translation()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn single_target_registration_returns_candidate_without_bundle_adjustment() -> Result<()> {
+        let camera = CameraModel::new_pinhole(320, 240, 220.0, 220.0, 160.0, 120.0);
+        let seed_pose = SE3::identity();
+        let target_pose = SE3::from_quat_translation(
+            glam::Quat::from_rotation_y(0.035),
+            glam::Vec3::new(-0.3, 0.02, 0.01),
+        );
+        let points = (0..64)
+            .map(|index| {
+                let column = (index % 8) as f32;
+                let row = (index / 8) as f32;
+                [
+                    -0.7 + column * 0.2,
+                    -0.55 + row * 0.16,
+                    3.0 + (index % 5) as f32 * 0.12,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = vec![minimal_frame(0, "seed.jpg"), minimal_frame(1, "target.jpg")];
+        for (frame, pose) in frames.iter_mut().zip([seed_pose, target_pose]) {
+            frame.width = camera.width;
+            frame.height = camera.height;
+            frame.keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+        }
+        let seed_points = points
+            .iter()
+            .enumerate()
+            .map(|(feature, &xyz)| Point3D {
+                xyz,
+                color: [feature as u8, 2, 3],
+                error: 0.25,
+                track: vec![TrackObservation { image: 0, feature }],
+            })
+            .collect::<Vec<_>>();
+        let mut seed_observations = vec![vec![None; points.len()], vec![None; points.len()]];
+        for feature in 0..points.len() {
+            seed_observations[0][feature] = Some(feature);
+        }
+        let seed_point_ids = (0..points.len())
+            .map(|index| index as u64 + 500)
+            .collect::<Vec<_>>();
+        let setup = ReferenceCameraSetup {
+            cameras: vec![camera],
+            camera_ids: vec![1],
+            camera_has_prior_focal_length: vec![true],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_ids: vec![1, 2],
+            image_camera_indices: vec![0, 0],
+            image_frame_indices: vec![None, None],
+            seed_reconstruction: Some(ReconstructionSeed {
+                poses: vec![Some(seed_pose), None],
+                observations: seed_observations,
+                point_ids: seed_point_ids.clone(),
+                points: seed_points.clone(),
+            }),
+        };
+        let pairs = vec![initial_pair_from_projected_points(
+            0,
+            1,
+            seed_pose,
+            target_pose,
+            points.len(),
+        )];
+        let config = MapperConfig {
+            reference: Some(PathBuf::from("required-by-contract")),
+            fix_existing_frames: true,
+            local_ba: false,
+            global_ba: false,
+            extract_colors: false,
+            abs_pose_min_num_inliers: 16,
+            pnp_iterations: 10_000,
+            random_seed: 0,
+            ..MapperConfig::default()
+        };
+
+        let candidate =
+            register_single_target_from_seed(&frames, &pairs, &setup, 1, &config, None)?
+                .expect("target should have a PnP candidate");
+
+        assert!(candidate.inlier_count >= 63);
+        assert!(candidate.inlier_ratio.is_finite());
+        assert!(candidate.mean_reprojection_error.is_finite());
+        let preserved_seed = candidate.reconstruction.poses[0].expect("seed pose preserved");
+        assert!(relative_rotation_deg(preserved_seed, seed_pose) < 1.0e-6);
+        assert!(pose_translation_error(preserved_seed, seed_pose) < 1.0e-6);
+        let estimated =
+            candidate.reconstruction.poses[1].expect("target pose committed to candidate");
+        assert!(relative_rotation_deg(estimated, target_pose) < 0.2);
+        assert!(pose_translation_error(estimated, target_pose) < 0.05);
+        assert_eq!(candidate.reconstruction.point_ids, seed_point_ids);
+        assert_eq!(candidate.reconstruction.points.len(), seed_points.len());
+        for (actual, expected) in candidate.reconstruction.points.iter().zip(&seed_points) {
+            assert_eq!(actual.xyz, expected.xyz);
+            assert_eq!(actual.color, expected.color);
+            assert_eq!(actual.error, expected.error);
+            assert!(actual.track.starts_with(&expected.track));
+        }
         Ok(())
     }
 

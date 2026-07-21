@@ -157,6 +157,22 @@ pub fn extract_features_to_database(
     extract_features_to_database_with_extractor(database_path, images_dir, options, &backend)
 }
 
+pub fn extract_features_to_database_with_task(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<ExtractFeaturesReport> {
+    let backend = SiftExtractionBackend::from_options(options)?;
+    extract_features_to_database_with_extractor_and_task(
+        database_path,
+        images_dir,
+        options,
+        &backend,
+        task,
+    )
+}
+
 pub fn extract_features_to_database_with_extractor<E: SiftFeatureExtractor>(
     database_path: &Path,
     images_dir: &Path,
@@ -182,6 +198,42 @@ pub fn extract_features_to_database_with_extractor_and_task<E: SiftFeatureExtrac
     extractor: &E,
     task: &mut SfmTaskContext<'_>,
 ) -> Result<ExtractFeaturesReport> {
+    extract_selected_features_to_database_with_extractor_and_task(
+        database_path,
+        images_dir,
+        options,
+        &[],
+        extractor,
+        task,
+    )
+}
+
+pub(crate) fn extract_selected_features_to_database_with_task(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    image_ids: &[u32],
+    task: &mut SfmTaskContext<'_>,
+) -> Result<ExtractFeaturesReport> {
+    let backend = SiftExtractionBackend::from_options(options)?;
+    extract_selected_features_to_database_with_extractor_and_task(
+        database_path,
+        images_dir,
+        options,
+        image_ids,
+        &backend,
+        task,
+    )
+}
+
+fn extract_selected_features_to_database_with_extractor_and_task<E: SiftFeatureExtractor>(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    image_ids: &[u32],
+    extractor: &E,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<ExtractFeaturesReport> {
     options.check()?;
     let db = ColmapDatabase::open(database_path)?;
     let mut images = db.read_all_images()?;
@@ -193,6 +245,23 @@ pub fn extract_features_to_database_with_extractor_and_task<E: SiftFeatureExtrac
             .cmp(&right.name)
             .then_with(|| left.image_id.cmp(&right.image_id))
     });
+    if !image_ids.is_empty() {
+        let selected = image_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if selected.len() != image_ids.len() {
+            bail!("selected feature extraction image IDs must be unique");
+        }
+        let available = images
+            .iter()
+            .map(|image| image.image_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(missing) = selected.difference(&available).next() {
+            bail!("selected feature extraction references missing image_id={missing}");
+        }
+        images.retain(|image| selected.contains(&image.image_id));
+    }
 
     let started = Instant::now();
     let image_count = images.len();
@@ -554,6 +623,40 @@ mod tests {
             assert!(!db.exists_descriptors(image_id)?);
         }
         assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_selected_extraction_does_not_touch_existing_keyframes() -> Result<()> {
+        use crate::task::{SfmTaskControl, SfmTaskEvent};
+
+        let (_dir, db_path, images_dir) = two_image_fixture()?;
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_keypoints(1, &[ColmapKeypoint::new(9.0, 9.0)])?;
+        db.write_descriptors(
+            1,
+            &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 128, vec![3u8; 128])?,
+        )?;
+        let control = SfmTaskControl::new();
+        let mut events = Vec::<SfmTaskEvent>::new();
+        let mut sink = |event: SfmTaskEvent| events.push(event);
+        let mut task = crate::task::SfmTaskContext::new(&control, &mut sink);
+
+        let report = extract_selected_features_to_database_with_extractor_and_task(
+            &db_path,
+            &images_dir,
+            &SiftExtractionOptions::default(),
+            &[2],
+            &DeterministicExtractor,
+            &mut task,
+        )?;
+
+        assert_eq!(report.image_count, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].image_id, Some(2));
+        assert_eq!(db.read_keypoints(1)?, vec![ColmapKeypoint::new(9.0, 9.0)]);
+        assert_eq!(db.read_descriptors(1)?.data, vec![3u8; 128]);
+        assert_eq!(db.read_keypoints(2)?, vec![ColmapKeypoint::new(1.0, 1.0)]);
         Ok(())
     }
 

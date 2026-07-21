@@ -4,7 +4,9 @@ pub mod task;
 
 pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
 pub use sequence_registration::{
-    FrameRegistrationDiagnostic, FrameRegistrationStatus, RegistrationRound, SequenceFrame,
+    register_remaining_sequence_frames, require_complete_pose_coverage,
+    run_keyframe_reconstruction, run_sequence_registration, FrameRegistrationDiagnostic,
+    FrameRegistrationStatus, KeyframeReconstructionResult, RegistrationRound, SequenceFrame,
     SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
     SequenceRegistrationResult, MAX_DYNAMIC_SUPPORT_CANDIDATES, MAX_SEQUENCE_NEIGHBORS,
     MAX_SEQUENCE_PLAN_FRAMES, MAX_TIMESTAMP_PLATEAU, MAX_TOTAL_SUPPORT_ENTRIES,
@@ -115,8 +117,8 @@ pub use compare::{
 pub use feature_extraction::{
     compare_extracted_sift_features, extract_features_to_database,
     extract_features_to_database_with_extractor,
-    extract_features_to_database_with_extractor_and_task, ExtractFeaturesReport,
-    SiftFeatureExtractor,
+    extract_features_to_database_with_extractor_and_task, extract_features_to_database_with_task,
+    ExtractFeaturesReport, SiftFeatureExtractor,
 };
 pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use feature_matching_db::{
