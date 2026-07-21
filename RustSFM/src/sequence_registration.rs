@@ -566,6 +566,7 @@ impl SequenceRegistrationPlan {
             wide_neighbors_each_side,
         )?;
         validate_keyframes(frames.len(), keyframes)?;
+        validate_timestamp_inputs(frames.len(), frames.iter().map(|frame| frame.timestamp_us))?;
         let frame_ids = frames.iter().map(|frame| frame.id).collect();
         let timestamps_us = frames.iter().map(|frame| frame.timestamp_us).collect();
         Self::build_validated(
@@ -920,6 +921,9 @@ fn validate_plan_ordering(
             duplicate_frame_ids: Vec::new(),
         });
     }
+    if let Some(timestamps_us) = timestamps_us {
+        validate_timestamp_inputs(frame_count, timestamps_us.iter().copied().map(Some))?;
+    }
     let mut observed = HashSet::with_capacity(frame_ids.len());
     let mut duplicates = BTreeSet::new();
     for frame_id in frame_ids.iter().copied() {
@@ -934,40 +938,81 @@ fn validate_plan_ordering(
             duplicate_frame_ids: duplicates.into_iter().collect(),
         });
     }
-    if let Some(timestamps_us) = timestamps_us {
-        if timestamps_us.len() != frame_count {
-            return Err(SequenceRegistrationError::TimestampCountMismatch {
-                frame_count,
-                timestamp_count: timestamps_us.len(),
-            });
+    Ok(())
+}
+
+fn validate_timestamp_inputs<I>(
+    frame_count: usize,
+    timestamps: I,
+) -> Result<(), SequenceRegistrationError>
+where
+    I: IntoIterator<Item = Option<i64>>,
+{
+    let mut timestamp_count = 0;
+    let mut all_present = true;
+    let mut previous_timestamp = None;
+    let mut plateau_start = 0;
+    let mut first_error = None;
+
+    for (current_frame, timestamp) in timestamps.into_iter().enumerate() {
+        timestamp_count += 1;
+        let Some(timestamp) = timestamp else {
+            all_present = false;
+            continue;
+        };
+        if !all_present {
+            continue;
         }
-        let mut plateau_start = 0;
-        for current_frame in 1..timestamps_us.len() {
-            if timestamps_us[current_frame - 1] > timestamps_us[current_frame] {
-                return Err(SequenceRegistrationError::UnsortedTimestamps {
-                    previous_frame: current_frame - 1,
-                    current_frame,
-                });
-            }
-            if timestamps_us[current_frame - 1] != timestamps_us[current_frame] {
-                validate_timestamp_plateau(timestamps_us, plateau_start, current_frame)?;
+
+        if let Some(previous_timestamp_value) = previous_timestamp {
+            if previous_timestamp_value > timestamp {
+                if first_error.is_none() {
+                    first_error = Some(SequenceRegistrationError::UnsortedTimestamps {
+                        previous_frame: current_frame - 1,
+                        current_frame,
+                    });
+                }
+            } else if previous_timestamp_value != timestamp {
+                if first_error.is_none() {
+                    first_error = timestamp_plateau_error(
+                        previous_timestamp_value,
+                        current_frame.saturating_sub(plateau_start),
+                    )
+                    .err();
+                }
                 plateau_start = current_frame;
             }
+        } else {
+            plateau_start = current_frame;
         }
-        validate_timestamp_plateau(timestamps_us, plateau_start, timestamps_us.len())?;
+        previous_timestamp = Some(timestamp);
+    }
+
+    if timestamp_count != frame_count {
+        return Err(SequenceRegistrationError::TimestampCountMismatch {
+            frame_count,
+            timestamp_count,
+        });
+    }
+    if !all_present {
+        return Ok(());
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if let Some(timestamp) = previous_timestamp {
+        return timestamp_plateau_error(timestamp, timestamp_count.saturating_sub(plateau_start));
     }
     Ok(())
 }
 
-fn validate_timestamp_plateau(
-    timestamps_us: &[i64],
-    start: usize,
-    end: usize,
+fn timestamp_plateau_error(
+    timestamp_us: i64,
+    plateau_size: usize,
 ) -> Result<(), SequenceRegistrationError> {
-    let plateau_size = end.saturating_sub(start);
     if plateau_size > MAX_TIMESTAMP_PLATEAU {
         return Err(SequenceRegistrationError::TimestampPlateauTooLarge {
-            timestamp_us: timestamps_us[start],
+            timestamp_us,
             plateau_size,
             max_plateau_size: MAX_TIMESTAMP_PLATEAU,
         });
