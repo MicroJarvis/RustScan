@@ -54,20 +54,22 @@ pub use crate::core::{GaussianCamera, HostSplats, SplatView};
 // Re-export training types
 pub use crate::training::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
-    parity_fixture_id_for_input_path, resolve_litegs_parity_fixture_input_path,
-    resolve_litegs_parity_reference_report_path, EvaluationDevice, EvaluationFrameMetric,
-    FinalTrainingMetrics, LiteGsCameraConfig, LiteGsConfig, LiteGsFeatureConfig,
-    LiteGsGrowthConfig, LiteGsOpacityResetMode, LiteGsPruneMode, LiteGsPruningConfig,
-    LiteGsRefineConfig, LiteGsRenderingConfig, LiteGsSplitScoreMode, LiteGsTileSize,
-    LiteGsTopologyConfig, LiteGsTrainingProfile, ParityCheckOutcome, ParityCheckStatus,
-    ParityFixtureKind, ParityFixtureSpec, ParityFloatDistribution, ParityGateEvaluation,
-    ParityGateStatus, ParityHarnessReport, ParityLossCurveSample, ParityLossTerms,
-    ParityMetricSnapshot, ParityReferenceComparison, ParityThresholds, ParityTimingMetrics,
-    ParityTopologyMetrics, ParityTopologyStepSample, PsnrSummary, SplatEvaluationConfig,
-    SplatEvaluationError, SplatEvaluationResult, SplatEvaluationSummary, TrainingDataConfig,
+    load_training_checkpoint, parity_fixture_id_for_input_path,
+    resolve_litegs_parity_fixture_input_path, resolve_litegs_parity_reference_report_path,
+    save_training_checkpoint, AdamCheckpoint, AdamParameterCheckpoint, EvaluationDevice,
+    EvaluationFrameMetric, FinalTrainingMetrics, LiteGsCameraConfig, LiteGsConfig,
+    LiteGsFeatureConfig, LiteGsGrowthConfig, LiteGsOpacityResetMode, LiteGsPruneMode,
+    LiteGsPruningConfig, LiteGsRefineConfig, LiteGsRenderingConfig, LiteGsSplitScoreMode,
+    LiteGsTileSize, LiteGsTopologyConfig, LiteGsTrainingProfile, ParityCheckOutcome,
+    ParityCheckStatus, ParityFixtureKind, ParityFixtureSpec, ParityFloatDistribution,
+    ParityGateEvaluation, ParityGateStatus, ParityHarnessReport, ParityLossCurveSample,
+    ParityLossTerms, ParityMetricSnapshot, ParityReferenceComparison, ParityThresholds,
+    ParityTimingMetrics, ParityTopologyMetrics, ParityTopologyStepSample, PsnrSummary,
+    SplatEvaluationConfig, SplatEvaluationError, SplatEvaluationResult, SplatEvaluationSummary,
+    TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint, TrainingDataConfig, TrainingIdentity,
     TrainingInitializationConfig, TrainingLossConfig, TrainingOptimizerConfig,
     TrainingRasterConfig, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_RASTER_COV_BLUR,
-    DEFAULT_TINY_FIXTURE_ID,
+    DEFAULT_TINY_FIXTURE_ID, TRAINING_CHECKPOINT_VERSION,
 };
 pub use crate::training::{
     compute_psnr_f32, scaled_dimensions, select_evaluation_frames, summarize_psnr_samples,
@@ -95,9 +97,6 @@ pub use crate::io::scene_io::{
     save_splats_splat, splat_artifact_fidelity, verify_lossless_roundtrip, SplatArtifactFidelity,
 };
 pub use crate::io::scene_io::{SceneIoError, SplatMetadata};
-#[cfg(feature = "gpu")]
-pub use crate::io::TrainingCheckpoint;
-
 // Re-export initialization types
 #[cfg(feature = "gpu")]
 pub use crate::init::initialize_host_splats_from_points;

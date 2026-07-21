@@ -1,5 +1,6 @@
 //! Training module for 3D Gaussian Splatting.
 
+mod checkpoint;
 mod config;
 mod evaluation;
 mod reporting;
@@ -23,6 +24,11 @@ pub(crate) mod forward;
 #[cfg(feature = "gpu")]
 use crate::{TrainingDataset, TrainingError};
 
+pub use checkpoint::{
+    load_training_checkpoint, save_training_checkpoint, AdamCheckpoint, AdamParameterCheckpoint,
+    TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity,
+    TRAINING_CHECKPOINT_VERSION,
+};
 pub use evaluation::MIN_RENDER_SCALE;
 pub use evaluation::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,

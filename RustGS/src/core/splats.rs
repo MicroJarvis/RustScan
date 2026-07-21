@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::sh::{sh0_to_rgb_value, sh_coeff_count_for_degree};
 use crate::TrainingError;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostSplats {
     pub(crate) positions: Vec<f32>,
     pub(crate) log_scales: Vec<f32>,

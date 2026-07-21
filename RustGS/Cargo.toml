@@ -17,6 +17,8 @@ required-features = ["cli"]
 
 [dependencies]
 rustscan-types = { path = "../rustscan-types" }
+bincode = "1.3"
+blake3 = "1"
 glam = { workspace = true }
 rayon = "1.8"
 rand = "0.8"
