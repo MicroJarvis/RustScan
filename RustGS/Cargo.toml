@@ -29,6 +29,7 @@ kiddo = "5.2.1"
 image = "0.25"
 log = "0.4"
 libc = "0.2"
+tempfile = "3"
 bytes = { version = "1", optional = true }
 
 # CLI dependencies
@@ -65,9 +66,6 @@ gpu = [
 gpu-wgpu = ["gpu"]
 cli = ["dep:clap", "dep:env_logger", "dep:anyhow"]
 rustsfm-contract-tests = ["dep:rustsfm"]
-
-[dev-dependencies]
-tempfile = "3"
 
 [[example]]
 name = "evaluate_psnr"

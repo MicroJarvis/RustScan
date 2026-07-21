@@ -44,6 +44,12 @@ pub mod training;
 #[cfg(feature = "gpu")]
 pub mod viewport;
 
+/// Explicit namespace for the pre-versioned, non-resumable JSON checkpoint.
+pub mod legacy {
+    #[allow(deprecated)]
+    pub use crate::io::TrainingCheckpoint;
+}
+
 use std::path::Path;
 
 pub use rustscan_types::{Intrinsics, MapPointData, ScenePose, TrainingDataset, SE3};
@@ -69,7 +75,10 @@ pub use crate::training::{
     TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint, TrainingDataConfig, TrainingIdentity,
     TrainingInitializationConfig, TrainingLossConfig, TrainingOptimizerConfig,
     TrainingRasterConfig, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_RASTER_COV_BLUR,
-    DEFAULT_TINY_FIXTURE_ID, TRAINING_CHECKPOINT_VERSION,
+    DEFAULT_TINY_FIXTURE_ID, MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
+    MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
+    MAX_TRAINING_IDENTITY_BYTES, TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC,
+    TRAINING_CHECKPOINT_VERSION,
 };
 pub use crate::training::{
     compute_psnr_f32, scaled_dimensions, select_evaluation_frames, summarize_psnr_samples,
@@ -97,6 +106,7 @@ pub use crate::io::scene_io::{
     save_splats_splat, splat_artifact_fidelity, verify_lossless_roundtrip, SplatArtifactFidelity,
 };
 pub use crate::io::scene_io::{SceneIoError, SplatMetadata};
+pub use crate::io::{load_legacy_training_checkpoint, LegacyTrainingCheckpoint};
 // Re-export initialization types
 #[cfg(feature = "gpu")]
 pub use crate::init::initialize_host_splats_from_points;

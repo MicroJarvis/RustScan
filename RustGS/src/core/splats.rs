@@ -94,6 +94,11 @@ impl HostSplats {
             row_count,
             sh_coeffs_row_width,
         )?;
+        validate_component_finite("positions", &self.positions)?;
+        validate_component_finite("log_scales", &self.log_scales)?;
+        validate_component_finite("rotations", &self.rotations)?;
+        validate_component_finite("opacity_logits", &self.opacity_logits)?;
+        validate_component_finite("sh_coeffs", &self.sh_coeffs)?;
         Ok(())
     }
 
@@ -240,6 +245,15 @@ fn validate_component_len(
     if actual != expected {
         return Err(TrainingError::TrainingFailed(format!(
             "splats invariant violated: {name} expected {expected} values for {row_count} gaussians, got {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_component_finite(name: &str, values: &[f32]) -> Result<(), TrainingError> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(TrainingError::TrainingFailed(format!(
+            "splats invariant violated: {name} values must be finite"
         )));
     }
     Ok(())
