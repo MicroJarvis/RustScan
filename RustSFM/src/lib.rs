@@ -1,6 +1,11 @@
 pub mod ba;
+pub mod task;
 
 pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
+pub use task::{
+    SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,
+    SfmTaskEventSink, SfmTaskIssue, SfmTaskOperation, SfmTaskStage, SfmTaskStop,
+};
 
 // I/O, COLMAP compatibility, and persistent graph/cache formats.
 #[path = "io/colmap.rs"]
