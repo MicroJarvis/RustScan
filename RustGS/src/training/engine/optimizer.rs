@@ -165,7 +165,7 @@ pub struct AdamScaled<B: Backend> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-async fn tensor_checkpoint<B: Backend, const D: usize>(
+pub(super) async fn tensor_checkpoint<B: Backend, const D: usize>(
     tensor: &Tensor<B, D>,
 ) -> Result<TensorCheckpoint, TrainingError> {
     let shape = tensor.dims().to_vec();
@@ -213,7 +213,7 @@ fn invalid_optimizer_checkpoint(message: impl Into<String>) -> TrainingError {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn restore_tensor<B: Backend, const D: usize>(
+pub(super) fn restore_tensor<B: Backend, const D: usize>(
     name: &str,
     checkpoint: &TensorCheckpoint,
     expected_shape: [usize; D],

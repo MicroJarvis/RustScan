@@ -5,6 +5,11 @@ use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElemen
 use burn_wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime};
 use bytemuck::{Pod, Zeroable};
 
+use crate::training::TopologyCheckpoint;
+use crate::TrainingError;
+
+use super::optimizer::{restore_tensor, tensor_checkpoint};
+
 const WORKGROUP_SIZE: u32 = 256;
 const SHADER_SRC: &str = include_str!("../shaders/accumulate_topology_stats.wgsl");
 
@@ -49,6 +54,101 @@ pub(crate) struct TopologyAccumulatorSet<B: Backend> {
     pub(crate) num_observations: Tensor<B, 1>,
     pub(crate) visible_observations: Tensor<B, 1>,
     pub(crate) actual_visible_observations: Tensor<B, 1>,
+}
+
+impl<B: Backend> TopologyAccumulatorSet<B> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn checkpoint(
+        &self,
+        splat_birth_iterations: &[usize],
+        splat_invisible_windows: &[usize],
+    ) -> Result<TopologyCheckpoint, TrainingError> {
+        Ok(TopologyCheckpoint {
+            grad_2d: tensor_checkpoint(&self.grad_2d).await?,
+            screen_grad_2d: tensor_checkpoint(&self.screen_grad_2d).await?,
+            abs_grad_2d: tensor_checkpoint(&self.abs_grad_2d).await?,
+            abs_pixel_grad_2d: tensor_checkpoint(&self.abs_pixel_grad_2d).await?,
+            pixel_coverage: tensor_checkpoint(&self.pixel_coverage).await?,
+            camera_depth: tensor_checkpoint(&self.camera_depth).await?,
+            grad_color: tensor_checkpoint(&self.grad_color).await?,
+            num_observations: tensor_checkpoint(&self.num_observations).await?,
+            visible_observations: tensor_checkpoint(&self.visible_observations).await?,
+            actual_visible_observations: tensor_checkpoint(&self.actual_visible_observations)
+                .await?,
+            splat_birth_iterations: splat_birth_iterations.to_vec(),
+            splat_invisible_windows: splat_invisible_windows.to_vec(),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_checkpoint(
+        checkpoint: &TopologyCheckpoint,
+        splat_count: usize,
+        device: &B::Device,
+    ) -> Result<Self, TrainingError> {
+        Ok(Self {
+            grad_2d: restore_tensor(
+                "topology.grad_2d",
+                &checkpoint.grad_2d,
+                [splat_count],
+                device,
+            )?,
+            screen_grad_2d: restore_tensor(
+                "topology.screen_grad_2d",
+                &checkpoint.screen_grad_2d,
+                [splat_count],
+                device,
+            )?,
+            abs_grad_2d: restore_tensor(
+                "topology.abs_grad_2d",
+                &checkpoint.abs_grad_2d,
+                [splat_count],
+                device,
+            )?,
+            abs_pixel_grad_2d: restore_tensor(
+                "topology.abs_pixel_grad_2d",
+                &checkpoint.abs_pixel_grad_2d,
+                [splat_count],
+                device,
+            )?,
+            pixel_coverage: restore_tensor(
+                "topology.pixel_coverage",
+                &checkpoint.pixel_coverage,
+                [splat_count],
+                device,
+            )?,
+            camera_depth: restore_tensor(
+                "topology.camera_depth",
+                &checkpoint.camera_depth,
+                [splat_count],
+                device,
+            )?,
+            grad_color: restore_tensor(
+                "topology.grad_color",
+                &checkpoint.grad_color,
+                [splat_count],
+                device,
+            )?,
+            num_observations: restore_tensor(
+                "topology.num_observations",
+                &checkpoint.num_observations,
+                [splat_count],
+                device,
+            )?,
+            visible_observations: restore_tensor(
+                "topology.visible_observations",
+                &checkpoint.visible_observations,
+                [splat_count],
+                device,
+            )?,
+            actual_visible_observations: restore_tensor(
+                "topology.actual_visible_observations",
+                &checkpoint.actual_visible_observations,
+                [splat_count],
+                device,
+            )?,
+        })
+    }
 }
 
 pub(crate) trait TopologyAccumBackend: Backend {
