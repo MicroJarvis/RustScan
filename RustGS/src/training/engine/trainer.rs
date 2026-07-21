@@ -26,7 +26,9 @@ use crate::TrainingError;
 use super::backend::{GsBackendBase, GsDevice, GsDiffBackend};
 use super::loss::{combined_loss_with_kernel, gaussian_kernel_1d, SsimConfig};
 use super::optimizer::{AdamScaled, AdamScaledConfig};
-use super::splats::{device_splats_to_host, host_splats_to_device, DeviceSplats};
+use super::splats::{
+    device_splats_to_host, host_splats_to_device, try_device_splats_to_host, DeviceSplats,
+};
 use super::topology_accum::{accumulate_topology_stats, TopologyAccumulatorSet};
 
 #[derive(Debug, Clone, Default)]
@@ -242,7 +244,9 @@ impl WgpuTrainer {
         completed_iterations: usize,
         latest_loss: Option<f32>,
     ) -> Result<TrainingCheckpoint, TrainingError> {
-        let host_splats = device_splats_to_host(splats).await;
+        let host_splats = try_device_splats_to_host(splats).await?;
+        let active_sh_degree =
+            self.active_sh_degree_at(completed_iterations, splats.sh_degree) as usize;
         let topology = TopologyAccumulatorSet {
             grad_2d: self.grad_2d_accum.clone(),
             screen_grad_2d: self.screen_grad_2d_accum.clone(),
@@ -262,7 +266,7 @@ impl WgpuTrainer {
             identity,
             completed_iterations,
             latest_loss,
-            active_sh_degree: host_splats.sh_degree(),
+            active_sh_degree,
             splats: host_splats,
             optimizer: self.optimizer.checkpoint().await?,
             topology,
@@ -305,7 +309,6 @@ impl WgpuTrainer {
         trainer.splat_birth_iterations = checkpoint.topology.splat_birth_iterations.clone();
         trainer.splat_invisible_windows = checkpoint.topology.splat_invisible_windows.clone();
         trainer.telemetry.active_sh_degree = Some(checkpoint.active_sh_degree);
-        trainer.update_optimizer_lrs(checkpoint.completed_iterations, sh_coeffs);
 
         Ok((trainer, splats))
     }
@@ -1167,6 +1170,7 @@ mod tests {
     use super::*;
     use crate::training::engine::splats::host_splats_to_device;
     use crate::training::{TensorCheckpoint, TrainingCheckpoint, TrainingIdentity};
+    use burn::module::Param;
 
     const CHECKPOINT_ITERATIONS: usize = 8;
 
@@ -1291,7 +1295,7 @@ mod tests {
         assert_eq!(checkpoint.completed_iterations, CHECKPOINT_ITERATIONS);
         assert_eq!(checkpoint.latest_loss, Some(0.125));
         assert_eq!(checkpoint.frame_shuffle_seed, 0x5eed_cafe);
-        assert_eq!(checkpoint.active_sh_degree, 1);
+        assert_eq!(checkpoint.active_sh_degree, 0);
         assert_eq!(checkpoint.splats.len(), 3);
         assert_eq!(checkpoint.optimizer.transforms.step, 1);
         assert_topology_tensor(&checkpoint.topology.grad_2d, [1.0, 2.0, 3.0]);
@@ -1404,5 +1408,113 @@ mod tests {
             .await
             .expect("re-export reset trainer checkpoint");
         assert_eq!(reexported.optimizer, checkpoint.optimizer);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trainer_checkpoint_preserves_decaying_lr_boundary_until_next_iteration() {
+        let device = GsDevice::default();
+        let mut config = trainer_checkpoint_config();
+        config.optimizer.lr_decay_iterations = Some(100);
+        config.optimizer.lr_pos_final = config.optimizer.lr_position * 0.1;
+        config.optimizer.lr_scale_final = config.optimizer.lr_scale * 0.1;
+        config.optimizer.lr_rotation_final = config.optimizer.lr_rotation * 0.1;
+        config.optimizer.lr_opacity_final = config.optimizer.lr_opacity * 0.1;
+        config.optimizer.lr_color_final = config.optimizer.lr_color * 0.1;
+        config.optimizer.lr_color_rest_final = config.optimizer.lr_color_rest * 0.1;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        trainer.update_optimizer_lrs(CHECKPOINT_ITERATIONS - 1, 4);
+        trainer.optimizer.step_device_splats(
+            &mut splats,
+            Tensor::ones([3, 10], &trainer.device).mul_scalar(0.1),
+            Tensor::ones([3, 4, 3], &trainer.device).mul_scalar(-0.2),
+            Tensor::ones([3], &trainer.device).mul_scalar(0.3),
+        );
+        let checkpoint = trainer
+            .checkpoint(
+                &splats,
+                trainer_checkpoint_identity(),
+                CHECKPOINT_ITERATIONS,
+                Some(0.125),
+            )
+            .await
+            .expect("export decaying-LR checkpoint");
+
+        let (mut restored, restored_splats) =
+            WgpuTrainer::from_checkpoint(config, device, 2.5, &checkpoint)
+                .await
+                .expect("restore decaying-LR checkpoint");
+        let reexported = restored
+            .checkpoint(
+                &restored_splats,
+                checkpoint.identity.clone(),
+                checkpoint.completed_iterations,
+                checkpoint.latest_loss,
+            )
+            .await
+            .expect("re-export decaying-LR checkpoint");
+        assert_eq!(reexported.optimizer, checkpoint.optimizer);
+
+        trainer.update_optimizer_lrs(CHECKPOINT_ITERATIONS, 4);
+        restored.update_optimizer_lrs(CHECKPOINT_ITERATIONS, 4);
+        assert_eq!(
+            restored
+                .optimizer
+                .checkpoint()
+                .await
+                .expect("restored optimizer after next LR update"),
+            trainer
+                .optimizer
+                .checkpoint()
+                .await
+                .expect("original optimizer after next LR update")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trainer_checkpoint_exports_scheduled_active_sh_degree_boundaries() {
+        let device = GsDevice::default();
+        let config = trainer_checkpoint_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
+
+        for (completed_iterations, expected_degree) in [(0, 0), (1000, 0), (1001, 1)] {
+            let checkpoint = trainer
+                .checkpoint(
+                    &splats,
+                    trainer_checkpoint_identity(),
+                    completed_iterations,
+                    None,
+                )
+                .await
+                .expect("export active-SH checkpoint");
+            assert_eq!(
+                checkpoint.active_sh_degree, expected_degree,
+                "completed iterations {completed_iterations}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trainer_checkpoint_rejects_malformed_device_splat_shapes_without_panicking() {
+        let device = GsDevice::default();
+        let config = trainer_checkpoint_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        splats.transforms = Param::from_tensor(Tensor::zeros([3, 9], &device));
+        let trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
+
+        let error = trainer
+            .checkpoint(&splats, trainer_checkpoint_identity(), 0, None)
+            .await
+            .expect_err("malformed device splats must return an error");
+        assert!(matches!(
+            error,
+            TrainingError::InvalidInput(message)
+                if message.contains("transforms") && message.contains("[N, 10]")
+        ));
     }
 }

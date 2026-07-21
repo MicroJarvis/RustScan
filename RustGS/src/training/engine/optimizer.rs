@@ -213,12 +213,11 @@ fn invalid_optimizer_checkpoint(message: impl Into<String>) -> TrainingError {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn restore_tensor<B: Backend, const D: usize>(
+pub(super) fn validate_tensor_checkpoint<const D: usize>(
     name: &str,
     checkpoint: &TensorCheckpoint,
     expected_shape: [usize; D],
-    device: &B::Device,
-) -> Result<Tensor<B, D>, TrainingError> {
+) -> Result<(), TrainingError> {
     if checkpoint.shape.len() != D {
         return Err(invalid_optimizer_checkpoint(format!(
             "{name} expected rank {D}, got {}",
@@ -247,13 +246,33 @@ pub(super) fn restore_tensor<B: Backend, const D: usize>(
         )));
     }
 
-    Ok(Tensor::from_data(
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn tensor_from_validated_checkpoint<B: Backend, const D: usize>(
+    checkpoint: &TensorCheckpoint,
+    device: &B::Device,
+) -> Tensor<B, D> {
+    Tensor::from_data(
         TensorData::new(
             checkpoint.values.clone(),
             Shape::from(checkpoint.shape.clone()),
         ),
         device,
-    ))
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn restore_tensor<B: Backend, const D: usize>(
+    name: &str,
+    checkpoint: &TensorCheckpoint,
+    expected_shape: [usize; D],
+    device: &B::Device,
+) -> Result<Tensor<B, D>, TrainingError> {
+    validate_tensor_checkpoint(name, checkpoint, expected_shape)?;
+
+    Ok(tensor_from_validated_checkpoint(checkpoint, device))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
