@@ -6,8 +6,8 @@ pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinea
 pub use sequence_registration::{
     FrameRegistrationDiagnostic, FrameRegistrationStatus, RegistrationRound, SequenceFrame,
     SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
-    SequenceRegistrationResult, MAX_SEQUENCE_NEIGHBORS, MAX_SEQUENCE_PLAN_FRAMES,
-    MAX_TOTAL_SUPPORT_ENTRIES,
+    SequenceRegistrationResult, MAX_DYNAMIC_SUPPORT_CANDIDATES, MAX_SEQUENCE_NEIGHBORS,
+    MAX_SEQUENCE_PLAN_FRAMES, MAX_TIMESTAMP_PLATEAU, MAX_TOTAL_SUPPORT_ENTRIES,
 };
 pub use task::{
     SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,

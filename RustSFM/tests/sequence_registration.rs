@@ -1,8 +1,8 @@
 use rustsfm::{
     FrameRegistrationDiagnostic, FrameRegistrationStatus, RegistrationRound, SequenceFrame,
     SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
-    SequenceRegistrationResult, MAX_SEQUENCE_NEIGHBORS, MAX_SEQUENCE_PLAN_FRAMES,
-    MAX_TOTAL_SUPPORT_ENTRIES,
+    SequenceRegistrationResult, MAX_DYNAMIC_SUPPORT_CANDIDATES, MAX_SEQUENCE_NEIGHBORS,
+    MAX_SEQUENCE_PLAN_FRAMES, MAX_TIMESTAMP_PLATEAU, MAX_TOTAL_SUPPORT_ENTRIES,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
@@ -97,6 +97,44 @@ fn temporal_later_round_can_add_only_explicit_registered_support() {
 }
 
 #[test]
+fn temporal_sorted_dynamic_support_reuses_bounded_keyframe_attempts() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+    let registered_support = [2, 5, 7];
+    let expected = vec![3, 5, 2, 6, 7, 0, 9];
+
+    for _ in 0..1_000 {
+        assert_eq!(
+            plan.attempts_for_with_sorted_support(4, RegistrationRound::Wide, &registered_support,)
+                .unwrap(),
+            expected
+        );
+    }
+
+    assert!(matches!(
+        plan.attempts_for_with_sorted_support(4, RegistrationRound::Wide, &[2, 2]),
+        Err(SequenceRegistrationError::DynamicSupportNotSortedUnique)
+    ));
+}
+
+#[test]
+fn temporal_sorted_dynamic_support_rejects_oversized_input() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+    let oversized = vec![0; MAX_DYNAMIC_SUPPORT_CANDIDATES + 1];
+
+    assert!(matches!(
+        plan.attempts_for_with_sorted_support(4, RegistrationRound::Wide, &oversized),
+        Err(SequenceRegistrationError::DynamicSupportLimitExceeded {
+            candidate_count,
+            max_candidates: MAX_DYNAMIC_SUPPORT_CANDIDATES,
+        }) if candidate_count == oversized.len()
+    ));
+    assert_eq!(
+        plan.attempts_for_with_support(4, RegistrationRound::Wide, &oversized),
+        plan.attempts_for(4, RegistrationRound::Wide)
+    );
+}
+
+#[test]
 fn temporal_dynamic_support_remains_bounded_for_large_merged_inputs() {
     let frame_count = 20_000;
     let frames: Vec<_> = (0..frame_count)
@@ -108,11 +146,11 @@ fn temporal_dynamic_support_remains_bounded_for_large_merged_inputs() {
         .collect();
     let keyframes: Vec<_> = (0..frame_count).step_by(2).collect();
     let plan = SequenceRegistrationPlan::build_from_frames(&frames, &keyframes, 4, 8).unwrap();
-    let mut registered_support: Vec<_> = (1..frame_count).step_by(2).rev().collect();
-    registered_support.extend([9_999, 9_999, usize::MAX]);
+    let registered_support: Vec<_> = (1..frame_count).step_by(2).collect();
 
-    let support =
-        plan.attempts_for_with_support(10_001, RegistrationRound::Narrow, &registered_support);
+    let support = plan
+        .attempts_for_with_sorted_support(10_001, RegistrationRound::Narrow, &registered_support)
+        .unwrap();
 
     assert!(support.len() <= 8);
     assert!(!support.contains(&10_001));
@@ -235,6 +273,31 @@ fn temporal_frame_plan_rejects_unsorted_timestamps() {
             previous_frame: 1,
             current_frame: 2,
         })
+    ));
+}
+
+#[test]
+fn temporal_frame_plan_rejects_oversized_timestamp_plateau() {
+    let frames: Vec<_> = (0..=MAX_TIMESTAMP_PLATEAU)
+        .map(|frame| SequenceFrame {
+            id: frame as u32,
+            image_path: PathBuf::new(),
+            timestamp_us: Some(42),
+        })
+        .collect();
+
+    assert!(matches!(
+        SequenceRegistrationPlan::build_from_frames(
+            &frames,
+            &[0, MAX_TIMESTAMP_PLATEAU],
+            2,
+            4,
+        ),
+        Err(SequenceRegistrationError::TimestampPlateauTooLarge {
+            timestamp_us: 42,
+            plateau_size,
+            max_plateau_size: MAX_TIMESTAMP_PLATEAU,
+        }) if plateau_size == frames.len()
     ));
 }
 

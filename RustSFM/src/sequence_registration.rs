@@ -8,6 +8,8 @@ use std::path::PathBuf;
 pub const MAX_SEQUENCE_PLAN_FRAMES: usize = 1_000_000;
 pub const MAX_SEQUENCE_NEIGHBORS: usize = 1_024;
 pub const MAX_TOTAL_SUPPORT_ENTRIES: usize = 32_000_000;
+pub const MAX_TIMESTAMP_PLATEAU: usize = MAX_SEQUENCE_NEIGHBORS;
+pub const MAX_DYNAMIC_SUPPORT_CANDIDATES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceFrame {
@@ -284,6 +286,20 @@ pub enum SequenceRegistrationError {
         estimated_support_entries: u128,
         max_support_entries: usize,
     },
+    TimestampPlateauTooLarge {
+        timestamp_us: i64,
+        plateau_size: usize,
+        max_plateau_size: usize,
+    },
+    DynamicSupportLimitExceeded {
+        candidate_count: usize,
+        max_candidates: usize,
+    },
+    DynamicSupportNotSortedUnique,
+    DynamicSupportFrameOutOfRange {
+        frame: usize,
+        frame_count: usize,
+    },
     InvalidFrameIds {
         imported_frames: usize,
         frame_id_count: usize,
@@ -378,6 +394,28 @@ impl fmt::Display for SequenceRegistrationError {
             } => write!(
                 formatter,
                 "sequence plan for {frame_count} frames may cache {estimated_support_entries} support entries, exceeding maximum {max_support_entries}"
+            ),
+            Self::TimestampPlateauTooLarge {
+                timestamp_us,
+                plateau_size,
+                max_plateau_size,
+            } => write!(
+                formatter,
+                "timestamp {timestamp_us} plateau contains {plateau_size} frames, exceeding maximum {max_plateau_size}"
+            ),
+            Self::DynamicSupportLimitExceeded {
+                candidate_count,
+                max_candidates,
+            } => write!(
+                formatter,
+                "dynamic support contains {candidate_count} candidates, exceeding maximum {max_candidates}"
+            ),
+            Self::DynamicSupportNotSortedUnique => {
+                formatter.write_str("dynamic support must be sorted and unique")
+            }
+            Self::DynamicSupportFrameOutOfRange { frame, frame_count } => write!(
+                formatter,
+                "dynamic support frame {frame} is out of range for {frame_count} frames"
             ),
             Self::InvalidFrameIds {
                 imported_frames,
@@ -607,25 +645,64 @@ impl SequenceRegistrationPlan {
         if frame >= self.frame_count || self.keyframes.binary_search(&frame).is_ok() {
             return Vec::new();
         }
+        if registered_support.len() > MAX_DYNAMIC_SUPPORT_CANDIDATES {
+            return self.attempts_for(frame, round).to_vec();
+        }
 
-        let registered_support: BTreeSet<_> = registered_support
+        let mut registered_support: Vec<_> = registered_support
             .iter()
             .copied()
             .filter(|support| *support < self.frame_count && *support != frame)
             .collect();
-        let candidates =
-            merge_support_candidates(&self.keyframes, &registered_support, self.frame_count);
+        registered_support.sort_unstable();
+        registered_support.dedup();
+        self.attempts_for_with_sorted_support(frame, round, &registered_support)
+            .unwrap_or_else(|_| self.attempts_for(frame, round).to_vec())
+    }
+
+    pub fn attempts_for_with_sorted_support(
+        &self,
+        frame: usize,
+        round: RegistrationRound,
+        registered_support: &[usize],
+    ) -> Result<Vec<usize>, SequenceRegistrationError> {
+        if registered_support.len() > MAX_DYNAMIC_SUPPORT_CANDIDATES {
+            return Err(SequenceRegistrationError::DynamicSupportLimitExceeded {
+                candidate_count: registered_support.len(),
+                max_candidates: MAX_DYNAMIC_SUPPORT_CANDIDATES,
+            });
+        }
+        if registered_support.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(SequenceRegistrationError::DynamicSupportNotSortedUnique);
+        }
+        if let Some(out_of_range) = registered_support
+            .iter()
+            .copied()
+            .find(|support| *support >= self.frame_count)
+        {
+            return Err(SequenceRegistrationError::DynamicSupportFrameOutOfRange {
+                frame: out_of_range,
+                frame_count: self.frame_count,
+            });
+        }
+        if frame >= self.frame_count || self.keyframes.binary_search(&frame).is_ok() {
+            return Ok(Vec::new());
+        }
+
+        let mut keyframe_support = self.attempts_for(frame, round).to_vec();
+        keyframe_support.sort_unstable();
+        let candidates = merge_sorted_support(&keyframe_support, registered_support, frame);
         let neighbors_each_side = match round {
             RegistrationRound::Narrow => self.narrow_neighbors_each_side,
             RegistrationRound::Wide => self.wide_neighbors_each_side,
         };
-        support_for(
+        Ok(support_for(
             frame,
             &candidates,
             neighbors_each_side,
             &self.frame_ids,
             self.timestamps_us.as_deref(),
-        )
+        ))
     }
 }
 
@@ -728,31 +805,50 @@ fn validate_plan_limits(
     Ok(())
 }
 
-fn merge_support_candidates(
-    keyframes: &[usize],
-    registered_support: &BTreeSet<usize>,
-    frame_count: usize,
+fn merge_sorted_support(
+    keyframe_support: &[usize],
+    registered_support: &[usize],
+    target_frame: usize,
 ) -> Vec<usize> {
     let mut merged = Vec::with_capacity(
-        keyframes
+        keyframe_support
             .len()
-            .saturating_add(registered_support.len())
-            .min(frame_count),
+            .saturating_add(registered_support.len()),
     );
     let mut keyframe_index = 0;
-    for registered in registered_support.iter().copied() {
-        while keyframe_index < keyframes.len() && keyframes[keyframe_index] < registered {
-            merged.push(keyframes[keyframe_index]);
-            keyframe_index += 1;
-        }
-        if keyframe_index < keyframes.len() && keyframes[keyframe_index] == registered {
-            merged.push(registered);
-            keyframe_index += 1;
-        } else {
-            merged.push(registered);
+    let mut registered_index = 0;
+    while keyframe_index < keyframe_support.len() || registered_index < registered_support.len() {
+        let next = match (
+            keyframe_support.get(keyframe_index),
+            registered_support.get(registered_index),
+        ) {
+            (Some(keyframe), Some(registered)) if keyframe < registered => {
+                keyframe_index += 1;
+                *keyframe
+            }
+            (Some(keyframe), Some(registered)) if registered < keyframe => {
+                registered_index += 1;
+                *registered
+            }
+            (Some(keyframe), Some(_)) => {
+                keyframe_index += 1;
+                registered_index += 1;
+                *keyframe
+            }
+            (Some(keyframe), None) => {
+                keyframe_index += 1;
+                *keyframe
+            }
+            (None, Some(registered)) => {
+                registered_index += 1;
+                *registered
+            }
+            (None, None) => break,
+        };
+        if next != target_frame {
+            merged.push(next);
         }
     }
-    merged.extend_from_slice(&keyframes[keyframe_index..]);
     merged
 }
 
@@ -845,14 +941,36 @@ fn validate_plan_ordering(
                 timestamp_count: timestamps_us.len(),
             });
         }
-        for (previous_frame, timestamps) in timestamps_us.windows(2).enumerate() {
-            if timestamps[0] > timestamps[1] {
+        let mut plateau_start = 0;
+        for current_frame in 1..timestamps_us.len() {
+            if timestamps_us[current_frame - 1] > timestamps_us[current_frame] {
                 return Err(SequenceRegistrationError::UnsortedTimestamps {
-                    previous_frame,
-                    current_frame: previous_frame + 1,
+                    previous_frame: current_frame - 1,
+                    current_frame,
                 });
             }
+            if timestamps_us[current_frame - 1] != timestamps_us[current_frame] {
+                validate_timestamp_plateau(timestamps_us, plateau_start, current_frame)?;
+                plateau_start = current_frame;
+            }
         }
+        validate_timestamp_plateau(timestamps_us, plateau_start, timestamps_us.len())?;
+    }
+    Ok(())
+}
+
+fn validate_timestamp_plateau(
+    timestamps_us: &[i64],
+    start: usize,
+    end: usize,
+) -> Result<(), SequenceRegistrationError> {
+    let plateau_size = end.saturating_sub(start);
+    if plateau_size > MAX_TIMESTAMP_PLATEAU {
+        return Err(SequenceRegistrationError::TimestampPlateauTooLarge {
+            timestamp_us: timestamps_us[start],
+            plateau_size,
+            max_plateau_size: MAX_TIMESTAMP_PLATEAU,
+        });
     }
     Ok(())
 }
