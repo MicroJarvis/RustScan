@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const DEFAULT_CHECKPOINT_EVERY: usize = 1_000;
+static NON_PERIODIC_CHECKPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn effective_checkpoint_every(args: &TrainArgs) -> Option<usize> {
     args.checkpoint_dir
@@ -41,17 +43,43 @@ impl<S> CheckpointPersistence<S> {
         S: FnMut(&Path, &T) -> Result<(), E>,
         E: From<std::io::Error>,
     {
-        let prefix = if reason == rustgs::TrainingCheckpointReason::Periodic {
-            "iteration".to_string()
+        let path = if reason == rustgs::TrainingCheckpointReason::Periodic {
+            self.directory
+                .join(format!("iteration-{iteration:06}.rgscp"))
         } else {
-            format!("{reason:?}").to_ascii_lowercase()
+            let prefix = format!("{reason:?}").to_ascii_lowercase();
+            self.unique_non_periodic_path(&prefix, iteration)
+                .map_err(E::from)?
         };
-        let path = self
-            .directory
-            .join(format!("{prefix}-{iteration:06}.rgscp"));
         (self.save_checkpoint)(&path, checkpoint)?;
         self.prune_periodic_checkpoints().map_err(E::from)?;
         Ok(path)
+    }
+
+    fn unique_non_periodic_path(&self, prefix: &str, iteration: usize) -> std::io::Result<PathBuf> {
+        let sequence = NON_PERIODIC_CHECKPOINT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let stem = format!("{prefix}-{iteration:06}-{}-{sequence}", std::process::id());
+        self.available_non_periodic_sibling_path(&stem)
+    }
+
+    fn available_non_periodic_sibling_path(&self, stem: &str) -> std::io::Result<PathBuf> {
+        let mut suffix = 0usize;
+        loop {
+            let file_name = if suffix == 0 {
+                format!("{stem}.rgscp")
+            } else {
+                format!("{stem}-{suffix}.rgscp")
+            };
+            let path = self.directory.join(file_name);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+                Err(error) => return Err(error),
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                std::io::Error::other("exhausted non-periodic checkpoint suffixes")
+            })?;
+        }
     }
 
     fn prune_periodic_checkpoints(&self) -> std::io::Result<()> {
@@ -84,7 +112,8 @@ fn periodic_checkpoint_iteration(file_name: &std::ffi::OsStr) -> Option<usize> {
     if digits.len() < 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    digits.parse().ok()
+    let iteration = digits.parse::<usize>().ok()?;
+    (format!("{iteration:06}") == digits).then_some(iteration)
 }
 
 pub(super) fn training_options(
@@ -2128,6 +2157,8 @@ fn splats_have_non_finite(splats: &rustgs::HostSplats) -> bool {
 mod checkpoint_persistence_tests {
     use super::*;
     use std::io;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn write_test_checkpoint(path: &Path, checkpoint: &usize) -> io::Result<()> {
         fs::write(path, checkpoint.to_string())
@@ -2182,8 +2213,12 @@ mod checkpoint_persistence_tests {
 
         assert!(pause_path.exists());
         assert!(shutdown_path.exists());
-        assert_eq!(pause_path.file_name().unwrap(), "pause-000001.rgscp");
-        assert_eq!(shutdown_path.file_name().unwrap(), "shutdown-000001.rgscp");
+        let pause_name = pause_path.file_name().unwrap().to_string_lossy();
+        let shutdown_name = shutdown_path.file_name().unwrap().to_string_lossy();
+        assert!(pause_name.starts_with("pause-000001-"));
+        assert!(pause_name.ends_with(".rgscp"));
+        assert!(shutdown_name.starts_with("shutdown-000001-"));
+        assert!(shutdown_name.ends_with(".rgscp"));
     }
 
     #[test]
@@ -2221,6 +2256,160 @@ mod checkpoint_persistence_tests {
         }
         assert!(pause_path.exists());
         assert!(shutdown_path.exists());
+    }
+
+    #[test]
+    fn checkpoint_persistence_ignores_noncanonical_periodic_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let overpadded = temp.path().join("iteration-0000001.rgscp");
+        fs::write(&overpadded, "not a canonical periodic checkpoint").unwrap();
+        for iteration in 1..=3 {
+            fs::write(
+                temp.path().join(format!("iteration-{iteration:06}.rgscp")),
+                iteration.to_string(),
+            )
+            .unwrap();
+        }
+
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+        persistence
+            .persist(rustgs::TrainingCheckpointReason::Periodic, 4, &4)
+            .unwrap();
+
+        assert!(overpadded.exists());
+        assert!(!temp.path().join("iteration-000001.rgscp").exists());
+        for iteration in 2..=4 {
+            assert!(temp
+                .path()
+                .join(format!("iteration-{iteration:06}.rgscp"))
+                .exists());
+        }
+    }
+
+    #[test]
+    fn periodic_checkpoint_names_are_canonical_at_large_iterations() {
+        assert_eq!(
+            periodic_checkpoint_iteration(std::ffi::OsStr::new("iteration-1000000.rgscp")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            periodic_checkpoint_iteration(std::ffi::OsStr::new("iteration-0000001.rgscp")),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_non_periodic_checkpoints_use_unique_paths_across_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        for reason in [
+            rustgs::TrainingCheckpointReason::Pause,
+            rustgs::TrainingCheckpointReason::Shutdown,
+        ] {
+            let first_path = {
+                let mut persistence =
+                    CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+                persistence.persist(reason, 1, &1).unwrap()
+            };
+            let second_path = {
+                let mut persistence =
+                    CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+                persistence.persist(reason, 1, &2).unwrap()
+            };
+
+            assert_ne!(first_path, second_path);
+            assert_eq!(fs::read_to_string(first_path).unwrap(), "1");
+            assert_eq!(fs::read_to_string(second_path).unwrap(), "2");
+        }
+        let names = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 4);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("pause-000001-"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("shutdown-000001-"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_non_periodic_path_selection_does_not_collide() {
+        let temp = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn_writer = |checkpoint: usize| {
+            let directory = temp.path().to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut persistence = CheckpointPersistence::new(
+                    directory,
+                    move |path: &Path, value: &usize| -> io::Result<()> {
+                        barrier.wait();
+                        fs::write(path, value.to_string())
+                    },
+                );
+                persistence
+                    .persist(rustgs::TrainingCheckpointReason::Pause, 1, &checkpoint)
+                    .unwrap()
+            })
+        };
+
+        let first = spawn_writer(1);
+        let second = spawn_writer(2);
+        let first_path = first.join().unwrap();
+        let second_path = second.join().unwrap();
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+    }
+
+    #[test]
+    fn non_periodic_sibling_probe_handles_reuse_and_ignores_temp_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let stem = "pause-000001-123-0";
+        fs::write(temp.path().join(format!("{stem}.rgscp")), "existing").unwrap();
+        fs::create_dir(temp.path().join(format!("{stem}-1.rgscp"))).unwrap();
+        fs::write(
+            temp.path().join(format!("{stem}-2.rgscp.tmp")),
+            "atomic temp",
+        )
+        .unwrap();
+        let persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+
+        let path = persistence
+            .available_non_periodic_sibling_path(stem)
+            .unwrap();
+
+        assert_eq!(path.file_name().unwrap(), "pause-000001-123-0-2.rgscp");
+    }
+
+    #[test]
+    fn duplicate_periodic_checkpoint_replaces_the_canonical_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+
+        let first_path = persistence
+            .persist(rustgs::TrainingCheckpointReason::Periodic, 1, &1)
+            .unwrap();
+        let second_path = persistence
+            .persist(rustgs::TrainingCheckpointReason::Periodic, 1, &2)
+            .unwrap();
+
+        assert_eq!(first_path, second_path);
+        assert_eq!(first_path.file_name().unwrap(), "iteration-000001.rgscp");
+        assert_eq!(fs::read_to_string(first_path).unwrap(), "2");
     }
 
     #[test]
