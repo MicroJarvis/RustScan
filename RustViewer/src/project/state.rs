@@ -10,6 +10,7 @@ use super::manifest::{
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     Source,
+    ImportConfig,
     KeyframeSelection,
     SfmConfig,
     PnpConfig,
@@ -70,7 +71,8 @@ impl ProjectManifest {
     }
 
     /// Applies a legal transition to a manifest that has already passed `validate`.
-    pub fn transition(
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn transition(
         &mut self,
         stage: ProjectStage,
         to: StageState,
@@ -188,9 +190,9 @@ impl ProjectManifest {
     }
 
     /// Invalidates a manifest that has already passed `validate`.
-    pub fn invalidate(&mut self, change: ChangeKind) {
+    pub(crate) fn invalidate(&mut self, change: ChangeKind) {
         let first = match change {
-            ChangeKind::Source => ProjectStage::Import,
+            ChangeKind::Source | ChangeKind::ImportConfig => ProjectStage::Import,
             ChangeKind::KeyframeSelection | ChangeKind::SfmConfig => ProjectStage::KeyframeSfm,
             ChangeKind::PnpConfig => ProjectStage::FullFramePnp,
             ChangeKind::TrainingConfig => ProjectStage::Training,
@@ -443,6 +445,50 @@ mod tests {
             manifest.stage(ProjectStage::Complete).state,
             StageState::Ready
         );
+    }
+
+    #[test]
+    fn invalidation_follows_every_change_category_dependency_boundary() {
+        let cases = [
+            (ChangeKind::Source, Some(ProjectStage::Import)),
+            (ChangeKind::ImportConfig, Some(ProjectStage::Import)),
+            (
+                ChangeKind::KeyframeSelection,
+                Some(ProjectStage::KeyframeSfm),
+            ),
+            (ChangeKind::SfmConfig, Some(ProjectStage::KeyframeSfm)),
+            (ChangeKind::PnpConfig, Some(ProjectStage::FullFramePnp)),
+            (ChangeKind::TrainingConfig, Some(ProjectStage::Training)),
+            (ChangeKind::ViewerAppearance, None),
+        ];
+
+        for (change, first_invalidated) in cases {
+            let mut manifest =
+                ProjectManifest::new("Flowers", SourceSpec::managed_images("source-a"));
+            for stage in ProjectStage::ORDER {
+                let record = manifest.stage_mut(stage);
+                record.state = StageState::Succeeded;
+                record.attempt = 1;
+                record.artifacts = vec![artifact_for(stage)];
+            }
+            manifest.invalidate(change);
+
+            let mut invalidated = false;
+            for stage in ProjectStage::ORDER {
+                if Some(stage) == first_invalidated {
+                    invalidated = true;
+                }
+                assert_eq!(
+                    manifest.stage(stage).state,
+                    if invalidated {
+                        StageState::Stale
+                    } else {
+                        StageState::Succeeded
+                    },
+                    "unexpected state for {stage:?} after {change:?}"
+                );
+            }
+        }
     }
 
     #[test]

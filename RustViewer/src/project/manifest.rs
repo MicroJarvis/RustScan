@@ -332,6 +332,17 @@ pub enum ProjectManifestValidationError {
         stage: ProjectStage,
         state: StageState,
     },
+    #[error("project manifest contains multiple active stages: {stages:?}")]
+    MultipleActiveStages { stages: Vec<ProjectStage> },
+    #[error("active stage {stage:?} is missing its project lease")]
+    ActiveStageWithoutLease { stage: ProjectStage },
+    #[error("lease exists for {stage:?}, but no project stage is active")]
+    LeaseWithoutActiveStage { stage: ProjectStage },
+    #[error("lease targets {lease_stage:?}, but the active stage is {active_stage:?}")]
+    LeaseActiveStageMismatch {
+        lease_stage: ProjectStage,
+        active_stage: ProjectStage,
+    },
 }
 
 impl ProjectManifest {
@@ -407,8 +418,15 @@ impl ProjectManifest {
         }
         self.validate_configs()?;
 
+        let mut active_stages = Vec::new();
         for stage in ProjectStage::ORDER {
             let record = self.try_stage(stage)?;
+            if matches!(
+                record.state,
+                StageState::Running | StageState::PauseRequested | StageState::CancelRequested
+            ) {
+                active_stages.push(stage);
+            }
             if let (Some(completed), Some(total)) = (record.completed, record.total) {
                 if completed > total {
                     return Err(ProjectManifestValidationError::InvalidProgress {
@@ -447,34 +465,47 @@ impl ProjectManifest {
             }
         }
 
-        if let Some(lease) = &self.lease {
-            if lease.project_id != self.id {
-                return Err(ProjectManifestValidationError::LeaseProjectMismatch {
-                    expected: self.id,
-                    found: lease.project_id,
-                });
+        if active_stages.len() > 1 {
+            return Err(ProjectManifestValidationError::MultipleActiveStages {
+                stages: active_stages,
+            });
+        }
+        match (active_stages.first().copied(), self.lease.as_ref()) {
+            (None, None) => {}
+            (Some(stage), None) => {
+                return Err(ProjectManifestValidationError::ActiveStageWithoutLease { stage });
             }
-            if lease.attempt == 0 {
-                return Err(ProjectManifestValidationError::LeaseAttemptZero {
+            (None, Some(lease)) => {
+                return Err(ProjectManifestValidationError::LeaseWithoutActiveStage {
                     stage: lease.stage,
                 });
             }
-            let record = self.try_stage(lease.stage)?;
-            if lease.attempt != record.attempt {
-                return Err(ProjectManifestValidationError::LeaseAttemptMismatch {
-                    stage: lease.stage,
-                    expected: record.attempt,
-                    found: lease.attempt,
-                });
-            }
-            if !matches!(
-                record.state,
-                StageState::Running | StageState::PauseRequested | StageState::CancelRequested
-            ) {
-                return Err(ProjectManifestValidationError::LeaseStageNotActive {
-                    stage: lease.stage,
-                    state: record.state,
-                });
+            (Some(active_stage), Some(lease)) => {
+                if lease.project_id != self.id {
+                    return Err(ProjectManifestValidationError::LeaseProjectMismatch {
+                        expected: self.id,
+                        found: lease.project_id,
+                    });
+                }
+                if lease.stage != active_stage {
+                    return Err(ProjectManifestValidationError::LeaseActiveStageMismatch {
+                        lease_stage: lease.stage,
+                        active_stage,
+                    });
+                }
+                if lease.attempt == 0 {
+                    return Err(ProjectManifestValidationError::LeaseAttemptZero {
+                        stage: lease.stage,
+                    });
+                }
+                let record = self.try_stage(lease.stage)?;
+                if lease.attempt != record.attempt {
+                    return Err(ProjectManifestValidationError::LeaseAttemptMismatch {
+                        stage: lease.stage,
+                        expected: record.attempt,
+                        found: lease.attempt,
+                    });
+                }
             }
         }
 
