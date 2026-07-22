@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
@@ -49,19 +51,64 @@ pub struct ArtifactRef {
     pub byte_len: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ArtifactValidationError {
+    #[error("a successful stage must commit at least one artifact")]
+    Empty,
+    #[error("artifact path must be a non-empty relative path without traversal: {0:?}")]
+    InvalidRelativePath(String),
+    #[error("artifact {relative_path:?} must have a canonical 64-character lowercase hex hash")]
+    InvalidContentHash {
+        relative_path: String,
+        content_hash: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageRecord {
-    pub state: StageState,
-    pub attempt: u32,
-    pub completed: Option<u64>,
-    pub total: Option<u64>,
-    pub started_unix_ms: Option<u64>,
-    pub updated_unix_ms: u64,
-    pub artifacts: Vec<ArtifactRef>,
-    pub error: Option<ProjectErrorRecord>,
+    pub(crate) state: StageState,
+    pub(crate) attempt: u32,
+    pub(crate) completed: Option<u64>,
+    pub(crate) total: Option<u64>,
+    pub(crate) started_unix_ms: Option<u64>,
+    pub(crate) updated_unix_ms: u64,
+    pub(crate) artifacts: Vec<ArtifactRef>,
+    pub(crate) error: Option<ProjectErrorRecord>,
 }
 
 impl StageRecord {
+    pub fn state(&self) -> StageState {
+        self.state
+    }
+
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub fn completed(&self) -> Option<u64> {
+        self.completed
+    }
+
+    pub fn total(&self) -> Option<u64> {
+        self.total
+    }
+
+    pub fn started_unix_ms(&self) -> Option<u64> {
+        self.started_unix_ms
+    }
+
+    pub fn updated_unix_ms(&self) -> u64 {
+        self.updated_unix_ms
+    }
+
+    pub fn artifacts(&self) -> &[ArtifactRef] {
+        &self.artifacts
+    }
+
+    pub fn error(&self) -> Option<&ProjectErrorRecord> {
+        self.error.as_ref()
+    }
+
     pub(crate) fn new(state: StageState, now_unix_ms: u64) -> Self {
         Self {
             state,
@@ -115,7 +162,7 @@ impl Default for CompatibilityRecord {
     fn default() -> Self {
         Self {
             rustsfm_artifact_version: 1,
-            rustgs_checkpoint_version: 1,
+            rustgs_checkpoint_version: rustgs::TRAINING_CHECKPOINT_VERSION,
         }
     }
 }
@@ -233,11 +280,58 @@ pub struct ProjectManifest {
     pub sfm_config: SfmConfigSnapshot,
     pub pnp_config: PnpConfigSnapshot,
     pub training_config: rustgs::TrainingConfig,
-    pub stages: BTreeMap<ProjectStage, StageRecord>,
+    pub(crate) stages: BTreeMap<ProjectStage, StageRecord>,
     pub active_scene: Option<ArtifactRef>,
     pub final_scene: Option<ArtifactRef>,
     pub compatibility: CompatibilityRecord,
     pub lease: Option<ProjectLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProjectManifestValidationError {
+    #[error("unsupported project schema version {found}; expected {expected}")]
+    UnsupportedSchemaVersion { expected: u32, found: u32 },
+    #[error("project display name must not be empty")]
+    EmptyDisplayName,
+    #[error("project source identity must not be empty")]
+    EmptySourceIdentity,
+    #[error("project manifest is missing the {stage:?} stage")]
+    MissingStage { stage: ProjectStage },
+    #[error("{stage:?} progress is invalid: completed {completed} exceeds total {total}")]
+    InvalidProgress {
+        stage: ProjectStage,
+        completed: u64,
+        total: u64,
+    },
+    #[error("succeeded stage {stage:?} must declare at least one artifact")]
+    SucceededStageWithoutArtifacts { stage: ProjectStage },
+    #[error("invalid artifact at {location}: {source}")]
+    InvalidArtifact {
+        location: String,
+        #[source]
+        source: ArtifactValidationError,
+    },
+    #[error("invalid import config field {field}")]
+    InvalidImportConfig { field: &'static str },
+    #[error("invalid PnP config field {field}")]
+    InvalidPnpConfig { field: &'static str },
+    #[error("invalid training config: {detail}")]
+    InvalidTrainingConfig { detail: String },
+    #[error("lease project id {found} does not match manifest project id {expected}")]
+    LeaseProjectMismatch { expected: Uuid, found: Uuid },
+    #[error("lease for {stage:?} must have a nonzero attempt")]
+    LeaseAttemptZero { stage: ProjectStage },
+    #[error("lease attempt {found} for {stage:?} does not match stage attempt {expected}")]
+    LeaseAttemptMismatch {
+        stage: ProjectStage,
+        expected: u32,
+        found: u32,
+    },
+    #[error("lease stage {stage:?} is not active; found {state:?}")]
+    LeaseStageNotActive {
+        stage: ProjectStage,
+        state: StageState,
+    },
 }
 
 impl ProjectManifest {
@@ -276,6 +370,200 @@ impl ProjectManifest {
             lease: None,
         }
     }
+
+    pub fn try_stage(
+        &self,
+        stage: ProjectStage,
+    ) -> Result<&StageRecord, ProjectManifestValidationError> {
+        self.stages
+            .get(&stage)
+            .ok_or(ProjectManifestValidationError::MissingStage { stage })
+    }
+
+    pub(crate) fn stage(&self, stage: ProjectStage) -> &StageRecord {
+        self.try_stage(stage)
+            .expect("ProjectManifest must be validated before state-machine use")
+    }
+
+    pub(crate) fn stage_mut(&mut self, stage: ProjectStage) -> &mut StageRecord {
+        self.stages
+            .get_mut(&stage)
+            .expect("ProjectManifest must be validated before state-machine use")
+    }
+
+    /// Validates untrusted persisted data before it is used by the state machine.
+    pub fn validate(&self) -> Result<(), ProjectManifestValidationError> {
+        if self.schema_version != PROJECT_SCHEMA_VERSION {
+            return Err(ProjectManifestValidationError::UnsupportedSchemaVersion {
+                expected: PROJECT_SCHEMA_VERSION,
+                found: self.schema_version,
+            });
+        }
+        if self.display_name.trim().is_empty() {
+            return Err(ProjectManifestValidationError::EmptyDisplayName);
+        }
+        if self.source.identity.trim().is_empty() {
+            return Err(ProjectManifestValidationError::EmptySourceIdentity);
+        }
+        self.validate_configs()?;
+
+        for stage in ProjectStage::ORDER {
+            let record = self.try_stage(stage)?;
+            if let (Some(completed), Some(total)) = (record.completed, record.total) {
+                if completed > total {
+                    return Err(ProjectManifestValidationError::InvalidProgress {
+                        stage,
+                        completed,
+                        total,
+                    });
+                }
+            }
+            if record.state == StageState::Succeeded && record.artifacts.is_empty() {
+                return Err(
+                    ProjectManifestValidationError::SucceededStageWithoutArtifacts { stage },
+                );
+            }
+            for (index, artifact) in record.artifacts.iter().enumerate() {
+                validate_artifact_ref(artifact).map_err(|source| {
+                    ProjectManifestValidationError::InvalidArtifact {
+                        location: format!("stage {stage:?} artifact {index}"),
+                        source,
+                    }
+                })?;
+            }
+        }
+
+        for (location, artifact) in [
+            ("active_scene", self.active_scene.as_ref()),
+            ("final_scene", self.final_scene.as_ref()),
+        ] {
+            if let Some(artifact) = artifact {
+                validate_artifact_ref(artifact).map_err(|source| {
+                    ProjectManifestValidationError::InvalidArtifact {
+                        location: location.to_owned(),
+                        source,
+                    }
+                })?;
+            }
+        }
+
+        if let Some(lease) = &self.lease {
+            if lease.project_id != self.id {
+                return Err(ProjectManifestValidationError::LeaseProjectMismatch {
+                    expected: self.id,
+                    found: lease.project_id,
+                });
+            }
+            if lease.attempt == 0 {
+                return Err(ProjectManifestValidationError::LeaseAttemptZero {
+                    stage: lease.stage,
+                });
+            }
+            let record = self.try_stage(lease.stage)?;
+            if lease.attempt != record.attempt {
+                return Err(ProjectManifestValidationError::LeaseAttemptMismatch {
+                    stage: lease.stage,
+                    expected: record.attempt,
+                    found: lease.attempt,
+                });
+            }
+            if !matches!(
+                record.state,
+                StageState::Running | StageState::PauseRequested | StageState::CancelRequested
+            ) {
+                return Err(ProjectManifestValidationError::LeaseStageNotActive {
+                    stage: lease.stage,
+                    state: record.state,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_configs(&self) -> Result<(), ProjectManifestValidationError> {
+        if !self.import_config.video_keyframes_per_second.is_finite()
+            || self.import_config.video_keyframes_per_second <= 0.0
+        {
+            return Err(ProjectManifestValidationError::InvalidImportConfig {
+                field: "video_keyframes_per_second",
+            });
+        }
+        if self.import_config.maximum_keyframe_gap_us <= 0 {
+            return Err(ProjectManifestValidationError::InvalidImportConfig {
+                field: "maximum_keyframe_gap_us",
+            });
+        }
+        if self.import_config.thumbnail_long_edge == 0 {
+            return Err(ProjectManifestValidationError::InvalidImportConfig {
+                field: "thumbnail_long_edge",
+            });
+        }
+
+        if self.pnp_config.narrow_neighbors_each_side == 0 {
+            return Err(ProjectManifestValidationError::InvalidPnpConfig {
+                field: "narrow_neighbors_each_side",
+            });
+        }
+        if self.pnp_config.wide_neighbors_each_side < self.pnp_config.narrow_neighbors_each_side {
+            return Err(ProjectManifestValidationError::InvalidPnpConfig {
+                field: "wide_neighbors_each_side",
+            });
+        }
+        if self.pnp_config.min_inliers == 0 {
+            return Err(ProjectManifestValidationError::InvalidPnpConfig {
+                field: "min_inliers",
+            });
+        }
+        if !self.pnp_config.min_inlier_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.pnp_config.min_inlier_ratio)
+            || self.pnp_config.min_inlier_ratio == 0.0
+        {
+            return Err(ProjectManifestValidationError::InvalidPnpConfig {
+                field: "min_inlier_ratio",
+            });
+        }
+        if !self.pnp_config.max_reprojection_error.is_finite()
+            || self.pnp_config.max_reprojection_error <= 0.0
+        {
+            return Err(ProjectManifestValidationError::InvalidPnpConfig {
+                field: "max_reprojection_error",
+            });
+        }
+        self.training_config.validate().map_err(|error| {
+            ProjectManifestValidationError::InvalidTrainingConfig {
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_artifact_ref(artifact: &ArtifactRef) -> Result<(), ArtifactValidationError> {
+    let path = Path::new(&artifact.relative_path);
+    if artifact.relative_path.trim().is_empty()
+        || artifact.relative_path.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            artifact.relative_path.clone(),
+        ));
+    }
+    let valid_hash = artifact.content_hash.len() == 64
+        && artifact
+            .content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid_hash {
+        return Err(ArtifactValidationError::InvalidContentHash {
+            relative_path: artifact.relative_path.clone(),
+            content_hash: artifact.content_hash.clone(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn unix_time_ms() -> u64 {
