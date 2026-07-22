@@ -107,7 +107,9 @@ fn new_manifest_uses_the_declared_schema_and_config_defaults() {
     let manifest = ProjectManifest::new("Flowers", source.clone());
 
     manifest.validate().unwrap();
-    assert_eq!(manifest.schema_version, PROJECT_SCHEMA_VERSION);
+    assert_eq!(manifest.schema_version(), PROJECT_SCHEMA_VERSION);
+    assert_ne!(manifest.id(), uuid::Uuid::nil());
+    assert_eq!(manifest.lease(), None);
     assert_eq!(source.kind, SourceKind::ImageSequence);
     assert_eq!(source.ownership, SourceOwnership::ManagedCopy);
     assert_eq!(source.identity, "source-a");
@@ -171,8 +173,9 @@ fn partial_stage_map_deserializes_but_fails_structural_validation_without_panick
 fn validation_rejects_schema_identity_progress_and_config_errors() {
     let manifest = ProjectManifest::new("Flowers", SourceSpec::managed_images("source-a"));
 
-    let mut wrong_schema = manifest.clone();
-    wrong_schema.schema_version += 1;
+    let mut wrong_schema = serde_json::to_value(&manifest).unwrap();
+    wrong_schema["schema_version"] = serde_json::json!(PROJECT_SCHEMA_VERSION + 1);
+    let wrong_schema: ProjectManifest = serde_json::from_value(wrong_schema).unwrap();
     assert!(matches!(
         wrong_schema.validate(),
         Err(ProjectManifestValidationError::UnsupportedSchemaVersion { .. })
@@ -319,7 +322,7 @@ fn validation_requires_exactly_one_matching_lease_for_one_active_stage() {
     lease_without_active["stages"]["import"]["state"] = serde_json::json!("queued");
     lease_without_active["stages"]["import"]["attempt"] = serde_json::json!(1);
     lease_without_active["lease"] = serde_json::to_value(ProjectLease {
-        project_id: manifest.id,
+        project_id: manifest.id(),
         stage: ProjectStage::Import,
         attempt: 1,
         process_id: 42,
@@ -339,7 +342,7 @@ fn validation_requires_exactly_one_matching_lease_for_one_active_stage() {
     valid["stages"]["import"]["state"] = serde_json::json!("running");
     valid["stages"]["import"]["attempt"] = serde_json::json!(1);
     valid["lease"] = serde_json::to_value(ProjectLease {
-        project_id: manifest.id,
+        project_id: manifest.id(),
         stage: ProjectStage::Import,
         attempt: 1,
         process_id: 42,
@@ -349,15 +352,17 @@ fn validation_requires_exactly_one_matching_lease_for_one_active_stage() {
     let valid: ProjectManifest = serde_json::from_value(valid).unwrap();
     valid.validate().unwrap();
 
-    let mut wrong_project = valid.clone();
-    wrong_project.lease.as_mut().unwrap().project_id = uuid::Uuid::new_v4();
+    let mut wrong_project = serde_json::to_value(&valid).unwrap();
+    wrong_project["lease"]["project_id"] = serde_json::to_value(uuid::Uuid::new_v4()).unwrap();
+    let wrong_project: ProjectManifest = serde_json::from_value(wrong_project).unwrap();
     assert!(matches!(
         wrong_project.validate(),
         Err(ProjectManifestValidationError::LeaseProjectMismatch { .. })
     ));
 
-    let mut wrong_attempt = valid.clone();
-    wrong_attempt.lease.as_mut().unwrap().attempt += 1;
+    let mut wrong_attempt = serde_json::to_value(&valid).unwrap();
+    wrong_attempt["lease"]["attempt"] = serde_json::json!(2);
+    let wrong_attempt: ProjectManifest = serde_json::from_value(wrong_attempt).unwrap();
     assert!(matches!(
         wrong_attempt.validate(),
         Err(ProjectManifestValidationError::LeaseAttemptMismatch { .. })
@@ -395,7 +400,7 @@ fn project_store_create_builds_the_exact_package_tree_and_validates_destination(
     fs::create_dir(&project).unwrap();
     let store = ProjectStore::create(&project, create_request("Flowers")).unwrap();
     assert_eq!(store.root(), fs::canonicalize(&project).unwrap());
-    assert_eq!(store.manifest().schema_version, PROJECT_SCHEMA_VERSION);
+    assert_eq!(store.manifest().schema_version(), PROJECT_SCHEMA_VERSION);
     for relative in [
         "Sources",
         "Sources/managed",
@@ -564,11 +569,11 @@ fn project_store_typed_updates_persist_identity_and_apply_invalidation_boundarie
 
     let path = create_succeeded_project(temp.path(), "Source");
     let mut store = ProjectStore::open(&path).unwrap();
-    let id = store.manifest().id;
+    let id = store.manifest().id();
     store
         .update_source(SourceSpec::managed_images("source-b"))
         .unwrap();
-    assert_eq!(store.manifest().id, id);
+    assert_eq!(store.manifest().id(), id);
     assert_stale_from(&store, ProjectStage::Import);
     drop(store);
     let reopened = ProjectStore::open(&path).unwrap();
@@ -613,7 +618,7 @@ fn project_store_typed_update_validates_before_atomic_manifest_replacement() {
     let path = temp.path().join("Flowers.rustscanproject");
     let mut store = ProjectStore::create(&path, create_request("Flowers")).unwrap();
     let before = fs::read(path.join("project.json")).unwrap();
-    let id = store.manifest().id;
+    let id = store.manifest().id();
     let mut invalid = store.manifest().import_config.clone();
     invalid.video_keyframes_per_second = f64::NAN;
 
@@ -621,11 +626,40 @@ fn project_store_typed_update_validates_before_atomic_manifest_replacement() {
         store.update_import_config(invalid),
         Err(ProjectStoreError::InvalidManifest(_))
     ));
-    assert_eq!(store.manifest().id, id);
+    assert_eq!(store.manifest().id(), id);
     assert_eq!(fs::read(path.join("project.json")).unwrap(), before);
     assert!(fs::read_dir(&path).unwrap().all(|entry| {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
         !name.ends_with(".tmp")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_store_typed_update_preserves_state_on_pre_rename_io_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Flowers.rustscanproject");
+    let mut store = ProjectStore::create(&path, create_request("Flowers")).unwrap();
+    let before_bytes = fs::read(path.join("project.json")).unwrap();
+    let before_config = store.manifest().import_config.clone();
+    let mut updated = before_config.clone();
+    updated.video_keyframes_per_second = 4.0;
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+    let result = store.update_import_config(updated);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(result, Err(ProjectStoreError::Io(_))));
+    assert_eq!(store.manifest().import_config, before_config);
+    assert_eq!(fs::read(path.join("project.json")).unwrap(), before_bytes);
+    assert!(fs::read_dir(&path).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
     }));
 }
 

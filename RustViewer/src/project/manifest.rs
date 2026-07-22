@@ -270,8 +270,8 @@ impl Default for PnpConfigSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectManifest {
-    pub schema_version: u32,
-    pub id: Uuid,
+    pub(crate) schema_version: u32,
+    pub(crate) id: Uuid,
     pub display_name: String,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
@@ -284,7 +284,7 @@ pub struct ProjectManifest {
     pub active_scene: Option<ArtifactRef>,
     pub final_scene: Option<ArtifactRef>,
     pub compatibility: CompatibilityRecord,
-    pub lease: Option<ProjectLease>,
+    pub(crate) lease: Option<ProjectLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -380,6 +380,18 @@ impl ProjectManifest {
             compatibility: CompatibilityRecord::default(),
             lease: None,
         }
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn lease(&self) -> Option<&ProjectLease> {
+        self.lease.as_ref()
     }
 
     pub fn try_stage(

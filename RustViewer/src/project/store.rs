@@ -98,10 +98,20 @@ pub enum ProjectStoreError {
     Io(#[from] io::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectStoreWarning {
+    ParentDirectorySyncFailed {
+        path: PathBuf,
+        error_kind: io::ErrorKind,
+        detail: String,
+    },
+}
+
 #[derive(Debug)]
 pub struct ProjectStore {
     root: PathBuf,
     manifest: ProjectManifest,
+    warnings: Vec<ProjectStoreWarning>,
     _lock_file: File,
 }
 
@@ -109,6 +119,14 @@ impl ProjectStore {
     pub fn create(
         path: impl AsRef<Path>,
         request: ProjectCreateRequest,
+    ) -> Result<Self, ProjectStoreError> {
+        Self::create_with_parent_sync(path, request, sync_parent_directory)
+    }
+
+    fn create_with_parent_sync(
+        path: impl AsRef<Path>,
+        request: ProjectCreateRequest,
+        sync_parent: impl FnOnce(&Path) -> io::Result<()>,
     ) -> Result<Self, ProjectStoreError> {
         let path = path.as_ref();
         require_package_suffix(path)?;
@@ -134,12 +152,13 @@ impl ProjectStore {
         for relative in PACKAGE_DIRECTORIES {
             cleanup.create_directory(&root.join(relative))?;
         }
-        write_manifest_bootstrap(&root, &manifest)?;
+        let warning = write_manifest_bootstrap_with_parent_sync(&root, &manifest, sync_parent)?;
         cleanup.disarm();
 
         Ok(Self {
             root,
             manifest,
+            warnings: warning.into_iter().collect(),
             _lock_file: lock_file,
         })
     }
@@ -172,6 +191,7 @@ impl ProjectStore {
         let store = Self {
             root,
             manifest,
+            warnings: Vec::new(),
             _lock_file: lock_file,
         };
         store.validate_committed_artifacts()?;
@@ -184,6 +204,14 @@ impl ProjectStore {
 
     pub fn manifest(&self) -> &ProjectManifest {
         &self.manifest
+    }
+
+    pub fn warnings(&self) -> &[ProjectStoreWarning] {
+        &self.warnings
+    }
+
+    pub fn take_warnings(&mut self) -> Vec<ProjectStoreWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     pub fn update_source(&mut self, source: SourceSpec) -> Result<(), ProjectStoreError> {
@@ -252,25 +280,38 @@ impl ProjectStore {
         &mut self,
         update: impl FnOnce(&mut ProjectManifest),
     ) -> Result<(), ProjectStoreError> {
+        self.update_manifest_with_parent_sync(update, sync_parent_directory)
+    }
+
+    fn update_manifest_with_parent_sync(
+        &mut self,
+        update: impl FnOnce(&mut ProjectManifest),
+        sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<(), ProjectStoreError> {
         let mut manifest = self.manifest.clone();
         update(&mut manifest);
-        self.write_manifest_atomic(&manifest)?;
+        let warning = self.write_manifest_atomic_with_parent_sync(&manifest, sync_parent)?;
         self.manifest = manifest;
+        self.warnings.extend(warning);
         Ok(())
     }
 
-    fn write_manifest_atomic(&self, manifest: &ProjectManifest) -> Result<(), ProjectStoreError> {
+    fn write_manifest_atomic_with_parent_sync(
+        &self,
+        manifest: &ProjectManifest,
+        sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<Option<ProjectStoreWarning>, ProjectStoreError> {
         manifest.validate()?;
-        if manifest.id != self.manifest.id {
+        if manifest.id() != self.manifest.id() {
             return Err(ProjectStoreError::ProjectIdentityMismatch {
-                expected: self.manifest.id,
-                found: manifest.id,
+                expected: self.manifest.id(),
+                found: manifest.id(),
             });
         }
         let bytes = serde_json::to_vec_pretty(manifest)
             .map_err(ProjectStoreError::ManifestSerialization)?;
-        write_bytes_atomic(&self.root.join(MANIFEST_NAME), &bytes)?;
-        Ok(())
+        write_bytes_atomic_with_parent_sync(&self.root.join(MANIFEST_NAME), &bytes, sync_parent)
+            .map_err(ProjectStoreError::Io)
     }
 
     fn validate_committed_artifacts(&self) -> Result<(), ProjectStoreError> {
@@ -490,18 +531,23 @@ fn migrate_one_version(
     })
 }
 
-fn write_manifest_bootstrap(
+fn write_manifest_bootstrap_with_parent_sync(
     root: &Path,
     manifest: &ProjectManifest,
-) -> Result<(), ProjectStoreError> {
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<Option<ProjectStoreWarning>, ProjectStoreError> {
     manifest.validate()?;
     let bytes =
         serde_json::to_vec_pretty(manifest).map_err(ProjectStoreError::ManifestSerialization)?;
-    write_bytes_atomic(&root.join(MANIFEST_NAME), &bytes)?;
-    Ok(())
+    write_bytes_atomic_with_parent_sync(&root.join(MANIFEST_NAME), &bytes, sync_parent)
+        .map_err(ProjectStoreError::Io)
 }
 
-fn write_bytes_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_bytes_atomic_with_parent_sync(
+    destination: &Path,
+    bytes: &[u8],
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Option<ProjectStoreWarning>> {
     let parent = destination.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -513,7 +559,7 @@ fn write_bytes_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         .unwrap_or_else(|| OsStr::new("artifact"))
         .to_string_lossy();
     let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
-    let result = (|| {
+    let before_rename = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -521,13 +567,24 @@ fn write_bytes_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, destination)?;
-        File::open(parent)?.sync_all()?;
         Ok(())
     })();
-    if result.is_err() {
+    if before_rename.is_err() {
         let _ = fs::remove_file(&temporary);
+        return before_rename.map(|()| None);
     }
-    result
+    // Rename switches the manifest authority. A later durability failure must not invite a retry.
+    Ok(sync_parent(parent)
+        .err()
+        .map(|error| ProjectStoreWarning::ParentDirectorySyncFailed {
+            path: parent.to_path_buf(),
+            error_kind: error.kind(),
+            detail: error.to_string(),
+        }))
+}
+
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
 }
 
 fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
@@ -565,7 +622,7 @@ mod tests {
         changed.id = Uuid::new_v4();
 
         assert!(matches!(
-            store.write_manifest_atomic(&changed),
+            store.write_manifest_atomic_with_parent_sync(&changed, sync_parent_directory),
             Err(ProjectStoreError::ProjectIdentityMismatch { .. })
         ));
         assert_eq!(fs::read(path.join(MANIFEST_NAME)).unwrap(), before);
@@ -582,5 +639,70 @@ mod tests {
         drop(cleanup);
 
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn post_rename_sync_failure_commits_manifest_and_records_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Flowers.rustscanproject");
+        let mut store = ProjectStore::create(
+            &path,
+            ProjectCreateRequest::new("Flowers", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let mut expected = store.manifest().import_config.clone();
+        expected.video_keyframes_per_second = 4.0;
+
+        store
+            .update_manifest_with_parent_sync(
+                |manifest| {
+                    manifest.import_config = expected.clone();
+                    manifest.invalidate(ChangeKind::ImportConfig);
+                },
+                |_| Err(io::Error::other("injected parent sync failure")),
+            )
+            .unwrap();
+
+        assert_eq!(store.manifest().import_config, expected);
+        let persisted: ProjectManifest =
+            serde_json::from_slice(&fs::read(path.join(MANIFEST_NAME)).unwrap()).unwrap();
+        assert_eq!(persisted.import_config, expected);
+        assert_eq!(
+            store.warnings(),
+            &[ProjectStoreWarning::ParentDirectorySyncFailed {
+                path: store.root().to_path_buf(),
+                error_kind: io::ErrorKind::Other,
+                detail: "injected parent sync failure".to_owned(),
+            }]
+        );
+        assert_eq!(store.take_warnings().len(), 1);
+        assert!(store.warnings().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_post_rename_sync_failure_returns_a_committed_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Bootstrap.rustscanproject");
+        fs::create_dir(&root).unwrap();
+
+        let store = ProjectStore::create_with_parent_sync(
+            &root,
+            ProjectCreateRequest::new("Bootstrap", SourceSpec::managed_images("source-a")),
+            |_| Err(io::Error::other("injected bootstrap sync failure")),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.warnings(),
+            [ProjectStoreWarning::ParentDirectorySyncFailed { .. }]
+        ));
+        assert!(matches!(
+            ProjectStore::open(&root),
+            Err(ProjectStoreError::AlreadyOpen { .. })
+        ));
+        let persisted: ProjectManifest =
+            serde_json::from_slice(&fs::read(root.join(MANIFEST_NAME)).unwrap()).unwrap();
+        assert_eq!(persisted.id(), store.manifest().id());
+        assert!(root.join("Sources").is_dir());
     }
 }

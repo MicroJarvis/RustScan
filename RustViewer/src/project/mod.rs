@@ -9,4 +9,4 @@ pub use manifest::{
     SourceSpec, StageRecord, StageState, SuggestedAction, PROJECT_SCHEMA_VERSION,
 };
 pub use state::{ChangeKind, ProjectStateError};
-pub use store::{ProjectCreateRequest, ProjectStore, ProjectStoreError};
+pub use store::{ProjectCreateRequest, ProjectStore, ProjectStoreError, ProjectStoreWarning};
