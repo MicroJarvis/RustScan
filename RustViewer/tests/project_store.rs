@@ -762,10 +762,13 @@ fn project_store_typed_update_preserves_state_on_pre_rename_io_failure() {
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
     let probe = path.join("permission-probe");
-    if fs::write(&probe, b"probe").is_ok() {
-        fs::remove_file(probe).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        return;
+    match fs::write(&probe, b"probe") {
+        Ok(()) => {
+            fs::remove_file(probe).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
     }
     let result = store.update_import_config(updated);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();

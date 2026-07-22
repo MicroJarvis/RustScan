@@ -122,6 +122,7 @@ pub struct ProjectStore {
     root: PathBuf,
     manifest: ProjectManifest,
     warnings: Vec<ProjectStoreWarning>,
+    root_directory: File,
     _lock_file: File,
 }
 
@@ -156,16 +157,33 @@ impl ProjectStore {
             true
         };
 
-        let mut cleanup = InitializationCleanup::new(path.to_path_buf(), created_root);
-        let root = fs::canonicalize(path)?;
-        let lock_file = create_and_lock(&root, Some(&mut cleanup))?;
+        let root = match fs::canonicalize(path) {
+            Ok(root) => root,
+            Err(error) => {
+                if created_root {
+                    let _ = fs::remove_dir(path);
+                }
+                return Err(error.into());
+            }
+        };
+        let mut cleanup = InitializationCleanup::new(root.clone(), created_root);
+        let root_directory = open_package_directory(&root)?;
+        let lock_file = match create_and_lock(&root, &root_directory, Some(&mut cleanup)) {
+            Ok(lock_file) => lock_file,
+            Err(error) => {
+                // Without ownership of the persistent lock, cleanup could race its holder.
+                cleanup.disarm();
+                return Err(error);
+            }
+        };
+        let mut initialization = InitializationGuard::new(cleanup, lock_file, root_directory);
         if !is_bootstrap_destination(&root)? {
             return Err(ProjectStoreError::DestinationNotEmpty { path: root });
         }
         let mut created_directory_parents = BTreeSet::new();
         for relative in PACKAGE_DIRECTORIES {
             let directory = root.join(relative);
-            if cleanup.create_directory(&directory)? {
+            if initialization.create_directory(&directory)? {
                 created_directory_parents.insert(
                     directory
                         .parent()
@@ -194,17 +212,25 @@ impl ProjectStore {
                 warnings.push(warning);
             }
         }
-        cleanup.disarm();
+        let (lock_file, root_directory) = initialization.finish();
 
         Ok(Self {
             root,
             manifest,
             warnings,
+            root_directory,
             _lock_file: lock_file,
         })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ProjectStoreError> {
+        Self::open_with_validation_hook(path, || {})
+    }
+
+    fn open_with_validation_hook(
+        path: impl AsRef<Path>,
+        before_artifact_validation: impl FnOnce(),
+    ) -> Result<Self, ProjectStoreError> {
         let path = path.as_ref();
         require_package_suffix(path)?;
         if fs::symlink_metadata(path)?.file_type().is_symlink() {
@@ -213,9 +239,10 @@ impl ProjectStore {
             });
         }
         let root = fs::canonicalize(path)?;
-        let lock_file = create_and_lock(&root, None)?;
+        let root_directory = open_package_directory(&root)?;
+        let lock_file = create_and_lock(&root, &root_directory, None)?;
         let manifest_path = root.join(MANIFEST_NAME);
-        let bytes = fs::read(&manifest_path)?;
+        let bytes = read_manifest_from_directory(&root_directory, &root)?;
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|source| ProjectStoreError::MalformedJson {
                 path: manifest_path.clone(),
@@ -233,8 +260,10 @@ impl ProjectStore {
             root,
             manifest,
             warnings: Vec::new(),
+            root_directory,
             _lock_file: lock_file,
         };
+        before_artifact_validation();
         store.validate_committed_artifacts()?;
         Ok(store)
     }
@@ -415,7 +444,7 @@ impl ProjectStore {
                 });
             };
         }
-        let file = open_artifact_file(&self.root, relative)?;
+        let file = open_artifact_file(&self.root_directory, &self.root, relative)?;
         let (found_len, found_hash) = hash_reader(file)?;
         if found_len != artifact.byte_len {
             return Err(ProjectStoreError::ArtifactLengthMismatch {
@@ -438,9 +467,33 @@ impl ProjectStore {
 
 fn create_and_lock(
     root: &Path,
+    root_directory: &File,
     cleanup: Option<&mut InitializationCleanup>,
 ) -> Result<File, ProjectStoreError> {
     let lock_path = root.join(LOCK_NAME);
+    #[cfg(unix)]
+    let (file, created) = match rustix_fs::openat(
+        root_directory,
+        LOCK_NAME,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(file) => (File::from(file), true),
+        Err(error) if error == Errno::EXIST => (
+            File::from(
+                rustix_fs::openat(
+                    root_directory,
+                    LOCK_NAME,
+                    OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(io::Error::from)?,
+            ),
+            false,
+        ),
+        Err(error) => return Err(io::Error::from(error).into()),
+    };
+    #[cfg(not(unix))]
     let (file, created) = match OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -454,13 +507,15 @@ fn create_and_lock(
         ),
         Err(error) => return Err(error.into()),
     };
-    if created {
-        if let Some(cleanup) = cleanup {
-            cleanup.created.push(lock_path.clone());
-        }
-    }
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(file),
+        Ok(()) => {
+            if created {
+                if let Some(cleanup) = cleanup {
+                    cleanup.record_created_file(PathBuf::from(LOCK_NAME));
+                }
+            }
+            Ok(file)
+        }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             Err(ProjectStoreError::AlreadyOpen { path: lock_path })
         }
@@ -468,10 +523,16 @@ fn create_and_lock(
     }
 }
 
+#[derive(Debug)]
+enum CreatedEntry {
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
 struct InitializationCleanup {
     root: PathBuf,
     remove_root: bool,
-    created: Vec<PathBuf>,
+    created: Vec<CreatedEntry>,
     armed: bool,
 }
 
@@ -488,10 +549,60 @@ impl InitializationCleanup {
     fn create_directory(&mut self, path: &Path) -> io::Result<bool> {
         if !path.exists() {
             fs::create_dir(path)?;
-            self.created.push(path.to_path_buf());
+            let relative = path.strip_prefix(&self.root).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "package scaffold directory escapes project root",
+                )
+            })?;
+            self.created
+                .push(CreatedEntry::Directory(relative.to_path_buf()));
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn record_created_file(&mut self, relative: PathBuf) {
+        self.created.push(CreatedEntry::File(relative));
+    }
+
+    fn cleanup_with_directory(&mut self, root_directory: &File, before_cleanup: impl FnOnce()) {
+        if !self.armed {
+            return;
+        }
+        before_cleanup();
+
+        for entry in self.created.iter().rev() {
+            #[cfg(unix)]
+            {
+                let (relative, flags) = match entry {
+                    CreatedEntry::File(relative) => (relative, rustix_fs::AtFlags::empty()),
+                    CreatedEntry::Directory(relative) => (relative, rustix_fs::AtFlags::REMOVEDIR),
+                };
+                let _ = rustix_fs::unlinkat(root_directory, relative, flags);
+            }
+            #[cfg(not(unix))]
+            {
+                let path = match entry {
+                    CreatedEntry::File(relative) | CreatedEntry::Directory(relative) => {
+                        self.root.join(relative)
+                    }
+                };
+                match entry {
+                    CreatedEntry::File(_) => {
+                        let _ = fs::remove_file(path);
+                    }
+                    CreatedEntry::Directory(_) => {
+                        let _ = fs::remove_dir(path);
+                    }
+                }
+            }
+        }
+
+        if self.remove_root && root_path_refers_to_directory(&self.root, root_directory) {
+            let _ = fs::remove_dir(&self.root);
+        }
+        self.disarm();
     }
 
     fn disarm(&mut self) {
@@ -504,20 +615,81 @@ impl Drop for InitializationCleanup {
         if !self.armed {
             return;
         }
+        if self.created.iter().any(|entry| {
+            matches!(entry, CreatedEntry::File(relative) if relative == Path::new(LOCK_NAME))
+        }) {
+            // A recorded persistent lock may only be removed by InitializationGuard while held.
+            return;
+        }
         if self.remove_root {
             let _ = fs::remove_dir_all(&self.root);
             return;
         }
-        for path in self.created.iter().rev() {
-            match fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.is_dir() => {
-                    let _ = fs::remove_dir(path);
+        for entry in self.created.iter().rev() {
+            let path = match entry {
+                CreatedEntry::File(relative) | CreatedEntry::Directory(relative) => {
+                    self.root.join(relative)
                 }
-                Ok(_) => {
+            };
+            match entry {
+                CreatedEntry::File(_) => {
                     let _ = fs::remove_file(path);
                 }
-                Err(_) => {}
+                CreatedEntry::Directory(_) => {
+                    let _ = fs::remove_dir(path);
+                }
             }
+        }
+    }
+}
+
+struct InitializationGuard {
+    cleanup: InitializationCleanup,
+    lock_file: Option<File>,
+    root_directory: Option<File>,
+}
+
+impl InitializationGuard {
+    fn new(cleanup: InitializationCleanup, lock_file: File, root_directory: File) -> Self {
+        Self {
+            cleanup,
+            lock_file: Some(lock_file),
+            root_directory: Some(root_directory),
+        }
+    }
+
+    fn create_directory(&mut self, path: &Path) -> io::Result<bool> {
+        self.cleanup.create_directory(path)
+    }
+
+    fn finish(mut self) -> (File, File) {
+        self.cleanup.disarm();
+        let lock_file = self
+            .lock_file
+            .take()
+            .expect("initialization guard owns the project lock");
+        let root_directory = self
+            .root_directory
+            .take()
+            .expect("initialization guard owns the project directory");
+        (lock_file, root_directory)
+    }
+
+    #[cfg(test)]
+    fn cleanup_with_hook(mut self, before_cleanup: impl FnOnce()) {
+        let root_directory = self
+            .root_directory
+            .as_ref()
+            .expect("initialization guard owns the project directory");
+        self.cleanup
+            .cleanup_with_directory(root_directory, before_cleanup);
+    }
+}
+
+impl Drop for InitializationGuard {
+    fn drop(&mut self) {
+        if let Some(root_directory) = self.root_directory.as_ref() {
+            self.cleanup.cleanup_with_directory(root_directory, || {});
         }
     }
 }
@@ -658,20 +830,80 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn open_artifact_file(root: &Path, relative: &Path) -> Result<File, ProjectStoreError> {
+fn open_package_directory(root: &Path) -> io::Result<File> {
+    rustix_fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn open_package_directory(root: &Path) -> io::Result<File> {
+    File::open(root)
+}
+
+#[cfg(unix)]
+fn read_manifest_from_directory(root_directory: &File, _root: &Path) -> io::Result<Vec<u8>> {
+    let opened = rustix_fs::openat(
+        root_directory,
+        MANIFEST_NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let metadata = rustix_fs::fstat(&opened).map_err(io::Error::from)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "project manifest is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::from(opened).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_manifest_from_directory(_root_directory: &File, root: &Path) -> io::Result<Vec<u8>> {
+    fs::read(root.join(MANIFEST_NAME))
+}
+
+#[cfg(unix)]
+fn root_path_refers_to_directory(root: &Path, root_directory: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(path_metadata) = fs::symlink_metadata(root) else {
+        return false;
+    };
+    let Ok(descriptor_metadata) = rustix_fs::fstat(root_directory) else {
+        return false;
+    };
+    path_metadata.is_dir()
+        && path_metadata.dev() == descriptor_metadata.st_dev as u64
+        && path_metadata.ino() == descriptor_metadata.st_ino
+}
+
+#[cfg(not(unix))]
+fn root_path_refers_to_directory(root: &Path, _root_directory: &File) -> bool {
+    fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir())
+}
+
+#[cfg(unix)]
+fn open_artifact_file(
+    root_directory: &File,
+    _root: &Path,
+    relative: &Path,
+) -> Result<File, ProjectStoreError> {
     let mut components = relative.components().map(|component| match component {
         Component::Normal(part) => Ok(part),
         _ => Err(ProjectStoreError::ArtifactPathEscapesPackage {
             path: relative.to_path_buf(),
         }),
     });
-    let root = rustix_fs::open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(io::Error::from)?;
-    let mut directory = File::from(root);
+    let mut directory = root_directory.try_clone()?;
     let Some(mut component) = components.next().transpose()? else {
         return Err(ProjectStoreError::ArtifactPathEscapesPackage {
             path: relative.to_path_buf(),
@@ -736,7 +968,11 @@ fn artifact_open_error(
 }
 
 #[cfg(not(unix))]
-fn open_artifact_file(root: &Path, relative: &Path) -> Result<File, ProjectStoreError> {
+fn open_artifact_file(
+    _root_directory: &File,
+    root: &Path,
+    relative: &Path,
+) -> Result<File, ProjectStoreError> {
     let mut current = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(part) = component else {
@@ -796,6 +1032,9 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
 
     #[test]
     fn typed_manifest_writer_rejects_project_identity_changes() {
@@ -976,5 +1215,102 @@ mod tests {
         assert!(result.is_err());
         assert!(!destination.exists());
         assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn initialization_cleanup_unlinks_the_lock_while_its_exclusive_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Failed.rustscanproject");
+        fs::create_dir(&root).unwrap();
+        let mut cleanup = InitializationCleanup::new(root.clone(), false);
+        let root_directory = open_package_directory(&root).unwrap();
+        let lock_file = create_and_lock(&root, &root_directory, Some(&mut cleanup)).unwrap();
+        let guard = InitializationGuard::new(cleanup, lock_file, root_directory);
+
+        let (attempt_tx, attempt_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let lock_path = root.join(LOCK_NAME);
+        let contender_path = lock_path.clone();
+        let contender = std::thread::spawn(move || {
+            attempt_rx.recv().unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(contender_path)
+                .unwrap();
+            let acquired = file.try_lock_exclusive().is_ok();
+            result_tx.send(acquired).unwrap();
+            if acquired {
+                release_rx.recv().unwrap();
+            }
+        });
+        let old_inode_was_acquired = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&old_inode_was_acquired);
+
+        guard.cleanup_with_hook(move || {
+            attempt_tx.send(()).unwrap();
+            observed.store(
+                result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Ordering::SeqCst,
+            );
+        });
+
+        assert!(!lock_path.exists());
+        let replacement = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        replacement.try_lock_exclusive().unwrap();
+        let _ = release_tx.send(());
+        contender.join().unwrap();
+        assert!(
+            !old_inode_was_acquired.load(Ordering::SeqCst),
+            "a contender acquired the old lock inode before cleanup unlinked it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_validates_artifacts_from_the_locked_package_directory_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Original.rustscanproject");
+        let moved = temp.path().join("Moved.rustscanproject");
+        let store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Original", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let relative = "Artifacts/import/attempt-00000001/result.bin";
+        let original = b"original";
+        fs::create_dir_all(root.join(relative).parent().unwrap()).unwrap();
+        fs::write(root.join(relative), original).unwrap();
+        let mut manifest = store.manifest().clone();
+        manifest.stage_mut(ProjectStage::Import).artifacts = vec![ArtifactRef {
+            relative_path: relative.to_owned(),
+            content_hash: blake3::hash(original).to_hex().to_string(),
+            byte_len: original.len() as u64,
+        }];
+        store
+            .write_manifest_atomic_with_parent_sync(&manifest, sync_parent_directory)
+            .unwrap();
+        drop(store);
+
+        let opened = ProjectStore::open_with_validation_hook(&root, || {
+            fs::rename(&root, &moved).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::create_dir_all(root.join(relative).parent().unwrap()).unwrap();
+            fs::write(root.join(relative), b"replaced").unwrap();
+        });
+
+        let store = opened.expect("validation must stay bound to the original package inode");
+        assert_eq!(store.manifest().id(), manifest.id());
+        assert_eq!(
+            fs::read(moved.join(relative)).unwrap(),
+            original,
+            "the original package artifact changed"
+        );
     }
 }
