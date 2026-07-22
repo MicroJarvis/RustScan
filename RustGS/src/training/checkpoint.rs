@@ -160,6 +160,25 @@ impl TrainingIdentity {
             config: hash_training_config(config)?,
         })
     }
+
+    pub(crate) fn validate_dataset_and_config(
+        &self,
+        dataset: &TrainingDataset,
+        config: &TrainingConfig,
+    ) -> Result<(), TrainingError> {
+        if self.dataset != hash_training_dataset(dataset)? {
+            return Err(TrainingError::InvalidInput(
+                "training identity dataset does not match the current training dataset".to_string(),
+            ));
+        }
+        if self.config != hash_training_config(config)? {
+            return Err(TrainingError::InvalidInput(
+                "training identity configuration does not match the current training configuration"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]

@@ -77,6 +77,10 @@ pub(crate) trait TrainingLoopObserver {
         false
     }
 
+    fn should_pause(&self) -> bool {
+        false
+    }
+
     fn should_emit_progress(&self, _iteration: usize) -> bool {
         false
     }
@@ -104,17 +108,20 @@ pub(crate) trait TrainingLoopObserver {
 
 fn complete_checkpoint_boundary(
     observer: &mut dyn TrainingLoopObserver,
-    ready: TrainingCheckpointReady,
+    mut ready: TrainingCheckpointReady,
 ) -> Result<Option<TrainingRunDisposition>, TrainingError> {
     if observer.should_cancel() {
         return Ok(Some(TrainingRunDisposition::Cancelled));
     }
 
+    if ready.reason == TrainingCheckpointReason::Periodic && observer.should_pause() {
+        ready.reason = TrainingCheckpointReason::Pause;
+    }
     let reason = ready.reason;
     observer.on_checkpoint(ready)?;
     if observer.should_cancel() {
         Ok(Some(TrainingRunDisposition::Cancelled))
-    } else if reason == TrainingCheckpointReason::Pause {
+    } else if reason == TrainingCheckpointReason::Pause || observer.should_pause() {
         Ok(Some(TrainingRunDisposition::Paused))
     } else {
         Ok(None)
@@ -1330,6 +1337,21 @@ mod tests {
         }
     }
 
+    struct PausedCheckpointObserver {
+        committed_reason: Option<TrainingCheckpointReason>,
+    }
+
+    impl TrainingLoopObserver for PausedCheckpointObserver {
+        fn should_pause(&self) -> bool {
+            true
+        }
+
+        fn on_checkpoint(&mut self, ready: TrainingCheckpointReady) -> Result<(), TrainingError> {
+            self.committed_reason = Some(ready.reason);
+            Ok(())
+        }
+    }
+
     fn assert_topology_tensor(tensor: &TensorCheckpoint, values: [f32; 3]) {
         assert_eq!(tensor.shape, [3]);
         assert_eq!(tensor.values, values);
@@ -1384,6 +1406,31 @@ mod tests {
 
         assert_eq!(disposition, Some(TrainingRunDisposition::Cancelled));
         assert_eq!(observer.checkpoint_calls, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn periodic_checkpoint_upgrades_to_pause_after_build_before_commit() {
+        let device = GsDevice::default();
+        let (_, checkpoint) = populated_trainer_checkpoint(&device).await;
+        let mut observer = PausedCheckpointObserver {
+            committed_reason: None,
+        };
+
+        let disposition = complete_checkpoint_boundary(
+            &mut observer,
+            TrainingCheckpointReady {
+                iteration: CHECKPOINT_ITERATIONS,
+                reason: TrainingCheckpointReason::Periodic,
+                checkpoint,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            observer.committed_reason,
+            Some(TrainingCheckpointReason::Pause)
+        );
+        assert_eq!(disposition, Some(TrainingRunDisposition::Paused));
     }
 
     #[tokio::test(flavor = "current_thread")]

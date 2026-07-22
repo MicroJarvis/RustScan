@@ -1281,6 +1281,122 @@ fn periodic_checkpoint_policy_commits_once_at_cadence_before_completed_event() {
 }
 
 #[test]
+fn periodic_checkpoint_sink_pause_reuses_commit_and_finishes_current_iteration() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "periodic-sink-pause-frame", 1);
+    let config = tiny_training_config(3);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"periodic-sink-pause", &config)
+            .unwrap();
+    let control = TrainingControl::default();
+    let sink_control = control.clone();
+    let sequence = Rc::new(RefCell::new(Vec::new()));
+    let sink_sequence = Rc::clone(&sequence);
+    let event_sequence = Rc::clone(&sequence);
+
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(1) })
+            .with_checkpoint_sink(move |ready| {
+                sink_sequence
+                    .borrow_mut()
+                    .push(format!("sink:{}:{:?}", ready.iteration, ready.reason));
+                sink_control.request_pause();
+                Ok(())
+            })
+            .with_event_sink(move |event| match event {
+                TrainingEvent::CheckpointReady(ready) => event_sequence
+                    .borrow_mut()
+                    .push(format!("checkpoint:{}:{:?}", ready.iteration, ready.reason)),
+                TrainingEvent::RunPaused(paused) => event_sequence
+                    .borrow_mut()
+                    .push(format!("paused:{}", paused.completed_iterations)),
+                TrainingEvent::RunCompleted(completed) => event_sequence
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(run.report.completed_iterations, 1);
+    assert!(!run.report.cancelled);
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Paused);
+    assert_eq!(
+        sequence.borrow().as_slice(),
+        [
+            "sink:1:Periodic",
+            "checkpoint:1:Periodic",
+            "paused:1",
+            "completed:Paused"
+        ]
+    );
+}
+
+#[test]
+fn periodic_checkpoint_event_pause_reuses_commit_and_finishes_current_iteration() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "periodic-event-pause-frame", 1);
+    let config = tiny_training_config(3);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"periodic-event-pause", &config)
+            .unwrap();
+    let control = TrainingControl::default();
+    let event_control = control.clone();
+    let sequence = Rc::new(RefCell::new(Vec::new()));
+    let sink_sequence = Rc::clone(&sequence);
+    let event_sequence = Rc::clone(&sequence);
+
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(1) })
+            .with_checkpoint_sink(move |ready| {
+                sink_sequence
+                    .borrow_mut()
+                    .push(format!("sink:{}:{:?}", ready.iteration, ready.reason));
+                Ok(())
+            })
+            .with_event_sink(move |event| match event {
+                TrainingEvent::CheckpointReady(ready) => {
+                    event_sequence
+                        .borrow_mut()
+                        .push(format!("checkpoint:{}:{:?}", ready.iteration, ready.reason));
+                    event_control.request_pause();
+                }
+                TrainingEvent::RunPaused(paused) => event_sequence
+                    .borrow_mut()
+                    .push(format!("paused:{}", paused.completed_iterations)),
+                TrainingEvent::RunCompleted(completed) => event_sequence
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(run.report.completed_iterations, 1);
+    assert!(!run.report.cancelled);
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Paused);
+    assert_eq!(
+        sequence.borrow().as_slice(),
+        [
+            "sink:1:Periodic",
+            "checkpoint:1:Periodic",
+            "paused:1",
+            "completed:Paused"
+        ]
+    );
+}
+
+#[test]
 fn cancel_requested_after_pause_wins_at_complete_iteration_boundary() {
     let temp = tempfile::tempdir().unwrap();
     let dataset = tiny_training_dataset(&temp, "cancel-frame", 1);
@@ -1372,6 +1488,9 @@ fn resume_at_completed_target_runs_zero_iterations_and_reports_completed() {
 
     assert_eq!(run.report.completed_iterations, 7);
     assert_eq!(run.report.final_loss, Some(0.125));
+    let telemetry = run.report.telemetry.as_ref().unwrap();
+    assert_eq!(telemetry.final_loss, Some(0.125));
+    assert_eq!(telemetry.final_step_loss, Some(0.125));
     assert_eq!(run.report.gaussian_count, 1);
     assert_eq!(run.splats.len(), 1);
     assert!(!run.report.cancelled);
