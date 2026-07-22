@@ -101,7 +101,7 @@ pub use crate::training::{TrainingBackend, TrainingConfig, TrainingResult};
 pub use crate::viewport::{BurnViewportDepth, BurnViewportRenderer, BurnViewportResolution};
 
 // Re-export IO types
-pub use crate::io::colmap_dataset::{load_colmap_dataset, ColmapConfig};
+pub use crate::io::colmap_dataset::{load_colmap_dataset, resolve_colmap_sparse_dir, ColmapConfig};
 #[cfg(feature = "gpu")]
 pub use crate::io::scene_io::{
     load_splats, load_splats_ply, load_splats_splat, save_splats, save_splats_ply,

@@ -4,7 +4,9 @@
 //!   rustgs train --input <colmap_dir> --output <scene.ply>
 //!   rustgs render --input <scene.splat|scene.ply> --camera <pose.json> --output <image.png>
 
-use anyhow::{bail, Context};
+use anyhow::bail;
+#[cfg(feature = "gpu")]
+use anyhow::Context;
 use clap::{CommandFactory, FromArgMatches};
 #[cfg(feature = "gpu")]
 use serde::{Deserialize, Serialize};
@@ -633,6 +635,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu")]
     fn training_options_preserve_defaults_without_checkpoint_flags() {
         let cli = Cli::try_parse_from(["rustgs", "train", "--input", "does-not-exist"]).unwrap();
         let Commands::Train(args) = cli.command else {
@@ -652,11 +655,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu")]
     fn training_options_attach_identity_default_cadence_and_sink() {
         let temp = tempfile::tempdir().unwrap();
         let input = temp.path().join("sparse");
         std::fs::create_dir(&input).unwrap();
         std::fs::write(input.join("cameras.txt"), "reconstruction").unwrap();
+        std::fs::write(input.join("images.txt"), "image poses").unwrap();
         let checkpoint_dir = temp.path().join("checkpoints");
         let cli = Cli::try_parse_from([
             "rustgs",
@@ -684,11 +689,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu")]
     fn training_options_load_resume_checkpoint_before_training() {
         let temp = tempfile::tempdir().unwrap();
         let input = temp.path().join("sparse");
         std::fs::create_dir(&input).unwrap();
         std::fs::write(input.join("cameras.txt"), "reconstruction").unwrap();
+        std::fs::write(input.join("images.txt"), "image poses").unwrap();
         let resume = temp.path().join("resume.rgscp");
         std::fs::write(&resume, "not a checkpoint").unwrap();
         let cli = Cli::try_parse_from([
@@ -712,6 +719,92 @@ mod tests {
                 .expect("corrupt resume checkpoint must fail");
 
         assert!(error.to_string().contains("checkpoint"));
+    }
+
+    #[cfg(feature = "gpu")]
+    fn create_sparse_zero_dataset_root(root: &std::path::Path) -> PathBuf {
+        let sparse = root.join("sparse/0");
+        std::fs::create_dir_all(&sparse).unwrap();
+        std::fs::write(sparse.join("cameras.txt"), "camera model").unwrap();
+        std::fs::write(sparse.join("images.txt"), "image poses").unwrap();
+        sparse
+    }
+
+    #[cfg(feature = "gpu")]
+    fn checkpoint_identity_for_input(
+        input: &std::path::Path,
+        checkpoint_dir: &std::path::Path,
+    ) -> rustgs::TrainingIdentity {
+        let cli = Cli::try_parse_from([
+            "rustgs",
+            "train",
+            "--input",
+            input.to_str().unwrap(),
+            "--checkpoint-dir",
+            checkpoint_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Commands::Train(args) = cli.command else {
+            panic!("expected train command");
+        };
+        let dataset =
+            rustgs::TrainingDataset::new(rustgs::Intrinsics::new(1.0, 1.0, 0.5, 0.5, 1, 1));
+
+        train_command::training_options(&args, &dataset, &rustgs::TrainingConfig::default())
+            .unwrap()
+            .identity
+            .unwrap()
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn training_identity_ignores_unrelated_dataset_root_files() {
+        let temp = tempfile::tempdir().unwrap();
+        create_sparse_zero_dataset_root(temp.path());
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let original = checkpoint_identity_for_input(temp.path(), &checkpoint_dir);
+
+        let unrelated = temp.path().join("rustgs-train.json");
+        std::fs::write(&unrelated, "first unrelated config").unwrap();
+        let added = checkpoint_identity_for_input(temp.path(), &checkpoint_dir);
+        std::fs::write(&unrelated, "changed unrelated config").unwrap();
+        let changed = checkpoint_identity_for_input(temp.path(), &checkpoint_dir);
+
+        assert_eq!(added, original);
+        assert_eq!(changed, original);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn training_identity_ignores_checkpoint_files_inside_dataset_root() {
+        let temp = tempfile::tempdir().unwrap();
+        create_sparse_zero_dataset_root(temp.path());
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let original = checkpoint_identity_for_input(temp.path(), &checkpoint_dir);
+
+        std::fs::create_dir(&checkpoint_dir).unwrap();
+        std::fs::write(
+            checkpoint_dir.join("iteration-001000.rgscp"),
+            "checkpoint bytes",
+        )
+        .unwrap();
+        let with_checkpoint = checkpoint_identity_for_input(temp.path(), &checkpoint_dir);
+
+        assert_eq!(with_checkpoint, original);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn training_identity_changes_when_sparse_model_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let sparse = create_sparse_zero_dataset_root(temp.path());
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let original = checkpoint_identity_for_input(temp.path(), &checkpoint_dir);
+
+        std::fs::write(sparse.join("cameras.txt"), "changed camera model").unwrap();
+        let changed = checkpoint_identity_for_input(temp.path(), &checkpoint_dir);
+
+        assert_ne!(changed, original);
     }
 }
 

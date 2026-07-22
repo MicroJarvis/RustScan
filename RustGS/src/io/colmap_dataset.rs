@@ -239,7 +239,11 @@ pub fn load_colmap_dataset(
     Ok(dataset)
 }
 
-pub(crate) fn resolve_colmap_sparse_dir(input: &Path) -> Result<PathBuf, TrainingError> {
+/// Resolve the COLMAP sparse model directory used when loading `input`.
+///
+/// Accepts a sparse model directory directly, a dataset root containing
+/// `sparse`, or the common dataset layout containing `sparse/0`.
+pub fn resolve_colmap_sparse_dir(input: &Path) -> Result<PathBuf, TrainingError> {
     // Check if input is directly a sparse directory
     if is_colmap_sparse_dir(input) {
         return Ok(input.to_path_buf());
