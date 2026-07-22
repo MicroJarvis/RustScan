@@ -462,6 +462,15 @@ fn project_store_create_cleans_initialization_failures() {
         let existing = temp.path().join("ReadOnly.rustscanproject");
         fs::create_dir(&existing).unwrap();
         fs::set_permissions(&existing, fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = existing.join("permission-probe");
+        match fs::write(&probe, b"probe") {
+            Ok(()) => {
+                fs::remove_file(probe).unwrap();
+                fs::set_permissions(&existing, fs::Permissions::from_mode(0o700)).unwrap();
+                return;
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        }
         assert!(matches!(
             ProjectStore::create(&existing, create_request("Read Only")),
             Err(ProjectStoreError::Io(_))
