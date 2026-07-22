@@ -42,7 +42,7 @@
 - Modify: `RustViewer/src/lib.rs`
 - Test: `RustViewer/tests/project_store.rs`
 
-- [ ] **Step 1: Write failing round-trip and transition tests**
+- [x] **Step 1: Write failing round-trip and transition tests**
 
 Create tests that build a new manifest, serialize it, and require these legal and illegal transitions:
 
@@ -75,7 +75,7 @@ fn running_cannot_jump_directly_to_paused() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run:
 
@@ -86,7 +86,7 @@ cargo test -p rust-viewer --test project_store succeeded_sfm_
 
 Expected: FAIL because project types do not exist.
 
-- [ ] **Step 3: Implement the schema**
+- [x] **Step 3: Implement the schema**
 
 Use explicit serde names and no wall-clock-only state:
 
@@ -218,7 +218,7 @@ pub struct PnpConfigSnapshot {
 
 Defaults are 3 keyframes/second, a 1,000,000 microsecond maximum gap, 256-pixel thumbnails, all images for image-sequence SFM, enabled wgpu SIFT/matching/PnP, 2/4 temporal neighbors, 24 PnP inliers, 0.20 inlier ratio, and 4.0 pixel reprojection error. Define `ProjectErrorRecord` with code, stage, summary, detail, optional frame/pair, retryability, and suggested actions. `SourceSpec::managed_images(identity)` is a test helper constructor with `ImageSequence`, `ManagedCopy`, empty paths, and no bookmark.
 
-- [ ] **Step 4: Implement transitions and invalidation**
+- [x] **Step 4: Implement transitions and invalidation**
 
 Encode legal transitions as a total match. `Succeeded -> Stale`, `Paused/Cancelled/Failed -> Queued`, and `Stale -> Ready` are legal; `Running -> Paused` is illegal unless it passes through `PauseRequested`; `Running -> Succeeded` is permitted only through `commit_stage_success`, which requires validated artifacts.
 
@@ -241,7 +241,7 @@ for stage in ProjectStage::ORDER.into_iter().skip_while(|stage| *stage != first)
 }
 ```
 
-- [ ] **Step 5: Run schema/state tests**
+- [x] **Step 5: Run schema/state tests**
 
 Run:
 
@@ -251,7 +251,7 @@ cargo test -p rust-viewer --test project_store
 
 Expected: PASS for round trip, every legal transition, rejected jumps, dependency readiness, and the five invalidation categories.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```bash
 git add RustViewer/src/project RustViewer/src/lib.rs RustViewer/tests/project_store.rs
@@ -259,6 +259,15 @@ git commit -m "feat(viewer): add persistent project state model"
 ```
 
 ### Task 2: Project Store, Atomic Artifacts, and Recovery Lease
+
+> **Revised 2026-07-22 after crash-consistency review:** Execute this task through
+> `docs/superpowers/plans/2026-07-22-rustviewer-project-store-hardening.md`. That plan splits
+> the work into Tasks 2A-2C and replaces per-file destination swaps with an immutable committed
+> attempt directory plus one authoritative manifest pointer switch. The older per-file swap design
+> below is retained only as historical context and must not be implemented. All artifact paths in
+> later tasks describe package-relative payload paths inside a stage workspace; after commit, callers
+> must consume the immutable `ArtifactRef` paths returned by `ProjectStore` rather than assuming a
+> mutable fixed destination.
 
 **Files:**
 - Modify: `RustViewer/Cargo.toml`
