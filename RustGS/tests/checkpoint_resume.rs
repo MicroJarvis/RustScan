@@ -1609,3 +1609,136 @@ fn pause_after_iteration_seven_commits_checkpoint_before_terminal_events() {
         ]
     );
 }
+
+#[test]
+fn resumed_training_matches_uninterrupted_training_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "resumed-continuity-frame", 3);
+    let config = tiny_training_config(12);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"resumed-continuity", &config).unwrap();
+
+    let uninterrupted = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new().with_identity(identity.clone()),
+    )
+    .unwrap();
+    assert_eq!(uninterrupted.report.completed_iterations, 12);
+    assert_eq!(
+        uninterrupted.report.disposition,
+        TrainingRunDisposition::Completed
+    );
+    assert!(!uninterrupted.report.cancelled);
+
+    let control = TrainingControl::new(TrainingEventCadence {
+        progress_every: 1,
+        snapshot_every: None,
+    });
+    let event_control = control.clone();
+    let captured_checkpoint = Rc::new(RefCell::new(None));
+    let sink_checkpoint = Rc::clone(&captured_checkpoint);
+    let paused = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity.clone())
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(7) })
+            .with_checkpoint_sink(move |ready| {
+                *sink_checkpoint.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            })
+            .with_event_sink(move |event| {
+                if matches!(
+                    event,
+                    TrainingEvent::IterationProgress(progress) if progress.iteration == 7
+                ) {
+                    event_control.request_pause();
+                }
+            }),
+    )
+    .unwrap();
+    assert_eq!(paused.report.completed_iterations, 7);
+    assert_eq!(paused.report.disposition, TrainingRunDisposition::Paused);
+    assert!(!paused.report.cancelled);
+    let checkpoint = captured_checkpoint
+        .borrow()
+        .clone()
+        .expect("pause checkpoint");
+    assert_eq!(checkpoint.completed_iterations, 7);
+    assert_eq!(
+        checkpoint.frame_shuffle_seed,
+        config.data.frame_shuffle_seed
+    );
+
+    let resumed = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity)
+            .with_resume_checkpoint(checkpoint.clone()),
+    )
+    .unwrap();
+    assert_eq!(resumed.report.completed_iterations, 12);
+    assert_eq!(
+        resumed.report.disposition,
+        TrainingRunDisposition::Completed
+    );
+    assert!(!resumed.report.cancelled);
+    assert_eq!(
+        resumed.report.gaussian_count,
+        uninterrupted.report.gaussian_count
+    );
+    assert_eq!(resumed.report.sh_degree, uninterrupted.report.sh_degree);
+
+    let expected = uninterrupted.splats.as_view();
+    let actual = resumed.splats.as_view();
+    for (name, expected, actual) in [
+        ("positions", expected.positions, actual.positions),
+        ("log_scales", expected.log_scales, actual.log_scales),
+        ("rotations", expected.rotations, actual.rotations),
+        (
+            "opacity_logits",
+            expected.opacity_logits,
+            actual.opacity_logits,
+        ),
+        ("sh_coeffs", expected.sh_coeffs, actual.sh_coeffs),
+    ] {
+        assert_eq!(actual.len(), expected.len(), "{name} length");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                actual.is_finite(),
+                "{name}[{index}] is not finite: {actual}"
+            );
+            assert!(
+                expected.is_finite(),
+                "{name}[{index}] is not finite: {expected}"
+            );
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "{name}[{index}] differs: resumed={actual}, uninterrupted={expected}"
+            );
+        }
+    }
+
+    let telemetry = resumed.report.telemetry.as_ref().unwrap();
+    let first_sample = telemetry
+        .loss_curve_samples
+        .first()
+        .expect("resume telemetry sample");
+    assert_eq!(first_sample.iteration, 8);
+    assert_eq!(first_sample.frame_idx, 7 % dataset.poses.len());
+    assert!(first_sample.total.is_some_and(f32::is_finite));
+    assert!(resumed.report.final_loss.is_some_and(f32::is_finite));
+    assert!(resumed.report.final_step_loss.is_some_and(f32::is_finite));
+    assert!(
+        (resumed.report.final_loss.unwrap() - uninterrupted.report.final_loss.unwrap()).abs()
+            <= 1e-5
+    );
+    assert!(
+        (resumed.report.final_step_loss.unwrap() - uninterrupted.report.final_step_loss.unwrap())
+            .abs()
+            <= 1e-5
+    );
+}

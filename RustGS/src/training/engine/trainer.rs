@@ -789,7 +789,8 @@ impl WgpuTrainer {
             let iteration_idx = zero_based + 1;
             let emit_progress = observer.should_emit_progress(iteration_idx);
             let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
-            let should_log_step = iteration_idx.is_multiple_of(100);
+            let should_log_step =
+                iteration_idx.is_multiple_of(100) || zero_based == start_iteration;
             let loss = self
                 .train_step(
                     splats,
