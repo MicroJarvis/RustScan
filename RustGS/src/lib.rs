@@ -87,10 +87,12 @@ pub use crate::training::{
 #[cfg(feature = "gpu")]
 pub use crate::training::{
     evaluate_splats, evaluation_device, last_training_telemetry, render_evaluation_frame,
-    runtime_from_splats, LiteGsOptimizerLrs, LiteGsTrainingTelemetry, TrainingControl,
+    runtime_from_splats, LiteGsOptimizerLrs, LiteGsTrainingTelemetry, TrainingCheckpointPolicy,
+    TrainingCheckpointReady, TrainingCheckpointReason, TrainingCheckpointSink, TrainingControl,
     TrainingEvent, TrainingEventCadence, TrainingEventRoute, TrainingIterationProgress,
     TrainingOptions, TrainingPlanSelected, TrainingRun, TrainingRunCancelled, TrainingRunCompleted,
-    TrainingRunReport, TrainingRunStarted, TrainingSnapshotReady,
+    TrainingRunDisposition, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
+    TrainingSnapshotReady,
 };
 #[cfg(feature = "gpu")]
 pub use crate::training::{SharedWgpuContext, SplatEvaluationRenderer};

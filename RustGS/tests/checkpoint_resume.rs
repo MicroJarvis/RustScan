@@ -1,17 +1,20 @@
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::panic::catch_unwind;
+use std::rc::Rc;
 use std::sync::{Arc, Barrier};
 
 use bincode::Options;
 use rustgs::{
-    load_training_checkpoint, save_training_checkpoint, AdamCheckpoint, AdamParameterCheckpoint,
-    HostSplats, Intrinsics, ScenePose, TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint,
-    TrainingConfig, TrainingDataset, TrainingError, TrainingIdentity,
-    MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
-    MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
-    MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3, TRAINING_CHECKPOINT_FORMAT_VERSION,
-    TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
+    load_training_checkpoint, save_training_checkpoint, train_splats, AdamCheckpoint,
+    AdamParameterCheckpoint, HostSplats, Intrinsics, ScenePose, TensorCheckpoint,
+    TopologyCheckpoint, TrainingCheckpoint, TrainingCheckpointPolicy, TrainingConfig,
+    TrainingControl, TrainingDataset, TrainingError, TrainingEvent, TrainingEventCadence,
+    TrainingIdentity, TrainingOptions, TrainingRunDisposition, MAX_TRAINING_CHECKPOINT_BYTES,
+    MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
+    MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3,
+    TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
 };
 use serde::Serialize;
 
@@ -854,4 +857,438 @@ fn legacy_json_checkpoint_has_an_explicit_migration_api() {
     assert_eq!(module_alias.into_splats(), splats);
 
     assert_invalid_input_contains(load_training_checkpoint(&path).unwrap_err(), "magic");
+}
+
+fn tiny_training_dataset(
+    temp: &tempfile::TempDir,
+    stem: &str,
+    frame_count: usize,
+) -> TrainingDataset {
+    let image_path = temp.path().join(format!("{stem}.rgb"));
+    let mut pixels = Vec::with_capacity(16 * 16 * 3);
+    for y in 0..16_u8 {
+        for x in 0..16_u8 {
+            pixels.extend_from_slice(&[
+                x.saturating_mul(12),
+                y.saturating_mul(12),
+                x.saturating_add(y).saturating_mul(6),
+            ]);
+        }
+    }
+    fs::write(&image_path, pixels).unwrap();
+
+    let mut dataset = TrainingDataset::new(Intrinsics::new(12.0, 12.0, 8.0, 8.0, 16, 16));
+    for frame_idx in 0..frame_count {
+        dataset.add_pose(ScenePose::new(
+            frame_idx as u64,
+            image_path.clone(),
+            SE3::identity(),
+            frame_idx as f64,
+        ));
+    }
+    dataset.add_point([0.0, 0.0, 2.0], Some([0.25, 0.5, 0.75]));
+    dataset.add_point([0.25, -0.2, 2.5], Some([0.75, 0.25, 0.5]));
+    dataset
+}
+
+fn tiny_training_config(iterations: usize) -> TrainingConfig {
+    TrainingConfig {
+        iterations,
+        raster: rustgs::TrainingRasterConfig {
+            render_scale: 1.0,
+            ..Default::default()
+        },
+        initialization: rustgs::TrainingInitializationConfig {
+            max_initial_gaussians: 2,
+            ..Default::default()
+        },
+        data: rustgs::TrainingDataConfig {
+            frame_cache_capacity: 2,
+            frame_prefetch_ahead: 1,
+            frame_shuffle_seed: 0,
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn pause_checkpoint_sink_failure_fails_run_without_paused_or_completed_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sink-failure-frame", 1);
+    let config = tiny_training_config(3);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"sink-failure", &config).unwrap();
+    let control = TrainingControl::new(TrainingEventCadence::default());
+    control.request_pause();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let captured_events = Rc::clone(&events);
+
+    let error = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity)
+            .with_checkpoint_sink(|_ready| {
+                Err(TrainingError::TrainingFailed(
+                    "checkpoint commit failed".to_string(),
+                ))
+            })
+            .with_event_sink(move |event| captured_events.borrow_mut().push(event)),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        TrainingError::TrainingFailed(ref message) if message == "checkpoint commit failed"
+    ));
+    assert!(matches!(
+        events.borrow().last(),
+        Some(TrainingEvent::RunFailed(_))
+    ));
+    assert!(!events.borrow().iter().any(|event| matches!(
+        event,
+        TrainingEvent::CheckpointReady(_)
+            | TrainingEvent::RunPaused(_)
+            | TrainingEvent::RunCompleted(_)
+    )));
+}
+
+#[test]
+fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "resume-frame", 3);
+    let pause_config = tiny_training_config(20);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"resume-reconstruction", &pause_config)
+            .unwrap();
+    let control = TrainingControl::new(TrainingEventCadence {
+        progress_every: 1,
+        snapshot_every: None,
+    });
+    let captured_checkpoint = Rc::new(RefCell::new(None));
+    let sink_checkpoint = Rc::clone(&captured_checkpoint);
+    let event_control = control.clone();
+
+    let paused = train_splats(
+        &dataset,
+        &pause_config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity.clone())
+            .with_checkpoint_sink(move |ready| {
+                *sink_checkpoint.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            })
+            .with_event_sink(move |event| {
+                if matches!(
+                    event,
+                    TrainingEvent::IterationProgress(progress) if progress.iteration == 7
+                ) {
+                    event_control.request_pause();
+                }
+            }),
+    )
+    .unwrap();
+    assert_eq!(paused.report.disposition, TrainingRunDisposition::Paused);
+    let checkpoint = captured_checkpoint
+        .borrow()
+        .clone()
+        .expect("pause checkpoint");
+
+    let resume_config = tiny_training_config(8);
+    let resume_identity = TrainingIdentity::from_canonical_content(
+        &dataset,
+        b"resume-reconstruction",
+        &resume_config,
+    )
+    .unwrap();
+    let resumed_iterations = Rc::new(RefCell::new(Vec::new()));
+    let captured_iterations = Rc::clone(&resumed_iterations);
+    let resumed = train_splats(
+        &dataset,
+        &resume_config,
+        TrainingOptions::new()
+            .with_identity(resume_identity)
+            .with_resume_checkpoint(checkpoint)
+            .with_event_sink(move |event| {
+                if let TrainingEvent::IterationProgress(progress) = event {
+                    captured_iterations.borrow_mut().push(progress.iteration);
+                }
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(resumed_iterations.borrow().as_slice(), [8]);
+    assert_eq!(resumed.report.completed_iterations, 8);
+    assert!(!resumed.report.cancelled);
+    assert_eq!(
+        resumed.report.disposition,
+        TrainingRunDisposition::Completed
+    );
+    let last_sample = resumed
+        .report
+        .telemetry
+        .as_ref()
+        .unwrap()
+        .loss_curve_samples
+        .last()
+        .expect("target iteration is retained in telemetry");
+    assert_eq!(last_sample.iteration, 8);
+    assert_eq!(last_sample.frame_idx, 1);
+}
+
+#[test]
+fn periodic_checkpoint_policy_commits_once_at_cadence_before_completed_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "periodic-frame", 1);
+    let config = tiny_training_config(3);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"periodic-reconstruction", &config)
+            .unwrap();
+    let sequence = Rc::new(RefCell::new(Vec::new()));
+    let sink_sequence = Rc::clone(&sequence);
+    let event_sequence = Rc::clone(&sequence);
+
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(2) })
+            .with_checkpoint_sink(move |ready| {
+                sink_sequence
+                    .borrow_mut()
+                    .push(format!("sink:{}:{:?}", ready.iteration, ready.reason));
+                Ok(())
+            })
+            .with_event_sink(move |event| match event {
+                TrainingEvent::CheckpointReady(ready) => event_sequence
+                    .borrow_mut()
+                    .push(format!("event:{}:{:?}", ready.iteration, ready.reason)),
+                TrainingEvent::RunCompleted(completed) => event_sequence
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Completed);
+    assert_eq!(run.report.completed_iterations, 3);
+    assert_eq!(
+        sequence.borrow().as_slice(),
+        ["sink:2:Periodic", "event:2:Periodic", "completed:Completed"]
+    );
+}
+
+#[test]
+fn cancel_requested_after_pause_wins_at_complete_iteration_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "cancel-frame", 1);
+    let config = tiny_training_config(3);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"cancel-reconstruction", &config)
+            .unwrap();
+    let control = TrainingControl::new(TrainingEventCadence {
+        progress_every: 1,
+        snapshot_every: None,
+    });
+    let event_control = control.clone();
+    let terminal = Rc::new(RefCell::new(Vec::new()));
+    let captured_terminal = Rc::clone(&terminal);
+
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity)
+            .with_event_sink(move |event| match event {
+                TrainingEvent::IterationProgress(progress) if progress.iteration == 1 => {
+                    event_control.request_pause();
+                    event_control.request_cancel();
+                }
+                TrainingEvent::CheckpointReady(_) => captured_terminal
+                    .borrow_mut()
+                    .push("checkpoint".to_string()),
+                TrainingEvent::RunPaused(_) => {
+                    captured_terminal.borrow_mut().push("paused".to_string())
+                }
+                TrainingEvent::RunCancelled(cancelled) => captured_terminal
+                    .borrow_mut()
+                    .push(format!("cancelled:{}", cancelled.completed_iterations)),
+                TrainingEvent::RunCompleted(completed) => captured_terminal
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(run.report.completed_iterations, 1);
+    assert!(run.report.cancelled);
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Cancelled);
+    assert_eq!(
+        terminal.borrow().as_slice(),
+        ["cancelled:1", "completed:Cancelled"]
+    );
+}
+
+#[test]
+fn resume_at_completed_target_runs_zero_iterations_and_reports_completed() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "zero-resume-frame", 1);
+    let config = tiny_training_config(7);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"zero-resume", &config).unwrap();
+    let mut checkpoint = checkpoint_fixture(7);
+    checkpoint.identity = identity.clone();
+    checkpoint.frame_shuffle_seed = config.data.frame_shuffle_seed;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let captured_events = Rc::clone(&events);
+
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity)
+            .with_resume_checkpoint(checkpoint)
+            .with_event_sink(move |event| match event {
+                TrainingEvent::IterationProgress(progress) => captured_events
+                    .borrow_mut()
+                    .push(format!("progress:{}", progress.iteration)),
+                TrainingEvent::RunCompleted(completed) => captured_events
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                TrainingEvent::RunPaused(_) => {
+                    captured_events.borrow_mut().push("paused".to_string())
+                }
+                TrainingEvent::RunCancelled(_) => {
+                    captured_events.borrow_mut().push("cancelled".to_string())
+                }
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(run.report.completed_iterations, 7);
+    assert_eq!(run.report.final_loss, Some(0.125));
+    assert_eq!(run.report.gaussian_count, 1);
+    assert_eq!(run.splats.len(), 1);
+    assert!(!run.report.cancelled);
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Completed);
+    assert_eq!(events.borrow().as_slice(), ["completed:Completed"]);
+}
+
+#[test]
+fn pause_after_iteration_seven_commits_checkpoint_before_terminal_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("pause-frame.rgb");
+    let mut pixels = Vec::with_capacity(16 * 16 * 3);
+    for y in 0..16_u8 {
+        for x in 0..16_u8 {
+            pixels.extend_from_slice(&[
+                x.saturating_mul(12),
+                y.saturating_mul(12),
+                x.saturating_add(y).saturating_mul(6),
+            ]);
+        }
+    }
+    fs::write(&image_path, pixels).unwrap();
+
+    let mut dataset = TrainingDataset::new(Intrinsics::new(12.0, 12.0, 8.0, 8.0, 16, 16));
+    dataset.add_pose(ScenePose::new(0, image_path, SE3::identity(), 0.0));
+    dataset.add_point([0.0, 0.0, 2.0], Some([0.25, 0.5, 0.75]));
+    dataset.add_point([0.25, -0.2, 2.5], Some([0.75, 0.25, 0.5]));
+    let config = TrainingConfig {
+        iterations: 20,
+        raster: rustgs::TrainingRasterConfig {
+            render_scale: 1.0,
+            ..Default::default()
+        },
+        initialization: rustgs::TrainingInitializationConfig {
+            max_initial_gaussians: 2,
+            ..Default::default()
+        },
+        data: rustgs::TrainingDataConfig {
+            frame_cache_capacity: 1,
+            frame_prefetch_ahead: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"pause-reconstruction", &config)
+            .unwrap();
+    let control = TrainingControl::new(TrainingEventCadence {
+        progress_every: 1,
+        snapshot_every: None,
+    });
+    let sequence = Rc::new(RefCell::new(Vec::new()));
+    let captured_checkpoint = Rc::new(RefCell::new(None));
+
+    let event_control = control.clone();
+    let event_sequence = Rc::clone(&sequence);
+    let checkpoint_sequence = Rc::clone(&sequence);
+    let sink_checkpoint = Rc::clone(&captured_checkpoint);
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(7) })
+            .with_checkpoint_sink(move |ready| {
+                checkpoint_sequence
+                    .borrow_mut()
+                    .push(format!("sink:{}", ready.iteration));
+                *sink_checkpoint.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            })
+            .with_event_sink(move |event| match event {
+                TrainingEvent::IterationProgress(progress) => {
+                    event_sequence
+                        .borrow_mut()
+                        .push(format!("progress:{}", progress.iteration));
+                    if progress.iteration == 7 {
+                        event_control.request_pause();
+                    }
+                }
+                TrainingEvent::CheckpointReady(ready) => event_sequence
+                    .borrow_mut()
+                    .push(format!("checkpoint:{}:{:?}", ready.iteration, ready.reason)),
+                TrainingEvent::RunPaused(paused) => event_sequence
+                    .borrow_mut()
+                    .push(format!("paused:{}", paused.completed_iterations)),
+                TrainingEvent::RunCompleted(completed) => event_sequence
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    let checkpoint = captured_checkpoint.borrow();
+    let checkpoint = checkpoint.as_ref().expect("pause checkpoint committed");
+    assert_eq!(run.report.completed_iterations, 7);
+    assert!(!run.report.cancelled);
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Paused);
+    assert_eq!(checkpoint.completed_iterations, 7);
+    assert_eq!(
+        sequence.borrow().as_slice(),
+        [
+            "progress:1",
+            "progress:2",
+            "progress:3",
+            "progress:4",
+            "progress:5",
+            "progress:6",
+            "progress:7",
+            "sink:7",
+            "checkpoint:7:Pause",
+            "paused:7",
+            "completed:Paused",
+        ]
+    );
 }

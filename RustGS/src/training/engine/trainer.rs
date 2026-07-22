@@ -18,8 +18,8 @@ use crate::training::topology::TopologyMutationPlan;
 use crate::training::topology::{apply_mutations, plan_mutations, snapshot_for_topology};
 use crate::training::topology::{apply_topology_metrics_delta, should_apply_topology_step};
 use crate::training::{
-    LiteGsPruneMode, TrainingCheckpoint, TrainingConfig, TrainingIdentity,
-    TRAINING_CHECKPOINT_VERSION,
+    LiteGsPruneMode, TrainingCheckpoint, TrainingCheckpointReady, TrainingCheckpointReason,
+    TrainingConfig, TrainingIdentity, TrainingRunDisposition, TRAINING_CHECKPOINT_VERSION,
 };
 use crate::TrainingError;
 
@@ -38,6 +38,7 @@ pub struct WgpuTrainingReport {
     pub final_gaussian_count: usize,
     pub completed_iterations: usize,
     pub cancelled: bool,
+    pub disposition: TrainingRunDisposition,
     pub training_loop_elapsed: Duration,
     pub telemetry: LiteGsTrainingTelemetry,
 }
@@ -84,9 +85,21 @@ pub(crate) trait TrainingLoopObserver {
         false
     }
 
+    fn checkpoint_reason(&self, _iteration: usize) -> Option<TrainingCheckpointReason> {
+        None
+    }
+
+    fn checkpoint_identity(&self) -> Option<&TrainingIdentity> {
+        None
+    }
+
     fn on_iteration(&mut self, _metrics: TrainingIterationMetrics) {}
 
     fn on_snapshot(&mut self, _metrics: TrainingIterationMetrics, _splats: HostSplats) {}
+
+    fn on_checkpoint(&mut self, _ready: TrainingCheckpointReady) -> Result<(), TrainingError> {
+        Ok(())
+    }
 }
 
 pub struct WgpuTrainer {
@@ -687,6 +700,7 @@ impl WgpuTrainer {
         frame_order: &[usize],
         frame_loader: &mut PrefetchFrameLoader,
         image_dims: (usize, usize),
+        start_iteration: usize,
         num_iterations: usize,
         observer: &mut dyn TrainingLoopObserver,
     ) -> Result<WgpuTrainingReport, TrainingError> {
@@ -698,7 +712,11 @@ impl WgpuTrainer {
             )));
         }
 
-        let mut report = WgpuTrainingReport::default();
+        let mut report = WgpuTrainingReport {
+            completed_iterations: start_iteration,
+            final_gaussian_count: splats.num_splats(),
+            ..Default::default()
+        };
         self.telemetry.topology.total_epochs =
             Some(training_epoch_count(num_iterations, cameras.len()));
         let collect_topology_stats =
@@ -708,13 +726,14 @@ impl WgpuTrainer {
         let target_tensor_cache_capacity = self.config.data.frame_cache_capacity.max(1);
         let training_loop_started_at = Instant::now();
 
-        for iteration in 0..num_iterations {
+        for zero_based in start_iteration..num_iterations {
             if observer.should_cancel() {
                 report.cancelled = true;
+                report.disposition = TrainingRunDisposition::Cancelled;
                 break;
             }
 
-            let sample_idx = iteration % cameras.len();
+            let sample_idx = zero_based % cameras.len();
             let frame_idx = frame_order[sample_idx];
             frame_loader.prefetch_order_window(frame_order, sample_idx)?;
             let decoded = frame_loader.get(frame_idx)?;
@@ -741,7 +760,7 @@ impl WgpuTrainer {
                 }
             };
 
-            let iteration_idx = iteration + 1;
+            let iteration_idx = zero_based + 1;
             let emit_progress = observer.should_emit_progress(iteration_idx);
             let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
             let should_log_step = iteration_idx.is_multiple_of(100);
@@ -786,7 +805,28 @@ impl WgpuTrainer {
 
             if observer.should_cancel() {
                 report.cancelled = true;
+                report.disposition = TrainingRunDisposition::Cancelled;
                 break;
+            }
+
+            if let Some(reason) = observer.checkpoint_reason(iteration_idx) {
+                let identity = observer.checkpoint_identity().cloned().ok_or_else(|| {
+                    TrainingError::InvalidInput(
+                        "checkpointing training requires the current training identity".to_string(),
+                    )
+                })?;
+                let checkpoint = self
+                    .checkpoint(splats, identity, iteration_idx, Some(loss))
+                    .await?;
+                observer.on_checkpoint(TrainingCheckpointReady {
+                    iteration: iteration_idx,
+                    reason,
+                    checkpoint,
+                })?;
+                if reason == TrainingCheckpointReason::Pause {
+                    report.disposition = TrainingRunDisposition::Paused;
+                    break;
+                }
             }
         }
 

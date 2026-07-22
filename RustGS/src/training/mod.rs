@@ -55,10 +55,12 @@ pub use evaluation::{
 pub use evaluation::{SharedWgpuContext, SplatEvaluationRenderer};
 #[cfg(feature = "gpu")]
 pub use events::{
-    TrainingControl, TrainingEvent, TrainingEventCadence, TrainingEventRoute,
-    TrainingIterationProgress, TrainingOptions, TrainingPlanSelected, TrainingRun,
-    TrainingRunCancelled, TrainingRunCompleted, TrainingRunFailed, TrainingRunReport,
-    TrainingRunStarted, TrainingSnapshotReady,
+    TrainingCheckpointPolicy, TrainingCheckpointReady, TrainingCheckpointReason,
+    TrainingCheckpointSink, TrainingControl, TrainingEvent, TrainingEventCadence,
+    TrainingEventRoute, TrainingIterationProgress, TrainingOptions, TrainingPlanSelected,
+    TrainingRun, TrainingRunCancelled, TrainingRunCompleted, TrainingRunDisposition,
+    TrainingRunFailed, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
+    TrainingSnapshotReady,
 };
 pub use reporting::metrics::{
     ParityFloatDistribution, ParityLossCurveSample, ParityLossTerms, ParityTopologyMetrics,
