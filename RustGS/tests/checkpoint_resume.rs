@@ -172,6 +172,13 @@ fn assert_invalid_input_contains(error: TrainingError, expected: &str) {
     }
 }
 
+fn invalid_input_message(error: TrainingError) -> String {
+    match error {
+        TrainingError::InvalidInput(message) => message,
+        other => panic!("expected TrainingError::InvalidInput, got {other:?}"),
+    }
+}
+
 #[test]
 fn checkpoint_store_round_trips_and_atomically_replaces() {
     let temp = tempfile::tempdir().unwrap();
@@ -955,6 +962,126 @@ fn pause_checkpoint_sink_failure_fails_run_without_paused_or_completed_events() 
 }
 
 #[test]
+fn cancel_requested_by_checkpoint_sink_commits_then_finishes_cancelled() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sink-cancel-frame", 1);
+    let config = tiny_training_config(3);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"sink-cancel", &config).unwrap();
+    let control = TrainingControl::new(TrainingEventCadence::default());
+    control.request_pause();
+    let sink_control = control.clone();
+    let sequence = Rc::new(RefCell::new(Vec::new()));
+    let sink_sequence = Rc::clone(&sequence);
+    let event_sequence = Rc::clone(&sequence);
+
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity)
+            .with_checkpoint_sink(move |ready| {
+                sink_sequence
+                    .borrow_mut()
+                    .push(format!("sink:{}", ready.iteration));
+                sink_control.request_cancel();
+                Ok(())
+            })
+            .with_event_sink(move |event| match event {
+                TrainingEvent::CheckpointReady(ready) => event_sequence
+                    .borrow_mut()
+                    .push(format!("checkpoint:{}", ready.iteration)),
+                TrainingEvent::RunPaused(_) => {
+                    event_sequence.borrow_mut().push("paused".to_string())
+                }
+                TrainingEvent::RunCancelled(cancelled) => event_sequence
+                    .borrow_mut()
+                    .push(format!("cancelled:{}", cancelled.completed_iterations)),
+                TrainingEvent::RunCompleted(completed) => event_sequence
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(run.report.completed_iterations, 1);
+    assert!(run.report.cancelled);
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Cancelled);
+    assert_eq!(
+        sequence.borrow().as_slice(),
+        [
+            "sink:1",
+            "checkpoint:1",
+            "cancelled:1",
+            "completed:Cancelled"
+        ]
+    );
+}
+
+#[test]
+fn cancel_requested_by_checkpoint_event_finishes_cancelled_after_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "event-cancel-frame", 1);
+    let config = tiny_training_config(3);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"event-cancel", &config).unwrap();
+    let control = TrainingControl::new(TrainingEventCadence::default());
+    control.request_pause();
+    let event_control = control.clone();
+    let sequence = Rc::new(RefCell::new(Vec::new()));
+    let sink_sequence = Rc::clone(&sequence);
+    let event_sequence = Rc::clone(&sequence);
+
+    let run = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity)
+            .with_checkpoint_sink(move |ready| {
+                sink_sequence
+                    .borrow_mut()
+                    .push(format!("sink:{}", ready.iteration));
+                Ok(())
+            })
+            .with_event_sink(move |event| match event {
+                TrainingEvent::CheckpointReady(ready) => {
+                    event_sequence
+                        .borrow_mut()
+                        .push(format!("checkpoint:{}", ready.iteration));
+                    event_control.request_cancel();
+                }
+                TrainingEvent::RunPaused(_) => {
+                    event_sequence.borrow_mut().push("paused".to_string())
+                }
+                TrainingEvent::RunCancelled(cancelled) => event_sequence
+                    .borrow_mut()
+                    .push(format!("cancelled:{}", cancelled.completed_iterations)),
+                TrainingEvent::RunCompleted(completed) => event_sequence
+                    .borrow_mut()
+                    .push(format!("completed:{:?}", completed.report.disposition)),
+                _ => {}
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(run.report.completed_iterations, 1);
+    assert!(run.report.cancelled);
+    assert_eq!(run.report.disposition, TrainingRunDisposition::Cancelled);
+    assert_eq!(
+        sequence.borrow().as_slice(),
+        [
+            "sink:1",
+            "checkpoint:1",
+            "cancelled:1",
+            "completed:Cancelled"
+        ]
+    );
+}
+
+#[test]
 fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
     let temp = tempfile::tempdir().unwrap();
     let dataset = tiny_training_dataset(&temp, "resume-frame", 3);
@@ -1036,6 +1163,77 @@ fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
         .expect("target iteration is retained in telemetry");
     assert_eq!(last_sample.iteration, 8);
     assert_eq!(last_sample.frame_idx, 1);
+}
+
+#[test]
+fn train_splats_rejects_resume_identity_errors_before_gpu_training_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "identity-validation-frame", 1);
+    let config = tiny_training_config(8);
+    let current =
+        TrainingIdentity::from_canonical_content(&dataset, b"identity-validation", &config)
+            .unwrap();
+    let cases = [
+        (
+            Some(current.clone()),
+            TrainingIdentity {
+                dataset: "other".to_string(),
+                ..current.clone()
+            },
+            "checkpoint dataset does not match the current training dataset",
+        ),
+        (
+            Some(current.clone()),
+            TrainingIdentity {
+                reconstruction: "other".to_string(),
+                ..current.clone()
+            },
+            "checkpoint reconstruction does not match the current sparse reconstruction",
+        ),
+        (
+            Some(current.clone()),
+            TrainingIdentity {
+                config: "other".to_string(),
+                ..current.clone()
+            },
+            "checkpoint configuration does not match the current training configuration",
+        ),
+        (
+            None,
+            current.clone(),
+            "resuming training requires the current training identity",
+        ),
+    ];
+
+    for (current_identity, checkpoint_identity, expected) in cases {
+        let mut checkpoint = checkpoint_fixture(7);
+        checkpoint.identity = checkpoint_identity;
+        checkpoint.frame_shuffle_seed = config.data.frame_shuffle_seed;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured_events = Rc::clone(&events);
+        let mut options = TrainingOptions::new()
+            .with_resume_checkpoint(checkpoint)
+            .with_event_sink(move |event| captured_events.borrow_mut().push(event));
+        if let Some(current_identity) = current_identity {
+            options = options.with_identity(current_identity);
+        }
+
+        let error = train_splats(&dataset, &config, options).unwrap_err();
+        assert_eq!(invalid_input_message(error), expected);
+        assert!(matches!(
+            events.borrow().last(),
+            Some(TrainingEvent::RunFailed(_))
+        ));
+        assert!(!events.borrow().iter().any(|event| matches!(
+            event,
+            TrainingEvent::IterationProgress(_)
+                | TrainingEvent::SnapshotReady(_)
+                | TrainingEvent::CheckpointReady(_)
+                | TrainingEvent::RunPaused(_)
+                | TrainingEvent::RunCancelled(_)
+                | TrainingEvent::RunCompleted(_)
+        )));
+    }
 }
 
 #[test]

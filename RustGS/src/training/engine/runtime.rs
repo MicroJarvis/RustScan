@@ -88,6 +88,18 @@ pub fn train_splats(
     config: &TrainingConfig,
     options: TrainingOptions<'_>,
 ) -> Result<TrainingRun, TrainingError> {
+    train_splats_with_device_factory(dataset, config, options, GsDevice::default)
+}
+
+fn train_splats_with_device_factory<DefaultFactory>(
+    dataset: &TrainingDataset,
+    config: &TrainingConfig,
+    options: TrainingOptions<'_>,
+    default_device: DefaultFactory,
+) -> Result<TrainingRun, TrainingError>
+where
+    DefaultFactory: FnOnce() -> GsDevice,
+{
     let run_started_at = Instant::now();
     let TrainingOptions {
         control,
@@ -132,6 +144,7 @@ pub fn train_splats(
         emit_iteration_events,
         on_event,
         on_checkpoint,
+        default_device,
     ) {
         Ok(run) => run,
         Err(error) => {
@@ -178,7 +191,7 @@ pub fn train_splats(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_training<F, C>(
+fn run_training<F, C, DefaultFactory>(
     dataset: &TrainingDataset,
     config: &TrainingConfig,
     control: &TrainingControl,
@@ -189,10 +202,12 @@ fn run_training<F, C>(
     emit_iteration_events: bool,
     on_event: &mut F,
     on_checkpoint: &mut C,
+    default_device: DefaultFactory,
 ) -> Result<TrainingRun, TrainingError>
 where
     F: FnMut(TrainingEvent) + ?Sized,
     C: FnMut(&TrainingCheckpointReady) -> Result<(), TrainingError> + ?Sized,
+    DefaultFactory: FnOnce() -> GsDevice,
 {
     let shared_device = shared_wgpu_context.map(|context| || context.training_device());
     let (start_iteration, device) = prepare_resume_runtime(
@@ -200,7 +215,7 @@ where
         identity,
         resume_checkpoint,
         shared_device,
-        GsDevice::default,
+        default_device,
     )?;
 
     if dataset.poses.is_empty() {
@@ -694,6 +709,59 @@ mod tests {
 
         assert_eq!(start_iteration, 0);
         assert_eq!(device, "shared");
+    }
+
+    #[test]
+    fn train_splats_resume_validation_uses_the_entry_path_before_device_factory() {
+        let dataset = TrainingDataset::new(Intrinsics::default());
+        let config = TrainingConfig::default();
+        let current = identity();
+
+        let cases = [
+            (
+                Some(current.clone()),
+                TrainingIdentity {
+                    dataset: "other".to_string(),
+                    ..current.clone()
+                },
+                "checkpoint dataset does not match the current training dataset",
+            ),
+            (
+                Some(current.clone()),
+                TrainingIdentity {
+                    reconstruction: "other".to_string(),
+                    ..current.clone()
+                },
+                "checkpoint reconstruction does not match the current sparse reconstruction",
+            ),
+            (
+                Some(current.clone()),
+                TrainingIdentity {
+                    config: "other".to_string(),
+                    ..current.clone()
+                },
+                "checkpoint configuration does not match the current training configuration",
+            ),
+            (
+                None,
+                current.clone(),
+                "resuming training requires the current training identity",
+            ),
+        ];
+
+        for (current_identity, checkpoint_identity, expected) in cases {
+            let checkpoint = resume_checkpoint(checkpoint_identity, 7);
+            let mut options = TrainingOptions::new().with_resume_checkpoint(checkpoint);
+            if let Some(current_identity) = current_identity {
+                options = options.with_identity(current_identity);
+            }
+
+            let error = train_splats_with_device_factory(&dataset, &config, options, || {
+                panic!("device factory must not run before resume validation")
+            })
+            .unwrap_err();
+            assert_eq!(invalid_input_message(error), expected);
+        }
     }
 
     #[test]

@@ -102,6 +102,25 @@ pub(crate) trait TrainingLoopObserver {
     }
 }
 
+fn complete_checkpoint_boundary(
+    observer: &mut dyn TrainingLoopObserver,
+    ready: TrainingCheckpointReady,
+) -> Result<Option<TrainingRunDisposition>, TrainingError> {
+    if observer.should_cancel() {
+        return Ok(Some(TrainingRunDisposition::Cancelled));
+    }
+
+    let reason = ready.reason;
+    observer.on_checkpoint(ready)?;
+    if observer.should_cancel() {
+        Ok(Some(TrainingRunDisposition::Cancelled))
+    } else if reason == TrainingCheckpointReason::Pause {
+        Ok(Some(TrainingRunDisposition::Paused))
+    } else {
+        Ok(None)
+    }
+}
+
 pub struct WgpuTrainer {
     config: TrainingConfig,
     optimizer: AdamScaled<GsBackendBase>,
@@ -818,13 +837,16 @@ impl WgpuTrainer {
                 let checkpoint = self
                     .checkpoint(splats, identity, iteration_idx, Some(loss))
                     .await?;
-                observer.on_checkpoint(TrainingCheckpointReady {
-                    iteration: iteration_idx,
-                    reason,
-                    checkpoint,
-                })?;
-                if reason == TrainingCheckpointReason::Pause {
-                    report.disposition = TrainingRunDisposition::Paused;
+                if let Some(disposition) = complete_checkpoint_boundary(
+                    observer,
+                    TrainingCheckpointReady {
+                        iteration: iteration_idx,
+                        reason,
+                        checkpoint,
+                    },
+                )? {
+                    report.cancelled = disposition == TrainingRunDisposition::Cancelled;
+                    report.disposition = disposition;
                     break;
                 }
             }
@@ -1293,6 +1315,21 @@ mod tests {
         (config, checkpoint)
     }
 
+    struct CancelledCheckpointObserver {
+        checkpoint_calls: usize,
+    }
+
+    impl TrainingLoopObserver for CancelledCheckpointObserver {
+        fn should_cancel(&self) -> bool {
+            true
+        }
+
+        fn on_checkpoint(&mut self, _ready: TrainingCheckpointReady) -> Result<(), TrainingError> {
+            self.checkpoint_calls += 1;
+            Ok(())
+        }
+    }
+
     fn assert_topology_tensor(tensor: &TensorCheckpoint, values: [f32; 3]) {
         assert_eq!(tensor.shape, [3]);
         assert_eq!(tensor.values, values);
@@ -1325,6 +1362,28 @@ mod tests {
         assert_eq!(report.final_step_loss, Some(0.25));
         assert_eq!(report.completed_iterations, 2);
         assert_eq!(report.final_gaussian_count, 11);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkpoint_cancel_after_build_skips_commit_and_finishes_cancelled() {
+        let device = GsDevice::default();
+        let (_, checkpoint) = populated_trainer_checkpoint(&device).await;
+        let mut observer = CancelledCheckpointObserver {
+            checkpoint_calls: 0,
+        };
+
+        let disposition = complete_checkpoint_boundary(
+            &mut observer,
+            TrainingCheckpointReady {
+                iteration: CHECKPOINT_ITERATIONS,
+                reason: TrainingCheckpointReason::Pause,
+                checkpoint,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(disposition, Some(TrainingRunDisposition::Cancelled));
+        assert_eq!(observer.checkpoint_calls, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
