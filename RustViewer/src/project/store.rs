@@ -5,12 +5,17 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
+#[cfg(unix)]
+use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
+#[cfg(unix)]
+use rustix::io::Errno;
 use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
     ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot, ProjectManifest,
-    ProjectManifestValidationError, SfmConfigSnapshot, SourceSpec, PROJECT_SCHEMA_VERSION,
+    ProjectManifestValidationError, ProjectStage, SfmConfigSnapshot, SourceSpec,
+    PROJECT_SCHEMA_VERSION,
 };
 
 const PACKAGE_EXTENSION: &str = "rustscanproject";
@@ -56,6 +61,11 @@ pub enum ProjectStoreError {
     SymlinkPackageRoot { path: PathBuf },
     #[error("project package is already open for writing: {path:?}")]
     AlreadyOpen { path: PathBuf },
+    #[error("cannot apply {change:?} while {stage:?} is active")]
+    StageActive {
+        stage: ProjectStage,
+        change: ChangeKind,
+    },
     #[error("project manifest is missing a valid schema_version")]
     InvalidSchemaVersion,
     #[error("project schema version {found} is newer than supported version {supported}")]
@@ -126,7 +136,7 @@ impl ProjectStore {
     fn create_with_parent_sync(
         path: impl AsRef<Path>,
         request: ProjectCreateRequest,
-        sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+        mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
     ) -> Result<Self, ProjectStoreError> {
         let path = path.as_ref();
         require_package_suffix(path)?;
@@ -135,7 +145,7 @@ impl ProjectStore {
 
         let created_root = if path.exists() {
             let metadata = fs::symlink_metadata(path)?;
-            if !metadata.is_dir() || fs::read_dir(path)?.next().transpose()?.is_some() {
+            if !metadata.is_dir() || !is_bootstrap_destination(path)? {
                 return Err(ProjectStoreError::DestinationNotEmpty {
                     path: path.to_path_buf(),
                 });
@@ -149,16 +159,47 @@ impl ProjectStore {
         let mut cleanup = InitializationCleanup::new(path.to_path_buf(), created_root);
         let root = fs::canonicalize(path)?;
         let lock_file = create_and_lock(&root, Some(&mut cleanup))?;
-        for relative in PACKAGE_DIRECTORIES {
-            cleanup.create_directory(&root.join(relative))?;
+        if !is_bootstrap_destination(&root)? {
+            return Err(ProjectStoreError::DestinationNotEmpty { path: root });
         }
-        let warning = write_manifest_bootstrap_with_parent_sync(&root, &manifest, sync_parent)?;
+        let mut created_directory_parents = BTreeSet::new();
+        for relative in PACKAGE_DIRECTORIES {
+            let directory = root.join(relative);
+            if cleanup.create_directory(&directory)? {
+                created_directory_parents.insert(
+                    directory
+                        .parent()
+                        .expect("package scaffold directory has a parent")
+                        .to_path_buf(),
+                );
+            }
+        }
+        let mut warnings = write_manifest_bootstrap_with_parent_sync(&root, &manifest, |parent| {
+            sync_parent(parent)
+        })?
+        .into_iter()
+        .collect::<Vec<_>>();
+        // The manifest rename sync already covers all new entries directly under the root.
+        created_directory_parents.remove(&root);
+        for parent in created_directory_parents {
+            if let Some(warning) = sync_directory_warning(&parent, &mut sync_parent) {
+                warnings.push(warning);
+            }
+        }
+        if created_root {
+            let package_parent = root.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "project package has no parent")
+            })?;
+            if let Some(warning) = sync_directory_warning(package_parent, &mut sync_parent) {
+                warnings.push(warning);
+            }
+        }
         cleanup.disarm();
 
         Ok(Self {
             root,
             manifest,
-            warnings: warning.into_iter().collect(),
+            warnings,
             _lock_file: lock_file,
         })
     }
@@ -218,6 +259,7 @@ impl ProjectStore {
         if self.manifest.source == source {
             return Ok(());
         }
+        self.ensure_change_does_not_invalidate_active_stage(ChangeKind::Source)?;
         self.update_manifest(|manifest| {
             manifest.source = source;
             manifest.invalidate(ChangeKind::Source);
@@ -231,6 +273,7 @@ impl ProjectStore {
         if self.manifest.import_config == config {
             return Ok(());
         }
+        self.ensure_change_does_not_invalidate_active_stage(ChangeKind::ImportConfig)?;
         self.update_manifest(|manifest| {
             manifest.import_config = config;
             manifest.invalidate(ChangeKind::ImportConfig);
@@ -244,6 +287,7 @@ impl ProjectStore {
         if self.manifest.sfm_config == config {
             return Ok(());
         }
+        self.ensure_change_does_not_invalidate_active_stage(ChangeKind::SfmConfig)?;
         self.update_manifest(|manifest| {
             manifest.sfm_config = config;
             manifest.invalidate(ChangeKind::SfmConfig);
@@ -257,6 +301,7 @@ impl ProjectStore {
         if self.manifest.pnp_config == config {
             return Ok(());
         }
+        self.ensure_change_does_not_invalidate_active_stage(ChangeKind::PnpConfig)?;
         self.update_manifest(|manifest| {
             manifest.pnp_config = config;
             manifest.invalidate(ChangeKind::PnpConfig);
@@ -270,6 +315,7 @@ impl ProjectStore {
         if self.manifest.training_config == config {
             return Ok(());
         }
+        self.ensure_change_does_not_invalidate_active_stage(ChangeKind::TrainingConfig)?;
         self.update_manifest(|manifest| {
             manifest.training_config = config;
             manifest.invalidate(ChangeKind::TrainingConfig);
@@ -281,6 +327,21 @@ impl ProjectStore {
         update: impl FnOnce(&mut ProjectManifest),
     ) -> Result<(), ProjectStoreError> {
         self.update_manifest_with_parent_sync(update, sync_parent_directory)
+    }
+
+    fn ensure_change_does_not_invalidate_active_stage(
+        &self,
+        change: ChangeKind,
+    ) -> Result<(), ProjectStoreError> {
+        if let Some(lease) = self.manifest.lease() {
+            if change.invalidates(lease.stage) {
+                return Err(ProjectStoreError::StageActive {
+                    stage: lease.stage,
+                    change,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn update_manifest_with_parent_sync(
@@ -347,42 +408,15 @@ impl ProjectStore {
 
     fn validate_committed_artifact(&self, artifact: &ArtifactRef) -> Result<(), ProjectStoreError> {
         let relative = Path::new(&artifact.relative_path);
-        let mut current = self.root.clone();
         for component in relative.components() {
-            let Component::Normal(part) = component else {
+            let Component::Normal(_) = component else {
                 return Err(ProjectStoreError::ArtifactPathEscapesPackage {
                     path: relative.to_path_buf(),
                 });
             };
-            current.push(part);
-            let metadata = match fs::symlink_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Err(ProjectStoreError::ArtifactMissing {
-                        path: relative.to_path_buf(),
-                    });
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if metadata.file_type().is_symlink() {
-                return Err(ProjectStoreError::ArtifactSymlink {
-                    path: relative.to_path_buf(),
-                });
-            }
         }
-
-        let canonical = fs::canonicalize(&current)?;
-        if !canonical.starts_with(&self.root) {
-            return Err(ProjectStoreError::ArtifactPathEscapesPackage {
-                path: relative.to_path_buf(),
-            });
-        }
-        if !fs::symlink_metadata(&current)?.is_file() {
-            return Err(ProjectStoreError::ArtifactNotRegularFile {
-                path: relative.to_path_buf(),
-            });
-        }
-        let (found_len, found_hash) = hash_reader(File::open(&current)?)?;
+        let file = open_artifact_file(&self.root, relative)?;
+        let (found_len, found_hash) = hash_reader(file)?;
         if found_len != artifact.byte_len {
             return Err(ProjectStoreError::ArtifactLengthMismatch {
                 path: relative.to_path_buf(),
@@ -451,12 +485,13 @@ impl InitializationCleanup {
         }
     }
 
-    fn create_directory(&mut self, path: &Path) -> io::Result<()> {
+    fn create_directory(&mut self, path: &Path) -> io::Result<bool> {
         if !path.exists() {
             fs::create_dir(path)?;
             self.created.push(path.to_path_buf());
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn disarm(&mut self) {
@@ -494,6 +529,18 @@ fn require_package_suffix(path: &Path) -> Result<(), ProjectStoreError> {
         });
     }
     Ok(())
+}
+
+fn is_bootstrap_destination(path: &Path) -> io::Result<bool> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name() != OsStr::new(LOCK_NAME)
+            || !fs::symlink_metadata(entry.path())?.is_file()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn schema_version(value: &serde_json::Value) -> Result<u32, ProjectStoreError> {
@@ -548,6 +595,15 @@ fn write_bytes_atomic_with_parent_sync(
     bytes: &[u8],
     sync_parent: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<Option<ProjectStoreWarning>> {
+    write_bytes_atomic_with_hooks(destination, bytes, sync_parent, |_| Ok(()))
+}
+
+fn write_bytes_atomic_with_hooks(
+    destination: &Path,
+    bytes: &[u8],
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+    before_rename: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Option<ProjectStoreWarning>> {
     let parent = destination.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -566,6 +622,7 @@ fn write_bytes_atomic_with_parent_sync(
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        before_rename(&temporary)?;
         fs::rename(&temporary, destination)?;
         Ok(())
     })();
@@ -583,8 +640,138 @@ fn write_bytes_atomic_with_parent_sync(
         }))
 }
 
+fn sync_directory_warning(
+    path: &Path,
+    sync_directory: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> Option<ProjectStoreWarning> {
+    sync_directory(path)
+        .err()
+        .map(|error| ProjectStoreWarning::ParentDirectorySyncFailed {
+            path: path.to_path_buf(),
+            error_kind: error.kind(),
+            detail: error.to_string(),
+        })
+}
+
 fn sync_parent_directory(parent: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
+}
+
+#[cfg(unix)]
+fn open_artifact_file(root: &Path, relative: &Path) -> Result<File, ProjectStoreError> {
+    let mut components = relative.components().map(|component| match component {
+        Component::Normal(part) => Ok(part),
+        _ => Err(ProjectStoreError::ArtifactPathEscapesPackage {
+            path: relative.to_path_buf(),
+        }),
+    });
+    let root = rustix_fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let mut directory = File::from(root);
+    let Some(mut component) = components.next().transpose()? else {
+        return Err(ProjectStoreError::ArtifactPathEscapesPackage {
+            path: relative.to_path_buf(),
+        });
+    };
+
+    for next in components {
+        let next = next?;
+        let opened = rustix_fs::openat(
+            &directory,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| artifact_open_error(&directory, component, relative, error))?;
+        directory = File::from(opened);
+        component = next;
+    }
+
+    let opened = rustix_fs::openat(
+        &directory,
+        component,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| artifact_open_error(&directory, component, relative, error))?;
+    let metadata = rustix_fs::fstat(&opened).map_err(io::Error::from)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() {
+        return Err(ProjectStoreError::ArtifactNotRegularFile {
+            path: relative.to_path_buf(),
+        });
+    }
+    Ok(File::from(opened))
+}
+
+#[cfg(unix)]
+fn artifact_open_error(
+    directory: &File,
+    component: &OsStr,
+    relative: &Path,
+    error: Errno,
+) -> ProjectStoreError {
+    if error == Errno::NOENT {
+        return ProjectStoreError::ArtifactMissing {
+            path: relative.to_path_buf(),
+        };
+    }
+    if error == Errno::LOOP
+        || rustix_fs::statat(directory, component, rustix_fs::AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|metadata| FileType::from_raw_mode(metadata.st_mode).is_symlink())
+    {
+        return ProjectStoreError::ArtifactSymlink {
+            path: relative.to_path_buf(),
+        };
+    }
+    if error == Errno::NOTDIR {
+        return ProjectStoreError::ArtifactNotRegularFile {
+            path: relative.to_path_buf(),
+        };
+    }
+    ProjectStoreError::Io(error.into())
+}
+
+#[cfg(not(unix))]
+fn open_artifact_file(root: &Path, relative: &Path) -> Result<File, ProjectStoreError> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(ProjectStoreError::ArtifactPathEscapesPackage {
+                path: relative.to_path_buf(),
+            });
+        };
+        current.push(part);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ProjectStoreError::ArtifactMissing {
+                    path: relative.to_path_buf(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(ProjectStoreError::ArtifactSymlink {
+                path: relative.to_path_buf(),
+            });
+        }
+    }
+    let canonical = fs::canonicalize(&current)?;
+    if !canonical.starts_with(root) {
+        return Err(ProjectStoreError::ArtifactPathEscapesPackage {
+            path: relative.to_path_buf(),
+        });
+    }
+    if !fs::symlink_metadata(&current)?.is_file() {
+        return Err(ProjectStoreError::ArtifactNotRegularFile {
+            path: relative.to_path_buf(),
+        });
+    }
+    Ok(File::open(current)?)
 }
 
 fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
@@ -607,6 +794,8 @@ fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn typed_manifest_writer_rejects_project_identity_changes() {
@@ -692,10 +881,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            store.warnings(),
-            [ProjectStoreWarning::ParentDirectorySyncFailed { .. }]
-        ));
+        assert!(!store.warnings().is_empty());
+        assert!(store.warnings().iter().all(|warning| matches!(
+            warning,
+            ProjectStoreWarning::ParentDirectorySyncFailed { .. }
+        )));
         assert!(matches!(
             ProjectStore::open(&root),
             Err(ProjectStoreError::AlreadyOpen { .. })
@@ -704,5 +894,87 @@ mod tests {
             serde_json::from_slice(&fs::read(root.join(MANIFEST_NAME)).unwrap()).unwrap();
         assert_eq!(persisted.id(), store.manifest().id());
         assert!(root.join("Sources").is_dir());
+    }
+
+    #[test]
+    fn bootstrap_syncs_created_directory_parents_and_new_package_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Durable.rustscanproject");
+        let synced = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&synced);
+
+        ProjectStore::create_with_parent_sync(
+            &root,
+            ProjectCreateRequest::new("Durable", SourceSpec::managed_images("source-a")),
+            move |path| {
+                observed.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let canonical_parent = canonical_root.parent().unwrap().to_path_buf();
+        let synced = synced.borrow();
+        for expected in [
+            canonical_root.clone(),
+            canonical_root.join("Sources"),
+            canonical_root.join("Cache"),
+            canonical_root.join("Training"),
+            canonical_root.join("Logs"),
+            canonical_parent,
+        ] {
+            assert!(
+                synced.iter().any(|path| path == &expected),
+                "did not sync {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_directory_sync_failures_after_commit_are_warnings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Warning.rustscanproject");
+        let package_parent = fs::canonicalize(temp.path()).unwrap();
+
+        let store = ProjectStore::create_with_parent_sync(
+            &root,
+            ProjectCreateRequest::new("Warning", SourceSpec::managed_images("source-a")),
+            |path| {
+                if path == package_parent {
+                    Err(io::Error::other("injected package-parent sync failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(root.join(MANIFEST_NAME).is_file());
+        assert!(store.warnings().iter().any(|warning| matches!(
+            warning,
+            ProjectStoreWarning::ParentDirectorySyncFailed { path, detail, .. }
+                if path == &package_parent && detail == "injected package-parent sync failure"
+        )));
+    }
+
+    #[test]
+    fn pre_rename_failure_after_temp_creation_removes_the_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join(MANIFEST_NAME);
+
+        let result = write_bytes_atomic_with_hooks(
+            &destination,
+            b"replacement",
+            |_| Ok(()),
+            |temporary| {
+                assert!(temporary.is_file());
+                Err(io::Error::other("injected pre-rename failure"))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
     }
 }

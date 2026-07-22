@@ -1,11 +1,19 @@
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Command;
+#[cfg(unix)]
+use std::sync::mpsc;
+#[cfg(unix)]
+use std::time::Duration;
 
+use fs2::FileExt;
 use rust_viewer::project::{
-    ArtifactRef, ImportConfigSnapshot, PnpConfigSnapshot, ProjectCreateRequest, ProjectLease,
-    ProjectManifest, ProjectManifestValidationError, ProjectStage, ProjectStore, ProjectStoreError,
-    SfmConfigSnapshot, SourceKind, SourceOwnership, SourceSpec, StageState, PROJECT_SCHEMA_VERSION,
+    ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot, ProjectCreateRequest,
+    ProjectLease, ProjectManifest, ProjectManifestValidationError, ProjectStage, ProjectStore,
+    ProjectStoreError, SfmConfigSnapshot, SourceKind, SourceOwnership, SourceSpec, StageState,
+    PROJECT_SCHEMA_VERSION,
 };
 
 const STAGES: [(ProjectStage, &str); 5] = [
@@ -464,6 +472,56 @@ fn project_store_create_cleans_initialization_failures() {
 }
 
 #[test]
+fn project_store_create_accepts_the_orphan_lock_left_by_a_failed_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Orphan.rustscanproject");
+    fs::create_dir(&path).unwrap();
+
+    assert!(matches!(
+        ProjectStore::open(&path),
+        Err(ProjectStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(path.join("project.lock").is_file());
+
+    let store = ProjectStore::create(&path, create_request("Recovered")).unwrap();
+    assert_eq!(store.manifest().display_name, "Recovered");
+}
+
+#[test]
+fn project_store_create_rejects_an_orphan_lock_alongside_other_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Occupied.rustscanproject");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("project.lock"), b"").unwrap();
+    fs::write(path.join("keep.txt"), b"keep").unwrap();
+
+    assert!(matches!(
+        ProjectStore::create(&path, create_request("Occupied")),
+        Err(ProjectStoreError::DestinationNotEmpty { .. })
+    ));
+    assert_eq!(fs::read(path.join("keep.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn project_store_create_rejects_a_locked_orphan_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Locked.rustscanproject");
+    fs::create_dir(&path).unwrap();
+    let lock = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path.join("project.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    assert!(matches!(
+        ProjectStore::create(&path, create_request("Locked")),
+        Err(ProjectStoreError::AlreadyOpen { .. })
+    ));
+}
+
+#[test]
 fn project_store_allows_only_one_writer() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("Flowers.rustscanproject");
@@ -613,6 +671,61 @@ fn project_store_typed_updates_persist_identity_and_apply_invalidation_boundarie
 }
 
 #[test]
+fn project_store_typed_updates_reject_only_changes_that_invalidate_the_active_stage() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Active.rustscanproject");
+    let store = ProjectStore::create(&path, create_request("Active")).unwrap();
+    let id = store.manifest().id();
+    drop(store);
+
+    let mut value = read_manifest_value(&path);
+    value["stages"]["import"]["state"] = serde_json::json!("running");
+    value["stages"]["import"]["attempt"] = serde_json::json!(1);
+    value["lease"] = serde_json::to_value(ProjectLease {
+        project_id: id,
+        stage: ProjectStage::Import,
+        attempt: 1,
+        process_id: 42,
+        started_unix_ms: 100,
+    })
+    .unwrap();
+    write_manifest_value(&path, &value);
+
+    let mut store = ProjectStore::open(&path).unwrap();
+    let before_bytes = fs::read(path.join("project.json")).unwrap();
+    let before_import = store.manifest().import_config.clone();
+    let mut import = before_import.clone();
+    import.video_keyframes_per_second += 1.0;
+
+    assert!(matches!(
+        store.update_import_config(import),
+        Err(ProjectStoreError::StageActive {
+            stage: ProjectStage::Import,
+            change: ChangeKind::ImportConfig,
+        })
+    ));
+    assert_eq!(store.manifest().import_config, before_import);
+    assert_eq!(fs::read(path.join("project.json")).unwrap(), before_bytes);
+
+    let mut training = store.manifest().training_config.clone();
+    training.iterations += 1;
+    store.update_training_config(training.clone()).unwrap();
+    assert_eq!(store.manifest().training_config, training);
+    assert_eq!(
+        store
+            .manifest()
+            .try_stage(ProjectStage::Import)
+            .unwrap()
+            .state(),
+        StageState::Running
+    );
+    assert_eq!(
+        store.manifest().lease().unwrap().stage,
+        ProjectStage::Import
+    );
+}
+
+#[test]
 fn project_store_typed_update_validates_before_atomic_manifest_replacement() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("Flowers.rustscanproject");
@@ -648,6 +761,12 @@ fn project_store_typed_update_preserves_state_on_pre_rename_io_failure() {
     updated.video_keyframes_per_second = 4.0;
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = path.join("permission-probe");
+    if fs::write(&probe, b"probe").is_ok() {
+        fs::remove_file(probe).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
     let result = store.update_import_config(updated);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -743,6 +862,54 @@ fn project_store_open_rejects_missing_length_hash_and_non_file_artifacts() {
     fs::create_dir_all(directory.join(relative)).unwrap();
     assert!(matches!(
         ProjectStore::open(&directory),
+        Err(ProjectStoreError::ArtifactNotRegularFile { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_store_open_rejects_a_fifo_without_waiting_for_a_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = b"artifact";
+    let relative = "Artifacts/import/attempt-00000001/result.fifo";
+    let path = create_project_with_artifact(
+        temp.path(),
+        "Fifo",
+        &ArtifactRef {
+            relative_path: relative.to_owned(),
+            content_hash: blake3::hash(bytes).to_hex().to_string(),
+            byte_len: bytes.len() as u64,
+        },
+    );
+    fs::create_dir_all(path.join(relative).parent().unwrap()).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(path.join(relative))
+        .status()
+        .unwrap()
+        .success());
+
+    let (tx, rx) = mpsc::sync_channel(1);
+    let open_path = path.clone();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(ProjectStore::open(open_path));
+    });
+    let result = match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => result,
+        Err(error) => {
+            let writer = OpenOptions::new()
+                .write(true)
+                .open(path.join(relative))
+                .unwrap();
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+            drop(writer);
+            handle.join().unwrap();
+            panic!("artifact validation blocked while opening a FIFO: {error}");
+        }
+    };
+    handle.join().unwrap();
+
+    assert!(matches!(
+        result,
         Err(ProjectStoreError::ArtifactNotRegularFile { .. })
     ));
 }

@@ -6788,6 +6788,7 @@ dependencies = [
  "glam",
  "rfd",
  "rustgs",
+ "rustix 1.1.4",
  "rustslam",
  "serde",
  "serde_json",

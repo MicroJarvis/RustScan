@@ -18,6 +18,27 @@ pub enum ChangeKind {
     ViewerAppearance,
 }
 
+impl ChangeKind {
+    pub(crate) fn invalidates(self, stage: ProjectStage) -> bool {
+        let first = match self {
+            Self::Source | Self::ImportConfig => ProjectStage::Import,
+            Self::KeyframeSelection | Self::SfmConfig => ProjectStage::KeyframeSfm,
+            Self::PnpConfig => ProjectStage::FullFramePnp,
+            Self::TrainingConfig => ProjectStage::Training,
+            Self::ViewerAppearance => return false,
+        };
+        let first_index = ProjectStage::ORDER
+            .iter()
+            .position(|candidate| *candidate == first)
+            .expect("declared project stage");
+        let stage_index = ProjectStage::ORDER
+            .iter()
+            .position(|candidate| *candidate == stage)
+            .expect("declared project stage");
+        stage_index >= first_index
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ValidatedArtifacts {

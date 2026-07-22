@@ -327,11 +327,6 @@ pub enum ProjectManifestValidationError {
         expected: u32,
         found: u32,
     },
-    #[error("lease stage {stage:?} is not active; found {state:?}")]
-    LeaseStageNotActive {
-        stage: ProjectStage,
-        state: StageState,
-    },
     #[error("project manifest contains multiple active stages: {stages:?}")]
     MultipleActiveStages { stages: Vec<ProjectStage> },
     #[error("active stage {stage:?} is missing its project lease")]
