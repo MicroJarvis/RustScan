@@ -331,6 +331,121 @@ mod tests {
     }
 
     #[test]
+    fn dependency_readiness_rejects_early_work_and_promotes_only_the_direct_successor() {
+        let mut manifest = ProjectManifest::new("Flowers", SourceSpec::managed_images("source-a"));
+
+        assert_eq!(
+            manifest.transition(ProjectStage::KeyframeSfm, StageState::Ready),
+            Err(ProjectStateError::DependencyNotReady {
+                stage: ProjectStage::KeyframeSfm,
+                predecessor: ProjectStage::Import,
+            })
+        );
+        force_state(&mut manifest, ProjectStage::KeyframeSfm, StageState::Ready);
+        assert_eq!(
+            manifest.transition(ProjectStage::KeyframeSfm, StageState::Queued),
+            Err(ProjectStateError::DependencyNotReady {
+                stage: ProjectStage::KeyframeSfm,
+                predecessor: ProjectStage::Import,
+            })
+        );
+        force_state(
+            &mut manifest,
+            ProjectStage::KeyframeSfm,
+            StageState::NotStarted,
+        );
+
+        manifest
+            .transition(ProjectStage::Import, StageState::Queued)
+            .unwrap();
+        manifest
+            .transition(ProjectStage::Import, StageState::Running)
+            .unwrap();
+        manifest
+            .commit_stage_success(
+                ProjectStage::Import,
+                validated_artifacts(ProjectStage::Import),
+            )
+            .unwrap();
+
+        assert_eq!(
+            manifest.stage(ProjectStage::Import).state,
+            StageState::Succeeded
+        );
+        assert_eq!(
+            manifest.stage(ProjectStage::KeyframeSfm).state,
+            StageState::Ready
+        );
+        for stage in [
+            ProjectStage::FullFramePnp,
+            ProjectStage::Training,
+            ProjectStage::Complete,
+        ] {
+            assert_eq!(manifest.stage(stage).state, StageState::NotStarted);
+            assert!(!manifest.dependencies_ready(stage));
+        }
+    }
+
+    #[test]
+    fn invalidation_handles_incomplete_states_and_viewer_appearance_is_a_no_op() {
+        let mut manifest = ProjectManifest::new("Flowers", SourceSpec::managed_images("source-a"));
+        manifest
+            .transition(ProjectStage::Import, StageState::Queued)
+            .unwrap();
+        manifest
+            .transition(ProjectStage::Import, StageState::Running)
+            .unwrap();
+        manifest
+            .commit_stage_success(
+                ProjectStage::Import,
+                validated_artifacts(ProjectStage::Import),
+            )
+            .unwrap();
+        force_state(&mut manifest, ProjectStage::KeyframeSfm, StageState::Failed);
+        force_state(
+            &mut manifest,
+            ProjectStage::FullFramePnp,
+            StageState::Queued,
+        );
+        force_state(
+            &mut manifest,
+            ProjectStage::Training,
+            StageState::NotStarted,
+        );
+        force_state(
+            &mut manifest,
+            ProjectStage::Complete,
+            StageState::PauseRequested,
+        );
+
+        let before_viewer_change = manifest.clone();
+        manifest.invalidate(ChangeKind::ViewerAppearance);
+        assert_eq!(manifest, before_viewer_change);
+
+        manifest.invalidate(ChangeKind::KeyframeSelection);
+        assert_eq!(
+            manifest.stage(ProjectStage::Import).state,
+            StageState::Succeeded
+        );
+        assert_eq!(
+            manifest.stage(ProjectStage::KeyframeSfm).state,
+            StageState::Ready
+        );
+        assert_eq!(
+            manifest.stage(ProjectStage::FullFramePnp).state,
+            StageState::Ready
+        );
+        assert_eq!(
+            manifest.stage(ProjectStage::Training).state,
+            StageState::NotStarted
+        );
+        assert_eq!(
+            manifest.stage(ProjectStage::Complete).state,
+            StageState::Ready
+        );
+    }
+
+    #[test]
     fn success_commit_accepts_running_and_both_request_races() {
         for terminal_race in [
             StageState::Running,
