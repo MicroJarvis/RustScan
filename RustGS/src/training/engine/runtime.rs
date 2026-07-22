@@ -224,6 +224,11 @@ where
         ));
     }
 
+    let initial_splats = resume_checkpoint
+        .is_none()
+        .then(|| build_initial_splats(dataset, config))
+        .transpose()?;
+
     let shared_device = shared_wgpu_context.map(|context| || context.training_device());
     let (start_iteration, device) = prepare_resume_runtime(
         dataset,
@@ -239,10 +244,6 @@ where
     let input_height = dataset.intrinsics.height as usize;
     let (target_width, target_height) =
         scaled_dimensions(input_width, input_height, config.raster.render_scale);
-    let initial_splats = resume_checkpoint
-        .is_none()
-        .then(|| build_initial_splats(dataset, config))
-        .transpose()?;
     let training_splats = resume_checkpoint
         .map(|checkpoint| &checkpoint.splats)
         .or(initial_splats.as_ref())
@@ -867,6 +868,20 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let dataset = identity_dataset(&temp);
+        let mut dataset_without_points = dataset.clone();
+        dataset_without_points.initial_points.clear();
+        let error = train_splats_with_device_factory(
+            &dataset_without_points,
+            &config,
+            TrainingOptions::new(),
+            || panic!("device factory must not run before new-run splat initialization"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_input_message(error),
+            "training now requires COLMAP sparse points for initialization; no initial_points were found in the dataset"
+        );
+
         let error = train_splats_with_device_factory(
             &dataset,
             &config,
