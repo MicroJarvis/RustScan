@@ -137,9 +137,12 @@ fn every_declared_generic_transition_is_legal() {
         (StageState::Queued, StageState::Running),
         (StageState::Running, StageState::PauseRequested),
         (StageState::PauseRequested, StageState::Paused),
+        (StageState::PauseRequested, StageState::CancelRequested),
+        (StageState::PauseRequested, StageState::Failed),
         (StageState::Paused, StageState::Queued),
         (StageState::Running, StageState::CancelRequested),
         (StageState::CancelRequested, StageState::Cancelled),
+        (StageState::CancelRequested, StageState::Failed),
         (StageState::Cancelled, StageState::Queued),
         (StageState::Running, StageState::Failed),
         (StageState::Failed, StageState::Queued),
@@ -158,11 +161,75 @@ fn every_declared_generic_transition_is_legal() {
 }
 
 #[test]
+fn cancel_supersedes_pause_before_worker_cancellation_completes() {
+    let mut manifest = ProjectManifest::new("Flowers", SourceSpec::managed_images("source-a"));
+    manifest
+        .transition(ProjectStage::Import, StageState::Queued)
+        .unwrap();
+    manifest
+        .transition(ProjectStage::Import, StageState::Running)
+        .unwrap();
+    manifest
+        .transition(ProjectStage::Import, StageState::PauseRequested)
+        .unwrap();
+
+    manifest
+        .transition(ProjectStage::Import, StageState::CancelRequested)
+        .unwrap();
+    assert_eq!(
+        manifest.stage(ProjectStage::Import).state,
+        StageState::CancelRequested
+    );
+    manifest
+        .transition(ProjectStage::Import, StageState::Cancelled)
+        .unwrap();
+    assert_eq!(
+        manifest.stage(ProjectStage::Import).state,
+        StageState::Cancelled
+    );
+}
+
+#[test]
+fn request_states_can_fail_without_losing_attempt_or_artifacts() {
+    for requested in [StageState::PauseRequested, StageState::CancelRequested] {
+        let mut manifest = ProjectManifest::new("Flowers", SourceSpec::managed_images("source-a"));
+        manifest
+            .transition(ProjectStage::Import, StageState::Queued)
+            .unwrap();
+        manifest
+            .transition(ProjectStage::Import, StageState::Running)
+            .unwrap();
+        manifest
+            .transition(ProjectStage::Import, requested)
+            .unwrap();
+
+        let artifact = artifact_for(ProjectStage::Import);
+        {
+            let record = manifest.stage_mut(ProjectStage::Import);
+            record.artifacts = vec![artifact.clone()];
+            record.updated_unix_ms = 0;
+        }
+        let attempt = manifest.stage(ProjectStage::Import).attempt;
+
+        manifest
+            .transition(ProjectStage::Import, StageState::Failed)
+            .unwrap();
+
+        let failed = manifest.stage(ProjectStage::Import);
+        assert_eq!(failed.state, StageState::Failed);
+        assert_eq!(failed.attempt, attempt);
+        assert_eq!(failed.artifacts, vec![artifact]);
+        assert!(failed.updated_unix_ms > 0);
+    }
+}
+
+#[test]
 fn representative_undeclared_transition_jumps_are_illegal() {
     let illegal = [
         (StageState::NotStarted, StageState::Queued),
         (StageState::Ready, StageState::Running),
         (StageState::Queued, StageState::Paused),
+        (StageState::Queued, StageState::Failed),
         (StageState::Running, StageState::Paused),
         (StageState::Running, StageState::Succeeded),
         (StageState::Paused, StageState::Succeeded),
