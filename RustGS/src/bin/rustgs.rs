@@ -35,6 +35,22 @@ struct TrainArgs {
     #[arg(short, long, default_value = "output/scene.ply")]
     output: PathBuf,
 
+    /// Directory for periodic training checkpoints
+    #[arg(long)]
+    checkpoint_dir: Option<PathBuf>,
+
+    /// Save a periodic training checkpoint every N iterations
+    #[arg(
+        long,
+        requires = "checkpoint_dir",
+        value_parser = parse_positive_usize
+    )]
+    checkpoint_every: Option<usize>,
+
+    /// Resume training from a saved training checkpoint
+    #[arg(long)]
+    resume: Option<PathBuf>,
+
     /// Path to a JSON training config file. Defaults to <input>/rustgs-train.json when present.
     #[arg(long)]
     train_config: Option<PathBuf>,
@@ -416,6 +432,16 @@ struct TrainArgs {
     eval_crop_rect: Option<String>,
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid positive integer '{value}': {error}"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone, clap::Args)]
 struct RenderArgs {
     /// Path to scene .splat or PLY file
@@ -517,6 +543,175 @@ mod tests {
             panic!("expected train command");
         };
         assert_eq!(args.output, PathBuf::from("output/scene.ply"));
+        assert_eq!(args.checkpoint_dir, None);
+        assert_eq!(args.checkpoint_every, None);
+        assert_eq!(args.resume, None);
+    }
+
+    #[test]
+    fn training_parses_resume_checkpoint_paths_and_cadence_exactly() {
+        let cli = Cli::try_parse_from([
+            "rustgs",
+            "train",
+            "--input",
+            "dataset",
+            "--checkpoint-dir",
+            "checkpoints/run-7",
+            "--checkpoint-every",
+            "125",
+            "--resume",
+            "checkpoints/run-6/iteration-001000.rgscp",
+        ])
+        .unwrap();
+        let Commands::Train(args) = cli.command else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(
+            args.checkpoint_dir,
+            Some(PathBuf::from("checkpoints/run-7"))
+        );
+        assert_eq!(args.checkpoint_every, Some(125));
+        assert_eq!(
+            args.resume,
+            Some(PathBuf::from("checkpoints/run-6/iteration-001000.rgscp"))
+        );
+    }
+
+    #[test]
+    fn training_defaults_checkpoint_cadence_only_when_directory_is_supplied() {
+        let cli = Cli::try_parse_from([
+            "rustgs",
+            "train",
+            "--input",
+            "dataset",
+            "--checkpoint-dir",
+            "checkpoints",
+        ])
+        .unwrap();
+        let Commands::Train(args) = cli.command else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(args.checkpoint_every, None);
+        assert_eq!(
+            train_command::effective_checkpoint_every(&args),
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn training_rejects_zero_checkpoint_cadence() {
+        let error = Cli::try_parse_from([
+            "rustgs",
+            "train",
+            "--input",
+            "dataset",
+            "--checkpoint-dir",
+            "checkpoints",
+            "--checkpoint-every",
+            "0",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn training_rejects_checkpoint_cadence_without_directory() {
+        let error = Cli::try_parse_from([
+            "rustgs",
+            "train",
+            "--input",
+            "dataset",
+            "--checkpoint-every",
+            "125",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--checkpoint-dir"));
+    }
+
+    #[test]
+    fn training_options_preserve_defaults_without_checkpoint_flags() {
+        let cli = Cli::try_parse_from(["rustgs", "train", "--input", "does-not-exist"]).unwrap();
+        let Commands::Train(args) = cli.command else {
+            panic!("expected train command");
+        };
+        let dataset =
+            rustgs::TrainingDataset::new(rustgs::Intrinsics::new(1.0, 1.0, 0.5, 0.5, 1, 1));
+
+        let options =
+            train_command::training_options(&args, &dataset, &rustgs::TrainingConfig::default())
+                .unwrap();
+
+        assert!(options.identity.is_none());
+        assert!(options.resume_checkpoint.is_none());
+        assert_eq!(options.checkpoint_policy, Default::default());
+        assert!(options.on_checkpoint.is_none());
+    }
+
+    #[test]
+    fn training_options_attach_identity_default_cadence_and_sink() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("sparse");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::write(input.join("cameras.txt"), "reconstruction").unwrap();
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let cli = Cli::try_parse_from([
+            "rustgs",
+            "train",
+            "--input",
+            input.to_str().unwrap(),
+            "--checkpoint-dir",
+            checkpoint_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Commands::Train(args) = cli.command else {
+            panic!("expected train command");
+        };
+        let dataset =
+            rustgs::TrainingDataset::new(rustgs::Intrinsics::new(1.0, 1.0, 0.5, 0.5, 1, 1));
+
+        let options =
+            train_command::training_options(&args, &dataset, &rustgs::TrainingConfig::default())
+                .unwrap();
+
+        assert!(options.identity.is_some());
+        assert!(options.resume_checkpoint.is_none());
+        assert_eq!(options.checkpoint_policy.every, Some(1_000));
+        assert!(options.on_checkpoint.is_some());
+    }
+
+    #[test]
+    fn training_options_load_resume_checkpoint_before_training() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("sparse");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::write(input.join("cameras.txt"), "reconstruction").unwrap();
+        let resume = temp.path().join("resume.rgscp");
+        std::fs::write(&resume, "not a checkpoint").unwrap();
+        let cli = Cli::try_parse_from([
+            "rustgs",
+            "train",
+            "--input",
+            input.to_str().unwrap(),
+            "--resume",
+            resume.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Commands::Train(args) = cli.command else {
+            panic!("expected train command");
+        };
+        let dataset =
+            rustgs::TrainingDataset::new(rustgs::Intrinsics::new(1.0, 1.0, 0.5, 0.5, 1, 1));
+
+        let error =
+            train_command::training_options(&args, &dataset, &rustgs::TrainingConfig::default())
+                .err()
+                .expect("corrupt resume checkpoint must fail");
+
+        assert!(error.to_string().contains("checkpoint"));
     }
 }
 
