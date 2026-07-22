@@ -9,12 +9,13 @@ use bincode::Options;
 use rustgs::{
     load_training_checkpoint, save_training_checkpoint, train_splats, AdamCheckpoint,
     AdamParameterCheckpoint, HostSplats, Intrinsics, ScenePose, TensorCheckpoint,
-    TopologyCheckpoint, TrainingCheckpoint, TrainingCheckpointPolicy, TrainingConfig,
-    TrainingControl, TrainingDataset, TrainingError, TrainingEvent, TrainingEventCadence,
-    TrainingIdentity, TrainingOptions, TrainingRunDisposition, MAX_TRAINING_CHECKPOINT_BYTES,
-    MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
-    MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3,
-    TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
+    TopologyCheckpoint, TrainingCheckpoint, TrainingCheckpointPolicy, TrainingCheckpointReason,
+    TrainingConfig, TrainingControl, TrainingDataset, TrainingError, TrainingEvent,
+    TrainingEventCadence, TrainingIdentity, TrainingOptions, TrainingRunDisposition,
+    MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
+    MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
+    MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3, TRAINING_CHECKPOINT_FORMAT_VERSION,
+    TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
 };
 use serde::Serialize;
 
@@ -918,6 +919,37 @@ fn tiny_training_config(iterations: usize) -> TrainingConfig {
     }
 }
 
+fn continuity_training_dataset(temp: &tempfile::TempDir) -> TrainingDataset {
+    let mut dataset = TrainingDataset::new(Intrinsics::new(12.0, 12.0, 8.0, 8.0, 16, 16));
+    for frame_idx in 0..3_u8 {
+        let image_path = temp
+            .path()
+            .join(format!("continuity-frame-{frame_idx}.rgb"));
+        let mut pixels = Vec::with_capacity(16 * 16 * 3);
+        for y in 0..16_u8 {
+            for x in 0..16_u8 {
+                pixels.extend_from_slice(&[
+                    x.saturating_mul(10).saturating_add(frame_idx * 19),
+                    y.saturating_mul(10).saturating_add(frame_idx * 23),
+                    x.saturating_add(y)
+                        .saturating_mul(5)
+                        .saturating_add(frame_idx * 29),
+                ]);
+            }
+        }
+        fs::write(&image_path, pixels).unwrap();
+        dataset.add_pose(ScenePose::new(
+            frame_idx as u64,
+            image_path,
+            SE3::new(&[0.0, 0.0, 0.0, 1.0], &[frame_idx as f32 * 0.05, 0.0, 0.0]),
+            frame_idx as f64,
+        ));
+    }
+    dataset.add_point([0.0, 0.0, 2.0], Some([0.25, 0.5, 0.75]));
+    dataset.add_point([0.25, -0.2, 2.5], Some([0.75, 0.25, 0.5]));
+    dataset
+}
+
 #[test]
 fn pause_checkpoint_sink_failure_fails_run_without_paused_or_completed_events() {
     let temp = tempfile::tempdir().unwrap();
@@ -1612,16 +1644,39 @@ fn pause_after_iteration_seven_commits_checkpoint_before_terminal_events() {
 
 #[test]
 fn resumed_training_matches_uninterrupted_training_state() {
+    const FRAME_ORDER: [usize; 3] = [1, 0, 2];
+
     let temp = tempfile::tempdir().unwrap();
-    let dataset = tiny_training_dataset(&temp, "resumed-continuity-frame", 3);
-    let config = tiny_training_config(12);
+    let dataset = continuity_training_dataset(&temp);
+    for left in 0..dataset.poses.len() {
+        for right in left + 1..dataset.poses.len() {
+            assert_ne!(
+                dataset.poses[left].image_path,
+                dataset.poses[right].image_path
+            );
+            assert_ne!(dataset.poses[left].pose, dataset.poses[right].pose);
+        }
+    }
+    let mut config = tiny_training_config(12);
+    config.data.frame_prefetch_ahead = 2;
+    config.data.frame_shuffle_seed = 0x5eed_cafe;
     let identity =
         TrainingIdentity::from_canonical_content(&dataset, b"resumed-continuity", &config).unwrap();
 
+    let captured_checkpoint = Rc::new(RefCell::new(None));
+    let sink_checkpoint = Rc::clone(&captured_checkpoint);
     let uninterrupted = train_splats(
         &dataset,
         &config,
-        TrainingOptions::new().with_identity(identity.clone()),
+        TrainingOptions::new()
+            .with_identity(identity.clone())
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(7) })
+            .with_checkpoint_sink(move |ready| {
+                assert_eq!(ready.iteration, 7);
+                assert_eq!(ready.reason, TrainingCheckpointReason::Periodic);
+                *sink_checkpoint.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
     )
     .unwrap();
     assert_eq!(uninterrupted.report.completed_iterations, 12);
@@ -1630,42 +1685,27 @@ fn resumed_training_matches_uninterrupted_training_state() {
         TrainingRunDisposition::Completed
     );
     assert!(!uninterrupted.report.cancelled);
-
-    let control = TrainingControl::new(TrainingEventCadence {
-        progress_every: 1,
-        snapshot_every: None,
-    });
-    let event_control = control.clone();
-    let captured_checkpoint = Rc::new(RefCell::new(None));
-    let sink_checkpoint = Rc::clone(&captured_checkpoint);
-    let paused = train_splats(
-        &dataset,
-        &config,
-        TrainingOptions::new()
-            .with_control(control)
-            .with_identity(identity.clone())
-            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(7) })
-            .with_checkpoint_sink(move |ready| {
-                *sink_checkpoint.borrow_mut() = Some(ready.checkpoint.clone());
-                Ok(())
-            })
-            .with_event_sink(move |event| {
-                if matches!(
-                    event,
-                    TrainingEvent::IterationProgress(progress) if progress.iteration == 7
-                ) {
-                    event_control.request_pause();
-                }
-            }),
-    )
-    .unwrap();
-    assert_eq!(paused.report.completed_iterations, 7);
-    assert_eq!(paused.report.disposition, TrainingRunDisposition::Paused);
-    assert!(!paused.report.cancelled);
+    let uninterrupted_samples = &uninterrupted
+        .report
+        .telemetry
+        .as_ref()
+        .unwrap()
+        .loss_curve_samples;
+    assert_eq!(
+        uninterrupted_samples
+            .iter()
+            .map(|sample| sample.iteration)
+            .collect::<Vec<_>>(),
+        [12]
+    );
+    assert_eq!(
+        uninterrupted_samples[0].frame_idx,
+        FRAME_ORDER[(12 - 1) % dataset.poses.len()]
+    );
     let checkpoint = captured_checkpoint
         .borrow()
         .clone()
-        .expect("pause checkpoint");
+        .expect("periodic checkpoint");
     assert_eq!(checkpoint.completed_iterations, 7);
     assert_eq!(
         checkpoint.frame_shuffle_seed,
@@ -1677,7 +1717,7 @@ fn resumed_training_matches_uninterrupted_training_state() {
         &config,
         TrainingOptions::new()
             .with_identity(identity)
-            .with_resume_checkpoint(checkpoint.clone()),
+            .with_resume_checkpoint(checkpoint),
     )
     .unwrap();
     assert_eq!(resumed.report.completed_iterations, 12);
@@ -1691,9 +1731,11 @@ fn resumed_training_matches_uninterrupted_training_state() {
         uninterrupted.report.gaussian_count
     );
     assert_eq!(resumed.report.sh_degree, uninterrupted.report.sh_degree);
+    assert_eq!(resumed.splats.len(), uninterrupted.splats.len());
 
     let expected = uninterrupted.splats.as_view();
     let actual = resumed.splats.as_view();
+    assert_eq!(actual.sh_degree, expected.sh_degree);
     for (name, expected, actual) in [
         ("positions", expected.positions, actual.positions),
         ("log_scales", expected.log_scales, actual.log_scales),
@@ -1728,7 +1770,10 @@ fn resumed_training_matches_uninterrupted_training_state() {
         .first()
         .expect("resume telemetry sample");
     assert_eq!(first_sample.iteration, 8);
-    assert_eq!(first_sample.frame_idx, 7 % dataset.poses.len());
+    assert_eq!(
+        first_sample.frame_idx,
+        FRAME_ORDER[(8 - 1) % dataset.poses.len()]
+    );
     assert!(first_sample.total.is_some_and(f32::is_finite));
     assert!(resumed.report.final_loss.is_some_and(f32::is_finite));
     assert!(resumed.report.final_step_loss.is_some_and(f32::is_finite));
