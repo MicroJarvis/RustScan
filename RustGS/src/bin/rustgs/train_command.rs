@@ -200,8 +200,9 @@ pub(super) fn training_options(
         return Ok(rustgs::TrainingOptions::default());
     }
 
-    let sparse_dir = rustgs::resolve_colmap_sparse_dir(&args.input)?;
-    let identity = rustgs::TrainingIdentity::from_inputs(dataset, &sparse_dir, config)?;
+    let reconstruction = rustgs::fingerprint_colmap_sparse_model(&args.input)?;
+    let identity =
+        rustgs::TrainingIdentity::from_canonical_content(dataset, &reconstruction, config)?;
     let mut options = rustgs::TrainingOptions::default().with_identity(identity);
 
     if let Some(resume_path) = &args.resume {
