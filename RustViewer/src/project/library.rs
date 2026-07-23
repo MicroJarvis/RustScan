@@ -74,6 +74,11 @@ pub enum ProjectLibraryError {
         #[source]
         source: io::Error,
     },
+    #[error("project deletion completed but parent directory sync failed: {source}")]
+    DeleteCompletedButUnsynced {
+        #[source]
+        source: io::Error,
+    },
     #[error("delete recovery path is not a tombstone directory: {path:?}")]
     InvalidDeleteTombstone { path: PathBuf },
     #[error("project manifest is malformed: {0}")]
@@ -98,7 +103,7 @@ pub fn list_summaries(
         if name == "." || name == ".." {
             continue;
         }
-        if name.starts_with(DELETE_TOMBSTONE_PREFIX) {
+        if parse_delete_tombstone_name(&name).is_some() {
             continue;
         }
         let root = library_root_label.join(&name);
@@ -269,7 +274,7 @@ pub fn cleanup_delete_tombstone(tombstone: impl AsRef<Path>) -> Result<(), Proje
     let name = tombstone
         .file_name()
         .and_then(OsStr::to_str)
-        .filter(|name| name.starts_with(DELETE_TOMBSTONE_PREFIX))
+        .filter(|name| parse_delete_tombstone_name(name).is_some())
         .ok_or_else(|| ProjectLibraryError::InvalidDeleteTombstone {
             path: tombstone.clone(),
         })?;
@@ -285,10 +290,20 @@ fn delete_prepared_with_after_removal(
     target: DeleteTarget,
     after_removal: &mut impl FnMut() -> io::Result<()>,
 ) -> Result<(), ProjectLibraryError> {
+    delete_prepared_with_after_removal_and_parent_sync(target, after_removal, &mut |parent| {
+        parent.sync_all()
+    })
+}
+
+fn delete_prepared_with_after_removal_and_parent_sync(
+    target: DeleteTarget,
+    after_removal: &mut impl FnMut() -> io::Result<()>,
+    sync_parent: &mut impl FnMut(&File) -> io::Result<()>,
+) -> Result<(), ProjectLibraryError> {
     ensure_delete_target_identity(&target)?;
     let (tombstone_name, tombstone) = move_delete_target_to_tombstone(&target)?;
     let cleanup = (|| {
-        target.parent.sync_all()?;
+        sync_parent(&target.parent)?;
         remove_directory_contents(&target.root, after_removal)?;
         rustix_fs::unlinkat(
             &target.parent,
@@ -296,13 +311,20 @@ fn delete_prepared_with_after_removal(
             rustix_fs::AtFlags::REMOVEDIR,
         )
         .map_err(io::Error::from)?;
-        target.parent.sync_all()?;
         Ok(())
     })();
     if let Err(source) = cleanup {
         return Err(ProjectLibraryError::DeleteCleanupFailed { tombstone, source });
     }
+    if let Err(source) = sync_parent(&target.parent) {
+        return Err(ProjectLibraryError::DeleteCompletedButUnsynced { source });
+    }
     Ok(())
+}
+
+fn parse_delete_tombstone_name(name: &str) -> Option<Uuid> {
+    name.strip_prefix(DELETE_TOMBSTONE_PREFIX)
+        .and_then(|id| Uuid::parse_str(id).ok())
 }
 
 fn move_delete_target_to_tombstone(
@@ -333,6 +355,21 @@ fn delete_prepared_with_test_failure_after_removal(
         removals += 1;
         if removals >= fail_after {
             Err(io::Error::other("injected deletion cleanup failure"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(test)]
+fn delete_prepared_with_test_failure_after_final_sync(
+    target: DeleteTarget,
+) -> Result<(), ProjectLibraryError> {
+    let mut syncs = 0;
+    delete_prepared_with_after_removal_and_parent_sync(target, &mut || Ok(()), &mut |_| {
+        syncs += 1;
+        if syncs == 2 {
+            Err(io::Error::other("injected final parent sync failure"))
         } else {
             Ok(())
         }
@@ -996,6 +1033,61 @@ mod tests {
 
         cleanup_delete_tombstone(&tombstone).unwrap();
         assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn cleanup_delete_tombstone_rejects_a_prefix_match_without_a_uuid_and_preserves_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let tombstone = temp.path().join(".rustscan-delete-notes");
+        fs::create_dir(&tombstone).unwrap();
+        fs::write(tombstone.join("payload"), b"keep").unwrap();
+
+        let error = cleanup_delete_tombstone(&tombstone).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectLibraryError::InvalidDeleteTombstone { .. }
+        ));
+        assert!(tombstone.is_dir());
+        assert_eq!(fs::read(tombstone.join("payload")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn cleanup_delete_tombstone_removes_a_prefix_and_uuid_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let tombstone = temp
+            .path()
+            .join(format!("{DELETE_TOMBSTONE_PREFIX}{}", Uuid::new_v4()));
+        fs::create_dir(&tombstone).unwrap();
+        fs::write(tombstone.join("payload"), b"delete").unwrap();
+
+        cleanup_delete_tombstone(&tombstone).unwrap();
+
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn final_delete_sync_failure_reports_completed_but_unsynced_without_a_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Delete.rustscanproject");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("payload"), b"delete").unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let root_directory = open_directory_path(&root).unwrap();
+        let target = prepare_delete(&root_directory, &root).unwrap();
+
+        let error = delete_prepared_with_test_failure_after_final_sync(target).unwrap_err();
+
+        let ProjectLibraryError::DeleteCompletedButUnsynced { source } = error else {
+            panic!("expected a completed-but-unsynced delete error");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert!(!root.exists());
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(DELETE_TOMBSTONE_PREFIX)));
     }
 
     #[cfg(unix)]
