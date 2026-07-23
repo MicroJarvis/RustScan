@@ -25,10 +25,10 @@ use uuid::Uuid;
 
 use super::state::ValidatedArtifacts;
 use super::{
-    artifacts, events, ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot,
-    ProjectErrorRecord, ProjectLease, ProjectManifest, ProjectManifestValidationError,
-    ProjectStage, ProjectStateError, SfmConfigSnapshot, SourceSpec, StageState, SuggestedAction,
-    PROJECT_SCHEMA_VERSION,
+    artifacts, events, library, ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot,
+    ProjectErrorRecord, ProjectLease, ProjectLibraryError, ProjectManifest,
+    ProjectManifestValidationError, ProjectStage, ProjectStateError, SfmConfigSnapshot, SourceSpec,
+    StageState, SuggestedAction, PROJECT_SCHEMA_VERSION,
 };
 
 const PACKAGE_EXTENSION: &str = "rustscanproject";
@@ -399,6 +399,44 @@ impl ProjectStore {
 
     pub fn warnings(&self) -> &[ProjectStoreWarning] {
         &self.warnings
+    }
+
+    pub fn duplicate(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<super::ProjectSummary, ProjectLibraryError> {
+        library::duplicate_package(
+            &self.root_directory,
+            &self.root,
+            &self.manifest,
+            destination,
+        )
+    }
+
+    pub fn reveal_path(&self) -> Result<PathBuf, ProjectLibraryError> {
+        library::reveal_path(&self.root)
+    }
+
+    pub fn delete(self, confirmation_id: Uuid) -> Result<(), ProjectLibraryError> {
+        self.delete_with_before_deletion(confirmation_id, || {})
+    }
+
+    fn delete_with_before_deletion(
+        self,
+        confirmation_id: Uuid,
+        before_deletion: impl FnOnce(),
+    ) -> Result<(), ProjectLibraryError> {
+        if self.manifest.id() != confirmation_id {
+            return Err(ProjectLibraryError::DeleteConfirmationMismatch {
+                expected: self.manifest.id(),
+                provided: confirmation_id,
+            });
+        }
+        let target = library::prepare_delete(&self.root_directory, &self.root)?;
+        target.release_root_directory_lock()?;
+        drop(self);
+        before_deletion();
+        library::delete_prepared(target)
     }
 
     pub fn take_warnings(&mut self) -> Vec<ProjectStoreWarning> {
@@ -2383,6 +2421,52 @@ mod tests {
             StageState::Failed
         );
         assert_eq!(store.manifest().lease(), None);
+    }
+
+    #[test]
+    fn project_library_refuses_duplicate_while_a_stage_lease_is_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Active.rustscanproject");
+        let mut store = ProjectStore::create(
+            &source,
+            ProjectCreateRequest::new("Active", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        store.begin_stage(ProjectStage::Import).unwrap();
+
+        assert!(matches!(
+            store.duplicate(temp.path().join("Duplicate.rustscanproject")),
+            Err(ProjectLibraryError::ActiveLease)
+        ));
+    }
+
+    #[test]
+    fn project_library_delete_preserves_a_package_replaced_after_lock_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Delete.rustscanproject");
+        let moved = temp.path().join("Original.rustscanproject");
+        let store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Delete", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let id = store.manifest().id();
+        let replacement = root.join("replacement-must-survive");
+
+        let error = store
+            .delete_with_before_deletion(id, || {
+                let reopened = ProjectStore::open(&root)
+                    .expect("all writer locks must be released before deletion");
+                drop(reopened);
+                fs::rename(&root, &moved).unwrap();
+                fs::create_dir(&root).unwrap();
+                fs::write(&replacement, b"replacement").unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(fs::read(&replacement).unwrap(), b"replacement");
+        assert!(moved.join(MANIFEST_NAME).is_file());
     }
 
     #[test]

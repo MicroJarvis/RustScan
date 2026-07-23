@@ -1,9 +1,13 @@
 mod artifacts;
 mod events;
+mod library;
 mod manifest;
 mod state;
 mod store;
 
+pub use library::{
+    list_summaries, ProjectLibraryError, ProjectSummary, ProjectSummaryEntry, ProjectSummaryStatus,
+};
 pub use manifest::{
     ArtifactRef, ArtifactValidationError, CompatibilityRecord, ImportConfigSnapshot,
     PnpConfigSnapshot, ProjectErrorRecord, ProjectLease, ProjectManifest,

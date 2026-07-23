@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use rust_viewer::project::{
-    ArtifactRef, ImportConfigSnapshot, PnpConfigSnapshot, ProjectCreateRequest, ProjectLease,
-    ProjectManifest, ProjectManifestValidationError, ProjectStage, ProjectStore, ProjectStoreError,
-    SfmConfigSnapshot, SourceKind, SourceOwnership, SourceSpec, StageState, PROJECT_SCHEMA_VERSION,
+    list_summaries, ArtifactRef, ImportConfigSnapshot, PnpConfigSnapshot, ProjectCreateRequest,
+    ProjectLease, ProjectManifest, ProjectManifestValidationError, ProjectStage, ProjectStore,
+    ProjectStoreError, ProjectSummaryEntry, ProjectSummaryStatus, SfmConfigSnapshot, SourceKind,
+    SourceOwnership, SourceSpec, StageState, PROJECT_SCHEMA_VERSION,
 };
 
 const STAGES: [(ProjectStage, &str); 5] = [
@@ -1152,4 +1153,200 @@ fn project_store_logs_interrupted_recovery_after_repairing_missing_newline() {
     assert_eq!(event["kind"], "recovered_interrupted");
     assert_eq!(event["stage"], "import");
     assert_eq!(event["attempt"], 2);
+}
+
+#[test]
+fn project_library_lists_valid_and_invalid_packages_without_hashing_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("Library");
+    fs::create_dir(&library).unwrap();
+    let valid = create_succeeded_project(&library, "Valid");
+    let imported = valid.join("Artifacts/import/attempt-00000001/result.bin");
+    fs::write(&imported, b"modified after commit").unwrap();
+    let invalid = library.join("Broken.rustscanproject");
+    fs::create_dir(&invalid).unwrap();
+    fs::write(invalid.join("project.json"), b"{not valid json").unwrap();
+    fs::create_dir_all(library.join("Nested/Hidden.rustscanproject")).unwrap();
+
+    let summaries = list_summaries(&library).unwrap();
+
+    assert_eq!(summaries.len(), 2);
+    assert!(
+        summaries.iter().any(|entry| matches!(
+            entry,
+            ProjectSummaryEntry::Project(summary)
+                if summary.root == valid
+                    && summary.status == ProjectSummaryStatus::Complete
+        )),
+        "summaries: {summaries:#?}"
+    );
+    assert!(summaries.iter().any(|entry| matches!(
+        entry,
+        ProjectSummaryEntry::Invalid { root, error }
+            if root == &invalid && !error.is_empty()
+    )));
+}
+
+#[test]
+fn project_library_sorts_summaries_by_recency_name_and_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("Library");
+    fs::create_dir(&library).unwrap();
+    let first = ProjectStore::create(
+        library.join("First.rustscanproject"),
+        create_request("alpha"),
+    )
+    .unwrap();
+    let first_id = first.manifest().id();
+    drop(first);
+    let second = ProjectStore::create(
+        library.join("Second.rustscanproject"),
+        create_request("Bravo"),
+    )
+    .unwrap();
+    let second_id = second.manifest().id();
+    drop(second);
+    let third = ProjectStore::create(
+        library.join("Third.rustscanproject"),
+        create_request("Zulu"),
+    )
+    .unwrap();
+    let third_id = third.manifest().id();
+    drop(third);
+
+    for (name, updated) in [("First", 100_u64), ("Second", 200), ("Third", 200)] {
+        let path = library.join(format!("{name}.rustscanproject"));
+        let mut value = read_manifest_value(&path);
+        value["updated_unix_ms"] = serde_json::json!(updated);
+        write_manifest_value(&path, &value);
+    }
+
+    let ids = list_summaries(&library)
+        .unwrap()
+        .into_iter()
+        .map(|entry| match entry {
+            ProjectSummaryEntry::Project(summary) => summary.id,
+            ProjectSummaryEntry::Invalid { root, error } => {
+                panic!("unexpected invalid summary {root:?}: {error}")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec![second_id, third_id, first_id]);
+}
+
+#[test]
+fn project_library_duplicates_referenced_artifacts_with_a_new_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("Library");
+    fs::create_dir(&library).unwrap();
+    let source = create_succeeded_project(&library, "Source");
+    fs::create_dir_all(source.join("Cache/.staging/import-9")).unwrap();
+    fs::write(
+        source.join("Cache/.staging/import-9/partial.bin"),
+        b"partial",
+    )
+    .unwrap();
+    fs::write(source.join("Logs/old.log"), b"old log").unwrap();
+    fs::create_dir_all(source.join("Artifacts/import/attempt-00000009")).unwrap();
+    fs::write(
+        source.join("Artifacts/import/attempt-00000009/orphan.bin"),
+        b"orphan",
+    )
+    .unwrap();
+    let store = ProjectStore::open(&source).unwrap();
+    let source_id = store.manifest().id();
+    let destination = library.join("Duplicate.rustscanproject");
+
+    let duplicate = store.duplicate(&destination).unwrap();
+
+    assert_ne!(duplicate.id, source_id);
+    assert_eq!(duplicate.root, destination);
+    assert!(!destination.join("project.lock").exists());
+    assert!(!destination.join("Cache/.staging").exists());
+    assert!(!destination.join("Logs/old.log").exists());
+    assert!(!destination
+        .join("Artifacts/import/attempt-00000009/orphan.bin")
+        .exists());
+    let duplicated = ProjectStore::open(&destination).unwrap();
+    assert_eq!(duplicated.manifest().id(), duplicate.id);
+    assert_eq!(duplicated.manifest().lease(), None);
+    drop(duplicated);
+    let events =
+        String::from_utf8(fs::read(destination.join("Logs/events.jsonl")).unwrap()).unwrap();
+    assert!(events.contains("duplicated_from"));
+    assert!(events.contains(&source_id.to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_library_refuses_unsafe_duplicate_destinations() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("Library");
+    fs::create_dir(&library).unwrap();
+    let source = create_succeeded_project(&library, "Source");
+    let store = ProjectStore::open(&source).unwrap();
+
+    assert!(store.duplicate(&source).is_err());
+    assert!(store
+        .duplicate(source.join("Nested.rustscanproject"))
+        .is_err());
+    assert!(store.duplicate(library.join("not-a-package")).is_err());
+    let empty = library.join("Empty.rustscanproject");
+    fs::create_dir(&empty).unwrap();
+    let duplicated = store.duplicate(&empty).unwrap();
+    assert_eq!(duplicated.root, empty);
+    let nonempty = library.join("Nonempty.rustscanproject");
+    fs::create_dir(&nonempty).unwrap();
+    fs::write(nonempty.join("existing"), b"existing").unwrap();
+    assert!(store.duplicate(&nonempty).is_err());
+    let symlink_destination = library.join("Symlink.rustscanproject");
+    symlink(&source, &symlink_destination).unwrap();
+    assert!(store.duplicate(&symlink_destination).is_err());
+}
+
+#[test]
+fn project_library_reveals_canonical_root_and_deletes_only_the_confirmed_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("Library");
+    fs::create_dir(&library).unwrap();
+    let path = ProjectStore::create(
+        library.join("Delete.rustscanproject"),
+        create_request("Delete"),
+    )
+    .unwrap()
+    .root()
+    .to_path_buf();
+    let expected = fs::canonicalize(&path).unwrap();
+    let store = ProjectStore::open(&path).unwrap();
+    assert_eq!(store.reveal_path().unwrap(), expected);
+    assert!(store.delete(uuid::Uuid::new_v4()).is_err());
+    assert!(path.exists());
+
+    let store = ProjectStore::open(&path).unwrap();
+    let id = store.manifest().id();
+    store.delete(id).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn project_library_delete_preserves_a_replaced_package_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("Delete.rustscanproject");
+    let moved = temp.path().join("Original.rustscanproject");
+    let store = ProjectStore::create(&root, create_request("Delete")).unwrap();
+    let id = store.manifest().id();
+
+    fs::rename(&root, &moved).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = root.join("replacement-must-survive");
+    fs::write(&replacement, b"replacement").unwrap();
+
+    let error = store.delete(id).unwrap_err();
+
+    assert!(error.to_string().contains("changed"));
+    assert_eq!(fs::read(&replacement).unwrap(), b"replacement");
+    assert!(moved.join("project.json").is_file());
 }

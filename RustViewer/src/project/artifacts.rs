@@ -681,7 +681,7 @@ fn ensure_directory(root_directory: &File, relative: &Path) -> io::Result<File> 
     target_os = "linux",
     target_os = "redox"
 ))]
-fn rename_no_replace(
+pub(crate) fn rename_no_replace(
     old_directory: &File,
     old_name: impl rustix::path::Arg,
     new_directory: &File,
@@ -702,7 +702,7 @@ fn rename_no_replace(
     target_os = "linux",
     target_os = "redox"
 )))]
-fn rename_no_replace(
+pub(crate) fn rename_no_replace(
     _old_directory: &File,
     _old_name: impl rustix::path::Arg,
     _new_directory: &File,
