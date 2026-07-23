@@ -22,6 +22,7 @@ blake3 = "1"
 fs2 = "0.4"
 rustix = { version = "1.1", features = ["fs"] }
 image = "0.25"
+crossbeam-channel = "0.5"
 rustslam = { path = "../RustSLAM", default-features = false, features = ["viewer-types"] }
 rustgs = { path = "../RustGS", default-features = false, features = ["gpu"] }
 

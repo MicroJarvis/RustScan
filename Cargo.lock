@@ -6903,6 +6903,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytemuck",
+ "crossbeam-channel",
  "eframe",
  "egui",
  "fs2",

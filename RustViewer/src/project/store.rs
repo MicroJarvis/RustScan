@@ -746,6 +746,26 @@ impl ProjectStore {
         self.begin_stage_with_workspace_creator(stage, artifacts::create_workspace)
     }
 
+    pub(crate) fn restart_from_stage(
+        &mut self,
+        stage: ProjectStage,
+    ) -> Result<(), ProjectStoreError> {
+        if let Some(lease) = self.manifest.lease() {
+            return Err(ProjectStoreError::StageLeaseActive { stage: lease.stage });
+        }
+        let change = match stage {
+            ProjectStage::Import => super::ChangeKind::Source,
+            ProjectStage::KeyframeSfm => super::ChangeKind::SfmConfig,
+            ProjectStage::FullFramePnp => super::ChangeKind::PnpConfig,
+            ProjectStage::Training => super::ChangeKind::TrainingConfig,
+            ProjectStage::Complete => return Ok(()),
+        };
+        let mut next = self.manifest.clone();
+        next.invalidate(change);
+        let attempt = next.stage(stage).attempt();
+        self.persist_manifest(&next, Some(("restart_requested", stage, attempt)))
+    }
+
     fn begin_stage_with_workspace_creator(
         &mut self,
         stage: ProjectStage,
@@ -827,6 +847,23 @@ impl ProjectStore {
         stage: ProjectStage,
     ) -> Result<(), ProjectStoreError> {
         self.transition_active_stage(stage, StageState::PauseRequested, "pause_requested", false)
+    }
+
+    pub(crate) fn record_stage_progress(
+        &mut self,
+        stage: ProjectStage,
+        completed: Option<u64>,
+        total: Option<u64>,
+    ) -> Result<(), ProjectStoreError> {
+        let lease = self.require_stage_lease(stage)?.clone();
+        let mut next = self.manifest.clone();
+        let now = super::manifest::unix_time_ms();
+        let record = next.stage_mut(stage);
+        record.completed = completed;
+        record.total = total;
+        record.updated_unix_ms = now;
+        next.updated_unix_ms = now;
+        self.persist_manifest(&next, Some(("progress", stage, lease.attempt)))
     }
 
     pub(crate) fn request_stage_cancel(

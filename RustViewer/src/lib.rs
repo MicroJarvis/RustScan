@@ -3,6 +3,7 @@
 pub mod app;
 pub mod loader;
 pub mod media;
+pub mod pipeline;
 pub mod project;
 pub mod renderer;
 pub mod robot;

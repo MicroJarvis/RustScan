@@ -632,7 +632,7 @@ git commit -m "feat(viewer): decode macOS video with AVFoundation"
 - Modify: `RustViewer/src/lib.rs`
 - Test: `RustViewer/tests/pipeline_coordinator.rs`
 
-- [ ] **Step 1: Write failing workflow and race tests**
+- [x] **Step 1: Write failing workflow and race tests**
 
 Use scripted fake workers to cover success, pause, cancel, failure/retry, PnP coverage failure, downstream invalidation, and interrupted recovery. The core success assertion is:
 
@@ -644,7 +644,7 @@ assert_eq!(workers.start_order(), [ProjectStage::Import, ProjectStage::KeyframeS
 assert_eq!(workers.max_concurrent(), 1);
 ```
 
-- [ ] **Step 2: Run coordinator tests and verify RED**
+- [x] **Step 2: Run coordinator tests and verify RED**
 
 Run:
 
@@ -654,7 +654,7 @@ cargo test -p rust-viewer --test pipeline_coordinator
 
 Expected: FAIL because the coordinator does not exist.
 
-- [ ] **Step 3: Define typed commands, events, and worker outcome**
+- [x] **Step 3: Define typed commands, events, and worker outcome**
 
 ```rust
 pub enum PipelineCommand {
@@ -704,17 +704,17 @@ pub enum ArtifactValidation { ReadableFile, Json, ColmapSparse, RustGsCheckpoint
 
 Define one trait per stage (`ImportWorker`, `SfmWorker`, `PnpWorker`, `TrainingWorker`) sharing `run(request, control, event_sink)`. Worker types have no egui dependency.
 
-- [ ] **Step 4: Implement the single-job coordinator**
+- [x] **Step 4: Implement the single-job coordinator**
 
 Use `crossbeam_channel::bounded(64)` for events and `bounded(8)` for commands. The coordinator determines the next ready dependency, writes the lease, transitions `Ready -> Queued -> Running`, spawns one named thread, and ignores additional Start commands while active. It persists throttled progress at most once per second, but forwards in-memory events immediately.
 
 On outcome, commit/validate artifacts before `Succeeded`, preserve valid artifacts for pause/cancel, clear the lease, and schedule the next stage only for automatic mode. PnP success must additionally satisfy `registered_frames == imported_frames`; otherwise emit `NeedsAttention` and never start training.
 
-- [ ] **Step 5: Implement pause/cancel/retry/restart semantics**
+- [x] **Step 5: Implement pause/cancel/retry/restart semantics**
 
 Pause immediately stores `PauseRequested`, calls the worker control token, and waits for `Paused` plus committed boundary artifacts. Cancel follows the same pattern with `CancelRequested`/`Cancelled`. Retry increments only the selected stage attempt. Restart first marks the selected and downstream stages Ready/Stale through `ChangeKind`, retains old final artifacts until replacements succeed, and requires a caller confirmation boolean.
 
-- [ ] **Step 6: Run fake-worker tests**
+- [x] **Step 6: Run fake-worker tests**
 
 Run:
 
@@ -724,7 +724,7 @@ cargo test -p rust-viewer --test pipeline_coordinator
 
 Expected: PASS with one maximum concurrent worker, no direct Running-to-Paused transition, no training after incomplete PnP, and deterministic recovery.
 
-- [ ] **Step 7: Commit Task 6**
+- [x] **Step 7: Commit Task 6**
 
 ```bash
 git add RustViewer/src/pipeline RustViewer/src/lib.rs RustViewer/tests/pipeline_coordinator.rs
