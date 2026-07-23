@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-#[cfg(any(not(unix), test))]
+#[cfg(test)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
 use fs2::FileExt;
 #[cfg(unix)]
 use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
@@ -55,6 +56,8 @@ impl ProjectCreateRequest {
 
 #[derive(Debug, Error)]
 pub enum ProjectStoreError {
+    #[error("project storage requires Unix descriptor-relative filesystem operations")]
+    UnsupportedPlatform,
     #[error("project package path must end in .rustscanproject: {path:?}")]
     InvalidPackageSuffix { path: PathBuf },
     #[error("project destination exists and is not an empty directory: {path:?}")]
@@ -170,6 +173,7 @@ impl ProjectStore {
         after_parent_open: impl FnOnce(),
         after_lock: impl FnOnce(),
     ) -> Result<Self, ProjectStoreError> {
+        require_supported_platform()?;
         let path = path.as_ref();
         require_package_suffix(path)?;
         let manifest = ProjectManifest::new(request.display_name, request.source);
@@ -286,6 +290,7 @@ impl ProjectStore {
         after_parent_open: impl FnOnce(),
         before_artifact_validation: impl FnOnce(),
     ) -> Result<Self, ProjectStoreError> {
+        require_supported_platform()?;
         let path = path.as_ref();
         require_package_suffix(path)?;
         let package_parent_input = path
@@ -349,6 +354,7 @@ impl ProjectStore {
     }
 
     pub fn update_source(&mut self, source: SourceSpec) -> Result<(), ProjectStoreError> {
+        require_supported_platform()?;
         if self.manifest.source == source {
             return Ok(());
         }
@@ -363,6 +369,7 @@ impl ProjectStore {
         &mut self,
         config: ImportConfigSnapshot,
     ) -> Result<(), ProjectStoreError> {
+        require_supported_platform()?;
         if self.manifest.import_config == config {
             return Ok(());
         }
@@ -377,6 +384,7 @@ impl ProjectStore {
         &mut self,
         config: SfmConfigSnapshot,
     ) -> Result<(), ProjectStoreError> {
+        require_supported_platform()?;
         if self.manifest.sfm_config == config {
             return Ok(());
         }
@@ -391,6 +399,7 @@ impl ProjectStore {
         &mut self,
         config: PnpConfigSnapshot,
     ) -> Result<(), ProjectStoreError> {
+        require_supported_platform()?;
         if self.manifest.pnp_config == config {
             return Ok(());
         }
@@ -405,6 +414,7 @@ impl ProjectStore {
         &mut self,
         config: rustgs::TrainingConfig,
     ) -> Result<(), ProjectStoreError> {
+        require_supported_platform()?;
         if self.manifest.training_config == config {
             return Ok(());
         }
@@ -455,6 +465,7 @@ impl ProjectStore {
         manifest: &ProjectManifest,
         sync_parent: impl FnOnce(&Path) -> io::Result<()>,
     ) -> Result<Option<ProjectStoreWarning>, ProjectStoreError> {
+        require_supported_platform()?;
         manifest.validate()?;
         if manifest.id() != self.manifest.id() {
             return Err(ProjectStoreError::ProjectIdentityMismatch {
@@ -536,13 +547,25 @@ impl ProjectStore {
     }
 }
 
+fn require_supported_platform() -> Result<(), ProjectStoreError> {
+    platform_support(cfg!(unix))
+}
+
+fn platform_support(supported: bool) -> Result<(), ProjectStoreError> {
+    if supported {
+        Ok(())
+    } else {
+        Err(ProjectStoreError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(unix)]
 fn create_and_lock(
     root: &Path,
     root_directory: &File,
     cleanup: Option<&mut InitializationCleanup>,
 ) -> Result<File, ProjectStoreError> {
     let lock_path = root.join(LOCK_NAME);
-    #[cfg(unix)]
     let (file, created) = match rustix_fs::openat(
         root_directory,
         LOCK_NAME,
@@ -555,7 +578,7 @@ fn create_and_lock(
                 rustix_fs::openat(
                     root_directory,
                     LOCK_NAME,
-                    OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                     Mode::empty(),
                 )
                 .map_err(io::Error::from)?,
@@ -564,20 +587,13 @@ fn create_and_lock(
         ),
         Err(error) => return Err(io::Error::from(error).into()),
     };
-    #[cfg(not(unix))]
-    let (file, created) = match OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(file) => (file, true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
-            OpenOptions::new().read(true).write(true).open(&lock_path)?,
-            false,
-        ),
-        Err(error) => return Err(error.into()),
-    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "project lock is not a regular file",
+        )
+        .into());
+    }
     match file.try_lock_exclusive() {
         Ok(()) => {
             if created {
@@ -592,6 +608,15 @@ fn create_and_lock(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(not(unix))]
+fn create_and_lock(
+    _root: &Path,
+    _root_directory: &File,
+    _cleanup: Option<&mut InitializationCleanup>,
+) -> Result<File, ProjectStoreError> {
+    Err(ProjectStoreError::UnsupportedPlatform)
 }
 
 #[derive(Debug)]
@@ -652,7 +677,10 @@ impl InitializationCleanup {
             .map_err(io::Error::from)?;
         }
         #[cfg(not(unix))]
-        fs::create_dir(self.root.join(relative))?;
+        {
+            let _ = (root_directory, relative);
+            return Err(unsupported_platform_io());
+        }
         self.created
             .push(CreatedEntry::Directory(relative.to_path_buf()));
         Ok(true)
@@ -682,19 +710,7 @@ impl InitializationCleanup {
             }
             #[cfg(not(unix))]
             {
-                let path = match entry {
-                    CreatedEntry::File(relative) | CreatedEntry::Directory(relative) => {
-                        self.root.join(relative)
-                    }
-                };
-                match entry {
-                    CreatedEntry::File(_) => {
-                        let _ = fs::remove_file(path);
-                    }
-                    CreatedEntry::Directory(_) => {
-                        let _ = fs::remove_dir(path);
-                    }
-                }
+                let _ = (root_directory, entry);
             }
         }
 
@@ -706,6 +722,7 @@ impl InitializationCleanup {
     }
 }
 
+#[cfg(unix)]
 impl Drop for InitializationCleanup {
     fn drop(&mut self) {
         if !self.armed {
@@ -809,19 +826,6 @@ fn require_package_suffix(path: &Path) -> Result<(), ProjectStoreError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn is_bootstrap_destination(path: &Path) -> io::Result<bool> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_name() != OsStr::new(LOCK_NAME)
-            || !fs::symlink_metadata(entry.path())?.is_file()
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 fn schema_version(value: &serde_json::Value) -> Result<u32, ProjectStoreError> {
     value
         .get("schema_version")
@@ -877,6 +881,7 @@ fn write_manifest_bootstrap_with_parent_sync(
     .map_err(ProjectStoreError::Io)
 }
 
+#[cfg(unix)]
 fn write_bytes_atomic_in_directory_with_hooks(
     root_directory: &File,
     root: &Path,
@@ -887,8 +892,8 @@ fn write_bytes_atomic_in_directory_with_hooks(
 ) -> io::Result<Option<ProjectStoreWarning>> {
     let temporary_name = format!(".{destination_name}.{}.tmp", Uuid::new_v4());
     let temporary = root.join(&temporary_name);
+    let mut temporary_created = false;
     let before_rename = (|| {
-        #[cfg(unix)]
         let mut file = File::from(
             rustix_fs::openat(
                 root_directory,
@@ -898,15 +903,10 @@ fn write_bytes_atomic_in_directory_with_hooks(
             )
             .map_err(io::Error::from)?,
         );
-        #[cfg(not(unix))]
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
+        temporary_created = true;
         file.write_all(bytes)?;
         file.sync_all()?;
         before_rename(&temporary)?;
-        #[cfg(unix)]
         rustix_fs::renameat(
             root_directory,
             temporary_name.as_str(),
@@ -914,20 +914,27 @@ fn write_bytes_atomic_in_directory_with_hooks(
             destination_name,
         )
         .map_err(io::Error::from)?;
-        #[cfg(not(unix))]
-        fs::rename(&temporary, root.join(destination_name))?;
         Ok(())
     })();
-    if before_rename.is_err() {
-        #[cfg(unix)]
-        let _ = rustix_fs::unlinkat(
+    if let Err(operation_error) = before_rename {
+        if !temporary_created {
+            return Err(operation_error);
+        }
+        let cleanup_result = rustix_fs::unlinkat(
             root_directory,
             temporary_name.as_str(),
             rustix_fs::AtFlags::empty(),
-        );
-        #[cfg(not(unix))]
-        let _ = fs::remove_file(&temporary);
-        return before_rename.map(|()| None);
+        )
+        .map_err(io::Error::from);
+        if let Err(cleanup_error) = cleanup_result {
+            return Err(io::Error::new(
+                cleanup_error.kind(),
+                format!(
+                    "pre-rename operation failed: {operation_error}; temporary file cleanup failed: {cleanup_error}"
+                ),
+            ));
+        }
+        return Err(operation_error);
     }
     // Rename switches the manifest authority. A later durability failure must not invite a retry.
     let descriptor_error = root_directory.sync_all().err();
@@ -939,6 +946,18 @@ fn write_bytes_atomic_in_directory_with_hooks(
             detail: error.to_string(),
         }
     }))
+}
+
+#[cfg(not(unix))]
+fn write_bytes_atomic_in_directory_with_hooks(
+    _root_directory: &File,
+    _root: &Path,
+    _destination_name: &str,
+    _bytes: &[u8],
+    _sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+    _before_rename: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Option<ProjectStoreWarning>> {
+    Err(unsupported_platform_io())
 }
 
 fn sync_open_directory_with_hook(
@@ -1015,8 +1034,8 @@ fn open_directory_at(root_directory: &File, relative: &Path, _label: &Path) -> i
 }
 
 #[cfg(not(unix))]
-fn open_directory_at(_root_directory: &File, _relative: &Path, label: &Path) -> io::Result<File> {
-    File::open(label)
+fn open_directory_at(_root_directory: &File, _relative: &Path, _label: &Path) -> io::Result<File> {
+    Err(unsupported_platform_io())
 }
 
 #[cfg(unix)]
@@ -1092,38 +1111,19 @@ fn open_existing_package_root(
 #[cfg(not(unix))]
 fn open_or_create_package_root(
     _package_parent_directory: &File,
-    name: &OsStr,
-    root_label: &Path,
+    _name: &OsStr,
+    _root_label: &Path,
 ) -> Result<(File, bool), ProjectStoreError> {
-    if root_label.exists() {
-        let metadata = fs::symlink_metadata(root_label)?;
-        if !metadata.is_dir() || !is_bootstrap_destination(root_label)? {
-            return Err(ProjectStoreError::DestinationNotEmpty {
-                path: root_label.to_path_buf(),
-            });
-        }
-        Ok((File::open(root_label)?, false))
-    } else {
-        let parent = root_label.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "project package has no parent")
-        })?;
-        fs::create_dir(parent.join(name))?;
-        Ok((File::open(root_label)?, true))
-    }
+    Err(ProjectStoreError::UnsupportedPlatform)
 }
 
 #[cfg(not(unix))]
 fn open_existing_package_root(
     _package_parent_directory: &File,
     _name: &OsStr,
-    root_label: &Path,
+    _root_label: &Path,
 ) -> Result<File, ProjectStoreError> {
-    if fs::symlink_metadata(root_label)?.file_type().is_symlink() {
-        return Err(ProjectStoreError::SymlinkPackageRoot {
-            path: root_label.to_path_buf(),
-        });
-    }
-    Ok(File::open(root_label)?)
+    Err(ProjectStoreError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -1144,12 +1144,12 @@ fn is_bootstrap_destination_in_directory(root_directory: &File) -> io::Result<bo
 
 #[cfg(not(unix))]
 fn is_bootstrap_destination_in_directory(_root_directory: &File) -> io::Result<bool> {
-    Ok(true)
+    Err(unsupported_platform_io())
 }
 
 #[cfg(not(unix))]
-fn open_package_directory(root: &Path) -> io::Result<File> {
-    File::open(root)
+fn open_package_directory(_root: &Path) -> io::Result<File> {
+    Err(unsupported_platform_io())
 }
 
 #[cfg(unix)]
@@ -1174,8 +1174,8 @@ fn read_manifest_from_directory(root_directory: &File, _root: &Path) -> io::Resu
 }
 
 #[cfg(not(unix))]
-fn read_manifest_from_directory(_root_directory: &File, root: &Path) -> io::Result<Vec<u8>> {
-    fs::read(root.join(MANIFEST_NAME))
+fn read_manifest_from_directory(_root_directory: &File, _root: &Path) -> io::Result<Vec<u8>> {
+    Err(unsupported_platform_io())
 }
 
 #[cfg(unix)]
@@ -1257,44 +1257,18 @@ fn artifact_open_error(
 #[cfg(not(unix))]
 fn open_artifact_file(
     _root_directory: &File,
-    root: &Path,
-    relative: &Path,
+    _root: &Path,
+    _relative: &Path,
 ) -> Result<File, ProjectStoreError> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return Err(ProjectStoreError::ArtifactPathEscapesPackage {
-                path: relative.to_path_buf(),
-            });
-        };
-        current.push(part);
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ProjectStoreError::ArtifactMissing {
-                    path: relative.to_path_buf(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if metadata.file_type().is_symlink() {
-            return Err(ProjectStoreError::ArtifactSymlink {
-                path: relative.to_path_buf(),
-            });
-        }
-    }
-    let canonical = fs::canonicalize(&current)?;
-    if !canonical.starts_with(root) {
-        return Err(ProjectStoreError::ArtifactPathEscapesPackage {
-            path: relative.to_path_buf(),
-        });
-    }
-    if !fs::symlink_metadata(&current)?.is_file() {
-        return Err(ProjectStoreError::ArtifactNotRegularFile {
-            path: relative.to_path_buf(),
-        });
-    }
-    Ok(File::open(current)?)
+    Err(ProjectStoreError::UnsupportedPlatform)
+}
+
+#[cfg(not(unix))]
+fn unsupported_platform_io() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        ProjectStoreError::UnsupportedPlatform,
+    )
 }
 
 fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
@@ -1318,7 +1292,51 @@ fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::process::Command;
     use std::rc::Rc;
+
+    #[test]
+    fn project_store_rejects_platforms_without_descriptor_relative_io() {
+        assert!(matches!(
+            platform_support(false),
+            Err(ProjectStoreError::UnsupportedPlatform)
+        ));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn public_create_reports_the_unsupported_platform() {
+        let result = ProjectStore::create(
+            "Unsupported.rustscanproject",
+            ProjectCreateRequest::new("Unsupported", SourceSpec::managed_images("source-a")),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProjectStoreError::UnsupportedPlatform)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_and_lock_rejects_a_non_regular_existing_lock_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(LOCK_NAME);
+        assert!(Command::new("mkfifo")
+            .arg(&lock_path)
+            .status()
+            .unwrap()
+            .success());
+        let root_directory = open_package_directory(temp.path()).unwrap();
+
+        let result = create_and_lock(temp.path(), &root_directory, None);
+
+        assert!(matches!(
+            result,
+            Err(ProjectStoreError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
 
     #[test]
     fn typed_manifest_writer_rejects_project_identity_changes() {
@@ -1505,6 +1523,53 @@ mod tests {
         assert!(result.is_err());
         assert!(!destination.exists());
         assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_rename_temp_cleanup_failure_is_reported_with_the_original_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_directory = open_package_directory(temp.path()).unwrap();
+        let moved_temporary = temp.path().join("moved-project.tmp");
+
+        let error = write_bytes_atomic_in_directory_with_hooks(
+            &root_directory,
+            temp.path(),
+            MANIFEST_NAME,
+            b"replacement",
+            |_| Ok(()),
+            |temporary| {
+                fs::rename(temporary, &moved_temporary).unwrap();
+                Err(io::Error::other("injected pre-rename failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let detail = error.to_string();
+        assert!(detail.contains("injected pre-rename failure"));
+        assert!(detail.contains("temporary file cleanup failed"));
+        assert!(moved_temporary.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_creation_failure_does_not_report_a_cleanup_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_directory = open_package_directory(temp.path()).unwrap();
+
+        let error = write_bytes_atomic_in_directory_with_hooks(
+            &root_directory,
+            temp.path(),
+            "missing/project.json",
+            b"replacement",
+            |_| Ok(()),
+            |_| panic!("the hook must not run when temp creation fails"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!error.to_string().contains("temporary file cleanup failed"));
     }
 
     #[cfg(unix)]
