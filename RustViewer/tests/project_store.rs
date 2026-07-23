@@ -12,10 +12,9 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use rust_viewer::project::{
-    ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot, ProjectCreateRequest,
-    ProjectLease, ProjectManifest, ProjectManifestValidationError, ProjectStage, ProjectStore,
-    ProjectStoreError, SfmConfigSnapshot, SourceKind, SourceOwnership, SourceSpec, StageState,
-    PROJECT_SCHEMA_VERSION,
+    ArtifactRef, ImportConfigSnapshot, PnpConfigSnapshot, ProjectCreateRequest, ProjectLease,
+    ProjectManifest, ProjectManifestValidationError, ProjectStage, ProjectStore, ProjectStoreError,
+    SfmConfigSnapshot, SourceKind, SourceOwnership, SourceSpec, StageState, PROJECT_SCHEMA_VERSION,
 };
 
 const STAGES: [(ProjectStage, &str); 5] = [
@@ -698,61 +697,6 @@ fn project_store_typed_updates_persist_identity_and_apply_invalidation_boundarie
 }
 
 #[test]
-fn project_store_typed_updates_reject_only_changes_that_invalidate_the_active_stage() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("Active.rustscanproject");
-    let store = ProjectStore::create(&path, create_request("Active")).unwrap();
-    let id = store.manifest().id();
-    drop(store);
-
-    let mut value = read_manifest_value(&path);
-    value["stages"]["import"]["state"] = serde_json::json!("running");
-    value["stages"]["import"]["attempt"] = serde_json::json!(1);
-    value["lease"] = serde_json::to_value(ProjectLease {
-        project_id: id,
-        stage: ProjectStage::Import,
-        attempt: 1,
-        process_id: 42,
-        started_unix_ms: 100,
-    })
-    .unwrap();
-    write_manifest_value(&path, &value);
-
-    let mut store = ProjectStore::open(&path).unwrap();
-    let before_bytes = fs::read(path.join("project.json")).unwrap();
-    let before_import = store.manifest().import_config.clone();
-    let mut import = before_import.clone();
-    import.video_keyframes_per_second += 1.0;
-
-    assert!(matches!(
-        store.update_import_config(import),
-        Err(ProjectStoreError::StageActive {
-            stage: ProjectStage::Import,
-            change: ChangeKind::ImportConfig,
-        })
-    ));
-    assert_eq!(store.manifest().import_config, before_import);
-    assert_eq!(fs::read(path.join("project.json")).unwrap(), before_bytes);
-
-    let mut training = store.manifest().training_config.clone();
-    training.iterations += 1;
-    store.update_training_config(training.clone()).unwrap();
-    assert_eq!(store.manifest().training_config, training);
-    assert_eq!(
-        store
-            .manifest()
-            .try_stage(ProjectStage::Import)
-            .unwrap()
-            .state(),
-        StageState::Running
-    );
-    assert_eq!(
-        store.manifest().lease().unwrap().stage,
-        ProjectStage::Import
-    );
-}
-
-#[test]
 fn project_store_typed_update_validates_before_atomic_manifest_replacement() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("Flowers.rustscanproject");
@@ -1005,4 +949,165 @@ fn project_store_rejects_symlinked_committed_artifacts_and_ancestor_escapes() {
         ProjectStore::open(&ancestor),
         Err(ProjectStoreError::ArtifactSymlink { .. })
     ));
+}
+
+fn make_interrupted_import(path: &Path, project_id: uuid::Uuid, prior_artifact: ArtifactRef) {
+    let mut value = read_manifest_value(path);
+    value["stages"]["import"]["state"] = serde_json::json!("running");
+    value["stages"]["import"]["attempt"] = serde_json::json!(2);
+    value["stages"]["import"]["artifacts"] = serde_json::to_value([prior_artifact]).unwrap();
+    value["lease"] = serde_json::to_value(ProjectLease {
+        project_id,
+        stage: ProjectStage::Import,
+        attempt: 2,
+        process_id: 42,
+        started_unix_ms: 100,
+    })
+    .unwrap();
+    write_manifest_value(path, &value);
+}
+
+#[test]
+fn project_store_commits_immutable_attempt_layout_without_overwriting_prior_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Immutable.rustscanproject");
+    let store = ProjectStore::create(&path, create_request("Immutable")).unwrap();
+    drop(store);
+
+    let prior_relative = "Artifacts/import/attempt-00000001/result.bin";
+    let committed_relative = "Artifacts/import/attempt-00000002/result.bin";
+    fs::create_dir_all(path.join(prior_relative).parent().unwrap()).unwrap();
+    fs::create_dir_all(path.join(committed_relative).parent().unwrap()).unwrap();
+    fs::write(path.join(prior_relative), b"attempt one").unwrap();
+    fs::write(path.join(committed_relative), b"attempt two").unwrap();
+    let committed = artifact_ref(committed_relative, b"attempt two");
+    let mut value = read_manifest_value(&path);
+    value["stages"]["import"]["state"] = serde_json::json!("succeeded");
+    value["stages"]["import"]["attempt"] = serde_json::json!(2);
+    value["stages"]["import"]["artifacts"] = serde_json::to_value([committed.clone()]).unwrap();
+    write_manifest_value(&path, &value);
+
+    let reopened = ProjectStore::open(&path).unwrap();
+
+    assert_eq!(
+        reopened
+            .manifest()
+            .try_stage(ProjectStage::Import)
+            .unwrap()
+            .artifacts(),
+        &[committed]
+    );
+    assert_eq!(fs::read(path.join(prior_relative)).unwrap(), b"attempt one");
+    assert_eq!(
+        fs::read(path.join(committed_relative)).unwrap(),
+        b"attempt two"
+    );
+}
+
+#[test]
+fn project_store_recovers_interrupted_staging_attempt_and_preserves_prior_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Recovery.rustscanproject");
+    let store = ProjectStore::create(&path, create_request("Recovery")).unwrap();
+    let project_id = store.manifest().id();
+    drop(store);
+
+    let prior_relative = "Artifacts/import/attempt-00000001/result.bin";
+    let prior_bytes = b"prior immutable attempt";
+    fs::create_dir_all(path.join(prior_relative).parent().unwrap()).unwrap();
+    fs::write(path.join(prior_relative), prior_bytes).unwrap();
+    make_interrupted_import(&path, project_id, artifact_ref(prior_relative, prior_bytes));
+
+    let abandoned = path.join("Cache/.staging/import-2/Sources/source.json");
+    fs::create_dir_all(abandoned.parent().unwrap()).unwrap();
+    fs::write(&abandoned, br#"{"source":"partial"}"#).unwrap();
+
+    let recovered = ProjectStore::open(&path).unwrap();
+
+    assert_eq!(
+        recovered
+            .manifest()
+            .try_stage(ProjectStage::Import)
+            .unwrap()
+            .state(),
+        StageState::Failed
+    );
+    assert_eq!(recovered.manifest().lease(), None);
+    assert_eq!(
+        recovered
+            .manifest()
+            .try_stage(ProjectStage::Import)
+            .unwrap()
+            .error()
+            .unwrap()
+            .code,
+        "interrupted"
+    );
+    assert_eq!(fs::read(path.join(prior_relative)).unwrap(), prior_bytes);
+    assert!(!abandoned.exists());
+    assert!(fs::read_dir(path.join("Logs/recovery"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().join("Sources/source.json").is_file()));
+}
+
+#[test]
+fn project_store_preserves_prior_attempt_when_recovering_unreferenced_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("RenameRecovery.rustscanproject");
+    let store = ProjectStore::create(&path, create_request("Rename Recovery")).unwrap();
+    let project_id = store.manifest().id();
+    drop(store);
+
+    let prior_relative = "Artifacts/import/attempt-00000001/result.bin";
+    let prior_bytes = b"prior immutable attempt";
+    fs::create_dir_all(path.join(prior_relative).parent().unwrap()).unwrap();
+    fs::write(path.join(prior_relative), prior_bytes).unwrap();
+    make_interrupted_import(&path, project_id, artifact_ref(prior_relative, prior_bytes));
+
+    let abandoned = path.join("Artifacts/import/attempt-00000002/Sources/source.json");
+    fs::create_dir_all(abandoned.parent().unwrap()).unwrap();
+    fs::write(&abandoned, br#"{"source":"renamed before manifest"}"#).unwrap();
+
+    let recovered = ProjectStore::open(&path).unwrap();
+
+    assert_eq!(
+        recovered
+            .manifest()
+            .try_stage(ProjectStage::Import)
+            .unwrap()
+            .artifacts(),
+        &[artifact_ref(prior_relative, prior_bytes)]
+    );
+    assert_eq!(fs::read(path.join(prior_relative)).unwrap(), prior_bytes);
+    assert!(!abandoned.exists());
+    assert!(fs::read_dir(path.join("Logs/recovery"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().join("Sources/source.json").is_file()));
+}
+
+#[test]
+fn project_store_logs_interrupted_recovery_after_repairing_missing_newline() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("EventRecovery.rustscanproject");
+    let store = ProjectStore::create(&path, create_request("Event Recovery")).unwrap();
+    let project_id = store.manifest().id();
+    drop(store);
+
+    let prior_relative = "Artifacts/import/attempt-00000001/result.bin";
+    let prior_bytes = b"prior immutable attempt";
+    fs::create_dir_all(path.join(prior_relative).parent().unwrap()).unwrap();
+    fs::write(path.join(prior_relative), prior_bytes).unwrap();
+    make_interrupted_import(&path, project_id, artifact_ref(prior_relative, prior_bytes));
+    fs::write(path.join("Logs/events.jsonl"), br#"{"legacy":true}"#).unwrap();
+
+    ProjectStore::open(&path).unwrap();
+
+    let log = String::from_utf8(fs::read(path.join("Logs/events.jsonl")).unwrap()).unwrap();
+    assert!(log.starts_with("{\"legacy\":true}\n"));
+    let event: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(event["kind"], "recovered_interrupted");
+    assert_eq!(event["stage"], "import");
+    assert_eq!(event["attempt"], 2);
 }

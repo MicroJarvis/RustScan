@@ -15,9 +15,11 @@ use rustix::io::Errno;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::state::ValidatedArtifacts;
 use super::{
-    ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot, ProjectManifest,
-    ProjectManifestValidationError, ProjectStage, SfmConfigSnapshot, SourceSpec,
+    artifacts, events, ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot,
+    ProjectErrorRecord, ProjectLease, ProjectManifest, ProjectManifestValidationError,
+    ProjectStage, ProjectStateError, SfmConfigSnapshot, SourceSpec, StageState, SuggestedAction,
     PROJECT_SCHEMA_VERSION,
 };
 
@@ -38,6 +40,15 @@ const PACKAGE_DIRECTORIES: [&str; 12] = [
     "Logs",
     "Logs/recovery",
 ];
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitFailpoint {
+    None,
+    AfterWorkspaceSync,
+    AfterAttemptRename,
+    BeforeManifestWrite,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCreateRequest {
@@ -73,6 +84,24 @@ pub enum ProjectStoreError {
         stage: ProjectStage,
         change: ChangeKind,
     },
+    #[error("project already has an active lease for {stage:?}")]
+    StageLeaseActive { stage: ProjectStage },
+    #[error("project lease belongs to {found:?}, not {expected:?}")]
+    StageLeaseMismatch {
+        expected: ProjectStage,
+        found: ProjectStage,
+    },
+    #[error("stage workspace {found_stage:?} attempt {found_attempt} does not match {expected_stage:?} attempt {expected_attempt}")]
+    WorkspaceLeaseMismatch {
+        expected_stage: ProjectStage,
+        expected_attempt: u32,
+        found_stage: ProjectStage,
+        found_attempt: u32,
+    },
+    #[error("artifact commit failed: {detail}")]
+    ArtifactCommit { detail: String },
+    #[error("project stage state update failed: {0}")]
+    State(#[from] ProjectStateError),
     #[error("project manifest is missing a valid schema_version")]
     InvalidSchemaVersion,
     #[error("project schema version {found} is newer than supported version {supported}")]
@@ -122,6 +151,11 @@ pub enum ProjectStoreWarning {
         error_kind: io::ErrorKind,
         detail: String,
     },
+    EventAppendFailed {
+        path: PathBuf,
+        error_kind: io::ErrorKind,
+        detail: String,
+    },
 }
 
 #[derive(Debug)]
@@ -135,6 +169,7 @@ pub struct ProjectStore {
     _writer_directory_lock: File,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ProjectStore {
     pub fn create(
         path: impl AsRef<Path>,
@@ -332,7 +367,7 @@ impl ProjectStore {
             })?;
         manifest.validate()?;
 
-        let store = Self {
+        let mut store = Self {
             root,
             manifest,
             warnings: Vec::new(),
@@ -340,6 +375,7 @@ impl ProjectStore {
             _lock_file: lock_file,
             _writer_directory_lock: writer_directory_lock,
         };
+        store.recover_interrupted_stage()?;
         before_artifact_validation();
         store.validate_committed_artifacts()?;
         Ok(store)
@@ -552,6 +588,315 @@ impl ProjectStore {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn begin_stage(
+        &mut self,
+        stage: ProjectStage,
+    ) -> Result<artifacts::StageWorkspace, ProjectStoreError> {
+        require_supported_platform()?;
+        if let Some(lease) = self.manifest.lease() {
+            return Err(ProjectStoreError::StageLeaseActive { stage: lease.stage });
+        }
+
+        let mut next = self.manifest.clone();
+        match next.stage(stage).state() {
+            StageState::Stale => next.transition(stage, StageState::Ready)?,
+            StageState::Ready | StageState::Paused | StageState::Cancelled | StageState::Failed => {
+            }
+            _ => {
+                return Err(ProjectStoreError::State(
+                    ProjectStateError::IllegalTransition {
+                        stage,
+                        from: next.stage(stage).state(),
+                        to: StageState::Running,
+                    },
+                ));
+            }
+        }
+        next.transition(stage, StageState::Queued)?;
+        next.transition(stage, StageState::Running)?;
+        let attempt = next.stage(stage).attempt();
+        next.lease = Some(ProjectLease {
+            project_id: next.id(),
+            stage,
+            attempt,
+            process_id: std::process::id(),
+            started_unix_ms: super::manifest::unix_time_ms(),
+        });
+        next.validate()?;
+
+        let workspace =
+            artifacts::create_workspace(&self.root_directory, &self.root, stage, attempt)
+                .map_err(Self::artifact_commit_error)?;
+        if let Err(error) = self.persist_manifest(&next, Some(("began", stage, attempt))) {
+            let _ = artifacts::remove_empty_workspace(&self.root_directory, &workspace);
+            return Err(error);
+        }
+        Ok(workspace)
+    }
+
+    pub(crate) fn request_stage_pause(
+        &mut self,
+        stage: ProjectStage,
+    ) -> Result<(), ProjectStoreError> {
+        self.transition_active_stage(stage, StageState::PauseRequested, "pause_requested", false)
+    }
+
+    pub(crate) fn request_stage_cancel(
+        &mut self,
+        stage: ProjectStage,
+    ) -> Result<(), ProjectStoreError> {
+        self.transition_active_stage(
+            stage,
+            StageState::CancelRequested,
+            "cancel_requested",
+            false,
+        )
+    }
+
+    pub(crate) fn mark_stage_paused(
+        &mut self,
+        stage: ProjectStage,
+    ) -> Result<(), ProjectStoreError> {
+        self.transition_active_stage(stage, StageState::Paused, "paused", true)
+    }
+
+    pub(crate) fn mark_stage_cancelled(
+        &mut self,
+        stage: ProjectStage,
+    ) -> Result<(), ProjectStoreError> {
+        self.transition_active_stage(stage, StageState::Cancelled, "cancelled", true)
+    }
+
+    pub(crate) fn mark_stage_failed(
+        &mut self,
+        stage: ProjectStage,
+        error: ProjectErrorRecord,
+    ) -> Result<(), ProjectStoreError> {
+        if error.stage != stage {
+            return Err(ProjectStoreError::State(
+                ProjectStateError::IllegalTransition {
+                    stage,
+                    from: self.manifest.stage(stage).state(),
+                    to: StageState::Failed,
+                },
+            ));
+        }
+        let lease = self.require_stage_lease(stage)?.clone();
+        let mut next = self.manifest.clone();
+        next.transition(stage, StageState::Failed)?;
+        next.stage_mut(stage).error = Some(error);
+        next.lease = None;
+        self.persist_manifest(&next, Some(("failed", stage, lease.attempt)))
+    }
+
+    pub(crate) fn commit_stage_success(
+        &mut self,
+        workspace: &artifacts::StageWorkspace,
+        declarations: &[artifacts::StagedArtifact],
+        strict: bool,
+    ) -> Result<(), ProjectStoreError> {
+        self.commit_stage_success_with_hooks(workspace, declarations, strict, |_| Ok(()), || Ok(()))
+    }
+
+    #[cfg(test)]
+    fn commit_stage_success_with_failpoint(
+        &mut self,
+        workspace: &artifacts::StageWorkspace,
+        declarations: &[artifacts::StagedArtifact],
+        strict: bool,
+        failpoint: CommitFailpoint,
+    ) -> Result<(), ProjectStoreError> {
+        self.commit_stage_success_with_hooks(
+            workspace,
+            declarations,
+            strict,
+            |phase| {
+                let inject = matches!(
+                    (failpoint, phase),
+                    (
+                        CommitFailpoint::AfterWorkspaceSync,
+                        artifacts::CommitPhase::AfterWorkspaceSync
+                    ) | (
+                        CommitFailpoint::AfterAttemptRename,
+                        artifacts::CommitPhase::AfterAttemptRename
+                    )
+                );
+                if inject {
+                    Err(artifacts::ArtifactCommitError::Io(io::Error::other(
+                        "injected artifact commit failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                if failpoint == CommitFailpoint::BeforeManifestWrite {
+                    Err(artifacts::ArtifactCommitError::Io(io::Error::other(
+                        "injected manifest commit failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+
+    fn commit_stage_success_with_hooks(
+        &mut self,
+        workspace: &artifacts::StageWorkspace,
+        declarations: &[artifacts::StagedArtifact],
+        strict: bool,
+        phase_hook: impl FnMut(artifacts::CommitPhase) -> Result<(), artifacts::ArtifactCommitError>,
+        before_manifest: impl FnOnce() -> Result<(), artifacts::ArtifactCommitError>,
+    ) -> Result<(), ProjectStoreError> {
+        let lease = self.require_stage_lease(workspace.stage())?.clone();
+        if lease.attempt != workspace.attempt() {
+            return Err(ProjectStoreError::WorkspaceLeaseMismatch {
+                expected_stage: lease.stage,
+                expected_attempt: lease.attempt,
+                found_stage: workspace.stage(),
+                found_attempt: workspace.attempt(),
+            });
+        }
+        let artifacts = artifacts::commit_workspace(
+            &self.root_directory,
+            workspace,
+            declarations,
+            strict,
+            phase_hook,
+        )
+        .map_err(Self::artifact_commit_error)?;
+        before_manifest().map_err(Self::artifact_commit_error)?;
+
+        let mut next = self.manifest.clone();
+        let validated = ValidatedArtifacts::try_new(artifacts).map_err(|error| {
+            ProjectStoreError::ArtifactCommit {
+                detail: error.to_string(),
+            }
+        })?;
+        next.commit_stage_success(lease.stage, validated)?;
+        next.lease = None;
+        self.persist_manifest(&next, Some(("succeeded", lease.stage, lease.attempt)))
+    }
+
+    fn transition_active_stage(
+        &mut self,
+        stage: ProjectStage,
+        target: StageState,
+        event: &'static str,
+        clear_lease: bool,
+    ) -> Result<(), ProjectStoreError> {
+        let lease = self.require_stage_lease(stage)?.clone();
+        let mut next = self.manifest.clone();
+        next.transition(stage, target)?;
+        if clear_lease {
+            next.lease = None;
+        }
+        self.persist_manifest(&next, Some((event, stage, lease.attempt)))
+    }
+
+    fn require_stage_lease(&self, stage: ProjectStage) -> Result<&ProjectLease, ProjectStoreError> {
+        let lease = self
+            .manifest
+            .lease()
+            .ok_or(ProjectStoreError::StageLeaseMismatch {
+                expected: stage,
+                found: stage,
+            })?;
+        if lease.stage != stage {
+            return Err(ProjectStoreError::StageLeaseMismatch {
+                expected: stage,
+                found: lease.stage,
+            });
+        }
+        Ok(lease)
+    }
+
+    fn persist_manifest(
+        &mut self,
+        manifest: &ProjectManifest,
+        event: Option<(&'static str, ProjectStage, u32)>,
+    ) -> Result<(), ProjectStoreError> {
+        let warning = self.write_manifest_atomic_with_parent_sync(manifest, |_| Ok(()))?;
+        self.manifest = manifest.clone();
+        self.warnings.extend(warning);
+        if let Some((kind, stage, attempt)) = event {
+            self.append_event_nonfatal(kind, stage, attempt);
+        }
+        Ok(())
+    }
+
+    fn artifact_commit_error(error: artifacts::ArtifactCommitError) -> ProjectStoreError {
+        ProjectStoreError::ArtifactCommit {
+            detail: error.to_string(),
+        }
+    }
+
+    fn recover_interrupted_stage(&mut self) -> Result<(), ProjectStoreError> {
+        let Some(lease) = self.manifest.lease().cloned() else {
+            return Ok(());
+        };
+        let preserve_committed_attempt =
+            self.manifest_references_attempt(lease.stage, lease.attempt);
+        artifacts::recover_interrupted_attempts(
+            &self.root_directory,
+            lease.stage,
+            lease.attempt,
+            preserve_committed_attempt,
+        )?;
+
+        let mut recovered = self.manifest.clone();
+        recovered.transition(lease.stage, StageState::Failed)?;
+        recovered.stage_mut(lease.stage).error = Some(ProjectErrorRecord {
+            code: "interrupted".to_owned(),
+            stage: lease.stage,
+            summary: "Stage interrupted while the project was closed".to_owned(),
+            detail: "The unfinished workspace was moved to Logs/recovery.".to_owned(),
+            frame_id: None,
+            pair: None,
+            retryable: true,
+            suggested_actions: vec![SuggestedAction::OpenLog, SuggestedAction::Retry],
+        });
+        recovered.lease = None;
+        let warning = self.write_manifest_atomic_with_parent_sync(&recovered, |_| Ok(()))?;
+        self.manifest = recovered;
+        self.warnings.extend(warning);
+        self.append_event_nonfatal("recovered_interrupted", lease.stage, lease.attempt);
+        Ok(())
+    }
+
+    fn manifest_references_attempt(&self, stage: ProjectStage, attempt: u32) -> bool {
+        let attempt_root = artifacts::attempt_relative(stage, attempt);
+        let attempt_root = attempt_root.to_string_lossy();
+        self.manifest_artifacts().any(|artifact| {
+            artifact.relative_path == attempt_root
+                || artifact
+                    .relative_path
+                    .strip_prefix(attempt_root.as_ref())
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+
+    fn manifest_artifacts(&self) -> impl Iterator<Item = &ArtifactRef> {
+        ProjectStage::ORDER
+            .into_iter()
+            .flat_map(|stage| self.manifest.stage(stage).artifacts().iter())
+            .chain(self.manifest.active_scene.iter())
+            .chain(self.manifest.final_scene.iter())
+    }
+
+    fn append_event_nonfatal(&mut self, kind: &'static str, stage: ProjectStage, attempt: u32) {
+        let event =
+            events::ProjectEvent::new(kind, stage, attempt, super::manifest::unix_time_ms());
+        if let Err(error) = events::append(&self.root_directory, &event) {
+            self.warnings.push(ProjectStoreWarning::EventAppendFailed {
+                path: self.root.join("Logs/events.jsonl"),
+                error_kind: error.kind(),
+                detail: error.to_string(),
+            });
+        }
     }
 }
 
@@ -1840,6 +2185,228 @@ mod tests {
             original,
             "the original package artifact changed"
         );
+    }
+
+    #[test]
+    fn commit_failpoints_preserve_the_prior_attempt_for_recovery() {
+        let _ = CommitFailpoint::None;
+        for failpoint in [
+            CommitFailpoint::AfterWorkspaceSync,
+            CommitFailpoint::AfterAttemptRename,
+            CommitFailpoint::BeforeManifestWrite,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("Failpoint.rustscanproject");
+            let mut store = ProjectStore::create(
+                &root,
+                ProjectCreateRequest::new("Failpoint", SourceSpec::managed_images("source-a")),
+            )
+            .unwrap();
+            let first = store.begin_stage(ProjectStage::Import).unwrap();
+            fs::create_dir_all(first.path().join("Sources")).unwrap();
+            fs::write(
+                first.path().join("Sources/source.json"),
+                br#"{"version":1}"#,
+            )
+            .unwrap();
+            let declaration = artifacts::StagedArtifact::new(
+                "Sources/source.json",
+                artifacts::ArtifactValidationKind::Json,
+            )
+            .unwrap();
+            store
+                .commit_stage_success(&first, std::slice::from_ref(&declaration), true)
+                .unwrap();
+            let prior = store
+                .manifest()
+                .try_stage(ProjectStage::Import)
+                .unwrap()
+                .artifacts()
+                .to_vec();
+            let prior_path = root.join(&prior[0].relative_path);
+            let prior_bytes = fs::read(&prior_path).unwrap();
+
+            let mut config = store.manifest().import_config.clone();
+            config.video_keyframes_per_second += 1.0;
+            store.update_import_config(config).unwrap();
+            let second = store.begin_stage(ProjectStage::Import).unwrap();
+            fs::create_dir_all(second.path().join("Sources")).unwrap();
+            fs::write(
+                second.path().join("Sources/source.json"),
+                br#"{"version":2}"#,
+            )
+            .unwrap();
+
+            assert!(store
+                .commit_stage_success_with_failpoint(
+                    &second,
+                    std::slice::from_ref(&declaration),
+                    true,
+                    failpoint,
+                )
+                .is_err());
+            drop(store);
+
+            let reopened = ProjectStore::open(&root).unwrap();
+            assert_eq!(
+                reopened
+                    .manifest()
+                    .try_stage(ProjectStage::Import)
+                    .unwrap()
+                    .artifacts(),
+                prior
+            );
+            assert_eq!(fs::read(prior_path).unwrap(), prior_bytes);
+            assert_eq!(
+                reopened
+                    .manifest()
+                    .try_stage(ProjectStage::Import)
+                    .unwrap()
+                    .state(),
+                StageState::Failed
+            );
+            assert!(fs::read_dir(root.join("Logs/recovery"))
+                .unwrap()
+                .next()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn stage_controls_persist_authoritative_state_before_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Controls.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Controls", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+
+        store.begin_stage(ProjectStage::Import).unwrap();
+        assert!(store.manifest().lease().is_some());
+        let mut config = store.manifest().import_config.clone();
+        config.video_keyframes_per_second += 1.0;
+        assert!(matches!(
+            store.update_import_config(config),
+            Err(ProjectStoreError::StageActive {
+                stage: ProjectStage::Import,
+                change: ChangeKind::ImportConfig,
+            })
+        ));
+        store.request_stage_pause(ProjectStage::Import).unwrap();
+        assert_eq!(
+            store.manifest().stage(ProjectStage::Import).state(),
+            StageState::PauseRequested
+        );
+        store.mark_stage_paused(ProjectStage::Import).unwrap();
+        assert_eq!(store.manifest().lease(), None);
+
+        store.begin_stage(ProjectStage::Import).unwrap();
+        store.request_stage_cancel(ProjectStage::Import).unwrap();
+        store.mark_stage_cancelled(ProjectStage::Import).unwrap();
+        assert_eq!(store.manifest().lease(), None);
+
+        store.begin_stage(ProjectStage::Import).unwrap();
+        store
+            .mark_stage_failed(
+                ProjectStage::Import,
+                ProjectErrorRecord {
+                    code: "worker_failed".to_owned(),
+                    stage: ProjectStage::Import,
+                    summary: "Worker failed".to_owned(),
+                    detail: "Injected failure".to_owned(),
+                    frame_id: None,
+                    pair: None,
+                    retryable: true,
+                    suggested_actions: vec![SuggestedAction::Retry],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.manifest().stage(ProjectStage::Import).state(),
+            StageState::Failed
+        );
+        assert_eq!(store.manifest().lease(), None);
+    }
+
+    #[test]
+    fn stage_commit_streams_declared_files_into_one_immutable_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Artifacts.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Artifacts", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let workspace = store.begin_stage(ProjectStage::Import).unwrap();
+        let payload = workspace.path().join("Sources/source.json");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"{not valid json").unwrap();
+        let declaration = artifacts::StagedArtifact::new(
+            "Sources/source.json",
+            artifacts::ArtifactValidationKind::Json,
+        )
+        .unwrap();
+
+        assert!(store
+            .commit_stage_success(&workspace, std::slice::from_ref(&declaration), true)
+            .is_err());
+        fs::write(&payload, br#"{"source":"valid"}"#).unwrap();
+        fs::write(workspace.path().join("undeclared.bin"), b"undeclared").unwrap();
+        assert!(store
+            .commit_stage_success(&workspace, std::slice::from_ref(&declaration), true)
+            .is_err());
+        fs::remove_file(workspace.path().join("undeclared.bin")).unwrap();
+        assert!(store
+            .commit_stage_success(
+                &workspace,
+                &[declaration.clone(), declaration.clone()],
+                true,
+            )
+            .is_err());
+        assert!(artifacts::StagedArtifact::new(
+            "../outside.json",
+            artifacts::ArtifactValidationKind::Json,
+        )
+        .is_err());
+
+        store
+            .commit_stage_success(&workspace, std::slice::from_ref(&declaration), true)
+            .unwrap();
+        let artifacts = store.manifest().stage(ProjectStage::Import).artifacts();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].relative_path,
+            "Artifacts/import/attempt-00000001/Sources/source.json"
+        );
+        assert_eq!(
+            fs::read(root.join(&artifacts[0].relative_path)).unwrap(),
+            br#"{"source":"valid"}"#
+        );
+        assert!(!workspace.path().exists());
+    }
+
+    #[test]
+    fn event_append_failure_is_a_warning_after_stage_begin_is_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("EventWarning.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Event Warning", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        fs::create_dir(root.join("Logs/events.jsonl")).unwrap();
+
+        store.begin_stage(ProjectStage::Import).unwrap();
+
+        assert_eq!(
+            store.manifest().stage(ProjectStage::Import).state(),
+            StageState::Running
+        );
+        assert!(store
+            .warnings()
+            .iter()
+            .any(|warning| matches!(warning, ProjectStoreWarning::EventAppendFailed { .. })));
     }
 }
 
