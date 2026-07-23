@@ -323,8 +323,9 @@ fn delete_prepared_with_after_removal_and_parent_sync(
 }
 
 fn parse_delete_tombstone_name(name: &str) -> Option<Uuid> {
-    name.strip_prefix(DELETE_TOMBSTONE_PREFIX)
-        .and_then(|id| Uuid::parse_str(id).ok())
+    let id = name.strip_prefix(DELETE_TOMBSTONE_PREFIX)?;
+    let parsed = Uuid::parse_str(id).ok()?;
+    (id == parsed.hyphenated().to_string()).then_some(parsed)
 }
 
 fn move_delete_target_to_tombstone(
@@ -1050,6 +1051,39 @@ mod tests {
         ));
         assert!(tombstone.is_dir());
         assert_eq!(fs::read(tombstone.join("payload")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn noncanonical_uuid_tombstone_names_are_preserved_and_not_hidden_from_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let names = [
+            format!("{DELETE_TOMBSTONE_PREFIX}{}", id.simple()),
+            format!("{DELETE_TOMBSTONE_PREFIX}{{{id}}}"),
+            format!("{DELETE_TOMBSTONE_PREFIX}urn:uuid:{id}"),
+        ];
+
+        for name in &names {
+            let path = temp.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("payload"), b"keep").unwrap();
+        }
+        let listed_package = temp.path().join("Listed.rustscanproject");
+        fs::create_dir(&listed_package).unwrap();
+
+        assert!(matches!(
+            list_summaries(temp.path()).unwrap().as_slice(),
+            [ProjectSummaryEntry::Invalid { root, .. }] if root == &listed_package
+        ));
+        for name in names {
+            let tombstone = temp.path().join(name);
+            assert!(matches!(
+                cleanup_delete_tombstone(&tombstone),
+                Err(ProjectLibraryError::InvalidDeleteTombstone { .. })
+            ));
+            assert!(tombstone.is_dir());
+            assert_eq!(fs::read(tombstone.join("payload")).unwrap(), b"keep");
+        }
     }
 
     #[test]
