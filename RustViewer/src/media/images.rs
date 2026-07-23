@@ -110,6 +110,10 @@ pub enum MediaImportError {
     FailedStagePersistence { import: String, state: String },
     #[error("image import commit failed ({commit}) and recovery could not complete: {recovery}")]
     CommitRecoveryRequired { commit: String, recovery: String },
+    #[error("video decoder failed: {0}")]
+    VideoDecoderFailed(String),
+    #[error("video decoder was cancelled")]
+    VideoDecoderCancelled,
 }
 
 pub fn import_image_sequence(

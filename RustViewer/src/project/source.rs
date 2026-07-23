@@ -89,6 +89,54 @@ impl SourceBookmark {
         }
         Ok(operation(&self.canonical_paths))
     }
+
+    /// Resolves exactly one source path and retains its macOS security scope for the
+    /// returned guard's full lifetime. Callers must not retain a bare path beyond it.
+    pub(crate) fn resolve_single_path_with_scope(
+        &self,
+    ) -> Result<ScopedSourcePath, SourceBookmarkError> {
+        if self.canonical_paths.len() != 1 {
+            return Err(SourceBookmarkError::ExpectedSinglePath {
+                found: self.canonical_paths.len(),
+            });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let bookmarks = self
+                .macos_security_scoped
+                .as_ref()
+                .ok_or(SourceBookmarkError::MissingSecurityScope)?;
+            if bookmarks.len() != 1 {
+                return Err(SourceBookmarkError::ExpectedSinglePath {
+                    found: bookmarks.len(),
+                });
+            }
+            let access = resolve_macos_security_scoped_bookmark(&bookmarks[0])?;
+            let path = PathBuf::from(&access.path);
+            return Ok(ScopedSourcePath {
+                path,
+                access: Some(access),
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(ScopedSourcePath {
+            path: PathBuf::from(&self.canonical_paths[0]),
+        })
+    }
+}
+
+/// A source path that may be used only while its owning scope guard remains alive.
+pub(crate) struct ScopedSourcePath {
+    path: PathBuf,
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)] // Retained solely to balance the security scope in Drop.
+    access: Option<SecurityScopedPath>,
+}
+
+impl ScopedSourcePath {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +149,13 @@ pub(crate) enum SourceBookmarkError {
     #[cfg(target_os = "macos")]
     #[error("macOS security-scoped bookmark is stale; relink or reimport the source")]
     Stale,
+    #[error("source bookmark must contain exactly one path, found {found}")]
+    ExpectedSinglePath { found: usize },
+    #[cfg(target_os = "macos")]
+    #[error(
+        "macOS source bookmark does not contain a security scope; relink or reimport the source"
+    )]
+    MissingSecurityScope,
 }
 
 #[cfg(target_os = "macos")]
@@ -214,5 +269,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(bytes, b"fixture image data");
+    }
+
+    #[test]
+    fn single_scoped_path_remains_usable_until_its_guard_is_dropped() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("capture.mov");
+        fs::write(&source, b"fixture video data").unwrap();
+        let canonical = fs::canonicalize(&source)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let bookmark = SourceBookmark::from_canonical_paths(vec![canonical]).unwrap();
+
+        let scoped = bookmark.resolve_single_path_with_scope().unwrap();
+
+        assert_eq!(fs::read(scoped.path()).unwrap(), b"fixture video data");
     }
 }

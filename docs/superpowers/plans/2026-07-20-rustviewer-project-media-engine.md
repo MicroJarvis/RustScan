@@ -548,7 +548,7 @@ git commit -m "feat(viewer): select deterministic video keyframes"
 - Create: `RustViewer/src/media/avfoundation.rs`
 - Test: `RustViewer/tests/media_import.rs`
 
-- [ ] **Step 1: Add target-specific dependencies**
+- [x] **Step 1: Add target-specific dependencies**
 
 Add:
 
@@ -561,7 +561,7 @@ objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMTime"] 
 objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer"] }
 ```
 
-- [ ] **Step 2: Write a platform-neutral decoder contract test**
+- [x] **Step 2: Write a platform-neutral decoder contract test**
 
 Use `FakeVideoDecoder` to emit five BGRA frames with presentation timestamps. Run `import_video` and assert all five normalized images exist while only selected frames have `is_keyframe`:
 
@@ -571,7 +571,7 @@ assert!(result.frames.windows(2).all(|pair| pair[0].presentation_time_us < pair[
 assert!(result.frames.iter().any(|frame| !frame.is_keyframe));
 ```
 
-- [ ] **Step 3: Define the decoder boundary**
+- [x] **Step 3: Define the decoder boundary**
 
 ```rust
 pub struct DecodedVideoFrame {
@@ -598,13 +598,13 @@ pub trait VideoDecoder: Send {
 
 `import_video` converts BGRA to RGB, writes every frame, emits bounded progress, computes quality metadata, then applies the deterministic keyframe selector. It never drops a decoded frame.
 
-- [ ] **Step 4: Implement AVFoundation decoding on macOS**
+- [x] **Step 4: Implement AVFoundation decoding on macOS**
 
 Open an `AVURLAsset`, select the first video track, configure `AVAssetReaderTrackOutput` for `kCVPixelFormatType_32BGRA`, and loop `copyNextSampleBuffer`. Lock each `CVPixelBuffer` read-only, copy row-strided bytes into owned memory, record `CMSampleBufferGetPresentationTimeStamp`, unlock, and release the sample before emitting the frame. Treat reader status failed/cancelled as structured errors; successful end-of-stream returns `None`.
 
 Implement security-scoped bookmark creation/resolution with `NSURL` bookmark APIs. Balance every successful `startAccessingSecurityScopedResource` with a guard that calls `stopAccessingSecurityScopedResource` on drop.
 
-- [ ] **Step 5: Run adapter tests**
+- [x] **Step 5: Run adapter tests**
 
 Run:
 
@@ -615,7 +615,7 @@ cargo test -p rust-viewer --test media_import video_import_
 
 Expected: PASS on every platform with the fake decoder. On macOS, an ignored test gated by `RUSTSCAN_VIDEO_FIXTURE` decodes the supplied MOV/MP4 and asserts non-empty, monotonic frames with valid dimensions.
 
-- [ ] **Step 6: Commit Task 5**
+- [x] **Step 6: Commit Task 5**
 
 ```bash
 git add RustViewer/Cargo.toml Cargo.lock RustViewer/src/media/video.rs RustViewer/src/media/avfoundation.rs RustViewer/tests/media_import.rs

@@ -27,7 +27,10 @@ rustgs = { path = "../RustGS", default-features = false, features = ["gpu"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3.2", features = ["NSData", "NSError", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3.2", features = ["NSData", "NSError", "NSValue", "NSString", "NSURL"] }
+objc2-av-foundation = { version = "0.3.2", features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVMediaFormat", "objc2-core-foundation", "objc2-core-media"] }
+objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMTime"] }
+objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer"] }
 
 [dev-dependencies]
 tempfile = "3.3"

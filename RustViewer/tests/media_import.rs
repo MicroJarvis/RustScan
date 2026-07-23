@@ -1,10 +1,12 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
 use rust_viewer::media::{
-    import_image_sequence, select_keyframes, ImageSequenceImportRequest, ImportedFrame,
-    KeyframeSelectionConfig, MediaEventSink, MediaImportError, MediaImportEvent,
+    import_image_sequence, import_video, select_keyframes, DecodedVideoFrame,
+    ImageSequenceImportRequest, ImportedFrame, KeyframeSelectionConfig, MediaEventSink,
+    MediaImportError, MediaImportEvent, VideoDecoder, VideoMetadata,
 };
 use rust_viewer::project::{
     ProjectCreateRequest, ProjectStage, ProjectStore, ProjectStoreWarning, SourceKind,
@@ -679,6 +681,173 @@ fn keyframe_selection_rejects_invalid_configuration_and_metadata() {
     let error =
         select_keyframes(&[missing_timestamp], KeyframeSelectionConfig::default()).unwrap_err();
     assert!(error.to_string().contains("presentation timestamp"));
+}
+
+#[test]
+fn video_import_decodes_every_bgra_frame_and_marks_only_selected_keyframes() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("Video.rustscanproject");
+    let mut store = ProjectStore::create(
+        &project,
+        ProjectCreateRequest::new("Video", SourceSpec::managed_images("pending-import")),
+    )
+    .unwrap();
+    let mut decoder = FakeVideoDecoder::new(
+        VideoMetadata {
+            duration_us: 400_000,
+            width: 2,
+            height: 2,
+            nominal_fps: 10.0,
+        },
+        (0..5)
+            .map(|index| DecodedVideoFrame {
+                presentation_time_us: i64::from(index) * 100_000,
+                width: 2,
+                height: 2,
+                bgra: [
+                    20 + index as u8,
+                    30,
+                    40,
+                    255,
+                    50,
+                    60,
+                    70,
+                    255,
+                    0,
+                    0,
+                    0,
+                    0,
+                    80,
+                    90,
+                    100,
+                    255,
+                    110,
+                    120,
+                    130,
+                    255,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]
+                .to_vec(),
+                bytes_per_row: 12,
+            })
+            .collect(),
+    );
+
+    let result = import_video(
+        &mut decoder,
+        SourceSpec {
+            kind: SourceKind::Video,
+            ownership: SourceOwnership::ManagedCopy,
+            identity: "fake-video".to_owned(),
+            display_paths: Vec::new(),
+            bookmark: None,
+        },
+        &mut store,
+        &mut RecordingSink::default(),
+    )
+    .unwrap();
+
+    assert_eq!(result.frames.len(), 5);
+    assert!(result.frames.windows(2).all(|pair| {
+        pair[0].presentation_time_us.unwrap() < pair[1].presentation_time_us.unwrap()
+    }));
+    assert!(result.frames.iter().any(|frame| !frame.is_keyframe));
+    assert!(result.frames.iter().all(|frame| {
+        image::open(project.join(&frame.normalized_image)).is_ok()
+            && image::open(project.join(&frame.thumbnail)).is_ok()
+    }));
+    assert_eq!(
+        image::open(project.join(&result.frames[0].normalized_image))
+            .unwrap()
+            .to_rgb8()
+            .get_pixel(0, 0)
+            .0,
+        [40, 30, 20]
+    );
+    assert_eq!(decoder.frames_remaining(), 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "set RUSTSCAN_VIDEO_FIXTURE to run against a local MOV or MP4 fixture"]
+fn video_decoder_avfoundation_fixture_emits_monotonic_frames() {
+    use rust_viewer::media::AvFoundationVideoDecoder;
+
+    let fixture = std::env::var_os("RUSTSCAN_VIDEO_FIXTURE")
+        .expect("RUSTSCAN_VIDEO_FIXTURE must point to a MOV or MP4 fixture");
+    let (mut decoder, source) = AvFoundationVideoDecoder::open_referenced(fixture).unwrap();
+    assert_eq!(source.kind, SourceKind::Video);
+    assert_eq!(source.ownership, SourceOwnership::Referenced);
+    assert!(source.bookmark.is_some());
+    let metadata = decoder.metadata().unwrap();
+    let mut previous_timestamp = None;
+    let mut frame_count = 0;
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        assert!(frame.width > 0 && frame.height > 0);
+        assert!(frame.bytes_per_row >= frame.width as usize * 4);
+        assert!(frame.bgra.len() >= frame.bytes_per_row * frame.height as usize);
+        if let Some(previous_timestamp) = previous_timestamp {
+            assert!(frame.presentation_time_us > previous_timestamp);
+        }
+        previous_timestamp = Some(frame.presentation_time_us);
+        frame_count += 1;
+    }
+    assert!(metadata.width > 0 && metadata.height > 0);
+    assert!(frame_count > 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn video_decoder_saved_referenced_requires_a_persisted_bookmark() {
+    use rust_viewer::media::AvFoundationVideoDecoder;
+
+    let source = SourceSpec {
+        kind: SourceKind::Video,
+        ownership: SourceOwnership::Referenced,
+        identity: "saved-video".to_owned(),
+        display_paths: vec!["/missing/capture.mov".to_owned()],
+        bookmark: None,
+    };
+
+    let error = match AvFoundationVideoDecoder::open_saved_referenced(&source) {
+        Ok(_) => panic!("saved referenced video without a bookmark unexpectedly opened"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(error, MediaImportError::InvalidSource(detail) if detail.contains("bookmark"))
+    );
+}
+
+struct FakeVideoDecoder {
+    metadata: VideoMetadata,
+    frames: VecDeque<DecodedVideoFrame>,
+}
+
+impl FakeVideoDecoder {
+    fn new(metadata: VideoMetadata, frames: Vec<DecodedVideoFrame>) -> Self {
+        Self {
+            metadata,
+            frames: frames.into(),
+        }
+    }
+
+    fn frames_remaining(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+impl VideoDecoder for FakeVideoDecoder {
+    fn metadata(&self) -> Result<VideoMetadata, MediaImportError> {
+        Ok(self.metadata)
+    }
+
+    fn next_frame(&mut self) -> Result<Option<DecodedVideoFrame>, MediaImportError> {
+        Ok(self.frames.pop_front())
+    }
 }
 
 fn metadata_frame(
