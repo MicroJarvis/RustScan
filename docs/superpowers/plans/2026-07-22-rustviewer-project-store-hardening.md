@@ -62,7 +62,7 @@ tempfile-based integration tests.
 - Modify: `RustViewer/src/project/state.rs`
 - Test: `RustViewer/tests/project_store.rs`
 
-- [ ] **Step 1: Preserve the current package-core RED tests and add writer-lock coverage**
+- [x] **Step 1: Preserve the current package-core RED tests and add writer-lock coverage**
 
 Keep the existing tests for suffix validation, empty destinations, package directories, atomic JSON,
 future schema dispatch, malformed manifests, and path/symlink containment. Add a test that holds one
@@ -86,7 +86,7 @@ fn project_store_allows_only_one_writer() {
 Also prove that no public API can replace `project.json` with another UUID. The public API should not
 expose generic manifest writes; integration tests should use only typed operations.
 
-- [ ] **Step 2: Run the package-core tests and verify RED**
+- [x] **Step 2: Run the package-core tests and verify RED**
 
 Run:
 
@@ -98,7 +98,7 @@ cargo test -p rust-viewer --test project_store project_store_allows_only_one_wri
 
 Expected: FAIL because the exclusive package lock and final typed API do not exist.
 
-- [ ] **Step 3: Implement package creation, open, and the exclusive lock**
+- [x] **Step 3: Implement package creation, open, and the exclusive lock**
 
 Use `fs2::FileExt::try_lock_exclusive` on `project.lock`. `ProjectStore` owns the open lock file for
 its full lifetime:
@@ -120,7 +120,7 @@ the sequential dispatcher, deserializes, and calls `ProjectManifest::validate()`
 that schema v1 is the first published format. Do not fabricate defaults for a schema that never
 existed.
 
-- [ ] **Step 4: Restrict manifest writes to typed operations**
+- [x] **Step 4: Restrict manifest writes to typed operations**
 
 Make the generic JSON helper crate-private and refuse `project.json`; only this private function may
 write the manifest:
@@ -145,7 +145,7 @@ closure or explicit snapshot plus `ChangeKind`, call `invalidate`, validate, per
 memory. Stage transition methods remain crate-only so Task 6's coordinator becomes the public state
 authority.
 
-- [ ] **Step 5: Validate package-wide active-state consistency**
+- [x] **Step 5: Validate package-wide active-state consistency**
 
 Extend manifest validation so persisted input cannot contain two active stages, an active stage
 without the matching lease, or a lease while another stage is active:
@@ -161,7 +161,7 @@ let active = ProjectStage::ORDER
 Require `active.len() <= 1`; require `lease.is_some()` exactly when one active stage exists, and
 require stage/attempt/project identity equality. Add malformed JSON fixtures for every violation.
 
-- [ ] **Step 6: Stream physical artifact validation on open**
+- [x] **Step 6: Stream physical artifact validation on open**
 
 For every stage artifact plus `active_scene` and `final_scene`, reject missing files, symlinks,
 directories, canonical paths outside the package, byte-length mismatch, and BLAKE3 mismatch. Hash
@@ -186,7 +186,7 @@ fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
 
 Do not hash artifacts in `list_summaries`; only a fully opened project pays this cost.
 
-- [ ] **Step 7: Run Task 2A verification and commit**
+- [x] **Step 7: Run Task 2A verification and commit**
 
 Run:
 
