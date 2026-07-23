@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(not(unix), test))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -131,13 +133,32 @@ impl ProjectStore {
         path: impl AsRef<Path>,
         request: ProjectCreateRequest,
     ) -> Result<Self, ProjectStoreError> {
-        Self::create_with_parent_sync(path, request, sync_parent_directory)
+        Self::create_with_hooks(path, request, |_| Ok(()), || {})
     }
 
+    #[cfg(test)]
     fn create_with_parent_sync(
         path: impl AsRef<Path>,
         request: ProjectCreateRequest,
-        mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
+        sync_parent: impl FnMut(&Path) -> io::Result<()>,
+    ) -> Result<Self, ProjectStoreError> {
+        Self::create_with_hooks(path, request, sync_parent, || {})
+    }
+
+    #[cfg(test)]
+    fn create_with_initialization_hook(
+        path: impl AsRef<Path>,
+        request: ProjectCreateRequest,
+        after_lock: impl FnOnce(),
+    ) -> Result<Self, ProjectStoreError> {
+        Self::create_with_hooks(path, request, |_| Ok(()), after_lock)
+    }
+
+    fn create_with_hooks(
+        path: impl AsRef<Path>,
+        request: ProjectCreateRequest,
+        mut sync_hook: impl FnMut(&Path) -> io::Result<()>,
+        after_lock: impl FnOnce(),
     ) -> Result<Self, ProjectStoreError> {
         let path = path.as_ref();
         require_package_suffix(path)?;
@@ -168,6 +189,10 @@ impl ProjectStore {
         };
         let mut cleanup = InitializationCleanup::new(root.clone(), created_root);
         let root_directory = open_package_directory(&root)?;
+        let package_parent = root.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "project package has no parent")
+        })?;
+        let package_parent_directory = open_package_directory(package_parent)?;
         let lock_file = match create_and_lock(&root, &root_directory, Some(&mut cleanup)) {
             Ok(lock_file) => lock_file,
             Err(error) => {
@@ -177,38 +202,49 @@ impl ProjectStore {
             }
         };
         let mut initialization = InitializationGuard::new(cleanup, lock_file, root_directory);
-        if !is_bootstrap_destination(&root)? {
+        after_lock();
+        if !is_bootstrap_destination_in_directory(initialization.root_directory())? {
             return Err(ProjectStoreError::DestinationNotEmpty { path: root });
         }
         let mut created_directory_parents = BTreeSet::new();
         for relative in PACKAGE_DIRECTORIES {
-            let directory = root.join(relative);
-            if initialization.create_directory(&directory)? {
+            let relative = Path::new(relative);
+            if initialization.create_directory(relative)? {
                 created_directory_parents.insert(
-                    directory
+                    relative
                         .parent()
                         .expect("package scaffold directory has a parent")
                         .to_path_buf(),
                 );
             }
         }
-        let mut warnings = write_manifest_bootstrap_with_parent_sync(&root, &manifest, |parent| {
-            sync_parent(parent)
-        })?
+        let mut warnings = write_manifest_bootstrap_with_parent_sync(
+            &root,
+            initialization.root_directory(),
+            &manifest,
+            |parent| sync_hook(parent),
+        )?
         .into_iter()
         .collect::<Vec<_>>();
         // The manifest rename sync already covers all new entries directly under the root.
-        created_directory_parents.remove(&root);
-        for parent in created_directory_parents {
-            if let Some(warning) = sync_directory_warning(&parent, &mut sync_parent) {
+        created_directory_parents.remove(Path::new(""));
+        for relative_parent in created_directory_parents {
+            let label = root.join(&relative_parent);
+            if let Some(warning) = sync_directory_at_with_hook(
+                initialization.root_directory(),
+                &relative_parent,
+                &label,
+                &mut sync_hook,
+            ) {
                 warnings.push(warning);
             }
         }
         if created_root {
-            let package_parent = root.parent().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "project package has no parent")
-            })?;
-            if let Some(warning) = sync_directory_warning(package_parent, &mut sync_parent) {
+            if let Some(warning) = sync_open_directory_with_hook(
+                &package_parent_directory,
+                package_parent,
+                &mut sync_hook,
+            ) {
                 warnings.push(warning);
             }
         }
@@ -355,7 +391,7 @@ impl ProjectStore {
         &mut self,
         update: impl FnOnce(&mut ProjectManifest),
     ) -> Result<(), ProjectStoreError> {
-        self.update_manifest_with_parent_sync(update, sync_parent_directory)
+        self.update_manifest_with_parent_sync(update, |_| Ok(()))
     }
 
     fn ensure_change_does_not_invalidate_active_stage(
@@ -400,8 +436,15 @@ impl ProjectStore {
         }
         let bytes = serde_json::to_vec_pretty(manifest)
             .map_err(ProjectStoreError::ManifestSerialization)?;
-        write_bytes_atomic_with_parent_sync(&self.root.join(MANIFEST_NAME), &bytes, sync_parent)
-            .map_err(ProjectStoreError::Io)
+        write_bytes_atomic_in_directory_with_hooks(
+            &self.root_directory,
+            &self.root,
+            MANIFEST_NAME,
+            &bytes,
+            sync_parent,
+            |_| Ok(()),
+        )
+        .map_err(ProjectStoreError::Io)
     }
 
     fn validate_committed_artifacts(&self) -> Result<(), ProjectStoreError> {
@@ -546,20 +589,45 @@ impl InitializationCleanup {
         }
     }
 
-    fn create_directory(&mut self, path: &Path) -> io::Result<bool> {
-        if !path.exists() {
-            fs::create_dir(path)?;
-            let relative = path.strip_prefix(&self.root).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "package scaffold directory escapes project root",
-                )
+    fn create_directory(&mut self, root_directory: &File, relative: &Path) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            let components = relative
+                .components()
+                .map(|component| match component {
+                    Component::Normal(part) => Ok(part),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "package scaffold path is not relative",
+                    )),
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let (leaf, parents) = components.split_last().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "empty scaffold path")
             })?;
-            self.created
-                .push(CreatedEntry::Directory(relative.to_path_buf()));
-            return Ok(true);
+            let mut parent_directory = root_directory.try_clone()?;
+            for parent in parents {
+                let opened = rustix_fs::openat(
+                    &parent_directory,
+                    *parent,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(io::Error::from)?;
+                parent_directory = File::from(opened);
+            }
+            rustix_fs::mkdirat(
+                &parent_directory,
+                *leaf,
+                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            )
+            .map_err(io::Error::from)?;
         }
-        Ok(false)
+        #[cfg(not(unix))]
+        fs::create_dir(self.root.join(relative))?;
+        self.created
+            .push(CreatedEntry::Directory(relative.to_path_buf()));
+        Ok(true)
     }
 
     fn record_created_file(&mut self, relative: PathBuf) {
@@ -573,6 +641,9 @@ impl InitializationCleanup {
         before_cleanup();
 
         for entry in self.created.iter().rev() {
+            if matches!(entry, CreatedEntry::File(relative) if relative == Path::new(LOCK_NAME)) {
+                continue;
+            }
             #[cfg(unix)]
             {
                 let (relative, flags) = match entry {
@@ -599,9 +670,6 @@ impl InitializationCleanup {
             }
         }
 
-        if self.remove_root && root_path_refers_to_directory(&self.root, root_directory) {
-            let _ = fs::remove_dir(&self.root);
-        }
         self.disarm();
     }
 
@@ -658,8 +726,18 @@ impl InitializationGuard {
         }
     }
 
-    fn create_directory(&mut self, path: &Path) -> io::Result<bool> {
-        self.cleanup.create_directory(path)
+    fn root_directory(&self) -> &File {
+        self.root_directory
+            .as_ref()
+            .expect("initialization guard owns the project directory")
+    }
+
+    fn create_directory(&mut self, relative: &Path) -> io::Result<bool> {
+        let root_directory = self
+            .root_directory
+            .as_ref()
+            .expect("initialization guard owns the project directory");
+        self.cleanup.create_directory(root_directory, relative)
     }
 
     fn finish(mut self) -> (File, File) {
@@ -752,42 +830,46 @@ fn migrate_one_version(
 
 fn write_manifest_bootstrap_with_parent_sync(
     root: &Path,
+    root_directory: &File,
     manifest: &ProjectManifest,
     sync_parent: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<Option<ProjectStoreWarning>, ProjectStoreError> {
     manifest.validate()?;
     let bytes =
         serde_json::to_vec_pretty(manifest).map_err(ProjectStoreError::ManifestSerialization)?;
-    write_bytes_atomic_with_parent_sync(&root.join(MANIFEST_NAME), &bytes, sync_parent)
-        .map_err(ProjectStoreError::Io)
+    write_bytes_atomic_in_directory_with_hooks(
+        root_directory,
+        root,
+        MANIFEST_NAME,
+        &bytes,
+        sync_parent,
+        |_| Ok(()),
+    )
+    .map_err(ProjectStoreError::Io)
 }
 
-fn write_bytes_atomic_with_parent_sync(
-    destination: &Path,
-    bytes: &[u8],
-    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<Option<ProjectStoreWarning>> {
-    write_bytes_atomic_with_hooks(destination, bytes, sync_parent, |_| Ok(()))
-}
-
-fn write_bytes_atomic_with_hooks(
-    destination: &Path,
+fn write_bytes_atomic_in_directory_with_hooks(
+    root_directory: &File,
+    root: &Path,
+    destination_name: &str,
     bytes: &[u8],
     sync_parent: impl FnOnce(&Path) -> io::Result<()>,
     before_rename: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<Option<ProjectStoreWarning>> {
-    let parent = destination.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "project manifest has no parent directory",
-        )
-    })?;
-    let name = destination
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("artifact"))
-        .to_string_lossy();
-    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let temporary_name = format!(".{destination_name}.{}.tmp", Uuid::new_v4());
+    let temporary = root.join(&temporary_name);
     let before_rename = (|| {
+        #[cfg(unix)]
+        let mut file = File::from(
+            rustix_fs::openat(
+                root_directory,
+                temporary_name.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(io::Error::from)?,
+        );
+        #[cfg(not(unix))]
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -795,36 +877,76 @@ fn write_bytes_atomic_with_hooks(
         file.write_all(bytes)?;
         file.sync_all()?;
         before_rename(&temporary)?;
-        fs::rename(&temporary, destination)?;
+        #[cfg(unix)]
+        rustix_fs::renameat(
+            root_directory,
+            temporary_name.as_str(),
+            root_directory,
+            destination_name,
+        )
+        .map_err(io::Error::from)?;
+        #[cfg(not(unix))]
+        fs::rename(&temporary, root.join(destination_name))?;
         Ok(())
     })();
     if before_rename.is_err() {
+        #[cfg(unix)]
+        let _ = rustix_fs::unlinkat(
+            root_directory,
+            temporary_name.as_str(),
+            rustix_fs::AtFlags::empty(),
+        );
+        #[cfg(not(unix))]
         let _ = fs::remove_file(&temporary);
         return before_rename.map(|()| None);
     }
     // Rename switches the manifest authority. A later durability failure must not invite a retry.
-    Ok(sync_parent(parent)
-        .err()
-        .map(|error| ProjectStoreWarning::ParentDirectorySyncFailed {
-            path: parent.to_path_buf(),
+    let descriptor_error = root_directory.sync_all().err();
+    let hook_error = sync_parent(root).err();
+    Ok(descriptor_error.or(hook_error).map(|error| {
+        ProjectStoreWarning::ParentDirectorySyncFailed {
+            path: root.to_path_buf(),
             error_kind: error.kind(),
             detail: error.to_string(),
-        }))
+        }
+    }))
 }
 
-fn sync_directory_warning(
-    path: &Path,
-    sync_directory: &mut impl FnMut(&Path) -> io::Result<()>,
+fn sync_open_directory_with_hook(
+    directory: &File,
+    label: &Path,
+    sync_hook: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> Option<ProjectStoreWarning> {
-    sync_directory(path)
-        .err()
+    let descriptor_error = directory.sync_all().err();
+    let hook_error = sync_hook(label).err();
+    descriptor_error
+        .or(hook_error)
         .map(|error| ProjectStoreWarning::ParentDirectorySyncFailed {
-            path: path.to_path_buf(),
+            path: label.to_path_buf(),
             error_kind: error.kind(),
             detail: error.to_string(),
         })
 }
 
+fn sync_directory_at_with_hook(
+    root_directory: &File,
+    relative: &Path,
+    label: &Path,
+    sync_hook: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> Option<ProjectStoreWarning> {
+    let descriptor_result = open_directory_at(root_directory, relative, label)
+        .and_then(|directory| directory.sync_all());
+    let hook_error = sync_hook(label).err();
+    descriptor_result.err().or(hook_error).map(|error| {
+        ProjectStoreWarning::ParentDirectorySyncFailed {
+            path: label.to_path_buf(),
+            error_kind: error.kind(),
+            detail: error.to_string(),
+        }
+    })
+}
+
+#[cfg(test)]
 fn sync_parent_directory(parent: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
@@ -838,6 +960,55 @@ fn open_package_directory(root: &Path) -> io::Result<File> {
     )
     .map(File::from)
     .map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn open_directory_at(root_directory: &File, relative: &Path, _label: &Path) -> io::Result<File> {
+    let mut directory = root_directory.try_clone()?;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path contains unsafe components",
+            ));
+        };
+        directory = File::from(
+            rustix_fs::openat(
+                &directory,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_directory_at(_root_directory: &File, _relative: &Path, label: &Path) -> io::Result<File> {
+    File::open(label)
+}
+
+#[cfg(unix)]
+fn is_bootstrap_destination_in_directory(root_directory: &File) -> io::Result<bool> {
+    let directory = rustix_fs::Dir::read_from(root_directory).map_err(io::Error::from)?;
+    for entry in directory {
+        let entry = entry.map_err(io::Error::from)?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if name != LOCK_NAME.as_bytes() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn is_bootstrap_destination_in_directory(_root_directory: &File) -> io::Result<bool> {
+    Ok(true)
 }
 
 #[cfg(not(unix))]
@@ -869,26 +1040,6 @@ fn read_manifest_from_directory(root_directory: &File, _root: &Path) -> io::Resu
 #[cfg(not(unix))]
 fn read_manifest_from_directory(_root_directory: &File, root: &Path) -> io::Result<Vec<u8>> {
     fs::read(root.join(MANIFEST_NAME))
-}
-
-#[cfg(unix)]
-fn root_path_refers_to_directory(root: &Path, root_directory: &File) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let Ok(path_metadata) = fs::symlink_metadata(root) else {
-        return false;
-    };
-    let Ok(descriptor_metadata) = rustix_fs::fstat(root_directory) else {
-        return false;
-    };
-    path_metadata.is_dir()
-        && path_metadata.dev() == descriptor_metadata.st_dev as u64
-        && path_metadata.ino() == descriptor_metadata.st_ino
-}
-
-#[cfg(not(unix))]
-fn root_path_refers_to_directory(root: &Path, _root_directory: &File) -> bool {
-    fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir())
 }
 
 #[cfg(unix)]
@@ -1032,9 +1183,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc};
-    use std::time::Duration;
 
     #[test]
     fn typed_manifest_writer_rejects_project_identity_changes() {
@@ -1061,9 +1209,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("Partial.rustscanproject");
         fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let root_directory = open_package_directory(&root).unwrap();
         let mut cleanup = InitializationCleanup::new(root.clone(), true);
-        cleanup.create_directory(&root.join("Sources")).unwrap();
-        fs::write(root.join(LOCK_NAME), b"").unwrap();
+        cleanup
+            .create_directory(&root_directory, Path::new("Sources"))
+            .unwrap();
         drop(cleanup);
 
         assert!(!root.exists());
@@ -1201,9 +1352,12 @@ mod tests {
     fn pre_rename_failure_after_temp_creation_removes_the_temp_file() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join(MANIFEST_NAME);
+        let root_directory = open_package_directory(temp.path()).unwrap();
 
-        let result = write_bytes_atomic_with_hooks(
-            &destination,
+        let result = write_bytes_atomic_in_directory_with_hooks(
+            &root_directory,
+            temp.path(),
+            MANIFEST_NAME,
             b"replacement",
             |_| Ok(()),
             |temporary| {
@@ -1217,58 +1371,135 @@ mod tests {
         assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn initialization_cleanup_unlinks_the_lock_while_its_exclusive_lock_is_held() {
+    fn initialization_cleanup_preserves_the_persistent_lock_inode_for_the_next_writer() {
+        use std::os::unix::fs::MetadataExt;
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("Failed.rustscanproject");
         fs::create_dir(&root).unwrap();
-        let mut cleanup = InitializationCleanup::new(root.clone(), false);
-        let root_directory = open_package_directory(&root).unwrap();
-        let lock_file = create_and_lock(&root, &root_directory, Some(&mut cleanup)).unwrap();
-        let guard = InitializationGuard::new(cleanup, lock_file, root_directory);
-
-        let (attempt_tx, attempt_rx) = mpsc::sync_channel(1);
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let mut cleanup = InitializationCleanup::new(canonical_root.clone(), true);
+        let root_directory = open_package_directory(&canonical_root).unwrap();
+        let lock_file =
+            create_and_lock(&canonical_root, &root_directory, Some(&mut cleanup)).unwrap();
+        let mut guard = InitializationGuard::new(cleanup, lock_file, root_directory);
+        guard.create_directory(Path::new("Sources")).unwrap();
         let lock_path = root.join(LOCK_NAME);
-        let contender_path = lock_path.clone();
-        let contender = std::thread::spawn(move || {
-            attempt_rx.recv().unwrap();
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(contender_path)
-                .unwrap();
-            let acquired = file.try_lock_exclusive().is_ok();
-            result_tx.send(acquired).unwrap();
-            if acquired {
-                release_rx.recv().unwrap();
-            }
-        });
-        let old_inode_was_acquired = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&old_inode_was_acquired);
-
-        guard.cleanup_with_hook(move || {
-            attempt_tx.send(()).unwrap();
-            observed.store(
-                result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-                Ordering::SeqCst,
-            );
-        });
-
-        assert!(!lock_path.exists());
-        let replacement = OpenOptions::new()
-            .create_new(true)
+        let observer = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&lock_path)
             .unwrap();
-        replacement.try_lock_exclusive().unwrap();
-        let _ = release_tx.send(());
-        contender.join().unwrap();
-        assert!(
-            !old_inode_was_acquired.load(Ordering::SeqCst),
-            "a contender acquired the old lock inode before cleanup unlinked it"
+        let old_metadata = observer.metadata().unwrap();
+
+        guard.cleanup_with_hook(|| {});
+
+        assert!(lock_path.is_file());
+        assert!(!root.join("Sources").exists());
+        let store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Recovered", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let writer_metadata = store._lock_file.metadata().unwrap();
+        let path_metadata = fs::metadata(&lock_path).unwrap();
+        assert_eq!(
+            (old_metadata.dev(), old_metadata.ino()),
+            (writer_metadata.dev(), writer_metadata.ino())
+        );
+        assert_eq!(
+            (old_metadata.dev(), old_metadata.ino()),
+            (path_metadata.dev(), path_metadata.ino())
+        );
+        assert!(matches!(
+            observer.try_lock_exclusive(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_creation_rejects_a_replaced_ancestor_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Package.rustscanproject");
+        let external = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&external).unwrap();
+        let root_directory = open_package_directory(&root).unwrap();
+        let mut cleanup = InitializationCleanup::new(root.clone(), false);
+        cleanup
+            .create_directory(&root_directory, Path::new("Sources"))
+            .unwrap();
+        fs::remove_dir(root.join("Sources")).unwrap();
+        symlink(&external, root.join("Sources")).unwrap();
+
+        assert!(cleanup
+            .create_directory(&root_directory, Path::new("Sources/managed"))
+            .is_err());
+        assert!(!external.join("managed").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_scaffold_and_manifest_stay_bound_to_the_locked_package_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Original.rustscanproject");
+        let moved = temp.path().join("Moved.rustscanproject");
+
+        let store = ProjectStore::create_with_initialization_hook(
+            &root,
+            ProjectCreateRequest::new("Original", SourceSpec::managed_images("source-a")),
+            || {
+                fs::rename(&root, &moved).unwrap();
+                fs::create_dir(&root).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(moved.join(MANIFEST_NAME).is_file());
+        assert!(moved.join("Sources/managed").is_dir());
+        assert!(moved.join("Cache/frames").is_dir());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+        assert_eq!(store.manifest().display_name, "Original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_manifest_update_stays_bound_to_the_locked_package_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Original.rustscanproject");
+        let moved = temp.path().join("Moved.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Original", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement_manifest = b"replacement package must remain untouched";
+        fs::write(root.join(MANIFEST_NAME), replacement_manifest).unwrap();
+
+        let mut config = store.manifest().import_config.clone();
+        config.video_keyframes_per_second += 1.0;
+        store.update_import_config(config.clone()).unwrap();
+
+        assert_eq!(
+            fs::read(root.join(MANIFEST_NAME)).unwrap(),
+            replacement_manifest
+        );
+        let persisted: ProjectManifest =
+            serde_json::from_slice(&fs::read(moved.join(MANIFEST_NAME)).unwrap()).unwrap();
+        assert_eq!(persisted.import_config, config);
+        assert_eq!(persisted.id(), store.manifest().id());
+        assert_eq!(
+            fs::metadata(moved.join(LOCK_NAME)).unwrap().ino(),
+            store._lock_file.metadata().unwrap().ino()
         );
     }
 
