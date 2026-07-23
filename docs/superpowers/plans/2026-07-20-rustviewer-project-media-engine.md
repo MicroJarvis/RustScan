@@ -373,7 +373,7 @@ git commit -m "feat(viewer): persist atomic project packages"
 - Modify: `RustViewer/src/lib.rs`
 - Test: `RustViewer/tests/media_import.rs`
 
-- [ ] **Step 1: Write failing import tests**
+- [x] **Step 1: Write failing import tests**
 
 Build three images named `frame10.png`, `frame2.png`, and `frame1.png`. Require natural ordering, managed copies, stable IDs, readable dimensions, thumbnails, and all-image keyframe selection:
 
@@ -386,7 +386,7 @@ assert!(result.frames.iter().all(|frame| store.resolve(&frame.normalized_image).
 assert!(result.frames.iter().all(|frame| store.resolve(&frame.thumbnail).unwrap().is_file()));
 ```
 
-- [ ] **Step 2: Run media tests and verify RED**
+- [x] **Step 2: Run media tests and verify RED**
 
 Run:
 
@@ -396,7 +396,7 @@ cargo test -p rust-viewer --test media_import image_sequence_
 
 Expected: FAIL because media import APIs do not exist.
 
-- [ ] **Step 3: Define frame and importer contracts**
+- [x] **Step 3: Define frame and importer contracts**
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -444,7 +444,7 @@ pub trait MediaEventSink {
 }
 ```
 
-- [ ] **Step 4: Implement managed image import**
+- [x] **Step 4: Implement managed image import**
 
 Accept jpg/jpeg/png/bmp/tif/tiff/webp, reject fewer than two readable images, natural-sort digit runs numerically, and assign IDs from zero. Decode with `image`, normalize orientation into lossless PNG at `Cache/frames/{id:08}.png`, and generate a 256-pixel longest-edge JPEG thumbnail at `Cache/thumbnails/{id:08}.jpg`. Compute source identity from sorted filename, byte length, modification nanoseconds, and first/last 64 KiB content hashes.
 
@@ -452,11 +452,11 @@ Use variance of a 3x3 Laplacian on a 320-pixel grayscale preview for sharpness. 
 
 Atomically write `Sources/source.json`, `Cache/frames.json`, and `Cache/keyframes.json` after all normalized images and thumbnails validate. These three files are the Import stage's declared artifacts.
 
-- [ ] **Step 5: Implement reference-in-place source records**
+- [x] **Step 5: Implement reference-in-place source records**
 
 Define `SourceOwnership::{ManagedCopy, Referenced}`. Managed copy is the default. Referenced image sequences store canonical paths plus identity; opening verifies both. Put macOS bookmark behavior behind `SourceBookmark` so non-macOS image projects compile with a plain canonical path and report a recoverable source error when moved.
 
-- [ ] **Step 6: Run image import tests**
+- [x] **Step 6: Run image import tests**
 
 Run:
 
@@ -467,7 +467,7 @@ cargo test -p rust-viewer --test media_import missing_or_changed_
 
 Expected: PASS; unreadable/missing files fail Import without partially committed frame metadata.
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 ```bash
 git add RustViewer/src/media RustViewer/src/project/source.rs RustViewer/src/lib.rs RustViewer/tests/media_import.rs

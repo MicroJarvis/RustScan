@@ -329,6 +329,35 @@ pub(crate) fn commit_workspace(
     )
 }
 
+/// Validates and syncs every expected staging payload without creating manifest references.
+pub(crate) fn validate_and_sync_workspace_payloads(
+    root_directory: &File,
+    workspace: &StageWorkspace,
+    payloads: &[StagedArtifact],
+) -> Result<(), ArtifactCommitError> {
+    if payloads.is_empty() {
+        return Err(ArtifactCommitError::EmptyDeclaration);
+    }
+    let mut expected = BTreeSet::new();
+    for payload in payloads {
+        if !expected.insert(payload.payload_path.clone()) {
+            return Err(ArtifactCommitError::DuplicatePayloadPath {
+                path: payload.payload_path.clone(),
+            });
+        }
+    }
+    let workspace_directory = open_directory(root_directory, &workspace.relative)?;
+    validate_workspace_payloads(
+        &workspace_directory,
+        &workspace.relative,
+        payloads,
+        &expected,
+        true,
+        &mut |_| {},
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn commit_workspace_with_test_sync_hook(
     root_directory: &File,

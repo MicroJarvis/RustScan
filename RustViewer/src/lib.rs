@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod loader;
+pub mod media;
 pub mod project;
 pub mod renderer;
 pub mod robot;

@@ -1,7 +1,8 @@
-mod artifacts;
+pub(crate) mod artifacts;
 mod events;
 mod library;
 mod manifest;
+pub(crate) mod source;
 mod state;
 mod store;
 

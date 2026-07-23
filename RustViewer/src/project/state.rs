@@ -113,6 +113,7 @@ impl ProjectManifest {
         let legal = match (from, to) {
             (StageState::NotStarted, StageState::Ready)
             | (StageState::Ready, StageState::Queued)
+            | (StageState::Ready, StageState::Failed)
             | (StageState::Queued, StageState::Running)
             | (StageState::Running, StageState::PauseRequested)
             | (StageState::PauseRequested, StageState::Paused)

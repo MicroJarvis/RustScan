@@ -25,10 +25,10 @@ use uuid::Uuid;
 
 use super::state::ValidatedArtifacts;
 use super::{
-    artifacts, events, library, ArtifactRef, ChangeKind, ImportConfigSnapshot, PnpConfigSnapshot,
-    ProjectErrorRecord, ProjectLease, ProjectLibraryError, ProjectManifest,
-    ProjectManifestValidationError, ProjectStage, ProjectStateError, SfmConfigSnapshot, SourceSpec,
-    StageState, SuggestedAction, PROJECT_SCHEMA_VERSION,
+    artifacts, events, library, source, ArtifactRef, ChangeKind, ImportConfigSnapshot,
+    PnpConfigSnapshot, ProjectErrorRecord, ProjectLease, ProjectLibraryError, ProjectManifest,
+    ProjectManifestValidationError, ProjectStage, ProjectStateError, SfmConfigSnapshot, SourceKind,
+    SourceOwnership, SourceSpec, StageState, SuggestedAction, PROJECT_SCHEMA_VERSION,
 };
 
 const PACKAGE_EXTENSION: &str = "rustscanproject";
@@ -163,6 +163,15 @@ pub enum ProjectStoreWarning {
         path: PathBuf,
         error_kind: io::ErrorKind,
         detail: String,
+    },
+    ReferencedSourceUnavailable {
+        path: PathBuf,
+        error_kind: io::ErrorKind,
+        detail: String,
+    },
+    ReferencedSourceChanged {
+        expected: String,
+        found: String,
     },
 }
 
@@ -385,6 +394,9 @@ impl ProjectStore {
         };
         store.recover_interrupted_stage()?;
         before_artifact_validation();
+        if let Some(warning) = store.referenced_source_warning() {
+            store.warnings.push(warning);
+        }
         store.validate_committed_artifacts()?;
         Ok(store)
     }
@@ -607,6 +619,97 @@ impl ProjectStore {
         Ok(())
     }
 
+    fn referenced_source_warning(&self) -> Option<ProjectStoreWarning> {
+        let source = &self.manifest.source;
+        if source.kind != SourceKind::ImageSequence
+            || source.ownership != SourceOwnership::Referenced
+        {
+            return None;
+        }
+        match source.bookmark.as_deref() {
+            Some(bytes) => match source::SourceBookmark::decode(bytes)
+                .map_err(source::SourceBookmarkError::from)
+                .and_then(|bookmark| {
+                    bookmark.with_resolved_paths(|paths| {
+                        self.referenced_source_warning_for_paths(paths)
+                    })
+                }) {
+                Ok(warning) => warning,
+                Err(error) => Some(ProjectStoreWarning::ReferencedSourceUnavailable {
+                    path: self.root.join("project.json"),
+                    error_kind: io::ErrorKind::InvalidData,
+                    detail: format!("referenced source bookmark is invalid: {error}"),
+                }),
+            },
+            None => self.referenced_source_warning_for_paths(&source.display_paths),
+        }
+    }
+
+    fn referenced_source_warning_for_paths(
+        &self,
+        display_paths: &[String],
+    ) -> Option<ProjectStoreWarning> {
+        let mut entries = Vec::with_capacity(display_paths.len());
+        for display_path in display_paths {
+            let requested = PathBuf::from(display_path);
+            let canonical = match fs::canonicalize(&requested) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Some(ProjectStoreWarning::ReferencedSourceUnavailable {
+                        path: requested,
+                        error_kind: error.kind(),
+                        detail: error.to_string(),
+                    });
+                }
+            };
+            let metadata = match fs::metadata(&canonical) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return Some(ProjectStoreWarning::ReferencedSourceUnavailable {
+                        path: canonical,
+                        error_kind: error.kind(),
+                        detail: error.to_string(),
+                    });
+                }
+            };
+            if !metadata.is_file() {
+                return Some(ProjectStoreWarning::ReferencedSourceUnavailable {
+                    path: canonical,
+                    error_kind: io::ErrorKind::InvalidInput,
+                    detail: "source is not a regular file".to_owned(),
+                });
+            }
+            let name = match canonical.file_name().and_then(OsStr::to_str) {
+                Some(name) => name.to_owned(),
+                None => {
+                    return Some(ProjectStoreWarning::ReferencedSourceUnavailable {
+                        path: canonical,
+                        error_kind: io::ErrorKind::InvalidData,
+                        detail: "source name is not valid UTF-8".to_owned(),
+                    });
+                }
+            };
+            entries.push((name, canonical));
+        }
+        let found = match source::image_sequence_identity(&entries) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Some(ProjectStoreWarning::ReferencedSourceUnavailable {
+                    path: self.root.clone(),
+                    error_kind: error.kind(),
+                    detail: error.to_string(),
+                });
+            }
+        };
+        if found != self.manifest.source.identity {
+            return Some(ProjectStoreWarning::ReferencedSourceChanged {
+                expected: self.manifest.source.identity.clone(),
+                found,
+            });
+        }
+        None
+    }
+
     fn validate_committed_artifact(&self, artifact: &ArtifactRef) -> Result<(), ProjectStoreError> {
         let relative = Path::new(&artifact.relative_path);
         for component in relative.components() {
@@ -767,11 +870,63 @@ impl ProjectStore {
             ));
         }
         let lease = self.require_stage_lease(stage)?.clone();
+        self.recover_active_stage_content(&lease)?;
         let mut next = self.manifest.clone();
         next.transition(stage, StageState::Failed)?;
         next.stage_mut(stage).error = Some(error);
         next.lease = None;
         self.persist_manifest(&next, Some(("failed", stage, lease.attempt)))
+    }
+
+    pub(crate) fn mark_stage_preflight_failed(
+        &mut self,
+        stage: ProjectStage,
+        error: ProjectErrorRecord,
+    ) -> Result<(), ProjectStoreError> {
+        if error.stage != stage {
+            return Err(ProjectStoreError::State(
+                ProjectStateError::IllegalTransition {
+                    stage,
+                    from: self.manifest.stage(stage).state(),
+                    to: StageState::Failed,
+                },
+            ));
+        }
+        if let Some(lease) = self.manifest.lease() {
+            return Err(ProjectStoreError::StageLeaseActive { stage: lease.stage });
+        }
+
+        let mut next = self.manifest.clone();
+        match next.stage(stage).state() {
+            StageState::Ready => next.transition(stage, StageState::Failed)?,
+            StageState::Stale => {
+                next.transition(stage, StageState::Ready)?;
+                next.transition(stage, StageState::Failed)?;
+            }
+            StageState::Failed => {}
+            StageState::Succeeded => return Ok(()),
+            from => {
+                return Err(ProjectStoreError::State(
+                    ProjectStateError::IllegalTransition {
+                        stage,
+                        from,
+                        to: StageState::Failed,
+                    },
+                ));
+            }
+        }
+        let attempt = next.stage(stage).attempt();
+        next.stage_mut(stage).error = Some(error);
+        self.persist_manifest(&next, Some(("preflight_failed", stage, attempt)))
+    }
+
+    pub(crate) fn validate_stage_payloads(
+        &self,
+        workspace: &artifacts::StageWorkspace,
+        payloads: &[artifacts::StagedArtifact],
+    ) -> Result<(), ProjectStoreError> {
+        artifacts::validate_and_sync_workspace_payloads(&self.root_directory, workspace, payloads)
+            .map_err(Self::artifact_commit_error)
     }
 
     pub(crate) fn commit_stage_success(
@@ -917,20 +1072,11 @@ impl ProjectStore {
         }
     }
 
-    fn recover_interrupted_stage(&mut self) -> Result<(), ProjectStoreError> {
+    pub(crate) fn recover_interrupted_stage(&mut self) -> Result<(), ProjectStoreError> {
         let Some(lease) = self.manifest.lease().cloned() else {
             return Ok(());
         };
-        let referenced_artifacts = self
-            .manifest_artifacts()
-            .map(|artifact| PathBuf::from(&artifact.relative_path))
-            .collect::<BTreeSet<_>>();
-        artifacts::recover_interrupted_attempts(
-            &self.root_directory,
-            lease.stage,
-            lease.attempt,
-            &referenced_artifacts,
-        )?;
+        self.recover_active_stage_content(&lease)?;
 
         let mut recovered = self.manifest.clone();
         recovered.transition(lease.stage, StageState::Failed)?;
@@ -949,6 +1095,20 @@ impl ProjectStore {
         self.manifest = recovered;
         self.warnings.extend(warning);
         self.append_event_nonfatal("recovered_interrupted", lease.stage, lease.attempt);
+        Ok(())
+    }
+
+    fn recover_active_stage_content(&self, lease: &ProjectLease) -> Result<(), ProjectStoreError> {
+        let referenced_artifacts = self
+            .manifest_artifacts()
+            .map(|artifact| PathBuf::from(&artifact.relative_path))
+            .collect::<BTreeSet<_>>();
+        artifacts::recover_interrupted_attempts(
+            &self.root_directory,
+            lease.stage,
+            lease.attempt,
+            &referenced_artifacts,
+        )?;
         Ok(())
     }
 
