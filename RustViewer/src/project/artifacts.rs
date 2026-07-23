@@ -118,27 +118,47 @@ pub(crate) fn recover_interrupted_attempts(
     root_directory: &File,
     stage: ProjectStage,
     attempt: u32,
-    preserve_committed_attempt: bool,
+    referenced_artifacts: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
-    move_to_recovery_if_present(
-        root_directory,
-        &PathBuf::from("Cache/.staging"),
-        &format!("{}-{attempt}", stage_name(stage)),
-        stage,
-        attempt,
-        "staging",
-    )?;
-    if !preserve_committed_attempt {
+    let staging = staging_relative(stage, attempt);
+    if !references_content(referenced_artifacts, &staging) {
         move_to_recovery_if_present(
             root_directory,
-            &PathBuf::from("Artifacts").join(stage_name(stage)),
-            &format!("attempt-{attempt:08}"),
+            staging.parent().expect("staging workspace has a parent"),
+            staging
+                .file_name()
+                .expect("staging workspace has a name")
+                .to_str()
+                .expect("staging workspace name is ASCII"),
+            stage,
+            attempt,
+            "staging",
+        )?;
+    }
+    let committed_attempt = attempt_relative(stage, attempt);
+    if !references_content(referenced_artifacts, &committed_attempt) {
+        move_to_recovery_if_present(
+            root_directory,
+            committed_attempt
+                .parent()
+                .expect("committed attempt has a parent"),
+            committed_attempt
+                .file_name()
+                .expect("committed attempt has a name")
+                .to_str()
+                .expect("committed attempt name is ASCII"),
             stage,
             attempt,
             "attempt",
         )?;
     }
     Ok(())
+}
+
+fn references_content(references: &BTreeSet<PathBuf>, directory: &Path) -> bool {
+    references
+        .iter()
+        .any(|reference| reference == directory || reference.starts_with(directory))
 }
 
 fn move_to_recovery_if_present(

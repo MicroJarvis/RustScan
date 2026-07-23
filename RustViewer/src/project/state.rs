@@ -280,7 +280,10 @@ mod tests {
 
     fn artifact_for(stage: ProjectStage) -> ArtifactRef {
         ArtifactRef {
-            relative_path: format!("artifacts/{stage:?}.json").to_lowercase(),
+            relative_path: format!(
+                "Artifacts/{}/attempt-00000001/result.bin",
+                stage.artifact_directory()
+            ),
             content_hash: "a".repeat(64),
             byte_len: 0,
         }

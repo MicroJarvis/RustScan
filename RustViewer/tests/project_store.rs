@@ -761,6 +761,8 @@ fn create_project_with_artifact(base: &Path, name: &str, reference: &ArtifactRef
     let store = ProjectStore::create(&path, create_request(name)).unwrap();
     drop(store);
     let mut value = read_manifest_value(&path);
+    value["stages"]["import"]["state"] = serde_json::json!("succeeded");
+    value["stages"]["import"]["attempt"] = serde_json::json!(1);
     value["stages"]["import"]["artifacts"] = serde_json::to_value([reference.clone()]).unwrap();
     write_manifest_value(&path, &value);
     path
@@ -780,6 +782,8 @@ fn project_store_open_stream_validates_stage_and_scene_artifacts() {
     fs::write(path.join(relative), &bytes).unwrap();
     let reference = artifact_ref(relative, &bytes);
     let mut value = read_manifest_value(&path);
+    value["stages"]["import"]["state"] = serde_json::json!("succeeded");
+    value["stages"]["import"]["attempt"] = serde_json::json!(1);
     value["stages"]["import"]["artifacts"] = serde_json::to_value([reference.clone()]).unwrap();
     value["active_scene"] = serde_json::to_value(&reference).unwrap();
     value["final_scene"] = serde_json::to_value(&reference).unwrap();
@@ -965,6 +969,39 @@ fn make_interrupted_import(path: &Path, project_id: uuid::Uuid, prior_artifact: 
     })
     .unwrap();
     write_manifest_value(path, &value);
+}
+
+#[test]
+fn project_store_rejects_active_lease_referencing_staging_artifacts_before_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("StagingReference.rustscanproject");
+    let store = ProjectStore::create(&path, create_request("Staging Reference")).unwrap();
+    let project_id = store.manifest().id();
+    drop(store);
+
+    let staging_relative = "Cache/.staging/import-2/Sources/source.json";
+    let staging_bytes = br#"{"source":"must not move"}"#;
+    let staging_path = path.join(staging_relative);
+    fs::create_dir_all(staging_path.parent().unwrap()).unwrap();
+    fs::write(&staging_path, staging_bytes).unwrap();
+    make_interrupted_import(
+        &path,
+        project_id,
+        artifact_ref(staging_relative, staging_bytes),
+    );
+    let manifest_before = fs::read(path.join("project.json")).unwrap();
+
+    assert!(matches!(
+        ProjectStore::open(&path),
+        Err(ProjectStoreError::InvalidManifest(
+            ProjectManifestValidationError::InvalidArtifact { .. }
+        ))
+    ));
+    assert_eq!(fs::read(&staging_path).unwrap(), staging_bytes);
+    assert_eq!(
+        fs::read(path.join("project.json")).unwrap(),
+        manifest_before
+    );
 }
 
 #[test]

@@ -838,13 +838,15 @@ impl ProjectStore {
         let Some(lease) = self.manifest.lease().cloned() else {
             return Ok(());
         };
-        let preserve_committed_attempt =
-            self.manifest_references_attempt(lease.stage, lease.attempt);
+        let referenced_artifacts = self
+            .manifest_artifacts()
+            .map(|artifact| PathBuf::from(&artifact.relative_path))
+            .collect::<BTreeSet<_>>();
         artifacts::recover_interrupted_attempts(
             &self.root_directory,
             lease.stage,
             lease.attempt,
-            preserve_committed_attempt,
+            &referenced_artifacts,
         )?;
 
         let mut recovered = self.manifest.clone();
@@ -865,18 +867,6 @@ impl ProjectStore {
         self.warnings.extend(warning);
         self.append_event_nonfatal("recovered_interrupted", lease.stage, lease.attempt);
         Ok(())
-    }
-
-    fn manifest_references_attempt(&self, stage: ProjectStage, attempt: u32) -> bool {
-        let attempt_root = artifacts::attempt_relative(stage, attempt);
-        let attempt_root = attempt_root.to_string_lossy();
-        self.manifest_artifacts().any(|artifact| {
-            artifact.relative_path == attempt_root
-                || artifact
-                    .relative_path
-                    .strip_prefix(attempt_root.as_ref())
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
     }
 
     fn manifest_artifacts(&self) -> impl Iterator<Item = &ArtifactRef> {
@@ -2161,7 +2151,9 @@ mod tests {
         fs::create_dir_all(root.join(relative).parent().unwrap()).unwrap();
         fs::write(root.join(relative), original).unwrap();
         let mut manifest = store.manifest().clone();
-        manifest.stage_mut(ProjectStage::Import).artifacts = vec![ArtifactRef {
+        let import = manifest.stage_mut(ProjectStage::Import);
+        import.attempt = 1;
+        import.artifacts = vec![ArtifactRef {
             relative_path: relative.to_owned(),
             content_hash: blake3::hash(original).to_hex().to_string(),
             byte_len: original.len() as u64,

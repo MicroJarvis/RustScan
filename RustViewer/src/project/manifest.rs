@@ -26,6 +26,16 @@ impl ProjectStage {
         Self::Training,
         Self::Complete,
     ];
+
+    pub(crate) fn artifact_directory(self) -> &'static str {
+        match self {
+            Self::Import => "import",
+            Self::KeyframeSfm => "keyframe_sfm",
+            Self::FullFramePnp => "full_frame_pnp",
+            Self::Training => "training",
+            Self::Complete => "complete",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,7 +459,7 @@ impl ProjectManifest {
                 );
             }
             for (index, artifact) in record.artifacts.iter().enumerate() {
-                validate_artifact_ref(artifact).map_err(|source| {
+                validate_stage_artifact_ref(stage, record.attempt, artifact).map_err(|source| {
                     ProjectManifestValidationError::InvalidArtifact {
                         location: format!("stage {stage:?} artifact {index}"),
                         source,
@@ -601,7 +611,76 @@ pub(crate) fn validate_artifact_ref(artifact: &ArtifactRef) -> Result<(), Artifa
             content_hash: artifact.content_hash.clone(),
         });
     }
+    parse_immutable_artifact_path(path, &artifact.relative_path)?;
     Ok(())
+}
+
+fn validate_stage_artifact_ref(
+    stage: ProjectStage,
+    current_attempt: u32,
+    artifact: &ArtifactRef,
+) -> Result<(), ArtifactValidationError> {
+    validate_artifact_ref(artifact)?;
+    let (artifact_stage, artifact_attempt) =
+        parse_immutable_artifact_path(Path::new(&artifact.relative_path), &artifact.relative_path)?;
+    if artifact_stage != stage || artifact_attempt > current_attempt {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            artifact.relative_path.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_immutable_artifact_path(
+    path: &Path,
+    original: &str,
+) -> Result<(ProjectStage, u32), ArtifactValidationError> {
+    let mut components = path.components();
+    let Some(Component::Normal(root)) = components.next() else {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            original.to_owned(),
+        ));
+    };
+    if root != "Artifacts" {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            original.to_owned(),
+        ));
+    }
+    let Some(Component::Normal(stage_name)) = components.next() else {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            original.to_owned(),
+        ));
+    };
+    let Some(stage) = ProjectStage::ORDER
+        .into_iter()
+        .find(|stage| stage.artifact_directory() == stage_name)
+    else {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            original.to_owned(),
+        ));
+    };
+    let Some(Component::Normal(attempt_name)) = components.next() else {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            original.to_owned(),
+        ));
+    };
+    let Some(attempt) = attempt_name
+        .to_str()
+        .and_then(|name| name.strip_prefix("attempt-"))
+        .filter(|digits| digits.len() == 8 && digits.bytes().all(|digit| digit.is_ascii_digit()))
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .filter(|attempt| *attempt > 0)
+    else {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            original.to_owned(),
+        ));
+    };
+    if components.next().is_none() {
+        return Err(ArtifactValidationError::InvalidRelativePath(
+            original.to_owned(),
+        ));
+    }
+    Ok((stage, attempt))
 }
 
 pub(crate) fn unix_time_ms() -> u64 {
