@@ -418,13 +418,13 @@ impl ProjectStore {
     }
 
     pub fn delete(self, confirmation_id: Uuid) -> Result<(), ProjectLibraryError> {
-        self.delete_with_before_deletion(confirmation_id, || {})
+        self.delete_with_before_tombstone(confirmation_id, || {})
     }
 
-    fn delete_with_before_deletion(
+    fn delete_with_before_tombstone(
         self,
         confirmation_id: Uuid,
-        before_deletion: impl FnOnce(),
+        before_tombstone: impl FnOnce(),
     ) -> Result<(), ProjectLibraryError> {
         if self.manifest.id() != confirmation_id {
             return Err(ProjectLibraryError::DeleteConfirmationMismatch {
@@ -435,8 +435,7 @@ impl ProjectStore {
         let target = library::prepare_delete(&self.root_directory, &self.root)?;
         target.release_root_directory_lock()?;
         drop(self);
-        before_deletion();
-        library::delete_prepared(target)
+        library::delete_prepared_with_before_tombstone(target, before_tombstone)
     }
 
     pub fn take_warnings(&mut self) -> Vec<ProjectStoreWarning> {
@@ -2441,7 +2440,7 @@ mod tests {
     }
 
     #[test]
-    fn project_library_delete_preserves_a_package_replaced_after_lock_release() {
+    fn project_library_delete_preserves_a_package_replaced_after_final_identity_check() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("Delete.rustscanproject");
         let moved = temp.path().join("Original.rustscanproject");
@@ -2454,7 +2453,7 @@ mod tests {
         let replacement = root.join("replacement-must-survive");
 
         let error = store
-            .delete_with_before_deletion(id, || {
+            .delete_with_before_tombstone(id, || {
                 let reopened = ProjectStore::open(&root)
                     .expect("all writer locks must be released before deletion");
                 drop(reopened);
