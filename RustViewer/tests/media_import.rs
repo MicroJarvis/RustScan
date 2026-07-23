@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
 use rust_viewer::media::{
-    import_image_sequence, ImageSequenceImportRequest, MediaEventSink, MediaImportError,
-    MediaImportEvent,
+    import_image_sequence, select_keyframes, ImageSequenceImportRequest, ImportedFrame,
+    KeyframeSelectionConfig, MediaEventSink, MediaImportError, MediaImportEvent,
 };
 use rust_viewer::project::{
     ProjectCreateRequest, ProjectStage, ProjectStore, ProjectStoreWarning, SourceKind,
@@ -592,4 +592,121 @@ fn image_sequence_naturally_sorts_normalizes_and_commits_every_frame() {
             },
         ]
     ));
+}
+
+#[test]
+fn keyframe_selection_is_deterministic_bounded_and_close_to_target_rate() {
+    let frames = (0..120)
+        .map(|id| metadata_frame(id, i64::from(id) * 1_000_000 / 30, 10.0, unique_hash(id)))
+        .collect::<Vec<_>>();
+    let config = KeyframeSelectionConfig::default();
+
+    let selected = select_keyframes(&frames, config).unwrap();
+
+    assert_eq!(selected, select_keyframes(&frames, config).unwrap());
+    assert_eq!(selected.first(), Some(&0));
+    assert_eq!(selected.last(), Some(&119));
+    assert!(selected.windows(2).all(|pair| {
+        frame_by_id(&frames, pair[1]).presentation_time_us.unwrap()
+            - frame_by_id(&frames, pair[0]).presentation_time_us.unwrap()
+            <= config.max_gap_us
+    }));
+    assert!((12..=14).contains(&selected.len()));
+}
+
+#[test]
+fn keyframe_selection_prefers_the_sharpest_near_duplicate_in_a_window() {
+    let frames = vec![
+        metadata_frame(0, 0, 1.0, 0),
+        metadata_frame(1, 333_334, 2.0, u64::MAX),
+        metadata_frame(2, 400_000, 9.0, u64::MAX ^ 1),
+        metadata_frame(3, 800_000, 1.0, 0x0123_4567_89ab_cdef),
+    ];
+
+    let selected = select_keyframes(&frames, KeyframeSelectionConfig::default()).unwrap();
+
+    assert!(selected.contains(&2));
+    assert!(!selected.contains(&1));
+}
+
+#[test]
+fn keyframe_selection_keeps_a_window_winner_when_its_forced_endpoints_share_the_window() {
+    let frames = vec![
+        metadata_frame(0, 0, 1.0, 0),
+        metadata_frame(1, 100_000, 10.0, u64::MAX),
+        metadata_frame(2, 200_000, 1.0, 0x0123_4567_89ab_cdef),
+    ];
+
+    let selected = select_keyframes(&frames, KeyframeSelectionConfig::default()).unwrap();
+
+    assert_eq!(selected, vec![0, 1, 2]);
+}
+
+#[test]
+fn keyframe_selection_suppresses_near_duplicates_without_exceeding_the_gap() {
+    let frames = (0..10)
+        .map(|id| metadata_frame(id, i64::from(id) * 333_333, f64::from(id), 0xfeed_face))
+        .collect::<Vec<_>>();
+    let config = KeyframeSelectionConfig::default();
+
+    let selected = select_keyframes(&frames, config).unwrap();
+
+    assert_eq!(selected, vec![0, 3, 6, 9]);
+    assert!(selected.len() < frames.len());
+    assert!(selected.windows(2).all(|pair| {
+        frame_by_id(&frames, pair[1]).presentation_time_us.unwrap()
+            - frame_by_id(&frames, pair[0]).presentation_time_us.unwrap()
+            <= config.max_gap_us
+    }));
+}
+
+#[test]
+fn keyframe_selection_rejects_invalid_configuration_and_metadata() {
+    let frame = metadata_frame(0, 0, 1.0, 0);
+
+    let error = select_keyframes(
+        &[frame.clone()],
+        KeyframeSelectionConfig {
+            target_per_second: 0.0,
+            ..KeyframeSelectionConfig::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("target_per_second"));
+
+    let mut missing_timestamp = frame;
+    missing_timestamp.presentation_time_us = None;
+    let error =
+        select_keyframes(&[missing_timestamp], KeyframeSelectionConfig::default()).unwrap_err();
+    assert!(error.to_string().contains("presentation timestamp"));
+}
+
+fn metadata_frame(
+    id: u32,
+    presentation_time_us: i64,
+    sharpness: f64,
+    perceptual_hash: u64,
+) -> ImportedFrame {
+    ImportedFrame {
+        id,
+        source_name: format!("frame{id:04}.png"),
+        presentation_time_us: Some(presentation_time_us),
+        normalized_image: String::new(),
+        thumbnail: String::new(),
+        width: 1,
+        height: 1,
+        sharpness,
+        perceptual_hash,
+        is_keyframe: false,
+    }
+}
+
+fn frame_by_id(frames: &[ImportedFrame], id: u32) -> &ImportedFrame {
+    frames.iter().find(|frame| frame.id == id).unwrap()
+}
+
+fn unique_hash(id: u32) -> u64 {
+    u64::from(id)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(17)
 }

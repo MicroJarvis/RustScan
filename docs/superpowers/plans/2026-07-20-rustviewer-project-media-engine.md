@@ -480,7 +480,7 @@ git commit -m "feat(viewer): import managed image sequences"
 - Create: `RustViewer/src/media/keyframes.rs`
 - Test: `RustViewer/tests/media_import.rs`
 
-- [ ] **Step 1: Write failing selection tests**
+- [x] **Step 1: Write failing selection tests**
 
 Build 120 metadata-only frames at 30 fps. Require approximately 3 fps, force every one-second gap, prefer the sharper of near-duplicates, include first and last frames, and return identical IDs on repeated calls.
 
@@ -492,7 +492,7 @@ assert!(selected.windows(2).all(|pair| frames[pair[1]].time_us - frames[pair[0]]
 assert_eq!(selected, select_keyframes(&frames, KeyframeSelectionConfig::default())?);
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -502,7 +502,7 @@ cargo test -p rust-viewer --test media_import keyframe_
 
 Expected: FAIL because selection is absent.
 
-- [ ] **Step 3: Implement bounded-window selection**
+- [x] **Step 3: Implement bounded-window selection**
 
 Define:
 
@@ -523,7 +523,7 @@ impl Default for KeyframeSelectionConfig {
 
 Divide the timeline into target-rate windows, select the highest tuple `(sharpness, reverse duplicate distance, reverse frame_id)` in each window, then fill any overlong gap with the sharpest candidate before the deadline. Sort and deduplicate final IDs.
 
-- [ ] **Step 4: Run keyframe tests**
+- [x] **Step 4: Run keyframe tests**
 
 Run:
 
@@ -533,7 +533,7 @@ cargo test -p rust-viewer --test media_import keyframe_
 
 Expected: PASS for determinism, sharpness preference, duplicate suppression, endpoints, and max gap.
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 ```bash
 git add RustViewer/src/media/keyframes.rs RustViewer/tests/media_import.rs
