@@ -56,7 +56,9 @@ impl ProjectCreateRequest {
 
 #[derive(Debug, Error)]
 pub enum ProjectStoreError {
-    #[error("project storage requires Unix descriptor-relative filesystem operations")]
+    #[error(
+        "project storage requires Unix descriptor-relative filesystem operations and native flock"
+    )]
     UnsupportedPlatform,
     #[error("project package path must end in .rustscanproject: {path:?}")]
     InvalidPackageSuffix { path: PathBuf },
@@ -129,6 +131,8 @@ pub struct ProjectStore {
     warnings: Vec<ProjectStoreWarning>,
     root_directory: File,
     _lock_file: File,
+    // Must drop last so the package-inode writer lock outlives all other file handles.
+    _writer_directory_lock: File,
 }
 
 impl ProjectStore {
@@ -208,6 +212,7 @@ impl ProjectStore {
             }
         };
         let mut initialization = InitializationGuard::new(cleanup, lock_file, root_directory);
+        let writer_directory_lock = initialization.root_directory().try_clone()?;
         after_lock();
         if !is_bootstrap_destination_in_directory(initialization.root_directory())? {
             return Err(ProjectStoreError::DestinationNotEmpty { path: root });
@@ -262,6 +267,7 @@ impl ProjectStore {
             warnings,
             root_directory,
             _lock_file: lock_file,
+            _writer_directory_lock: writer_directory_lock,
         })
     }
 
@@ -310,6 +316,7 @@ impl ProjectStore {
         let root_directory =
             open_existing_package_root(&package_parent_directory, root_name, &root)?;
         let lock_file = create_and_lock(&root, &root_directory, None)?;
+        let writer_directory_lock = root_directory.try_clone()?;
         let manifest_path = root.join(MANIFEST_NAME);
         let bytes = read_manifest_from_directory(&root_directory, &root)?;
         let value: serde_json::Value =
@@ -331,6 +338,7 @@ impl ProjectStore {
             warnings: Vec::new(),
             root_directory,
             _lock_file: lock_file,
+            _writer_directory_lock: writer_directory_lock,
         };
         before_artifact_validation();
         store.validate_committed_artifacts()?;
@@ -548,7 +556,7 @@ impl ProjectStore {
 }
 
 fn require_supported_platform() -> Result<(), ProjectStoreError> {
-    platform_support(cfg!(unix))
+    platform_support(cfg!(all(unix, not(target_os = "solaris"))))
 }
 
 fn platform_support(supported: bool) -> Result<(), ProjectStoreError> {
@@ -1357,6 +1365,34 @@ mod tests {
             result,
             Err(ProjectStoreError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
         ));
+    }
+
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    #[test]
+    fn writer_directory_lock_survives_operational_directory_handle_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Locked.rustscanproject");
+        let store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Locked", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let lock_path = root.join(LOCK_NAME);
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+
+        let ProjectStore {
+            root_directory,
+            _lock_file,
+            ..
+        } = store;
+        drop(root_directory);
+
+        assert!(matches!(
+            ProjectStore::open(&root),
+            Err(ProjectStoreError::AlreadyOpen { .. })
+        ));
+        drop(_lock_file);
     }
 
     #[test]
