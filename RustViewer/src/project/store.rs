@@ -262,22 +262,48 @@ impl ProjectStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ProjectStoreError> {
-        Self::open_with_validation_hook(path, || {})
+        Self::open_with_hooks(path, || {}, || {})
     }
 
+    #[cfg(test)]
     fn open_with_validation_hook(
         path: impl AsRef<Path>,
         before_artifact_validation: impl FnOnce(),
     ) -> Result<Self, ProjectStoreError> {
+        Self::open_with_hooks(path, || {}, before_artifact_validation)
+    }
+
+    #[cfg(test)]
+    fn open_with_parent_open_hook(
+        path: impl AsRef<Path>,
+        after_parent_open: impl FnOnce(),
+    ) -> Result<Self, ProjectStoreError> {
+        Self::open_with_hooks(path, after_parent_open, || {})
+    }
+
+    fn open_with_hooks(
+        path: impl AsRef<Path>,
+        after_parent_open: impl FnOnce(),
+        before_artifact_validation: impl FnOnce(),
+    ) -> Result<Self, ProjectStoreError> {
         let path = path.as_ref();
         require_package_suffix(path)?;
-        if fs::symlink_metadata(path)?.file_type().is_symlink() {
-            return Err(ProjectStoreError::SymlinkPackageRoot {
-                path: path.to_path_buf(),
-            });
-        }
-        let root = fs::canonicalize(path)?;
-        let root_directory = open_package_directory(&root)?;
+        let package_parent_input = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let package_parent = fs::canonicalize(package_parent_input)?;
+        let root_name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "project package has no directory name",
+            )
+        })?;
+        let root = package_parent.join(root_name);
+        let package_parent_directory = open_package_directory(&package_parent)?;
+        after_parent_open();
+        let root_directory =
+            open_existing_package_root(&package_parent_directory, root_name, &root)?;
         let lock_file = create_and_lock(&root, &root_directory, None)?;
         let manifest_path = root.join(MANIFEST_NAME);
         let bytes = read_manifest_from_directory(&root_directory, &root)?;
@@ -1031,6 +1057,38 @@ fn open_or_create_package_root(
     }
 }
 
+#[cfg(unix)]
+fn open_existing_package_root(
+    package_parent_directory: &File,
+    name: &OsStr,
+    root_label: &Path,
+) -> Result<File, ProjectStoreError> {
+    let metadata = rustix_fs::statat(
+        package_parent_directory,
+        name,
+        rustix_fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(io::Error::from)?;
+    let file_type = FileType::from_raw_mode(metadata.st_mode);
+    if file_type.is_symlink() {
+        return Err(ProjectStoreError::SymlinkPackageRoot {
+            path: root_label.to_path_buf(),
+        });
+    }
+    if !file_type.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "project package root is not a directory",
+        )
+        .into());
+    }
+    Ok(open_directory_at(
+        package_parent_directory,
+        Path::new(name),
+        root_label,
+    )?)
+}
+
 #[cfg(not(unix))]
 fn open_or_create_package_root(
     _package_parent_directory: &File,
@@ -1052,6 +1110,20 @@ fn open_or_create_package_root(
         fs::create_dir(parent.join(name))?;
         Ok((File::open(root_label)?, true))
     }
+}
+
+#[cfg(not(unix))]
+fn open_existing_package_root(
+    _package_parent_directory: &File,
+    _name: &OsStr,
+    root_label: &Path,
+) -> Result<File, ProjectStoreError> {
+    if fs::symlink_metadata(root_label)?.file_type().is_symlink() {
+        return Err(ProjectStoreError::SymlinkPackageRoot {
+            path: root_label.to_path_buf(),
+        });
+    }
+    Ok(File::open(root_label)?)
 }
 
 #[cfg(unix)]
@@ -1560,6 +1632,38 @@ mod tests {
             .next()
             .is_none());
         assert_eq!(store.manifest().display_name, "Original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_binds_the_package_to_the_parent_directory_inode_before_opening_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("Library");
+        let moved_parent = temp.path().join("MovedLibrary");
+        let root = parent.join("Original.rustscanproject");
+        fs::create_dir(&parent).unwrap();
+        let created = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Original", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        drop(created);
+
+        let store = ProjectStore::open_with_parent_open_hook(&root, || {
+            fs::rename(&parent, &moved_parent).unwrap();
+            fs::create_dir(&parent).unwrap();
+            fs::create_dir(parent.join("Original.rustscanproject")).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(store.manifest().display_name, "Original");
+        assert!(moved_parent
+            .join("Original.rustscanproject/project.json")
+            .is_file());
+        assert!(fs::read_dir(parent.join("Original.rustscanproject"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[cfg(unix)]
