@@ -217,7 +217,7 @@ git commit -m "feat(viewer): persist locked project packages"
 - Modify: `RustViewer/src/project/mod.rs`
 - Test: `RustViewer/tests/project_store.rs`
 
-- [ ] **Step 1: Replace destination-swap tests with immutable-attempt RED tests**
+- [x] **Step 1: Replace destination-swap tests with immutable-attempt RED tests**
 
 A stage workspace mirrors package-relative payload paths:
 
@@ -239,7 +239,7 @@ The manifest references the latter paths. Add tests proving the old committed at
 old manifest references remain unchanged when validation, rename, fsync, or manifest persistence is
 injected to fail.
 
-- [ ] **Step 2: Add deterministic commit failpoints and verify RED**
+- [x] **Step 2: Add deterministic commit failpoints and verify RED**
 
 Under `cfg(test)`, route the internal commit through:
 
@@ -256,7 +256,7 @@ For every failpoint: start from a previously succeeded artifact set, invalidate 
 attempt, inject failure, drop the store, reopen, and assert the prior artifact bytes and references
 remain valid while the abandoned attempt is preserved under `Logs/recovery`.
 
-- [ ] **Step 3: Implement streaming validation and one-directory commit**
+- [x] **Step 3: Implement streaming validation and one-directory commit**
 
 Replace `StagedArtifact { source, destination }` with one package-relative payload path and a
 validation kind. Reject empty declarations, duplicate paths, unsafe components, symlinks, missing
@@ -267,7 +267,7 @@ Fsync every declared file and containing directory, then rename the workspace di
 `Artifacts/{stage}/attempt-{attempt:08}` and fsync the stage artifact parent. Construct final
 `ArtifactRef` values only after the rename.
 
-- [ ] **Step 4: Switch manifest authority once**
+- [x] **Step 4: Switch manifest authority once**
 
 Build one new manifest in memory that commits validated artifacts, sets the stage to `Succeeded`,
 clears the lease, and refreshes readiness. Persist it with one atomic `project.json` replacement,
@@ -275,7 +275,7 @@ then update the in-memory manifest. If the write fails, keep the old manifest in
 new attempt directory unreferenced for deterministic recovery. Never write an intermediate Running
 manifest containing new artifact references.
 
-- [ ] **Step 5: Implement typed stage control and JSONL events**
+- [x] **Step 5: Implement typed stage control and JSONL events**
 
 Add crate-only store methods for begin, pause request, cancel request, paused, cancelled, failed, and
 success. `begin_stage` rejects any existing lease, securely creates an empty workspace, then persists
@@ -289,7 +289,7 @@ the next valid event remains parseable. Flush and `sync_data` after every record
 remain successful if diagnostic logging fails; expose such failures through a non-fatal warning list
 instead of returning an error that invites the caller to repeat a committed operation.
 
-- [ ] **Step 6: Implement deterministic interrupted recovery**
+- [x] **Step 6: Implement deterministic interrupted recovery**
 
 On open, an active lease means interrupted work because the exclusive writer lock has already been
 acquired. For its exact stage/attempt:
@@ -302,7 +302,7 @@ acquired. For its exact stage/attempt:
 - Clear the lease, atomically persist, and append a recovery event.
 - Do not queue retry automatically.
 
-- [ ] **Step 7: Run Task 2B verification and commit**
+- [x] **Step 7: Run Task 2B verification and commit**
 
 Run:
 
