@@ -384,10 +384,7 @@ the lease, validate all copied committed artifact references, write a fresh even
 
 `delete(self, confirmation_id)` consumes the locked store, compares the exact UUID, verifies the
 canonical root still has the `.rustscanproject` suffix and is not a symlink, releases the lock, and
-atomically renames only that verified root to a private hidden quarantine sibling. Deletion is
-logical: the verified tombstone remains for separately authorized deferred garbage collection;
-`delete` never recursively removes it or attempts an unsafe restoration after a post-rename error.
-`reveal_path(&self)` returns the canonical root without invoking Finder.
+removes only that root. `reveal_path(&self)` returns the canonical root without invoking Finder.
 
 - [ ] **Step 6: Run Task 2C and full Task 2 verification**
 
