@@ -1333,7 +1333,7 @@ mod tests {
         ));
     }
 
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), target_os = "solaris"))]
     #[test]
     fn public_create_reports_the_unsupported_platform() {
         let result = ProjectStore::create(

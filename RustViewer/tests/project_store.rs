@@ -1,3 +1,5 @@
+#![cfg(all(unix, not(target_os = "solaris")))]
+
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
