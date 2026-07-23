@@ -133,7 +133,7 @@ impl ProjectStore {
         path: impl AsRef<Path>,
         request: ProjectCreateRequest,
     ) -> Result<Self, ProjectStoreError> {
-        Self::create_with_hooks(path, request, |_| Ok(()), || {})
+        Self::create_with_hooks(path, request, |_| Ok(()), || {}, || {})
     }
 
     #[cfg(test)]
@@ -142,7 +142,7 @@ impl ProjectStore {
         request: ProjectCreateRequest,
         sync_parent: impl FnMut(&Path) -> io::Result<()>,
     ) -> Result<Self, ProjectStoreError> {
-        Self::create_with_hooks(path, request, sync_parent, || {})
+        Self::create_with_hooks(path, request, sync_parent, || {}, || {})
     }
 
     #[cfg(test)]
@@ -151,13 +151,23 @@ impl ProjectStore {
         request: ProjectCreateRequest,
         after_lock: impl FnOnce(),
     ) -> Result<Self, ProjectStoreError> {
-        Self::create_with_hooks(path, request, |_| Ok(()), after_lock)
+        Self::create_with_hooks(path, request, |_| Ok(()), || {}, after_lock)
+    }
+
+    #[cfg(test)]
+    fn create_with_parent_open_hook(
+        path: impl AsRef<Path>,
+        request: ProjectCreateRequest,
+        after_parent_open: impl FnOnce(),
+    ) -> Result<Self, ProjectStoreError> {
+        Self::create_with_hooks(path, request, |_| Ok(()), after_parent_open, || {})
     }
 
     fn create_with_hooks(
         path: impl AsRef<Path>,
         request: ProjectCreateRequest,
         mut sync_hook: impl FnMut(&Path) -> io::Result<()>,
+        after_parent_open: impl FnOnce(),
         after_lock: impl FnOnce(),
     ) -> Result<Self, ProjectStoreError> {
         let path = path.as_ref();
@@ -165,34 +175,26 @@ impl ProjectStore {
         let manifest = ProjectManifest::new(request.display_name, request.source);
         manifest.validate()?;
 
-        let created_root = if path.exists() {
-            let metadata = fs::symlink_metadata(path)?;
-            if !metadata.is_dir() || !is_bootstrap_destination(path)? {
-                return Err(ProjectStoreError::DestinationNotEmpty {
-                    path: path.to_path_buf(),
-                });
-            }
-            false
-        } else {
-            fs::create_dir(path)?;
-            true
-        };
-
-        let root = match fs::canonicalize(path) {
-            Ok(root) => root,
-            Err(error) => {
-                if created_root {
-                    let _ = fs::remove_dir(path);
-                }
-                return Err(error.into());
-            }
-        };
-        let mut cleanup = InitializationCleanup::new(root.clone(), created_root);
-        let root_directory = open_package_directory(&root)?;
-        let package_parent = root.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "project package has no parent")
+        let package_parent_input = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let package_parent = fs::canonicalize(package_parent_input)?;
+        let root_name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "project package has no directory name",
+            )
         })?;
-        let package_parent_directory = open_package_directory(package_parent)?;
+        let root = package_parent.join(root_name);
+        let package_parent_directory = open_package_directory(&package_parent)?;
+        after_parent_open();
+        let (root_directory, created_root) =
+            open_or_create_package_root(&package_parent_directory, root_name, &root)?;
+        if !is_bootstrap_destination_in_directory(&root_directory)? {
+            return Err(ProjectStoreError::DestinationNotEmpty { path: root });
+        }
+        let mut cleanup = InitializationCleanup::new(root.clone(), created_root);
         let lock_file = match create_and_lock(&root, &root_directory, Some(&mut cleanup)) {
             Ok(lock_file) => lock_file,
             Err(error) => {
@@ -242,7 +244,7 @@ impl ProjectStore {
         if created_root {
             if let Some(warning) = sync_open_directory_with_hook(
                 &package_parent_directory,
-                package_parent,
+                &package_parent,
                 &mut sync_hook,
             ) {
                 warnings.push(warning);
@@ -781,6 +783,7 @@ fn require_package_suffix(path: &Path) -> Result<(), ProjectStoreError> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn is_bootstrap_destination(path: &Path) -> io::Result<bool> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -988,6 +991,67 @@ fn open_directory_at(root_directory: &File, relative: &Path, _label: &Path) -> i
 #[cfg(not(unix))]
 fn open_directory_at(_root_directory: &File, _relative: &Path, label: &Path) -> io::Result<File> {
     File::open(label)
+}
+
+#[cfg(unix)]
+fn open_or_create_package_root(
+    package_parent_directory: &File,
+    name: &OsStr,
+    root_label: &Path,
+) -> Result<(File, bool), ProjectStoreError> {
+    match rustix_fs::statat(
+        package_parent_directory,
+        name,
+        rustix_fs::AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(metadata) => {
+            if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
+                return Err(ProjectStoreError::DestinationNotEmpty {
+                    path: root_label.to_path_buf(),
+                });
+            }
+            Ok((
+                open_directory_at(package_parent_directory, Path::new(name), root_label)?,
+                false,
+            ))
+        }
+        Err(error) if error == Errno::NOENT => {
+            rustix_fs::mkdirat(
+                package_parent_directory,
+                name,
+                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            )
+            .map_err(io::Error::from)?;
+            Ok((
+                open_directory_at(package_parent_directory, Path::new(name), root_label)?,
+                true,
+            ))
+        }
+        Err(error) => Err(io::Error::from(error).into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_or_create_package_root(
+    _package_parent_directory: &File,
+    name: &OsStr,
+    root_label: &Path,
+) -> Result<(File, bool), ProjectStoreError> {
+    if root_label.exists() {
+        let metadata = fs::symlink_metadata(root_label)?;
+        if !metadata.is_dir() || !is_bootstrap_destination(root_label)? {
+            return Err(ProjectStoreError::DestinationNotEmpty {
+                path: root_label.to_path_buf(),
+            });
+        }
+        Ok((File::open(root_label)?, false))
+    } else {
+        let parent = root_label.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "project package has no parent")
+        })?;
+        fs::create_dir(parent.join(name))?;
+        Ok((File::open(root_label)?, true))
+    }
 }
 
 #[cfg(unix)]
@@ -1464,6 +1528,37 @@ mod tests {
         assert!(moved.join("Sources/managed").is_dir());
         assert!(moved.join("Cache/frames").is_dir());
         assert!(fs::read_dir(&root).unwrap().next().is_none());
+        assert_eq!(store.manifest().display_name, "Original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_binds_the_package_to_the_parent_directory_inode_before_opening_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("Library");
+        let moved_parent = temp.path().join("MovedLibrary");
+        let root = parent.join("Original.rustscanproject");
+        fs::create_dir(&parent).unwrap();
+
+        let store = ProjectStore::create_with_parent_open_hook(
+            &root,
+            ProjectCreateRequest::new("Original", SourceSpec::managed_images("source-a")),
+            || {
+                assert!(!root.exists());
+                fs::rename(&parent, &moved_parent).unwrap();
+                fs::create_dir(&parent).unwrap();
+                fs::create_dir(parent.join("Original.rustscanproject")).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(moved_parent
+            .join("Original.rustscanproject/project.json")
+            .is_file());
+        assert!(fs::read_dir(parent.join("Original.rustscanproject"))
+            .unwrap()
+            .next()
+            .is_none());
         assert_eq!(store.manifest().display_name, "Original");
     }
 
