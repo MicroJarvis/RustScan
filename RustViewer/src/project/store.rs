@@ -1,6 +1,14 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-#[cfg(all(test, unix, not(target_os = "solaris")))]
+#[cfg(all(
+    test,
+    any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "redox",
+    )
+))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -594,6 +602,22 @@ impl ProjectStore {
         &mut self,
         stage: ProjectStage,
     ) -> Result<artifacts::StageWorkspace, ProjectStoreError> {
+        self.begin_stage_with_workspace_creator(stage, artifacts::create_workspace)
+    }
+
+    fn begin_stage_with_workspace_creator(
+        &mut self,
+        stage: ProjectStage,
+        create_workspace: impl FnOnce(
+            &File,
+            &Path,
+            ProjectStage,
+            u32,
+        ) -> Result<
+            artifacts::StageWorkspace,
+            artifacts::ArtifactCommitError,
+        >,
+    ) -> Result<artifacts::StageWorkspace, ProjectStoreError> {
         require_supported_platform()?;
         if let Some(lease) = self.manifest.lease() {
             return Err(ProjectStoreError::StageLeaseActive { stage: lease.stage });
@@ -626,14 +650,35 @@ impl ProjectStore {
         });
         next.validate()?;
 
-        let workspace =
-            artifacts::create_workspace(&self.root_directory, &self.root, stage, attempt)
-                .map_err(Self::artifact_commit_error)?;
-        if let Err(error) = self.persist_manifest(&next, Some(("began", stage, attempt))) {
-            let _ = artifacts::remove_empty_workspace(&self.root_directory, &workspace);
-            return Err(error);
+        self.persist_manifest(&next, Some(("began", stage, attempt)))?;
+        match create_workspace(&self.root_directory, &self.root, stage, attempt) {
+            Ok(workspace) => Ok(workspace),
+            Err(error) => {
+                let workspace_may_exist = matches!(
+                    &error,
+                    artifacts::ArtifactCommitError::WorkspaceCreationUncertain { .. }
+                );
+                let creation_error = Self::artifact_commit_error(error);
+                if workspace_may_exist {
+                    return Err(creation_error);
+                }
+                let mut failed = self.manifest.clone();
+                failed.transition(stage, StageState::Failed)?;
+                failed.stage_mut(stage).error = Some(ProjectErrorRecord {
+                    code: "workspace_create_failed".to_owned(),
+                    stage,
+                    summary: "Stage workspace creation failed".to_owned(),
+                    detail: creation_error.to_string(),
+                    frame_id: None,
+                    pair: None,
+                    retryable: true,
+                    suggested_actions: vec![SuggestedAction::Retry],
+                });
+                failed.lease = None;
+                self.persist_manifest(&failed, Some(("failed", stage, attempt)))?;
+                Err(creation_error)
+            }
         }
-        Ok(workspace)
     }
 
     pub(crate) fn request_stage_pause(
@@ -891,7 +936,12 @@ impl ProjectStore {
 }
 
 fn require_supported_platform() -> Result<(), ProjectStoreError> {
-    platform_support(cfg!(all(unix, not(target_os = "solaris"))))
+    platform_support(cfg!(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "redox",
+    )))
 }
 
 fn platform_support(supported: bool) -> Result<(), ProjectStoreError> {
@@ -1652,10 +1702,19 @@ fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
     Ok((total, hasher.finalize()))
 }
 
-#[cfg(all(test, unix, not(target_os = "solaris")))]
+#[cfg(all(
+    test,
+    any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "redox",
+    )
+))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::{BTreeSet, VecDeque};
     use std::process::Command;
     use std::rc::Rc;
 
@@ -1678,7 +1737,12 @@ mod tests {
         ));
     }
 
-    #[cfg(all(unix, not(target_os = "solaris")))]
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "redox",
+    ))]
     #[test]
     fn writer_directory_lock_survives_operational_directory_handle_drop() {
         let temp = tempfile::tempdir().unwrap();
@@ -2322,6 +2386,104 @@ mod tests {
     }
 
     #[test]
+    fn begin_stage_records_workspace_creation_failure_after_durable_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("WorkspaceFailure.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Workspace Failure", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+
+        let staging = root.join("Cache/.staging");
+        fs::remove_dir(&staging).unwrap();
+        fs::write(&staging, b"not a directory").unwrap();
+
+        assert!(matches!(
+            store.begin_stage(ProjectStage::Import),
+            Err(ProjectStoreError::ArtifactCommit { .. })
+        ));
+        assert_eq!(
+            store.manifest().stage(ProjectStage::Import).state(),
+            StageState::Failed
+        );
+        assert_eq!(store.manifest().lease(), None);
+        assert_eq!(
+            store
+                .manifest()
+                .stage(ProjectStage::Import)
+                .error()
+                .unwrap()
+                .code,
+            "workspace_create_failed"
+        );
+        drop(store);
+
+        let reopened = ProjectStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.manifest().stage(ProjectStage::Import).state(),
+            StageState::Failed
+        );
+        assert_eq!(reopened.manifest().lease(), None);
+        drop(reopened);
+
+        fs::remove_file(&staging).unwrap();
+        fs::create_dir(&staging).unwrap();
+        let mut retry = ProjectStore::open(&root).unwrap();
+        let workspace = retry.begin_stage(ProjectStage::Import).unwrap();
+        assert_eq!(workspace.attempt(), 2);
+    }
+
+    #[test]
+    fn begin_stage_recovers_an_uncertain_workspace_creation_before_retrying() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("UncertainWorkspace.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new(
+                "Uncertain Workspace",
+                SourceSpec::managed_images("source-a"),
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.begin_stage_with_workspace_creator(
+                ProjectStage::Import,
+                |root_directory, root, stage, attempt| {
+                    artifacts::create_workspace(root_directory, root, stage, attempt)?;
+                    Err(artifacts::ArtifactCommitError::WorkspaceCreationUncertain {
+                        source: io::Error::other("injected staging sync failure"),
+                    })
+                }
+            ),
+            Err(ProjectStoreError::ArtifactCommit { .. })
+        ));
+        assert_eq!(
+            store.manifest().stage(ProjectStage::Import).state(),
+            StageState::Running
+        );
+        assert!(store.manifest().lease().is_some());
+        drop(store);
+
+        let recovered = ProjectStore::open(&root).unwrap();
+        assert_eq!(
+            recovered.manifest().stage(ProjectStage::Import).state(),
+            StageState::Failed
+        );
+        assert_eq!(recovered.manifest().lease(), None);
+        assert!(fs::read_dir(root.join("Logs/recovery"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().is_dir()));
+        drop(recovered);
+
+        let mut retry = ProjectStore::open(&root).unwrap();
+        let workspace = retry.begin_stage(ProjectStage::Import).unwrap();
+        assert_eq!(workspace.attempt(), 2);
+    }
+
+    #[test]
     fn stage_commit_streams_declared_files_into_one_immutable_attempt() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("Artifacts.rustscanproject");
@@ -2379,6 +2541,161 @@ mod tests {
     }
 
     #[test]
+    fn stage_commit_rehashes_the_final_attempt_after_payload_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("FinalValidation.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Final Validation", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let workspace = store.begin_stage(ProjectStage::Import).unwrap();
+        let payload = workspace.path().join("Sources/source.json");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, br#"{"source":"initial"}"#).unwrap();
+        let declaration = artifacts::StagedArtifact::new(
+            "Sources/source.json",
+            artifacts::ArtifactValidationKind::Json,
+        )
+        .unwrap();
+        let replacement = br#"{"source":"replaced after validation"}"#;
+        let replacement_path = payload.clone();
+
+        store
+            .commit_stage_success_with_hooks(
+                &workspace,
+                std::slice::from_ref(&declaration),
+                true,
+                move |phase| {
+                    if phase == artifacts::CommitPhase::AfterWorkspaceSync {
+                        fs::remove_file(&replacement_path).unwrap();
+                        fs::write(&replacement_path, replacement).unwrap();
+                    }
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap();
+
+        let artifact = &store.manifest().stage(ProjectStage::Import).artifacts()[0];
+        assert_eq!(artifact.byte_len, replacement.len() as u64);
+        assert_eq!(
+            artifact.content_hash,
+            blake3::hash(replacement).to_hex().to_string()
+        );
+        assert_eq!(
+            fs::read(root.join(&artifact.relative_path)).unwrap(),
+            replacement
+        );
+    }
+
+    #[test]
+    fn artifact_commit_syncs_payload_ancestors_and_both_rename_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("SyncCoverage.rustscanproject");
+        let mut store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Sync Coverage", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let workspace = store.begin_stage(ProjectStage::Import).unwrap();
+        let payload = workspace.path().join("Sources/nested/source.json");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, br#"{"source":"nested"}"#).unwrap();
+        let declaration = artifacts::StagedArtifact::new(
+            "Sources/nested/source.json",
+            artifacts::ArtifactValidationKind::Json,
+        )
+        .unwrap();
+        let synced = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&synced);
+
+        artifacts::commit_workspace_with_test_sync_hook(
+            &store.root_directory,
+            &workspace,
+            std::slice::from_ref(&declaration),
+            true,
+            |_| Ok(()),
+            move |path| observed.borrow_mut().push(path.to_path_buf()),
+        )
+        .unwrap();
+
+        let synced = synced.borrow();
+        for expected in [
+            PathBuf::from("Cache/.staging/import-1/Sources/nested/source.json"),
+            PathBuf::from("Cache/.staging/import-1/Sources/nested"),
+            PathBuf::from("Cache/.staging/import-1/Sources"),
+            PathBuf::from("Cache/.staging/import-1"),
+            PathBuf::from("Artifacts/import/attempt-00000001/Sources/nested/source.json"),
+            PathBuf::from("Artifacts/import/attempt-00000001/Sources/nested"),
+            PathBuf::from("Artifacts/import/attempt-00000001/Sources"),
+            PathBuf::from("Artifacts/import/attempt-00000001"),
+        ] {
+            assert!(synced.contains(&expected), "missing sync for {expected:?}");
+        }
+        let staging_parent = synced
+            .iter()
+            .position(|path| path == Path::new("Cache/.staging"))
+            .unwrap();
+        let attempt_parent = synced
+            .iter()
+            .position(|path| path == Path::new("Artifacts/import"))
+            .unwrap();
+        assert!(staging_parent < attempt_parent);
+    }
+
+    #[test]
+    fn recovery_retries_collision_without_replacing_and_syncs_both_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("RecoveryCollision.rustscanproject");
+        let store = ProjectStore::create(
+            &root,
+            ProjectCreateRequest::new("Recovery Collision", SourceSpec::managed_images("source-a")),
+        )
+        .unwrap();
+        let abandoned = root.join("Cache/.staging/import-2/Sources/source.json");
+        fs::create_dir_all(abandoned.parent().unwrap()).unwrap();
+        fs::write(&abandoned, br#"{"source":"partial"}"#).unwrap();
+        let collision = root.join("Logs/recovery/collision");
+        fs::create_dir(&collision).unwrap();
+        fs::write(collision.join("sentinel"), b"must survive").unwrap();
+        let names = Rc::new(RefCell::new(VecDeque::from([
+            "collision".to_owned(),
+            "available".to_owned(),
+        ])));
+        let next_name = Rc::clone(&names);
+        let synced = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&synced);
+
+        artifacts::recover_interrupted_attempts_with_test_hooks(
+            &store.root_directory,
+            ProjectStage::Import,
+            2,
+            &BTreeSet::new(),
+            move || next_name.borrow_mut().pop_front().unwrap(),
+            move |path| observed.borrow_mut().push(path.to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(collision.join("sentinel")).unwrap(),
+            b"must survive"
+        );
+        assert_eq!(
+            fs::read(root.join("Logs/recovery/available/Sources/source.json")).unwrap(),
+            br#"{"source":"partial"}"#
+        );
+        assert!(!abandoned.exists());
+        assert_eq!(
+            *synced.borrow(),
+            vec![
+                PathBuf::from("Cache/.staging"),
+                PathBuf::from("Logs/recovery")
+            ]
+        );
+    }
+
+    #[test]
     fn event_append_failure_is_a_warning_after_stage_begin_is_persisted() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("EventWarning.rustscanproject");
@@ -2402,7 +2719,15 @@ mod tests {
     }
 }
 
-#[cfg(all(test, any(not(unix), target_os = "solaris")))]
+#[cfg(all(
+    test,
+    not(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "redox",
+    ))
+))]
 mod unsupported_platform_tests {
     use super::*;
 

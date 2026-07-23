@@ -1,4 +1,9 @@
-#![cfg(any(not(unix), target_os = "solaris"))]
+#![cfg(not(any(
+    target_vendor = "apple",
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+)))]
 
 use rust_viewer::project::{ProjectCreateRequest, ProjectStore, ProjectStoreError, SourceSpec};
 

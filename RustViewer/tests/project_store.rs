@@ -1,4 +1,9 @@
-#![cfg(all(unix, not(target_os = "solaris")))]
+#![cfg(any(
+    target_vendor = "apple",
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+))]
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};

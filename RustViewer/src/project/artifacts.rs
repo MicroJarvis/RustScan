@@ -90,6 +90,11 @@ pub(crate) enum ArtifactCommitError {
     },
     #[error("attempt directory already exists: {path:?}")]
     AttemptAlreadyExists { path: PathBuf },
+    #[error("workspace directory may exist after its parent-directory sync failed: {source}")]
+    WorkspaceCreationUncertain {
+        #[source]
+        source: io::Error,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -120,6 +125,49 @@ pub(crate) fn recover_interrupted_attempts(
     attempt: u32,
     referenced_artifacts: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
+    recover_interrupted_attempts_with_hooks(
+        root_directory,
+        stage,
+        attempt,
+        referenced_artifacts,
+        || {
+            format!(
+                "interrupted-{}-{attempt}-{}",
+                stage_name(stage),
+                Uuid::new_v4()
+            )
+        },
+        |_| {},
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn recover_interrupted_attempts_with_test_hooks(
+    root_directory: &File,
+    stage: ProjectStage,
+    attempt: u32,
+    referenced_artifacts: &BTreeSet<PathBuf>,
+    recovery_name: impl FnMut() -> String,
+    sync_hook: impl FnMut(&Path),
+) -> io::Result<()> {
+    recover_interrupted_attempts_with_hooks(
+        root_directory,
+        stage,
+        attempt,
+        referenced_artifacts,
+        recovery_name,
+        sync_hook,
+    )
+}
+
+fn recover_interrupted_attempts_with_hooks(
+    root_directory: &File,
+    stage: ProjectStage,
+    attempt: u32,
+    referenced_artifacts: &BTreeSet<PathBuf>,
+    mut recovery_name: impl FnMut() -> String,
+    mut sync_hook: impl FnMut(&Path),
+) -> io::Result<()> {
     let staging = staging_relative(stage, attempt);
     if !references_content(referenced_artifacts, &staging) {
         move_to_recovery_if_present(
@@ -132,7 +180,8 @@ pub(crate) fn recover_interrupted_attempts(
                 .expect("staging workspace name is ASCII"),
             stage,
             attempt,
-            "staging",
+            &mut recovery_name,
+            &mut sync_hook,
         )?;
     }
     let committed_attempt = attempt_relative(stage, attempt);
@@ -149,7 +198,8 @@ pub(crate) fn recover_interrupted_attempts(
                 .expect("committed attempt name is ASCII"),
             stage,
             attempt,
-            "attempt",
+            &mut recovery_name,
+            &mut sync_hook,
         )?;
     }
     Ok(())
@@ -167,7 +217,8 @@ fn move_to_recovery_if_present(
     source_name: &str,
     stage: ProjectStage,
     attempt: u32,
-    kind: &str,
+    recovery_name: &mut impl FnMut() -> String,
+    sync_hook: &mut impl FnMut(&Path),
 ) -> io::Result<()> {
     let source_parent_directory = match open_directory(root_directory, source_parent) {
         Ok(directory) => directory,
@@ -192,19 +243,30 @@ fn move_to_recovery_if_present(
     }
 
     let recovery_directory = open_directory(root_directory, Path::new("Logs/recovery"))?;
-    let destination_name = format!(
-        "interrupted-{}-{attempt}-{kind}-{}",
-        stage_name(stage),
-        Uuid::new_v4()
-    );
-    rustix_fs::renameat(
-        &source_parent_directory,
-        source_name,
-        &recovery_directory,
-        destination_name.as_str(),
-    )
-    .map_err(io::Error::from)?;
-    recovery_directory.sync_all()
+    for _ in 0..16 {
+        let destination_name = recovery_name();
+        match rename_no_replace(
+            &source_parent_directory,
+            source_name,
+            &recovery_directory,
+            destination_name.as_str(),
+        ) {
+            Ok(()) => {
+                sync_directory(&source_parent_directory, source_parent, sync_hook)?;
+                sync_directory(&recovery_directory, Path::new("Logs/recovery"), sync_hook)?;
+                return Ok(());
+            }
+            Err(error) if error == Errno::EXIST => continue,
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "unable to allocate collision-free recovery directory for {} attempt {attempt}",
+            stage_name(stage)
+        ),
+    ))
 }
 
 fn open_directory(root_directory: &File, relative: &Path) -> io::Result<File> {
@@ -238,7 +300,9 @@ pub(crate) fn create_workspace(
     let staging_parent = open_directory(root_directory, Path::new("Cache/.staging"))?;
     let name = format!("{}-{attempt}", stage_name(stage));
     rustix_fs::mkdirat(&staging_parent, name.as_str(), Mode::RWXU).map_err(io::Error::from)?;
-    staging_parent.sync_all()?;
+    if let Err(source) = staging_parent.sync_all() {
+        return Err(ArtifactCommitError::WorkspaceCreationUncertain { source });
+    }
     let relative = staging_relative(stage, attempt);
     Ok(StageWorkspace {
         stage,
@@ -248,31 +312,49 @@ pub(crate) fn create_workspace(
     })
 }
 
-pub(crate) fn remove_empty_workspace(
-    root_directory: &File,
-    workspace: &StageWorkspace,
-) -> io::Result<()> {
-    let parent = open_directory(
-        root_directory,
-        workspace
-            .relative
-            .parent()
-            .expect("staging workspace has a parent"),
-    )?;
-    let name = workspace
-        .relative
-        .file_name()
-        .expect("staging workspace has a name");
-    rustix_fs::unlinkat(&parent, name, rustix_fs::AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-    parent.sync_all()
-}
-
 pub(crate) fn commit_workspace(
     root_directory: &File,
     workspace: &StageWorkspace,
     declarations: &[StagedArtifact],
     strict: bool,
+    phase_hook: impl FnMut(CommitPhase) -> Result<(), ArtifactCommitError>,
+) -> Result<Vec<ArtifactRef>, ArtifactCommitError> {
+    commit_workspace_with_hooks(
+        root_directory,
+        workspace,
+        declarations,
+        strict,
+        phase_hook,
+        |_| {},
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn commit_workspace_with_test_sync_hook(
+    root_directory: &File,
+    workspace: &StageWorkspace,
+    declarations: &[StagedArtifact],
+    strict: bool,
+    phase_hook: impl FnMut(CommitPhase) -> Result<(), ArtifactCommitError>,
+    sync_hook: impl FnMut(&Path),
+) -> Result<Vec<ArtifactRef>, ArtifactCommitError> {
+    commit_workspace_with_hooks(
+        root_directory,
+        workspace,
+        declarations,
+        strict,
+        phase_hook,
+        sync_hook,
+    )
+}
+
+fn commit_workspace_with_hooks(
+    root_directory: &File,
+    workspace: &StageWorkspace,
+    declarations: &[StagedArtifact],
+    strict: bool,
     mut phase_hook: impl FnMut(CommitPhase) -> Result<(), ArtifactCommitError>,
+    mut sync_hook: impl FnMut(&Path),
 ) -> Result<Vec<ArtifactRef>, ArtifactCommitError> {
     if declarations.is_empty() {
         return Err(ArtifactCommitError::EmptyDeclaration);
@@ -287,36 +369,14 @@ pub(crate) fn commit_workspace(
     }
 
     let workspace_directory = open_directory(root_directory, &workspace.relative)?;
-    let mut validated = Vec::with_capacity(declarations.len());
-    for declaration in declarations {
-        let (mut file, containing_directory) =
-            open_payload_file(&workspace_directory, declaration.payload_path())?;
-        if declaration.kind == ArtifactValidationKind::Json {
-            serde_json::from_reader::<_, serde_json::Value>(&mut file).map_err(|source| {
-                ArtifactCommitError::MalformedJson {
-                    path: declaration.payload_path.clone(),
-                    source,
-                }
-            })?;
-            file.rewind()?;
-        }
-        let (byte_len, content_hash) = hash_reader(&mut file)?;
-        file.sync_all()?;
-        containing_directory.sync_all()?;
-        validated.push((
-            declaration.payload_path.clone(),
-            byte_len,
-            content_hash.to_hex().to_string(),
-        ));
-    }
-    if strict {
-        let mut discovered = BTreeSet::new();
-        collect_regular_files(&workspace_directory, Path::new(""), &mut discovered)?;
-        if let Some(path) = discovered.into_iter().find(|path| !declared.contains(path)) {
-            return Err(ArtifactCommitError::UndeclaredPayload { path });
-        }
-    }
-    workspace_directory.sync_all()?;
+    validate_workspace_payloads(
+        &workspace_directory,
+        &workspace.relative,
+        declarations,
+        &declared,
+        strict,
+        &mut sync_hook,
+    )?;
     phase_hook(CommitPhase::AfterWorkspaceSync)?;
 
     let attempt_parent = ensure_directory(
@@ -348,17 +408,40 @@ pub(crate) fn commit_workspace(
         .relative
         .file_name()
         .expect("staging workspace has a name");
-    rename_attempt_no_replace(
+    rename_no_replace(
         &staging_parent,
         workspace_name,
         &attempt_parent,
         attempt_name.as_str(),
     )
     .map_err(io::Error::from)?;
-    attempt_parent.sync_all()?;
+    sync_directory(
+        &staging_parent,
+        workspace
+            .relative
+            .parent()
+            .expect("staging workspace has a parent"),
+        &mut sync_hook,
+    )?;
+    sync_directory(
+        &attempt_parent,
+        attempt_relative(workspace.stage, workspace.attempt)
+            .parent()
+            .expect("attempt directory has a parent"),
+        &mut sync_hook,
+    )?;
     phase_hook(CommitPhase::AfterAttemptRename)?;
 
     let attempt_root = attempt_relative(workspace.stage, workspace.attempt);
+    let attempt_directory = open_directory(root_directory, &attempt_root)?;
+    let validated = validate_workspace_payloads(
+        &attempt_directory,
+        &attempt_root,
+        declarations,
+        &declared,
+        strict,
+        &mut sync_hook,
+    )?;
     Ok(validated
         .into_iter()
         .map(|(payload_path, byte_len, content_hash)| ArtifactRef {
@@ -370,6 +453,76 @@ pub(crate) fn commit_workspace(
             byte_len,
         })
         .collect())
+}
+
+fn validate_workspace_payloads(
+    workspace_directory: &File,
+    workspace_relative: &Path,
+    declarations: &[StagedArtifact],
+    declared: &BTreeSet<PathBuf>,
+    strict: bool,
+    sync_hook: &mut impl FnMut(&Path),
+) -> Result<Vec<(PathBuf, u64, String)>, ArtifactCommitError> {
+    let mut validated = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let (mut file, containing_directories) = open_payload_file(
+            workspace_directory,
+            workspace_relative,
+            declaration.payload_path(),
+        )?;
+        if declaration.kind == ArtifactValidationKind::Json {
+            serde_json::from_reader::<_, serde_json::Value>(&mut file).map_err(|source| {
+                ArtifactCommitError::MalformedJson {
+                    path: declaration.payload_path.clone(),
+                    source,
+                }
+            })?;
+            file.rewind()?;
+        }
+        let (byte_len, content_hash) = hash_reader(&mut file)?;
+        sync_file(
+            &file,
+            &workspace_relative.join(declaration.payload_path()),
+            sync_hook,
+        )?;
+        for (directory, relative) in containing_directories.into_iter().rev() {
+            sync_directory(&directory, &relative, sync_hook)?;
+        }
+        validated.push((
+            declaration.payload_path.clone(),
+            byte_len,
+            content_hash.to_hex().to_string(),
+        ));
+    }
+    if strict {
+        let mut discovered = BTreeSet::new();
+        collect_regular_files(workspace_directory, Path::new(""), &mut discovered)?;
+        if let Some(path) = discovered.into_iter().find(|path| !declared.contains(path)) {
+            return Err(ArtifactCommitError::UndeclaredPayload { path });
+        }
+    }
+    sync_directory(workspace_directory, workspace_relative, sync_hook)?;
+    Ok(validated)
+}
+
+fn sync_file(
+    file: &File,
+    relative: &Path,
+    sync_hook: &mut impl FnMut(&Path),
+) -> Result<(), ArtifactCommitError> {
+    file.sync_all()?;
+    sync_hook(relative);
+    Ok(())
+}
+
+fn sync_directory(
+    directory: &File,
+    relative: &Path,
+    sync_hook: &mut impl FnMut(&Path),
+) -> io::Result<()> {
+    directory.sync_all()?;
+    sync_hook(relative);
+    Ok(())
 }
 
 fn normalize_relative_path(path: &Path) -> Result<PathBuf, ArtifactCommitError> {
@@ -391,14 +544,20 @@ fn normalize_relative_path(path: &Path) -> Result<PathBuf, ArtifactCommitError> 
 
 fn open_payload_file(
     workspace_directory: &File,
+    workspace_relative: &Path,
     relative: &Path,
-) -> Result<(File, File), ArtifactCommitError> {
+) -> Result<(File, Vec<(File, PathBuf)>), ArtifactCommitError> {
     let relative = normalize_relative_path(relative)?;
     let mut components = relative.components();
     let Some(std::path::Component::Normal(mut component)) = components.next() else {
         return Err(ArtifactCommitError::UnsafePayloadPath { path: relative });
     };
     let mut directory = workspace_directory.try_clone()?;
+    let mut directory_relative = PathBuf::new();
+    let mut containing_directories = vec![(
+        workspace_directory.try_clone()?,
+        workspace_relative.to_path_buf(),
+    )];
     for next in components {
         let std::path::Component::Normal(next) = next else {
             return Err(ArtifactCommitError::UnsafePayloadPath { path: relative });
@@ -411,6 +570,11 @@ fn open_payload_file(
         )
         .map_err(io::Error::from)?;
         directory = File::from(opened);
+        directory_relative.push(component);
+        containing_directories.push((
+            directory.try_clone()?,
+            workspace_relative.join(&directory_relative),
+        ));
         component = next;
     }
     let opened = rustix_fs::openat(
@@ -428,7 +592,7 @@ fn open_payload_file(
     if !file_type.is_file() {
         return Err(ArtifactCommitError::NotRegularFile { path: relative });
     }
-    Ok((File::from(opened), directory))
+    Ok((File::from(opened), containing_directories))
 }
 
 fn collect_regular_files(
@@ -517,7 +681,7 @@ fn ensure_directory(root_directory: &File, relative: &Path) -> io::Result<File> 
     target_os = "linux",
     target_os = "redox"
 ))]
-fn rename_attempt_no_replace(
+fn rename_no_replace(
     old_directory: &File,
     old_name: impl rustix::path::Arg,
     new_directory: &File,
@@ -538,13 +702,13 @@ fn rename_attempt_no_replace(
     target_os = "linux",
     target_os = "redox"
 )))]
-fn rename_attempt_no_replace(
-    old_directory: &File,
-    old_name: impl rustix::path::Arg,
-    new_directory: &File,
-    new_name: impl rustix::path::Arg,
+fn rename_no_replace(
+    _old_directory: &File,
+    _old_name: impl rustix::path::Arg,
+    _new_directory: &File,
+    _new_name: impl rustix::path::Arg,
 ) -> rustix::io::Result<()> {
-    rustix_fs::renameat(old_directory, old_name, new_directory, new_name)
+    Err(Errno::NOSYS)
 }
 
 fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
