@@ -62,6 +62,12 @@ pub enum ProjectLibraryError {
     DestinationNotEmpty { path: PathBuf },
     #[error("source package has an active stage lease")]
     ActiveLease,
+    #[error("project duplication completed but parent directory sync failed at {destination:?}: {source}")]
+    DuplicateCompletedButUnsynced {
+        destination: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("delete confirmation id {provided} does not match project id {expected}")]
     DeleteConfirmationMismatch { expected: Uuid, provided: Uuid },
     #[error("project package changed before deletion: {path:?}")]
@@ -122,6 +128,24 @@ pub(crate) fn duplicate_package(
     source_manifest: &ProjectManifest,
     destination: impl AsRef<Path>,
 ) -> Result<ProjectSummary, ProjectLibraryError> {
+    duplicate_package_with_hooks(
+        source_directory,
+        source_root,
+        source_manifest,
+        destination,
+        &mut commit_duplicate_rename,
+        &mut |parent| parent.sync_all(),
+    )
+}
+
+fn duplicate_package_with_hooks(
+    source_directory: &File,
+    source_root: &Path,
+    source_manifest: &ProjectManifest,
+    destination: impl AsRef<Path>,
+    commit_rename: &mut impl FnMut(&File, &str, &str, DestinationState) -> io::Result<()>,
+    sync_after_commit: &mut impl FnMut(&File) -> io::Result<()>,
+) -> Result<ProjectSummary, ProjectLibraryError> {
     require_supported_platform()?;
     source_manifest.validate().map_err(manifest_error)?;
     if source_manifest.lease().is_some() {
@@ -135,22 +159,22 @@ pub(crate) fn duplicate_package(
     let temporary_name = format!(".{}-duplicate-{}", destination_name, Uuid::new_v4());
     rustix_fs::mkdirat(&destination_parent, temporary_name.as_str(), Mode::RWXU)
         .map_err(io::Error::from)?;
-    destination_parent.sync_all()?;
-    let temporary_root = File::from(
-        rustix_fs::openat(
-            &destination_parent,
-            temporary_name.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?,
-    );
     let temporary_path = destination_root
         .parent()
         .expect("duplicate destination has a parent")
         .join(&temporary_name);
 
     let result = (|| {
+        destination_parent.sync_all()?;
+        let temporary_root = File::from(
+            rustix_fs::openat(
+                &destination_parent,
+                temporary_name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
         copy_non_artifact_payloads(source_directory, &temporary_root)?;
         let mut manifest = source_manifest.clone();
         manifest.id = Uuid::new_v4();
@@ -177,24 +201,18 @@ pub(crate) fn duplicate_package(
         )?;
         temporary_root.sync_all()?;
 
-        if destination_state == DestinationState::EmptyDirectory {
-            ensure_empty_destination(&destination_parent, &destination_name)?;
-            rustix_fs::unlinkat(
-                &destination_parent,
-                &destination_name,
-                rustix_fs::AtFlags::REMOVEDIR,
-            )
-            .map_err(io::Error::from)?;
-            destination_parent.sync_all()?;
-        }
-        artifacts::rename_no_replace(
+        commit_rename(
             &destination_parent,
-            temporary_name.as_str(),
-            &destination_parent,
+            &temporary_name,
             &destination_name,
-        )
-        .map_err(io::Error::from)?;
-        destination_parent.sync_all()?;
+            destination_state,
+        )?;
+        sync_after_commit(&destination_parent).map_err(|source| {
+            ProjectLibraryError::DuplicateCompletedButUnsynced {
+                destination: requested_destination.clone(),
+                source,
+            }
+        })?;
         Ok(summary_from_manifest(&manifest, requested_destination))
     })();
 
@@ -202,6 +220,26 @@ pub(crate) fn duplicate_package(
         let _ = fs::remove_dir_all(&temporary_path);
     }
     result
+}
+
+fn commit_duplicate_rename(
+    parent: &File,
+    temporary_name: &str,
+    destination_name: &str,
+    destination_state: DestinationState,
+) -> io::Result<()> {
+    match destination_state {
+        DestinationState::Missing => {
+            artifacts::rename_no_replace(parent, temporary_name, parent, destination_name)
+                .map_err(io::Error::from)
+        }
+        // POSIX rename replaces only an empty destination directory. It keeps the destination
+        // unchanged when the replacement fails, which preserves the caller's empty placeholder.
+        DestinationState::EmptyDirectory => {
+            rustix_fs::renameat(parent, temporary_name, parent, destination_name)
+                .map_err(io::Error::from)
+        }
+    }
 }
 
 pub(crate) struct DeleteTarget {
@@ -1001,6 +1039,83 @@ fn require_supported_platform() -> Result<(), ProjectLibraryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::{ProjectCreateRequest, ProjectStore, SourceSpec};
+
+    #[test]
+    fn duplicate_keeps_an_existing_empty_destination_when_commit_rename_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Source.rustscanproject");
+        let store = ProjectStore::create(
+            &source,
+            ProjectCreateRequest::new("Source", SourceSpec::managed_images("source")),
+        )
+        .unwrap();
+        let destination = temp.path().join("Destination.rustscanproject");
+        fs::create_dir(&destination).unwrap();
+        let source_directory = open_directory_path(store.root()).unwrap();
+
+        let error = duplicate_package_with_hooks(
+            &source_directory,
+            store.root(),
+            store.manifest(),
+            &destination,
+            &mut |_, _, _, _| Err(io::Error::other("injected duplicate rename failure")),
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+
+        let ProjectLibraryError::Io(source) = error else {
+            panic!("expected the injected rename failure");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert!(destination.is_dir());
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".Destination.rustscanproject-duplicate-")));
+    }
+
+    #[test]
+    fn duplicate_reports_completed_but_unsynced_after_the_destination_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Source.rustscanproject");
+        let store = ProjectStore::create(
+            &source,
+            ProjectCreateRequest::new("Source", SourceSpec::managed_images("source")),
+        )
+        .unwrap();
+        let destination = temp.path().join("Destination.rustscanproject");
+        fs::create_dir(&destination).unwrap();
+        let source_directory = open_directory_path(store.root()).unwrap();
+
+        let error = duplicate_package_with_hooks(
+            &source_directory,
+            store.root(),
+            store.manifest(),
+            &destination,
+            &mut commit_duplicate_rename,
+            &mut |_| Err(io::Error::other("injected final parent sync failure")),
+        )
+        .unwrap_err();
+
+        let ProjectLibraryError::DuplicateCompletedButUnsynced {
+            destination: completed_destination,
+            source,
+        } = error
+        else {
+            panic!("expected a completed-but-unsynced duplicate error");
+        };
+        assert_eq!(completed_destination, destination);
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert!(destination.join(MANIFEST_NAME).is_file());
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".Destination.rustscanproject-duplicate-")));
+    }
 
     #[test]
     fn interrupted_delete_hides_the_package_and_leaves_a_recoverable_tombstone() {

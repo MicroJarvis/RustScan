@@ -330,7 +330,7 @@ git commit -m "feat(viewer): commit recoverable project artifacts"
 - Modify: `RustViewer/src/project/mod.rs`
 - Test: `RustViewer/tests/project_store.rs`
 
-- [ ] **Step 1: Write summary, duplicate, delete, and reveal RED tests**
+- [x] **Step 1: Write summary, duplicate, delete, and reveal RED tests**
 
 Define a lightweight result that does not load or hash artifacts:
 
@@ -355,7 +355,7 @@ Test valid and corrupt packages in one library, duplicate UUID replacement, refu
 active lease, exclusion of `Cache/.staging`, `project.lock`, and old logs, exact-ID deletion, nested or
 self destinations, symlink roots, and canonical reveal paths.
 
-- [ ] **Step 2: Run the library tests and verify RED**
+- [x] **Step 2: Run the library tests and verify RED**
 
 Run:
 
@@ -365,14 +365,14 @@ cargo test -p rust-viewer --test project_store project_library_
 
 Expected: FAIL because `library.rs` and typed operations do not exist.
 
-- [ ] **Step 3: Implement lightweight summaries**
+- [x] **Step 3: Implement lightweight summaries**
 
 Scan only immediate `.rustscanproject` children. Read `project.json` as a value, reject future schema,
 deserialize and run structural manifest validation, but do not canonicalize/hash every artifact.
 Return one `ProjectSummaryEntry` per candidate so a corrupt project does not hide valid projects.
 Sort newest first, then case-insensitive display name, then UUID for determinism.
 
-- [ ] **Step 4: Implement atomic duplicate**
+- [x] **Step 4: Implement atomic duplicate**
 
 Reject self, descendant, symlink, non-suffixed, and non-empty destinations. Refuse duplication while
 the source has an active lease. Copy through a sibling temporary package, skipping `project.lock`,
@@ -380,13 +380,13 @@ the source has an active lease. Copy through a sibling temporary package, skippi
 the lease, validate all copied committed artifact references, write a fresh event log containing a
 `duplicated_from` record, fsync, then rename the temporary package into place.
 
-- [ ] **Step 5: Implement exact-ID delete and reveal**
+- [x] **Step 5: Implement exact-ID delete and reveal**
 
 `delete(self, confirmation_id)` consumes the locked store, compares the exact UUID, verifies the
 canonical root still has the `.rustscanproject` suffix and is not a symlink, releases the lock, and
 removes only that root. `reveal_path(&self)` returns the canonical root without invoking Finder.
 
-- [ ] **Step 6: Run Task 2C and full Task 2 verification**
+- [x] **Step 6: Run Task 2C and full Task 2 verification**
 
 Run:
 
@@ -401,7 +401,7 @@ git diff --check
 Expected: all Task 1 and Task 2 tests pass. A full `cargo test -p rust-viewer` may still report only
 the pre-existing `loader::colmap::tests::loads_colmap_and_maps_scene` failure.
 
-- [ ] **Step 7: Commit Task 2C**
+- [x] **Step 7: Commit Task 2C**
 
 ```bash
 git add RustViewer/src/project RustViewer/tests/project_store.rs
@@ -410,3 +410,11 @@ git commit -m "feat(viewer): manage project library packages"
 
 After each of Tasks 2A, 2B, and 2C, perform independent specification review followed by independent
 code-quality review. Do not begin the next task until both reviews pass.
+
+**Completion record:** Task 2C was implemented across the project-library commits beginning with
+`b7abb6d`; its final duplicate transaction repair is covered by `DuplicateCompletedButUnsynced` and
+the failure-boundary tests in `RustViewer/src/project/library.rs`. Independent specification and
+quality reviews passed after that repair. The final verification ran `cargo test -p rust-viewer
+--test project_store` (35 tests), `cargo test -p rust-viewer --lib project::library::tests` (8
+tests), `cargo test -p rust-viewer --lib project::state::tests` (10 tests), `cargo fmt --all --
+--check`, and `git diff --check`.

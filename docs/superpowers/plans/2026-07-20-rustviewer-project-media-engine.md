@@ -260,6 +260,10 @@ git commit -m "feat(viewer): add persistent project state model"
 
 ### Task 2: Project Store, Atomic Artifacts, and Recovery Lease
 
+> **Completion status:** This task was completed and hardened by
+> `2026-07-22-rustviewer-project-store-hardening.md`, which adds immutable attempt commits,
+> descriptor-relative operations, project-library management, and review-gated recovery semantics.
+
 > **Revised 2026-07-22 after crash-consistency review:** Execute this task through
 > `docs/superpowers/plans/2026-07-22-rustviewer-project-store-hardening.md`. That plan splits
 > the work into Tasks 2A-2C and replaces per-file destination swaps with an immutable committed
@@ -274,7 +278,7 @@ git commit -m "feat(viewer): add persistent project state model"
 - Create: `RustViewer/src/project/store.rs`
 - Test: `RustViewer/tests/project_store.rs`
 
-- [ ] **Step 1: Add dependencies and write failing package tests**
+- [x] **Step 1: Add dependencies and write failing package tests**
 
 Add:
 
@@ -301,7 +305,7 @@ assert_eq!(reopened.manifest().stage(ProjectStage::Import).state, StageState::Fa
 assert_eq!(reopened.manifest().stage(ProjectStage::Import).error.as_ref().unwrap().code, "interrupted");
 ```
 
-- [ ] **Step 2: Run store tests and verify RED**
+- [x] **Step 2: Run store tests and verify RED**
 
 Run:
 
@@ -311,11 +315,11 @@ cargo test -p rust-viewer --test project_store project_store_
 
 Expected: FAIL because `ProjectStore` does not exist.
 
-- [ ] **Step 3: Implement creation/open/migration**
+- [x] **Step 3: Implement creation/open/migration**
 
 `ProjectStore::create` requires a `.rustscanproject` suffix, creates the exact package tree from the design, writes schema version 1, and fails if a non-empty destination exists. `open` canonicalizes the root, reads `project.json`, rejects future schema versions, runs explicit sequential migration functions for older versions, and validates every relative artifact remains under the canonical project root.
 
-- [ ] **Step 4: Implement atomic JSON and stage directories**
+- [x] **Step 4: Implement atomic JSON and stage directories**
 
 Centralize writes:
 
@@ -339,11 +343,11 @@ Add `ProjectStore::list_summaries(library_root)`, `duplicate(destination)`, and 
 
 Append every stage transition, structured warning/error, pause/cancel request, and artifact commit as one flushed JSON record in `Logs/events.jsonl`. A corrupt trailing line is preserved for diagnostics and ignored during recovery; `project.json` remains authoritative.
 
-- [ ] **Step 5: Implement lease recovery**
+- [x] **Step 5: Implement lease recovery**
 
 `begin_stage` writes a lease containing project UUID, stage, attempt, process ID, and start time before the worker starts. Clean completion clears it. On open, a remaining lease converts only `Running`, `PauseRequested`, or `CancelRequested` to `Failed` with code `interrupted`, keeps all committed artifacts, moves abandoned staging output to `Logs/recovery/{stage}-{attempt}`, and requires user-confirmed retry.
 
-- [ ] **Step 6: Run project store tests**
+- [x] **Step 6: Run project store tests**
 
 Run:
 
@@ -353,7 +357,7 @@ cargo test -p rust-viewer --test project_store
 
 Expected: PASS for atomic replacement, traversal rejection, artifact hashes, stage commit ordering, future-version rejection, and interrupted recovery.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```bash
 git add RustViewer/Cargo.toml Cargo.lock RustViewer/src/project/store.rs RustViewer/tests/project_store.rs
