@@ -1309,6 +1309,8 @@ fn project_library_refuses_unsafe_duplicate_destinations() {
 
 #[test]
 fn project_library_reveals_canonical_root_and_deletes_only_the_confirmed_id() {
+    use std::os::unix::fs::MetadataExt;
+
     let temp = tempfile::tempdir().unwrap();
     let library = temp.path().join("Library");
     fs::create_dir(&library).unwrap();
@@ -1327,8 +1329,31 @@ fn project_library_reveals_canonical_root_and_deletes_only_the_confirmed_id() {
 
     let store = ProjectStore::open(&path).unwrap();
     let id = store.manifest().id();
+    let original_metadata = fs::metadata(&path).unwrap();
+    let original_manifest = fs::read(path.join("project.json")).unwrap();
     store.delete(id).unwrap();
     assert!(!path.exists());
+
+    let quarantines = fs::read_dir(&library)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".rustscan-delete-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(quarantines.len(), 1);
+    let quarantine = &quarantines[0];
+    let quarantine_metadata = fs::metadata(quarantine).unwrap();
+    assert_eq!(quarantine_metadata.dev(), original_metadata.dev());
+    assert_eq!(quarantine_metadata.ino(), original_metadata.ino());
+    assert_eq!(
+        fs::read(quarantine.join("project.json")).unwrap(),
+        original_manifest
+    );
+    assert!(list_summaries(&library).unwrap().is_empty());
 }
 
 #[test]

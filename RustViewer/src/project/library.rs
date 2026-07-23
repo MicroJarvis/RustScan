@@ -242,28 +242,40 @@ pub(crate) fn delete_prepared_with_before_tombstone(
     target: DeleteTarget,
     before_tombstone: impl FnOnce(),
 ) -> Result<(), ProjectLibraryError> {
-    delete_prepared_with_hooks(target, before_tombstone, || next_delete_tombstone_name())
+    delete_prepared_with_after_rename_hook(
+        target,
+        before_tombstone,
+        |_| {},
+        || next_delete_tombstone_name(),
+    )
 }
 
+#[cfg(test)]
 fn delete_prepared_with_hooks(
     target: DeleteTarget,
     before_tombstone: impl FnOnce(),
+    next_tombstone_name: impl FnMut() -> String,
+) -> Result<(), ProjectLibraryError> {
+    delete_prepared_with_after_rename_hook(target, before_tombstone, |_| {}, next_tombstone_name)
+}
+
+fn delete_prepared_with_after_rename_hook(
+    target: DeleteTarget,
+    before_tombstone: impl FnOnce(),
+    after_rename: impl FnOnce(&str),
     mut next_tombstone_name: impl FnMut() -> String,
 ) -> Result<(), ProjectLibraryError> {
     ensure_delete_target_identity(&target)?;
     before_tombstone();
+    ensure_delete_target_identity(&target)?;
 
     // A private no-replace name removes the final external package-name race.
-    let (tombstone_name, tombstone) =
-        move_delete_target_to_tombstone(&target, &mut next_tombstone_name)?;
-    remove_directory_contents(&tombstone)?;
-    rustix_fs::unlinkat(
-        &target.parent,
-        &tombstone_name,
-        rustix_fs::AtFlags::REMOVEDIR,
-    )
-    .map_err(io::Error::from)?;
-    target.parent.sync_all()?;
+    let (tombstone_name, _tombstone) =
+        move_delete_target_to_tombstone(&target, &mut next_tombstone_name, after_rename)?;
+    target
+        .parent
+        .sync_all()
+        .map_err(|error| delete_tombstone_preserved(&target, &tombstone_name, error))?;
     Ok(())
 }
 
@@ -813,6 +825,7 @@ fn next_delete_tombstone_name() -> String {
 fn move_delete_target_to_tombstone(
     target: &DeleteTarget,
     next_tombstone_name: &mut impl FnMut() -> String,
+    after_rename: impl FnOnce(&str),
 ) -> Result<(String, File), ProjectLibraryError> {
     loop {
         let tombstone_name = next_tombstone_name();
@@ -823,7 +836,11 @@ fn move_delete_target_to_tombstone(
             tombstone_name.as_str(),
         ) {
             Ok(()) => {
-                target.parent.sync_all()?;
+                target
+                    .parent
+                    .sync_all()
+                    .map_err(|error| delete_tombstone_preserved(target, &tombstone_name, error))?;
+                after_rename(&tombstone_name);
                 let tombstone = open_verified_delete_tombstone(target, &tombstone_name)?;
                 return Ok((tombstone_name, tombstone));
             }
@@ -846,16 +863,17 @@ fn open_verified_delete_tombstone(
         &target.parent,
         tombstone_name,
         rustix_fs::AtFlags::SYMLINK_NOFOLLOW,
-    );
-    match entry {
-        Ok(metadata) if delete_target_matches_metadata(target, &metadata) => {}
-        Ok(_) => return Err(restore_mismatched_tombstone(target, tombstone_name)),
-        Err(error) if error == Errno::NOENT => {
-            return Err(ProjectLibraryError::DeleteTargetChanged {
-                path: target.root_path.clone(),
-            })
-        }
-        Err(error) => return Err(io::Error::from(error).into()),
+    )
+    .map_err(|error| delete_tombstone_preserved(target, tombstone_name, io::Error::from(error)))?;
+    if !delete_target_matches_metadata(target, &entry) {
+        return Err(delete_tombstone_preserved(
+            target,
+            tombstone_name,
+            io::Error::new(
+                io::ErrorKind::Other,
+                "tombstone no longer matches the delete target",
+            ),
+        ));
     }
 
     let opened = rustix_fs::openat(
@@ -863,17 +881,23 @@ fn open_verified_delete_tombstone(
         tombstone_name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    );
-    let opened = match opened {
-        Ok(opened) => File::from(opened),
-        Err(_) => return Err(restore_mismatched_tombstone(target, tombstone_name)),
-    };
-    let metadata = rustix_fs::fstat(&opened).map_err(io::Error::from)?;
+    )
+    .map(File::from)
+    .map_err(|error| delete_tombstone_preserved(target, tombstone_name, io::Error::from(error)))?;
+    let metadata = rustix_fs::fstat(&opened).map_err(|error| {
+        delete_tombstone_preserved(target, tombstone_name, io::Error::from(error))
+    })?;
     if delete_target_matches_metadata(target, &metadata) {
         Ok(opened)
     } else {
-        drop(opened);
-        Err(restore_mismatched_tombstone(target, tombstone_name))
+        Err(delete_tombstone_preserved(
+            target,
+            tombstone_name,
+            io::Error::new(
+                io::ErrorKind::Other,
+                "opened tombstone no longer matches the delete target",
+            ),
+        ))
     }
 }
 
@@ -881,69 +905,19 @@ fn delete_target_matches_metadata(target: &DeleteTarget, metadata: &rustix_fs::S
     metadata.st_dev as u64 == target.root_device && metadata.st_ino as u64 == target.root_inode
 }
 
-fn restore_mismatched_tombstone(
+fn delete_tombstone_preserved(
     target: &DeleteTarget,
     tombstone_name: &str,
+    source: io::Error,
 ) -> ProjectLibraryError {
-    match artifacts::rename_no_replace(&target.parent, tombstone_name, &target.parent, &target.name)
-    {
-        Ok(()) => {
-            let _ = target.parent.sync_all();
-            ProjectLibraryError::DeleteTargetChanged {
-                path: target.root_path.clone(),
-            }
-        }
-        Err(error) if error == Errno::NOENT => ProjectLibraryError::DeleteTargetChanged {
-            path: target.root_path.clone(),
-        },
-        Err(error) => ProjectLibraryError::DeleteTombstonePreserved {
-            path: target
-                .root_path
-                .parent()
-                .expect("canonical project root has a parent")
-                .join(tombstone_name),
-            source: io::Error::from(error),
-        },
+    ProjectLibraryError::DeleteTombstonePreserved {
+        path: target
+            .root_path
+            .parent()
+            .expect("canonical project root has a parent")
+            .join(tombstone_name),
+        source,
     }
-}
-
-fn remove_directory_tree_at(parent: &File, name: &str) -> Result<(), ProjectLibraryError> {
-    let directory = File::from(
-        rustix_fs::openat(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?,
-    );
-    remove_directory_contents(&directory)?;
-    rustix_fs::unlinkat(parent, name, rustix_fs::AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-    Ok(())
-}
-
-fn remove_directory_contents(directory: &File) -> Result<(), ProjectLibraryError> {
-    for entry in rustix_fs::Dir::read_from(directory).map_err(io::Error::from)? {
-        let entry = entry.map_err(io::Error::from)?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let metadata = rustix_fs::statat(
-            directory,
-            name.as_str(),
-            rustix_fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(io::Error::from)?;
-        if FileType::from_raw_mode(metadata.st_mode).is_dir() {
-            remove_directory_tree_at(directory, &name)?;
-        } else {
-            rustix_fs::unlinkat(directory, name.as_str(), rustix_fs::AtFlags::empty())
-                .map_err(io::Error::from)?;
-        }
-    }
-    directory.sync_all()?;
-    Ok(())
 }
 
 fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
@@ -1018,6 +992,56 @@ mod tests {
 
         assert!(!root.exists());
         assert_eq!(fs::read(&collision_marker).unwrap(), b"collision");
-        assert!(!temp.path().join(tombstone).exists());
+        assert!(temp.path().join(tombstone).is_dir());
+    }
+
+    #[test]
+    fn delete_tombstone_swap_preserves_the_replacement_without_restoring_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Delete.rustscanproject");
+        let tombstone = ".delete-tombstone";
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("project.json"), b"original").unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let expected_tombstone = canonical_root.parent().unwrap().join(tombstone);
+        let root_directory = open_directory_path(&canonical_root).unwrap();
+        let target = prepare_delete(&root_directory, &canonical_root).unwrap();
+
+        let error = delete_prepared_with_after_rename_hook(
+            target,
+            || {},
+            |tombstone_name| {
+                let quarantine = temp.path().join(tombstone_name);
+                let moved = temp.path().join("Original.rustscanproject");
+                fs::rename(&quarantine, &moved).unwrap();
+                fs::create_dir(&quarantine).unwrap();
+                fs::write(quarantine.join("replacement-must-survive"), b"replacement").unwrap();
+            },
+            || tombstone.to_owned(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ProjectLibraryError::DeleteTombstonePreserved { ref path, .. }
+                    if path == &expected_tombstone
+            ),
+            "error: {error:?}"
+        );
+        assert_eq!(
+            fs::read(temp.path().join(tombstone).join("replacement-must-survive")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(
+                temp.path()
+                    .join("Original.rustscanproject")
+                    .join("project.json")
+            )
+            .unwrap(),
+            b"original"
+        );
+        assert!(!root.exists());
     }
 }
