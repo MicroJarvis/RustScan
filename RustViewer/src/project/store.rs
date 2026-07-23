@@ -566,6 +566,15 @@ fn create_and_lock(
     cleanup: Option<&mut InitializationCleanup>,
 ) -> Result<File, ProjectStoreError> {
     let lock_path = root.join(LOCK_NAME);
+    // The stable package inode is the outer writer lock. A lock-file inode alone can be
+    // unlinked and replaced while still locked, admitting a second writer on the replacement.
+    match root_directory.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return Err(ProjectStoreError::AlreadyOpen { path: lock_path });
+        }
+        Err(error) => return Err(error.into()),
+    }
     let (file, created) = match rustix_fs::openat(
         root_directory,
         LOCK_NAME,
@@ -596,6 +605,18 @@ fn create_and_lock(
     }
     match file.try_lock_exclusive() {
         Ok(()) => {
+            let opened_metadata = rustix_fs::fstat(&file).map_err(io::Error::from)?;
+            let entry_metadata = rustix_fs::statat(
+                root_directory,
+                LOCK_NAME,
+                rustix_fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(io::Error::from)?;
+            if opened_metadata.st_dev != entry_metadata.st_dev
+                || opened_metadata.st_ino != entry_metadata.st_ino
+            {
+                return Err(ProjectStoreError::AlreadyOpen { path: lock_path });
+            }
             if created {
                 if let Some(cleanup) = cleanup {
                     cleanup.record_created_file(PathBuf::from(LOCK_NAME));

@@ -543,6 +543,22 @@ fn project_store_allows_only_one_writer() {
     ProjectStore::open(&path).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn project_store_lock_replacement_does_not_admit_a_second_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Flowers.rustscanproject");
+    let first = ProjectStore::create(&path, create_request("Flowers")).unwrap();
+    let lock_path = path.join("project.lock");
+    fs::remove_file(&lock_path).unwrap();
+    fs::write(&lock_path, b"").unwrap();
+
+    let second = ProjectStore::open(&path);
+
+    assert!(matches!(second, Err(ProjectStoreError::AlreadyOpen { .. })));
+    drop(first);
+}
+
 #[test]
 fn project_store_open_dispatches_schema_before_typed_deserialization() {
     let temp = tempfile::tempdir().unwrap();
