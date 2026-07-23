@@ -19,6 +19,7 @@ use super::{
 const PACKAGE_EXTENSION: &str = "rustscanproject";
 const MANIFEST_NAME: &str = "project.json";
 const LOCK_NAME: &str = "project.lock";
+const DELETE_TOMBSTONE_PREFIX: &str = ".rustscan-delete-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectSummaryStatus {
@@ -65,6 +66,16 @@ pub enum ProjectLibraryError {
     DeleteConfirmationMismatch { expected: Uuid, provided: Uuid },
     #[error("project package changed before deletion: {path:?}")]
     DeleteTargetChanged { path: PathBuf },
+    #[error(
+        "project deletion cleanup failed; recoverable tombstone is at {tombstone:?}: {source}"
+    )]
+    DeleteCleanupFailed {
+        tombstone: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("delete recovery path is not a tombstone directory: {path:?}")]
+    InvalidDeleteTombstone { path: PathBuf },
     #[error("project manifest is malformed: {0}")]
     InvalidManifest(String),
     #[error("copied artifact does not match its manifest reference: {path:?}")]
@@ -85,6 +96,9 @@ pub fn list_summaries(
         let entry = entry.map_err(io::Error::from)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == "." || name == ".." {
+            continue;
+        }
+        if name.starts_with(DELETE_TOMBSTONE_PREFIX) {
             continue;
         }
         let root = library_root_label.join(&name);
@@ -233,13 +247,96 @@ impl DeleteTarget {
 }
 
 pub(crate) fn delete_prepared(target: DeleteTarget) -> Result<(), ProjectLibraryError> {
-    ensure_delete_target_identity(&target)?;
-    remove_directory_contents(&target.root)?;
-    ensure_delete_target_identity(&target)?;
-    rustix_fs::unlinkat(&target.parent, &target.name, rustix_fs::AtFlags::REMOVEDIR)
-        .map_err(io::Error::from)?;
-    target.parent.sync_all()?;
+    delete_prepared_with_after_removal(target, &mut || Ok(()))
+}
+
+pub fn cleanup_delete_tombstone(tombstone: impl AsRef<Path>) -> Result<(), ProjectLibraryError> {
+    require_supported_platform()?;
+    let requested = tombstone.as_ref();
+    let metadata = fs::symlink_metadata(requested)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProjectLibraryError::InvalidDeleteTombstone {
+            path: requested.to_path_buf(),
+        });
+    }
+    let tombstone = fs::canonicalize(requested)?;
+    let parent_path =
+        tombstone
+            .parent()
+            .ok_or_else(|| ProjectLibraryError::InvalidDeleteTombstone {
+                path: tombstone.clone(),
+            })?;
+    let name = tombstone
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| name.starts_with(DELETE_TOMBSTONE_PREFIX))
+        .ok_or_else(|| ProjectLibraryError::InvalidDeleteTombstone {
+            path: tombstone.clone(),
+        })?;
+    let parent = open_directory_path(parent_path)?;
+    let directory = open_directory_at(&parent, Path::new(name))?;
+    remove_directory_contents(&directory, &mut || Ok(()))?;
+    rustix_fs::unlinkat(&parent, name, rustix_fs::AtFlags::REMOVEDIR).map_err(io::Error::from)?;
+    parent.sync_all()?;
     Ok(())
+}
+
+fn delete_prepared_with_after_removal(
+    target: DeleteTarget,
+    after_removal: &mut impl FnMut() -> io::Result<()>,
+) -> Result<(), ProjectLibraryError> {
+    ensure_delete_target_identity(&target)?;
+    let (tombstone_name, tombstone) = move_delete_target_to_tombstone(&target)?;
+    let cleanup = (|| {
+        target.parent.sync_all()?;
+        remove_directory_contents(&target.root, after_removal)?;
+        rustix_fs::unlinkat(
+            &target.parent,
+            tombstone_name.as_str(),
+            rustix_fs::AtFlags::REMOVEDIR,
+        )
+        .map_err(io::Error::from)?;
+        target.parent.sync_all()?;
+        Ok(())
+    })();
+    if let Err(source) = cleanup {
+        return Err(ProjectLibraryError::DeleteCleanupFailed { tombstone, source });
+    }
+    Ok(())
+}
+
+fn move_delete_target_to_tombstone(
+    target: &DeleteTarget,
+) -> Result<(String, PathBuf), ProjectLibraryError> {
+    for _ in 0..16 {
+        let name = format!("{DELETE_TOMBSTONE_PREFIX}{}", Uuid::new_v4());
+        match artifacts::rename_no_replace(&target.parent, &target.name, &target.parent, &name) {
+            Ok(()) => return Ok((name.clone(), target.root_path.with_file_name(name))),
+            Err(Errno::EXIST) => continue,
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate collision-free deletion tombstone",
+    )
+    .into())
+}
+
+#[cfg(test)]
+fn delete_prepared_with_test_failure_after_removal(
+    target: DeleteTarget,
+    fail_after: usize,
+) -> Result<(), ProjectLibraryError> {
+    let mut removals = 0;
+    delete_prepared_with_after_removal(target, &mut || {
+        removals += 1;
+        if removals >= fail_after {
+            Err(io::Error::other("injected deletion cleanup failure"))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 pub(crate) fn reveal_path(root: &Path) -> Result<PathBuf, ProjectLibraryError> {
@@ -781,7 +878,11 @@ fn ensure_delete_target_identity(target: &DeleteTarget) -> Result<(), ProjectLib
     }
 }
 
-fn remove_directory_tree_at(parent: &File, name: &str) -> Result<(), ProjectLibraryError> {
+fn remove_directory_tree_at(
+    parent: &File,
+    name: &str,
+    after_removal: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     let directory = File::from(
         rustix_fs::openat(
             parent,
@@ -791,12 +892,16 @@ fn remove_directory_tree_at(parent: &File, name: &str) -> Result<(), ProjectLibr
         )
         .map_err(io::Error::from)?,
     );
-    remove_directory_contents(&directory)?;
+    remove_directory_contents(&directory, after_removal)?;
     rustix_fs::unlinkat(parent, name, rustix_fs::AtFlags::REMOVEDIR).map_err(io::Error::from)?;
+    after_removal()?;
     Ok(())
 }
 
-fn remove_directory_contents(directory: &File) -> Result<(), ProjectLibraryError> {
+fn remove_directory_contents(
+    directory: &File,
+    after_removal: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     for entry in rustix_fs::Dir::read_from(directory).map_err(io::Error::from)? {
         let entry = entry.map_err(io::Error::from)?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -810,10 +915,11 @@ fn remove_directory_contents(directory: &File) -> Result<(), ProjectLibraryError
         )
         .map_err(io::Error::from)?;
         if FileType::from_raw_mode(metadata.st_mode).is_dir() {
-            remove_directory_tree_at(directory, &name)?;
+            remove_directory_tree_at(directory, &name, after_removal)?;
         } else {
             rustix_fs::unlinkat(directory, name.as_str(), rustix_fs::AtFlags::empty())
                 .map_err(io::Error::from)?;
+            after_removal()?;
         }
     }
     directory.sync_all()?;
@@ -857,6 +963,40 @@ fn require_supported_platform() -> Result<(), ProjectLibraryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_delete_hides_the_package_and_leaves_a_recoverable_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Delete.rustscanproject");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("first-child"), b"first").unwrap();
+        fs::write(root.join("second-child"), b"second").unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let root_directory = open_directory_path(&root).unwrap();
+        let target = prepare_delete(&root_directory, &root).unwrap();
+
+        let error = delete_prepared_with_test_failure_after_removal(target, 1).unwrap_err();
+        let ProjectLibraryError::DeleteCleanupFailed { tombstone, source } = error else {
+            panic!("expected a recoverable delete cleanup error");
+        };
+
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert!(!root.exists());
+        assert!(tombstone.is_dir());
+        assert!(tombstone
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".rustscan-delete-"));
+        assert!(
+            !tombstone.join("first-child").exists() || !tombstone.join("second-child").exists(),
+            "the injected failure must occur after a child was removed"
+        );
+        assert!(list_summaries(temp.path()).unwrap().is_empty());
+
+        cleanup_delete_tombstone(&tombstone).unwrap();
+        assert!(!tombstone.exists());
+    }
 
     #[cfg(unix)]
     #[test]
