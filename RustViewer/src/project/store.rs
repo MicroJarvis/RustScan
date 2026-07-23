@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-#[cfg(test)]
+#[cfg(all(test, unix, not(target_os = "solaris")))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -1317,37 +1317,13 @@ fn hash_reader(mut reader: impl Read) -> io::Result<(u64, blake3::Hash)> {
     Ok((total, hasher.finalize()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix, not(target_os = "solaris")))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    #[cfg(unix)]
     use std::process::Command;
     use std::rc::Rc;
 
-    #[test]
-    fn project_store_rejects_platforms_without_descriptor_relative_io() {
-        assert!(matches!(
-            platform_support(false),
-            Err(ProjectStoreError::UnsupportedPlatform)
-        ));
-    }
-
-    #[cfg(any(not(unix), target_os = "solaris"))]
-    #[test]
-    fn public_create_reports_the_unsupported_platform() {
-        let result = ProjectStore::create(
-            "Unsupported.rustscanproject",
-            ProjectCreateRequest::new("Unsupported", SourceSpec::managed_images("source-a")),
-        );
-
-        assert!(matches!(
-            result,
-            Err(ProjectStoreError::UnsupportedPlatform)
-        ));
-    }
-
-    #[cfg(unix)]
     #[test]
     fn create_and_lock_rejects_a_non_regular_existing_lock_file() {
         let temp = tempfile::tempdir().unwrap();
@@ -1864,5 +1840,31 @@ mod tests {
             original,
             "the original package artifact changed"
         );
+    }
+}
+
+#[cfg(all(test, any(not(unix), target_os = "solaris")))]
+mod unsupported_platform_tests {
+    use super::*;
+
+    #[test]
+    fn project_store_rejects_platforms_without_descriptor_relative_io() {
+        assert!(matches!(
+            platform_support(false),
+            Err(ProjectStoreError::UnsupportedPlatform)
+        ));
+    }
+
+    #[test]
+    fn public_create_reports_the_unsupported_platform() {
+        let result = ProjectStore::create(
+            "Unsupported.rustscanproject",
+            ProjectCreateRequest::new("Unsupported", SourceSpec::managed_images("source-a")),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProjectStoreError::UnsupportedPlatform)
+        ));
     }
 }
