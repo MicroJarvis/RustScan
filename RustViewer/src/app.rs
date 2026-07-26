@@ -25,8 +25,8 @@ use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
 use crate::training::preview::PreviewResolution;
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{
-    draw_side_panel, DatasetUiSummary, ImageSourceSummary, PanelAction, ReconstructionUiState,
-    UiState,
+    draw_side_panel, reconstruction_is_running, DatasetUiSummary, ImageSourceSummary, PanelAction,
+    ReconstructionUiState, UiState,
 };
 use crate::ui::theme::{
     overlay_bg, PANEL_BG, TEXT_PRIMARY, TEXT_SECONDARY, VIEWPORT_BG, WINDOW_BG,
@@ -457,6 +457,12 @@ impl ViewerApp {
     }
 
     fn start_training(&mut self) {
+        if reconstruction_is_running(self.ui_state.reconstruction_state) {
+            self.ui_state.training_error =
+                Some("Wait for reconstruction to finish before starting training.".to_string());
+            return;
+        }
+
         let Some(loaded) = self.loaded_colmap.as_ref() else {
             self.ui_state.training_error =
                 Some("Load a COLMAP dataset before training.".to_string());
@@ -525,11 +531,9 @@ impl ViewerApp {
         }
 
         let manager_state = self.training_manager.state();
-        if manager_state != crate::training::TrainingSessionState::Idle
-            || !self.training_manager.is_training_active()
-        {
-            self.ui_state.training_state = manager_state;
-        }
+        let manager_active = self.training_manager.is_training_active();
+        self.ui_state.training_state =
+            training_state_for_ui(self.ui_state.training_state, manager_state, manager_active);
         self.ui_state.training_progress = self.training_manager.progress();
         if let Some(error) = self.training_manager.latest_error() {
             self.ui_state.training_error = Some(error);
@@ -798,6 +802,18 @@ impl ViewerApp {
                     }
                 });
             });
+    }
+}
+
+fn training_state_for_ui(
+    current_ui_state: crate::training::TrainingSessionState,
+    manager_state: crate::training::TrainingSessionState,
+    manager_active: bool,
+) -> crate::training::TrainingSessionState {
+    if manager_state == crate::training::TrainingSessionState::Idle && manager_active {
+        current_ui_state
+    } else {
+        manager_state
     }
 }
 
@@ -1332,7 +1348,44 @@ mod tests {
     use super::*;
     use crate::reconstruction::ReconstructionProgress;
     use crate::renderer::scene::MeshGpuVertex;
+    use crate::training::TrainingSessionState;
     use crate::ui::panel::{reconstruction_is_blocked_by_training, ReconstructionUiState};
+
+    #[test]
+    fn reconstruction_training_state_sync_preserves_starting_before_worker_transition() {
+        assert_eq!(
+            training_state_for_ui(
+                TrainingSessionState::Starting,
+                TrainingSessionState::Idle,
+                true,
+            ),
+            TrainingSessionState::Starting
+        );
+    }
+
+    #[test]
+    fn reconstruction_training_state_syncs_inactive_idle_state() {
+        assert_eq!(
+            training_state_for_ui(
+                TrainingSessionState::Starting,
+                TrainingSessionState::Idle,
+                false,
+            ),
+            TrainingSessionState::Idle
+        );
+    }
+
+    #[test]
+    fn reconstruction_training_state_syncs_active_manager_state() {
+        assert_eq!(
+            training_state_for_ui(
+                TrainingSessionState::Starting,
+                TrainingSessionState::Training,
+                true,
+            ),
+            TrainingSessionState::Training
+        );
+    }
 
     #[test]
     fn reconstruction_training_states_are_blocked() {

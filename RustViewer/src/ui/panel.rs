@@ -128,9 +128,17 @@ impl Default for UiState {
 impl UiState {
     pub fn can_run_reconstruction(&self) -> bool {
         self.image_source.is_some()
-            && !matches!(self.reconstruction_state, ReconstructionUiState::Running)
+            && !reconstruction_is_running(self.reconstruction_state)
             && !reconstruction_is_blocked_by_training(self.training_state)
     }
+
+    pub fn can_start_training(&self) -> bool {
+        self.dataset_summary.is_some() && !reconstruction_is_running(self.reconstruction_state)
+    }
+}
+
+pub(crate) fn reconstruction_is_running(state: ReconstructionUiState) -> bool {
+    matches!(state, ReconstructionUiState::Running)
 }
 
 pub(crate) fn reconstruction_is_blocked_by_training(state: TrainingSessionState) -> bool {
@@ -421,13 +429,7 @@ fn draw_training_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut 
                 format_duration(state.training_progress.elapsed),
             );
 
-            let dataset_ready = state.dataset_summary.is_some();
-            let training_active = matches!(
-                state.training_state,
-                TrainingSessionState::Starting
-                    | TrainingSessionState::Training
-                    | TrainingSessionState::Stopping
-            );
+            let training_active = reconstruction_is_blocked_by_training(state.training_state);
 
             let button_label = if training_active {
                 "Stop Training"
@@ -438,7 +440,7 @@ fn draw_training_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut 
             let clicked = if training_active {
                 draw_secondary_button(ui, button_icon, button_label)
             } else {
-                ui.add_enabled_ui(dataset_ready, |ui| {
+                ui.add_enabled_ui(state.can_start_training(), |ui| {
                     draw_blue_button(ui, button_icon, button_label)
                 })
                 .inner
@@ -944,6 +946,22 @@ mod tests {
         state.reconstruction_state = ReconstructionUiState::Ready;
         state.training_state = TrainingSessionState::Training;
         assert!(!state.can_run_reconstruction());
+    }
+
+    #[test]
+    fn reconstruction_running_blocks_training_start() {
+        let mut state = UiState::default();
+        state.dataset_summary = Some(DatasetUiSummary {
+            root_path: "/captures/chair".to_owned(),
+            frame_count: 24,
+            sparse_point_count: 1_024,
+            width: 1_920,
+            height: 1_080,
+        });
+        assert!(state.can_start_training());
+
+        state.reconstruction_state = ReconstructionUiState::Running;
+        assert!(!state.can_start_training());
     }
 
     #[test]
