@@ -25,8 +25,8 @@ use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
 use crate::training::preview::PreviewResolution;
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{
-    draw_side_panel, DatasetUiSummary, ImageSourceSummary, PanelAction, ReconstructionUiState,
-    UiState,
+    draw_side_panel, reconstruction_is_blocked_by_training, DatasetUiSummary, ImageSourceSummary,
+    PanelAction, ReconstructionUiState, UiState,
 };
 use crate::ui::theme::{
     overlay_bg, PANEL_BG, TEXT_PRIMARY, TEXT_SECONDARY, VIEWPORT_BG, WINDOW_BG,
@@ -67,6 +67,7 @@ pub struct ViewerApp {
     camera: ArcballCamera,
     robot: RobotController,
     preview_camera: ArcballCamera,
+    egui_ctx: egui::Context,
     ui_state: UiState,
     image_source: Option<ImageSource>,
     loaded_colmap: Option<LoadedColmapDataset>,
@@ -117,6 +118,7 @@ impl ViewerApp {
             camera: ArcballCamera::default(),
             robot: RobotController::default(),
             preview_camera: ArcballCamera::default(),
+            egui_ctx: cc.egui_ctx.clone(),
             ui_state: UiState::default(),
             image_source: None,
             loaded_colmap: None,
@@ -406,6 +408,7 @@ impl ViewerApp {
 
     fn spawn_image_import(&self) {
         let tx = self.command_tx.clone();
+        let egui_ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
             let Some(path) = rfd::FileDialog::new().pick_folder() else {
                 return;
@@ -413,16 +416,19 @@ impl ViewerApp {
 
             let result = ImageSource::open(path).map_err(|error| error.to_string());
             let _ = tx.send(AppCommand::ImageSourceLoaded(result));
+            egui_ctx.request_repaint();
         });
     }
 
     fn spawn_reconstruction(&mut self) {
+        if !self.ui_state.can_run_reconstruction()
+            || reconstruction_is_blocked_by_training(self.training_manager.state())
+        {
+            return;
+        }
         let Some(source) = self.image_source.clone() else {
             return;
         };
-        if !self.ui_state.can_run_reconstruction() {
-            return;
-        }
 
         self.ui_state.reconstruction_state = ReconstructionUiState::Running;
         self.ui_state.reconstruction_error = None;
@@ -430,20 +436,25 @@ impl ViewerApp {
         self.ui_state.reconstruction_points = 0;
 
         let tx = self.command_tx.clone();
+        let egui_ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<LoadedColmapDataset, String> {
                 let output =
                     create_run_directory(source.root()).map_err(|error| error.to_string())?;
-                let mut emit = |progress| {
-                    let _ = tx.send(AppCommand::ReconstructionProgress(progress));
-                };
-                RustSfmRunner
-                    .run(&source, output.clone(), &mut emit)
-                    .map_err(|error| error.to_string())?;
+                {
+                    let mut emit = |progress| {
+                        let _ = tx.send(AppCommand::ReconstructionProgress(progress));
+                        egui_ctx.request_repaint();
+                    };
+                    RustSfmRunner
+                        .run(&source, output.clone(), &mut emit)
+                        .map_err(|error| error.to_string())?;
+                }
                 load_colmap_training_dataset(&output, &ColmapConfig::default())
                     .map_err(|error| error.to_string())
             })();
             let _ = tx.send(AppCommand::ReconstructionFinished(result));
+            egui_ctx.request_repaint();
         });
     }
 
@@ -469,6 +480,7 @@ impl ViewerApp {
             .start(loaded.dataset.clone(), config, options)
         {
             Ok(()) => {
+                self.ui_state.training_state = crate::training::TrainingSessionState::Starting;
                 self.ui_state.training_error = None;
                 self.ui_state.preview_error = None;
                 self.preview_dirty = true;
@@ -1317,7 +1329,26 @@ mod tests {
     use super::*;
     use crate::reconstruction::ReconstructionProgress;
     use crate::renderer::scene::MeshGpuVertex;
-    use crate::ui::panel::ReconstructionUiState;
+    use crate::ui::panel::{reconstruction_is_blocked_by_training, ReconstructionUiState};
+
+    #[test]
+    fn reconstruction_training_states_are_blocked() {
+        assert!(reconstruction_is_blocked_by_training(
+            crate::training::TrainingSessionState::Loading
+        ));
+        assert!(reconstruction_is_blocked_by_training(
+            crate::training::TrainingSessionState::Starting
+        ));
+        assert!(reconstruction_is_blocked_by_training(
+            crate::training::TrainingSessionState::Training
+        ));
+        assert!(reconstruction_is_blocked_by_training(
+            crate::training::TrainingSessionState::Stopping
+        ));
+        assert!(!reconstruction_is_blocked_by_training(
+            crate::training::TrainingSessionState::Idle
+        ));
+    }
 
     #[test]
     fn reconstruction_progress_updates_ui_state() {

@@ -129,7 +129,18 @@ impl UiState {
     pub fn can_run_reconstruction(&self) -> bool {
         self.image_source.is_some()
             && !matches!(self.reconstruction_state, ReconstructionUiState::Running)
+            && !reconstruction_is_blocked_by_training(self.training_state)
     }
+}
+
+pub(crate) fn reconstruction_is_blocked_by_training(state: TrainingSessionState) -> bool {
+    matches!(
+        state,
+        TrainingSessionState::Loading
+            | TrainingSessionState::Starting
+            | TrainingSessionState::Training
+            | TrainingSessionState::Stopping
+    )
 }
 
 /// Draw the left-side control panel.
@@ -929,6 +940,9 @@ mod tests {
         });
         assert!(state.can_run_reconstruction());
         state.reconstruction_state = ReconstructionUiState::Running;
+        assert!(!state.can_run_reconstruction());
+        state.reconstruction_state = ReconstructionUiState::Ready;
+        state.training_state = TrainingSessionState::Training;
         assert!(!state.can_run_reconstruction());
     }
 
