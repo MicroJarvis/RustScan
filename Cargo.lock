@@ -6735,12 +6735,14 @@ dependencies = [
 name = "rust-viewer"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytemuck",
  "eframe",
  "egui",
  "glam",
  "rfd",
  "rustgs",
+ "rustsfm",
  "rustslam",
  "serde",
  "serde_json",
