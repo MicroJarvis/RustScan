@@ -10903,6 +10903,44 @@ mod tests {
     }
 
     #[test]
+    fn disabling_database_discovery_ignores_input_and_parent_databases() -> Result<()> {
+        let dir = tempdir()?;
+        let images_dir = dir.path().join("images");
+        fs::create_dir_all(&images_dir)?;
+        fs::write(dir.path().join("database.db"), [])?;
+        fs::write(images_dir.join("database.db"), [])?;
+
+        let resolved = resolve_mapper_database_path(&MapperConfig {
+            input: images_dir,
+            discover_database: false,
+            ..MapperConfig::default()
+        })?;
+
+        assert_eq!(resolved, None);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_database_is_used_when_discovery_is_disabled() -> Result<()> {
+        let dir = tempdir()?;
+        let images_dir = dir.path().join("images");
+        fs::create_dir_all(&images_dir)?;
+        fs::write(images_dir.join("database.db"), [])?;
+        let explicit = dir.path().join("explicit.db");
+        fs::write(&explicit, [])?;
+
+        let resolved = resolve_mapper_database_path(&MapperConfig {
+            input: images_dir,
+            database: Some(explicit.clone()),
+            discover_database: false,
+            ..MapperConfig::default()
+        })?;
+
+        assert_eq!(resolved.as_deref(), Some(explicit.as_path()));
+        Ok(())
+    }
+
+    #[test]
     fn explicit_missing_database_is_an_error() {
         let dir = tempdir().unwrap();
         let err = resolve_mapper_database_path(&MapperConfig {

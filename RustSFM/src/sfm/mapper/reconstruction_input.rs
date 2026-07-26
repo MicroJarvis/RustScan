@@ -30,9 +30,11 @@ pub(super) fn resolve_mapper_database_path(config: &MapperConfig) -> Result<Opti
         return Ok(Some(database.clone()));
     }
 
-    for candidate in default_database_candidates(&config.input) {
-        if candidate.exists() {
-            return Ok(Some(candidate));
+    if config.discover_database {
+        for candidate in default_database_candidates(&config.input) {
+            if candidate.exists() {
+                return Ok(Some(candidate));
+            }
         }
     }
 

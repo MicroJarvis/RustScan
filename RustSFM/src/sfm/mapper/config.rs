@@ -56,6 +56,11 @@ pub struct MapperConfig {
     pub output: PathBuf,
     pub reference: Option<PathBuf>,
     pub database: Option<PathBuf>,
+    /// Search for `database.db` beside the input images when no database is explicit.
+    ///
+    /// Explicit `database` paths are always honored. This defaults to true to
+    /// preserve the existing mapper behavior.
+    pub discover_database: bool,
     pub write_two_view_geometries: bool,
     pub ignore_database_two_view_poses: bool,
     pub write_database: bool,
@@ -150,6 +155,7 @@ impl Default for MapperConfig {
             output: PathBuf::new(),
             reference: None,
             database: None,
+            discover_database: true,
             write_two_view_geometries: false,
             ignore_database_two_view_poses: false,
             write_database: false,

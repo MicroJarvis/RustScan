@@ -134,6 +134,7 @@ pub fn mapper_config_for(input: &Path, output: &Path) -> rustsfm::MapperConfig {
         output: output.to_path_buf(),
         local_matching: true,
         single_camera: true,
+        discover_database: false,
         copy_images: true,
         ..rustsfm::MapperConfig::default()
     }
@@ -201,13 +202,14 @@ mod tests {
     }
 
     #[test]
-    fn mapper_config_enables_shared_camera_local_matching_and_image_copying() {
+    fn mapper_config_enables_isolated_shared_camera_local_matching_and_image_copying() {
         let input = PathBuf::from("/captures/set-a");
         let output = PathBuf::from("/captures/set-a/.rustviewer/rustsfm/run-1");
         let config = mapper_config_for(&input, &output);
         assert_eq!(config.input, input);
         assert_eq!(config.output, output);
         assert!(config.local_matching && config.single_camera && config.copy_images);
+        assert!(!config.discover_database);
         assert!(config.fx.is_none() && config.fy.is_none());
     }
 
