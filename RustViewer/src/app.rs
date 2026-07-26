@@ -14,6 +14,9 @@ use crate::loader::checkpoint::LoadError;
 use crate::loader::{
     load_colmap_training_dataset, map_training_dataset_to_scene, LoadedColmapDataset,
 };
+use crate::reconstruction::{
+    create_run_directory, ImageSource, ReconstructionProgress, ReconstructionRunner, RustSfmRunner,
+};
 use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
@@ -21,7 +24,10 @@ use crate::robot::{GroundPlane, NavigationMode, RobotController, RobotInput};
 use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
 use crate::training::preview::PreviewResolution;
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
-use crate::ui::panel::{draw_side_panel, DatasetUiSummary, PanelAction, UiState};
+use crate::ui::panel::{
+    draw_side_panel, DatasetUiSummary, ImageSourceSummary, PanelAction, ReconstructionUiState,
+    UiState,
+};
 use crate::ui::theme::{
     overlay_bg, PANEL_BG, TEXT_PRIMARY, TEXT_SECONDARY, VIEWPORT_BG, WINDOW_BG,
 };
@@ -46,6 +52,9 @@ enum AssetLoadKind {
 enum AppCommand {
     LoadAsset { kind: AssetLoadKind, path: PathBuf },
     ColmapLoaded(Result<LoadedColmapDataset, String>),
+    ImageSourceLoaded(Result<ImageSource, String>),
+    ReconstructionProgress(ReconstructionProgress),
+    ReconstructionFinished(Result<LoadedColmapDataset, String>),
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +68,7 @@ pub struct ViewerApp {
     robot: RobotController,
     preview_camera: ArcballCamera,
     ui_state: UiState,
+    image_source: Option<ImageSource>,
     loaded_colmap: Option<LoadedColmapDataset>,
     command_rx: mpsc::Receiver<AppCommand>,
     command_tx: mpsc::Sender<AppCommand>,
@@ -108,6 +118,7 @@ impl ViewerApp {
             robot: RobotController::default(),
             preview_camera: ArcballCamera::default(),
             ui_state: UiState::default(),
+            image_source: None,
             loaded_colmap: None,
             command_rx,
             command_tx,
@@ -142,6 +153,13 @@ impl ViewerApp {
             match command {
                 AppCommand::LoadAsset { kind, path } => self.handle_asset_load(kind, path),
                 AppCommand::ColmapLoaded(result) => self.handle_colmap_loaded(result),
+                AppCommand::ImageSourceLoaded(result) => self.handle_image_source_loaded(result),
+                AppCommand::ReconstructionProgress(progress) => {
+                    apply_reconstruction_progress(&mut self.ui_state, progress);
+                }
+                AppCommand::ReconstructionFinished(result) => {
+                    self.handle_reconstruction_finished(result);
+                }
             }
         }
     }
@@ -240,6 +258,47 @@ impl ViewerApp {
         }
     }
 
+    fn handle_image_source_loaded(&mut self, result: Result<ImageSource, String>) {
+        match result {
+            Ok(source) => {
+                self.ui_state.image_source = Some(ImageSourceSummary {
+                    root_path: source.root().display().to_string(),
+                    image_count: source.image_count(),
+                });
+                self.image_source = Some(source);
+                self.ui_state.reconstruction_error = None;
+                self.ui_state.reconstruction_registered_images = 0;
+                self.ui_state.reconstruction_points = 0;
+                self.ui_state.reconstruction_state = ReconstructionUiState::Ready;
+            }
+            Err(error) => {
+                self.image_source = None;
+                self.ui_state.image_source = None;
+                self.ui_state.reconstruction_registered_images = 0;
+                self.ui_state.reconstruction_points = 0;
+                self.ui_state.reconstruction_state = ReconstructionUiState::Failed;
+                self.ui_state.reconstruction_error = Some(error);
+            }
+        }
+    }
+
+    fn handle_reconstruction_finished(&mut self, result: Result<LoadedColmapDataset, String>) {
+        match result {
+            Ok(loaded) => {
+                self.handle_colmap_loaded(Ok(loaded));
+                if apply_reconstruction_result(&mut self.ui_state, Ok(())) {
+                    self.start_training();
+                }
+            }
+            Err(error) => {
+                let _ = apply_reconstruction_result(&mut self.ui_state, Err(error));
+                self.ui_state.is_loading = false;
+                self.ui_state.loading_message = None;
+                self.ui_state.load_error = None;
+            }
+        }
+    }
+
     fn new_gpu_viewport_bridge(&self) -> Option<GpuViewportBridge> {
         self.wgpu_render_state
             .as_ref()
@@ -262,12 +321,8 @@ impl ViewerApp {
                 PanelAction::OpenGaussian => self.spawn_file_dialog(AssetLoadKind::Gaussian),
                 PanelAction::OpenMesh => self.spawn_file_dialog(AssetLoadKind::Mesh),
                 PanelAction::OpenColmap => self.spawn_colmap_load(),
-                PanelAction::OpenImages => {
-                    // Wired by reconstruction orchestration.
-                }
-                PanelAction::RunReconstruction => {
-                    // Wired by reconstruction orchestration.
-                }
+                PanelAction::OpenImages => self.spawn_image_import(),
+                PanelAction::RunReconstruction => self.spawn_reconstruction(),
                 PanelAction::StartTraining => self.start_training(),
                 PanelAction::StopTraining => self.stop_training(),
                 PanelAction::AutoFitScene => {
@@ -346,6 +401,49 @@ impl ViewerApp {
             let result = load_colmap_training_dataset(&path, &ColmapConfig::default())
                 .map_err(|err| err.to_string());
             let _ = tx.send(AppCommand::ColmapLoaded(result));
+        });
+    }
+
+    fn spawn_image_import(&self) {
+        let tx = self.command_tx.clone();
+        std::thread::spawn(move || {
+            let Some(path) = rfd::FileDialog::new().pick_folder() else {
+                return;
+            };
+
+            let result = ImageSource::open(path).map_err(|error| error.to_string());
+            let _ = tx.send(AppCommand::ImageSourceLoaded(result));
+        });
+    }
+
+    fn spawn_reconstruction(&mut self) {
+        let Some(source) = self.image_source.clone() else {
+            return;
+        };
+        if !self.ui_state.can_run_reconstruction() {
+            return;
+        }
+
+        self.ui_state.reconstruction_state = ReconstructionUiState::Running;
+        self.ui_state.reconstruction_error = None;
+        self.ui_state.reconstruction_registered_images = 0;
+        self.ui_state.reconstruction_points = 0;
+
+        let tx = self.command_tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<LoadedColmapDataset, String> {
+                let output =
+                    create_run_directory(source.root()).map_err(|error| error.to_string())?;
+                let mut emit = |progress| {
+                    let _ = tx.send(AppCommand::ReconstructionProgress(progress));
+                };
+                RustSfmRunner
+                    .run(&source, output.clone(), &mut emit)
+                    .map_err(|error| error.to_string())?;
+                load_colmap_training_dataset(&output, &ColmapConfig::default())
+                    .map_err(|error| error.to_string())
+            })();
+            let _ = tx.send(AppCommand::ReconstructionFinished(result));
         });
     }
 
@@ -685,6 +783,27 @@ impl ViewerApp {
                     }
                 });
             });
+    }
+}
+
+fn apply_reconstruction_progress(state: &mut UiState, progress: ReconstructionProgress) {
+    state.reconstruction_state = ReconstructionUiState::Running;
+    state.reconstruction_registered_images = progress.registered_images;
+    state.reconstruction_points = progress.points;
+}
+
+fn apply_reconstruction_result(state: &mut UiState, result: Result<(), String>) -> bool {
+    match result {
+        Ok(()) => {
+            state.reconstruction_state = ReconstructionUiState::Completed;
+            state.reconstruction_error = None;
+            true
+        }
+        Err(error) => {
+            state.reconstruction_state = ReconstructionUiState::Failed;
+            state.reconstruction_error = Some(error);
+            false
+        }
     }
 }
 
@@ -1196,7 +1315,48 @@ fn ray_triangle_t(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reconstruction::ReconstructionProgress;
     use crate::renderer::scene::MeshGpuVertex;
+    use crate::ui::panel::ReconstructionUiState;
+
+    #[test]
+    fn reconstruction_progress_updates_ui_state() {
+        let mut state = UiState::default();
+        apply_reconstruction_progress(
+            &mut state,
+            ReconstructionProgress {
+                registered_images: 5,
+                registered_frames: 5,
+                points: 123,
+                stage: "next_image_reg",
+            },
+        );
+        assert_eq!(state.reconstruction_state, ReconstructionUiState::Running);
+        assert_eq!(state.reconstruction_registered_images, 5);
+        assert_eq!(state.reconstruction_points, 123);
+    }
+
+    #[test]
+    fn reconstruction_failure_never_requests_training() {
+        let mut state = UiState::default();
+        let start_training =
+            apply_reconstruction_result(&mut state, Err("no verified image pairs".to_owned()));
+        assert!(!start_training);
+        assert_eq!(state.reconstruction_state, ReconstructionUiState::Failed);
+        assert_eq!(
+            state.reconstruction_error.as_deref(),
+            Some("no verified image pairs")
+        );
+    }
+
+    #[test]
+    fn successful_reconstruction_requests_training_only_after_completion() {
+        let mut state = UiState::default();
+        let start_training = apply_reconstruction_result(&mut state, Ok(()));
+        assert!(start_training);
+        assert_eq!(state.reconstruction_state, ReconstructionUiState::Completed);
+        assert!(state.reconstruction_error.is_none());
+    }
 
     #[test]
     fn clear_scene_preserving_layers_removes_data_without_resetting_visibility() {
