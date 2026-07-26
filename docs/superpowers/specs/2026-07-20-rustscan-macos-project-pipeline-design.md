@@ -165,6 +165,11 @@ Flowers.rustscanproject/
     checkpoints/
     scene.ply
     scene.parity.json
+  Artifacts/
+    import/attempt-00000001/
+    keyframe_sfm/attempt-00000001/
+    full_frame_pnp/attempt-00000001/
+    training/attempt-00000001/
   Logs/
     events.jsonl
 ```
@@ -180,6 +185,13 @@ Flowers.rustscanproject/
 
 Large frame, database, sparse, checkpoint, and PLY data remain in their native formats.
 
+The paths shown under `Sources`, `Cache`, `Reconstruction`, and `Training` are logical payload paths.
+During a stage run they exist beneath `Cache/.staging/{stage}-{attempt}`. A successful commit renames
+that complete workspace once into `Artifacts/{stage}/attempt-{attempt:08}`; authoritative manifest
+references point to the immutable committed paths. Consumers resolve artifacts through the manifest
+instead of assuming a mutable fixed path. User-facing exports may mirror final data to familiar
+locations, but those mirrors are not orchestration authority.
+
 ### Source ownership
 
 - Managed copy is the default because it makes projects reliable and movable.
@@ -190,9 +202,14 @@ Large frame, database, sparse, checkpoint, and PLY data remain in their native f
 ### Atomic updates
 
 - Manifest and small JSON artifacts are written to a sibling temporary file, flushed, and renamed.
-- A stage becomes `Succeeded` only after all declared artifacts pass validation.
-- Partial outputs remain in a stage-specific temporary directory and are never advertised as final.
-- Opening a project cleans abandoned temporary outputs only after preserving diagnostics.
+- A stage becomes `Succeeded` only after all declared artifacts pass validation and its entire attempt
+  workspace has been flushed and renamed once into an immutable committed directory.
+- One atomic manifest replacement switches artifact references, marks the stage succeeded, and clears
+  its lease. There is no intermediate manifest that points at new artifacts while the stage runs.
+- Previous committed attempt directories are never overwritten during replacement, so the old
+  manifest remains usable until the pointer switch succeeds.
+- Partial or unreferenced attempt outputs are never advertised as final. Opening a project moves them
+  to recovery storage only after preserving diagnostics.
 
 ## Pipeline State Model
 
@@ -427,4 +444,3 @@ The UI follows these rules:
 - A successful project produces one loadable lossless PLY, a passed parity report, and persistent
   reconstruction artifacts.
 - Existing direct artifact viewing remains functional.
-

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::sh::{sh0_to_rgb_value, sh_coeff_count_for_degree};
+use crate::sh::sh0_to_rgb_value;
 use crate::TrainingError;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostSplats {
     pub(crate) positions: Vec<f32>,
     pub(crate) log_scales: Vec<f32>,
@@ -87,12 +87,18 @@ impl HostSplats {
         validate_component_len("positions", self.positions.len(), row_count, 3)?;
         validate_component_len("log_scales", self.log_scales.len(), row_count, 3)?;
         validate_component_len("rotations", self.rotations.len(), row_count, 4)?;
+        let sh_coeffs_row_width = self.checked_sh_coeffs_row_width()?;
         validate_component_len(
             "sh_coeffs",
             self.sh_coeffs.len(),
             row_count,
-            self.sh_coeffs_row_width(),
+            sh_coeffs_row_width,
         )?;
+        validate_component_finite("positions", &self.positions)?;
+        validate_component_finite("log_scales", &self.log_scales)?;
+        validate_component_finite("rotations", &self.rotations)?;
+        validate_component_finite("opacity_logits", &self.opacity_logits)?;
+        validate_component_finite("sh_coeffs", &self.sh_coeffs)?;
         Ok(())
     }
 
@@ -105,40 +111,19 @@ impl HostSplats {
     }
 
     pub fn position(&self, idx: usize) -> [f32; 3] {
-        let base = idx * 3;
-        [
-            self.positions[base],
-            self.positions[base + 1],
-            self.positions[base + 2],
-        ]
+        component_array(&self.positions, idx)
     }
 
     pub fn log_scale(&self, idx: usize) -> [f32; 3] {
-        let base = idx * 3;
-        [
-            self.log_scales[base],
-            self.log_scales[base + 1],
-            self.log_scales[base + 2],
-        ]
+        component_array(&self.log_scales, idx)
     }
 
     pub fn rotation(&self, idx: usize) -> [f32; 4] {
-        let base = idx * 4;
-        [
-            self.rotations[base],
-            self.rotations[base + 1],
-            self.rotations[base + 2],
-            self.rotations[base + 3],
-        ]
+        component_array(&self.rotations, idx)
     }
 
     pub fn sh_0(&self, idx: usize) -> [f32; 3] {
-        let base = idx * self.sh_coeffs_row_width();
-        [
-            self.sh_coeffs[base],
-            self.sh_coeffs[base + 1],
-            self.sh_coeffs[base + 2],
-        ]
+        component_array(self.sh_coeffs_row(idx), 0)
     }
 
     pub fn rgb_color(&self, idx: usize) -> [f32; 3] {
@@ -150,7 +135,7 @@ impl HostSplats {
     }
 
     pub(crate) fn sh_coeffs_row_width(&self) -> usize {
-        sh_coeff_count_for_degree(self.sh_degree) * 3
+        self.checked_sh_coeffs_row_width().unwrap_or(usize::MAX)
     }
 
     pub fn sh_coeffs_row(&self, idx: usize) -> &[f32] {
@@ -159,6 +144,17 @@ impl HostSplats {
 
     pub fn sh_rest(&self, idx: usize) -> &[f32] {
         self.sh_coeffs_row(idx).get(3..).unwrap_or(&[])
+    }
+
+    fn checked_sh_coeffs_row_width(&self) -> Result<usize, TrainingError> {
+        let order = self
+            .sh_degree
+            .checked_add(1)
+            .ok_or_else(|| sh_width_overflow(self.sh_degree))?;
+        order
+            .checked_mul(order)
+            .and_then(|coefficient_count| coefficient_count.checked_mul(3))
+            .ok_or_else(|| sh_width_overflow(self.sh_degree))
     }
 
     pub fn scale(&self, idx: usize) -> [f32; 3] {
@@ -217,6 +213,22 @@ impl HostSplats {
     }
 }
 
+fn component_array<const N: usize>(values: &[f32], idx: usize) -> [f32; N] {
+    let start = idx.saturating_mul(N);
+    std::array::from_fn(|offset| {
+        values
+            .get(start.saturating_add(offset))
+            .copied()
+            .unwrap_or_default()
+    })
+}
+
+fn sh_width_overflow(sh_degree: usize) -> TrainingError {
+    TrainingError::TrainingFailed(format!(
+        "splats invariant violated: SH width overflow for degree {sh_degree}"
+    ))
+}
+
 pub(crate) fn row_slice(values: &[f32], width: usize, idx: usize) -> &[f32] {
     let start = idx.saturating_mul(width);
     let end = start.saturating_add(width);
@@ -238,6 +250,44 @@ fn validate_component_len(
     Ok(())
 }
 
+fn validate_component_finite(name: &str, values: &[f32]) -> Result<(), TrainingError> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(TrainingError::TrainingFailed(format!(
+            "splats invariant violated: {name} values must be finite"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn sigmoid_scalar(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::catch_unwind;
+
+    use super::HostSplats;
+
+    #[test]
+    fn corrupt_splat_component_reads_do_not_panic() {
+        let splats = HostSplats {
+            positions: vec![],
+            log_scales: vec![],
+            rotations: vec![],
+            opacity_logits: vec![0.0],
+            sh_coeffs: vec![],
+            sh_degree: usize::MAX,
+        };
+
+        let reads = catch_unwind(|| {
+            assert_eq!(splats.position(0), [0.0; 3]);
+            assert_eq!(splats.log_scale(0), [0.0; 3]);
+            assert_eq!(splats.rotation(0), [0.0; 4]);
+            assert_eq!(splats.sh_0(0), [0.0; 3]);
+            assert!(splats.sh_coeffs_row(0).is_empty());
+        });
+
+        assert!(reads.is_ok(), "corrupt splat reads must not panic");
+    }
 }

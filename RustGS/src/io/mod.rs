@@ -6,19 +6,16 @@
 pub mod colmap_dataset;
 pub mod scene_io;
 
-#[cfg(feature = "gpu")]
 use crate::core::HostSplats;
-#[cfg(feature = "gpu")]
 use crate::TrainingError;
-#[cfg(feature = "gpu")]
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "gpu")]
 use std::path::Path;
 
-/// Simple training checkpoint used by the trainer's incremental save.
-#[cfg(feature = "gpu")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrainingCheckpoint {
+/// Legacy JSON snapshot containing no optimizer or topology state.
+///
+/// This artifact can recover its splats, but cannot resume training exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyTrainingCheckpoint {
     /// Current iteration
     pub iteration: usize,
     /// Current loss
@@ -27,8 +24,7 @@ pub struct TrainingCheckpoint {
     pub splats: HostSplats,
 }
 
-#[cfg(feature = "gpu")]
-impl Default for TrainingCheckpoint {
+impl Default for LegacyTrainingCheckpoint {
     fn default() -> Self {
         Self {
             iteration: 0,
@@ -38,8 +34,7 @@ impl Default for TrainingCheckpoint {
     }
 }
 
-#[cfg(feature = "gpu")]
-impl TrainingCheckpoint {
+impl LegacyTrainingCheckpoint {
     /// Create a new checkpoint.
     pub fn new() -> Self {
         Self::default()
@@ -56,12 +51,30 @@ impl TrainingCheckpoint {
 
     /// Load checkpoint from file.
     pub fn load(path: &Path) -> Result<Self, TrainingError> {
-        let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes).map_err(|err| {
-            TrainingError::TrainingFailed(format!(
-                "failed to deserialize checkpoint {}: {err}",
-                path.display()
-            ))
-        })
+        load_legacy_training_checkpoint(path)
+    }
+
+    /// Recover the splat snapshot from this non-resumable legacy artifact.
+    pub fn into_splats(self) -> HostSplats {
+        self.splats
     }
 }
+
+/// Load the pre-versioned JSON checkpoint format.
+pub fn load_legacy_training_checkpoint(
+    path: &Path,
+) -> Result<LegacyTrainingCheckpoint, TrainingError> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(|err| {
+        TrainingError::TrainingFailed(format!(
+            "failed to deserialize checkpoint {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+/// Compatibility alias for the old `rustgs::io::TrainingCheckpoint` path.
+#[deprecated(
+    note = "use rustgs::LegacyTrainingCheckpoint for JSON snapshots or rustgs::TrainingCheckpoint for resumable checkpoints"
+)]
+pub type TrainingCheckpoint = LegacyTrainingCheckpoint;

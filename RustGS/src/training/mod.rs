@@ -1,5 +1,6 @@
 //! Training module for 3D Gaussian Splatting.
 
+mod checkpoint;
 mod config;
 mod evaluation;
 mod reporting;
@@ -23,6 +24,14 @@ pub(crate) mod forward;
 #[cfg(feature = "gpu")]
 use crate::{TrainingDataset, TrainingError};
 
+pub use checkpoint::{
+    load_training_checkpoint, save_training_checkpoint, AdamCheckpoint, AdamParameterCheckpoint,
+    TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity,
+    MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
+    MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
+    MAX_TRAINING_IDENTITY_BYTES, TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC,
+    TRAINING_CHECKPOINT_VERSION,
+};
 pub use evaluation::MIN_RENDER_SCALE;
 pub use evaluation::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
@@ -46,10 +55,12 @@ pub use evaluation::{
 pub use evaluation::{SharedWgpuContext, SplatEvaluationRenderer};
 #[cfg(feature = "gpu")]
 pub use events::{
-    TrainingControl, TrainingEvent, TrainingEventCadence, TrainingEventRoute,
-    TrainingIterationProgress, TrainingOptions, TrainingPlanSelected, TrainingRun,
-    TrainingRunCancelled, TrainingRunCompleted, TrainingRunFailed, TrainingRunReport,
-    TrainingRunStarted, TrainingSnapshotReady,
+    TrainingCheckpointPolicy, TrainingCheckpointReady, TrainingCheckpointReason,
+    TrainingCheckpointSink, TrainingControl, TrainingEvent, TrainingEventCadence,
+    TrainingEventRoute, TrainingIterationProgress, TrainingOptions, TrainingPlanSelected,
+    TrainingRun, TrainingRunCancelled, TrainingRunCompleted, TrainingRunDisposition,
+    TrainingRunFailed, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
+    TrainingSnapshotReady,
 };
 pub use reporting::metrics::{
     ParityFloatDistribution, ParityLossCurveSample, ParityLossTerms, ParityTopologyMetrics,
@@ -62,7 +73,7 @@ pub use config::{
     LiteGsRenderingConfig, LiteGsSplitScoreMode, LiteGsTileSize, LiteGsTopologyConfig,
     LiteGsTrainingProfile, TrainingBackend, TrainingConfig, TrainingDataConfig,
     TrainingInitializationConfig, TrainingLossConfig, TrainingOptimizerConfig,
-    TrainingRasterConfig, TrainingResult, DEFAULT_RASTER_COV_BLUR,
+    TrainingRasterConfig, TrainingResult, DEFAULT_RASTER_COV_BLUR, MAX_TRAINING_ITERATIONS,
 };
 #[cfg(feature = "gpu")]
 pub use reporting::telemetry::{

@@ -18,9 +18,22 @@ rfd = "0.14"
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = "1.0"
+uuid = { version = "1.24", features = ["serde", "v4"] }
+blake3 = "1"
+fs2 = "0.4"
+rustix = { version = "1.1", features = ["fs"] }
+image = "0.25"
+crossbeam-channel = "0.5"
 rustslam = { path = "../RustSLAM", default-features = false, features = ["viewer-types"] }
-rustsfm = { path = "../RustSFM", default-features = false, features = ["gpu-wgpu"] }
 rustgs = { path = "../RustGS", default-features = false, features = ["gpu"] }
+rustsfm = { path = "../RustSFM", default-features = false, features = ["gpu-vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", features = ["NSData", "NSError", "NSValue", "NSString", "NSURL"] }
+objc2-av-foundation = { version = "0.3.2", features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVMediaFormat", "objc2-core-foundation", "objc2-core-media"] }
+objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMTime"] }
+objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer"] }
 
 [dev-dependencies]
 tempfile = "3.3"

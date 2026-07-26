@@ -399,6 +399,10 @@ impl SharedWgpuContext {
     pub(crate) fn device(&self) -> <GsBackendBase as Backend>::Device {
         self.device.clone()
     }
+
+    pub(crate) fn training_device(&self) -> <GsBackendBase as Backend>::Device {
+        self.device.clone()
+    }
 }
 
 #[cfg(feature = "gpu")]

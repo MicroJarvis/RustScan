@@ -239,7 +239,11 @@ pub fn load_colmap_dataset(
     Ok(dataset)
 }
 
-pub(crate) fn resolve_colmap_sparse_dir(input: &Path) -> Result<PathBuf, TrainingError> {
+/// Resolve the COLMAP sparse model directory used when loading `input`.
+///
+/// Accepts a sparse model directory directly, a dataset root containing
+/// `sparse`, or the common dataset layout containing `sparse/0`.
+pub fn resolve_colmap_sparse_dir(input: &Path) -> Result<PathBuf, TrainingError> {
     // Check if input is directly a sparse directory
     if is_colmap_sparse_dir(input) {
         return Ok(input.to_path_buf());
@@ -261,6 +265,93 @@ pub(crate) fn resolve_colmap_sparse_dir(input: &Path) -> Result<PathBuf, Trainin
         "could not find COLMAP sparse reconstruction in {}",
         input.display(),
     )))
+}
+
+/// Fingerprint the exact COLMAP sparse model files selected by the loader.
+///
+/// The fingerprint covers cameras, images, and points3D. For each category,
+/// the binary file is selected when present; otherwise the text file is used.
+/// Other files and subdirectories are ignored. File contents are streamed into
+/// the digest so large point clouds do not need to be buffered in memory.
+pub fn fingerprint_colmap_sparse_model(input: &Path) -> Result<[u8; 32], TrainingError> {
+    let sparse_dir = resolve_colmap_sparse_dir(input)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"RustGS COLMAP sparse model fingerprint\0v1");
+
+    for stem in ["cameras", "images", "points3D"] {
+        let (path, encoding) = select_colmap_model_file(&sparse_dir, stem).ok_or_else(|| {
+            TrainingError::InvalidInput(format!(
+                "missing COLMAP {stem} model in {}",
+                sparse_dir.display()
+            ))
+        })?;
+        let label = format!("{stem}.{}", encoding.extension());
+        update_fingerprint_label(&mut hasher, label.as_bytes());
+        update_fingerprint_file(&mut hasher, &path)?;
+    }
+
+    Ok(*hasher.finalize().as_bytes())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColmapModelEncoding {
+    Binary,
+    Text,
+}
+
+impl ColmapModelEncoding {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Binary => "bin",
+            Self::Text => "txt",
+        }
+    }
+}
+
+fn select_colmap_model_file(
+    directory: &Path,
+    stem: &str,
+) -> Option<(PathBuf, ColmapModelEncoding)> {
+    let binary = directory.join(format!("{stem}.bin"));
+    if binary.exists() {
+        return Some((binary, ColmapModelEncoding::Binary));
+    }
+    let text = directory.join(format!("{stem}.txt"));
+    text.exists().then_some((text, ColmapModelEncoding::Text))
+}
+
+fn update_fingerprint_label(hasher: &mut blake3::Hasher, label: &[u8]) {
+    hasher.update(&(label.len() as u64).to_le_bytes());
+    hasher.update(label);
+}
+
+fn update_fingerprint_file(hasher: &mut blake3::Hasher, path: &Path) -> Result<(), TrainingError> {
+    let mut file = File::open(path)?;
+    let expected_len = file.metadata()?.len();
+    hasher.update(&expected_len.to_le_bytes());
+
+    let mut actual_len = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        actual_len = actual_len.checked_add(read as u64).ok_or_else(|| {
+            TrainingError::InvalidInput(format!(
+                "COLMAP model file length overflow in {}",
+                path.display()
+            ))
+        })?;
+        hasher.update(&buffer[..read]);
+    }
+    if actual_len != expected_len {
+        return Err(TrainingError::InvalidInput(format!(
+            "COLMAP model file {} changed while fingerprinting",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn is_colmap_sparse_dir(path: &Path) -> bool {
@@ -762,18 +853,13 @@ fn read_bounded_count(
 }
 
 fn parse_colmap_cameras(dir: &Path) -> Result<Vec<ColmapCamera>, TrainingError> {
-    let bin_path = dir.join("cameras.bin");
-    let txt_path = dir.join("cameras.txt");
-
-    if bin_path.exists() {
-        parse_cameras_binary(&bin_path)
-    } else if txt_path.exists() {
-        parse_cameras_text(&txt_path)
-    } else {
-        Err(TrainingError::InvalidInput(format!(
+    match select_colmap_model_file(dir, "cameras") {
+        Some((path, ColmapModelEncoding::Binary)) => parse_cameras_binary(&path),
+        Some((path, ColmapModelEncoding::Text)) => parse_cameras_text(&path),
+        None => Err(TrainingError::InvalidInput(format!(
             "no cameras file found in {}",
             dir.display(),
-        )))
+        ))),
     }
 }
 
@@ -903,18 +989,13 @@ fn parse_camera_model_name(name: &str) -> Result<&'static ColmapCameraModelSpec,
 }
 
 fn parse_colmap_images(dir: &Path) -> Result<Vec<ColmapImage>, TrainingError> {
-    let bin_path = dir.join("images.bin");
-    let txt_path = dir.join("images.txt");
-
-    if bin_path.exists() {
-        parse_images_binary(&bin_path)
-    } else if txt_path.exists() {
-        parse_images_text(&txt_path)
-    } else {
-        Err(TrainingError::InvalidInput(format!(
+    match select_colmap_model_file(dir, "images") {
+        Some((path, ColmapModelEncoding::Binary)) => parse_images_binary(&path),
+        Some((path, ColmapModelEncoding::Text)) => parse_images_text(&path),
+        None => Err(TrainingError::InvalidInput(format!(
             "no images file found in {}",
             dir.display(),
-        )))
+        ))),
     }
 }
 
@@ -1029,18 +1110,13 @@ fn parse_images_text(path: &Path) -> Result<Vec<ColmapImage>, TrainingError> {
 }
 
 fn parse_colmap_points3d(dir: &Path) -> Result<Vec<ColmapPoint3D>, TrainingError> {
-    let bin_path = dir.join("points3D.bin");
-    let txt_path = dir.join("points3D.txt");
-
-    if bin_path.exists() {
-        parse_points3d_binary(&bin_path)
-    } else if txt_path.exists() {
-        parse_points3d_text(&txt_path)
-    } else {
-        Err(TrainingError::InvalidInput(format!(
+    match select_colmap_model_file(dir, "points3D") {
+        Some((path, ColmapModelEncoding::Binary)) => parse_points3d_binary(&path),
+        Some((path, ColmapModelEncoding::Text)) => parse_points3d_text(&path),
+        None => Err(TrainingError::InvalidInput(format!(
             "missing COLMAP sparse points in {} (expected points3D.bin or points3D.txt)",
             dir.display(),
-        )))
+        ))),
     }
 }
 
@@ -1157,6 +1233,47 @@ mod tests {
         fs::write(sparse.join("images.txt"), images)?;
         fs::write(sparse.join("points3D.txt"), "1 0 0 1 255 0 0 0\n")?;
         Ok(())
+    }
+
+    #[test]
+    fn sparse_model_fingerprint_prefers_binary_files_over_text_fallbacks() {
+        let dir = tempdir().unwrap();
+        for stem in ["cameras", "images", "points3D"] {
+            fs::write(
+                dir.path().join(format!("{stem}.bin")),
+                format!("{stem} bin"),
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join(format!("{stem}.txt")),
+                format!("{stem} txt"),
+            )
+            .unwrap();
+        }
+        let original = fingerprint_colmap_sparse_model(dir.path()).unwrap();
+
+        for stem in ["cameras", "images", "points3D"] {
+            fs::write(
+                dir.path().join(format!("{stem}.txt")),
+                format!("changed {stem} txt"),
+            )
+            .unwrap();
+        }
+        let changed_text = fingerprint_colmap_sparse_model(dir.path()).unwrap();
+
+        assert_eq!(changed_text, original);
+    }
+
+    #[test]
+    fn sparse_model_fingerprint_matches_dataset_root_and_direct_sparse_input() {
+        let dir = tempdir().unwrap();
+        let sparse = dir.path().join("sparse/0");
+        write_minimal_fixture(&sparse, "camera model", "image poses").unwrap();
+
+        assert_eq!(
+            fingerprint_colmap_sparse_model(dir.path()).unwrap(),
+            fingerprint_colmap_sparse_model(&sparse).unwrap()
+        );
     }
 
     #[test]

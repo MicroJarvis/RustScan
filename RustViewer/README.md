@@ -30,6 +30,18 @@ Runtime boundaries:
 - **Layer visibility** — Toggle trajectory, points, Gaussians, mesh
 - **Apple HIG design** — Clean, native-feeling UI
 
+## Reconstruction Workflow
+
+RustViewer can create a managed `.rustscanproject` from an image sequence. The workbench then
+runs RustSFM keyframe reconstruction and full-frame registration through the persistent project
+pipeline. It writes the verified COLMAP sparse model and normalized images into the committed
+FullFramePnP artifact. RustGS training is enabled only after every imported image has a pose; its
+latest Gaussian snapshot is rendered in the RustViewer wgpu viewport.
+
+The desktop workbench currently accepts image sequences only. Video import and video PnP are
+intentionally disabled in the UI until the dedicated video reconstruction path has the same
+complete-pose and artifact-validation guarantees.
+
 ## Architecture
 
 ```
