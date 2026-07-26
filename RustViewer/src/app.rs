@@ -262,6 +262,12 @@ impl ViewerApp {
                 PanelAction::OpenGaussian => self.spawn_file_dialog(AssetLoadKind::Gaussian),
                 PanelAction::OpenMesh => self.spawn_file_dialog(AssetLoadKind::Mesh),
                 PanelAction::OpenColmap => self.spawn_colmap_load(),
+                PanelAction::OpenImages => {
+                    // Wired by reconstruction orchestration.
+                }
+                PanelAction::RunReconstruction => {
+                    // Wired by reconstruction orchestration.
+                }
                 PanelAction::StartTraining => self.start_training(),
                 PanelAction::StopTraining => self.stop_training(),
                 PanelAction::AutoFitScene => {
