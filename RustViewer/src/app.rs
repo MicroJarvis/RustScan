@@ -76,6 +76,44 @@ struct ProjectImportSummary {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+enum ImageImportInput {
+    Files(Vec<PathBuf>),
+    Folder(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+struct ImageImportRequest {
+    input: ImageImportInput,
+    destination: PathBuf,
+}
+
+fn image_import_request(
+    input: Option<ImageImportInput>,
+    destination: Option<PathBuf>,
+) -> Option<ImageImportRequest> {
+    Some(ImageImportRequest {
+        input: input?,
+        destination: destination?,
+    })
+}
+
+fn send_image_import_completion(
+    tx: &mpsc::Sender<AppCommand>,
+    ctx: &egui::Context,
+    result: Result<ProjectImportSummary, String>,
+) {
+    if tx.send(AppCommand::ImageSequenceImported(result)).is_ok() {
+        ctx.request_repaint();
+    }
+}
+
+fn send_image_import_cancellation(tx: &mpsc::Sender<AppCommand>, ctx: &egui::Context) {
+    if tx.send(AppCommand::ImageSequenceImportCancelled).is_ok() {
+        ctx.request_repaint();
+    }
+}
+
 struct DiscardMediaEvents;
 
 impl MediaEventSink for DiscardMediaEvents {
@@ -511,18 +549,18 @@ impl ViewerApp {
             })
     }
 
-    fn process_panel_actions(&mut self, actions: Vec<PanelAction>) {
+    fn process_panel_actions(&mut self, ctx: &egui::Context, actions: Vec<PanelAction>) {
         for action in actions {
             match action {
                 PanelAction::OpenImages => {
-                    self.spawn_image_sequence_import(ImageImportSource::Folder)
+                    self.spawn_image_sequence_import(ctx, ImageImportSource::Folder)
                 }
                 PanelAction::RunReconstruction => self.spawn_image_sequence_sfm(),
                 PanelAction::ImportImageFiles => {
-                    self.spawn_image_sequence_import(ImageImportSource::Files)
+                    self.spawn_image_sequence_import(ctx, ImageImportSource::Files)
                 }
                 PanelAction::ImportImageFolder => {
-                    self.spawn_image_sequence_import(ImageImportSource::Folder)
+                    self.spawn_image_sequence_import(ctx, ImageImportSource::Folder)
                 }
                 PanelAction::SolvePoses => self.spawn_image_sequence_sfm(),
                 PanelAction::OpenCheckpoint => self.spawn_file_dialog(AssetLoadKind::Checkpoint),
@@ -614,7 +652,7 @@ impl ViewerApp {
         });
     }
 
-    fn spawn_image_sequence_import(&mut self, source: ImageImportSource) {
+    fn spawn_image_sequence_import(&mut self, ctx: &egui::Context, source: ImageImportSource) {
         if matches!(
             self.ui_state.training_state,
             crate::training::TrainingSessionState::Loading
@@ -643,43 +681,36 @@ impl ViewerApp {
         );
 
         let tx = self.command_tx.clone();
-        std::thread::spawn(move || {
-            let paths = match source {
-                ImageImportSource::Files => {
-                    let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("Images", IMAGE_FILE_EXTENSIONS)
-                        .pick_files()
-                    else {
-                        let _ = tx.send(AppCommand::ImageSequenceImportCancelled);
-                        return;
-                    };
-                    paths
-                }
-                ImageImportSource::Folder => {
-                    let Some(folder) = rfd::FileDialog::new().pick_folder() else {
-                        let _ = tx.send(AppCommand::ImageSequenceImportCancelled);
-                        return;
-                    };
-                    match image_files_in_folder(&folder) {
-                        Ok(paths) => paths,
-                        Err(error) => {
-                            let _ = tx.send(AppCommand::ImageSequenceImported(Err(error)));
-                            return;
-                        }
-                    }
-                }
-            };
-            let Some(destination) = rfd::FileDialog::new()
+        let input = match source {
+            ImageImportSource::Files => rfd::FileDialog::new()
+                .add_filter("Images", IMAGE_FILE_EXTENSIONS)
+                .pick_files()
+                .map(ImageImportInput::Files),
+            ImageImportSource::Folder => rfd::FileDialog::new()
+                .pick_folder()
+                .map(ImageImportInput::Folder),
+        };
+        let destination = if input.is_some() {
+            rfd::FileDialog::new()
                 .add_filter("RustScan Project", &["rustscanproject"])
                 .save_file()
-            else {
-                let _ = tx.send(AppCommand::ImageSequenceImportCancelled);
-                return;
-            };
+        } else {
+            None
+        };
+        let Some(request) = image_import_request(input, destination) else {
+            send_image_import_cancellation(&tx, ctx);
+            return;
+        };
 
-            let result = create_image_sequence_project(paths, destination)
-                .map_err(|error| error.to_string());
-            let _ = tx.send(AppCommand::ImageSequenceImported(result));
+        let completion_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let ImageImportRequest { input, destination } = request;
+            let result = match input {
+                ImageImportInput::Files(paths) => create_image_sequence_project(paths, destination),
+                ImageImportInput::Folder(folder) => image_files_in_folder(&folder)
+                    .and_then(|paths| create_image_sequence_project(paths, destination)),
+            };
+            send_image_import_completion(&tx, &completion_ctx, result);
         });
     }
 
@@ -1418,7 +1449,7 @@ impl eframe::App for ViewerApp {
             .show_inside(ui, |ui| {
                 panel_actions.extend(workbench::draw_viewport_toolbar(ui, &snapshot));
             });
-        self.process_panel_actions(panel_actions);
+        self.process_panel_actions(&ctx, panel_actions);
         self.robot.visible = self.ui_state.robot_visible;
         self.robot.camera_mode = self.ui_state.robot_camera_mode;
         self.robot.move_speed = self.ui_state.robot_move_speed;
@@ -1848,6 +1879,85 @@ mod tests {
             ),
             PanelAction::ImportImageFiles,
         );
+    }
+
+    #[test]
+    fn image_import_request_requires_selected_images_and_destination() {
+        let paths = vec![PathBuf::from("frame-01.png"), PathBuf::from("frame-02.png")];
+        let input = ImageImportInput::Files(paths);
+        let destination = PathBuf::from("Capture.rustscanproject");
+        assert!(image_import_request(Some(input.clone()), Some(destination.clone())).is_some());
+        assert!(image_import_request(None, Some(destination.clone())).is_none());
+        assert!(image_import_request(Some(input), None).is_none());
+    }
+
+    #[test]
+    fn image_import_request_keeps_folder_selection_for_worker() {
+        let folder = PathBuf::from("Capture");
+        let destination = PathBuf::from("Capture.rustscanproject");
+
+        let request = image_import_request(
+            Some(ImageImportInput::Folder(folder.clone())),
+            Some(destination),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            request.input,
+            ImageImportInput::Folder(selected_folder) if selected_folder == folder
+        ));
+    }
+
+    #[test]
+    fn image_import_completion_enqueues_result_before_requesting_repaint() {
+        let (tx, rx) = mpsc::channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let received_command = Arc::new(Mutex::new(None));
+        let callback_rx = Arc::clone(&rx);
+        let callback_command = Arc::clone(&received_command);
+        let ctx = egui::Context::default();
+        ctx.set_request_repaint_callback(move |_| {
+            *callback_command.lock().unwrap() = Some(
+                callback_rx
+                    .lock()
+                    .unwrap()
+                    .try_recv()
+                    .expect("image import result should be queued before repaint"),
+            );
+        });
+
+        send_image_import_completion(&tx, &ctx, Err("import failed".to_owned()));
+
+        assert!(matches!(
+            received_command.lock().unwrap().take(),
+            Some(AppCommand::ImageSequenceImported(Err(error))) if error == "import failed"
+        ));
+    }
+
+    #[test]
+    fn image_import_cancellation_enqueues_command_before_requesting_repaint() {
+        let (tx, rx) = mpsc::channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let received_command = Arc::new(Mutex::new(None));
+        let callback_rx = Arc::clone(&rx);
+        let callback_command = Arc::clone(&received_command);
+        let ctx = egui::Context::default();
+        ctx.set_request_repaint_callback(move |_| {
+            *callback_command.lock().unwrap() = Some(
+                callback_rx
+                    .lock()
+                    .unwrap()
+                    .try_recv()
+                    .expect("image import cancellation should be queued before repaint"),
+            );
+        });
+
+        send_image_import_cancellation(&tx, &ctx);
+
+        assert!(matches!(
+            received_command.lock().unwrap().take(),
+            Some(AppCommand::ImageSequenceImportCancelled)
+        ));
     }
 
     #[test]
