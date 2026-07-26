@@ -303,7 +303,7 @@ fn run_reconstruction_impl(
         }
     }
     if reference_camera_setup.is_none() && mapper_database.is_none() {
-        reference_camera_setup = Some(local_image_camera_setup(&frames, config));
+        reference_camera_setup = Some(local_image_camera_setup(&frames, config)?);
         if let Some(first) = reference_camera_setup
             .as_ref()
             .and_then(|setup| setup.cameras.first())
@@ -15186,7 +15186,8 @@ mod tests {
                 fx: Some(90.0),
                 ..MapperConfig::default()
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(setup.camera_ids, vec![1, 2]);
         assert_eq!(setup.image_ids, vec![1, 2]);
@@ -15195,6 +15196,59 @@ mod tests {
         assert_eq!(setup.cameras[1].height, 150);
         assert_eq!(setup.cameras[0].fx, 90.0);
         assert_eq!(setup.cameras[1].cx, 100.0);
+    }
+
+    #[test]
+    fn local_image_fallback_can_share_one_camera_across_same_sized_images() {
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        for frame in &mut frames {
+            frame.width = 120;
+            frame.height = 80;
+        }
+
+        let setup = local_image_camera_setup(
+            &frames,
+            &MapperConfig {
+                single_camera: true,
+                fx: Some(90.0),
+                cy: Some(35.0),
+                ..MapperConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(setup.camera_ids, vec![1]);
+        assert_eq!(setup.image_ids, vec![1, 2]);
+        assert_eq!(setup.image_camera_indices, vec![0, 0]);
+        assert_eq!(setup.cameras.len(), 1);
+        assert_eq!(setup.cameras[0].width, 120);
+        assert_eq!(setup.cameras[0].height, 80);
+        assert_eq!(setup.cameras[0].fx, 90.0);
+        assert_eq!(setup.cameras[0].fy, 144.0);
+        assert_eq!(setup.cameras[0].cx, 60.0);
+        assert_eq!(setup.cameras[0].cy, 35.0);
+    }
+
+    #[test]
+    fn local_image_fallback_rejects_mixed_dimensions_for_a_shared_camera() {
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        frames[0].width = 120;
+        frames[0].height = 80;
+        frames[1].width = 200;
+        frames[1].height = 150;
+
+        let err = local_image_camera_setup(
+            &frames,
+            &MapperConfig {
+                single_camera: true,
+                ..MapperConfig::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("single camera"));
+        assert!(err.to_string().contains("120x80"));
+        assert!(err.to_string().contains("200x150"));
     }
 
     #[test]
@@ -15212,7 +15266,7 @@ mod tests {
             lowe_sift::Descriptor::new([0.9; lowe_sift::DESCRIPTOR_LEN]),
             lowe_sift::Descriptor::new([0.4; lowe_sift::DESCRIPTOR_LEN]),
         ];
-        let setup = local_image_camera_setup(&frames, &MapperConfig::default());
+        let setup = local_image_camera_setup(&frames, &MapperConfig::default()).unwrap();
         let mut pair = pair_with_inliers(0, 1, &[(0, 1)]);
         pair.matches = pair.inlier_matches.clone();
         pair.two_view_config = crate::database::COLMAP_TWO_VIEW_CALIBRATED;

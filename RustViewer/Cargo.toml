@@ -24,3 +24,4 @@ rustgs = { path = "../RustGS", default-features = false, features = ["gpu"] }
 
 [dev-dependencies]
 tempfile = "3.3"
+image = "0.25"

@@ -520,39 +520,50 @@ pub(super) fn database_camera_setup(
 pub(super) fn local_image_camera_setup(
     frames: &[ImageFrame],
     config: &MapperConfig,
-) -> ReferenceCameraSetup {
+) -> Result<ReferenceCameraSetup> {
+    if config.single_camera {
+        if let Some(first) = frames.first() {
+            if let Some(mismatched) = frames
+                .iter()
+                .skip(1)
+                .find(|frame| frame.width != first.width || frame.height != first.height)
+            {
+                bail!(
+                    "single camera local reconstruction requires matching image dimensions; '{}' is {}x{} but '{}' is {}x{}",
+                    first.name,
+                    first.width,
+                    first.height,
+                    mismatched.name,
+                    mismatched.width,
+                    mismatched.height,
+                );
+            }
+
+            return Ok(ReferenceCameraSetup {
+                cameras: vec![local_image_camera(first, config)],
+                camera_ids: vec![1],
+                camera_has_prior_focal_length: vec![true],
+                rigs: Vec::new(),
+                frames: Vec::new(),
+                image_ids: (1..=frames.len() as u32).collect(),
+                image_camera_indices: vec![0; frames.len()],
+                image_frame_indices: vec![None; frames.len()],
+                seed_reconstruction: None,
+            });
+        }
+    }
+
     let mut cameras = Vec::with_capacity(frames.len());
     let mut camera_ids = Vec::with_capacity(frames.len());
     let mut image_ids = Vec::with_capacity(frames.len());
     let mut image_camera_indices = Vec::with_capacity(frames.len());
     for (idx, frame) in frames.iter().enumerate() {
-        let focal = frame.width.max(frame.height) as f32 * 1.2;
-        let mut camera = CameraModel::new_pinhole(
-            frame.width,
-            frame.height,
-            focal,
-            focal,
-            frame.width as f32 * 0.5,
-            frame.height as f32 * 0.5,
-        );
-        if let Some(fx) = config.fx {
-            camera.set_fx(fx);
-        }
-        if let Some(fy) = config.fy {
-            camera.set_fy(fy);
-        }
-        if let Some(cx) = config.cx {
-            camera.set_cx(cx);
-        }
-        if let Some(cy) = config.cy {
-            camera.set_cy(cy);
-        }
-        cameras.push(camera);
+        cameras.push(local_image_camera(frame, config));
         camera_ids.push(idx as u32 + 1);
         image_ids.push(idx as u32 + 1);
         image_camera_indices.push(idx);
     }
-    ReferenceCameraSetup {
+    Ok(ReferenceCameraSetup {
         cameras,
         camera_ids,
         camera_has_prior_focal_length: vec![true; frames.len()],
@@ -562,7 +573,32 @@ pub(super) fn local_image_camera_setup(
         image_camera_indices,
         image_frame_indices: vec![None; frames.len()],
         seed_reconstruction: None,
+    })
+}
+
+fn local_image_camera(frame: &ImageFrame, config: &MapperConfig) -> CameraModel {
+    let focal = frame.width.max(frame.height) as f32 * 1.2;
+    let mut camera = CameraModel::new_pinhole(
+        frame.width,
+        frame.height,
+        focal,
+        focal,
+        frame.width as f32 * 0.5,
+        frame.height as f32 * 0.5,
+    );
+    if let Some(fx) = config.fx {
+        camera.set_fx(fx);
     }
+    if let Some(fy) = config.fy {
+        camera.set_fy(fy);
+    }
+    if let Some(cx) = config.cx {
+        camera.set_cx(cx);
+    }
+    if let Some(cy) = config.cy {
+        camera.set_cy(cy);
+    }
+    camera
 }
 
 pub(super) fn rig_from_colmap(rig: &ColmapRig) -> Rig {

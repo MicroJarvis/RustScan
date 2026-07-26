@@ -6740,6 +6740,7 @@ dependencies = [
  "eframe",
  "egui",
  "glam",
+ "image",
  "rfd",
  "rustgs",
  "rustsfm",

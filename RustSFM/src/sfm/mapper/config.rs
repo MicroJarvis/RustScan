@@ -75,6 +75,11 @@ pub struct MapperConfig {
     pub sift_matching: SiftMatchingOptions,
     pub max_hamming_distance: f32,
     pub local_matching: bool,
+    /// Reuse one automatically estimated camera for local image-only reconstruction.
+    ///
+    /// This is opt-in because the legacy image-only fallback assigns a camera to
+    /// each image, matching the behavior of existing callers.
+    pub single_camera: bool,
     pub local_window: usize,
     pub matching_pair_strategy: MatchingPairStrategy,
     pub experimental_sequence_heuristics: bool,
@@ -164,6 +169,7 @@ impl Default for MapperConfig {
             sift_matching: SiftMatchingOptions::default(),
             max_hamming_distance: 160.0,
             local_matching: false,
+            single_camera: false,
             local_window: 0,
             matching_pair_strategy: MatchingPairStrategy::default(),
             experimental_sequence_heuristics: false,
