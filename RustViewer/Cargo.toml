@@ -26,7 +26,6 @@ image = "0.25"
 crossbeam-channel = "0.5"
 rustslam = { path = "../RustSLAM", default-features = false, features = ["viewer-types"] }
 rustgs = { path = "../RustGS", default-features = false, features = ["gpu"] }
-rustsfm = { path = "../RustSFM", default-features = false, features = ["gpu-vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -34,6 +33,10 @@ objc2-foundation = { version = "0.3.2", features = ["NSData", "NSError", "NSValu
 objc2-av-foundation = { version = "0.3.2", features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVMediaFormat", "objc2-core-foundation", "objc2-core-media"] }
 objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMTime"] }
 objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer"] }
+rustsfm = { path = "../RustSFM", default-features = false, features = ["gpu-wgpu"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rustsfm = { path = "../RustSFM", default-features = false, features = ["gpu-vulkan"] }
 
 [dev-dependencies]
 tempfile = "3.3"
