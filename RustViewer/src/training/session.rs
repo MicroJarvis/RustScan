@@ -686,6 +686,7 @@ mod tests {
 
             let report = TrainingRunReport {
                 elapsed: Duration::from_millis(12),
+                training_loop_elapsed: Duration::from_millis(12),
                 final_loss: Some(0.42),
                 final_step_loss: Some(0.42),
                 gaussian_count: 64,
@@ -727,6 +728,7 @@ mod tests {
                         splats: HostSplats::default(),
                         report: TrainingRunReport {
                             elapsed: Duration::from_millis(125),
+                            training_loop_elapsed: Duration::from_millis(125),
                             final_loss: None,
                             final_step_loss: None,
                             gaussian_count: 0,
@@ -744,6 +746,7 @@ mod tests {
 
             let report = TrainingRunReport {
                 elapsed: Duration::from_millis(250),
+                training_loop_elapsed: Duration::from_millis(250),
                 final_loss: Some(0.11),
                 final_step_loss: Some(0.11),
                 gaussian_count: 128,
