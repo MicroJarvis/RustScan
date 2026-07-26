@@ -126,14 +126,23 @@ impl Default for UiState {
 }
 
 impl UiState {
+    pub fn can_load_colmap(&self) -> bool {
+        !self.is_loading
+            && !reconstruction_is_running(self.reconstruction_state)
+            && !reconstruction_is_blocked_by_training(self.training_state)
+    }
+
     pub fn can_run_reconstruction(&self) -> bool {
         self.image_source.is_some()
+            && !self.is_loading
             && !reconstruction_is_running(self.reconstruction_state)
             && !reconstruction_is_blocked_by_training(self.training_state)
     }
 
     pub fn can_start_training(&self) -> bool {
-        self.dataset_summary.is_some() && !reconstruction_is_running(self.reconstruction_state)
+        self.dataset_summary.is_some()
+            && !self.is_loading
+            && !reconstruction_is_running(self.reconstruction_state)
     }
 }
 
@@ -188,7 +197,12 @@ pub fn draw_side_panel(
             actions.push(PanelAction::OpenMesh);
         }
 
-        if draw_blue_button(ui, "🗂", "Load COLMAP") {
+        let load_colmap_clicked = ui
+            .add_enabled_ui(state.can_load_colmap(), |ui| {
+                draw_blue_button(ui, "🗂", "Load COLMAP")
+            })
+            .inner;
+        if load_colmap_clicked {
             actions.push(PanelAction::OpenColmap);
         }
 
@@ -949,6 +963,37 @@ mod tests {
     }
 
     #[test]
+    fn reconstruction_and_colmap_operations_exclude_conflicts() {
+        let mut state = UiState::default();
+        state.dataset_summary = Some(DatasetUiSummary {
+            root_path: "/captures/chair/sparse".to_owned(),
+            frame_count: 24,
+            sparse_point_count: 1_024,
+            width: 1_920,
+            height: 1_080,
+        });
+        state.image_source = Some(ImageSourceSummary {
+            root_path: "/captures/chair".to_owned(),
+            image_count: 24,
+        });
+
+        assert!(state.can_load_colmap());
+        assert!(state.can_run_reconstruction());
+
+        state.is_loading = true;
+        assert!(!state.can_load_colmap());
+        assert!(!state.can_run_reconstruction());
+
+        state.is_loading = false;
+        state.reconstruction_state = ReconstructionUiState::Running;
+        assert!(!state.can_load_colmap());
+
+        state.reconstruction_state = ReconstructionUiState::Ready;
+        state.training_state = TrainingSessionState::Training;
+        assert!(!state.can_load_colmap());
+    }
+
+    #[test]
     fn reconstruction_running_blocks_training_start() {
         let mut state = UiState::default();
         state.dataset_summary = Some(DatasetUiSummary {
@@ -960,6 +1005,10 @@ mod tests {
         });
         assert!(state.can_start_training());
 
+        state.is_loading = true;
+        assert!(!state.can_start_training());
+
+        state.is_loading = false;
         state.reconstruction_state = ReconstructionUiState::Running;
         assert!(!state.can_start_training());
     }

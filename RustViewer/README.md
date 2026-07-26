@@ -11,6 +11,18 @@ RustViewer is a desktop application for visualizing SLAM reconstruction results,
 - **Gaussian point cloud** — 3DGS scene from training
 - **Mesh** — Extracted mesh with solid/wireframe rendering
 
+## Reconstruction Workflow
+
+1. Select **Import Images** and choose a folder with at least two JPEG or PNG images.
+2. Select **Run Reconstruction**. Each RustSFM result is written below the input folder at `<input>/.rustviewer/rustsfm/<run-id>/`; older runs are never overwritten.
+3. RustSFM uses automatic single-camera intrinsics. After it produces a valid COLMAP sparse model, RustViewer loads it, starts RustGS 3DGS training automatically, and displays training snapshots.
+
+Runtime boundaries:
+
+- On macOS, wgpu uses Metal rather than native Vulkan.
+- This release cannot cancel a running RustSFM reconstruction.
+- Existing RustGS training cancellation remains available.
+
 ## Features
 
 - **Offline file loading** — Load `pipeline.json`, `scene.ply`, `mesh.obj/ply`
@@ -27,6 +39,7 @@ RustViewer/
 │   ├── main.rs             # Binary entry point
 │   ├── lib.rs              # Library root, module declarations
 │   ├── app.rs              # Main eframe app struct
+│   ├── reconstruction.rs   # RustSFM runner and output validation
 │   ├── loader/             # File loading utilities
 │   │   ├── mod.rs          # Loader trait and exports
 │   │   ├── checkpoint.rs   # Checkpoint JSON loader
@@ -61,6 +74,8 @@ cargo build -p rust-viewer --release
 - **wgpu** — Cross-platform GPU rendering (via eframe)
 - **glam** — SIMD-accelerated math library
 - **rustslam** — SLAM library with `viewer-types` feature
+- **rustsfm** — Image pose solving and COLMAP sparse-model export
+- **rustgs** — 3D Gaussian Splatting training
 
 ## Notes
 

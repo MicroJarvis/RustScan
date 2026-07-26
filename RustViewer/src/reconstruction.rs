@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use std::{
     fs,
     io::ErrorKind,
@@ -87,6 +87,7 @@ impl ReconstructionRunner for RustSfmRunner {
         let config = mapper_config_for(source.root(), &output_dir);
         let mut sink = ProgressSink { emit };
         let summary = rustsfm::run_reconstruction_with_callbacks(&config, Some(&mut sink))?;
+        validate_completed_summary(&summary)?;
 
         Ok(ReconstructionOutput {
             output_dir,
@@ -135,6 +136,18 @@ pub fn mapper_config_for(input: &Path, output: &Path) -> rustsfm::MapperConfig {
         copy_images: true,
         ..rustsfm::MapperConfig::default()
     }
+}
+
+pub fn validate_completed_summary(summary: &rustsfm::ReconstructionSummary) -> anyhow::Result<()> {
+    ensure!(
+        summary.registered_images > 0,
+        "RustSFM completed without registered images"
+    );
+    ensure!(
+        summary.points > 0,
+        "RustSFM completed without sparse points"
+    );
+    Ok(())
 }
 
 struct ProgressSink<'a> {
@@ -195,5 +208,33 @@ mod tests {
         assert_eq!(config.output, output);
         assert!(config.local_matching && config.copy_images);
         assert!(config.fx.is_none() && config.fy.is_none());
+    }
+
+    #[test]
+    fn completed_summary_requires_registered_images_and_sparse_points() {
+        let empty = rustsfm::ReconstructionSummary {
+            images: 12,
+            registered_images: 0,
+            points: 0,
+            pairs: 0,
+            models: 0,
+            elapsed_ms: 1.0,
+            debug_log: Vec::new(),
+        };
+        assert!(validate_completed_summary(&empty).is_err());
+    }
+
+    #[test]
+    fn completed_summary_accepts_registered_sparse_model() {
+        let complete = rustsfm::ReconstructionSummary {
+            images: 12,
+            registered_images: 8,
+            points: 120,
+            pairs: 24,
+            models: 1,
+            elapsed_ms: 1.0,
+            debug_log: Vec::new(),
+        };
+        assert!(validate_completed_summary(&complete).is_ok());
     }
 }

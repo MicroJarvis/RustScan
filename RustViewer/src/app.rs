@@ -52,6 +52,7 @@ enum AssetLoadKind {
 enum AppCommand {
     LoadAsset { kind: AssetLoadKind, path: PathBuf },
     ColmapLoaded(Result<LoadedColmapDataset, String>),
+    ColmapLoadCancelled,
     ImageSourceLoaded(Result<ImageSource, String>),
     ReconstructionProgress(ReconstructionProgress),
     ReconstructionFinished(Result<LoadedColmapDataset, String>),
@@ -155,6 +156,7 @@ impl ViewerApp {
             match command {
                 AppCommand::LoadAsset { kind, path } => self.handle_asset_load(kind, path),
                 AppCommand::ColmapLoaded(result) => self.handle_colmap_loaded(result),
+                AppCommand::ColmapLoadCancelled => clear_colmap_loading_state(&mut self.ui_state),
                 AppCommand::ImageSourceLoaded(result) => self.handle_image_source_loaded(result),
                 AppCommand::ReconstructionProgress(progress) => {
                     apply_reconstruction_progress(&mut self.ui_state, progress);
@@ -218,8 +220,7 @@ impl ViewerApp {
     }
 
     fn handle_colmap_loaded(&mut self, result: Result<LoadedColmapDataset, String>) {
-        self.ui_state.is_loading = false;
-        self.ui_state.loading_message = None;
+        clear_colmap_loading_state(&mut self.ui_state);
 
         match result {
             Ok(loaded) => {
@@ -390,19 +391,27 @@ impl ViewerApp {
     }
 
     fn spawn_colmap_load(&mut self) {
+        if !self.ui_state.can_load_colmap() || self.training_manager.is_training_active() {
+            return;
+        }
+
         self.ui_state.is_loading = true;
         self.ui_state.loading_message = Some("Loading COLMAP dataset…".to_string());
         self.ui_state.load_error = None;
 
         let tx = self.command_tx.clone();
+        let egui_ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
-            let Some(path) = rfd::FileDialog::new().pick_folder() else {
-                return;
+            let command = match rfd::FileDialog::new().pick_folder() {
+                Some(path) => {
+                    let result = load_colmap_training_dataset(&path, &ColmapConfig::default())
+                        .map_err(|err| err.to_string());
+                    AppCommand::ColmapLoaded(result)
+                }
+                None => AppCommand::ColmapLoadCancelled,
             };
-
-            let result = load_colmap_training_dataset(&path, &ColmapConfig::default())
-                .map_err(|err| err.to_string());
-            let _ = tx.send(AppCommand::ColmapLoaded(result));
+            let _ = tx.send(command);
+            egui_ctx.request_repaint();
         });
     }
 
@@ -457,6 +466,14 @@ impl ViewerApp {
     }
 
     fn start_training(&mut self) {
+        if self.ui_state.is_loading {
+            self.ui_state.training_error = Some(
+                "Wait for the COLMAP dataset to finish loading before starting training."
+                    .to_string(),
+            );
+            return;
+        }
+
         if reconstruction_is_running(self.ui_state.reconstruction_state) {
             self.ui_state.training_error =
                 Some("Wait for reconstruction to finish before starting training.".to_string());
@@ -821,6 +838,11 @@ fn apply_reconstruction_progress(state: &mut UiState, progress: ReconstructionPr
     state.reconstruction_state = ReconstructionUiState::Running;
     state.reconstruction_registered_images = progress.registered_images;
     state.reconstruction_points = progress.points;
+}
+
+fn clear_colmap_loading_state(state: &mut UiState) {
+    state.is_loading = false;
+    state.loading_message = None;
 }
 
 fn apply_reconstruction_result(state: &mut UiState, result: Result<(), String>) -> bool {
@@ -1404,6 +1426,42 @@ mod tests {
         assert!(!reconstruction_is_blocked_by_training(
             crate::training::TrainingSessionState::Idle
         ));
+    }
+
+    #[test]
+    fn reconstruction_colmap_load_conflicts_are_rejected_by_ui_state() {
+        let mut state = UiState::default();
+        state.image_source = Some(ImageSourceSummary {
+            root_path: "/captures/chair".to_owned(),
+            image_count: 24,
+        });
+        assert!(state.can_load_colmap());
+        assert!(state.can_run_reconstruction());
+
+        state.is_loading = true;
+        assert!(!state.can_load_colmap());
+        assert!(!state.can_run_reconstruction());
+
+        state.is_loading = false;
+        state.reconstruction_state = ReconstructionUiState::Running;
+        assert!(!state.can_load_colmap());
+
+        state.reconstruction_state = ReconstructionUiState::Ready;
+        state.training_state = TrainingSessionState::Training;
+        assert!(!state.can_load_colmap());
+    }
+
+    #[test]
+    fn reconstruction_colmap_load_cancellation_clears_loading_state() {
+        let mut state = UiState::default();
+        state.is_loading = true;
+        state.loading_message = Some("Loading COLMAP dataset…".to_owned());
+
+        clear_colmap_loading_state(&mut state);
+
+        assert!(!state.is_loading);
+        assert!(state.loading_message.is_none());
+        assert!(state.load_error.is_none());
     }
 
     #[test]
