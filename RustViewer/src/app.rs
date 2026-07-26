@@ -25,8 +25,8 @@ use crate::training::gpu_viewport::{viewport_render_scale, GpuViewportBridge};
 use crate::training::preview::PreviewResolution;
 use crate::training::{TrainingControlOptions, TrainingManager, TrainingSessionEvent};
 use crate::ui::panel::{
-    draw_side_panel, reconstruction_is_blocked_by_training, DatasetUiSummary, ImageSourceSummary,
-    PanelAction, ReconstructionUiState, UiState,
+    draw_side_panel, DatasetUiSummary, ImageSourceSummary, PanelAction, ReconstructionUiState,
+    UiState,
 };
 use crate::ui::theme::{
     overlay_bg, PANEL_BG, TEXT_PRIMARY, TEXT_SECONDARY, VIEWPORT_BG, WINDOW_BG,
@@ -421,9 +421,7 @@ impl ViewerApp {
     }
 
     fn spawn_reconstruction(&mut self) {
-        if !self.ui_state.can_run_reconstruction()
-            || reconstruction_is_blocked_by_training(self.training_manager.state())
-        {
+        if !self.ui_state.can_run_reconstruction() || self.training_manager.is_training_active() {
             return;
         }
         let Some(source) = self.image_source.clone() else {
@@ -526,7 +524,12 @@ impl ViewerApp {
             }
         }
 
-        self.ui_state.training_state = self.training_manager.state();
+        let manager_state = self.training_manager.state();
+        if manager_state != crate::training::TrainingSessionState::Idle
+            || !self.training_manager.is_training_active()
+        {
+            self.ui_state.training_state = manager_state;
+        }
         self.ui_state.training_progress = self.training_manager.progress();
         if let Some(error) = self.training_manager.latest_error() {
             self.ui_state.training_error = Some(error);

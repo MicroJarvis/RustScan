@@ -385,6 +385,13 @@ impl TrainingManager {
         self.session.is_some()
     }
 
+    pub fn is_training_active(&self) -> bool {
+        self.session
+            .as_ref()
+            .map(|session| !session.is_terminal())
+            .unwrap_or(false)
+    }
+
     pub fn clear_terminal_session(&mut self) {
         let should_clear = self
             .session
@@ -841,6 +848,35 @@ mod tests {
         assert_eq!(manager.state(), TrainingSessionState::Cancelled);
         assert!(manager.latest_report().is_none());
         assert!(manager.latest_snapshot().is_none());
+    }
+
+    #[test]
+    fn manager_reports_training_activity_for_non_terminal_sessions() {
+        let mut manager = TrainingManager::new();
+        assert!(!manager.is_training_active());
+
+        manager
+            .start_with_runner(
+                dummy_dataset(),
+                TrainingConfig::default(),
+                TrainingControlOptions::default(),
+                SlowRunner,
+            )
+            .unwrap();
+        assert!(manager.is_training_active());
+
+        manager.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            manager.poll_events();
+            if manager.state().is_terminal() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(manager.state().is_terminal());
+        assert!(!manager.is_training_active());
     }
 
     fn collect_until_terminal(
