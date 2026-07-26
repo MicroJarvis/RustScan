@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -11,6 +11,36 @@ use rust_viewer::project::{
     ProjectCreateRequest, ProjectStage, ProjectStore, SourceSpec, StageState,
 };
 use rustgs::HostSplats;
+
+#[test]
+fn worker_request_includes_the_locked_project_root_and_stage_workspace() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project_root = temporary.path().join("fixture.rustscanproject");
+    let store = ProjectStore::create(
+        &project_root,
+        ProjectCreateRequest::new("Fixture", SourceSpec::managed_images("fixture")),
+    )
+    .unwrap();
+    let (request_sender, request_receiver) = mpsc::channel();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let workers = PipelineWorkers::new(
+        FakeStageWorker::new(ProjectStage::Import, Arc::clone(&trace)),
+        CapturingSfmWorker { request_sender },
+        FakeStageWorker::new(ProjectStage::FullFramePnp, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::Training, trace),
+    );
+    let mut coordinator = PipelineCoordinator::new(store, workers).unwrap();
+
+    coordinator.send(PipelineCommand::StartAutomatic).unwrap();
+    coordinator.drive_until_idle().unwrap();
+
+    let request = request_receiver.recv().unwrap();
+    assert!(request.project_root.ends_with("fixture.rustscanproject"));
+    assert!(request.workspace_path.starts_with(&request.project_root));
+    assert!(request
+        .workspace_path
+        .ends_with("Cache/.staging/keyframe_sfm-1"));
+}
 
 #[test]
 fn automatic_pipeline_runs_stages_in_order_with_one_worker_at_a_time() {
@@ -52,6 +82,94 @@ fn automatic_pipeline_runs_stages_in_order_with_one_worker_at_a_time() {
         ]
     );
     assert_eq!(coordinator.max_concurrent_workers(), 1);
+}
+
+#[test]
+fn reconstruction_target_stops_after_full_frame_pnp() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = ProjectStore::create(
+        temporary.path().join("Target.rustscanproject"),
+        ProjectCreateRequest::new("Target", SourceSpec::managed_images("fixture")),
+    )
+    .unwrap();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let workers = PipelineWorkers::new(
+        FakeStageWorker::new(ProjectStage::Import, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::KeyframeSfm, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::FullFramePnp, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::Training, Arc::clone(&trace)),
+    );
+    let mut coordinator = PipelineCoordinator::new(store, workers).unwrap();
+
+    coordinator
+        .send(PipelineCommand::StartThrough {
+            stage: ProjectStage::FullFramePnp,
+        })
+        .unwrap();
+    coordinator.drive_until_idle().unwrap();
+
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            ProjectStage::Import,
+            ProjectStage::KeyframeSfm,
+            ProjectStage::FullFramePnp,
+        ]
+    );
+    assert_eq!(
+        coordinator
+            .store()
+            .manifest()
+            .try_stage(ProjectStage::Training)
+            .unwrap()
+            .state(),
+        StageState::Ready
+    );
+}
+
+#[test]
+fn reconstruction_pipeline_stops_after_full_frame_pose_coverage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = ProjectStore::create(
+        temporary.path().join("Reconstruction.rustscanproject"),
+        ProjectCreateRequest::new("Reconstruction", SourceSpec::managed_images("fixture")),
+    )
+    .unwrap();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let workers = PipelineWorkers::new(
+        FakeStageWorker::new(ProjectStage::Import, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::KeyframeSfm, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::FullFramePnp, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::Training, Arc::clone(&trace)),
+    );
+    let mut coordinator = PipelineCoordinator::new(store, workers).unwrap();
+
+    coordinator
+        .send(PipelineCommand::StartThrough {
+            stage: ProjectStage::FullFramePnp,
+        })
+        .unwrap();
+    coordinator.drive_until_idle().unwrap();
+
+    assert_eq!(
+        coordinator
+            .store()
+            .manifest()
+            .try_stage(ProjectStage::FullFramePnp)
+            .unwrap()
+            .state(),
+        StageState::Succeeded
+    );
+    assert_eq!(
+        coordinator
+            .store()
+            .manifest()
+            .try_stage(ProjectStage::Training)
+            .unwrap()
+            .state(),
+        StageState::Ready
+    );
+    assert!(!trace.lock().unwrap().contains(&ProjectStage::Training));
 }
 
 #[test]
@@ -478,6 +596,31 @@ fn pausing_worker_retains_valid_pending_artifacts_in_its_workspace() {
 struct FakeStageWorker {
     stage: ProjectStage,
     trace: Arc<Mutex<Vec<ProjectStage>>>,
+}
+
+struct CapturingSfmWorker {
+    request_sender: mpsc::Sender<StageRequest>,
+}
+
+impl SfmWorker for CapturingSfmWorker {
+    fn run(
+        &self,
+        request: StageRequest,
+        _control: WorkerControl,
+        _events: WorkerEventSink,
+    ) -> WorkerOutcome {
+        self.request_sender.send(request).unwrap();
+        WorkerOutcome::Failed(rust_viewer::project::ProjectErrorRecord {
+            code: "captured".to_owned(),
+            stage: ProjectStage::KeyframeSfm,
+            summary: "Captured request".to_owned(),
+            detail: "The request was captured for this contract test.".to_owned(),
+            frame_id: None,
+            pair: None,
+            retryable: false,
+            suggested_actions: Vec::new(),
+        })
+    }
 }
 
 impl FakeStageWorker {

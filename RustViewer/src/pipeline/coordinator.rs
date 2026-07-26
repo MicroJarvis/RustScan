@@ -44,6 +44,7 @@ pub struct PipelineCoordinator {
     worker_event_receiver: Receiver<PipelineEvent>,
     active: Option<ActiveWorker>,
     automatic: bool,
+    automatic_target: Option<ProjectStage>,
     max_concurrent_workers: usize,
     last_progress_persisted: Option<Instant>,
 }
@@ -76,6 +77,7 @@ impl PipelineCoordinator {
             worker_event_receiver,
             active: None,
             automatic: false,
+            automatic_target: None,
             max_concurrent_workers: 0,
             last_progress_persisted: None,
         })
@@ -124,8 +126,9 @@ impl PipelineCoordinator {
             return Ok(());
         }
         if self.active.is_none() && self.automatic {
-            if !self.start_next_ready_stage()? {
+            if self.target_stage_succeeded() || !self.start_next_ready_stage()? {
                 self.automatic = false;
+                self.automatic_target = None;
             }
         }
         Ok(())
@@ -136,10 +139,18 @@ impl PipelineCoordinator {
             PipelineCommand::StartAutomatic => {
                 if self.active.is_none() {
                     self.automatic = true;
+                    self.automatic_target = None;
+                }
+            }
+            PipelineCommand::StartThrough { stage } => {
+                if self.active.is_none() {
+                    self.automatic = true;
+                    self.automatic_target = Some(stage);
                 }
             }
             PipelineCommand::Pause => {
                 self.automatic = false;
+                self.automatic_target = None;
                 if let Some(active) = &self.active {
                     self.store.request_stage_pause(active.stage)?;
                     active.control.request_pause();
@@ -147,6 +158,7 @@ impl PipelineCoordinator {
             }
             PipelineCommand::Cancel => {
                 self.automatic = false;
+                self.automatic_target = None;
                 if let Some(active) = &self.active {
                     self.store.request_stage_cancel(active.stage)?;
                     active.control.request_cancel();
@@ -169,6 +181,7 @@ impl PipelineCoordinator {
                 if confirmed && self.active.is_none() {
                     self.store.restart_from_stage(stage)?;
                     self.automatic = true;
+                    self.automatic_target = None;
                 }
             }
             PipelineCommand::Shutdown { disposition } => match disposition {
@@ -190,6 +203,9 @@ impl PipelineCoordinator {
             ProjectStage::FullFramePnp,
             ProjectStage::Training,
         ] {
+            if self.automatic_target.is_some_and(|target| stage > target) {
+                break;
+            }
             if self
                 .store
                 .manifest()
@@ -204,6 +220,15 @@ impl PipelineCoordinator {
         Ok(false)
     }
 
+    fn target_stage_succeeded(&self) -> bool {
+        self.automatic_target.is_some_and(|target| {
+            self.store
+                .manifest()
+                .try_stage(target)
+                .is_ok_and(|record| record.state() == StageState::Succeeded)
+        })
+    }
+
     fn start_stage(&mut self, stage: ProjectStage) -> Result<(), PipelineCoordinatorError> {
         if self.active.is_some() {
             return Ok(());
@@ -212,6 +237,8 @@ impl PipelineCoordinator {
         let request = StageRequest {
             stage,
             attempt: workspace.attempt(),
+            project_root: self.store.root().to_path_buf(),
+            workspace_path: workspace.path().to_path_buf(),
             manifest: self.store.manifest().clone(),
         };
         let control = WorkerControl::new();

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -49,6 +50,8 @@ pub enum WorkerOutcome {
 pub struct StageRequest {
     pub stage: ProjectStage,
     pub attempt: u32,
+    pub project_root: PathBuf,
+    pub workspace_path: PathBuf,
     pub manifest: ProjectManifest,
 }
 

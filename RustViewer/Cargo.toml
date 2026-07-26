@@ -25,6 +25,7 @@ image = "0.25"
 crossbeam-channel = "0.5"
 rustslam = { path = "../RustSLAM", default-features = false, features = ["viewer-types"] }
 rustgs = { path = "../RustGS", default-features = false, features = ["gpu"] }
+rustsfm = { path = "../RustSFM", default-features = false, features = ["gpu-vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

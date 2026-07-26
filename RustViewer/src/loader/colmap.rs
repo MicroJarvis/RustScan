@@ -212,7 +212,7 @@ mod tests {
 
         std::fs::write(
             sparse.join("images.txt"),
-            "# Image list with two lines of data per image:\n1 1.0 0.0 0.0 0.0 0.0 0.0 1.0 1 frame_0001.jpg\n2 1.0 0.0 0.0 0.0 1.0 0.0 2.0 1 frame_0002.jpg\n",
+            "# Image list with two lines of data per image:\n1 1.0 0.0 0.0 0.0 0.0 0.0 1.0 1 frame_0001.jpg\n\n2 1.0 0.0 0.0 0.0 1.0 0.0 2.0 1 frame_0002.jpg\n\n",
         )
         .unwrap();
 

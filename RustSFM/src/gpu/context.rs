@@ -7,12 +7,13 @@ use std::sync::{mpsc, Arc};
 pub struct WgpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    backend: wgpu::Backend,
     capabilities: GpuSiftCapabilities,
 }
 
 impl WgpuContext {
     pub fn try_new() -> Result<Arc<Self>> {
-        Self::try_new_optional()?.context("no compatible wgpu adapter is available")
+        Self::try_new_optional()?.context(no_compatible_adapter_message())
     }
 
     pub fn try_new_optional() -> Result<Option<Arc<Self>>> {
@@ -20,6 +21,15 @@ impl WgpuContext {
     }
 
     async fn new_async() -> Result<Option<Arc<Self>>> {
+        #[cfg(feature = "gpu-vulkan")]
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::from_build_config().with_env(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        #[cfg(not(feature = "gpu-vulkan"))]
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = match instance
@@ -49,8 +59,9 @@ impl WgpuContext {
         Ok(Some(Arc::new(Self {
             device,
             queue,
+            backend: info.backend,
             capabilities: GpuSiftCapabilities {
-                backend: GpuBackendKind::Wgpu,
+                backend: gpu_backend_kind(info.backend),
                 device_name: info.name,
             },
         })))
@@ -58,6 +69,10 @@ impl WgpuContext {
 
     pub fn capabilities(&self) -> &GpuSiftCapabilities {
         &self.capabilities
+    }
+
+    pub fn backend(&self) -> wgpu::Backend {
+        self.backend
     }
 
     pub(crate) fn device(&self) -> &wgpu::Device {
@@ -124,5 +139,24 @@ impl WgpuContext {
         drop(mapped);
         staging.unmap();
         Ok(values)
+    }
+}
+
+fn no_compatible_adapter_message() -> &'static str {
+    #[cfg(feature = "gpu-vulkan")]
+    {
+        "no compatible Vulkan adapter is available"
+    }
+    #[cfg(not(feature = "gpu-vulkan"))]
+    {
+        "no compatible wgpu adapter is available"
+    }
+}
+
+fn gpu_backend_kind(backend: wgpu::Backend) -> GpuBackendKind {
+    if backend == wgpu::Backend::Vulkan {
+        GpuBackendKind::Vulkan
+    } else {
+        GpuBackendKind::Wgpu
     }
 }

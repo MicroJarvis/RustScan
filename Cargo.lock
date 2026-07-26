@@ -6917,6 +6917,7 @@ dependencies = [
  "rfd",
  "rustgs",
  "rustix 1.1.4",
+ "rustsfm",
  "rustslam",
  "serde",
  "serde_json",

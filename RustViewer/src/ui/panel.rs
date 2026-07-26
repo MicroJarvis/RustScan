@@ -10,6 +10,9 @@ use crate::ui::theme::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelAction {
+    ImportImageFiles,
+    ImportImageFolder,
+    SolvePoses,
     OpenCheckpoint,
     OpenGaussian,
     OpenMesh,
@@ -22,6 +25,17 @@ pub enum PanelAction {
     PlaceRobotInView,
     PickRobotGround,
     FlipRobotGround,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceSelection {
+    Images,
+}
+
+pub fn panel_action_for_primary_import(selection: SourceSelection) -> PanelAction {
+    match selection {
+        SourceSelection::Images => PanelAction::ImportImageFiles,
+    }
 }
 
 #[derive(Debug, Clone)]

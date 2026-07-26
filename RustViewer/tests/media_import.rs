@@ -3,15 +3,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
+use rust_viewer::loader::load_colmap_training_dataset;
 use rust_viewer::media::{
     import_image_sequence, import_video, select_keyframes, DecodedVideoFrame,
     ImageSequenceImportRequest, ImportedFrame, KeyframeSelectionConfig, MediaEventSink,
     MediaImportError, MediaImportEvent, VideoDecoder, VideoMetadata,
 };
+use rust_viewer::pipeline::{
+    ArtifactValidation, ImportWorker, PendingArtifact, PipelineCommand, PipelineCoordinator,
+    PipelineWorkers, PnpWorker, SfmWorker, StageRequest, TrainingWorker, WorkerControl,
+    WorkerEventSink, WorkerOutcome,
+};
 use rust_viewer::project::{
     ProjectCreateRequest, ProjectStage, ProjectStore, ProjectStoreWarning, SourceKind,
     SourceOwnership, SourceSpec, StageState, SuggestedAction,
 };
+use rustgs::ColmapConfig;
 
 #[derive(Default)]
 struct RecordingSink {
@@ -463,6 +470,171 @@ fn write_fixture_png(directory: &Path, name: &str) -> PathBuf {
         .save(&path)
         .unwrap();
     path
+}
+
+#[test]
+fn image_project_full_frame_result_is_a_loadable_colmap_dataset() {
+    let fixture = completed_image_project_fixture();
+
+    let loaded = load_colmap_training_dataset(&fixture.colmap_root, &ColmapConfig::default())
+        .expect("committed FullFramePnp artifact should load without a GPU adapter");
+
+    assert_eq!(loaded.summary.frame_count, 2);
+}
+
+struct CompletedImageProjectFixture {
+    _temporary: tempfile::TempDir,
+    colmap_root: PathBuf,
+}
+
+fn completed_image_project_fixture() -> CompletedImageProjectFixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let sources = temporary.path().join("source-images");
+    fs::create_dir(&sources).unwrap();
+    let project = temporary.path().join("Completed.rustscanproject");
+    let mut store = ProjectStore::create(
+        &project,
+        ProjectCreateRequest::new("Completed", SourceSpec::managed_images("pending-import")),
+    )
+    .unwrap();
+    import_image_sequence(
+        &ImageSequenceImportRequest::managed(vec![
+            write_fixture_png(&sources, "frame1.png"),
+            write_fixture_png(&sources, "frame2.png"),
+        ]),
+        &mut store,
+        &mut RecordingSink::default(),
+    )
+    .unwrap();
+
+    let workers = PipelineWorkers::new(
+        UnexpectedProjectWorker,
+        FixtureSfmWorker,
+        FixturePnpWorker,
+        UnexpectedProjectWorker,
+    );
+    let mut pipeline = PipelineCoordinator::new(store, workers).unwrap();
+    pipeline
+        .send(PipelineCommand::StartThrough {
+            stage: ProjectStage::FullFramePnp,
+        })
+        .unwrap();
+    pipeline.drive_until_idle().unwrap();
+    assert_eq!(
+        pipeline
+            .store()
+            .manifest()
+            .try_stage(ProjectStage::FullFramePnp)
+            .unwrap()
+            .state(),
+        StageState::Succeeded
+    );
+
+    CompletedImageProjectFixture {
+        colmap_root: pipeline
+            .store()
+            .root()
+            .join("Artifacts/full_frame_pnp/attempt-00000001/colmap"),
+        _temporary: temporary,
+    }
+}
+
+struct UnexpectedProjectWorker;
+
+impl ImportWorker for UnexpectedProjectWorker {
+    fn run(
+        &self,
+        _request: StageRequest,
+        _control: WorkerControl,
+        _events: WorkerEventSink,
+    ) -> WorkerOutcome {
+        panic!("the imported project must not rerun its import stage")
+    }
+}
+
+impl TrainingWorker for UnexpectedProjectWorker {
+    fn run(
+        &self,
+        _request: StageRequest,
+        _control: WorkerControl,
+        _events: WorkerEventSink,
+    ) -> WorkerOutcome {
+        panic!("reconstruction must stop before the training stage")
+    }
+}
+
+struct FixtureSfmWorker;
+
+impl SfmWorker for FixtureSfmWorker {
+    fn run(
+        &self,
+        _request: StageRequest,
+        _control: WorkerControl,
+        _events: WorkerEventSink,
+    ) -> WorkerOutcome {
+        WorkerOutcome::Succeeded(vec![PendingArtifact::new(
+            "keyframe-result.json",
+            br#"{}"#.to_vec(),
+            ArtifactValidation::Json,
+        )])
+    }
+}
+
+struct FixturePnpWorker;
+
+impl PnpWorker for FixturePnpWorker {
+    fn run(
+        &self,
+        request: StageRequest,
+        _control: WorkerControl,
+        _events: WorkerEventSink,
+    ) -> WorkerOutcome {
+        let imported_images = request
+            .project_root
+            .join("Artifacts/import/attempt-00000001/Cache/frames");
+        let first = fs::read(imported_images.join("00000000.png")).unwrap();
+        let second = fs::read(imported_images.join("00000001.png")).unwrap();
+        WorkerOutcome::Succeeded(vec![
+            PendingArtifact::new(
+                "colmap/sparse/0/cameras.txt",
+                b"1 PINHOLE 1 1 1.0 1.0 0.5 0.5\n".to_vec(),
+                ArtifactValidation::ReadableFile,
+            ),
+            PendingArtifact::new(
+                "colmap/sparse/0/images.txt",
+                concat!(
+                    "1 1.0 0.0 0.0 0.0 0.0 0.0 0.0 1 00000000.png\n\n",
+                    "2 1.0 0.0 0.0 0.0 1.0 0.0 0.0 1 00000001.png\n\n",
+                )
+                .as_bytes()
+                .to_vec(),
+                ArtifactValidation::ReadableFile,
+            ),
+            PendingArtifact::new(
+                "colmap/sparse/0/points3D.txt",
+                b"1 0.0 0.0 1.0 128 128 128 0.1 1 0\n".to_vec(),
+                ArtifactValidation::ReadableFile,
+            ),
+            PendingArtifact::new(
+                "colmap/images/00000000.png",
+                first,
+                ArtifactValidation::ReadableFile,
+            ),
+            PendingArtifact::new(
+                "colmap/images/00000001.png",
+                second,
+                ArtifactValidation::ReadableFile,
+            ),
+            PendingArtifact::new(
+                "pnp-result.json",
+                br#"{"imported_frames":2,"registered_frames":2,"complete":true}"#.to_vec(),
+                ArtifactValidation::PnpCoverage {
+                    imported_frames: 2,
+                    registered_frames: 2,
+                },
+            ),
+        ])
+    }
 }
 
 #[test]

@@ -50,6 +50,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuBackendKind {
     Wgpu,
+    Vulkan,
 }
 
 #[derive(Debug, Clone)]
@@ -428,7 +429,7 @@ mod tests {
     #[cfg(feature = "gpu-wgpu")]
     use wgpu::util::DeviceExt;
 
-    #[cfg(feature = "gpu-wgpu")]
+    #[cfg(all(feature = "gpu-wgpu", not(feature = "gpu-vulkan")))]
     #[test]
     fn wgpu_context_reports_a_real_adapter_when_available() -> Result<()> {
         let Some(context) = WgpuContext::try_new_optional()? else {
@@ -437,6 +438,16 @@ mod tests {
         };
         assert!(!context.capabilities().device_name.trim().is_empty());
         assert_eq!(context.capabilities().backend, GpuBackendKind::Wgpu);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-vulkan")]
+    #[test]
+    fn wgpu_context_requires_vulkan_adapter() -> Result<()> {
+        let context = WgpuContext::try_new()?;
+
+        assert_eq!(context.backend(), wgpu::Backend::Vulkan);
+        assert_eq!(context.capabilities().backend, GpuBackendKind::Vulkan);
         Ok(())
     }
 

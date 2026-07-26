@@ -5,6 +5,9 @@ use crate::project::{ProjectErrorRecord, ProjectManifest, ProjectStage};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineCommand {
     StartAutomatic,
+    StartThrough {
+        stage: ProjectStage,
+    },
     Pause,
     Cancel,
     Retry {
