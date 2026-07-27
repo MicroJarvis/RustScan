@@ -199,6 +199,8 @@ fn mapper_config_for(request: &StageRequest) -> rustsfm::MapperConfig {
     mapper_config.single_camera = true;
     mapper_config.discover_database = false;
     mapper_config.copy_images = true;
+    mapper_config.max_features = 4096;
+    mapper_config.matching_pair_strategy = rustsfm::MatchingPairStrategy::LocalWindow { window: 5 };
     mapper_config.sift_extraction.use_gpu = request.manifest.sfm_config.use_gpu_sift;
     mapper_config.sift_matching.use_gpu = request.manifest.sfm_config.use_gpu_matching;
     mapper_config.use_gpu_pnp = request.manifest.pnp_config.use_gpu_pnp;
@@ -478,6 +480,11 @@ mod tests {
         assert!(mapper_config.single_camera);
         assert!(!mapper_config.discover_database);
         assert!(mapper_config.copy_images);
+        assert_eq!(mapper_config.max_features, 4096);
+        assert_eq!(
+            mapper_config.matching_pair_strategy,
+            rustsfm::MatchingPairStrategy::LocalWindow { window: 5 }
+        );
         assert!(registration_config.use_gpu_pnp);
     }
 
