@@ -10,7 +10,8 @@ use crate::pipeline::{
     StageRequest, WorkerControl, WorkerEventSink, WorkerOutcome,
 };
 use crate::project::{
-    KeyframeSelectionMode, ProjectErrorRecord, ProjectStage, SourceKind, SuggestedAction,
+    KeyframeSelectionMode, ProjectErrorRecord, ProjectStage, SourceKind, StageState,
+    SuggestedAction,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -174,36 +175,31 @@ impl PnpWorker for RustSfmWorker {
             Ok(sequence) => sequence,
             Err(error) => return worker_failure(ProjectStage::FullFramePnp, error),
         };
-        if sequence.frames.len() < 2 {
-            return worker_failure(
-                ProjectStage::FullFramePnp,
-                RustSfmWorkerError::Sfm(
-                    "at least two keyframes are required for reconstruction".to_owned(),
-                ),
-            );
-        }
         let output = match worker_output_directory(&request) {
             Ok(output) => output,
             Err(error) => return worker_failure(ProjectStage::FullFramePnp, error),
         };
         let mapper_config = mapper_config_for(&request);
         let registration_config = registration_config_for(&request);
+        let keyframes = match hydrate_keyframe_result(&request, &sequence.frames, &output) {
+            Ok(keyframes) => keyframes,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&output);
+                return worker_failure(ProjectStage::FullFramePnp, error);
+            }
+        };
 
         let sfm_control = rustsfm::SfmTaskControl::new();
         let mut task_sink = progress_sink(&control, &events, &sfm_control);
         let mut task = rustsfm::SfmTaskContext::new(&sfm_control, &mut task_sink);
-        let keyframe_ids = sequence
-            .frames
-            .iter()
-            .map(|frame| frame.id)
-            .collect::<Vec<_>>();
-        let result = rustsfm::run_sequence_registration(
+        let result = run_remaining_registration_with(
             &sequence.frames,
-            &keyframe_ids,
+            &keyframes,
             &mapper_config,
             &registration_config,
             &output,
             &mut task,
+            rustsfm::register_remaining_sequence_frames,
         );
         drop(task);
         drop(task_sink);
@@ -384,6 +380,148 @@ fn keyframe_stage_artifacts(
         ));
     }
     Ok(artifacts)
+}
+
+fn hydrate_keyframe_result(
+    request: &StageRequest,
+    frames: &[rustsfm::SequenceFrame],
+    output: &Path,
+) -> Result<rustsfm::KeyframeReconstructionResult, RustSfmWorkerError> {
+    let stage = request
+        .manifest
+        .try_stage(ProjectStage::KeyframeSfm)
+        .map_err(|error| RustSfmWorkerError::Manifest(error.to_string()))?;
+    if stage.state() != StageState::Succeeded {
+        return Err(RustSfmWorkerError::Sfm(
+            "the keyframe stage has not committed successful artifacts".to_owned(),
+        ));
+    }
+
+    let result_path = committed_keyframe_artifact_path(request, "keyframe-result.json")?;
+    ensure_regular_project_file(&result_path)?;
+    let stage_result = serde_json::from_slice::<KeyframeStageResult>(&fs::read(result_path)?)
+        .map_err(|error| {
+            RustSfmWorkerError::Sfm(format!("invalid committed keyframe result: {error}"))
+        })?;
+    if stage_result.imported_frames != frames.len() {
+        return Err(RustSfmWorkerError::Sfm(format!(
+            "committed keyframe result describes {} imported frames, current sequence has {}",
+            stage_result.imported_frames,
+            frames.len()
+        )));
+    }
+    if stage_result.selected_keyframe_count != stage_result.selected_keyframe_ids.len() {
+        return Err(RustSfmWorkerError::Sfm(
+            "committed keyframe count does not match selected IDs".to_owned(),
+        ));
+    }
+    validate_selected_frame_ids(frames, &stage_result.selected_keyframe_ids)?;
+    if stage_result.registered_keyframes > stage_result.selected_keyframe_count {
+        return Err(RustSfmWorkerError::Sfm(
+            "committed registered keyframe count exceeds selected count".to_owned(),
+        ));
+    }
+
+    let database = output.join("Cache/database.db");
+    copy_committed_keyframe_artifact(request, "rustsfm/database.db", &database)?;
+    let sparse_model = output.join("Cache/keyframe-sparse/0");
+    for name in [
+        "cameras.txt",
+        "images.txt",
+        "points3D.txt",
+        "cameras.bin",
+        "images.bin",
+        "points3D.bin",
+    ] {
+        copy_committed_keyframe_artifact(
+            request,
+            &format!("rustsfm/keyframe-sparse/0/{name}"),
+            &sparse_model.join(name),
+        )?;
+    }
+
+    Ok(rustsfm::KeyframeReconstructionResult {
+        imported_frames: stage_result.imported_frames,
+        keyframe_ids: stage_result.selected_keyframe_ids,
+        registered_keyframes: stage_result.registered_keyframes,
+        database,
+        sparse_model,
+    })
+}
+
+fn committed_keyframe_artifact_path(
+    request: &StageRequest,
+    suffix: &str,
+) -> Result<PathBuf, RustSfmWorkerError> {
+    let stage = request
+        .manifest
+        .try_stage(ProjectStage::KeyframeSfm)
+        .map_err(|error| RustSfmWorkerError::Manifest(error.to_string()))?;
+    let suffix = Path::new(suffix);
+    let mut matches = Vec::new();
+    for artifact in stage.artifacts() {
+        let relative = safe_relative_path(&artifact.relative_path)?;
+        if relative.ends_with(suffix) {
+            matches.push(request.project_root.join(relative));
+        }
+    }
+    match matches.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err(RustSfmWorkerError::Sfm(format!(
+            "missing committed keyframe artifact suffix {}",
+            suffix.display()
+        ))),
+        _ => Err(RustSfmWorkerError::Sfm(format!(
+            "duplicate committed keyframe artifact suffix {}",
+            suffix.display()
+        ))),
+    }
+}
+
+fn copy_committed_keyframe_artifact(
+    request: &StageRequest,
+    suffix: &str,
+    destination: &Path,
+) -> Result<(), RustSfmWorkerError> {
+    let source = committed_keyframe_artifact_path(request, suffix)?;
+    ensure_regular_project_file(&source)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| RustSfmWorkerError::UnsafeFramePath(destination.display().to_string()))?;
+    fs::create_dir_all(parent)?;
+    fs::copy(source, destination)?;
+    ensure_regular_project_file(destination)
+}
+
+fn run_remaining_registration_with<F>(
+    frames: &[rustsfm::SequenceFrame],
+    keyframes: &rustsfm::KeyframeReconstructionResult,
+    mapper_config: &rustsfm::MapperConfig,
+    registration_config: &rustsfm::SequenceRegistrationConfig,
+    output: &Path,
+    task: &mut rustsfm::SfmTaskContext<'_>,
+    run_remaining: F,
+) -> anyhow::Result<rustsfm::SequenceRegistrationResult>
+where
+    F: FnOnce(
+        &[rustsfm::SequenceFrame],
+        &[u32],
+        &rustsfm::KeyframeReconstructionResult,
+        &rustsfm::MapperConfig,
+        &rustsfm::SequenceRegistrationConfig,
+        &Path,
+        &mut rustsfm::SfmTaskContext<'_>,
+    ) -> anyhow::Result<rustsfm::SequenceRegistrationResult>,
+{
+    run_remaining(
+        frames,
+        &keyframes.keyframe_ids,
+        keyframes,
+        mapper_config,
+        registration_config,
+        output,
+        task,
+    )
 }
 
 fn load_imported_sequence(request: &StageRequest) -> Result<ImportedSequence, RustSfmWorkerError> {
@@ -601,7 +739,8 @@ mod tests {
     };
     use crate::pipeline::{StageRequest, WorkerOutcome};
     use crate::project::{
-        KeyframeSelectionMode, ProjectCreateRequest, ProjectStage, ProjectStore, SourceSpec,
+        ArtifactRef, KeyframeSelectionMode, ProjectCreateRequest, ProjectStage, ProjectStore,
+        SourceSpec, StageState,
     };
 
     #[derive(Default)]
@@ -825,6 +964,138 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_keyframe_result_copies_committed_database_and_sparse_model() {
+        let (_temp, mut request) = fixture_request();
+        let stage_result = commit_keyframe_stage_fixture(&mut request);
+        let sequence = super::load_imported_sequence(&request).unwrap();
+        let output = super::worker_output_directory(&request).unwrap();
+
+        let hydrated = super::hydrate_keyframe_result(&request, &sequence.frames, &output).unwrap();
+
+        assert_eq!(hydrated.keyframe_ids, stage_result.selected_keyframe_ids);
+        assert_eq!(hydrated.database, output.join("Cache/database.db"));
+        assert_eq!(
+            hydrated.sparse_model,
+            output.join("Cache/keyframe-sparse/0")
+        );
+        assert_eq!(fs::read(&hydrated.database).unwrap(), b"committed database");
+    }
+
+    #[test]
+    fn hydrate_keyframe_result_rejects_missing_and_duplicate_artifact_suffixes() {
+        let (_temp, mut missing_request) = fixture_request();
+        commit_keyframe_stage_fixture(&mut missing_request);
+        missing_request
+            .manifest
+            .stage_mut(ProjectStage::KeyframeSfm)
+            .artifacts
+            .retain(|artifact| !artifact.relative_path.ends_with("/cameras.bin"));
+        let frames = super::load_imported_sequence(&missing_request)
+            .unwrap()
+            .frames;
+        let output = super::worker_output_directory(&missing_request).unwrap();
+        assert!(super::hydrate_keyframe_result(&missing_request, &frames, &output).is_err());
+
+        let (_temp, mut duplicate_request) = fixture_request();
+        commit_keyframe_stage_fixture(&mut duplicate_request);
+        let duplicate_relative =
+            "Artifacts/keyframe_sfm/attempt-00000001/duplicate/rustsfm/database.db".to_owned();
+        let duplicate_path = duplicate_request.project_root.join(&duplicate_relative);
+        fs::create_dir_all(duplicate_path.parent().unwrap()).unwrap();
+        fs::write(&duplicate_path, b"duplicate").unwrap();
+        duplicate_request
+            .manifest
+            .stage_mut(ProjectStage::KeyframeSfm)
+            .artifacts
+            .push(artifact_ref(duplicate_relative, 9));
+        let frames = super::load_imported_sequence(&duplicate_request)
+            .unwrap()
+            .frames;
+        let output = super::worker_output_directory(&duplicate_request).unwrap();
+        assert!(super::hydrate_keyframe_result(&duplicate_request, &frames, &output).is_err());
+    }
+
+    #[test]
+    fn hydrate_keyframe_result_rejects_unsafe_paths_and_sequence_mismatches() {
+        let (_temp, mut unsafe_request) = fixture_request();
+        commit_keyframe_stage_fixture(&mut unsafe_request);
+        unsafe_request
+            .manifest
+            .stage_mut(ProjectStage::KeyframeSfm)
+            .artifacts[0]
+            .relative_path = "../keyframe-result.json".to_owned();
+        let frames = super::load_imported_sequence(&unsafe_request)
+            .unwrap()
+            .frames;
+        let output = super::worker_output_directory(&unsafe_request).unwrap();
+        assert!(super::hydrate_keyframe_result(&unsafe_request, &frames, &output).is_err());
+
+        for (imported_frames, selected_ids) in [(3, vec![0, 1]), (2, vec![0, 99])] {
+            let (_temp, mut request) = fixture_request();
+            let mut result = commit_keyframe_stage_fixture(&mut request);
+            result.imported_frames = imported_frames;
+            result.selected_keyframe_ids = selected_ids;
+            result.selected_keyframe_count = result.selected_keyframe_ids.len();
+            overwrite_keyframe_stage_result(&request, &result);
+            let frames = super::load_imported_sequence(&request).unwrap().frames;
+            let output = super::worker_output_directory(&request).unwrap();
+            assert!(super::hydrate_keyframe_result(&request, &frames, &output).is_err());
+        }
+    }
+
+    #[test]
+    fn remaining_registration_boundary_receives_hydrated_keyframes_and_all_frames() {
+        let (_temp, request) = fixture_request();
+        let sequence = super::load_imported_sequence(&request).unwrap();
+        let mapper = super::mapper_config_for(&request);
+        let registration = super::registration_config_for(&request);
+        let output = request.workspace_path.join("remaining");
+        let selected = sequence
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<Vec<_>>();
+        let keyframes = rustsfm::KeyframeReconstructionResult {
+            imported_frames: sequence.frames.len(),
+            keyframe_ids: selected.clone(),
+            registered_keyframes: selected.len(),
+            database: output.join("Cache/database.db"),
+            sparse_model: output.join("Cache/keyframe-sparse/0"),
+        };
+        let control = rustsfm::SfmTaskControl::new();
+        let mut sink = |_| {};
+        let mut task = rustsfm::SfmTaskContext::new(&control, &mut sink);
+        let called = Cell::new(false);
+
+        let result = super::run_remaining_registration_with(
+            &sequence.frames,
+            &keyframes,
+            &mapper,
+            &registration,
+            &output,
+            &mut task,
+            |frames, ids, received_keyframes, _, _, received_output, _| {
+                called.set(true);
+                assert_eq!(frames, sequence.frames);
+                assert_eq!(ids, selected);
+                assert_eq!(received_keyframes, &keyframes);
+                assert_eq!(received_output, output);
+                Ok(rustsfm::SequenceRegistrationResult {
+                    imported_frames: frames.len(),
+                    registered_frames: frames.len(),
+                    frame_ids: ids.to_vec(),
+                    diagnostics: Vec::new(),
+                    sparse_model: output.join("sparse/0"),
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(called.get());
+        assert_eq!(result.registered_frames, sequence.frames.len());
+    }
+
+    #[test]
     fn imported_keyframe_flags_do_not_filter_the_stable_sequence() {
         let (_temp, mut request) = fixture_request();
         request.manifest.sfm_config.use_all_images = false;
@@ -925,6 +1196,88 @@ mod tests {
                 },
                 decision: rustsfm::AdaptiveKeyframeSelectionDecision::Boundary,
             }],
+        }
+    }
+
+    fn commit_keyframe_stage_fixture(request: &mut StageRequest) -> super::KeyframeStageResult {
+        let selected_keyframe_ids = vec![0, 1];
+        let result = super::KeyframeStageResult {
+            mode: KeyframeSelectionMode::Adaptive,
+            imported_frames: 2,
+            selected_keyframe_count: selected_keyframe_ids.len(),
+            selected_keyframe_ids,
+            registered_keyframes: 2,
+            selection_config: Some(rustsfm::AdaptiveKeyframeSelectionConfig::default()),
+            evaluated_pairs: 1,
+            diagnostics: adaptive_result(&[0, 1]).diagnostics,
+        };
+        let root = "Artifacts/keyframe_sfm/attempt-00000001";
+        let files = [
+            ("keyframe-result.json", serde_json::to_vec(&result).unwrap()),
+            ("rustsfm/database.db", b"committed database".to_vec()),
+            (
+                "rustsfm/keyframe-sparse/0/cameras.txt",
+                b"cameras text".to_vec(),
+            ),
+            (
+                "rustsfm/keyframe-sparse/0/images.txt",
+                b"images text".to_vec(),
+            ),
+            (
+                "rustsfm/keyframe-sparse/0/points3D.txt",
+                b"points text".to_vec(),
+            ),
+            (
+                "rustsfm/keyframe-sparse/0/cameras.bin",
+                b"cameras binary".to_vec(),
+            ),
+            (
+                "rustsfm/keyframe-sparse/0/images.bin",
+                b"images binary".to_vec(),
+            ),
+            (
+                "rustsfm/keyframe-sparse/0/points3D.bin",
+                b"points binary".to_vec(),
+            ),
+        ];
+        let mut artifacts = Vec::new();
+        for (suffix, payload) in files {
+            let relative = format!("{root}/{suffix}");
+            let path = request.project_root.join(&relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &payload).unwrap();
+            artifacts.push(artifact_ref(relative, payload.len()));
+        }
+        let stage = request.manifest.stage_mut(ProjectStage::KeyframeSfm);
+        stage.state = StageState::Succeeded;
+        stage.artifacts = artifacts;
+        result
+    }
+
+    fn overwrite_keyframe_stage_result(
+        request: &StageRequest,
+        result: &super::KeyframeStageResult,
+    ) {
+        let artifact = request
+            .manifest
+            .try_stage(ProjectStage::KeyframeSfm)
+            .unwrap()
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.relative_path.ends_with("/keyframe-result.json"))
+            .unwrap();
+        fs::write(
+            request.project_root.join(&artifact.relative_path),
+            serde_json::to_vec(result).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn artifact_ref(relative_path: String, byte_len: usize) -> ArtifactRef {
+        ArtifactRef {
+            relative_path,
+            content_hash: "0".repeat(64),
+            byte_len: byte_len as u64,
         }
     }
 
