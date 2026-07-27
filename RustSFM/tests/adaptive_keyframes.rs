@@ -1,7 +1,14 @@
+use rustsfm::colmap::ColmapCamera;
+use rustsfm::database::{
+    ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint,
+    COLMAP_FEATURE_SIFT,
+};
+use rustsfm::types::{CameraModel, COLMAP_PINHOLE};
 use rustsfm::{
-    run_adaptive_keyframe_selection, select_adaptive_keyframes_from_metrics,
-    AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
-    AdaptiveKeyframeSelectionDecision, AdaptiveKeyframeSelectionError, MapperConfig, SequenceFrame,
+    generate_matching_pairs, run_adaptive_keyframe_selection, run_keyframe_reconstruction,
+    select_adaptive_keyframes_from_metrics, AdaptiveKeyframePairMetrics,
+    AdaptiveKeyframeSelectionConfig, AdaptiveKeyframeSelectionDecision,
+    AdaptiveKeyframeSelectionError, MapperConfig, MatchingPairStrategy, SequenceFrame,
     SfmTaskContext, SfmTaskControl, SfmTaskOperation, SfmTaskStage, SfmTaskStop,
 };
 use std::collections::BTreeSet;
@@ -288,6 +295,7 @@ fn runtime_selection_acquires_finite_metrics_and_reports_selection_progress() {
         write_textured_runtime_frame(&image_dir, 30, "002.png", 6),
     ];
     let output = temp.path().join("output");
+    std::fs::create_dir_all(output.join("Cache")).unwrap();
     let mut mapper = MapperConfig::default();
     mapper.max_features = 512;
     mapper.min_matches = 4;
@@ -342,6 +350,104 @@ fn runtime_selection_acquires_finite_metrics_and_reports_selection_progress() {
     }));
 }
 
+#[test]
+fn selection_features_are_reused_by_keyframe_reconstruction() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_dir = temp.path().join("images");
+    std::fs::create_dir(&image_dir).unwrap();
+    let frames = [
+        write_textured_runtime_frame(&image_dir, 10, "000.png", 0),
+        write_textured_runtime_frame(&image_dir, 20, "001.png", 3),
+        write_textured_runtime_frame(&image_dir, 30, "002.png", 6),
+        write_textured_runtime_frame(&image_dir, 40, "003.png", 9),
+        write_textured_runtime_frame(&image_dir, 50, "004.png", 12),
+        write_textured_runtime_frame(&image_dir, 60, "005.png", 15),
+    ];
+    let output = temp.path().join("output");
+    std::fs::create_dir_all(output.join("Cache")).unwrap();
+    let mut mapper = MapperConfig::default();
+    mapper.fx = Some(220.0);
+    mapper.fy = Some(220.0);
+    mapper.cx = Some(160.0);
+    mapper.cy = Some(120.0);
+    mapper.max_features = 512;
+    mapper.min_matches = 8;
+    mapper.min_inliers = 8;
+    mapper.min_triangulated = 4;
+    mapper.init_num_trials = 1;
+    mapper.init_min_num_inliers = 16;
+    mapper.init_min_tri_angle_deg = 0.5;
+    mapper.essential_threshold_px = 2.0;
+    mapper.essential_iterations = 2_000;
+    mapper.multiple_models = false;
+    mapper.copy_images = false;
+    mapper.random_seed = 0;
+    mapper.local_ba = false;
+    mapper.global_ba = false;
+    mapper.extract_colors = false;
+    mapper.abs_pose_min_num_inliers = 16;
+    mapper.ignore_two_view_tracks = false;
+    mapper.sift_extraction.use_gpu = false;
+    mapper.sift_matching.use_gpu = false;
+    mapper.sift_matching.cpu_brute_force_matcher = true;
+    mapper.matching_pair_strategy = MatchingPairStrategy::LocalWindow { window: 5 };
+    preseed_projected_sift_database(&output.join("Cache/database.db"), &frames);
+    let selection_config = AdaptiveKeyframeSelectionConfig {
+        retention_feature_coverage: 0.99,
+        min_inliers: 8,
+        min_inlier_ratio: 0.20,
+        min_triangulated: 4,
+    };
+    let control = SfmTaskControl::new();
+    let mut selection_sink = |_| {};
+    let mut selection_task = SfmTaskContext::new(&control, &mut selection_sink);
+    let selection = run_adaptive_keyframe_selection(
+        &frames,
+        &selection_config,
+        &mapper,
+        &output,
+        &mut selection_task,
+    )
+    .unwrap();
+    drop(selection_task);
+
+    let mut reconstruction_events = Vec::new();
+    let mut reconstruction_sink = |event| reconstruction_events.push(event);
+    let mut reconstruction_task = SfmTaskContext::new(&control, &mut reconstruction_sink);
+    let reconstruction = run_keyframe_reconstruction(
+        &frames,
+        &selection.selected_frame_ids,
+        &mapper,
+        &output,
+        &mut reconstruction_task,
+    );
+    drop(reconstruction_task);
+    drop(reconstruction_sink);
+
+    assert_eq!(
+        reconstruction_events
+            .iter()
+            .filter(|event| event.operation == SfmTaskOperation::ExtractImage)
+            .count(),
+        0,
+        "selected image features must be reused from adaptive selection",
+    );
+    assert_eq!(
+        reconstruction_events
+            .iter()
+            .filter(|event| event.operation == SfmTaskOperation::MatchPairBatch)
+            .count(),
+        generate_matching_pairs(
+            selection.selected_frame_ids.len(),
+            MatchingPairStrategy::LocalWindow { window: 5 },
+        )
+        .len(),
+    );
+    let reconstruction = reconstruction.unwrap();
+    assert_eq!(reconstruction.database, output.join("Cache/database.db"));
+    assert_eq!(reconstruction.keyframe_ids, selection.selected_frame_ids);
+}
+
 fn write_runtime_frame(directory: &Path, id: u32, name: &str) -> SequenceFrame {
     let path = directory.join(name);
     image::GrayImage::from_pixel(8, 8, image::Luma([128]))
@@ -381,5 +487,94 @@ fn write_textured_runtime_frame(
         id,
         image_path: path,
         timestamp_us: Some(i64::from(id)),
+    }
+}
+
+fn preseed_projected_sift_database(database_path: &Path, frames: &[SequenceFrame]) {
+    let camera = CameraModel::new_pinhole(320, 240, 220.0, 220.0, 160.0, 120.0);
+    let poses = (0..frames.len())
+        .map(|index| {
+            rustslam::SE3::from_quat_translation(
+                glam::Quat::from_rotation_y((index as f32 - 2.5) * 0.012),
+                glam::Vec3::new(index as f32 * -0.11, (index % 2) as f32 * 0.01, 0.0),
+            )
+        })
+        .collect::<Vec<_>>();
+    let points = (0..64)
+        .map(|index| {
+            let column = (index % 8) as f32;
+            let row = (index / 8) as f32;
+            [
+                -0.75 + column * 0.21,
+                -0.55 + row * 0.16,
+                3.0 + (index % 7) as f32 * 0.11,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let descriptors = (0..64)
+        .flat_map(|feature| {
+            (0..128).map(move |offset| {
+                ((feature * 37 + offset * 17 + feature * offset * 3) % 251) as u8
+            })
+        })
+        .collect::<Vec<_>>();
+    let database = ColmapDatabase::open(database_path).unwrap();
+    database
+        .write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: COLMAP_PINHOLE,
+                    width: 320,
+                    height: 240,
+                    params: vec![220.0, 220.0, 160.0, 120.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )
+        .unwrap();
+    for (index, frame) in frames.iter().enumerate() {
+        let image_id = index as u32 + 1;
+        database
+            .write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: frame
+                        .image_path
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        let keypoints = points
+            .iter()
+            .map(|point| {
+                let camera_point = poses[index].transform_point(point);
+                ColmapKeypoint::new(
+                    camera.fx * camera_point[0] / camera_point[2] + camera.cx,
+                    camera.fy * camera_point[1] / camera_point[2] + camera.cy,
+                )
+            })
+            .collect::<Vec<_>>();
+        database.write_keypoints(image_id, &keypoints).unwrap();
+        database
+            .write_descriptors(
+                image_id,
+                &ColmapDescriptors::new(
+                    COLMAP_FEATURE_SIFT,
+                    keypoints.len(),
+                    128,
+                    descriptors.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
     }
 }
