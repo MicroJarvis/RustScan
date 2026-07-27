@@ -1,3 +1,12 @@
+mod adaptive_keyframes;
+
+pub use adaptive_keyframes::{
+    select_adaptive_keyframes_from_metrics, AdaptiveKeyframePairDiagnostic,
+    AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
+    AdaptiveKeyframeSelectionDecision, AdaptiveKeyframeSelectionError,
+    AdaptiveKeyframeSelectionResult,
+};
+
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BinaryHeap;
 use std::collections::{BTreeSet, HashSet};
