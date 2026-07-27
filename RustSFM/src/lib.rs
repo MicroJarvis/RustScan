@@ -5,11 +5,15 @@ pub mod task;
 pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
 pub use sequence_registration::{
     register_remaining_sequence_frames, require_complete_pose_coverage,
-    run_keyframe_reconstruction, run_sequence_registration, FrameRegistrationDiagnostic,
-    FrameRegistrationStatus, KeyframeReconstructionResult, RegistrationRound, SequenceFrame,
-    SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
-    SequenceRegistrationResult, MAX_DYNAMIC_SUPPORT_CANDIDATES, MAX_SEQUENCE_NEIGHBORS,
-    MAX_SEQUENCE_PLAN_FRAMES, MAX_TIMESTAMP_PLATEAU, MAX_TOTAL_SUPPORT_ENTRIES,
+    run_adaptive_keyframe_selection, run_keyframe_reconstruction, run_sequence_registration,
+    select_adaptive_keyframes_from_metrics, AdaptiveKeyframePairDiagnostic,
+    AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
+    AdaptiveKeyframeSelectionDecision, AdaptiveKeyframeSelectionError,
+    AdaptiveKeyframeSelectionResult, FrameRegistrationDiagnostic, FrameRegistrationStatus,
+    KeyframeReconstructionResult, RegistrationRound, SequenceFrame, SequenceRegistrationConfig,
+    SequenceRegistrationError, SequenceRegistrationPlan, SequenceRegistrationResult,
+    MAX_DYNAMIC_SUPPORT_CANDIDATES, MAX_SEQUENCE_NEIGHBORS, MAX_SEQUENCE_PLAN_FRAMES,
+    MAX_TIMESTAMP_PLATEAU, MAX_TOTAL_SUPPORT_ENTRIES,
 };
 pub use task::{
     SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,

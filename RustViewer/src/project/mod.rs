@@ -13,7 +13,7 @@ pub use library::{
 };
 pub use manifest::{
     ArtifactRef, ArtifactValidationError, CompatibilityRecord, ImportConfigSnapshot,
-    PnpConfigSnapshot, ProjectErrorRecord, ProjectLease, ProjectManifest,
+    KeyframeSelectionMode, PnpConfigSnapshot, ProjectErrorRecord, ProjectLease, ProjectManifest,
     ProjectManifestValidationError, ProjectStage, SfmConfigSnapshot, SourceKind, SourceOwnership,
     SourceSpec, StageRecord, StageState, SuggestedAction, PROJECT_SCHEMA_VERSION,
 };

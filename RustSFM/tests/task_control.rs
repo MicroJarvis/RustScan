@@ -3,13 +3,14 @@ use rustsfm::{
     extract_features_to_database, extract_features_to_database_with_extractor,
     extract_features_to_database_with_extractor_and_task, extract_features_to_database_with_task,
     match_features_to_database, match_features_to_database_with_task,
-    register_remaining_sequence_frames, run_keyframe_reconstruction, run_reconstruction,
-    run_reconstruction_with_callbacks, run_reconstruction_with_task, run_sequence_registration,
-    ExtractFeaturesReport, KeyframeReconstructionResult, MapperConfig, MatchFeaturesOptions,
-    MatchFeaturesReport, PipelineCallbackSink, ReconstructionSummary, SequenceFrame,
-    SequenceRegistrationConfig, SequenceRegistrationResult, SfmControlState, SfmTaskContext,
-    SfmTaskControl, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage, SfmTaskStop,
-    SiftExtractionOptions, SiftFeatureExtractor,
+    register_remaining_sequence_frames, run_adaptive_keyframe_selection,
+    run_keyframe_reconstruction, run_reconstruction, run_reconstruction_with_callbacks,
+    run_reconstruction_with_task, run_sequence_registration, AdaptiveKeyframeSelectionConfig,
+    AdaptiveKeyframeSelectionResult, ExtractFeaturesReport, KeyframeReconstructionResult,
+    MapperConfig, MatchFeaturesOptions, MatchFeaturesReport, PipelineCallbackSink,
+    ReconstructionSummary, SequenceFrame, SequenceRegistrationConfig, SequenceRegistrationResult,
+    SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,
+    SfmTaskOperation, SfmTaskStage, SfmTaskStop, SiftExtractionOptions, SiftFeatureExtractor,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
@@ -143,6 +144,7 @@ fn task_stages_round_trip_through_snake_case_json() {
     assert_wire_round_trips(&[
         (SfmTaskStage::FeatureExtraction, "feature_extraction"),
         (SfmTaskStage::FeatureMatching, "feature_matching"),
+        (SfmTaskStage::KeyframeSelection, "keyframe_selection"),
         (SfmTaskStage::IncrementalMapping, "incremental_mapping"),
         (SfmTaskStage::BundleAdjustment, "bundle_adjustment"),
         (
@@ -159,6 +161,11 @@ fn task_operations_round_trip_through_snake_case_json() {
         (SfmTaskOperation::Begin, "begin"),
         (SfmTaskOperation::ExtractImage, "extract_image"),
         (SfmTaskOperation::MatchPairBatch, "match_pair_batch"),
+        (
+            SfmTaskOperation::EvaluateKeyframePair,
+            "evaluate_keyframe_pair",
+        ),
+        (SfmTaskOperation::SelectKeyframe, "select_keyframe"),
         (
             SfmTaskOperation::RegisterInitialPair,
             "register_initial_pair",
@@ -292,6 +299,16 @@ fn legacy_and_controlled_public_entry_points_keep_their_signatures() {
         ) -> anyhow::Result<
             KeyframeReconstructionResult,
         >;
+    type ControlledAdaptiveSelectionApi =
+        for<'frames, 'selection, 'mapper, 'output, 'context, 'task> fn(
+            &'frames [SequenceFrame],
+            &'selection AdaptiveKeyframeSelectionConfig,
+            &'mapper MapperConfig,
+            &'output Path,
+            &'context mut SfmTaskContext<'task>,
+        ) -> anyhow::Result<
+            AdaptiveKeyframeSelectionResult,
+        >;
     type ControlledRemainingSequenceApi =
         for<'frames, 'keyframes, 'result, 'mapper, 'config, 'output, 'context, 'task> fn(
             &'frames [SequenceFrame],
@@ -323,6 +340,7 @@ fn legacy_and_controlled_public_entry_points_keep_their_signatures() {
     let _: ControlledExtractionApi = extract_features_to_database_with_task;
     let _: ControlledMatchingApi = match_features_to_database_with_task;
     let _: ControlledMapperApi = run_reconstruction_with_task;
+    let _: ControlledAdaptiveSelectionApi = run_adaptive_keyframe_selection;
     let _: ControlledKeyframeApi = run_keyframe_reconstruction;
     let _: ControlledRemainingSequenceApi = register_remaining_sequence_frames;
     let _: ControlledSequenceApi = run_sequence_registration;

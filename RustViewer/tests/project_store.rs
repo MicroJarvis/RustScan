@@ -17,10 +17,10 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use rust_viewer::project::{
-    list_summaries, ArtifactRef, ImportConfigSnapshot, PnpConfigSnapshot, ProjectCreateRequest,
-    ProjectLease, ProjectManifest, ProjectManifestValidationError, ProjectStage, ProjectStore,
-    ProjectStoreError, ProjectSummaryEntry, ProjectSummaryStatus, SfmConfigSnapshot, SourceKind,
-    SourceOwnership, SourceSpec, StageState, PROJECT_SCHEMA_VERSION,
+    list_summaries, ArtifactRef, ImportConfigSnapshot, KeyframeSelectionMode, PnpConfigSnapshot,
+    ProjectCreateRequest, ProjectLease, ProjectManifest, ProjectManifestValidationError,
+    ProjectStage, ProjectStore, ProjectStoreError, ProjectSummaryEntry, ProjectSummaryStatus,
+    SfmConfigSnapshot, SourceKind, SourceOwnership, SourceSpec, StageState, PROJECT_SCHEMA_VERSION,
 };
 
 const STAGES: [(ProjectStage, &str); 5] = [
@@ -37,6 +37,13 @@ fn create_request(name: &str) -> ProjectCreateRequest {
 
 fn assert_invalid(manifest: &ProjectManifest) {
     assert!(manifest.validate().is_err());
+}
+
+fn assert_invalid_sfm_config(manifest: &ProjectManifest) {
+    assert!(matches!(
+        manifest.validate(),
+        Err(ProjectManifestValidationError::InvalidSfmConfig { .. })
+    ));
 }
 
 fn read_manifest_value(path: &Path) -> serde_json::Value {
@@ -141,6 +148,8 @@ fn new_manifest_uses_the_declared_schema_and_config_defaults() {
     assert_eq!(
         manifest.sfm_config,
         SfmConfigSnapshot {
+            keyframe_selection: KeyframeSelectionMode::Adaptive,
+            adaptive_keyframes: rustsfm::AdaptiveKeyframeSelectionConfig::default(),
             use_all_images: true,
             use_gpu_sift: true,
             use_gpu_matching: true,
@@ -161,6 +170,27 @@ fn new_manifest_uses_the_declared_schema_and_config_defaults() {
         manifest.compatibility.rustgs_checkpoint_version,
         rustgs::TRAINING_CHECKPOINT_VERSION
     );
+}
+
+#[test]
+fn legacy_manifest_defaults_to_adaptive_keyframe_selection() {
+    let manifest = ProjectManifest::new("Flowers", SourceSpec::managed_images("source-a"));
+    let mut value = serde_json::to_value(manifest).unwrap();
+    let sfm_config = value["sfm_config"].as_object_mut().unwrap();
+    sfm_config.remove("keyframe_selection");
+    sfm_config.remove("adaptive_keyframes");
+
+    let restored: ProjectManifest = serde_json::from_value(value).unwrap();
+
+    assert_eq!(
+        restored.sfm_config.keyframe_selection,
+        KeyframeSelectionMode::Adaptive
+    );
+    assert_eq!(
+        restored.sfm_config.adaptive_keyframes,
+        rustsfm::AdaptiveKeyframeSelectionConfig::default()
+    );
+    assert!(restored.sfm_config.use_all_images);
 }
 
 #[test]
@@ -234,6 +264,26 @@ fn validation_rejects_schema_identity_progress_and_config_errors() {
     let mut invalid = manifest.clone();
     invalid.import_config.thumbnail_long_edge = 0;
     assert_invalid(&invalid);
+
+    for coverage in [f64::NAN, -0.1, 1.1] {
+        let mut invalid = manifest.clone();
+        invalid
+            .sfm_config
+            .adaptive_keyframes
+            .retention_feature_coverage = coverage;
+        assert_invalid_sfm_config(&invalid);
+    }
+    let mut invalid = manifest.clone();
+    invalid.sfm_config.adaptive_keyframes.min_inliers = 0;
+    assert_invalid_sfm_config(&invalid);
+    for ratio in [f64::NAN, -0.1, 1.1] {
+        let mut invalid = manifest.clone();
+        invalid.sfm_config.adaptive_keyframes.min_inlier_ratio = ratio;
+        assert_invalid_sfm_config(&invalid);
+    }
+    let mut invalid = manifest.clone();
+    invalid.sfm_config.adaptive_keyframes.min_triangulated = 0;
+    assert_invalid_sfm_config(&invalid);
 
     let mut invalid = manifest.clone();
     invalid.pnp_config.narrow_neighbors_each_side = 0;

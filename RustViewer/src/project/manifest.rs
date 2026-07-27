@@ -240,14 +240,28 @@ impl Default for ImportConfigSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SfmConfigSnapshot {
+    #[serde(default)]
+    pub keyframe_selection: KeyframeSelectionMode,
+    #[serde(default)]
+    pub adaptive_keyframes: rustsfm::AdaptiveKeyframeSelectionConfig,
     pub use_all_images: bool,
     pub use_gpu_sift: bool,
     pub use_gpu_matching: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyframeSelectionMode {
+    #[default]
+    Adaptive,
+    AllImages,
+}
+
 impl Default for SfmConfigSnapshot {
     fn default() -> Self {
         Self {
+            keyframe_selection: KeyframeSelectionMode::default(),
+            adaptive_keyframes: rustsfm::AdaptiveKeyframeSelectionConfig::default(),
             use_all_images: true,
             use_gpu_sift: true,
             use_gpu_matching: true,
@@ -323,6 +337,8 @@ pub enum ProjectManifestValidationError {
     },
     #[error("invalid import config field {field}")]
     InvalidImportConfig { field: &'static str },
+    #[error("invalid SfM config: {detail}")]
+    InvalidSfmConfig { detail: String },
     #[error("invalid PnP config field {field}")]
     InvalidPnpConfig { field: &'static str },
     #[error("invalid training config: {detail}")]
@@ -547,6 +563,13 @@ impl ProjectManifest {
                 field: "thumbnail_long_edge",
             });
         }
+
+        self.sfm_config
+            .adaptive_keyframes
+            .validate()
+            .map_err(|error| ProjectManifestValidationError::InvalidSfmConfig {
+                detail: error.to_string(),
+            })?;
 
         if self.pnp_config.narrow_neighbors_each_side == 0 {
             return Err(ProjectManifestValidationError::InvalidPnpConfig {
