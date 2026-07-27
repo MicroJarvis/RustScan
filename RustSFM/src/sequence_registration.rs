@@ -1,8 +1,8 @@
 mod adaptive_keyframes;
 
 pub use adaptive_keyframes::{
-    select_adaptive_keyframes_from_metrics, AdaptiveKeyframePairDiagnostic,
-    AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
+    run_adaptive_keyframe_selection, select_adaptive_keyframes_from_metrics,
+    AdaptiveKeyframePairDiagnostic, AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
     AdaptiveKeyframeSelectionDecision, AdaptiveKeyframeSelectionError,
     AdaptiveKeyframeSelectionResult,
 };
@@ -302,7 +302,10 @@ fn persist_keyframe_sparse_snapshot(
     Ok(destination)
 }
 
-fn link_or_copy_stable_image(source: &Path, destination_dir: &Path) -> anyhow::Result<PathBuf> {
+pub(super) fn link_or_copy_stable_image(
+    source: &Path,
+    destination_dir: &Path,
+) -> anyhow::Result<PathBuf> {
     let name = source
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("input image {} has no file name", source.display()))?;
@@ -345,7 +348,7 @@ fn files_have_same_contents(left: &Path, right: &Path) -> anyhow::Result<bool> {
     }
 }
 
-fn import_database_images(
+pub(super) fn import_database_images(
     frames: &[SequenceFrame],
     indices: &[usize],
     mapper_config: &MapperConfig,
@@ -437,7 +440,7 @@ fn database_camera_metadata_matches(
         && actual.has_prior_focal_length == expected.has_prior_focal_length
 }
 
-fn database_image_ids_for_indices(
+pub(super) fn database_image_ids_for_indices(
     frames: &[SequenceFrame],
     indices: &[usize],
     database: &Path,
@@ -554,7 +557,7 @@ fn validate_sparse_reconstruction(reconstruction: &Reconstruction) -> anyhow::Re
     Ok(())
 }
 
-fn validate_runner_inputs(
+pub(super) fn validate_runner_inputs(
     frames: &[SequenceFrame],
     keyframe_ids: &[u32],
 ) -> anyhow::Result<Vec<usize>> {
@@ -1123,7 +1126,7 @@ fn registered_image_names(reconstruction: &Reconstruction) -> HashSet<&str> {
         .collect()
 }
 
-fn sequence_match_options(mapper_config: &MapperConfig) -> MatchFeaturesOptions {
+pub(super) fn sequence_match_options(mapper_config: &MapperConfig) -> MatchFeaturesOptions {
     let mut sift_matching = mapper_config.sift_matching.clone();
     sift_matching.max_ratio = mapper_config.match_ratio as f32;
     MatchFeaturesOptions {
@@ -1161,7 +1164,7 @@ fn sequence_attempt_random_seed(
     (value & i32::MAX as u64) as i32
 }
 
-fn database_features_exist(database: &Path, image_id: u32) -> anyhow::Result<bool> {
+pub(super) fn database_features_exist(database: &Path, image_id: u32) -> anyhow::Result<bool> {
     let database = ColmapDatabase::open_read_only(database)?;
     Ok(database.exists_keypoints(image_id)? && database.exists_descriptors(image_id)?)
 }

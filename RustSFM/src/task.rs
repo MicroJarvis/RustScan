@@ -10,6 +10,7 @@ use std::time::Instant;
 pub enum SfmTaskStage {
     FeatureExtraction,
     FeatureMatching,
+    KeyframeSelection,
     IncrementalMapping,
     BundleAdjustment,
     FullFrameRegistration,
@@ -22,6 +23,8 @@ pub enum SfmTaskOperation {
     Begin,
     ExtractImage,
     MatchPairBatch,
+    EvaluateKeyframePair,
+    SelectKeyframe,
     RegisterInitialPair,
     RegisterImage,
     LocalBundleAdjustment,

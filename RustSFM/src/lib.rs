@@ -5,8 +5,9 @@ pub mod task;
 pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
 pub use sequence_registration::{
     register_remaining_sequence_frames, require_complete_pose_coverage,
-    run_keyframe_reconstruction, run_sequence_registration, select_adaptive_keyframes_from_metrics,
-    AdaptiveKeyframePairDiagnostic, AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
+    run_adaptive_keyframe_selection, run_keyframe_reconstruction, run_sequence_registration,
+    select_adaptive_keyframes_from_metrics, AdaptiveKeyframePairDiagnostic,
+    AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
     AdaptiveKeyframeSelectionDecision, AdaptiveKeyframeSelectionError,
     AdaptiveKeyframeSelectionResult, FrameRegistrationDiagnostic, FrameRegistrationStatus,
     KeyframeReconstructionResult, RegistrationRound, SequenceFrame, SequenceRegistrationConfig,
