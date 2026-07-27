@@ -9,14 +9,35 @@ use crate::pipeline::{
     ArtifactValidation, PendingArtifact, PipelineProgressDetail, PnpWorker, SfmWorker,
     StageRequest, WorkerControl, WorkerEventSink, WorkerOutcome,
 };
-use crate::project::{ProjectErrorRecord, ProjectStage, SourceKind, SuggestedAction};
+use crate::project::{
+    KeyframeSelectionMode, ProjectErrorRecord, ProjectStage, SourceKind, SuggestedAction,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RustSfmWorker;
 
 struct ImportedSequence {
     frames: Vec<rustsfm::SequenceFrame>,
-    keyframe_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct KeyframeStageResult {
+    mode: KeyframeSelectionMode,
+    imported_frames: usize,
+    selected_keyframe_count: usize,
+    selected_keyframe_ids: Vec<u32>,
+    registered_keyframes: usize,
+    selection_config: Option<rustsfm::AdaptiveKeyframeSelectionConfig>,
+    evaluated_pairs: usize,
+    diagnostics: Vec<rustsfm::AdaptiveKeyframePairDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedKeyframeSelection {
+    selected_frame_ids: Vec<u32>,
+    selection_config: Option<rustsfm::AdaptiveKeyframeSelectionConfig>,
+    evaluated_pairs: usize,
+    diagnostics: Vec<rustsfm::AdaptiveKeyframePairDiagnostic>,
 }
 
 #[derive(Debug, Error)]
@@ -57,14 +78,6 @@ impl SfmWorker for RustSfmWorker {
             Ok(sequence) => sequence,
             Err(error) => return worker_failure(ProjectStage::KeyframeSfm, error),
         };
-        if sequence.keyframe_ids.len() < 2 {
-            return worker_failure(
-                ProjectStage::KeyframeSfm,
-                RustSfmWorkerError::Sfm(
-                    "at least two keyframes are required for reconstruction".to_owned(),
-                ),
-            );
-        }
         let output = match worker_output_directory(&request) {
             Ok(output) => output,
             Err(error) => return worker_failure(ProjectStage::KeyframeSfm, error),
@@ -74,9 +87,33 @@ impl SfmWorker for RustSfmWorker {
         let sfm_control = rustsfm::SfmTaskControl::new();
         let mut task_sink = progress_sink(&control, &events, &sfm_control);
         let mut task = rustsfm::SfmTaskContext::new(&sfm_control, &mut task_sink);
+        let selection = resolve_keyframe_selection_with(
+            request.manifest.sfm_config.keyframe_selection,
+            &request.manifest.sfm_config.adaptive_keyframes,
+            &sequence.frames,
+            &mapper_config,
+            &output,
+            &mut task,
+            rustsfm::run_adaptive_keyframe_selection,
+        );
+        let selection = match selection {
+            Ok(selection) => selection,
+            Err(error) => {
+                drop(task);
+                drop(task_sink);
+                let _ = fs::remove_dir_all(&output);
+                return worker_failure(ProjectStage::KeyframeSfm, error);
+            }
+        };
+        if let Some(outcome) = requested_stop(&control) {
+            drop(task);
+            drop(task_sink);
+            let _ = fs::remove_dir_all(&output);
+            return outcome;
+        }
         let result = rustsfm::run_keyframe_reconstruction(
             &sequence.frames,
-            &sequence.keyframe_ids,
+            &selection.selected_frame_ids,
             &mapper_config,
             &output,
             &mut task,
@@ -98,20 +135,31 @@ impl SfmWorker for RustSfmWorker {
                 );
             }
         };
-        let payload = serde_json::to_vec_pretty(&serde_json::json!({
-            "imported_frames": result.imported_frames,
-            "registered_keyframes": result.registered_keyframes,
-            "keyframe_ids": result.keyframe_ids,
-        }))
-        .expect("JSON serialization of scalar RustSFM result");
+        if result.keyframe_ids != selection.selected_frame_ids {
+            let _ = fs::remove_dir_all(&output);
+            return worker_failure(
+                ProjectStage::KeyframeSfm,
+                RustSfmWorkerError::Sfm(
+                    "RustSFM reconstruction returned different keyframe IDs than selection"
+                        .to_owned(),
+                ),
+            );
+        }
+        let artifacts = match keyframe_stage_artifacts(
+            request.manifest.sfm_config.keyframe_selection,
+            &selection,
+            &result,
+        ) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&output);
+                return worker_failure(ProjectStage::KeyframeSfm, error);
+            }
+        };
         if let Err(error) = fs::remove_dir_all(&output) {
             return worker_failure(ProjectStage::KeyframeSfm, RustSfmWorkerError::Io(error));
         }
-        WorkerOutcome::Succeeded(vec![PendingArtifact::new(
-            "keyframe-result.json",
-            payload,
-            ArtifactValidation::Json,
-        )])
+        WorkerOutcome::Succeeded(artifacts)
     }
 }
 
@@ -126,7 +174,7 @@ impl PnpWorker for RustSfmWorker {
             Ok(sequence) => sequence,
             Err(error) => return worker_failure(ProjectStage::FullFramePnp, error),
         };
-        if sequence.keyframe_ids.len() < 2 {
+        if sequence.frames.len() < 2 {
             return worker_failure(
                 ProjectStage::FullFramePnp,
                 RustSfmWorkerError::Sfm(
@@ -144,9 +192,14 @@ impl PnpWorker for RustSfmWorker {
         let sfm_control = rustsfm::SfmTaskControl::new();
         let mut task_sink = progress_sink(&control, &events, &sfm_control);
         let mut task = rustsfm::SfmTaskContext::new(&sfm_control, &mut task_sink);
+        let keyframe_ids = sequence
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<Vec<_>>();
         let result = rustsfm::run_sequence_registration(
             &sequence.frames,
-            &sequence.keyframe_ids,
+            &keyframe_ids,
             &mapper_config,
             &registration_config,
             &output,
@@ -219,6 +272,120 @@ fn registration_config_for(request: &StageRequest) -> rustsfm::SequenceRegistrat
     }
 }
 
+fn resolve_keyframe_selection_with<F>(
+    mode: KeyframeSelectionMode,
+    config: &rustsfm::AdaptiveKeyframeSelectionConfig,
+    frames: &[rustsfm::SequenceFrame],
+    mapper_config: &rustsfm::MapperConfig,
+    output: &Path,
+    task: &mut rustsfm::SfmTaskContext<'_>,
+    run_adaptive: F,
+) -> Result<ResolvedKeyframeSelection, RustSfmWorkerError>
+where
+    F: FnOnce(
+        &[rustsfm::SequenceFrame],
+        &rustsfm::AdaptiveKeyframeSelectionConfig,
+        &rustsfm::MapperConfig,
+        &Path,
+        &mut rustsfm::SfmTaskContext<'_>,
+    ) -> anyhow::Result<rustsfm::AdaptiveKeyframeSelectionResult>,
+{
+    if frames.len() < 2 {
+        return Err(RustSfmWorkerError::Sfm(
+            "at least two imported frames are required for reconstruction".to_owned(),
+        ));
+    }
+    let resolved = match mode {
+        KeyframeSelectionMode::Adaptive => {
+            let result = run_adaptive(frames, config, mapper_config, output, task)
+                .map_err(|error| RustSfmWorkerError::Sfm(error.to_string()))?;
+            ResolvedKeyframeSelection {
+                selected_frame_ids: result.selected_frame_ids,
+                selection_config: Some(result.config),
+                evaluated_pairs: result.evaluated_pairs,
+                diagnostics: result.diagnostics,
+            }
+        }
+        KeyframeSelectionMode::AllImages => ResolvedKeyframeSelection {
+            selected_frame_ids: frames.iter().map(|frame| frame.id).collect(),
+            selection_config: None,
+            evaluated_pairs: 0,
+            diagnostics: Vec::new(),
+        },
+    };
+    validate_selected_frame_ids(frames, &resolved.selected_frame_ids)?;
+    Ok(resolved)
+}
+
+fn validate_selected_frame_ids(
+    frames: &[rustsfm::SequenceFrame],
+    selected_frame_ids: &[u32],
+) -> Result<(), RustSfmWorkerError> {
+    if selected_frame_ids.len() < 2 {
+        return Err(RustSfmWorkerError::Sfm(
+            "RustSFM keyframe selection returned fewer than two frames".to_owned(),
+        ));
+    }
+    let mut next_selected = 0;
+    for frame in frames {
+        if selected_frame_ids.get(next_selected) == Some(&frame.id) {
+            next_selected += 1;
+        }
+    }
+    if next_selected != selected_frame_ids.len() {
+        return Err(RustSfmWorkerError::Sfm(
+            "RustSFM keyframe selection must contain known IDs in stable sequence order".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn keyframe_stage_artifacts(
+    mode: KeyframeSelectionMode,
+    selection: &ResolvedKeyframeSelection,
+    reconstruction: &rustsfm::KeyframeReconstructionResult,
+) -> Result<Vec<PendingArtifact>, RustSfmWorkerError> {
+    ensure_regular_project_file(&reconstruction.database)?;
+    let stage_result = KeyframeStageResult {
+        mode,
+        imported_frames: reconstruction.imported_frames,
+        selected_keyframe_count: selection.selected_frame_ids.len(),
+        selected_keyframe_ids: selection.selected_frame_ids.clone(),
+        registered_keyframes: reconstruction.registered_keyframes,
+        selection_config: selection.selection_config.clone(),
+        evaluated_pairs: selection.evaluated_pairs,
+        diagnostics: selection.diagnostics.clone(),
+    };
+    let mut artifacts = vec![PendingArtifact::new(
+        "keyframe-result.json",
+        serde_json::to_vec_pretty(&stage_result)
+            .expect("serializable RustSFM keyframe stage result"),
+        ArtifactValidation::Json,
+    )];
+    artifacts.push(PendingArtifact::new(
+        "rustsfm/database.db",
+        fs::read(&reconstruction.database)?,
+        ArtifactValidation::ReadableFile,
+    ));
+    for name in [
+        "cameras.txt",
+        "images.txt",
+        "points3D.txt",
+        "cameras.bin",
+        "images.bin",
+        "points3D.bin",
+    ] {
+        let path = reconstruction.sparse_model.join(name);
+        ensure_regular_project_file(&path)?;
+        artifacts.push(PendingArtifact::new(
+            format!("rustsfm/keyframe-sparse/0/{name}"),
+            fs::read(path)?,
+            ArtifactValidation::ReadableFile,
+        ));
+    }
+    Ok(artifacts)
+}
+
 fn load_imported_sequence(request: &StageRequest) -> Result<ImportedSequence, RustSfmWorkerError> {
     if request.manifest.source.kind != SourceKind::ImageSequence {
         return Err(RustSfmWorkerError::UnsupportedSource);
@@ -243,7 +410,6 @@ fn load_imported_sequence(request: &StageRequest) -> Result<ImportedSequence, Ru
 
     let mut frame_ids = BTreeSet::new();
     let mut frames = Vec::with_capacity(imported.len());
-    let mut keyframe_ids = Vec::new();
     for frame in imported {
         if !frame_ids.insert(frame.id) {
             return Err(RustSfmWorkerError::Sfm(format!(
@@ -258,24 +424,13 @@ fn load_imported_sequence(request: &StageRequest) -> Result<ImportedSequence, Ru
             return Err(RustSfmWorkerError::UnsafeFramePath(frame.normalized_image));
         }
         ensure_regular_project_file(&image_path)?;
-        if request.manifest.sfm_config.use_all_images || frame.is_keyframe {
-            keyframe_ids.push(frame.id);
-        }
         frames.push(rustsfm::SequenceFrame {
             id: frame.id,
             image_path,
             timestamp_us: frame.presentation_time_us,
         });
     }
-    if keyframe_ids.is_empty() {
-        return Err(RustSfmWorkerError::Sfm(
-            "the imported project has no selected keyframes".to_owned(),
-        ));
-    }
-    Ok(ImportedSequence {
-        frames,
-        keyframe_ids,
-    })
+    Ok(ImportedSequence { frames })
 }
 
 fn worker_output_directory(request: &StageRequest) -> Result<PathBuf, RustSfmWorkerError> {
@@ -437,6 +592,7 @@ fn ensure_regular_project_file(path: &Path) -> Result<(), RustSfmWorkerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -444,7 +600,9 @@ mod tests {
         import_image_sequence, ImageSequenceImportRequest, MediaEventSink, MediaImportEvent,
     };
     use crate::pipeline::{StageRequest, WorkerOutcome};
-    use crate::project::{ProjectCreateRequest, ProjectStage, ProjectStore, SourceSpec};
+    use crate::project::{
+        KeyframeSelectionMode, ProjectCreateRequest, ProjectStage, ProjectStore, SourceSpec,
+    };
 
     #[derive(Default)]
     struct DiscardEvents;
@@ -505,7 +663,169 @@ mod tests {
     }
 
     #[test]
-    fn empty_keyframe_selection_is_rejected_when_all_images_are_disabled() {
+    fn adaptive_selection_uses_only_rustsfm_selected_ids() {
+        let (_temp, request) = fixture_request();
+        let sequence = super::load_imported_sequence(&request).unwrap();
+        let mapper_config = super::mapper_config_for(&request);
+        let output = request.workspace_path.join("selection");
+        let control = rustsfm::SfmTaskControl::new();
+        let mut sink = |_| {};
+        let mut task = rustsfm::SfmTaskContext::new(&control, &mut sink);
+        let calls = Cell::new(0);
+
+        let resolved = super::resolve_keyframe_selection_with(
+            KeyframeSelectionMode::Adaptive,
+            &request.manifest.sfm_config.adaptive_keyframes,
+            &sequence.frames,
+            &mapper_config,
+            &output,
+            &mut task,
+            |frames, config, mapper, received_output, _task| {
+                calls.set(calls.get() + 1);
+                assert_eq!(frames, sequence.frames);
+                assert_eq!(config, &request.manifest.sfm_config.adaptive_keyframes);
+                assert_eq!(mapper.max_features, 4096);
+                assert_eq!(received_output, output);
+                Ok(adaptive_result(&[frames[0].id, frames[1].id]))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            resolved.selected_frame_ids,
+            sequence
+                .frames
+                .iter()
+                .map(|frame| frame.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(request.manifest.sfm_config.use_all_images);
+    }
+
+    #[test]
+    fn all_images_selection_never_invokes_adaptive_selector() {
+        let (_temp, request) = fixture_request();
+        let sequence = super::load_imported_sequence(&request).unwrap();
+        let mapper_config = super::mapper_config_for(&request);
+        let control = rustsfm::SfmTaskControl::new();
+        let mut sink = |_| {};
+        let mut task = rustsfm::SfmTaskContext::new(&control, &mut sink);
+
+        let resolved = super::resolve_keyframe_selection_with(
+            KeyframeSelectionMode::AllImages,
+            &request.manifest.sfm_config.adaptive_keyframes,
+            &sequence.frames,
+            &mapper_config,
+            &request.workspace_path,
+            &mut task,
+            |_, _, _, _, _| panic!("all-images mode must not run adaptive selection"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.selected_frame_ids,
+            sequence
+                .frames
+                .iter()
+                .map(|frame| frame.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(resolved.evaluated_pairs, 0);
+        assert!(resolved.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn invalid_adaptive_selection_results_are_rejected() {
+        let (_temp, request) = fixture_request();
+        let sequence = super::load_imported_sequence(&request).unwrap();
+        let mapper_config = super::mapper_config_for(&request);
+
+        for selected in [vec![1], vec![1, 1], vec![2, 1], vec![1, 99]] {
+            let control = rustsfm::SfmTaskControl::new();
+            let mut sink = |_| {};
+            let mut task = rustsfm::SfmTaskContext::new(&control, &mut sink);
+            let result = super::resolve_keyframe_selection_with(
+                KeyframeSelectionMode::Adaptive,
+                &request.manifest.sfm_config.adaptive_keyframes,
+                &sequence.frames,
+                &mapper_config,
+                &request.workspace_path,
+                &mut task,
+                |_, _, _, _, _| Ok(adaptive_result(&selected)),
+            );
+
+            assert!(result.is_err(), "selection {selected:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn keyframe_stage_artifacts_persist_selection_and_reconstruction() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("rustsfm");
+        let database = output.join("Cache/database.db");
+        let sparse = output.join("Cache/keyframe-sparse/0");
+        fs::create_dir_all(&sparse).unwrap();
+        fs::write(&database, b"database").unwrap();
+        for name in [
+            "cameras.txt",
+            "images.txt",
+            "points3D.txt",
+            "cameras.bin",
+            "images.bin",
+            "points3D.bin",
+        ] {
+            fs::write(sparse.join(name), name.as_bytes()).unwrap();
+        }
+        let selection = super::ResolvedKeyframeSelection {
+            selected_frame_ids: vec![1, 3],
+            selection_config: Some(rustsfm::AdaptiveKeyframeSelectionConfig::default()),
+            evaluated_pairs: 2,
+            diagnostics: adaptive_result(&[1, 3]).diagnostics,
+        };
+        let reconstruction = rustsfm::KeyframeReconstructionResult {
+            imported_frames: 3,
+            keyframe_ids: vec![1, 3],
+            registered_keyframes: 2,
+            database,
+            sparse_model: sparse,
+        };
+
+        let artifacts = super::keyframe_stage_artifacts(
+            KeyframeSelectionMode::Adaptive,
+            &selection,
+            &reconstruction,
+        )
+        .unwrap();
+        let names = artifacts
+            .iter()
+            .map(|artifact| artifact.relative_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "keyframe-result.json",
+                "rustsfm/database.db",
+                "rustsfm/keyframe-sparse/0/cameras.txt",
+                "rustsfm/keyframe-sparse/0/images.txt",
+                "rustsfm/keyframe-sparse/0/points3D.txt",
+                "rustsfm/keyframe-sparse/0/cameras.bin",
+                "rustsfm/keyframe-sparse/0/images.bin",
+                "rustsfm/keyframe-sparse/0/points3D.bin",
+            ]
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&artifacts[0].payload).unwrap();
+        assert_eq!(payload["imported_frames"], 3);
+        assert_eq!(payload["selected_keyframe_count"], 2);
+        assert_eq!(payload["selected_keyframe_ids"], serde_json::json!([1, 3]));
+        assert!(payload["selection_config"].is_object());
+        assert_eq!(payload["evaluated_pairs"], 2);
+        assert!(payload["diagnostics"].is_array());
+    }
+
+    #[test]
+    fn imported_keyframe_flags_do_not_filter_the_stable_sequence() {
         let (_temp, mut request) = fixture_request();
         request.manifest.sfm_config.use_all_images = false;
         let metadata = request
@@ -520,13 +840,15 @@ mod tests {
         }
         fs::write(&metadata, serde_json::to_vec(&frames).unwrap()).unwrap();
 
-        let error = match super::load_imported_sequence(&request) {
-            Ok(_) => panic!("an empty keyframe selection must be rejected"),
-            Err(error) => error,
-        };
+        let sequence = super::load_imported_sequence(&request).unwrap();
 
-        assert!(
-            matches!(error, super::RustSfmWorkerError::Sfm(detail) if detail.contains("keyframes"))
+        assert_eq!(
+            sequence
+                .frames
+                .iter()
+                .map(|frame| frame.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
         );
     }
 
@@ -582,6 +904,28 @@ mod tests {
         let outcome = super::outcome_for_registration(2, 1, Vec::new());
 
         assert!(matches!(outcome, WorkerOutcome::Failed(_)));
+    }
+
+    fn adaptive_result(selected_frame_ids: &[u32]) -> rustsfm::AdaptiveKeyframeSelectionResult {
+        rustsfm::AdaptiveKeyframeSelectionResult {
+            imported_frames: 2,
+            usable_frames: 2,
+            selected_frame_ids: selected_frame_ids.to_vec(),
+            config: rustsfm::AdaptiveKeyframeSelectionConfig::default(),
+            evaluated_pairs: 1,
+            diagnostics: vec![rustsfm::AdaptiveKeyframePairDiagnostic {
+                metrics: rustsfm::AdaptiveKeyframePairMetrics {
+                    anchor_frame_id: 1,
+                    candidate_frame_id: 2,
+                    descriptor_matches: 40,
+                    inliers: 30,
+                    triangulated: 20,
+                    inlier_ratio: 0.75,
+                    feature_coverage: 0.5,
+                },
+                decision: rustsfm::AdaptiveKeyframeSelectionDecision::Boundary,
+            }],
+        }
     }
 
     fn fixture_request() -> (tempfile::TempDir, StageRequest) {
