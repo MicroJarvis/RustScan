@@ -26,11 +26,11 @@ pub use context::WgpuContext;
 #[cfg(feature = "gpu-wgpu")]
 pub use matcher::WgpuSiftMatcher;
 #[cfg(feature = "gpu-wgpu")]
-pub(crate) use pnp_focal::{GpuPnpFocalCandidate, WgpuPnPFocalScorer};
+pub(crate) use pnp_focal::WgpuPnPFocalSolver;
 #[cfg(all(feature = "gpu-wgpu", test))]
 pub(crate) use pnp_focal::{
-    GpuPnpFocalModel, GpuPnpFocalResult, WgpuPnPFocalCandidateGenerator, WgpuPnPFocalSampler,
-    WgpuPnPFocalSolver,
+    GpuPnpFocalCandidate, GpuPnpFocalModel, GpuPnpFocalResult, WgpuPnPFocalCandidateGenerator,
+    WgpuPnPFocalSampler, WgpuPnPFocalScorer,
 };
 #[cfg(feature = "gpu-wgpu")]
 pub use pnp_scorer::WgpuPnpModelScorer;
