@@ -28,7 +28,10 @@ pub use matcher::WgpuSiftMatcher;
 #[cfg(feature = "gpu-wgpu")]
 pub(crate) use pnp_focal::{GpuPnpFocalCandidate, WgpuPnPFocalScorer};
 #[cfg(all(feature = "gpu-wgpu", test))]
-pub(crate) use pnp_focal::{GpuPnpFocalModel, GpuPnpFocalResult, WgpuPnPFocalSampler};
+pub(crate) use pnp_focal::{
+    GpuPnpFocalModel, GpuPnpFocalResult, WgpuPnPFocalCandidateGenerator, WgpuPnPFocalSampler,
+    WgpuPnPFocalSolver,
+};
 #[cfg(feature = "gpu-wgpu")]
 pub use pnp_scorer::WgpuPnpModelScorer;
 #[cfg(all(feature = "gpu-wgpu", test))]
@@ -762,6 +765,10 @@ mod tests {
     fn wgpu_pnp_focal_abi_records_are_wgsl_aligned() {
         assert_eq!(std::mem::size_of::<GpuPnpFocalModel>(), 64);
         assert_eq!(std::mem::size_of::<GpuPnpFocalResult>(), 32);
+        assert_eq!(
+            std::mem::size_of::<super::pnp_focal::GpuPnpFocalSupport>(),
+            16
+        );
     }
 
     #[cfg(feature = "gpu-wgpu")]
@@ -812,6 +819,250 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(unique.len(), 4, "sample has duplicate indices: {indices:?}");
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_recovers_synthetic_pose_and_focal() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal solver test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = (0usize..32)
+            .map(|index| {
+                let x = (index % 8) as f32 * 0.25 - 0.875;
+                let y = (index / 8) as f32 * 0.25 - 0.375;
+                [x, y, 3.0 + (index % 5) as f32 * 0.15]
+            })
+            .collect::<Vec<_>>();
+        let mut image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+        for point in image.iter_mut().take(6) {
+            point[0] += 500.0;
+            point[1] -= 400.0;
+        }
+
+        let solver = WgpuPnPFocalSolver::from_context(context)?;
+        let result = solver
+            .solve(&image, &world, 2.0, 7, 512, 150.0, 1_400.0)?
+            .expect("valid synthetic PnP-focal solution");
+
+        assert!(result.inliers >= 24);
+        assert!((result.focal - focal).abs() / focal < 0.05);
+        let matrix = result.pose.to_matrix();
+        assert!((matrix[0][0] - 1.0).abs() < 0.05);
+        assert!((matrix[1][1] - 1.0).abs() < 0.05);
+        assert!((matrix[2][2] - 1.0).abs() < 0.05);
+        assert!(matrix[0][3].abs() < 0.05);
+        assert!(matrix[1][3].abs() < 0.05);
+        assert!(matrix[2][3].abs() < 0.05);
+        Ok(())
+    }
+
+    #[test]
+    fn wgpu_pnp_focal_search_grid_spans_configured_bounds() {
+        let focal_grid = super::pnp_focal::focal_search_grid(150.0, 1_400.0, 8).unwrap();
+
+        assert_eq!(focal_grid.len(), 8);
+        assert!((focal_grid[0] - 150.0).abs() < 1.0e-4);
+        assert!((focal_grid[7] - 1_400.0).abs() < 1.0e-3);
+        assert!(focal_grid.windows(2).all(|pair| pair[0] < pair[1]));
+        let ratios = focal_grid
+            .windows(2)
+            .map(|pair| pair[1] / pair[0])
+            .collect::<Vec<_>>();
+        assert!(ratios
+            .windows(2)
+            .all(|pair| (pair[0] - pair[1]).abs() < 1.0e-5));
+    }
+
+    #[test]
+    fn wgpu_pnp_focal_selection_prefers_support_then_residual_then_index() {
+        use rustslam::tracker::PnPModelSupport;
+
+        let supports = [
+            PnPModelSupport {
+                inliers: 10,
+                residual_sum: 3.0,
+            },
+            PnPModelSupport {
+                inliers: 11,
+                residual_sum: 100.0,
+            },
+            PnPModelSupport {
+                inliers: 11,
+                residual_sum: 2.0,
+            },
+            PnPModelSupport {
+                inliers: 11,
+                residual_sum: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            super::pnp_focal::select_best_focal_support(&supports),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_mask_matches_gpu_support() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal mask test: no compatible adapter");
+            return Ok(());
+        };
+        let points = [[0.0, 0.0], [70.0, 0.0], [0.0, 70.0], [500.0, 500.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [0.0, 0.2, 2.0],
+            [-0.2, 0.1, 2.0],
+        ];
+        let candidate = GpuPnpFocalCandidate {
+            pose: rustslam::SE3::identity(),
+            focal: 700.0,
+        };
+        let mut scorer = WgpuPnPFocalScorer::from_context(context)?;
+        scorer.prepare(&points, &world, 1.0)?;
+
+        let support = scorer.score(candidate)?;
+        let mask = scorer.inlier_mask(candidate)?;
+        assert_eq!(
+            mask.iter().filter(|&&inlier| inlier).count(),
+            support.inliers
+        );
+        assert_eq!(mask, vec![true, true, true, false]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_noisy_refinement_does_not_reduce_support() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal refinement test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = (0usize..32)
+            .map(|index| {
+                let x = (index % 8) as f32 * 0.25 - 0.875;
+                let y = (index / 8) as f32 * 0.25 - 0.375;
+                [x, y, 3.0 + (index % 5) as f32 * 0.15]
+            })
+            .collect::<Vec<_>>();
+        let image = world
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let noise_x = (index % 3) as f32 * 0.15 - 0.15;
+                let noise_y = (index % 5) as f32 * 0.10 - 0.20;
+                [
+                    focal * point[0] / point[2] + noise_x,
+                    focal * point[1] / point[2] + noise_y,
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let solver = WgpuPnPFocalSolver::from_context(context)?;
+        let result = solver
+            .solve(&image, &world, 2.0, 7, 512, 150.0, 1_400.0)?
+            .expect("noisy synthetic PnP-focal solution");
+
+        assert!(result.inliers >= result.initial_inliers);
+        assert_eq!(
+            result.inlier_mask.iter().filter(|&&inlier| inlier).count(),
+            result.inliers
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_out_of_bounds_focal_returns_none() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal bounds test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = (0usize..32)
+            .map(|index| {
+                [
+                    (index.wrapping_mul(17) % 29) as f32 * 0.13 - 1.75,
+                    (index.wrapping_mul(11) % 31) as f32 * 0.11 - 1.65,
+                    1.5 + (index.wrapping_mul(7) % 23) as f32 * 0.23,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+
+        let solver = WgpuPnPFocalSolver::from_context(context)?;
+        assert!(solver
+            .solve(&image, &world, 0.01, 7, 256, 0.5, 1.0)?
+            .is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_p3p_candidate_projects_its_sample() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal P3P candidate test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = [
+            [-0.6, -0.3, 3.0],
+            [0.5, -0.2, 3.4],
+            [-0.2, 0.6, 3.2],
+            [0.4, 0.5, 3.8],
+        ];
+        let image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+        let generator = WgpuPnPFocalCandidateGenerator::from_context(context)?;
+        let candidates = generator.generate_p3p(&image, &world, [0, 1, 2, 3], focal, 0)?;
+
+        assert!(candidates
+            .iter()
+            .any(|model| { model_reprojects_points(model, &image, &world, focal, 1.0e-2) }));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_p3p_batch_candidate_projects_its_sample() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal P3P batch candidate test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = [
+            [-0.6, -0.3, 3.0],
+            [0.5, -0.2, 3.4],
+            [-0.2, 0.6, 3.2],
+            [0.4, 0.5, 3.8],
+        ];
+        let image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+        let generator = WgpuPnPFocalCandidateGenerator::from_context(context)?;
+        let candidates =
+            generator.generate_p3p_batch(&image, &world, &[([0, 1, 2, 3], focal, 0)])?;
+
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates
+            .iter()
+            .any(|model| { model_reprojects_points(model, &image, &world, focal, 1.0e-2) }));
         Ok(())
     }
 
@@ -869,6 +1120,37 @@ mod tests {
             .expect_err("prepare must invalidate the previous scoring batch");
         assert!(error.to_string().contains("latest scoring batch"));
         Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn model_reprojects_points(
+        model: &GpuPnpFocalModel,
+        image: &[[f32; 2]],
+        world: &[[f32; 3]],
+        expected_focal: f32,
+        max_error_px: f32,
+    ) -> bool {
+        let focal = model.log_focal_and_padding[0].exp();
+        if !focal.is_finite() || (focal - expected_focal).abs() / expected_focal > 1.0e-3 {
+            return false;
+        }
+        image.iter().zip(world).all(|(image, world)| {
+            let x = model.row0[0] * world[0]
+                + model.row0[1] * world[1]
+                + model.row0[2] * world[2]
+                + model.row0[3];
+            let y = model.row1[0] * world[0]
+                + model.row1[1] * world[1]
+                + model.row1[2] * world[2]
+                + model.row1[3];
+            let z = model.row2[0] * world[0]
+                + model.row2[1] * world[1]
+                + model.row2[2] * world[2]
+                + model.row2[3];
+            z > 0.0
+                && ((focal * x / z - image[0]).powi(2) + (focal * y / z - image[1]).powi(2)).sqrt()
+                    <= max_error_px
+        })
     }
 
     #[cfg(feature = "gpu-wgpu")]
