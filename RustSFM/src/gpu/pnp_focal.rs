@@ -159,43 +159,49 @@ impl GpuPnpFocalRefinementState {
         let current_model = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm gpu pnp-focal current model"),
             size: model_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let current_support = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm gpu pnp-focal current support"),
             size: support_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let current_mask = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm gpu pnp-focal current mask"),
             size: mask_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let candidate_model = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm gpu pnp-focal candidate model"),
             size: model_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let candidate_support = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm gpu pnp-focal candidate support"),
             size: support_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let candidate_mask = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm gpu pnp-focal candidate mask"),
             size: mask_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let candidate_status = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm gpu pnp-focal candidate refinement status"),
             size: checked_gpu_storage_bytes::<u32>(1, storage_limit, "refinement status")?,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         Ok(Self {

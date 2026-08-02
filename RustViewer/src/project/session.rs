@@ -27,14 +27,28 @@ impl ProjectSessionSummary {
         let pnp = manifest.stage(ProjectStage::FullFramePnp);
         let training = manifest.stage(ProjectStage::Training);
 
-        Self::from_states(
+        let mut summary = Self::from_states(
             manifest.source.kind,
             import.state(),
             sfm.state(),
             pnp.state(),
             training.state(),
         )
-        .with_imported_frame_count(import.completed())
+        .with_imported_frame_count(import.completed());
+
+        if summary.pose_state == ProjectStagePresentation::Failed {
+            if let Some(detail) = [sfm, pnp]
+                .into_iter()
+                .find(|stage| stage.state() == StageState::Failed)
+                .and_then(|stage| stage.error.as_ref())
+                .map(|error| error.detail.trim())
+                .filter(|detail| !detail.is_empty())
+            {
+                summary.pose_detail = detail.to_owned();
+            }
+        }
+
+        summary
     }
 
     pub fn from_states(
@@ -170,5 +184,34 @@ mod tests {
 
         assert_eq!(summary.training_state, ProjectStagePresentation::Waiting);
         assert_eq!(summary.training_detail, "Waiting for full-frame poses");
+    }
+
+    #[test]
+    fn project_session_failed_pose_uses_persisted_stage_error() {
+        let mut manifest = ProjectManifest::new(
+            "Failure fixture",
+            crate::project::SourceSpec::managed_images("fixture"),
+        );
+        manifest.stage_mut(ProjectStage::Import).state = StageState::Succeeded;
+        let stage = manifest.stage_mut(ProjectStage::KeyframeSfm);
+        stage.state = StageState::Failed;
+        stage.error = Some(crate::project::ProjectErrorRecord {
+            code: "rustsfm_failed".to_owned(),
+            stage: ProjectStage::KeyframeSfm,
+            summary: "RustSFM pose solve failed".to_owned(),
+            detail: "GPU PnP-focal fallback could not solve".to_owned(),
+            frame_id: None,
+            pair: None,
+            retryable: true,
+            suggested_actions: Vec::new(),
+        });
+
+        let summary = ProjectSessionSummary::from_manifest(&manifest);
+
+        assert_eq!(summary.pose_state, ProjectStagePresentation::Failed);
+        assert_eq!(
+            summary.pose_detail,
+            "GPU PnP-focal fallback could not solve"
+        );
     }
 }
