@@ -13,6 +13,8 @@ mod context;
 #[cfg(feature = "gpu-wgpu")]
 mod matcher;
 #[cfg(feature = "gpu-wgpu")]
+mod pnp_focal;
+#[cfg(feature = "gpu-wgpu")]
 mod pnp_scorer;
 #[cfg(feature = "gpu-wgpu")]
 mod scorer;
@@ -27,6 +29,8 @@ pub use matcher::WgpuSiftMatcher;
 pub use pnp_scorer::WgpuPnpModelScorer;
 #[cfg(all(feature = "gpu-wgpu", test))]
 pub(crate) use pnp_scorer::{GpuPnpImagePoint, GpuPnpModel, GpuPnpObjectPoint};
+#[cfg(all(feature = "gpu-wgpu", test))]
+pub(crate) use pnp_focal::{GpuPnpFocalModel, GpuPnpFocalResult};
 #[cfg(feature = "gpu-wgpu")]
 pub(crate) use scorer::WgpuModelScoringSession;
 #[cfg(feature = "gpu-wgpu")]
@@ -749,6 +753,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuPnpImagePoint>(), 16);
         assert_eq!(std::mem::size_of::<GpuPnpObjectPoint>(), 16);
         assert_eq!(std::mem::size_of::<GpuPnpModel>(), 48);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_abi_records_are_wgsl_aligned() {
+        assert_eq!(std::mem::size_of::<GpuPnpFocalModel>(), 64);
+        assert_eq!(std::mem::size_of::<GpuPnpFocalResult>(), 32);
     }
 
     #[cfg(feature = "gpu-wgpu")]
