@@ -26,13 +26,13 @@ pub use context::WgpuContext;
 #[cfg(feature = "gpu-wgpu")]
 pub use matcher::WgpuSiftMatcher;
 #[cfg(feature = "gpu-wgpu")]
+pub(crate) use pnp_focal::{GpuPnpFocalCandidate, WgpuPnPFocalScorer};
+#[cfg(all(feature = "gpu-wgpu", test))]
+pub(crate) use pnp_focal::{GpuPnpFocalModel, GpuPnpFocalResult, WgpuPnPFocalSampler};
+#[cfg(feature = "gpu-wgpu")]
 pub use pnp_scorer::WgpuPnpModelScorer;
 #[cfg(all(feature = "gpu-wgpu", test))]
 pub(crate) use pnp_scorer::{GpuPnpImagePoint, GpuPnpModel, GpuPnpObjectPoint};
-#[cfg(all(feature = "gpu-wgpu", test))]
-pub(crate) use pnp_focal::{GpuPnpFocalModel, GpuPnpFocalResult};
-#[cfg(feature = "gpu-wgpu")]
-pub(crate) use pnp_focal::{GpuPnpFocalCandidate, WgpuPnPFocalScorer};
 #[cfg(feature = "gpu-wgpu")]
 pub(crate) use scorer::WgpuModelScoringSession;
 #[cfg(feature = "gpu-wgpu")]
@@ -767,15 +767,51 @@ mod tests {
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn wgpu_pnp_focal_scorer_uses_candidate_focal_length() -> Result<()> {
-        let Some(context) = WgpuContext::try_new_optional()? else { return Ok(()); };
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
         let points = [[0.0, 0.0], [70.0, 0.0], [0.0, 70.0], [-70.0, 35.0]];
-        let world = [[0.0, 0.0, 2.0], [0.2, 0.0, 2.0], [0.0, 0.2, 2.0], [-0.2, 0.1, 2.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [0.0, 0.2, 2.0],
+            [-0.2, 0.1, 2.0],
+        ];
         let mut scorer = WgpuPnPFocalScorer::from_context(context)?;
         scorer.prepare(&points, &world, 1.0)?;
-        let correct = scorer.score(GpuPnpFocalCandidate { pose: rustslam::SE3::identity(), focal: 700.0 })?;
-        let wrong = scorer.score(GpuPnpFocalCandidate { pose: rustslam::SE3::identity(), focal: 350.0 })?;
+        let correct = scorer.score(GpuPnpFocalCandidate {
+            pose: rustslam::SE3::identity(),
+            focal: 700.0,
+        })?;
+        let wrong = scorer.score(GpuPnpFocalCandidate {
+            pose: rustslam::SE3::identity(),
+            focal: 350.0,
+        })?;
         assert_eq!(correct.inliers, 4);
         assert!(wrong.inliers < correct.inliers);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_sampling_is_deterministic_and_unique() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal sampler test: no compatible adapter");
+            return Ok(());
+        };
+        let sampler = WgpuPnPFocalSampler::from_context(context)?;
+        let first = sampler.sample_indices(7, 64, 19)?;
+        let second = sampler.sample_indices(7, 64, 19)?;
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        for indices in first {
+            assert!(indices.iter().all(|&index| index < 19));
+            let unique = indices
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique.len(), 4, "sample has duplicate indices: {indices:?}");
+        }
         Ok(())
     }
 
