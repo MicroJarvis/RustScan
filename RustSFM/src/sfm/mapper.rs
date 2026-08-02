@@ -116,6 +116,67 @@ fn gpu_pnp_mapper_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(GpuPnpMapperError(message.into()))
 }
 
+/// Keeps fixed-intrinsics GPU PnP fail-fast when the backend could not initialize,
+/// while allowing the unknown-focal route to run its own GPU-to-CPU fallback.
+#[cfg(feature = "gpu-wgpu")]
+struct UnavailableGpuPnpModelScorer {
+    error: String,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl PnPModelScorer for UnavailableGpuPnpModelScorer {
+    type Error = anyhow::Error;
+
+    fn prepare(
+        &mut self,
+        _normalized_points: &[[f32; 2]],
+        _object_points: &[[f32; 3]],
+        _threshold: f32,
+    ) -> Result<(), Self::Error> {
+        Err(gpu_pnp_mapper_error(format!(
+            "failed to initialize gpu pnp scorer: {}",
+            self.error
+        )))
+    }
+
+    fn score_models(
+        &mut self,
+        _models: &[SE3],
+    ) -> Result<Vec<rustslam::tracker::PnPModelSupport>, Self::Error> {
+        unreachable!("GPU PnP initialization failure must be reported by prepare")
+    }
+
+    fn inlier_mask(&mut self, _model: &SE3) -> Result<Vec<bool>, Self::Error> {
+        unreachable!("GPU PnP initialization failure must be reported by prepare")
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[derive(Debug)]
+struct GpuPnPFocalFallbackError {
+    gpu_error: Option<anyhow::Error>,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl std::fmt::Display for GpuPnPFocalFallbackError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CPU PnP-focal fallback could not solve")?;
+        if let Some(error) = &self.gpu_error {
+            write!(formatter, "; GPU PnP-focal error: {error:#}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl std::error::Error for GpuPnPFocalFallbackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.gpu_error
+            .as_ref()
+            .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatabasePairMatches {
     pub left: usize,
@@ -131,6 +192,12 @@ pub(crate) struct SingleTargetRegistrationCandidate {
     pub mean_reprojection_error: f64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SingleTargetRegistrationAttempt {
+    pub candidate: Option<SingleTargetRegistrationCandidate>,
+    pub debug_log: Vec<String>,
+}
+
 pub(crate) fn register_single_target_from_seed(
     frames: &[ImageFrame],
     pairs: &[PairGeometry],
@@ -138,7 +205,7 @@ pub(crate) fn register_single_target_from_seed(
     target_image: usize,
     config: &MapperConfig,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
-) -> Result<Option<SingleTargetRegistrationCandidate>> {
+) -> Result<SingleTargetRegistrationAttempt> {
     if config.reference.is_none() {
         bail!("single-target registration requires a reference model");
     }
@@ -147,9 +214,6 @@ pub(crate) fn register_single_target_from_seed(
     }
     if target_image >= frames.len() {
         bail!("target image index {target_image} is out of range");
-    }
-    if config.use_gpu_pnp && pnp_scorer.is_none() {
-        bail!("gpu pnp was requested but no gpu scorer is available");
     }
     let camera = setup
         .cameras
@@ -222,7 +286,10 @@ pub(crate) fn register_single_target_from_seed(
         &mut telemetry,
     )?
     else {
-        return Ok(None);
+        return Ok(SingleTargetRegistrationAttempt {
+            candidate: None,
+            debug_log: vec![telemetry.format_log()],
+        });
     };
     if absolute_pose
         .pose
@@ -233,7 +300,10 @@ pub(crate) fn register_single_target_from_seed(
         || !absolute_pose.inlier_ratio.is_finite()
         || !absolute_pose.mean_error_px.is_finite()
     {
-        return Ok(None);
+        return Ok(SingleTargetRegistrationAttempt {
+            candidate: None,
+            debug_log: vec![telemetry.format_log()],
+        });
     }
     apply_image_camera(&mut reconstruction, target_image, absolute_pose.camera);
     observation_manager.register_image(
@@ -255,12 +325,15 @@ pub(crate) fn register_single_target_from_seed(
             },
         );
     }
-    Ok(Some(SingleTargetRegistrationCandidate {
-        reconstruction,
-        inlier_count: absolute_pose.inliers,
-        inlier_ratio: f64::from(absolute_pose.inlier_ratio),
-        mean_reprojection_error: f64::from(absolute_pose.mean_error_px),
-    }))
+    Ok(SingleTargetRegistrationAttempt {
+        candidate: Some(SingleTargetRegistrationCandidate {
+            reconstruction,
+            inlier_count: absolute_pose.inliers,
+            inlier_ratio: f64::from(absolute_pose.inlier_ratio),
+            mean_reprojection_error: f64::from(absolute_pose.mean_error_px),
+        }),
+        debug_log: vec![telemetry.format_log()],
+    })
 }
 
 pub(crate) fn register_single_target_from_database_with_pnp_scorer(
@@ -271,7 +344,7 @@ pub(crate) fn register_single_target_from_database_with_pnp_scorer(
     support_names: &[String],
     config: &MapperConfig,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
-) -> Result<Option<SingleTargetRegistrationCandidate>> {
+) -> Result<SingleTargetRegistrationAttempt> {
     let reference_model = read_colmap_sparse_model(reference)?;
     let registered_names = reference_model
         .reconstruction
@@ -361,7 +434,10 @@ pub(crate) fn register_single_target_from_database_with_pnp_scorer(
         })
         .collect::<Vec<_>>();
     if pairs.is_empty() {
-        return Ok(None);
+        return Ok(SingleTargetRegistrationAttempt {
+            candidate: None,
+            debug_log: Vec::new(),
+        });
     }
     let mut target_config = config.clone();
     target_config.reference = Some(reference.to_path_buf());
@@ -399,15 +475,10 @@ fn validate_gpu_pnp_config(config: &MapperConfig, has_global_mapper: bool) -> Re
 }
 
 fn validate_gpu_pnp_route(
-    estimate_focal: bool,
+    _estimate_focal: bool,
     generalized: bool,
     structureless: bool,
 ) -> Result<()> {
-    if estimate_focal {
-        return Err(gpu_pnp_mapper_error(
-            "gpu pnp does not support focal length estimation",
-        ));
-    }
     if generalized {
         return Err(gpu_pnp_mapper_error(
             "gpu pnp does not support generalized rig absolute pose",
@@ -421,6 +492,17 @@ fn validate_gpu_pnp_route(
     Ok(())
 }
 
+fn validate_gpu_pnp_registration_route(
+    config: &MapperConfig,
+    generalized: bool,
+    structureless: bool,
+) -> Result<()> {
+    if config.use_gpu_pnp {
+        validate_gpu_pnp_route(false, generalized, structureless)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn create_gpu_pnp_scorer(
     config: &MapperConfig,
 ) -> Result<Option<Box<DynPnPModelScorer>>> {
@@ -429,10 +511,21 @@ pub(crate) fn create_gpu_pnp_scorer(
     }
     #[cfg(feature = "gpu-wgpu")]
     {
-        let scorer = crate::gpu::WgpuPnpModelScorer::try_new().map_err(|error| {
-            gpu_pnp_mapper_error(format!("failed to initialize gpu pnp scorer: {error:#}"))
-        })?;
-        Ok(Some(Box::new(scorer)))
+        let scorer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::gpu::WgpuPnpModelScorer::try_new()
+        }));
+        match scorer {
+            Ok(Ok(scorer)) => Ok(Some(Box::new(scorer))),
+            Ok(Err(error)) => Ok(Some(Box::new(UnavailableGpuPnpModelScorer {
+                error: format!("{error:#}"),
+            }))),
+            Err(panic) => Ok(Some(Box::new(UnavailableGpuPnpModelScorer {
+                error: format!(
+                    "GPU PnP scorer panicked during initialization: {}",
+                    panic_message(panic)
+                ),
+            }))),
+        }
     }
     #[cfg(not(feature = "gpu-wgpu"))]
     {
@@ -2181,9 +2274,6 @@ fn incremental_pipeline_map_with_pnp_scorer_and_events(
     events: &mut MapperEventBridge<'_, '_>,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
 ) -> Result<IncrementalPipelineMapResult> {
-    if config.use_gpu_pnp && pnp_scorer.is_none() {
-        bail!("gpu pnp was requested but no gpu scorer is available");
-    }
     let mut pnp_scorer = pnp_scorer;
     let mut session = IncrementalMapperSession::default();
     let mut reconstructions = Vec::new();
@@ -2278,6 +2368,16 @@ fn incremental_pipeline_map_with_pnp_scorer_and_events(
                 Err(err) => {
                     if err.downcast_ref::<GpuPnpMapperError>().is_some()
                         || err.downcast_ref::<SfmTaskStop>().is_some()
+                        || {
+                            #[cfg(feature = "gpu-wgpu")]
+                            {
+                                err.downcast_ref::<GpuPnPFocalFallbackError>().is_some()
+                            }
+                            #[cfg(not(feature = "gpu-wgpu"))]
+                            {
+                                false
+                            }
+                        }
                     {
                         return Err(err);
                     }
@@ -3566,12 +3666,18 @@ struct IncrementalRegistrationTelemetry {
     pose_solve_refine_ms: f64,
     observation_update_ms: f64,
     triangulation_ms: f64,
+    gpu_pnp_focal_fallbacks: Vec<String>,
 }
 
 impl IncrementalRegistrationTelemetry {
+    #[cfg(feature = "gpu-wgpu")]
+    fn record_gpu_pnp_focal_fallback(&mut self, reason: impl std::fmt::Display) {
+        self.gpu_pnp_focal_fallbacks.push(reason.to_string());
+    }
+
     fn format_log(&self) -> String {
         format!(
-            "incremental_registration candidate_units={} skipped_unchanged={} structure_based_attempts={} structureless_attempts={} structureless_estimates={} structureless_accepted={} structureless_solver_ms={:.2} fallback_epochs={} collect_observations_ms={:.2} pose_solve_refine_ms={:.2} observation_update_ms={:.2} triangulation_ms={:.2}",
+            "incremental_registration candidate_units={} skipped_unchanged={} structure_based_attempts={} structureless_attempts={} structureless_estimates={} structureless_accepted={} structureless_solver_ms={:.2} fallback_epochs={} collect_observations_ms={:.2} pose_solve_refine_ms={:.2} observation_update_ms={:.2} triangulation_ms={:.2} gpu_pnp_focal_fallback={}",
             self.candidate_units,
             self.skipped_unchanged,
             self.structure_based_attempts,
@@ -3584,6 +3690,7 @@ impl IncrementalRegistrationTelemetry {
             self.pose_solve_refine_ms,
             self.observation_update_ms,
             self.triangulation_ms,
+            self.gpu_pnp_focal_fallbacks.join("; "),
         )
     }
 }
@@ -3907,9 +4014,7 @@ fn registration_choice_for_image_with_pnp_scorer(
                 camera_has_prior_focal_length,
                 registration_stats,
             ) {
-                if pnp_scorer.is_some() {
-                    validate_gpu_pnp_route(false, true, false)?;
-                }
+                validate_gpu_pnp_registration_route(config, true, false)?;
                 let Some(abs_pose) = solve_generalized_frame_absolute_pose(
                     image,
                     frames,
@@ -3943,9 +4048,7 @@ fn registration_choice_for_image_with_pnp_scorer(
             }
         }
         NextImageRegistrationMode::StructureLess => {
-            if pnp_scorer.is_some() {
-                validate_gpu_pnp_route(false, false, true)?;
-            }
+            validate_gpu_pnp_registration_route(config, false, true)?;
             let Some(abs_pose) = solve_structureless_absolute_pose(
                 image,
                 frames,
@@ -4115,9 +4218,7 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
             camera_has_prior_focal_length,
             registration_stats,
         ) {
-            if pnp_scorer.is_some() {
-                validate_gpu_pnp_route(false, true, false)?;
-            }
+            validate_gpu_pnp_registration_route(config, true, false)?;
             solve_generalized_frame_absolute_pose(
                 image,
                 frames,
@@ -4147,9 +4248,7 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
         let pose = if structure_based_pose.is_some() {
             structure_based_pose
         } else {
-            if pnp_scorer.is_some() {
-                validate_gpu_pnp_route(false, false, true)?;
-            }
+            validate_gpu_pnp_registration_route(config, false, true)?;
             solve_structureless_absolute_pose(
                 image,
                 frames,
@@ -8081,6 +8180,7 @@ fn solve_absolute_pose_with_pnp_scorer(
                 estimate_focal,
                 config,
                 pnp_scorer,
+                telemetry,
             )?
         else {
             return Ok(None);
@@ -8194,12 +8294,14 @@ fn solve_absolute_pose_with_camera_hypotheses(
     estimate_focal: bool,
     config: &MapperConfig,
 ) -> Option<(SE3, Vec<bool>, CameraModel)> {
+    let mut telemetry = IncrementalRegistrationTelemetry::default();
     solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
         observations,
         camera,
         estimate_focal,
         config,
         None,
+        &mut telemetry,
     )
     .expect("CPU absolute pose route is infallible")
 }
@@ -8210,10 +8312,22 @@ fn solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
     estimate_focal: bool,
     config: &MapperConfig,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
+    telemetry: &mut IncrementalRegistrationTelemetry,
 ) -> Result<Option<(SE3, Vec<bool>, CameraModel)>> {
+    #[cfg(not(feature = "gpu-wgpu"))]
+    let _ = telemetry;
     if estimate_focal {
-        if pnp_scorer.is_some() {
-            validate_gpu_pnp_route(true, false, false)?;
+        if config.use_gpu_pnp {
+            #[cfg(feature = "gpu-wgpu")]
+            {
+                return solve_absolute_pose_with_gpu_focal_dispatch(
+                    observations,
+                    camera,
+                    config,
+                    telemetry,
+                    solve_absolute_pose_with_gpu_focal_estimation,
+                );
+            }
         }
         return Ok(solve_absolute_pose_with_focal_estimation(
             observations,
@@ -8235,6 +8349,162 @@ fn solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
         best = Some((eval, pose, inliers, camera));
     }
     Ok(best.map(|(_, pose, inliers, camera)| (pose, inliers, camera)))
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn fallback_to_cpu_focal_estimation(
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    config: &MapperConfig,
+    telemetry: &mut IncrementalRegistrationTelemetry,
+    reason: impl std::fmt::Display,
+    gpu_error: Option<anyhow::Error>,
+) -> Result<Option<(SE3, Vec<bool>, CameraModel)>> {
+    telemetry.record_gpu_pnp_focal_fallback(reason);
+    match solve_absolute_pose_with_focal_estimation(observations, camera, config) {
+        Some(result) => Ok(Some(result)),
+        None if gpu_error.is_none() => Ok(None),
+        None => Err(anyhow::Error::new(GpuPnPFocalFallbackError { gpu_error })),
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn is_task_cancellation_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::task::SfmTaskStop>()
+            .is_some_and(|stop| matches!(stop, crate::task::SfmTaskStop::Cancelled))
+    })
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn solve_absolute_pose_with_gpu_focal_dispatch<F>(
+    observations: &[AbsolutePoseObservation],
+    camera: CameraModel,
+    config: &MapperConfig,
+    telemetry: &mut IncrementalRegistrationTelemetry,
+    dispatch: F,
+) -> Result<Option<(SE3, Vec<bool>, CameraModel)>>
+where
+    F: FnOnce(
+        &[AbsolutePoseObservation],
+        CameraModel,
+        &MapperConfig,
+    ) -> Result<Option<(SE3, Vec<bool>, CameraModel)>>,
+{
+    let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch(observations, camera, config)
+    }));
+    match gpu_result {
+        Ok(Ok(Some(result))) => Ok(Some(result)),
+        Ok(Ok(None)) => fallback_to_cpu_focal_estimation(
+            observations,
+            camera,
+            config,
+            telemetry,
+            "gpu pnp-focal returned no valid solution; using CPU PnP-f",
+            None,
+        ),
+        Ok(Err(error)) if is_task_cancellation_error(&error) => Err(error),
+        Ok(Err(error)) => fallback_to_cpu_focal_estimation(
+            observations,
+            camera,
+            config,
+            telemetry,
+            format!("gpu pnp-focal failed: {error:#}; using CPU PnP-f"),
+            Some(error),
+        ),
+        Err(panic) => {
+            let panic = panic_message(panic);
+            fallback_to_cpu_focal_estimation(
+                observations,
+                camera,
+                config,
+                telemetry,
+                format!("gpu pnp-focal panicked: {panic}; using CPU PnP-f"),
+                Some(gpu_pnp_mapper_error(format!(
+                    "gpu pnp-focal panicked: {panic}"
+                ))),
+            )
+        }
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn solve_absolute_pose_with_gpu_focal_estimation(
+    observations: &[AbsolutePoseObservation],
+    initial_camera: CameraModel,
+    config: &MapperConfig,
+) -> Result<Option<(SE3, Vec<bool>, CameraModel)>> {
+    let Some(focal_idxs) = colmap_camera_model_focal_idxs(initial_camera.model_id) else {
+        return Ok(None);
+    };
+    if focal_idxs.is_empty() {
+        return Ok(None);
+    }
+    let max_dimension = initial_camera.width.max(initial_camera.height).max(1) as f32;
+    let min_focal = max_dimension * config.min_focal_length_ratio as f32;
+    let max_focal = max_dimension * config.max_focal_length_ratio as f32;
+    let centered_points = observations
+        .iter()
+        .map(|observation| {
+            [
+                observation.xy[0] - initial_camera.cx,
+                observation.xy[1] - initial_camera.cy,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let object_points = observations
+        .iter()
+        .map(|observation| observation.xyz)
+        .collect::<Vec<_>>();
+    let context = crate::gpu::WgpuContext::try_new()?;
+    let solver = crate::gpu::WgpuPnPFocalSolver::from_context(context)?;
+    let Some(solution) = solver.solve(
+        &centered_points,
+        &object_points,
+        config.pnp_threshold_px,
+        absolute_pose_ransac_seed(config) as u32,
+        config.pnp_iterations as usize,
+        min_focal,
+        max_focal,
+    )?
+    else {
+        return Ok(None);
+    };
+    if solution.inlier_mask.len() != observations.len()
+        || solution.inliers
+            != solution
+                .inlier_mask
+                .iter()
+                .filter(|&&inlier| inlier)
+                .count()
+    {
+        bail!("gpu pnp-focal returned an invalid inlier mask");
+    }
+    let mut camera = initial_camera;
+    for &idx in focal_idxs {
+        if idx >= camera.num_params {
+            bail!("gpu pnp-focal focal parameter index {idx} is out of range");
+        }
+        camera.params[idx] = solution.focal as f64;
+    }
+    camera.sync_intrinsics_from_params();
+    if camera_has_bogus_params(camera, config) {
+        bail!("gpu pnp-focal returned invalid camera parameters");
+    }
+    Ok(Some((solution.pose, solution.inlier_mask, camera)))
 }
 
 fn solve_absolute_pose_with_focal_estimation(
@@ -10629,17 +10899,27 @@ mod tests {
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
-    fn mapper_gpu_pnp_rejects_focal_estimation_route() {
-        let error =
-            validate_gpu_pnp_route(true, false, false).expect_err("focal route must reject");
-        assert!(error.to_string().contains("focal"));
-        assert!(error.downcast_ref::<GpuPnpMapperError>().is_some());
-
+    fn mapper_gpu_pnp_keeps_generalized_and_structureless_rejections() {
         let error =
             validate_gpu_pnp_route(false, true, false).expect_err("generalized route must reject");
         assert!(error.to_string().contains("generalized"));
         let error = validate_gpu_pnp_route(false, false, true)
             .expect_err("structureless route must reject");
+        assert!(error.to_string().contains("structureless"));
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn mapper_gpu_pnp_rejects_unsupported_routes_without_a_gpu_scorer() {
+        let config = MapperConfig {
+            use_gpu_pnp: true,
+            ..MapperConfig::default()
+        };
+        let error = validate_gpu_pnp_registration_route(&config, true, false)
+            .expect_err("generalized GPU PnP route must reject without a scorer");
+        assert!(error.to_string().contains("generalized"));
+        let error = validate_gpu_pnp_registration_route(&config, false, true)
+            .expect_err("structureless GPU PnP route must reject without a scorer");
         assert!(error.to_string().contains("structureless"));
     }
 
@@ -10736,6 +11016,194 @@ mod tests {
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
+    fn mapper_gpu_pnp_focal_dispatch_failure_falls_back_to_cpu() -> Result<()> {
+        let camera = CameraModel::new_pinhole(640, 480, 450.0, 450.0, 320.0, 240.0);
+        let expected_pose = SE3::from_axis_angle(&[0.015, -0.01, 0.02], &[0.3, -0.12, 0.55]);
+        let expected_focal = 700.0;
+        let observations = (0..32)
+            .map(|index| {
+                let xyz = [
+                    ((index % 8) as f32 - 3.5) * 0.22,
+                    ((index / 8) as f32 - 1.5) * 0.27,
+                    4.2 + (index % 5) as f32 * 0.3,
+                ];
+                let point = expected_pose.transform_point(&xyz);
+                AbsolutePoseObservation {
+                    feature: index,
+                    point_id: index,
+                    xy: [
+                        expected_focal * point[0] / point[2] + camera.cx,
+                        expected_focal * point[1] / point[2] + camera.cy,
+                    ],
+                    xyz,
+                }
+            })
+            .collect::<Vec<_>>();
+        let config = MapperConfig {
+            use_gpu_pnp: true,
+            ba_refine_focal_length: true,
+            pnp_threshold_px: 2.0,
+            pnp_iterations: 512,
+            abs_pose_min_num_inliers: 4,
+            abs_pose_min_inlier_ratio: 0.0,
+            random_seed: 7,
+            ..MapperConfig::default()
+        };
+        let cpu = solve_absolute_pose_with_focal_estimation(&observations, camera, &config)
+            .expect("CPU unknown-focal PnP");
+        let mut telemetry = IncrementalRegistrationTelemetry::default();
+        let gpu = solve_absolute_pose_with_gpu_focal_dispatch(
+            &observations,
+            camera,
+            &config,
+            &mut telemetry,
+            |_observations, _camera, _config| bail!("simulated focal GPU dispatch failure"),
+        )?
+        .expect("CPU PnP-fallback result");
+
+        assert!(gpu.1.iter().filter(|&&inlier| inlier).count() >= 24);
+        assert!((gpu.2.fx - expected_focal).abs() / expected_focal < 0.05);
+        assert!((gpu.2.fx - cpu.2.fx).abs() / cpu.2.fx < 0.05);
+        assert!(!camera_has_bogus_params(gpu.2, &config));
+        assert_eq!(telemetry.gpu_pnp_focal_fallbacks.len(), 1);
+        assert!(telemetry.gpu_pnp_focal_fallbacks[0].contains("simulated focal GPU dispatch"));
+        assert!(telemetry
+            .format_log()
+            .contains("gpu_pnp_focal_fallback=gpu pnp-focal"));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn mapper_gpu_pnp_focal_fallback_reports_cpu_unsolved() -> Result<()> {
+        let camera = CameraModel::new_pinhole(640, 480, 450.0, 450.0, 320.0, 240.0);
+        let config = MapperConfig::default();
+        let mut telemetry = IncrementalRegistrationTelemetry::default();
+
+        let gpu_error = anyhow::Error::msg("simulated GPU device loss")
+            .context("simulated GPU dispatch failure");
+        let error = fallback_to_cpu_focal_estimation(
+            &[],
+            camera,
+            &config,
+            &mut telemetry,
+            "simulated focal GPU dispatch failure",
+            Some(gpu_error),
+        )
+        .expect_err("an unsolved CPU PnP-focal fallback must be reported");
+
+        assert!(error
+            .to_string()
+            .contains("CPU PnP-focal fallback could not solve"));
+        assert!(error.to_string().contains("simulated GPU dispatch failure"));
+        let fallback = error
+            .downcast_ref::<GpuPnPFocalFallbackError>()
+            .expect("CPU fallback error type");
+        let source = std::error::Error::source(fallback).expect("GPU error source");
+        assert!(source
+            .to_string()
+            .contains("simulated GPU dispatch failure"));
+        assert!(source
+            .source()
+            .expect("GPU error root cause")
+            .to_string()
+            .contains("simulated GPU device loss"));
+        assert_eq!(telemetry.gpu_pnp_focal_fallbacks.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn mapper_gpu_pnp_focal_no_solution_preserves_cpu_none() -> Result<()> {
+        let camera = CameraModel::new_pinhole(640, 480, 450.0, 450.0, 320.0, 240.0);
+        let config = MapperConfig::default();
+        let mut telemetry = IncrementalRegistrationTelemetry::default();
+
+        let result = fallback_to_cpu_focal_estimation(
+            &[],
+            camera,
+            &config,
+            &mut telemetry,
+            "gpu pnp-focal returned no valid solution; using CPU PnP-f",
+            None,
+        )?;
+
+        assert!(result.is_none());
+        assert_eq!(telemetry.gpu_pnp_focal_fallbacks.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn mapper_gpu_pnp_focal_real_solver_maps_focal_camera_and_mask() -> Result<()> {
+        let Some(_) = crate::gpu::WgpuContext::try_new_optional()? else {
+            eprintln!("skipping mapper GPU PnP-focal test: no compatible adapter");
+            return Ok(());
+        };
+        let camera = CameraModel::new_pinhole(640, 480, 450.0, 450.0, 320.0, 240.0);
+        let expected_pose = SE3::from_axis_angle(&[0.015, -0.01, 0.02], &[0.3, -0.12, 0.55]);
+        let expected_focal = 700.0;
+        let observations = (0..32)
+            .map(|index| {
+                let xyz = [
+                    ((index % 8) as f32 - 3.5) * 0.22,
+                    ((index / 8) as f32 - 1.5) * 0.27,
+                    4.2 + (index % 5) as f32 * 0.3,
+                ];
+                let point = expected_pose.transform_point(&xyz);
+                AbsolutePoseObservation {
+                    feature: index,
+                    point_id: index,
+                    xy: [
+                        expected_focal * point[0] / point[2] + camera.cx,
+                        expected_focal * point[1] / point[2] + camera.cy,
+                    ],
+                    xyz,
+                }
+            })
+            .collect::<Vec<_>>();
+        let config = MapperConfig {
+            use_gpu_pnp: true,
+            ba_refine_focal_length: true,
+            pnp_threshold_px: 2.0,
+            pnp_iterations: 512,
+            abs_pose_min_num_inliers: 4,
+            abs_pose_min_inlier_ratio: 0.0,
+            random_seed: 7,
+            ..MapperConfig::default()
+        };
+
+        let solved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            solve_absolute_pose_with_gpu_focal_estimation(&observations, camera, &config)
+        }));
+        let (_, mask, solved_camera) = match solved {
+            Ok(Ok(Some(solution))) => solution,
+            Ok(Ok(None)) => {
+                eprintln!("skipping mapper GPU PnP-focal test: adapter returned no solution");
+                return Ok(());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(panic) => {
+                let message = panic_message(panic);
+                if message.contains("XPC_ERROR_CONNECTION_INTERRUPTED") {
+                    eprintln!("skipping mapper GPU PnP-focal test: {message}");
+                    return Ok(());
+                }
+                std::panic::panic_any(message);
+            }
+        };
+
+        assert_eq!(mask.len(), observations.len());
+        assert!(mask.iter().all(|&inlier| inlier));
+        assert!((solved_camera.fx - expected_focal).abs() / expected_focal < 0.05);
+        assert_eq!(solved_camera.params[0], solved_camera.fx as f64);
+        assert_eq!(solved_camera.params[1], solved_camera.fy as f64);
+        assert!(!camera_has_bogus_params(solved_camera, &config));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
     fn mapper_gpu_pnp_matches_known_intrinsics_cpu_mask() -> Result<()> {
         let Some(context) = crate::gpu::WgpuContext::try_new_optional()? else {
             eprintln!("skipping mapper GPU PnP test: no compatible adapter");
@@ -10768,8 +11236,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let config = MapperConfig {
+            use_gpu_pnp: true,
             pnp_threshold_px: 2.0,
             pnp_iterations: 512,
+            abs_pose_min_num_inliers: 4,
             abs_pose_min_inlier_ratio: 0.0,
             random_seed: 7,
             ..MapperConfig::default()
@@ -10777,11 +11247,14 @@ mod tests {
         let cpu = solve_absolute_pose_for_camera(&observations, camera, &config)
             .expect("CPU known-intrinsics PnP");
         let mut scorer = crate::gpu::WgpuPnpModelScorer::from_context(context)?;
-        let gpu = solve_absolute_pose_for_camera_with_pnp_scorer(
+        let mut telemetry = IncrementalRegistrationTelemetry::default();
+        let gpu = solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
             &observations,
             camera,
+            false,
             &config,
             Some(&mut scorer),
+            &mut telemetry,
         )?
         .expect("GPU known-intrinsics PnP");
         let cpu_inliers = cpu.1.iter().filter(|&&value| value).count();
@@ -11501,6 +11974,7 @@ mod tests {
             pose_solve_refine_ms: 2.5,
             observation_update_ms: 3.75,
             triangulation_ms: 4.5,
+            gpu_pnp_focal_fallbacks: Vec::new(),
         };
 
         let line = telemetry.format_log();
@@ -16667,9 +17141,11 @@ mod tests {
             ..MapperConfig::default()
         };
 
-        let candidate =
-            register_single_target_from_seed(&frames, &pairs, &setup, 1, &config, None)?
-                .expect("target should have a PnP candidate");
+        let attempt = register_single_target_from_seed(&frames, &pairs, &setup, 1, &config, None)?;
+        let candidate = attempt
+            .candidate
+            .expect("target should have a PnP candidate");
+        assert_eq!(attempt.debug_log.len(), 1);
 
         assert!(candidate.inlier_count >= 63);
         assert!(candidate.inlier_ratio.is_finite());

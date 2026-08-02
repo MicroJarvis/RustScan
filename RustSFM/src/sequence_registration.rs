@@ -152,6 +152,27 @@ impl FrameRegistrationDiagnostic {
     }
 }
 
+fn append_registration_diagnostic_message(
+    message: Option<String>,
+    debug_log: &[String],
+) -> Option<String> {
+    let diagnostics = debug_log
+        .iter()
+        .filter(|entry| {
+            entry
+                .split_once("gpu_pnp_focal_fallback=")
+                .is_some_and(|(_, fallback)| !fallback.trim().is_empty())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match (message, diagnostics.is_empty()) {
+        (Some(message), true) => Some(message),
+        (Some(message), false) => Some(format!("{message}; {}", diagnostics.join("; "))),
+        (None, true) => None,
+        (None, false) => Some(diagnostics.join("; ")),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SequenceRegistrationResult {
     pub imported_frames: usize,
@@ -806,7 +827,7 @@ pub fn register_remaining_sequence_frames(
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let mut attempt_mapper_config = target_mapper_config.clone();
             attempt_mapper_config.random_seed = attempt_seed;
-            let candidate = register_single_target_from_database_with_pnp_scorer(
+            let attempt = register_single_target_from_database_with_pnp_scorer(
                 &sequence_input,
                 &keyframe_result.database,
                 &current_reference,
@@ -815,6 +836,7 @@ pub fn register_remaining_sequence_frames(
                 &attempt_mapper_config,
                 pnp_scorer.as_deref_mut(),
             )?;
+            let candidate = attempt.candidate;
             let (inlier_count, inlier_ratio, mean_error) = candidate
                 .as_ref()
                 .map(|candidate| {
@@ -831,10 +853,31 @@ pub fn register_remaining_sequence_frames(
                 inlier_count,
                 inlier_ratio,
                 mean_error,
-                candidate
-                    .is_none()
-                    .then(|| "PnP did not produce a finite pose".to_owned()),
+                append_registration_diagnostic_message(
+                    candidate
+                        .is_none()
+                        .then(|| "PnP did not produce a finite pose".to_owned()),
+                    &attempt.debug_log,
+                ),
             );
+            if let Some(message) = append_registration_diagnostic_message(None, &attempt.debug_log)
+            {
+                task.emit(SfmTaskEvent {
+                    sequence: 0,
+                    elapsed_ms: 0,
+                    stage: SfmTaskStage::FullFrameRegistration,
+                    operation: SfmTaskOperation::RegisterFrameAttempt,
+                    kind: SfmTaskEventKind::Progress,
+                    completed: Some(diagnostics.iter().map(|item| item.attempts).sum()),
+                    total: None,
+                    registered_images: Some(registered_names.len()),
+                    sparse_points: Some(current_reconstruction.points.len()),
+                    image_id: Some(frames[target].id),
+                    pair: None,
+                    message: Some(message),
+                    issue: None,
+                });
+            }
             if !accepts_registration(&diagnostics[target], config) {
                 continue;
             }
@@ -865,7 +908,10 @@ pub fn register_remaining_sequence_frames(
             current_reconstruction = candidate.reconstruction;
             current_reference = accepted_sparse;
             diagnostics[target].status = FrameRegistrationStatus::Registered;
-            diagnostics[target].message = Some(format!("registered in {round:?} round"));
+            diagnostics[target].message = append_registration_diagnostic_message(
+                Some(format!("registered in {round:?} round")),
+                &attempt.debug_log,
+            );
             match accepted_this_round.binary_search(&target) {
                 Ok(_) => {}
                 Err(position) => accepted_this_round.insert(position, target),
@@ -2105,6 +2151,25 @@ where
 #[cfg(test)]
 mod task6_tests {
     use super::*;
+
+    #[test]
+    fn registration_diagnostic_keeps_gpu_focal_fallback_context() {
+        let message = append_registration_diagnostic_message(
+            Some("registered in Narrow round".to_owned()),
+            &["incremental_registration gpu_pnp_focal_fallback=gpu dispatch failed".to_owned()],
+        )
+        .expect("diagnostic message");
+
+        assert!(message.contains("registered in Narrow round"));
+        assert!(message.contains("gpu_pnp_focal_fallback=gpu dispatch failed"));
+        assert_eq!(
+            append_registration_diagnostic_message(
+                None,
+                &["incremental_registration gpu_pnp_focal_fallback=".to_owned()],
+            ),
+            None
+        );
+    }
 
     fn single_frame(path: PathBuf) -> SequenceFrame {
         SequenceFrame {
