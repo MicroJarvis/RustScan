@@ -379,14 +379,22 @@ impl PipelineCoordinator {
                 completed,
                 total,
                 ..
-            } = event
+            } = &event
             {
+                if !self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.stage == *stage)
+                {
+                    continue;
+                }
                 if self
                     .last_progress_persisted
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
                 {
                     if completed.is_some() || total.is_some() {
-                        self.store.record_stage_progress(stage, completed, total)?;
+                        self.store
+                            .record_stage_progress(*stage, *completed, *total)?;
                         self.last_progress_persisted = Some(Instant::now());
                     }
                 }

@@ -2,6 +2,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::{Receiver, Sender};
 use rust_viewer::pipeline::{
     ArtifactValidation, ImportWorker, PendingArtifact, PipelineCommand, PipelineCoordinator,
     PipelineEvent, PipelineProgressDetail, PipelineWorkers, PnpWorker, SfmWorker, StageRequest,
@@ -217,6 +218,62 @@ fn incomplete_pnp_coverage_needs_attention_and_never_starts_training() {
         std::iter::from_fn(|| coordinator.try_next_event()).any(|event| matches!(
             event,
             rust_viewer::pipeline::PipelineEvent::NeedsAttention(_)
+        ))
+    );
+}
+
+#[test]
+fn stale_progress_after_pnp_failure_is_discarded_without_replacing_the_error() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = ProjectStore::create(
+        temporary.path().join("LateProgress.rustscanproject"),
+        ProjectCreateRequest::new("Late progress", SourceSpec::managed_images("fixture")),
+    )
+    .unwrap();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let (trigger_sender, trigger_receiver) = crossbeam_channel::bounded(1);
+    let (emitted_sender, emitted_receiver) = crossbeam_channel::bounded(1);
+    let workers = PipelineWorkers::new(
+        FakeStageWorker::new(ProjectStage::Import, Arc::clone(&trace)),
+        FakeStageWorker::new(ProjectStage::KeyframeSfm, Arc::clone(&trace)),
+        LateProgressFailingPnpWorker {
+            trigger: trigger_receiver,
+            emitted: emitted_sender,
+        },
+        FakeStageWorker::new(ProjectStage::Training, trace),
+    );
+    let mut coordinator = PipelineCoordinator::new(store, workers).unwrap();
+
+    coordinator.send(PipelineCommand::StartAutomatic).unwrap();
+    coordinator.drive_until_idle().unwrap();
+    let pnp = coordinator
+        .store()
+        .manifest()
+        .try_stage(ProjectStage::FullFramePnp)
+        .unwrap();
+    assert_eq!(pnp.state(), StageState::Failed);
+    assert_eq!(pnp.error().unwrap().detail, "terminal PnP error");
+
+    trigger_sender.send(()).unwrap();
+    emitted_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    coordinator.drive_once().unwrap();
+
+    let pnp = coordinator
+        .store()
+        .manifest()
+        .try_stage(ProjectStage::FullFramePnp)
+        .unwrap();
+    assert_eq!(pnp.state(), StageState::Failed);
+    assert_eq!(pnp.error().unwrap().detail, "terminal PnP error");
+    assert!(
+        !std::iter::from_fn(|| coordinator.try_next_event()).any(|event| matches!(
+            event,
+            PipelineEvent::StageProgress {
+                stage: ProjectStage::FullFramePnp,
+                ..
+            }
         ))
     );
 }
@@ -712,6 +769,11 @@ struct IncompletePnpWorker {
     trace: Arc<Mutex<Vec<ProjectStage>>>,
 }
 
+struct LateProgressFailingPnpWorker {
+    trigger: Receiver<()>,
+    emitted: Sender<()>,
+}
+
 struct FailingThenSucceedingSfmWorker {
     trace: Arc<Mutex<Vec<ProjectStage>>>,
     failures_remaining: Arc<Mutex<usize>>,
@@ -812,5 +874,43 @@ impl PnpWorker for IncompletePnpWorker {
                 registered_frames: 4,
             },
         )])
+    }
+}
+
+impl PnpWorker for LateProgressFailingPnpWorker {
+    fn run(
+        &self,
+        _request: StageRequest,
+        _control: WorkerControl,
+        events: WorkerEventSink,
+    ) -> WorkerOutcome {
+        let trigger = self.trigger.clone();
+        let emitted = self.emitted.clone();
+        thread::spawn(move || {
+            if trigger.recv().is_ok() {
+                events.progress(
+                    Some(9),
+                    Some(10),
+                    PipelineProgressDetail::Sfm {
+                        operation: "MatchPairBatch".to_owned(),
+                        image_id: None,
+                        pair: None,
+                        registered_images: None,
+                        sparse_points: None,
+                    },
+                );
+                let _ = emitted.send(());
+            }
+        });
+        WorkerOutcome::Failed(rust_viewer::project::ProjectErrorRecord {
+            code: "terminal_failure".to_owned(),
+            stage: ProjectStage::FullFramePnp,
+            summary: "PnP failed".to_owned(),
+            detail: "terminal PnP error".to_owned(),
+            frame_id: None,
+            pair: None,
+            retryable: false,
+            suggested_actions: Vec::new(),
+        })
     }
 }
