@@ -234,15 +234,16 @@ impl PipelineCoordinator {
             return Ok(());
         }
         let workspace = self.store.begin_stage(stage)?;
+        let attempt = workspace.attempt();
         let request = StageRequest {
             stage,
-            attempt: workspace.attempt(),
+            attempt,
             project_root: self.store.root().to_path_buf(),
             workspace_path: workspace.path().to_path_buf(),
             manifest: self.store.manifest().clone(),
         };
         let control = WorkerControl::new();
-        let sink = WorkerEventSink::new(stage, self.worker_event_sender.clone());
+        let sink = WorkerEventSink::new(stage, attempt, self.worker_event_sender.clone());
         let (outcome_sender, outcome_receiver) = bounded(1);
         let workers = self.workers.clone();
         let worker_control = control.clone();
@@ -376,17 +377,24 @@ impl PipelineCoordinator {
         while let Ok(event) = self.worker_event_receiver.try_recv() {
             if let PipelineEvent::StageProgress {
                 stage,
+                attempt,
                 completed,
                 total,
                 ..
-            } = event
+            } = &event
             {
+                if !self.active.as_ref().is_some_and(|active| {
+                    active.stage == *stage && active.workspace.attempt() == *attempt
+                }) {
+                    continue;
+                }
                 if self
                     .last_progress_persisted
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
                 {
                     if completed.is_some() || total.is_some() {
-                        self.store.record_stage_progress(stage, completed, total)?;
+                        self.store
+                            .record_stage_progress(*stage, *completed, *total)?;
                         self.last_progress_persisted = Some(Instant::now());
                     }
                 }

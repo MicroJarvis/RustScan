@@ -238,7 +238,12 @@ impl PnpWorker for RustSfmWorker {
         if let Err(error) = fs::remove_dir_all(&output) {
             return worker_failure(ProjectStage::FullFramePnp, RustSfmWorkerError::Io(error));
         }
-        outcome_for_registration(result.imported_frames, result.registered_frames, artifacts)
+        registration_outcome_with_backend_progress(
+            &events,
+            &result,
+            registration_config.use_gpu_pnp,
+            artifacts,
+        )
     }
 }
 
@@ -691,6 +696,53 @@ fn outcome_for_registration(
     WorkerOutcome::Succeeded(artifacts)
 }
 
+fn registration_outcome_with_backend_progress(
+    events: &WorkerEventSink,
+    registration: &rustsfm::SequenceRegistrationResult,
+    gpu_pnp_enabled: bool,
+    artifacts: Vec<PendingArtifact>,
+) -> WorkerOutcome {
+    let outcome = outcome_for_registration(
+        registration.imported_frames,
+        registration.registered_frames,
+        artifacts,
+    );
+    if matches!(outcome, WorkerOutcome::Succeeded(_)) {
+        events.progress(
+            Some(registration.registered_frames as u64),
+            Some(registration.imported_frames as u64),
+            PipelineProgressDetail::Sfm {
+                operation: gpu_pnp_focal_backend_progress(registration, gpu_pnp_enabled),
+                image_id: None,
+                pair: None,
+                registered_images: Some(registration.registered_frames),
+                sparse_points: None,
+            },
+        );
+    }
+    outcome
+}
+
+fn gpu_pnp_focal_backend_progress(
+    registration: &rustsfm::SequenceRegistrationResult,
+    gpu_pnp_enabled: bool,
+) -> String {
+    if !gpu_pnp_enabled {
+        return "CPU PnP configured".to_owned();
+    }
+    if let Some(reason) = registration.diagnostics.iter().find_map(|diagnostic| {
+        diagnostic
+            .message
+            .as_deref()
+            .and_then(|message| message.split_once("gpu_pnp_focal_fallback="))
+            .map(|(_, reason)| reason.trim())
+            .filter(|reason| !reason.is_empty())
+    }) {
+        return format!("GPU PnP-focal CPU fallback: {reason}");
+    }
+    "GPU PnP configured; no focal-solver fallback reported".to_owned()
+}
+
 fn worker_failure(stage: ProjectStage, error: RustSfmWorkerError) -> WorkerOutcome {
     WorkerOutcome::Failed(ProjectErrorRecord {
         code: "rustsfm_failed".to_owned(),
@@ -737,7 +789,9 @@ mod tests {
     use crate::media::{
         import_image_sequence, ImageSequenceImportRequest, MediaEventSink, MediaImportEvent,
     };
-    use crate::pipeline::{StageRequest, WorkerOutcome};
+    use crate::pipeline::{
+        ArtifactValidation, PendingArtifact, PipelineProgressDetail, StageRequest, WorkerOutcome,
+    };
     use crate::project::{
         ArtifactRef, KeyframeSelectionMode, ProjectCreateRequest, ProjectStage, ProjectStore,
         SourceSpec, StageState,
@@ -1175,6 +1229,94 @@ mod tests {
         let outcome = super::outcome_for_registration(2, 1, Vec::new());
 
         assert!(matches!(outcome, WorkerOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn gpu_pnp_focal_backend_progress_distinguishes_cpu_fallback_reason() {
+        let mut diagnostic = rustsfm::FrameRegistrationDiagnostic::new(
+            7,
+            rustsfm::FrameRegistrationStatus::Registered,
+        );
+        diagnostic.message = Some(
+            "registered in Narrow round; gpu_pnp_focal_fallback=gpu dispatch failed".to_owned(),
+        );
+        let mut registration = rustsfm::SequenceRegistrationResult {
+            imported_frames: 2,
+            registered_frames: 2,
+            frame_ids: vec![0, 7],
+            diagnostics: vec![
+                rustsfm::FrameRegistrationDiagnostic::new(
+                    0,
+                    rustsfm::FrameRegistrationStatus::Keyframe,
+                ),
+                diagnostic,
+            ],
+            sparse_model: std::path::PathBuf::from("fixture/sparse/0"),
+        };
+
+        assert_eq!(
+            super::gpu_pnp_focal_backend_progress(&registration, true),
+            "GPU PnP-focal CPU fallback: gpu dispatch failed"
+        );
+        assert_eq!(
+            super::gpu_pnp_focal_backend_progress(&registration, false),
+            "CPU PnP configured"
+        );
+        registration.diagnostics[1].message = None;
+        assert_eq!(
+            super::gpu_pnp_focal_backend_progress(&registration, true),
+            "GPU PnP configured; no focal-solver fallback reported"
+        );
+    }
+
+    #[test]
+    fn backend_completion_progress_is_emitted_only_for_successful_registration() {
+        let registration = rustsfm::SequenceRegistrationResult {
+            imported_frames: 2,
+            registered_frames: 2,
+            frame_ids: vec![0, 1],
+            diagnostics: Vec::new(),
+            sparse_model: std::path::PathBuf::from("fixture/sparse/0"),
+        };
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let events = crate::pipeline::WorkerEventSink::new(ProjectStage::FullFramePnp, 1, sender);
+
+        let outcome = super::registration_outcome_with_backend_progress(
+            &events,
+            &registration,
+            true,
+            vec![PendingArtifact::new(
+                "result.json",
+                br#"{}"#.to_vec(),
+                ArtifactValidation::Json,
+            )],
+        );
+
+        assert!(matches!(outcome, WorkerOutcome::Succeeded(_)));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            crate::pipeline::PipelineEvent::StageProgress {
+                stage: ProjectStage::FullFramePnp,
+                attempt: 1,
+                completed: Some(2),
+                total: Some(2),
+                detail: PipelineProgressDetail::Sfm { operation, .. },
+            } if operation == "GPU PnP configured; no focal-solver fallback reported"
+        ));
+
+        let incomplete = rustsfm::SequenceRegistrationResult {
+            registered_frames: 1,
+            ..registration
+        };
+        let outcome = super::registration_outcome_with_backend_progress(
+            &events,
+            &incomplete,
+            true,
+            Vec::new(),
+        );
+
+        assert!(matches!(outcome, WorkerOutcome::Failed(_)));
+        assert!(receiver.try_recv().is_err());
     }
 
     fn adaptive_result(selected_frame_ids: &[u32]) -> rustsfm::AdaptiveKeyframeSelectionResult {

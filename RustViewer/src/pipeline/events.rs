@@ -54,6 +54,7 @@ pub enum PipelineEvent {
     ManifestChanged(ProjectManifest),
     StageProgress {
         stage: ProjectStage,
+        attempt: u32,
         completed: Option<u64>,
         total: Option<u64>,
         detail: PipelineProgressDetail,

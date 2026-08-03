@@ -79,12 +79,17 @@ impl WorkerControl {
 #[derive(Clone)]
 pub struct WorkerEventSink {
     stage: ProjectStage,
+    attempt: u32,
     sender: Sender<PipelineEvent>,
 }
 
 impl WorkerEventSink {
-    pub(crate) fn new(stage: ProjectStage, sender: Sender<PipelineEvent>) -> Self {
-        Self { stage, sender }
+    pub(crate) fn new(stage: ProjectStage, attempt: u32, sender: Sender<PipelineEvent>) -> Self {
+        Self {
+            stage,
+            attempt,
+            sender,
+        }
     }
     pub fn progress(
         &self,
@@ -94,6 +99,7 @@ impl WorkerEventSink {
     ) {
         let _ = self.sender.try_send(PipelineEvent::StageProgress {
             stage: self.stage,
+            attempt: self.attempt,
             completed,
             total,
             detail,

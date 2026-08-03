@@ -447,7 +447,10 @@ impl ViewerApp {
                             .and_then(|root| committed_project_colmap_root(root, &manifest));
                     }
                 }
-                PipelineEvent::StageProgress { detail, .. } => {
+                PipelineEvent::StageProgress { stage, detail, .. } => {
+                    if should_ignore_pipeline_progress(self.project_summary.as_ref(), stage) {
+                        continue;
+                    }
                     self.ui_state.is_loading = true;
                     let message = pipeline_progress_message(&detail);
                     self.record_activity(
@@ -1193,6 +1196,18 @@ fn pipeline_activity_title(detail: &PipelineProgressDetail) -> &'static str {
         PipelineProgressDetail::Sfm { .. } => "Pose solve",
         PipelineProgressDetail::Training { .. } => "Gaussian train",
     }
+}
+
+fn should_ignore_pipeline_progress(
+    project: Option<&ProjectSessionSummary>,
+    stage: ProjectStage,
+) -> bool {
+    matches!(
+        stage,
+        ProjectStage::KeyframeSfm | ProjectStage::FullFramePnp
+    ) && project.is_some_and(|summary| {
+        summary.pose_state == crate::project::ProjectStagePresentation::Failed
+    })
 }
 
 fn project_stage_title(stage: ProjectStage) -> &'static str {
@@ -2085,6 +2100,38 @@ mod tests {
             reconstruction_failure_message(&manifest).as_deref(),
             Some("Feature matching exhausted the available pairs.")
         );
+    }
+
+    #[test]
+    fn persisted_pose_failure_ignores_late_pnp_progress() {
+        let mut manifest = crate::project::ProjectManifest::new(
+            "Failure fixture",
+            SourceSpec::managed_images("fixture"),
+        );
+        manifest.stage_mut(ProjectStage::Import).state = crate::project::StageState::Succeeded;
+        manifest.stage_mut(ProjectStage::KeyframeSfm).state = crate::project::StageState::Succeeded;
+        let stage = manifest.stage_mut(ProjectStage::FullFramePnp);
+        stage.state = crate::project::StageState::Failed;
+        stage.error = Some(ProjectErrorRecord {
+            code: "rustsfm_failed".to_owned(),
+            stage: ProjectStage::FullFramePnp,
+            summary: "RustSFM pose solve failed".to_owned(),
+            detail: "GPU PnP-focal fallback could not solve".to_owned(),
+            frame_id: None,
+            pair: None,
+            retryable: true,
+            suggested_actions: vec![SuggestedAction::Retry],
+        });
+        let summary = ProjectSessionSummary::from_manifest(&manifest);
+
+        assert!(should_ignore_pipeline_progress(
+            Some(&summary),
+            ProjectStage::FullFramePnp
+        ));
+        assert!(!should_ignore_pipeline_progress(
+            Some(&summary),
+            ProjectStage::Import
+        ));
     }
 
     fn fixture_colmap_root() -> PathBuf {
