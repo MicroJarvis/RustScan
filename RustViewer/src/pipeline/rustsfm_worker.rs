@@ -1279,7 +1279,7 @@ mod tests {
             sparse_model: std::path::PathBuf::from("fixture/sparse/0"),
         };
         let (sender, receiver) = crossbeam_channel::bounded(1);
-        let events = crate::pipeline::WorkerEventSink::new(ProjectStage::FullFramePnp, sender);
+        let events = crate::pipeline::WorkerEventSink::new(ProjectStage::FullFramePnp, 1, sender);
 
         let outcome = super::registration_outcome_with_backend_progress(
             &events,
@@ -1297,6 +1297,7 @@ mod tests {
             receiver.recv().unwrap(),
             crate::pipeline::PipelineEvent::StageProgress {
                 stage: ProjectStage::FullFramePnp,
+                attempt: 1,
                 completed: Some(2),
                 total: Some(2),
                 detail: PipelineProgressDetail::Sfm { operation, .. },
