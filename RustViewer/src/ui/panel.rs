@@ -16,6 +16,7 @@ pub enum PanelAction {
     OpenCheckpoint,
     OpenGaussian,
     OpenMesh,
+    OpenProject,
     OpenColmap,
     OpenImages,
     RunReconstruction,
@@ -209,6 +210,10 @@ pub fn draw_side_panel(
 
         if draw_blue_button(ui, "🔷", "Load Mesh") {
             actions.push(PanelAction::OpenMesh);
+        }
+
+        if draw_blue_button(ui, "🗂", "Open RustScan Project") {
+            actions.push(PanelAction::OpenProject);
         }
 
         let load_colmap_clicked = ui
