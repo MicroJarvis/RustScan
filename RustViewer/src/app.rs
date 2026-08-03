@@ -419,6 +419,7 @@ impl ViewerApp {
         let mut colmap_root = None;
         let mut pipeline_error = None;
         let mut project_root = None;
+        let mut persisted_manifest = None;
         let mut events = Vec::new();
 
         if let Some(pipeline) = self.project_pipeline.as_mut() {
@@ -426,27 +427,24 @@ impl ViewerApp {
                 pipeline_error = Some(error.to_string());
             }
             project_root = Some(pipeline.store().root().to_path_buf());
+            persisted_manifest = Some(pipeline.store().manifest().clone());
             while let Some(event) = pipeline.try_next_event() {
                 events.push(event);
             }
         }
 
+        if let Some(manifest) = persisted_manifest.as_ref() {
+            self.sync_project_summary_from_manifest(manifest);
+            if reconstruction_failure_message(manifest).is_none() && should_load_dataset {
+                colmap_root = project_root
+                    .as_deref()
+                    .and_then(|root| committed_project_colmap_root(root, manifest));
+            }
+        }
+
         for event in events {
             match event {
-                PipelineEvent::ManifestChanged(manifest) => {
-                    let project_summary = ProjectSessionSummary::from_manifest(&manifest);
-                    self.record_project_activity(&project_summary);
-                    self.project_summary = Some(project_summary);
-                    if let Some(error) = reconstruction_failure_message(&manifest) {
-                        self.ui_state.is_loading = false;
-                        self.ui_state.loading_message = None;
-                        self.ui_state.load_error = Some(error);
-                    } else if should_load_dataset {
-                        colmap_root = project_root
-                            .as_deref()
-                            .and_then(|root| committed_project_colmap_root(root, &manifest));
-                    }
-                }
+                PipelineEvent::ManifestChanged(_) => {}
                 PipelineEvent::StageProgress { stage, detail, .. } => {
                     if should_ignore_pipeline_progress(self.project_summary.as_ref(), stage) {
                         continue;
@@ -483,6 +481,19 @@ impl ViewerApp {
         }
         if let Some(root) = colmap_root {
             self.load_committed_project_colmap(root);
+        }
+    }
+
+    fn sync_project_summary_from_manifest(&mut self, manifest: &crate::project::ProjectManifest) {
+        let project_summary = ProjectSessionSummary::from_manifest(manifest);
+        if self.project_summary.as_ref() != Some(&project_summary) {
+            self.record_project_activity(&project_summary);
+            self.project_summary = Some(project_summary);
+        }
+        if let Some(error) = reconstruction_failure_message(manifest) {
+            self.ui_state.is_loading = false;
+            self.ui_state.loading_message = None;
+            self.ui_state.load_error = Some(error);
         }
     }
 
@@ -2100,6 +2111,60 @@ mod tests {
             reconstruction_failure_message(&manifest).as_deref(),
             Some("Feature matching exhausted the available pairs.")
         );
+    }
+
+    #[test]
+    fn persisted_pose_failure_refreshes_retry_control_when_terminal_event_is_missing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project_root = temporary.path().join("Retry.rustscanproject");
+        let first = temporary.path().join("frame-01.png");
+        let second = temporary.path().join("frame-02.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]))
+            .save(&first)
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([56, 34, 12, 255]))
+            .save(&second)
+            .unwrap();
+        let imported = create_image_sequence_project(vec![first, second], project_root).unwrap();
+        let mut store = ProjectStore::open(&imported.path).unwrap();
+        store.begin_stage(ProjectStage::KeyframeSfm).unwrap();
+        store
+            .mark_stage_failed(
+                ProjectStage::KeyframeSfm,
+                ProjectErrorRecord {
+                    code: "rustsfm_failed".to_owned(),
+                    stage: ProjectStage::KeyframeSfm,
+                    summary: "RustSFM pose solve failed".to_owned(),
+                    detail: "GPU compute pipeline was unavailable.".to_owned(),
+                    frame_id: None,
+                    pair: None,
+                    retryable: true,
+                    suggested_actions: vec![SuggestedAction::Retry],
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let mut app = viewer_app_for_test();
+        app.project_summary = Some(ProjectSessionSummary::from_states(
+            crate::project::SourceKind::ImageSequence,
+            crate::project::StageState::Succeeded,
+            crate::project::StageState::Running,
+            crate::project::StageState::Ready,
+            crate::project::StageState::Ready,
+        ));
+        app.project_pipeline = Some(new_project_pipeline(&imported.path).unwrap());
+        app.ui_state.is_loading = true;
+
+        app.drive_project_pipeline();
+
+        let snapshot = WorkbenchSnapshot {
+            project: app.project_summary.clone(),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.primary_command().label, "Retry pose solve");
+        assert!(snapshot.primary_command().enabled);
+        assert!(!app.ui_state.is_loading);
     }
 
     #[test]
