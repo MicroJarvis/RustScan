@@ -218,6 +218,17 @@ impl PnpWorker for RustSfmWorker {
                 );
             }
         };
+        events.progress(
+            Some(result.registered_frames as u64),
+            Some(result.imported_frames as u64),
+            PipelineProgressDetail::Sfm {
+                operation: gpu_pnp_focal_backend_progress(&result, registration_config.use_gpu_pnp),
+                image_id: None,
+                pair: None,
+                registered_images: Some(result.registered_frames),
+                sparse_points: None,
+            },
+        );
         if !result.has_complete_coverage() {
             let _ = fs::remove_dir_all(&output);
             return worker_failure(
@@ -689,6 +700,26 @@ fn outcome_for_registration(
         );
     }
     WorkerOutcome::Succeeded(artifacts)
+}
+
+fn gpu_pnp_focal_backend_progress(
+    registration: &rustsfm::SequenceRegistrationResult,
+    gpu_pnp_enabled: bool,
+) -> String {
+    if !gpu_pnp_enabled {
+        return "CPU PnP-focal completed".to_owned();
+    }
+    if let Some(reason) = registration.diagnostics.iter().find_map(|diagnostic| {
+        diagnostic
+            .message
+            .as_deref()
+            .and_then(|message| message.split_once("gpu_pnp_focal_fallback="))
+            .map(|(_, reason)| reason.trim())
+            .filter(|reason| !reason.is_empty())
+    }) {
+        return format!("GPU PnP-focal CPU fallback: {reason}");
+    }
+    "GPU PnP-focal completed".to_owned()
 }
 
 fn worker_failure(stage: ProjectStage, error: RustSfmWorkerError) -> WorkerOutcome {
@@ -1175,6 +1206,44 @@ mod tests {
         let outcome = super::outcome_for_registration(2, 1, Vec::new());
 
         assert!(matches!(outcome, WorkerOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn gpu_pnp_focal_backend_progress_distinguishes_cpu_fallback_reason() {
+        let mut diagnostic = rustsfm::FrameRegistrationDiagnostic::new(
+            7,
+            rustsfm::FrameRegistrationStatus::Registered,
+        );
+        diagnostic.message = Some(
+            "registered in Narrow round; gpu_pnp_focal_fallback=gpu dispatch failed".to_owned(),
+        );
+        let mut registration = rustsfm::SequenceRegistrationResult {
+            imported_frames: 2,
+            registered_frames: 2,
+            frame_ids: vec![0, 7],
+            diagnostics: vec![
+                rustsfm::FrameRegistrationDiagnostic::new(
+                    0,
+                    rustsfm::FrameRegistrationStatus::Keyframe,
+                ),
+                diagnostic,
+            ],
+            sparse_model: std::path::PathBuf::from("fixture/sparse/0"),
+        };
+
+        assert_eq!(
+            super::gpu_pnp_focal_backend_progress(&registration, true),
+            "GPU PnP-focal CPU fallback: gpu dispatch failed"
+        );
+        assert_eq!(
+            super::gpu_pnp_focal_backend_progress(&registration, false),
+            "CPU PnP-focal completed"
+        );
+        registration.diagnostics[1].message = None;
+        assert_eq!(
+            super::gpu_pnp_focal_backend_progress(&registration, true),
+            "GPU PnP-focal completed"
+        );
     }
 
     fn adaptive_result(selected_frame_ids: &[u32]) -> rustsfm::AdaptiveKeyframeSelectionResult {
