@@ -44,7 +44,7 @@ impl ProjectSessionSummary {
                 .map(|error| error.detail.trim())
                 .filter(|detail| !detail.is_empty())
             {
-                summary.pose_detail = detail.to_owned();
+                summary.pose_detail = compact_pose_failure_detail(detail);
             }
         }
 
@@ -87,6 +87,26 @@ impl ProjectSessionSummary {
     fn with_imported_frame_count(mut self, imported_frame_count: Option<u64>) -> Self {
         self.imported_frame_count = imported_frame_count;
         self
+    }
+}
+
+fn compact_pose_failure_detail(detail: &str) -> String {
+    const MAX_CHARACTERS: usize = 96;
+    let first_line = detail
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut characters = first_line.chars();
+    let prefix = characters
+        .by_ref()
+        .take(MAX_CHARACTERS.saturating_sub(3))
+        .collect::<String>();
+
+    if characters.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
     }
 }
 
@@ -213,5 +233,36 @@ mod tests {
             summary.pose_detail,
             "GPU PnP-focal fallback could not solve"
         );
+    }
+
+    #[test]
+    fn project_session_failed_pose_compacts_multiline_error_detail() {
+        let mut manifest = ProjectManifest::new(
+            "Failure fixture",
+            crate::project::SourceSpec::managed_images("fixture"),
+        );
+        manifest.stage_mut(ProjectStage::Import).state = StageState::Succeeded;
+        let stage = manifest.stage_mut(ProjectStage::KeyframeSfm);
+        stage.state = StageState::Failed;
+        stage.error = Some(crate::project::ProjectErrorRecord {
+            code: "rustsfm_failed".to_owned(),
+            stage: ProjectStage::KeyframeSfm,
+            summary: "RustSFM pose solve failed".to_owned(),
+            detail: format!(
+                "GPU PnP-focal pipeline failed: {}\n\nCaused by:\n{}",
+                "adapter validation error ".repeat(12),
+                "full wgpu stack trace ".repeat(12),
+            ),
+            frame_id: None,
+            pair: None,
+            retryable: true,
+            suggested_actions: Vec::new(),
+        });
+
+        let summary = ProjectSessionSummary::from_manifest(&manifest);
+
+        assert!(!summary.pose_detail.contains('\n'));
+        assert!(summary.pose_detail.chars().count() <= 96);
+        assert!(summary.pose_detail.ends_with("..."));
     }
 }
