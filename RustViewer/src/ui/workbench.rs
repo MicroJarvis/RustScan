@@ -469,6 +469,10 @@ fn draw_image_import_menu(ui: &mut Ui, label: RichText, actions: &mut Vec<PanelA
             ui.close();
         }
         ui.separator();
+        if ui.button("打开 RustScan 项目...").clicked() {
+            actions.push(PanelAction::OpenProject);
+            ui.close();
+        }
         if ui.button("打开 COLMAP 工作区...").clicked() {
             actions.push(PanelAction::OpenColmap);
             ui.close();

@@ -56,6 +56,7 @@ enum AssetLoadKind {
     Checkpoint,
     Gaussian,
     Mesh,
+    ProjectPackage,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -270,6 +271,11 @@ impl ViewerApp {
     }
 
     fn handle_asset_load(&mut self, kind: AssetLoadKind, path: PathBuf) {
+        if matches!(kind, AssetLoadKind::ProjectPackage) {
+            self.handle_project_package_load(path);
+            return;
+        }
+
         let mut next_loaded_splats = None;
         let mut load_succeeded = false;
 
@@ -290,6 +296,7 @@ impl ViewerApp {
                     }
                 }
                 AssetLoadKind::Mesh => crate::loader::mesh::load_mesh(&path, &mut scene),
+                AssetLoadKind::ProjectPackage => unreachable!("handled before scene loading"),
             };
 
             match result {
@@ -385,33 +392,50 @@ impl ViewerApp {
                         return;
                     }
                 };
-                if let Ok(mut scene) = self.scene.lock() {
-                    clear_scene_preserving_layers(&mut scene);
-                }
-                self.loaded_colmap = None;
-                self.loaded_splats = None;
-                let project_summary =
-                    ProjectSessionSummary::from_manifest(pipeline.store().manifest());
-                self.record_project_activity(&project_summary);
-                self.project_summary = Some(project_summary);
-                self.project_path = Some(pipeline.store().root().to_path_buf());
-                self.project_pipeline = Some(pipeline);
-                self.ui_state.dataset_summary = None;
-                self.ui_state.load_error = None;
-                self.ui_state.training_error = None;
-                self.ui_state.training_state = crate::training::TrainingSessionState::Idle;
-                self.ui_state.training_progress = Default::default();
-                self.viewport_bridge = self.new_gpu_viewport_bridge();
-                self.viewport_texture = None;
-                self.viewport_dirty = true;
-                self.viewport_last_motion = None;
-                self.viewport_render_error = None;
+                self.activate_project_pipeline(pipeline);
             }
             Err(error) => {
                 self.record_activity("Import", error.clone(), PipelineStageState::Failed);
                 self.ui_state.load_error = Some(error);
             }
         }
+    }
+
+    fn handle_project_package_load(&mut self, path: PathBuf) {
+        match new_project_pipeline(&path) {
+            Ok(pipeline) => self.activate_project_pipeline(pipeline),
+            Err(error) => {
+                self.ui_state.is_loading = false;
+                self.ui_state.loading_message = None;
+                self.record_activity("Project", error.clone(), PipelineStageState::Failed);
+                self.ui_state.load_error = Some(error);
+            }
+        }
+    }
+
+    fn activate_project_pipeline(&mut self, pipeline: PipelineCoordinator) {
+        if let Ok(mut scene) = self.scene.lock() {
+            clear_scene_preserving_layers(&mut scene);
+        }
+        self.loaded_colmap = None;
+        self.loaded_splats = None;
+        let project_summary = ProjectSessionSummary::from_manifest(pipeline.store().manifest());
+        self.record_project_activity(&project_summary);
+        self.project_summary = Some(project_summary);
+        self.project_path = Some(pipeline.store().root().to_path_buf());
+        self.project_pipeline = Some(pipeline);
+        self.ui_state.is_loading = false;
+        self.ui_state.loading_message = None;
+        self.ui_state.dataset_summary = None;
+        self.ui_state.load_error = None;
+        self.ui_state.training_error = None;
+        self.ui_state.training_state = crate::training::TrainingSessionState::Idle;
+        self.ui_state.training_progress = Default::default();
+        self.viewport_bridge = self.new_gpu_viewport_bridge();
+        self.viewport_texture = None;
+        self.viewport_dirty = true;
+        self.viewport_last_motion = None;
+        self.viewport_render_error = None;
     }
 
     fn drive_project_pipeline(&mut self) {
@@ -580,6 +604,7 @@ impl ViewerApp {
                 PanelAction::OpenCheckpoint => self.spawn_file_dialog(AssetLoadKind::Checkpoint),
                 PanelAction::OpenGaussian => self.spawn_file_dialog(AssetLoadKind::Gaussian),
                 PanelAction::OpenMesh => self.spawn_file_dialog(AssetLoadKind::Mesh),
+                PanelAction::OpenProject => self.spawn_project_package_dialog(),
                 PanelAction::OpenColmap => self.spawn_colmap_load(),
                 PanelAction::StartTraining => self.start_training(),
                 PanelAction::StopTraining => self.stop_training(),
@@ -636,11 +661,27 @@ impl ViewerApp {
                     rfd::FileDialog::new().add_filter("Splats", &["splat", "ply"])
                 }
                 AssetLoadKind::Mesh => rfd::FileDialog::new().add_filter("Mesh", &["obj", "ply"]),
+                AssetLoadKind::ProjectPackage => {
+                    unreachable!("project packages use a directory dialog")
+                }
             };
 
             if let Some(path) = dialog.pick_file() {
                 let _ = tx.send(AppCommand::LoadAsset { kind, path });
             }
+        });
+    }
+
+    fn spawn_project_package_dialog(&self) {
+        let tx = self.command_tx.clone();
+        std::thread::spawn(move || {
+            let Some(path) = rfd::FileDialog::new().pick_folder() else {
+                return;
+            };
+            let _ = tx.send(AppCommand::LoadAsset {
+                kind: AssetLoadKind::ProjectPackage,
+                path,
+            });
         });
     }
 
@@ -1046,6 +1087,7 @@ fn startup_asset_kind(path: &std::path::Path) -> AssetLoadKind {
         Some("json") => AssetLoadKind::Checkpoint,
         Some("obj") => AssetLoadKind::Mesh,
         Some("ply") | Some("splat") => AssetLoadKind::Gaussian,
+        Some("rustscanproject") => AssetLoadKind::ProjectPackage,
         _ => AssetLoadKind::Gaussian,
     }
 }
@@ -2002,6 +2044,14 @@ mod tests {
     }
 
     #[test]
+    fn startup_asset_kind_recognizes_rustscan_projects() {
+        assert!(matches!(
+            startup_asset_kind(std::path::Path::new("Retry.rustscanproject")),
+            AssetLoadKind::ProjectPackage
+        ));
+    }
+
+    #[test]
     fn imported_image_project_waits_for_explicit_reconstruction_start() {
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("frame-01.png");
@@ -2157,6 +2207,50 @@ mod tests {
         app.ui_state.is_loading = true;
 
         app.drive_project_pipeline();
+
+        let snapshot = WorkbenchSnapshot {
+            project: app.project_summary.clone(),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.primary_command().label, "Retry pose solve");
+        assert!(snapshot.primary_command().enabled);
+        assert!(!app.ui_state.is_loading);
+    }
+
+    #[test]
+    fn opening_failed_project_restores_retry_pose_command() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project_root = temporary.path().join("Retry.rustscanproject");
+        let first = temporary.path().join("frame-01.png");
+        let second = temporary.path().join("frame-02.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 255]))
+            .save(&first)
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([56, 34, 12, 255]))
+            .save(&second)
+            .unwrap();
+        let imported = create_image_sequence_project(vec![first, second], project_root).unwrap();
+        let mut store = ProjectStore::open(&imported.path).unwrap();
+        store.begin_stage(ProjectStage::KeyframeSfm).unwrap();
+        store
+            .mark_stage_failed(
+                ProjectStage::KeyframeSfm,
+                ProjectErrorRecord {
+                    code: "rustsfm_failed".to_owned(),
+                    stage: ProjectStage::KeyframeSfm,
+                    summary: "RustSFM pose solve failed".to_owned(),
+                    detail: "GPU compute pipeline was unavailable.".to_owned(),
+                    frame_id: None,
+                    pair: None,
+                    retryable: true,
+                    suggested_actions: vec![SuggestedAction::Retry],
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let mut app = viewer_app_for_test();
+        app.handle_project_package_load(imported.path);
 
         let snapshot = WorkbenchSnapshot {
             project: app.project_summary.clone(),
