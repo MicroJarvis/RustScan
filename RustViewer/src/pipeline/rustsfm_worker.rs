@@ -602,13 +602,20 @@ fn progress_sink<'a>(
             event.completed.map(|value| value as u64),
             event.total.map(|value| value as u64),
             PipelineProgressDetail::Sfm {
-                operation: format!("{:?}", event.operation),
+                operation: progress_operation_label(event.operation),
                 image_id: event.image_id,
                 pair: event.pair,
                 registered_images: event.registered_images,
                 sparse_points: event.sparse_points,
             },
         );
+    }
+}
+
+fn progress_operation_label(operation: rustsfm::SfmTaskOperation) -> String {
+    match operation {
+        rustsfm::SfmTaskOperation::MatchPairBatch => "Matching image pairs".to_owned(),
+        operation => format!("{operation:?}"),
     }
 }
 
@@ -1267,6 +1274,42 @@ mod tests {
             super::gpu_pnp_focal_backend_progress(&registration, true),
             "GPU PnP configured; no focal-solver fallback reported"
         );
+    }
+
+    #[test]
+    fn match_pair_batch_progress_uses_user_facing_label() {
+        let control = crate::pipeline::WorkerControl::new();
+        let sfm_control = rustsfm::SfmTaskControl::new();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let events = crate::pipeline::WorkerEventSink::new(ProjectStage::KeyframeSfm, 3, sender);
+        let mut sink = super::progress_sink(&control, &events, &sfm_control);
+
+        sink(rustsfm::SfmTaskEvent {
+            sequence: 11,
+            elapsed_ms: 240,
+            stage: rustsfm::SfmTaskStage::FeatureMatching,
+            operation: rustsfm::SfmTaskOperation::MatchPairBatch,
+            kind: rustsfm::SfmTaskEventKind::Progress,
+            completed: Some(32),
+            total: Some(100),
+            registered_images: None,
+            sparse_points: None,
+            image_id: None,
+            pair: Some((7, 8)),
+            message: Some("ignored event message".to_owned()),
+            issue: None,
+        });
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            crate::pipeline::PipelineEvent::StageProgress {
+                stage: ProjectStage::KeyframeSfm,
+                attempt: 3,
+                completed: Some(32),
+                total: Some(100),
+                detail: PipelineProgressDetail::Sfm { operation, pair, .. },
+            } if operation == "Matching image pairs" && pair == Some((7, 8))
+        ));
     }
 
     #[test]

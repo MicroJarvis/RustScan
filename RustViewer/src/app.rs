@@ -469,12 +469,18 @@ impl ViewerApp {
         for event in events {
             match event {
                 PipelineEvent::ManifestChanged(_) => {}
-                PipelineEvent::StageProgress { stage, detail, .. } => {
+                PipelineEvent::StageProgress {
+                    stage,
+                    completed,
+                    total,
+                    detail,
+                    ..
+                } => {
                     if should_ignore_pipeline_progress(self.project_summary.as_ref(), stage) {
                         continue;
                     }
                     self.ui_state.is_loading = true;
-                    let message = pipeline_progress_message(&detail);
+                    let message = pipeline_progress_message(&detail, completed, total);
                     self.record_activity(
                         pipeline_activity_title(&detail),
                         message.clone(),
@@ -1225,7 +1231,11 @@ fn reconstruction_failure_message(manifest: &crate::project::ProjectManifest) ->
         })
 }
 
-fn pipeline_progress_message(detail: &PipelineProgressDetail) -> String {
+fn pipeline_progress_message(
+    detail: &PipelineProgressDetail,
+    completed: Option<u64>,
+    total: Option<u64>,
+) -> String {
     match detail {
         PipelineProgressDetail::Media { frame_id } => frame_id
             .map(|id| format!("Importing frame {id}"))
@@ -1236,6 +1246,11 @@ fn pipeline_progress_message(detail: &PipelineProgressDetail) -> String {
             ..
         } => registered_images
             .map(|count| format!("{operation}: {count} poses"))
+            .or_else(|| {
+                completed
+                    .zip(total)
+                    .map(|(completed, total)| format!("{operation}: {completed}/{total}"))
+            })
             .unwrap_or_else(|| operation.clone()),
         PipelineProgressDetail::Training { iteration, .. } => {
             format!("Training iteration {iteration}")
@@ -1946,6 +1961,26 @@ mod tests {
                 crate::ui::panel::SourceSelection::Images,
             ),
             PanelAction::ImportImageFiles,
+        );
+    }
+
+    #[test]
+    fn sfm_pair_progress_message_includes_completed_and_total() {
+        let detail = PipelineProgressDetail::Sfm {
+            operation: "Matching image pairs".to_owned(),
+            image_id: None,
+            pair: Some((7, 8)),
+            registered_images: None,
+            sparse_points: None,
+        };
+
+        assert_eq!(
+            pipeline_progress_message(&detail, Some(32), Some(100)),
+            "Matching image pairs: 32/100"
+        );
+        assert_eq!(
+            pipeline_progress_message(&detail, Some(32), None),
+            "Matching image pairs"
         );
     }
 
