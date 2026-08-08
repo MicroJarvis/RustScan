@@ -128,7 +128,7 @@ pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use feature_matching_db::{
     debug_two_view_database_pair, match_features_to_database, match_features_to_database_with_task,
     DebugTwoViewOptions, DebugTwoViewReport, MatchFeaturesOptions, MatchFeaturesReport,
-    MatchFeaturesVerifierEvent, MatchFeaturesVerifierTrace,
+    MatchFeaturesTimingReport, MatchFeaturesVerifierEvent, MatchFeaturesVerifierTrace,
 };
 pub use global_mapper::{
     pairwise_matches_from_pairs, run_global_mapper, run_global_reconstruction,

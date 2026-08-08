@@ -53,9 +53,51 @@ pub struct MatchFeaturesReport {
     pub verified_pairs: usize,
     pub total_matches: usize,
     pub matching_seconds: f64,
+    #[serde(default)]
+    pub timings: MatchFeaturesTimingReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verifier_trace: Option<MatchFeaturesVerifierTrace>,
     pub pairs: Vec<MatchFeaturesPairReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MatchFeaturesTimingReport {
+    pub backend_initialization_seconds: f64,
+    pub database_prepare_seconds: f64,
+    pub pair_compute_seconds: f64,
+    pub database_commit_seconds: f64,
+    pub event_sink_seconds: f64,
+    pub unclassified_seconds: f64,
+    pub attempted_pairs: usize,
+    pub produced_pair_reports: usize,
+    pub committed_batches: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MatchPairBatchTiming {
+    database_commit_seconds: f64,
+    event_sink_seconds: f64,
+    produced_pair_reports: usize,
+}
+
+impl MatchFeaturesTimingReport {
+    fn finish(&mut self, total_seconds: f64) {
+        let classified_seconds = self.backend_initialization_seconds
+            + self.database_prepare_seconds
+            + self.pair_compute_seconds
+            + self.database_commit_seconds
+            + self.event_sink_seconds;
+        self.unclassified_seconds = (total_seconds - classified_seconds).max(0.0);
+    }
+
+    fn record_batch(&mut self, attempted_pairs: usize, batch: MatchPairBatchTiming) {
+        self.attempted_pairs += attempted_pairs;
+        self.produced_pair_reports += batch.produced_pair_reports;
+        self.committed_batches += 1;
+        self.database_commit_seconds += batch.database_commit_seconds;
+        self.event_sink_seconds += batch.event_sink_seconds;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +223,7 @@ pub fn match_features_to_database_with_task(
     options.sift_matching.check()?;
     task.checkpoint()?;
     let started = Instant::now();
+    let prepare_started = Instant::now();
     let db = ColmapDatabase::open(database_path)?;
     let mut images = db.read_all_images()?;
     if images.len() < 2 {
@@ -207,7 +250,12 @@ pub fn match_features_to_database_with_task(
     };
     let pair_count = input_pairs.len();
     let batch_size = options.task_pair_batch_size.max(1);
+    let mut timings = MatchFeaturesTimingReport {
+        database_prepare_seconds: prepare_started.elapsed().as_secs_f64(),
+        ..MatchFeaturesTimingReport::default()
+    };
 
+    let backend_started = Instant::now();
     #[cfg(feature = "gpu-wgpu")]
     let computed_backend = if !options.use_existing_matches && options.sift_matching.use_gpu {
         Some(ComputedGpuBackend::new()?)
@@ -224,6 +272,7 @@ pub fn match_features_to_database_with_task(
     if options.sift_matching.use_gpu {
         bail!("RustSFM was built without gpu-wgpu support");
     }
+    timings.backend_initialization_seconds = backend_started.elapsed().as_secs_f64();
 
     let fifo_enabled = options.use_existing_matches
         && !options.sift_matching.use_gpu
@@ -263,6 +312,7 @@ pub fn match_features_to_database_with_task(
     } else {
         for batch in input_pairs.chunks(batch_size) {
             task.checkpoint()?;
+            let compute_started = Instant::now();
             let pair_reports = if options.use_existing_matches {
                 existing_match_pair_reports_for_inputs(
                     batch,
@@ -282,11 +332,12 @@ pub fn match_features_to_database_with_task(
                     computed_backend.as_ref(),
                 )?
             };
+            timings.pair_compute_seconds += compute_started.elapsed().as_secs_f64();
             let input_indices = batch
                 .iter()
                 .map(MatchPairInput::indices)
                 .collect::<Vec<_>>();
-            commit_and_emit_pair_batch(
+            let batch_timing = commit_and_emit_pair_batch(
                 &db,
                 &frames,
                 &image_id_by_index,
@@ -300,6 +351,7 @@ pub fn match_features_to_database_with_task(
                 &mut total_matches,
                 &mut completed,
             )?;
+            timings.record_batch(batch.len(), batch_timing);
         }
         None
     };
@@ -320,6 +372,13 @@ pub fn match_features_to_database_with_task(
             .cmp(&right.left_image)
             .then_with(|| left.right_image.cmp(&right.right_image))
     });
+    if fifo_enabled {
+        timings.attempted_pairs = pair_count;
+        timings.produced_pair_reports = reports.len();
+        timings.committed_batches = pair_count.div_ceil(batch_size);
+    }
+    let matching_seconds = started.elapsed().as_secs_f64();
+    timings.finish(matching_seconds);
 
     Ok(MatchFeaturesReport {
         database: database_path.to_path_buf(),
@@ -331,7 +390,8 @@ pub fn match_features_to_database_with_task(
             .filter(|pair| pair.num_inliers >= options.min_inliers)
             .count(),
         total_matches,
-        matching_seconds: started.elapsed().as_secs_f64(),
+        matching_seconds,
+        timings,
         verifier_trace,
         pairs: reports,
     })
@@ -339,6 +399,7 @@ pub fn match_features_to_database_with_task(
 
 pub(crate) struct ExplicitPairMatchingSession {
     use_gpu: bool,
+    initialization_seconds: f64,
     #[cfg(feature = "gpu-wgpu")]
     computed_backend: Option<ComputedGpuBackend>,
 }
@@ -346,6 +407,7 @@ pub(crate) struct ExplicitPairMatchingSession {
 impl ExplicitPairMatchingSession {
     pub(crate) fn new(options: &MatchFeaturesOptions) -> Result<Self> {
         options.sift_matching.check()?;
+        let started = Instant::now();
         #[cfg(feature = "gpu-wgpu")]
         let computed_backend = if options.sift_matching.use_gpu {
             Some(ComputedGpuBackend::new()?)
@@ -358,6 +420,7 @@ impl ExplicitPairMatchingSession {
         }
         Ok(Self {
             use_gpu: options.sift_matching.use_gpu,
+            initialization_seconds: started.elapsed().as_secs_f64(),
             #[cfg(feature = "gpu-wgpu")]
             computed_backend,
         })
@@ -396,6 +459,7 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
     }
     task.checkpoint()?;
     let started = Instant::now();
+    let prepare_started = Instant::now();
     let db = ColmapDatabase::open(database_path)?;
     let mut seen = std::collections::BTreeSet::new();
     let mut endpoint_ids = std::collections::BTreeSet::new();
@@ -446,12 +510,18 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
     }
 
     let pair_count = inputs.len();
+    let mut timings = MatchFeaturesTimingReport {
+        backend_initialization_seconds: session.initialization_seconds,
+        database_prepare_seconds: prepare_started.elapsed().as_secs_f64(),
+        ..MatchFeaturesTimingReport::default()
+    };
     let mut reports = Vec::new();
     let mut total_matches = 0usize;
     let mut completed = 0usize;
     let mut did_clear = false;
     for batch in inputs.chunks(options.task_pair_batch_size.max(1)) {
         task.checkpoint()?;
+        let compute_started = Instant::now();
         let pair_reports = computed_match_pair_reports_for_inputs(
             batch,
             &frames,
@@ -460,11 +530,12 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             #[cfg(feature = "gpu-wgpu")]
             session.computed_backend.as_ref(),
         )?;
+        timings.pair_compute_seconds += compute_started.elapsed().as_secs_f64();
         let indices = batch
             .iter()
             .map(MatchPairInput::indices)
             .collect::<Vec<_>>();
-        commit_and_emit_pair_batch(
+        let batch_timing = commit_and_emit_pair_batch(
             &db,
             &frames,
             &image_id_by_index,
@@ -478,12 +549,15 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             &mut total_matches,
             &mut completed,
         )?;
+        timings.record_batch(batch.len(), batch_timing);
     }
     reports.sort_by(|left, right| {
         left.left_image
             .cmp(&right.left_image)
             .then_with(|| left.right_image.cmp(&right.right_image))
     });
+    let matching_seconds = started.elapsed().as_secs_f64();
+    timings.finish(matching_seconds + timings.backend_initialization_seconds);
     Ok(MatchFeaturesReport {
         database: database_path.to_path_buf(),
         backend: matching_backend_name(&options.sift_matching).to_owned(),
@@ -494,7 +568,8 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             .filter(|pair| pair.num_inliers >= options.min_inliers)
             .count(),
         total_matches,
-        matching_seconds: started.elapsed().as_secs_f64(),
+        matching_seconds,
+        timings,
         verifier_trace: None,
         pairs: reports,
     })
@@ -877,7 +952,8 @@ fn commit_and_emit_pair_batch(
     reports: &mut Vec<MatchFeaturesPairReport>,
     total_matches: &mut usize,
     completed: &mut usize,
-) -> Result<()> {
+) -> Result<MatchPairBatchTiming> {
+    let commit_started = Instant::now();
     let (batch_reports, batch_matches) = db.with_transaction(|| {
         if !*did_clear {
             if options.clear_existing && !options.use_existing_matches {
@@ -889,6 +965,8 @@ fn commit_and_emit_pair_batch(
         }
         persist_pair_reports(db, frames, image_id_by_index, options, pair_reports)
     })?;
+    let database_commit_seconds = commit_started.elapsed().as_secs_f64();
+    let produced_pair_reports = batch_reports.len();
     *did_clear = true;
     *total_matches += batch_matches;
     reports.extend(batch_reports);
@@ -896,6 +974,7 @@ fn commit_and_emit_pair_batch(
     let last_pair = input_indices
         .last()
         .map(|&(left, right)| (image_id_by_index[left].1, image_id_by_index[right].1));
+    let event_started = Instant::now();
     task.emit(SfmTaskEvent {
         sequence: 0,
         elapsed_ms: 0,
@@ -911,8 +990,13 @@ fn commit_and_emit_pair_batch(
         message: None,
         issue: None,
     });
+    let event_sink_seconds = event_started.elapsed().as_secs_f64();
     task.checkpoint()?;
-    Ok(())
+    Ok(MatchPairBatchTiming {
+        database_commit_seconds,
+        event_sink_seconds,
+        produced_pair_reports,
+    })
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -2099,6 +2183,53 @@ mod tests {
     #[test]
     fn match_features_task_batch_default_is_32() {
         assert_eq!(MatchFeaturesOptions::default().task_pair_batch_size, 32);
+    }
+
+    #[test]
+    fn match_feature_timing_defaults_when_deserializing_legacy_report() -> Result<()> {
+        let report: MatchFeaturesReport = serde_json::from_value(serde_json::json!({
+            "database": "database.db",
+            "backend": "cpu_match_and_score",
+            "pair_count": 0,
+            "matched_pairs": 0,
+            "verified_pairs": 0,
+            "total_matches": 0,
+            "matching_seconds": 0.25,
+            "pairs": []
+        }))?;
+
+        assert_eq!(report.timings, MatchFeaturesTimingReport::default());
+        Ok(())
+    }
+
+    #[test]
+    fn match_feature_timing_counts_attempted_pairs_and_committed_batches() -> Result<()> {
+        for batch_size in [1, 2] {
+            let (_dir, db_path, input_pairs) = controlled_computed_matching_fixture()?;
+            let report = match_features_to_database(
+                &db_path,
+                &controlled_computed_matching_options(batch_size),
+            )?;
+
+            assert_eq!(report.timings.attempted_pairs, input_pairs.len());
+            assert_eq!(report.timings.produced_pair_reports, report.pairs.len());
+            assert_eq!(
+                report.timings.committed_batches,
+                input_pairs.len().div_ceil(batch_size)
+            );
+            for seconds in [
+                report.timings.backend_initialization_seconds,
+                report.timings.database_prepare_seconds,
+                report.timings.pair_compute_seconds,
+                report.timings.database_commit_seconds,
+                report.timings.event_sink_seconds,
+                report.timings.unclassified_seconds,
+            ] {
+                assert!(seconds.is_finite());
+                assert!(seconds >= 0.0);
+            }
+        }
+        Ok(())
     }
 
     #[test]
