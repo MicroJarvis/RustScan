@@ -682,8 +682,8 @@ git commit -m "docs(rustsfm): record gpu geometry profile"
 - [x] Resolve every Critical or Important finding and re-run affected tests.
 - [x] Sync `codex/match-pair-telemetry` with current `main`.
 - [x] Run the complete affected RustSFM and RustViewer regression suites after synchronization.
-- [ ] Merge into `main` only when tests pass.
-- [ ] Remove the worktree and delete the merged feature branch.
+- [x] Merge into `main` only when tests pass.
+- [x] Remove the worktree and delete the merged feature branch.
 
 Final-gate evidence (2026-08-09): the specification reviewer found no Critical or Important
 deviation. The code-quality reviewer found one Important timing-accounting issue: a reused
@@ -700,3 +700,9 @@ image-pair progress UI. Post-sync RustSFM ran 657 library tests: 637 passed and 
 failures remained (19 missing external COLMAP fixtures and one adapter-required legacy SIFT benchmark).
 Post-sync RustViewer ran 152 library tests: 150 passed; the same two macOS security-scoped file tests
 failed. The new RustViewer pair-progress test and the new RustSFM session-accounting test both passed.
+
+Integration completed in merge commit `f6e7adc`. Merged-main focused verification passed for the
+session-accounting test (1/1), GPU geometry timing tests (3/3), RustViewer pair-progress test (1/1),
+gpu-wgpu `cargo check`, formatting, and diff checks. The clean
+`.worktrees/match-pair-telemetry` worktree and merged `codex/match-pair-telemetry` branch were then
+removed; unrelated worktrees and pre-existing untracked main-worktree files were left untouched.
