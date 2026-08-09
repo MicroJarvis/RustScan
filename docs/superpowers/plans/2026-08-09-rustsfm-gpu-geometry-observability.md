@@ -677,10 +677,26 @@ git commit -m "docs(rustsfm): record gpu geometry profile"
 
 ### Final Review And Integration Gate
 
-- [ ] Dispatch a final specification reviewer across the prerequisite and Task 1-4 commits.
-- [ ] Dispatch a final code-quality reviewer across the prerequisite and Task 1-4 commits.
-- [ ] Resolve every Critical or Important finding and re-run affected tests.
-- [ ] Sync `codex/match-pair-telemetry` with current `main`.
-- [ ] Run the complete affected RustSFM and RustViewer regression suites after synchronization.
+- [x] Dispatch a final specification reviewer across the prerequisite and Task 1-4 commits.
+- [x] Dispatch a final code-quality reviewer across the prerequisite and Task 1-4 commits.
+- [x] Resolve every Critical or Important finding and re-run affected tests.
+- [x] Sync `codex/match-pair-telemetry` with current `main`.
+- [x] Run the complete affected RustSFM and RustViewer regression suites after synchronization.
 - [ ] Merge into `main` only when tests pass.
 - [ ] Remove the worktree and delete the merged feature branch.
+
+Final-gate evidence (2026-08-09): the specification reviewer found no Critical or Important
+deviation. The code-quality reviewer found one Important timing-accounting issue: a reused
+`ExplicitPairMatchingSession` attributed its one-time backend initialization to every call. It also
+reported a Low issue where the empty-pair clear transaction was unclassified. Commit `735c10c`
+resolved both: warm session calls report zero backend initialization, the creating wrapper reports
+the initialization exactly once in both its wall time and timing breakdown, and the empty-pair clear
+is recorded as database commit time. A deterministic synthetic one-second session test failed before
+the fix and passed afterward. Affected verification passed: explicit session 2/2, timing 2/2, FIFO
+2/2, benchmark 5/5, sequence registration 60/60, gpu-wgpu `cargo check`, formatting, and diff checks.
+
+The branch then merged current `main` commit `400a618` without conflict, preserving RustViewer's live
+image-pair progress UI. Post-sync RustSFM ran 657 library tests: 637 passed and the same 20 prerequisite
+failures remained (19 missing external COLMAP fixtures and one adapter-required legacy SIFT benchmark).
+Post-sync RustViewer ran 152 library tests: 150 passed; the same two macOS security-scoped file tests
+failed. The new RustViewer pair-progress test and the new RustSFM session-accounting test both passed.
