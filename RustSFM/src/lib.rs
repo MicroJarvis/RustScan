@@ -116,6 +116,8 @@ pub mod parity;
 
 pub mod gpu;
 
+pub use gpu::{WgpuGeometryTiming, WgpuModelScorerTiming, WgpuRansacStageTiming};
+
 pub use compare::{
     compare_colmap, compare_colmap_stages, parse_compare_stages, CompareReport, CompareStage,
     CompareStagesReport,

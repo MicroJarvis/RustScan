@@ -491,7 +491,7 @@ git commit -m "feat(rustsfm): attribute gpu ransac timing"
 - Modify: `RustSFM/src/lib.rs`
 - Test: `RustSFM/src/feature/feature_matching_db.rs`
 
-- [ ] **Step 1: Add failing serialization and aggregation tests**
+- [x] **Step 1: Add failing serialization and aggregation tests**
 
 Extend `match_feature_timing_defaults_when_deserializing_legacy_report` to assert
 `gpu_geometry_detail == WgpuGeometryTiming::default()`. Add
@@ -500,7 +500,7 @@ Extend `match_feature_timing_defaults_when_deserializing_legacy_report` to asser
 counts and durations. Call `record_computed_batch` and assert exact stage values. Preserve the
 existing descriptor timing assertions in the same test module.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -511,7 +511,7 @@ CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
 
 Expected: compilation or assertion failure because the match report does not carry geometry detail.
 
-- [ ] **Step 3: Add the backward-compatible report field**
+- [x] **Step 3: Add the backward-compatible report field**
 
 Add to `MatchFeaturesTimingReport`:
 
@@ -524,7 +524,7 @@ Re-export `WgpuGeometryTiming`, `WgpuModelScorerTiming`, and `WgpuRansacStageTim
 benchmark/report consumers can deserialize the nested field without private-type leakage. Keep
 `gpu_geometry_seconds` and all descriptor timing fields unchanged.
 
-- [ ] **Step 4: Collect and aggregate per-pair timing**
+- [x] **Step 4: Collect and aggregate per-pair timing**
 
 Add `gpu_geometry_timing: WgpuGeometryTiming` to `ComputedMatchPairBatch`. In the GPU loop, call
 `estimate_pair_geometry_with_options_and_cameras_gpu_profiled`, add its timing even when the geometry
@@ -534,7 +534,7 @@ zero. `record_computed_batch` adds the nested value to `MatchFeaturesTimingRepor
 Do not alter pair order, transaction batching, `task_pair_batch_size`, progress events,
 pause/cancel checks, or result filtering.
 
-- [ ] **Step 5: Run matching regressions**
+- [x] **Step 5: Run matching regressions**
 
 Run:
 
@@ -553,7 +553,7 @@ git diff --check
 
 Expected: all report, transaction, progress, pause, cancellation, and compile checks pass.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```bash
 git add RustSFM/src/feature/feature_matching_db.rs RustSFM/src/lib.rs \

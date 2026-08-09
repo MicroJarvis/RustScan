@@ -5,8 +5,9 @@ use crate::database::{
 };
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 #[cfg(feature = "gpu-wgpu")]
-use crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu;
+use crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu_profiled;
 use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions};
+use crate::gpu::WgpuGeometryTiming;
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher, WgpuSiftMatcherTiming};
 use crate::mapper::pair_geometry_to_colmap_two_view_geometry;
@@ -74,6 +75,8 @@ pub struct MatchFeaturesTimingReport {
     pub committed_batches: usize,
     pub gpu_descriptor_match_seconds: f64,
     pub gpu_geometry_seconds: f64,
+    #[serde(default)]
+    pub gpu_geometry_detail: WgpuGeometryTiming,
     pub gpu_descriptor_pack_seconds: f64,
     pub gpu_buffer_prepare_seconds: f64,
     pub gpu_submit_seconds: f64,
@@ -138,6 +141,7 @@ struct ComputedMatchPairBatch {
     reports: Vec<PairReportInput>,
     gpu_descriptor_match_seconds: f64,
     gpu_geometry_seconds: f64,
+    gpu_geometry_timing: WgpuGeometryTiming,
     #[cfg(feature = "gpu-wgpu")]
     gpu_matcher_timing: WgpuSiftMatcherTiming,
 }
@@ -146,6 +150,7 @@ impl MatchFeaturesTimingReport {
     fn record_computed_batch(&mut self, batch: &ComputedMatchPairBatch) {
         self.gpu_descriptor_match_seconds += batch.gpu_descriptor_match_seconds;
         self.gpu_geometry_seconds += batch.gpu_geometry_seconds;
+        self.gpu_geometry_detail += batch.gpu_geometry_timing;
         #[cfg(feature = "gpu-wgpu")]
         self.record_gpu_matcher_timing(batch.gpu_matcher_timing);
     }
@@ -1106,6 +1111,7 @@ fn computed_match_pair_reports_for_inputs(
         let mut reports = Vec::with_capacity(pairs.len());
         let mut gpu_descriptor_match_seconds = 0.0;
         let mut gpu_geometry_seconds = 0.0;
+        let mut gpu_geometry_timing = WgpuGeometryTiming::default();
         let mut gpu_matcher_timing = WgpuSiftMatcherTiming::default();
         for &(left, right) in &pairs {
             let descriptor_started = Instant::now();
@@ -1117,7 +1123,7 @@ fn computed_match_pair_reports_for_inputs(
             gpu_descriptor_match_seconds += descriptor_started.elapsed().as_secs_f64();
             gpu_matcher_timing += pair_timing;
             let geometry_started = Instant::now();
-            if let Some(report) = estimate_existing_or_computed_pair_gpu(
+            let (report, pair_geometry_timing) = estimate_existing_or_computed_pair_gpu_profiled(
                 &backend.scorer,
                 left,
                 right,
@@ -1125,7 +1131,9 @@ fn computed_match_pair_reports_for_inputs(
                 frames,
                 cameras,
                 options,
-            )? {
+            )?;
+            gpu_geometry_timing += pair_geometry_timing;
+            if let Some(report) = report {
                 reports.push(report);
             }
             gpu_geometry_seconds += geometry_started.elapsed().as_secs_f64();
@@ -1134,6 +1142,7 @@ fn computed_match_pair_reports_for_inputs(
             reports,
             gpu_descriptor_match_seconds,
             gpu_geometry_seconds,
+            gpu_geometry_timing,
             gpu_matcher_timing,
         });
     }
@@ -1151,6 +1160,7 @@ fn computed_match_pair_reports_for_inputs(
             .collect(),
         gpu_descriptor_match_seconds: 0.0,
         gpu_geometry_seconds: 0.0,
+        gpu_geometry_timing: WgpuGeometryTiming::default(),
         #[cfg(feature = "gpu-wgpu")]
         gpu_matcher_timing: WgpuSiftMatcherTiming::default(),
     })
@@ -2111,19 +2121,38 @@ fn estimate_existing_or_computed_pair_gpu(
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
 ) -> Result<Option<PairReportInput>> {
+    estimate_existing_or_computed_pair_gpu_profiled(
+        scorer, left, right, matches, frames, cameras, options,
+    )
+    .map(|(report, _)| report)
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn estimate_existing_or_computed_pair_gpu_profiled(
+    scorer: &WgpuModelScorer,
+    left: usize,
+    right: usize,
+    matches: Vec<rustslam::Match>,
+    frames: &[ImageFrame],
+    cameras: &[CameraModel],
+    options: &MatchFeaturesOptions,
+) -> Result<(Option<PairReportInput>, WgpuGeometryTiming)> {
     let min_matches_for_estimation = if options.use_existing_matches {
         options.min_inliers
     } else {
         options.min_num_matches
     };
     if matches.len() < min_matches_for_estimation {
-        return Ok(if options.use_existing_matches {
-            Some((left, right, matches, None))
-        } else {
-            None
-        });
+        return Ok((
+            if options.use_existing_matches {
+                Some((left, right, matches, None))
+            } else {
+                None
+            },
+            WgpuGeometryTiming::default(),
+        ));
     }
-    let geometry = estimate_pair_geometry_with_options_and_cameras_gpu(
+    let (geometry, timing) = estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
         scorer,
         left,
         right,
@@ -2144,7 +2173,7 @@ fn estimate_existing_or_computed_pair_gpu(
             ..PairEstimationOptions::default()
         },
     )?;
-    Ok(Some((left, right, matches, geometry)))
+    Ok((Some((left, right, matches, geometry)), timing))
 }
 
 /// Build vocabulary-tree candidate pairs from the in-memory frame descriptors.
@@ -2324,6 +2353,10 @@ mod tests {
         }))?;
 
         assert_eq!(report.timings, MatchFeaturesTimingReport::default());
+        assert_eq!(
+            report.timings.gpu_geometry_detail,
+            crate::gpu::WgpuGeometryTiming::default()
+        );
         Ok(())
     }
 
@@ -2381,6 +2414,72 @@ mod tests {
         assert!((report.gpu_descriptor_pack_seconds - 0.1).abs() < 1.0e-12);
         assert!((report.gpu_readback_wait_seconds - 0.25).abs() < 1.0e-12);
         assert!((report.gpu_cpu_postprocess_seconds - 0.6).abs() < 1.0e-12);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_geometry_timing_folds_into_match_feature_report() {
+        let mut report = MatchFeaturesTimingReport::default();
+        let batch = ComputedMatchPairBatch {
+            reports: Vec::new(),
+            gpu_descriptor_match_seconds: 0.0,
+            gpu_geometry_seconds: 9.0,
+            gpu_matcher_timing: WgpuSiftMatcherTiming::default(),
+            gpu_geometry_timing: crate::gpu::WgpuGeometryTiming {
+                essential: crate::gpu::WgpuRansacStageTiming {
+                    session_prepare_seconds: 0.1,
+                    scorer: crate::gpu::WgpuModelScorerTiming {
+                        score_calls: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                fundamental: crate::gpu::WgpuRansacStageTiming {
+                    candidate_generation_seconds: 0.2,
+                    scorer: crate::gpu::WgpuModelScorerTiming {
+                        score_calls: 10,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                homography: crate::gpu::WgpuRansacStageTiming {
+                    cpu_refinement_seconds: 0.3,
+                    scorer: crate::gpu::WgpuModelScorerTiming {
+                        score_calls: 100,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+        };
+
+        report.record_computed_batch(&batch);
+
+        assert_eq!(report.gpu_geometry_seconds, 9.0);
+        assert_eq!(report.gpu_geometry_detail.essential.scorer.score_calls, 1);
+        assert_eq!(
+            report.gpu_geometry_detail.fundamental.scorer.score_calls,
+            10
+        );
+        assert_eq!(
+            report.gpu_geometry_detail.homography.scorer.score_calls,
+            100
+        );
+        assert_eq!(
+            report.gpu_geometry_detail.essential.session_prepare_seconds,
+            0.1
+        );
+        assert_eq!(
+            report
+                .gpu_geometry_detail
+                .fundamental
+                .candidate_generation_seconds,
+            0.2
+        );
+        assert_eq!(
+            report.gpu_geometry_detail.homography.cpu_refinement_seconds,
+            0.3
+        );
     }
 
     #[test]
