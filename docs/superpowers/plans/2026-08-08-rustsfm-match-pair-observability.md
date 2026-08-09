@@ -172,3 +172,78 @@ git commit -m "feat(rustsfm): profile gpu match-pair work"
 ```
 
 Self-review must confirm byte/call accounting, timer nesting, empty-input behavior, and exact result equivalence. No shader, pair scheduling, database, event, pause/cancel, backend selection, or keyframe-count behavior may change.
+
+### Task 3: Repeatable Match-Pair Benchmark Harness
+
+**Files:**
+- Create: `RustSFM/src/diagnostics/match_pair_benchmark.rs`
+- Modify: `RustSFM/src/feature/feature_matching_db.rs`
+- Modify: `RustSFM/src/lib.rs`
+- Modify: `RustSFM/src/cli/mod.rs`
+- Modify: `RustSFM/src/cli/commands.rs`
+- Test: `RustSFM/src/diagnostics/match_pair_benchmark.rs`
+- Test: `RustSFM/src/cli/mod.rs`
+
+- [ ] **Step 1: Write failing benchmark-contract tests**
+
+Add CPU-only tests for a deterministic helper that selects local-window pairs from sorted image IDs. Prove `pair_limit=Some(96)` returns exactly 96 pairs, while `pair_limit=None` preserves a generated set larger than 2,890 pairs. Add a tiny-database test proving two repetitions return two structured run summaries and leave the source database's matches and two-view geometries unchanged. Add CLI parsing tests for `benchmark-match-pairs --window 5 --pair-limit 96 --repetitions 3 --use-gpu --output-json report.json`.
+
+- [ ] **Step 2: Run focused tests and verify RED**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu match_pair_benchmark -- --nocapture
+```
+
+Expected: compilation failure because the benchmark types, pair selector, and CLI command do not exist.
+
+- [ ] **Step 3: Add the isolated benchmark API**
+
+Create serializable `MatchPairBenchmarkReport` and `MatchPairBenchmarkRun` records. The top-level report must contain the source database path, copied byte count, database-copy duration, requested pair limit, actual pair count, repetition count, one-time backend initialization duration, and one summary per run. Each run contains aggregate match counts, `matching_seconds`, and `MatchFeaturesTimingReport`; it must not duplicate every per-pair report.
+
+Add:
+
+```rust
+pub fn benchmark_match_pairs(
+    source_database: &Path,
+    window: usize,
+    pair_limit: Option<usize>,
+    repetitions: usize,
+    options: &MatchFeaturesOptions,
+) -> Result<MatchPairBenchmarkReport>
+```
+
+Reject zero window, zero pair limit, and zero repetitions before creating GPU state. Copy the source database once into a `tempfile::TempDir`, generate local-window pairs from image IDs sorted by `(name, image_id)`, and reuse one `ExplicitPairMatchingSession` for every repetition. Force `clear_existing=true` only on the temporary working database so every run starts from the same persistence state. Keep source database contents unchanged. Report session initialization once; per-run timings must set backend initialization to zero and recompute unclassified time against that run's `matching_seconds`.
+
+- [ ] **Step 4: Add the CLI command and structured output**
+
+Add `benchmark-match-pairs` with `--database`, `--window` (default 5), optional `--pair-limit`, `--repetitions` (default 1), `--use-gpu`, optional `--output-json`, `--random-seed` (default 0), and `--log-level`. Build matching options from RustSFM defaults with `task_pair_batch_size=1`, matching RustViewer's current pair commit cadence. Print a one-line aggregate and write pretty JSON when requested.
+
+The command must not add a default pair or image cap. `--pair-limit` is an explicit benchmark-only request and must not be threaded into RustViewer or `MapperConfig`.
+
+- [ ] **Step 5: Verify focused behavior and CLI parsing**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu match_pair_benchmark -- --nocapture
+```
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --bin rustsfm --no-default-features --features gpu-wgpu benchmark_match_pairs -- --nocapture
+```
+
+Expected: all benchmark and parsing tests pass without requiring a GPU adapter.
+
+- [ ] **Step 6: Compile, format, review, and commit**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo check -p rustsfm \
+  --no-default-features --features gpu-wgpu
+cargo fmt --all -- --check
+git diff --check
+git add RustSFM/src/diagnostics/match_pair_benchmark.rs RustSFM/src/feature/feature_matching_db.rs RustSFM/src/lib.rs RustSFM/src/cli/mod.rs RustSFM/src/cli/commands.rs docs/superpowers/plans/2026-08-08-rustsfm-match-pair-observability.md
+git commit -m "feat(rustsfm): add match-pair benchmark harness"
+```
+
+Self-review must confirm the source database is never opened for writes, session initialization is not counted once per repetition, pair selection has no implicit cap, and benchmark-only options do not affect RustViewer behavior.
