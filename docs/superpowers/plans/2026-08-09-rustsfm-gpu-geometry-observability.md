@@ -383,7 +383,7 @@ git commit -m "feat(rustsfm): profile gpu model scorer work"
 - Test: `RustSFM/src/geometry/two_view.rs`
 - Test: `RustSFM/src/geometry/geometry.rs`
 
-- [ ] **Step 1: Write failing stage-attribution and parity tests**
+- [x] **Step 1: Write failing stage-attribution and parity tests**
 
 Add an adapter-optional fixed-seed geometry test that calls the existing GPU entry point and the new
 profiled entry point on identical synthetic correspondences and asserts their `Option<PairGeometry>`
@@ -391,7 +391,7 @@ values are equal. The test must also assert that any non-zero scorer calls appea
 stage fields and that all durations are finite and non-negative. Stage aggregation itself is already
 covered by Task 1's CPU-only test and must not be duplicated here.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -403,7 +403,7 @@ CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
 Expected: compilation failure because the profiled two-view and pair-geometry functions do not
 exist.
 
-- [ ] **Step 3: Return timing from each GPU RANSAC estimator**
+- [x] **Step 3: Return timing from each GPU RANSAC estimator**
 
 Change only the three private GPU RANSAC functions. Each returns its existing model result plus one
 stage timing:
@@ -422,7 +422,7 @@ returned values to `timing.scorer`. Measure existing local optimization/refineme
 `Instant`; do not move them or change their conditions. Every early return must include the current
 timing value.
 
-- [ ] **Step 4: Add a profiled calibrated two-view API**
+- [x] **Step 4: Add a profiled calibrated two-view API**
 
 Add:
 
@@ -446,7 +446,7 @@ GPU profiled caller receives all three stage timing values. The existing GPU fun
 profiled function and discards timing. Essential failure returns Essential timing and zero later
 stages; Fundamental or Homography `None` results retain their measured stage timing.
 
-- [ ] **Step 5: Add a profiled pair-geometry API**
+- [x] **Step 5: Add a profiled pair-geometry API**
 
 In `geometry.rs`, add
 `estimate_pair_geometry_with_options_and_cameras_gpu_profiled` with the current GPU arguments and
@@ -461,7 +461,7 @@ variant and drops timing. For pre-estimation early exits caused by too few match
 `(None, WgpuGeometryTiming::default())`. Do not change match selection, normalization, camera math,
 inlier expansion, triangulation, or report construction.
 
-- [ ] **Step 6: Verify parity and commit**
+- [x] **Step 6: Verify parity and commit**
 
 Run:
 
