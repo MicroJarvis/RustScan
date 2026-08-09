@@ -109,10 +109,14 @@ pub mod visibility_pyramid;
 // Diagnostics and validation harnesses.
 #[path = "diagnostics/compare.rs"]
 pub mod compare;
+#[path = "diagnostics/match_pair_benchmark.rs"]
+pub mod match_pair_benchmark;
 #[path = "diagnostics/parity.rs"]
 pub mod parity;
 
 pub mod gpu;
+
+pub use gpu::{WgpuGeometryTiming, WgpuModelScorerTiming, WgpuRansacStageTiming};
 
 pub use compare::{
     compare_colmap, compare_colmap_stages, parse_compare_stages, CompareReport, CompareStage,
@@ -128,7 +132,7 @@ pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use feature_matching_db::{
     debug_two_view_database_pair, match_features_to_database, match_features_to_database_with_task,
     DebugTwoViewOptions, DebugTwoViewReport, MatchFeaturesOptions, MatchFeaturesReport,
-    MatchFeaturesVerifierEvent, MatchFeaturesVerifierTrace,
+    MatchFeaturesTimingReport, MatchFeaturesVerifierEvent, MatchFeaturesVerifierTrace,
 };
 pub use global_mapper::{
     pairwise_matches_from_pairs, run_global_mapper, run_global_reconstruction,
@@ -150,6 +154,9 @@ pub use mapper::{
     ImageSelectionMethod, IncrementalPipelineCallback, IncrementalPipelineResult,
     IncrementalPipelineStatus, MapperConfig, PipelineCallbackEvent, PipelineCallbackSink,
     ReconstructionSeed, ReconstructionSummary, ReferenceCameraSetup,
+};
+pub use match_pair_benchmark::{
+    benchmark_match_pairs, MatchPairBenchmarkReport, MatchPairBenchmarkRun,
 };
 pub use parity::{compare_database_parity, ParityReport};
 pub use retrieval::{

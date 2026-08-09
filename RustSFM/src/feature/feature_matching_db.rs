@@ -5,10 +5,11 @@ use crate::database::{
 };
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 #[cfg(feature = "gpu-wgpu")]
-use crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu;
+use crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu_profiled;
 use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions};
+use crate::gpu::WgpuGeometryTiming;
 #[cfg(feature = "gpu-wgpu")]
-use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher};
+use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher, WgpuSiftMatcherTiming};
 use crate::mapper::pair_geometry_to_colmap_two_view_geometry;
 use crate::sift::{match_sift_with_options, SiftFeatures, SiftMatchingOptions};
 use crate::task::{SfmTaskContext, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage};
@@ -53,9 +54,106 @@ pub struct MatchFeaturesReport {
     pub verified_pairs: usize,
     pub total_matches: usize,
     pub matching_seconds: f64,
+    #[serde(default)]
+    pub timings: MatchFeaturesTimingReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verifier_trace: Option<MatchFeaturesVerifierTrace>,
     pub pairs: Vec<MatchFeaturesPairReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MatchFeaturesTimingReport {
+    pub backend_initialization_seconds: f64,
+    pub database_prepare_seconds: f64,
+    pub pair_compute_seconds: f64,
+    pub database_commit_seconds: f64,
+    pub event_sink_seconds: f64,
+    pub unclassified_seconds: f64,
+    pub attempted_pairs: usize,
+    pub produced_pair_reports: usize,
+    pub committed_batches: usize,
+    pub gpu_descriptor_match_seconds: f64,
+    pub gpu_geometry_seconds: f64,
+    #[serde(default)]
+    pub gpu_geometry_detail: WgpuGeometryTiming,
+    pub gpu_descriptor_pack_seconds: f64,
+    pub gpu_buffer_prepare_seconds: f64,
+    pub gpu_submit_seconds: f64,
+    pub gpu_readback_total_seconds: f64,
+    pub gpu_readback_copy_submit_seconds: f64,
+    pub gpu_readback_wait_seconds: f64,
+    pub gpu_readback_map_decode_seconds: f64,
+    pub gpu_cpu_postprocess_seconds: f64,
+    pub gpu_match_direction_calls: usize,
+    pub gpu_readback_calls: usize,
+    pub gpu_readback_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MatchPairBatchTiming {
+    database_commit_seconds: f64,
+    event_sink_seconds: f64,
+    produced_pair_reports: usize,
+}
+
+impl MatchFeaturesTimingReport {
+    pub(crate) fn finish(&mut self, total_seconds: f64) {
+        let classified_seconds = self.backend_initialization_seconds
+            + self.database_prepare_seconds
+            + self.pair_compute_seconds
+            + self.database_commit_seconds
+            + self.event_sink_seconds;
+        self.unclassified_seconds = (total_seconds - classified_seconds).max(0.0);
+    }
+
+    fn record_batch(&mut self, attempted_pairs: usize, batch: MatchPairBatchTiming) {
+        self.attempted_pairs += attempted_pairs;
+        self.produced_pair_reports += batch.produced_pair_reports;
+        self.committed_batches += 1;
+        self.database_commit_seconds += batch.database_commit_seconds;
+        self.event_sink_seconds += batch.event_sink_seconds;
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn record_gpu_matcher_timing(&mut self, timing: WgpuSiftMatcherTiming) {
+        self.gpu_descriptor_pack_seconds += timing.descriptor_pack_seconds;
+        self.gpu_buffer_prepare_seconds += timing.buffer_prepare_seconds;
+        self.gpu_submit_seconds += timing.submit_seconds;
+        self.gpu_readback_total_seconds += timing.readback_total_seconds;
+        self.gpu_readback_copy_submit_seconds += timing.readback_copy_submit_seconds;
+        self.gpu_readback_wait_seconds += timing.readback_wait_seconds;
+        self.gpu_readback_map_decode_seconds += timing.readback_map_decode_seconds;
+        self.gpu_cpu_postprocess_seconds += timing.cpu_postprocess_seconds;
+        self.gpu_match_direction_calls = self
+            .gpu_match_direction_calls
+            .saturating_add(timing.direction_calls);
+        self.gpu_readback_calls = self
+            .gpu_readback_calls
+            .saturating_add(timing.readback_calls);
+        self.gpu_readback_bytes = self
+            .gpu_readback_bytes
+            .saturating_add(timing.readback_bytes);
+    }
+}
+
+struct ComputedMatchPairBatch {
+    reports: Vec<PairReportInput>,
+    gpu_descriptor_match_seconds: f64,
+    gpu_geometry_seconds: f64,
+    gpu_geometry_timing: WgpuGeometryTiming,
+    #[cfg(feature = "gpu-wgpu")]
+    gpu_matcher_timing: WgpuSiftMatcherTiming,
+}
+
+impl MatchFeaturesTimingReport {
+    fn record_computed_batch(&mut self, batch: &ComputedMatchPairBatch) {
+        self.gpu_descriptor_match_seconds += batch.gpu_descriptor_match_seconds;
+        self.gpu_geometry_seconds += batch.gpu_geometry_seconds;
+        self.gpu_geometry_detail += batch.gpu_geometry_timing;
+        #[cfg(feature = "gpu-wgpu")]
+        self.record_gpu_matcher_timing(batch.gpu_matcher_timing);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +279,7 @@ pub fn match_features_to_database_with_task(
     options.sift_matching.check()?;
     task.checkpoint()?;
     let started = Instant::now();
+    let prepare_started = Instant::now();
     let db = ColmapDatabase::open(database_path)?;
     let mut images = db.read_all_images()?;
     if images.len() < 2 {
@@ -207,7 +306,12 @@ pub fn match_features_to_database_with_task(
     };
     let pair_count = input_pairs.len();
     let batch_size = options.task_pair_batch_size.max(1);
+    let mut timings = MatchFeaturesTimingReport {
+        database_prepare_seconds: prepare_started.elapsed().as_secs_f64(),
+        ..MatchFeaturesTimingReport::default()
+    };
 
+    let backend_started = Instant::now();
     #[cfg(feature = "gpu-wgpu")]
     let computed_backend = if !options.use_existing_matches && options.sift_matching.use_gpu {
         Some(ComputedGpuBackend::new()?)
@@ -224,6 +328,7 @@ pub fn match_features_to_database_with_task(
     if options.sift_matching.use_gpu {
         bail!("RustSFM was built without gpu-wgpu support");
     }
+    timings.backend_initialization_seconds = backend_started.elapsed().as_secs_f64();
 
     let fifo_enabled = options.use_existing_matches
         && !options.sift_matching.use_gpu
@@ -245,7 +350,10 @@ pub fn match_features_to_database_with_task(
                 MatchPairInput::Computed { .. } => unreachable!(),
             })
             .collect::<Vec<_>>();
-        run_controlled_colmap_fifo_batches(
+        let fifo_started = Instant::now();
+        let commit_before = timings.database_commit_seconds;
+        let event_before = timings.event_sink_seconds;
+        let trace = run_controlled_colmap_fifo_batches(
             fifo_pairs,
             &frames,
             &cameras,
@@ -259,10 +367,17 @@ pub fn match_features_to_database_with_task(
             &mut total_matches,
             &mut completed,
             &mut did_clear,
-        )?
+            &mut timings,
+        )?;
+        let fifo_overhead = (timings.database_commit_seconds - commit_before)
+            + (timings.event_sink_seconds - event_before);
+        timings.pair_compute_seconds +=
+            (fifo_started.elapsed().as_secs_f64() - fifo_overhead).max(0.0);
+        trace
     } else {
         for batch in input_pairs.chunks(batch_size) {
             task.checkpoint()?;
+            let compute_started = Instant::now();
             let pair_reports = if options.use_existing_matches {
                 existing_match_pair_reports_for_inputs(
                     batch,
@@ -273,20 +388,23 @@ pub fn match_features_to_database_with_task(
                     existing_backend.as_ref(),
                 )?
             } else {
-                computed_match_pair_reports_for_inputs(
+                let computed = computed_match_pair_reports_for_inputs(
                     batch,
                     &frames,
                     &cameras,
                     options,
                     #[cfg(feature = "gpu-wgpu")]
                     computed_backend.as_ref(),
-                )?
+                )?;
+                timings.record_computed_batch(&computed);
+                computed.reports
             };
+            timings.pair_compute_seconds += compute_started.elapsed().as_secs_f64();
             let input_indices = batch
                 .iter()
                 .map(MatchPairInput::indices)
                 .collect::<Vec<_>>();
-            commit_and_emit_pair_batch(
+            let batch_timing = commit_and_emit_pair_batch(
                 &db,
                 &frames,
                 &image_id_by_index,
@@ -300,11 +418,13 @@ pub fn match_features_to_database_with_task(
                 &mut total_matches,
                 &mut completed,
             )?;
+            timings.record_batch(batch.len(), batch_timing);
         }
         None
     };
     if input_pairs.is_empty() {
         task.checkpoint()?;
+        let commit_started = Instant::now();
         db.with_transaction(|| {
             if options.clear_existing && !options.use_existing_matches {
                 db.clear_matches()?;
@@ -314,12 +434,15 @@ pub fn match_features_to_database_with_task(
             }
             Ok(())
         })?;
+        timings.database_commit_seconds += commit_started.elapsed().as_secs_f64();
     }
     reports.sort_by(|left, right| {
         left.left_image
             .cmp(&right.left_image)
             .then_with(|| left.right_image.cmp(&right.right_image))
     });
+    let matching_seconds = started.elapsed().as_secs_f64();
+    timings.finish(matching_seconds);
 
     Ok(MatchFeaturesReport {
         database: database_path.to_path_buf(),
@@ -331,7 +454,8 @@ pub fn match_features_to_database_with_task(
             .filter(|pair| pair.num_inliers >= options.min_inliers)
             .count(),
         total_matches,
-        matching_seconds: started.elapsed().as_secs_f64(),
+        matching_seconds,
+        timings,
         verifier_trace,
         pairs: reports,
     })
@@ -339,6 +463,7 @@ pub fn match_features_to_database_with_task(
 
 pub(crate) struct ExplicitPairMatchingSession {
     use_gpu: bool,
+    initialization_seconds: f64,
     #[cfg(feature = "gpu-wgpu")]
     computed_backend: Option<ComputedGpuBackend>,
 }
@@ -346,6 +471,7 @@ pub(crate) struct ExplicitPairMatchingSession {
 impl ExplicitPairMatchingSession {
     pub(crate) fn new(options: &MatchFeaturesOptions) -> Result<Self> {
         options.sift_matching.check()?;
+        let started = Instant::now();
         #[cfg(feature = "gpu-wgpu")]
         let computed_backend = if options.sift_matching.use_gpu {
             Some(ComputedGpuBackend::new()?)
@@ -358,9 +484,14 @@ impl ExplicitPairMatchingSession {
         }
         Ok(Self {
             use_gpu: options.sift_matching.use_gpu,
+            initialization_seconds: started.elapsed().as_secs_f64(),
             #[cfg(feature = "gpu-wgpu")]
             computed_backend,
         })
+    }
+
+    pub(crate) fn initialization_seconds(&self) -> f64 {
+        self.initialization_seconds
     }
 }
 
@@ -371,13 +502,17 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_task(
     task: &mut SfmTaskContext<'_>,
 ) -> Result<MatchFeaturesReport> {
     let session = ExplicitPairMatchingSession::new(options)?;
-    match_explicit_image_pairs_to_database_with_session(
+    let mut report = match_explicit_image_pairs_to_database_with_session(
         database_path,
         image_pairs,
         options,
         &session,
         task,
-    )
+    )?;
+    report.matching_seconds += session.initialization_seconds;
+    report.timings.backend_initialization_seconds += session.initialization_seconds;
+    report.timings.finish(report.matching_seconds);
+    Ok(report)
 }
 
 pub(crate) fn match_explicit_image_pairs_to_database_with_session(
@@ -396,6 +531,7 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
     }
     task.checkpoint()?;
     let started = Instant::now();
+    let prepare_started = Instant::now();
     let db = ColmapDatabase::open(database_path)?;
     let mut seen = std::collections::BTreeSet::new();
     let mut endpoint_ids = std::collections::BTreeSet::new();
@@ -446,13 +582,18 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
     }
 
     let pair_count = inputs.len();
+    let mut timings = MatchFeaturesTimingReport {
+        database_prepare_seconds: prepare_started.elapsed().as_secs_f64(),
+        ..MatchFeaturesTimingReport::default()
+    };
     let mut reports = Vec::new();
     let mut total_matches = 0usize;
     let mut completed = 0usize;
     let mut did_clear = false;
     for batch in inputs.chunks(options.task_pair_batch_size.max(1)) {
         task.checkpoint()?;
-        let pair_reports = computed_match_pair_reports_for_inputs(
+        let compute_started = Instant::now();
+        let computed = computed_match_pair_reports_for_inputs(
             batch,
             &frames,
             &cameras,
@@ -460,11 +601,14 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             #[cfg(feature = "gpu-wgpu")]
             session.computed_backend.as_ref(),
         )?;
+        timings.record_computed_batch(&computed);
+        let pair_reports = computed.reports;
+        timings.pair_compute_seconds += compute_started.elapsed().as_secs_f64();
         let indices = batch
             .iter()
             .map(MatchPairInput::indices)
             .collect::<Vec<_>>();
-        commit_and_emit_pair_batch(
+        let batch_timing = commit_and_emit_pair_batch(
             &db,
             &frames,
             &image_id_by_index,
@@ -478,12 +622,15 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             &mut total_matches,
             &mut completed,
         )?;
+        timings.record_batch(batch.len(), batch_timing);
     }
     reports.sort_by(|left, right| {
         left.left_image
             .cmp(&right.left_image)
             .then_with(|| left.right_image.cmp(&right.right_image))
     });
+    let matching_seconds = started.elapsed().as_secs_f64();
+    timings.finish(matching_seconds);
     Ok(MatchFeaturesReport {
         database: database_path.to_path_buf(),
         backend: matching_backend_name(&options.sift_matching).to_owned(),
@@ -494,7 +641,8 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             .filter(|pair| pair.num_inliers >= options.min_inliers)
             .count(),
         total_matches,
-        matching_seconds: started.elapsed().as_secs_f64(),
+        matching_seconds,
+        timings,
         verifier_trace: None,
         pairs: reports,
     })
@@ -877,7 +1025,8 @@ fn commit_and_emit_pair_batch(
     reports: &mut Vec<MatchFeaturesPairReport>,
     total_matches: &mut usize,
     completed: &mut usize,
-) -> Result<()> {
+) -> Result<MatchPairBatchTiming> {
+    let commit_started = Instant::now();
     let (batch_reports, batch_matches) = db.with_transaction(|| {
         if !*did_clear {
             if options.clear_existing && !options.use_existing_matches {
@@ -889,6 +1038,8 @@ fn commit_and_emit_pair_batch(
         }
         persist_pair_reports(db, frames, image_id_by_index, options, pair_reports)
     })?;
+    let database_commit_seconds = commit_started.elapsed().as_secs_f64();
+    let produced_pair_reports = batch_reports.len();
     *did_clear = true;
     *total_matches += batch_matches;
     reports.extend(batch_reports);
@@ -896,6 +1047,7 @@ fn commit_and_emit_pair_batch(
     let last_pair = input_indices
         .last()
         .map(|&(left, right)| (image_id_by_index[left].1, image_id_by_index[right].1));
+    let event_started = Instant::now();
     task.emit(SfmTaskEvent {
         sequence: 0,
         elapsed_ms: 0,
@@ -911,8 +1063,13 @@ fn commit_and_emit_pair_batch(
         message: None,
         issue: None,
     });
+    let event_sink_seconds = event_started.elapsed().as_secs_f64();
     task.checkpoint()?;
-    Ok(())
+    Ok(MatchPairBatchTiming {
+        database_commit_seconds,
+        event_sink_seconds,
+        produced_pair_reports,
+    })
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -952,18 +1109,26 @@ fn computed_match_pair_reports_for_inputs(
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
     #[cfg(feature = "gpu-wgpu")] gpu_backend: Option<&ComputedGpuBackend>,
-) -> Result<Vec<PairReportInput>> {
+) -> Result<ComputedMatchPairBatch> {
     let pairs = batch.iter().map(|pair| pair.indices()).collect::<Vec<_>>();
     #[cfg(feature = "gpu-wgpu")]
     if let Some(backend) = gpu_backend {
         let mut reports = Vec::with_capacity(pairs.len());
+        let mut gpu_descriptor_match_seconds = 0.0;
+        let mut gpu_geometry_seconds = 0.0;
+        let mut gpu_geometry_timing = WgpuGeometryTiming::default();
+        let mut gpu_matcher_timing = WgpuSiftMatcherTiming::default();
         for &(left, right) in &pairs {
-            let matches = backend.matcher.match_descriptors(
+            let descriptor_started = Instant::now();
+            let (matches, pair_timing) = backend.matcher.match_descriptors_profiled(
                 &frames[left].sift.descriptors_u8,
                 &frames[right].sift.descriptors_u8,
                 &options.sift_matching,
             )?;
-            if let Some(report) = estimate_existing_or_computed_pair_gpu(
+            gpu_descriptor_match_seconds += descriptor_started.elapsed().as_secs_f64();
+            gpu_matcher_timing += pair_timing;
+            let geometry_started = Instant::now();
+            let (report, pair_geometry_timing) = estimate_existing_or_computed_pair_gpu_profiled(
                 &backend.scorer,
                 left,
                 right,
@@ -971,23 +1136,39 @@ fn computed_match_pair_reports_for_inputs(
                 frames,
                 cameras,
                 options,
-            )? {
+            )?;
+            gpu_geometry_timing += pair_geometry_timing;
+            if let Some(report) = report {
                 reports.push(report);
             }
+            gpu_geometry_seconds += geometry_started.elapsed().as_secs_f64();
         }
-        return Ok(reports);
+        return Ok(ComputedMatchPairBatch {
+            reports,
+            gpu_descriptor_match_seconds,
+            gpu_geometry_seconds,
+            gpu_geometry_timing,
+            gpu_matcher_timing,
+        });
     }
-    Ok(pairs
-        .par_iter()
-        .filter_map(|&(left, right)| {
-            let matches = match_sift_with_options(
-                &frames[left].sift,
-                &frames[right].sift,
-                &options.sift_matching,
-            );
-            estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
-        })
-        .collect())
+    Ok(ComputedMatchPairBatch {
+        reports: pairs
+            .par_iter()
+            .filter_map(|&(left, right)| {
+                let matches = match_sift_with_options(
+                    &frames[left].sift,
+                    &frames[right].sift,
+                    &options.sift_matching,
+                );
+                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
+            })
+            .collect(),
+        gpu_descriptor_match_seconds: 0.0,
+        gpu_geometry_seconds: 0.0,
+        gpu_geometry_timing: WgpuGeometryTiming::default(),
+        #[cfg(feature = "gpu-wgpu")]
+        gpu_matcher_timing: WgpuSiftMatcherTiming::default(),
+    })
 }
 
 fn existing_match_pair_reports_for_inputs(
@@ -1143,6 +1324,7 @@ fn commit_ready_fifo_prefixes(
     reports: &mut Vec<MatchFeaturesPairReport>,
     total_matches: &mut usize,
     completed: &mut usize,
+    timings: &mut MatchFeaturesTimingReport,
 ) -> Result<()> {
     while *next_commit_start < input_indices.len() {
         let end = (*next_commit_start + task_batch_size).min(input_indices.len());
@@ -1162,7 +1344,7 @@ fn commit_ready_fifo_prefixes(
                     .expect("ready FIFO prefix contains every report")
             })
             .collect::<Vec<_>>();
-        commit_and_emit_pair_batch(
+        let batch_timing = commit_and_emit_pair_batch(
             db,
             frames,
             image_id_by_index,
@@ -1176,6 +1358,7 @@ fn commit_ready_fifo_prefixes(
             total_matches,
             completed,
         )?;
+        timings.record_batch(batch.len(), batch_timing);
         *next_commit_start = end;
     }
     Ok(())
@@ -1196,6 +1379,7 @@ fn run_controlled_colmap_fifo_batches(
     total_matches: &mut usize,
     completed: &mut usize,
     did_clear: &mut bool,
+    timings: &mut MatchFeaturesTimingReport,
 ) -> Result<Option<MatchFeaturesVerifierTrace>> {
     if let Some(trace_path) = colmap_fifo_replay_trace_path() {
         return run_controlled_colmap_replay_batches(
@@ -1212,6 +1396,7 @@ fn run_controlled_colmap_fifo_batches(
             total_matches,
             completed,
             did_clear,
+            timings,
             &trace_path,
         );
     }
@@ -1317,6 +1502,7 @@ fn run_controlled_colmap_fifo_batches(
                     reports,
                     total_matches,
                     completed,
+                    timings,
                 )?;
             }
             if next_commit_start != input_indices.len() {
@@ -1529,6 +1715,7 @@ fn run_controlled_colmap_replay_batches(
     total_matches: &mut usize,
     completed: &mut usize,
     did_clear: &mut bool,
+    timings: &mut MatchFeaturesTimingReport,
     trace_path: &Path,
 ) -> Result<Option<MatchFeaturesVerifierTrace>> {
     let schedule = load_colmap_fifo_replay_schedule(trace_path)?;
@@ -1680,6 +1867,7 @@ fn run_controlled_colmap_replay_batches(
                     reports,
                     total_matches,
                     completed,
+                    timings,
                 )?;
             }
             if next_commit_start != input_indices.len() {
@@ -1938,19 +2126,38 @@ fn estimate_existing_or_computed_pair_gpu(
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
 ) -> Result<Option<PairReportInput>> {
+    estimate_existing_or_computed_pair_gpu_profiled(
+        scorer, left, right, matches, frames, cameras, options,
+    )
+    .map(|(report, _)| report)
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn estimate_existing_or_computed_pair_gpu_profiled(
+    scorer: &WgpuModelScorer,
+    left: usize,
+    right: usize,
+    matches: Vec<rustslam::Match>,
+    frames: &[ImageFrame],
+    cameras: &[CameraModel],
+    options: &MatchFeaturesOptions,
+) -> Result<(Option<PairReportInput>, WgpuGeometryTiming)> {
     let min_matches_for_estimation = if options.use_existing_matches {
         options.min_inliers
     } else {
         options.min_num_matches
     };
     if matches.len() < min_matches_for_estimation {
-        return Ok(if options.use_existing_matches {
-            Some((left, right, matches, None))
-        } else {
-            None
-        });
+        return Ok((
+            if options.use_existing_matches {
+                Some((left, right, matches, None))
+            } else {
+                None
+            },
+            WgpuGeometryTiming::default(),
+        ));
     }
-    let geometry = estimate_pair_geometry_with_options_and_cameras_gpu(
+    let (geometry, timing) = estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
         scorer,
         left,
         right,
@@ -1971,7 +2178,7 @@ fn estimate_existing_or_computed_pair_gpu(
             ..PairEstimationOptions::default()
         },
     )?;
-    Ok(Some((left, right, matches, geometry)))
+    Ok((Some((left, right, matches, geometry)), timing))
 }
 
 /// Build vocabulary-tree candidate pairs from the in-memory frame descriptors.
@@ -2096,9 +2303,188 @@ mod tests {
 
     static MATCHING_ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
+    fn assert_fifo_timing_report(
+        report: &MatchFeaturesReport,
+        expected_pairs: usize,
+        task_pair_batch_size: usize,
+    ) {
+        assert_eq!(report.timings.attempted_pairs, expected_pairs);
+        assert_eq!(report.timings.produced_pair_reports, expected_pairs);
+        assert_eq!(
+            report.timings.committed_batches,
+            expected_pairs.div_ceil(task_pair_batch_size)
+        );
+        for (name, seconds) in [
+            ("pair_compute_seconds", report.timings.pair_compute_seconds),
+            (
+                "database_commit_seconds",
+                report.timings.database_commit_seconds,
+            ),
+            ("event_sink_seconds", report.timings.event_sink_seconds),
+        ] {
+            assert!(seconds.is_finite(), "{name} must be finite: {seconds}");
+            assert!(seconds >= 0.0, "{name} must be non-negative: {seconds}");
+        }
+
+        let classified_seconds = report.timings.backend_initialization_seconds
+            + report.timings.database_prepare_seconds
+            + report.timings.pair_compute_seconds
+            + report.timings.database_commit_seconds
+            + report.timings.event_sink_seconds;
+        const TIMING_EPSILON_SECONDS: f64 = 1.0e-9;
+        assert!(
+            classified_seconds <= report.matching_seconds + TIMING_EPSILON_SECONDS,
+            "classified timing {classified_seconds} exceeded matching time {}",
+            report.matching_seconds
+        );
+    }
+
     #[test]
     fn match_features_task_batch_default_is_32() {
         assert_eq!(MatchFeaturesOptions::default().task_pair_batch_size, 32);
+    }
+
+    #[test]
+    fn match_feature_timing_defaults_when_deserializing_legacy_report() -> Result<()> {
+        let report: MatchFeaturesReport = serde_json::from_value(serde_json::json!({
+            "database": "database.db",
+            "backend": "cpu_match_and_score",
+            "pair_count": 0,
+            "matched_pairs": 0,
+            "verified_pairs": 0,
+            "total_matches": 0,
+            "matching_seconds": 0.25,
+            "pairs": []
+        }))?;
+
+        assert_eq!(report.timings, MatchFeaturesTimingReport::default());
+        assert_eq!(
+            report.timings.gpu_geometry_detail,
+            crate::gpu::WgpuGeometryTiming::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn match_feature_timing_counts_attempted_pairs_and_committed_batches() -> Result<()> {
+        for batch_size in [1, 2] {
+            let (_dir, db_path, input_pairs) = controlled_computed_matching_fixture()?;
+            let report = match_features_to_database(
+                &db_path,
+                &controlled_computed_matching_options(batch_size),
+            )?;
+
+            assert_eq!(report.timings.attempted_pairs, input_pairs.len());
+            assert_eq!(report.timings.produced_pair_reports, report.pairs.len());
+            assert_eq!(
+                report.timings.committed_batches,
+                input_pairs.len().div_ceil(batch_size)
+            );
+            for seconds in [
+                report.timings.backend_initialization_seconds,
+                report.timings.database_prepare_seconds,
+                report.timings.pair_compute_seconds,
+                report.timings.database_commit_seconds,
+                report.timings.event_sink_seconds,
+                report.timings.unclassified_seconds,
+            ] {
+                assert!(seconds.is_finite());
+                assert!(seconds >= 0.0);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_match_timing_folds_into_match_feature_report() {
+        let mut report = MatchFeaturesTimingReport::default();
+        report.record_gpu_matcher_timing(crate::gpu::WgpuSiftMatcherTiming {
+            descriptor_pack_seconds: 0.1,
+            buffer_prepare_seconds: 0.2,
+            submit_seconds: 0.3,
+            readback_total_seconds: 0.4,
+            readback_copy_submit_seconds: 0.05,
+            readback_wait_seconds: 0.25,
+            readback_map_decode_seconds: 0.1,
+            cpu_postprocess_seconds: 0.6,
+            direction_calls: 2,
+            readback_calls: 2,
+            readback_bytes: 256,
+        });
+
+        assert_eq!(report.gpu_match_direction_calls, 2);
+        assert_eq!(report.gpu_readback_calls, 2);
+        assert_eq!(report.gpu_readback_bytes, 256);
+        assert!((report.gpu_descriptor_pack_seconds - 0.1).abs() < 1.0e-12);
+        assert!((report.gpu_readback_wait_seconds - 0.25).abs() < 1.0e-12);
+        assert!((report.gpu_cpu_postprocess_seconds - 0.6).abs() < 1.0e-12);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_geometry_timing_folds_into_match_feature_report() {
+        let mut report = MatchFeaturesTimingReport::default();
+        let batch = ComputedMatchPairBatch {
+            reports: Vec::new(),
+            gpu_descriptor_match_seconds: 0.0,
+            gpu_geometry_seconds: 9.0,
+            gpu_matcher_timing: WgpuSiftMatcherTiming::default(),
+            gpu_geometry_timing: crate::gpu::WgpuGeometryTiming {
+                essential: crate::gpu::WgpuRansacStageTiming {
+                    session_prepare_seconds: 0.1,
+                    scorer: crate::gpu::WgpuModelScorerTiming {
+                        score_calls: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                fundamental: crate::gpu::WgpuRansacStageTiming {
+                    candidate_generation_seconds: 0.2,
+                    scorer: crate::gpu::WgpuModelScorerTiming {
+                        score_calls: 10,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                homography: crate::gpu::WgpuRansacStageTiming {
+                    cpu_refinement_seconds: 0.3,
+                    scorer: crate::gpu::WgpuModelScorerTiming {
+                        score_calls: 100,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+        };
+
+        report.record_computed_batch(&batch);
+
+        assert_eq!(report.gpu_geometry_seconds, 9.0);
+        assert_eq!(report.gpu_geometry_detail.essential.scorer.score_calls, 1);
+        assert_eq!(
+            report.gpu_geometry_detail.fundamental.scorer.score_calls,
+            10
+        );
+        assert_eq!(
+            report.gpu_geometry_detail.homography.scorer.score_calls,
+            100
+        );
+        assert_eq!(
+            report.gpu_geometry_detail.essential.session_prepare_seconds,
+            0.1
+        );
+        assert_eq!(
+            report
+                .gpu_geometry_detail
+                .fundamental
+                .candidate_generation_seconds,
+            0.2
+        );
+        assert_eq!(
+            report.gpu_geometry_detail.homography.cpu_refinement_seconds,
+            0.3
+        );
     }
 
     #[test]
@@ -2441,8 +2827,44 @@ mod tests {
     }
 
     #[test]
+    fn controlled_explicit_matching_session_excludes_reused_initialization_time() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl};
+
+        let (_dir, db_path, input_pairs) = controlled_computed_matching_fixture()?;
+        let control = SfmTaskControl::new();
+        let mut sink = |_event| {};
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let mut options = controlled_computed_matching_options(1);
+        options.clear_existing = false;
+        let session = ExplicitPairMatchingSession {
+            use_gpu: false,
+            initialization_seconds: 1.0,
+            #[cfg(feature = "gpu-wgpu")]
+            computed_backend: None,
+        };
+
+        let report = match_explicit_image_pairs_to_database_with_session(
+            &db_path,
+            &[input_pairs[0]],
+            &options,
+            &session,
+            &mut task,
+        )?;
+
+        assert_eq!(report.timings.backend_initialization_seconds, 0.0);
+        let classified_seconds = report.timings.database_prepare_seconds
+            + report.timings.pair_compute_seconds
+            + report.timings.database_commit_seconds
+            + report.timings.event_sink_seconds;
+        assert!(classified_seconds <= report.matching_seconds + 1.0e-9);
+        Ok(())
+    }
+
+    #[test]
     fn controlled_fifo_trace_is_independent_of_task_commit_batch_size() -> Result<()> {
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (_dir, db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
         let _env = MatchingEnvGuard::fifo_trace(2);
 
@@ -2455,6 +2877,7 @@ mod tests {
             );
         }
         let report = match_features_to_database(&db_path, &controlled_fifo_geometry_options(2))?;
+        assert_fifo_timing_report(&report, input_pairs.len(), 2);
         let trace = report.verifier_trace.as_ref().expect("live FIFO trace");
         assert_eq!(trace.worker_count, 2);
         assert_eq!(trace.events.len(), input_pairs.len());
@@ -2470,7 +2893,9 @@ mod tests {
 
     #[test]
     fn controlled_fifo_replay_is_independent_of_task_commit_batch_size() -> Result<()> {
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let trace_dir = tempdir()?;
         let trace_path = trace_dir.path().join("trace.json");
         std::fs::write(
@@ -2496,6 +2921,9 @@ mod tests {
         large_options.task_pair_batch_size = 32;
         let small = match_features_to_database(&small_db_path, &small_options)?;
         let large = match_features_to_database(&large_db_path, &large_options)?;
+
+        assert_fifo_timing_report(&small, input_pairs.len(), 1);
+        assert_fifo_timing_report(&large, input_pairs.len(), 32);
 
         assert_eq!(
             serde_json::to_value(&small.pairs)?,
@@ -2544,7 +2972,9 @@ mod tests {
     fn controlled_live_fifo_cancel_commits_only_first_prefix() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
 
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (_dir, db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
         let _env = MatchingEnvGuard::fifo_trace(2);
         let control = SfmTaskControl::new();
@@ -2583,7 +3013,9 @@ mod tests {
     fn controlled_replay_fifo_cancel_commits_only_first_prefix() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
 
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let trace_dir = tempdir()?;
         let trace_path = trace_dir.path().join("trace.json");
         write_fifo_replay_trace(&trace_path)?;

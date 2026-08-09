@@ -2,6 +2,17 @@ use super::{GpuBackendKind, GpuSiftCapabilities};
 use anyhow::{Context, Result};
 use bytemuck::Pod;
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WgpuReadbackTiming {
+    pub(crate) total_seconds: f64,
+    pub(crate) copy_submit_seconds: f64,
+    pub(crate) wait_seconds: f64,
+    pub(crate) map_decode_seconds: f64,
+    pub(crate) calls: usize,
+    pub(crate) bytes: u64,
+}
 
 #[derive(Debug)]
 pub struct WgpuContext {
@@ -98,13 +109,24 @@ impl WgpuContext {
         source: &wgpu::Buffer,
         element_count: usize,
     ) -> Result<Vec<T>> {
+        self.read_buffer_profiled(source, element_count)
+            .map(|(values, _)| values)
+    }
+
+    pub(crate) fn read_buffer_profiled<T: Pod>(
+        &self,
+        source: &wgpu::Buffer,
+        element_count: usize,
+    ) -> Result<(Vec<T>, WgpuReadbackTiming)> {
         if element_count == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), WgpuReadbackTiming::default()));
         }
+        let total_started = Instant::now();
         let byte_len = element_count
             .checked_mul(std::mem::size_of::<T>())
             .context("wgpu readback byte count overflow")?;
         let byte_len = u64::try_from(byte_len).context("wgpu readback does not fit u64")?;
+        let copy_submit_started = Instant::now();
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm wgpu readback staging"),
             size: byte_len,
@@ -118,13 +140,17 @@ impl WgpuContext {
             });
         encoder.copy_buffer_to_buffer(source, 0, &staging, 0, byte_len);
         let submission = self.queue.submit(Some(encoder.finish()));
+        let copy_submit_seconds = copy_submit_started.elapsed().as_secs_f64();
 
         let slice = staging.slice(..);
         let (sender, receiver) = mpsc::sync_channel(1);
+        let map_decode_started = Instant::now();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
+        let wait_started = Instant::now();
         self.wait_for(submission)?;
+        let wait_seconds = wait_started.elapsed().as_secs_f64();
         receiver
             .recv()
             .context("wgpu readback callback was dropped")?
@@ -138,7 +164,18 @@ impl WgpuContext {
             .collect();
         drop(mapped);
         staging.unmap();
-        Ok(values)
+        let map_decode_seconds = map_decode_started.elapsed().as_secs_f64();
+        Ok((
+            values,
+            WgpuReadbackTiming {
+                total_seconds: total_started.elapsed().as_secs_f64(),
+                copy_submit_seconds,
+                wait_seconds,
+                map_decode_seconds,
+                calls: 1,
+                bytes: byte_len,
+            },
+        ))
     }
 }
 
