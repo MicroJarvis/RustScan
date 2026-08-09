@@ -96,3 +96,79 @@ git commit -m "feat(rustsfm): report match-pair timing breakdown"
 ```
 
 Self-review must explicitly confirm that matching results, event sequence, transaction boundaries, and pause/cancel checkpoints are unchanged.
+
+### Task 2: GPU Matcher And Readback Timing Breakdown
+
+**Files:**
+- Modify: `RustSFM/src/gpu/context.rs`
+- Modify: `RustSFM/src/gpu/matcher.rs`
+- Modify: `RustSFM/src/gpu/mod.rs`
+- Modify: `RustSFM/src/feature/feature_matching_db.rs`
+- Test: `RustSFM/src/gpu/mod.rs`
+- Test: `RustSFM/src/feature/feature_matching_db.rs`
+
+- [ ] **Step 1: Write failing timing aggregation tests**
+
+Add CPU-only tests for a `WgpuSiftMatcherTiming` value that accumulates two one-way calls without losing byte or call counts, and for folding a synthetic matcher timing into `MatchFeaturesTimingReport`. Add an adapter-optional smoke test that calls the profiled matcher with cross-check enabled and, when an adapter exists, asserts two direction/readback calls, non-zero readback bytes, and finite non-negative durations.
+
+- [ ] **Step 2: Run focused tests and verify RED**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu gpu_match_timing -- --nocapture
+```
+
+Expected: compilation failure because the profiled matcher API and timing records do not exist.
+
+- [ ] **Step 3: Add a profiled readback helper without changing existing callers**
+
+In `WgpuContext`, add an internal profiled readback helper returning the decoded values plus timings for staging/copy submission, device wait, callback/map/decode, total duration, call count, and byte count. Keep `read_buffer` as a compatibility wrapper over the profiled helper. Empty reads must return zero timings and no GPU work.
+
+- [ ] **Step 4: Add a profiled SIFT matcher API**
+
+Add `match_descriptors_profiled` returning matches plus a `WgpuSiftMatcherTiming`. Keep `match_descriptors` as a wrapper returning only matches. Measure descriptor packing, buffer/bind-group/encoder preparation, compute submission, profiled readback, and CPU candidate/cross-check/sort processing. Cross-check must still execute forward and reverse matching exactly once each.
+
+All timing structs need deterministic zero defaults, checked/saturating count accumulation, and finite non-negative wall-clock values. Do not request timestamp-query features or change device limits.
+
+- [ ] **Step 5: Fold GPU detail into `MatchFeaturesTimingReport`**
+
+Add backward-compatible, serde-defaulted fields for GPU descriptor matching, geometry validation, descriptor packing, buffer preparation, submission, readback total/copy/wait/map-decode, CPU postprocessing, direction calls, readback calls, and readback bytes. The computed GPU path must collect one matcher timing per pair and aggregate in memory; CPU and existing-match paths keep zero GPU-specific values. Do not emit per-pair logs.
+
+- [ ] **Step 6: Verify GREEN and existing matcher behavior**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu gpu_match_timing -- --nocapture
+```
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu gpu::tests::wgpu_sift_matcher_applies_ratio_distance_and_cross_check -- --exact --nocapture
+```
+
+Expected: timing tests and the existing result-equivalence matcher test pass, or adapter-dependent tests explicitly skip when no adapter is available.
+
+- [ ] **Step 7: Run matching regressions and compile checks**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu feature_matching_db::tests -- --nocapture
+```
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo check -p rustsfm \
+  --no-default-features --features gpu-wgpu
+```
+
+Expected: all feature matching tests pass and the macOS wgpu configuration compiles.
+
+- [ ] **Step 8: Format, self-review, and commit**
+
+```bash
+cargo fmt --check
+git diff --check
+git add RustSFM/src/gpu/context.rs RustSFM/src/gpu/matcher.rs RustSFM/src/gpu/mod.rs RustSFM/src/feature/feature_matching_db.rs docs/superpowers/plans/2026-08-08-rustsfm-match-pair-observability.md
+git commit -m "feat(rustsfm): profile gpu match-pair work"
+```
+
+Self-review must confirm byte/call accounting, timer nesting, empty-input behavior, and exact result equivalence. No shader, pair scheduling, database, event, pause/cancel, backend selection, or keyframe-count behavior may change.

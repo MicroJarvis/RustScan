@@ -8,7 +8,7 @@ use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu;
 use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions};
 #[cfg(feature = "gpu-wgpu")]
-use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher};
+use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher, WgpuSiftMatcherTiming};
 use crate::mapper::pair_geometry_to_colmap_two_view_geometry;
 use crate::sift::{match_sift_with_options, SiftFeatures, SiftMatchingOptions};
 use crate::task::{SfmTaskContext, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage};
@@ -72,6 +72,19 @@ pub struct MatchFeaturesTimingReport {
     pub attempted_pairs: usize,
     pub produced_pair_reports: usize,
     pub committed_batches: usize,
+    pub gpu_descriptor_match_seconds: f64,
+    pub gpu_geometry_seconds: f64,
+    pub gpu_descriptor_pack_seconds: f64,
+    pub gpu_buffer_prepare_seconds: f64,
+    pub gpu_submit_seconds: f64,
+    pub gpu_readback_total_seconds: f64,
+    pub gpu_readback_copy_submit_seconds: f64,
+    pub gpu_readback_wait_seconds: f64,
+    pub gpu_readback_map_decode_seconds: f64,
+    pub gpu_cpu_postprocess_seconds: f64,
+    pub gpu_match_direction_calls: usize,
+    pub gpu_readback_calls: usize,
+    pub gpu_readback_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -97,6 +110,44 @@ impl MatchFeaturesTimingReport {
         self.committed_batches += 1;
         self.database_commit_seconds += batch.database_commit_seconds;
         self.event_sink_seconds += batch.event_sink_seconds;
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn record_gpu_matcher_timing(&mut self, timing: WgpuSiftMatcherTiming) {
+        self.gpu_descriptor_pack_seconds += timing.descriptor_pack_seconds;
+        self.gpu_buffer_prepare_seconds += timing.buffer_prepare_seconds;
+        self.gpu_submit_seconds += timing.submit_seconds;
+        self.gpu_readback_total_seconds += timing.readback_total_seconds;
+        self.gpu_readback_copy_submit_seconds += timing.readback_copy_submit_seconds;
+        self.gpu_readback_wait_seconds += timing.readback_wait_seconds;
+        self.gpu_readback_map_decode_seconds += timing.readback_map_decode_seconds;
+        self.gpu_cpu_postprocess_seconds += timing.cpu_postprocess_seconds;
+        self.gpu_match_direction_calls = self
+            .gpu_match_direction_calls
+            .saturating_add(timing.direction_calls);
+        self.gpu_readback_calls = self
+            .gpu_readback_calls
+            .saturating_add(timing.readback_calls);
+        self.gpu_readback_bytes = self
+            .gpu_readback_bytes
+            .saturating_add(timing.readback_bytes);
+    }
+}
+
+struct ComputedMatchPairBatch {
+    reports: Vec<PairReportInput>,
+    gpu_descriptor_match_seconds: f64,
+    gpu_geometry_seconds: f64,
+    #[cfg(feature = "gpu-wgpu")]
+    gpu_matcher_timing: WgpuSiftMatcherTiming,
+}
+
+impl MatchFeaturesTimingReport {
+    fn record_computed_batch(&mut self, batch: &ComputedMatchPairBatch) {
+        self.gpu_descriptor_match_seconds += batch.gpu_descriptor_match_seconds;
+        self.gpu_geometry_seconds += batch.gpu_geometry_seconds;
+        #[cfg(feature = "gpu-wgpu")]
+        self.record_gpu_matcher_timing(batch.gpu_matcher_timing);
     }
 }
 
@@ -323,14 +374,16 @@ pub fn match_features_to_database_with_task(
                     existing_backend.as_ref(),
                 )?
             } else {
-                computed_match_pair_reports_for_inputs(
+                let computed = computed_match_pair_reports_for_inputs(
                     batch,
                     &frames,
                     &cameras,
                     options,
                     #[cfg(feature = "gpu-wgpu")]
                     computed_backend.as_ref(),
-                )?
+                )?;
+                timings.record_computed_batch(&computed);
+                computed.reports
             };
             timings.pair_compute_seconds += compute_started.elapsed().as_secs_f64();
             let input_indices = batch
@@ -522,7 +575,7 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
     for batch in inputs.chunks(options.task_pair_batch_size.max(1)) {
         task.checkpoint()?;
         let compute_started = Instant::now();
-        let pair_reports = computed_match_pair_reports_for_inputs(
+        let computed = computed_match_pair_reports_for_inputs(
             batch,
             &frames,
             &cameras,
@@ -530,6 +583,8 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             #[cfg(feature = "gpu-wgpu")]
             session.computed_backend.as_ref(),
         )?;
+        timings.record_computed_batch(&computed);
+        let pair_reports = computed.reports;
         timings.pair_compute_seconds += compute_started.elapsed().as_secs_f64();
         let indices = batch
             .iter()
@@ -1036,17 +1091,24 @@ fn computed_match_pair_reports_for_inputs(
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
     #[cfg(feature = "gpu-wgpu")] gpu_backend: Option<&ComputedGpuBackend>,
-) -> Result<Vec<PairReportInput>> {
+) -> Result<ComputedMatchPairBatch> {
     let pairs = batch.iter().map(|pair| pair.indices()).collect::<Vec<_>>();
     #[cfg(feature = "gpu-wgpu")]
     if let Some(backend) = gpu_backend {
         let mut reports = Vec::with_capacity(pairs.len());
+        let mut gpu_descriptor_match_seconds = 0.0;
+        let mut gpu_geometry_seconds = 0.0;
+        let mut gpu_matcher_timing = WgpuSiftMatcherTiming::default();
         for &(left, right) in &pairs {
-            let matches = backend.matcher.match_descriptors(
+            let descriptor_started = Instant::now();
+            let (matches, pair_timing) = backend.matcher.match_descriptors_profiled(
                 &frames[left].sift.descriptors_u8,
                 &frames[right].sift.descriptors_u8,
                 &options.sift_matching,
             )?;
+            gpu_descriptor_match_seconds += descriptor_started.elapsed().as_secs_f64();
+            gpu_matcher_timing += pair_timing;
+            let geometry_started = Instant::now();
             if let Some(report) = estimate_existing_or_computed_pair_gpu(
                 &backend.scorer,
                 left,
@@ -1058,20 +1120,32 @@ fn computed_match_pair_reports_for_inputs(
             )? {
                 reports.push(report);
             }
+            gpu_geometry_seconds += geometry_started.elapsed().as_secs_f64();
         }
-        return Ok(reports);
+        return Ok(ComputedMatchPairBatch {
+            reports,
+            gpu_descriptor_match_seconds,
+            gpu_geometry_seconds,
+            gpu_matcher_timing,
+        });
     }
-    Ok(pairs
-        .par_iter()
-        .filter_map(|&(left, right)| {
-            let matches = match_sift_with_options(
-                &frames[left].sift,
-                &frames[right].sift,
-                &options.sift_matching,
-            );
-            estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
-        })
-        .collect())
+    Ok(ComputedMatchPairBatch {
+        reports: pairs
+            .par_iter()
+            .filter_map(|&(left, right)| {
+                let matches = match_sift_with_options(
+                    &frames[left].sift,
+                    &frames[right].sift,
+                    &options.sift_matching,
+                );
+                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
+            })
+            .collect(),
+        gpu_descriptor_match_seconds: 0.0,
+        gpu_geometry_seconds: 0.0,
+        #[cfg(feature = "gpu-wgpu")]
+        gpu_matcher_timing: WgpuSiftMatcherTiming::default(),
+    })
 }
 
 fn existing_match_pair_reports_for_inputs(
@@ -2230,6 +2304,32 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_match_timing_folds_into_match_feature_report() {
+        let mut report = MatchFeaturesTimingReport::default();
+        report.record_gpu_matcher_timing(crate::gpu::WgpuSiftMatcherTiming {
+            descriptor_pack_seconds: 0.1,
+            buffer_prepare_seconds: 0.2,
+            submit_seconds: 0.3,
+            readback_total_seconds: 0.4,
+            readback_copy_submit_seconds: 0.05,
+            readback_wait_seconds: 0.25,
+            readback_map_decode_seconds: 0.1,
+            cpu_postprocess_seconds: 0.6,
+            direction_calls: 2,
+            readback_calls: 2,
+            readback_bytes: 256,
+        });
+
+        assert_eq!(report.gpu_match_direction_calls, 2);
+        assert_eq!(report.gpu_readback_calls, 2);
+        assert_eq!(report.gpu_readback_bytes, 256);
+        assert!((report.gpu_descriptor_pack_seconds - 0.1).abs() < 1.0e-12);
+        assert!((report.gpu_readback_wait_seconds - 0.25).abs() < 1.0e-12);
+        assert!((report.gpu_cpu_postprocess_seconds - 0.6).abs() < 1.0e-12);
     }
 
     #[test]

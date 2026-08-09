@@ -24,7 +24,7 @@ mod sift;
 #[cfg(feature = "gpu-wgpu")]
 pub use context::WgpuContext;
 #[cfg(feature = "gpu-wgpu")]
-pub use matcher::WgpuSiftMatcher;
+pub use matcher::{WgpuSiftMatcher, WgpuSiftMatcherTiming};
 #[cfg(feature = "gpu-wgpu")]
 pub(crate) use pnp_focal::WgpuPnPFocalSolver;
 #[cfg(all(feature = "gpu-wgpu", test))]
@@ -575,6 +575,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 0), (1, 1)]
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_match_timing_accumulates_durations_bytes_and_calls() {
+        let mut total = WgpuSiftMatcherTiming {
+            descriptor_pack_seconds: 0.1,
+            buffer_prepare_seconds: 0.2,
+            submit_seconds: 0.3,
+            readback_total_seconds: 0.4,
+            readback_copy_submit_seconds: 0.05,
+            readback_wait_seconds: 0.25,
+            readback_map_decode_seconds: 0.1,
+            cpu_postprocess_seconds: 0.6,
+            direction_calls: 1,
+            readback_calls: 1,
+            readback_bytes: 64,
+        };
+        total += WgpuSiftMatcherTiming {
+            descriptor_pack_seconds: 1.0,
+            buffer_prepare_seconds: 2.0,
+            submit_seconds: 3.0,
+            readback_total_seconds: 4.0,
+            readback_copy_submit_seconds: 0.5,
+            readback_wait_seconds: 2.5,
+            readback_map_decode_seconds: 1.0,
+            cpu_postprocess_seconds: 6.0,
+            direction_calls: 1,
+            readback_calls: 1,
+            readback_bytes: 128,
+        };
+
+        assert_eq!(total.direction_calls, 2);
+        assert_eq!(total.readback_calls, 2);
+        assert_eq!(total.readback_bytes, 192);
+        assert!((total.descriptor_pack_seconds - 1.1).abs() < 1.0e-12);
+        assert!((total.readback_wait_seconds - 2.75).abs() < 1.0e-12);
+        assert!((total.cpu_postprocess_seconds - 6.6).abs() < 1.0e-12);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_match_timing_profiled_matcher_reports_cross_check_work() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping profiled GPU matcher test: no compatible adapter");
+            return Ok(());
+        };
+        let left = [[0u8; 128], [255u8; 128]];
+        let right = [[0u8; 128], [255u8; 128], [127u8; 128]];
+        let options = crate::sift::SiftMatchingOptions {
+            use_gpu: true,
+            cross_check: true,
+            ..Default::default()
+        };
+
+        let (_matches, timing) = WgpuSiftMatcher::from_context(context)?
+            .match_descriptors_profiled(&left, &right, &options)?;
+
+        assert_eq!(timing.direction_calls, 2);
+        assert_eq!(timing.readback_calls, 2);
+        assert!(timing.readback_bytes > 0);
+        assert!(timing.readback_map_decode_seconds >= timing.readback_wait_seconds);
+        for seconds in [
+            timing.descriptor_pack_seconds,
+            timing.buffer_prepare_seconds,
+            timing.submit_seconds,
+            timing.readback_total_seconds,
+            timing.readback_copy_submit_seconds,
+            timing.readback_wait_seconds,
+            timing.readback_map_decode_seconds,
+            timing.cpu_postprocess_seconds,
+        ] {
+            assert!(seconds.is_finite());
+            assert!(seconds >= 0.0);
+        }
         Ok(())
     }
 
