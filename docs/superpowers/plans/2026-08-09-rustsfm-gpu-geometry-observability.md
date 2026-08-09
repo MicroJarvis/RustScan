@@ -566,7 +566,7 @@ git commit -m "feat(rustsfm): report gpu geometry timing"
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-09-rustsfm-gpu-geometry-observability.md`
 
-- [ ] **Step 1: Run the complete determinable regression suite**
+- [x] **Step 1: Run the complete determinable regression suite**
 
 Run the RustSFM library suite with the wgpu feature. Skip only the repository's already documented
 external-fixture test and adapter-required legacy SIFT benchmark when their prerequisites are absent:
@@ -580,7 +580,14 @@ git diff --check
 
 Record exact passed, failed, and skipped counts. Any new failure blocks benchmarking.
 
-- [ ] **Step 2: Build the release CLI**
+Evidence (2026-08-09): the complete command ran 656 tests: 636 passed, 20 failed, 0 ignored.
+Nineteen failures were the repository's existing `real_colmap_sparse_*`/COLMAP fixture tests because
+`test_data/flowers2_colmap/sparse/text` is absent from this worktree. The remaining failure was the
+adapter-required legacy SIFT benchmark because that test process did not obtain a compatible wgpu
+adapter. Adapter-optional GPU tests otherwise passed or reported their explicit skip path, and no
+telemetry-specific test failed. `cargo fmt --all -- --check` and `git diff --check` both passed.
+
+- [x] **Step 2: Build the release CLI**
 
 Run:
 
@@ -591,7 +598,10 @@ CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo build -p rustsfm 
 
 Expected: `target/release/rustsfm` is produced successfully.
 
-- [ ] **Step 3: Run the bounded flowers2 benchmark**
+Evidence (2026-08-09): the release build completed successfully in 13.72 seconds and produced
+`/Users/tfjiang/Projects/RustScan/target/release/rustsfm`. Existing dead-code warnings were unchanged.
+
+- [x] **Step 3: Run the bounded flowers2 benchmark**
 
 First confirm no benchmark process is running. Then run exactly one GPU benchmark:
 
@@ -606,7 +616,16 @@ Expected for every repetition: `pair_count=96`, `matched_pairs=96`, `verified_pa
 `total_matches=62409`. Verify that each stage's call/model/byte counts are deterministic across the
 three runs and that every duration is finite and non-negative. Do not assert a speed threshold.
 
-- [ ] **Step 4: Decide whether the full benchmark is warranted**
+Evidence (2026-08-09): the sandboxed attempt stopped before pair processing because no compatible
+wgpu adapter was visible. Running the identical generic-wgpu command outside the sandbox obtained the
+adapter and completed all three repetitions. Results were exactly 96 matched, 96 verified, and 62,409
+matches in every run. Matching times were 18.898, 18.917, and 18.839 seconds. Descriptor matching was
+6.472, 6.477, and 6.464 seconds; geometry was 12.066, 12.055, and 11.985 seconds. Every duration was
+finite and non-negative. Each stage's score calls, mask calls, models scored, readback calls, and
+readback bytes were identical across repetitions. Homography alone issued 5,066 score calls and 656
+mask calls per run, and spent 8.638-8.688 seconds in scorer readback wait.
+
+- [x] **Step 4: Decide whether the full benchmark is warranted**
 
 Run the 2,890-pair benchmark only if bounded result parity and timing accounting pass:
 
@@ -621,11 +640,26 @@ Never run it concurrently with another flowers2 GPU benchmark. Compare against t
 2,890 matched/verified pairs, 2,958,062 matches, and 452.045 seconds without treating wall time as a
 hard pass criterion.
 
-- [ ] **Step 5: Record evidence and commit**
+Evidence (2026-08-09): bounded parity and deterministic accounting passed, so one full benchmark was
+run with no concurrent flowers2 benchmark. It preserved exactly 2,890 matched pairs, 2,890 verified
+pairs, and 2,958,062 matches. Total matching time was 506.979 seconds versus the 452.045-second prior
+measurement; wall time is observational, not a pass criterion. Descriptor matching used 199.057
+seconds and geometry used 303.509 seconds. Descriptor readback wait was 190.293 seconds. Essential,
+Fundamental, and Homography scorer readback wait was 20.484, 16.573, and 207.854 seconds respectively.
+Together the non-overlapping descriptor and geometry waits account for about 85.8% of total matching
+wall time; Homography scorer wait alone accounts for about 68.5% of geometry time.
+
+- [x] **Step 5: Record evidence and commit**
 
 Append exact bounded and, when run, full results to this plan. State which decision-gate condition
 from the design applies and identify the next optimization to design. Do not commit `/tmp` JSON or
 logs.
+
+Decision: the first design gate applies. Summary/scorer readback wait dominates, especially the
+Homography stage, and score calls scale with the existing 64-trial chunks (120,048 Homography score
+calls versus 17,350 mask calls in the full run). The next optimization to design is a larger or
+adaptive GPU RANSAC chunk experiment guarded by fixed-seed result-parity tests. Deferred mask recovery,
+buffer residency, and CPU candidate/refinement work are not the first target supported by this data.
 
 Run:
 
