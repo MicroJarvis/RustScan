@@ -109,6 +109,8 @@ pub mod visibility_pyramid;
 // Diagnostics and validation harnesses.
 #[path = "diagnostics/compare.rs"]
 pub mod compare;
+#[path = "diagnostics/match_pair_benchmark.rs"]
+pub mod match_pair_benchmark;
 #[path = "diagnostics/parity.rs"]
 pub mod parity;
 
@@ -150,6 +152,9 @@ pub use mapper::{
     ImageSelectionMethod, IncrementalPipelineCallback, IncrementalPipelineResult,
     IncrementalPipelineStatus, MapperConfig, PipelineCallbackEvent, PipelineCallbackSink,
     ReconstructionSeed, ReconstructionSummary, ReferenceCameraSetup,
+};
+pub use match_pair_benchmark::{
+    benchmark_match_pairs, MatchPairBenchmarkReport, MatchPairBenchmarkRun,
 };
 pub use parity::{compare_database_parity, ParityReport};
 pub use retrieval::{

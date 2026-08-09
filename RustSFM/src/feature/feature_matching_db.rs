@@ -95,7 +95,7 @@ struct MatchPairBatchTiming {
 }
 
 impl MatchFeaturesTimingReport {
-    fn finish(&mut self, total_seconds: f64) {
+    pub(crate) fn finish(&mut self, total_seconds: f64) {
         let classified_seconds = self.backend_initialization_seconds
             + self.database_prepare_seconds
             + self.pair_compute_seconds
@@ -477,6 +477,10 @@ impl ExplicitPairMatchingSession {
             #[cfg(feature = "gpu-wgpu")]
             computed_backend,
         })
+    }
+
+    pub(crate) fn initialization_seconds(&self) -> f64 {
+        self.initialization_seconds
     }
 }
 

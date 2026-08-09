@@ -12,10 +12,10 @@ use rustsfm::feature_matching::MatchingPairStrategy;
 use rustsfm::generalized_pose::generalized_pose_capabilities;
 use rustsfm::sift::SiftMatchingOptions;
 use rustsfm::{
-    benchmark_sift_extraction, compare_colmap_stages, compare_database_parity,
-    compare_extracted_sift_features, debug_two_view_database_pair, extract_features_to_database,
-    match_features_to_database, parse_compare_stages, run_reconstruction, DebugTwoViewOptions,
-    MapperConfig, MatchFeaturesOptions,
+    benchmark_match_pairs, benchmark_sift_extraction, compare_colmap_stages,
+    compare_database_parity, compare_extracted_sift_features, debug_two_view_database_pair,
+    extract_features_to_database, match_features_to_database, parse_compare_stages,
+    run_reconstruction, DebugTwoViewOptions, MapperConfig, MatchFeaturesOptions,
 };
 
 fn run_reconstruct(args: ReconstructArgs) -> Result<()> {
@@ -183,6 +183,39 @@ fn run_match_features(args: MatchFeaturesArgs) -> Result<()> {
         report.verified_pairs,
         report.total_matches,
         report.matching_seconds
+    );
+    if let Some(path) = args.output_json {
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    }
+    Ok(())
+}
+
+fn run_benchmark_match_pairs(args: BenchmarkMatchPairsArgs) -> Result<()> {
+    env_logger::Builder::new()
+        .parse_filters(&args.log_level)
+        .init();
+    let mut options = MatchFeaturesOptions::default();
+    options.pair_strategy = MatchingPairStrategy::LocalWindow {
+        window: args.window,
+    };
+    options.sift_matching.use_gpu = args.use_gpu;
+    options.random_seed = args.random_seed;
+    options.task_pair_batch_size = 1;
+    let report = benchmark_match_pairs(
+        &args.database,
+        args.window,
+        args.pair_limit,
+        args.repetitions,
+        &options,
+    )?;
+    let run_seconds = report
+        .runs
+        .iter()
+        .map(|run| run.matching_seconds)
+        .sum::<f64>();
+    println!(
+        "match-pair benchmark: pairs={} repetitions={} init_seconds={:.3} run_seconds={:.3}",
+        report.pair_count, report.repetitions, report.session_initialization_seconds, run_seconds
     );
     if let Some(path) = args.output_json {
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
@@ -690,6 +723,7 @@ pub(super) fn run() -> Result<()> {
             }
         }
         Commands::MatchFeatures(args) => run_match_features(args)?,
+        Commands::BenchmarkMatchPairs(args) => run_benchmark_match_pairs(args)?,
         Commands::DebugTwoview(args) => {
             env_logger::Builder::new()
                 .parse_filters(&args.log_level)
