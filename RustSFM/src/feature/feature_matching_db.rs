@@ -424,6 +424,7 @@ pub fn match_features_to_database_with_task(
     };
     if input_pairs.is_empty() {
         task.checkpoint()?;
+        let commit_started = Instant::now();
         db.with_transaction(|| {
             if options.clear_existing && !options.use_existing_matches {
                 db.clear_matches()?;
@@ -433,6 +434,7 @@ pub fn match_features_to_database_with_task(
             }
             Ok(())
         })?;
+        timings.database_commit_seconds += commit_started.elapsed().as_secs_f64();
     }
     reports.sort_by(|left, right| {
         left.left_image
@@ -500,13 +502,17 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_task(
     task: &mut SfmTaskContext<'_>,
 ) -> Result<MatchFeaturesReport> {
     let session = ExplicitPairMatchingSession::new(options)?;
-    match_explicit_image_pairs_to_database_with_session(
+    let mut report = match_explicit_image_pairs_to_database_with_session(
         database_path,
         image_pairs,
         options,
         &session,
         task,
-    )
+    )?;
+    report.matching_seconds += session.initialization_seconds;
+    report.timings.backend_initialization_seconds += session.initialization_seconds;
+    report.timings.finish(report.matching_seconds);
+    Ok(report)
 }
 
 pub(crate) fn match_explicit_image_pairs_to_database_with_session(
@@ -577,7 +583,6 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
 
     let pair_count = inputs.len();
     let mut timings = MatchFeaturesTimingReport {
-        backend_initialization_seconds: session.initialization_seconds,
         database_prepare_seconds: prepare_started.elapsed().as_secs_f64(),
         ..MatchFeaturesTimingReport::default()
     };
@@ -625,7 +630,7 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             .then_with(|| left.right_image.cmp(&right.right_image))
     });
     let matching_seconds = started.elapsed().as_secs_f64();
-    timings.finish(matching_seconds + timings.backend_initialization_seconds);
+    timings.finish(matching_seconds);
     Ok(MatchFeaturesReport {
         database: database_path.to_path_buf(),
         backend: matching_backend_name(&options.sift_matching).to_owned(),
@@ -2818,6 +2823,40 @@ mod tests {
                 requested.contains(&pair)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_explicit_matching_session_excludes_reused_initialization_time() -> Result<()> {
+        use crate::task::{SfmTaskContext, SfmTaskControl};
+
+        let (_dir, db_path, input_pairs) = controlled_computed_matching_fixture()?;
+        let control = SfmTaskControl::new();
+        let mut sink = |_event| {};
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let mut options = controlled_computed_matching_options(1);
+        options.clear_existing = false;
+        let session = ExplicitPairMatchingSession {
+            use_gpu: false,
+            initialization_seconds: 1.0,
+            #[cfg(feature = "gpu-wgpu")]
+            computed_backend: None,
+        };
+
+        let report = match_explicit_image_pairs_to_database_with_session(
+            &db_path,
+            &[input_pairs[0]],
+            &options,
+            &session,
+            &mut task,
+        )?;
+
+        assert_eq!(report.timings.backend_initialization_seconds, 0.0);
+        let classified_seconds = report.timings.database_prepare_seconds
+            + report.timings.pair_compute_seconds
+            + report.timings.database_commit_seconds
+            + report.timings.event_sink_seconds;
+        assert!(classified_seconds <= report.matching_seconds + 1.0e-9);
         Ok(())
     }
 
