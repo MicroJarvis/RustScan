@@ -19,7 +19,7 @@
 - Test: `RustSFM/src/io/database.rs`
 - Test: `RustSFM/src/diagnostics/match_pair_benchmark.rs`
 
-- [ ] **Step 1: Write failing online-backup and repetition-isolation tests**
+- [x] **Step 1: Write failing online-backup and repetition-isolation tests**
 
 Enable a database test named `database_backup_captures_committed_wal_rows`. Create a database,
 switch a separate writer connection to WAL mode, create and commit a marker row while keeping the
@@ -36,7 +36,7 @@ snapshot containing a distinctive match and geometry row, copy it for run indice
 only run 0, and assert run 1 plus the snapshot retain the original rows. This proves each repetition
 has an independent starting file.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 ```bash
 CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
@@ -48,7 +48,7 @@ CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
 Expected: compilation failure because the backup and per-run snapshot helpers do not exist, and the
 old benchmark still rejects a non-empty WAL.
 
-- [ ] **Step 3: Enable and wrap SQLite online backup**
+- [x] **Step 3: Enable and wrap SQLite online backup**
 
 Change the dependency to:
 
@@ -77,7 +77,7 @@ pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<u64> {
 The destination is a new file inside a private `TempDir`. Do not expose the internal connection or
 run schema migrations against the snapshot.
 
-- [ ] **Step 4: Snapshot once and isolate every repetition**
+- [x] **Step 4: Snapshot once and isolate every repetition**
 
 Remove the WAL rejection helper. In `benchmark_match_pairs`, open the source read-only and call
 `backup_to` into `source-snapshot.db`, measuring this as `database_copy_seconds`. Close the source,
@@ -103,7 +103,7 @@ Inside the repetition loop, create a distinct run database from the stable snaps
 outside the loop and keep `run_options.clear_existing=true`. Do not include per-run file-copy time in
 `matching_seconds`.
 
-- [ ] **Step 5: Verify, format, and commit**
+- [x] **Step 5: Verify, format, and commit**
 
 ```bash
 CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \

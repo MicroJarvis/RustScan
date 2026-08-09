@@ -601,6 +601,20 @@ impl Default for DatabaseCache {
 }
 
 impl ColmapDatabase {
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<u64> {
+        let destination = destination.as_ref();
+        let mut target = Connection::open(destination)
+            .with_context(|| format!("open SQLite backup destination {}", destination.display()))?;
+        let backup = rusqlite::backup::Backup::new(&self.conn, &mut target)
+            .context("initialize SQLite online backup")?;
+        backup
+            .run_to_completion(256, std::time::Duration::from_millis(1), None)
+            .context("copy SQLite online backup")?;
+        drop(backup);
+        drop(target);
+        Ok(std::fs::metadata(destination)?.len())
+    }
+
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open COLMAP database read-only")?;
@@ -3406,6 +3420,38 @@ mod tests {
         }
 
         assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn database_backup_captures_committed_wal_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let backup = dir.path().join("backup.db");
+        drop(ColmapDatabase::open(&source).unwrap());
+
+        let writer = Connection::open(&source).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE benchmark_marker(value INTEGER NOT NULL);
+                 INSERT INTO benchmark_marker(value) VALUES(42);",
+            )
+            .unwrap();
+
+        let database = ColmapDatabase::open_read_only(&source).unwrap();
+        let copied_bytes = database.backup_to(&backup).unwrap();
+        assert!(copied_bytes > 0);
+        let copied =
+            Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            copied
+                .query_row("SELECT value FROM benchmark_marker", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            42
+        );
+        drop(writer);
     }
 
     #[test]

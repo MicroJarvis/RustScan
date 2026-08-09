@@ -9,25 +9,15 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
-    let mut path = database.as_os_str().to_os_string();
-    path.push(suffix);
-    PathBuf::from(path)
-}
-
-fn reject_uncheckpointed_wal(database: &Path) -> Result<()> {
-    let wal = sqlite_sidecar_path(database, "-wal");
-    if wal
-        .metadata()
-        .map(|metadata| metadata.len() > 0)
-        .unwrap_or(false)
-    {
-        bail!(
-            "benchmark source has a non-empty SQLite WAL at {}; checkpoint it before benchmarking",
-            wal.display()
-        );
-    }
-    Ok(())
+fn copy_benchmark_snapshot_for_run(
+    snapshot: &Path,
+    work_dir: &Path,
+    run_index: usize,
+) -> Result<PathBuf> {
+    let database = work_dir.join(format!("run-{run_index}.db"));
+    std::fs::copy(snapshot, &database)
+        .with_context(|| format!("copy benchmark snapshot for run {}", run_index + 1))?;
+    Ok(database)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,12 +85,19 @@ pub fn benchmark_match_pairs(
     if repetitions == 0 {
         bail!("match-pair benchmark repetitions must be greater than zero");
     }
-    reject_uncheckpointed_wal(source_database)?;
-
+    let work_dir = tempfile::tempdir().context("create match-pair benchmark directory")?;
+    let source_snapshot = work_dir.path().join("source-snapshot.db");
+    let copy_started = Instant::now();
     let source = ColmapDatabase::open_read_only(source_database)
         .with_context(|| format!("open benchmark source {}", source_database.display()))?;
-    let mut images = source.read_all_images()?;
+    let copied_database_bytes = source.backup_to(&source_snapshot)?;
     drop(source);
+    let database_copy_seconds = copy_started.elapsed().as_secs_f64();
+
+    let snapshot = ColmapDatabase::open_read_only(&source_snapshot)
+        .context("open completed benchmark source snapshot")?;
+    let mut images = snapshot.read_all_images()?;
+    drop(snapshot);
     images.sort_by(|left, right| {
         left.name
             .cmp(&right.name)
@@ -115,13 +112,6 @@ pub fn benchmark_match_pairs(
         bail!("match-pair benchmark requires at least one generated image pair");
     }
 
-    let work_dir = tempfile::tempdir().context("create match-pair benchmark directory")?;
-    let working_database = work_dir.path().join("database.db");
-    let copy_started = Instant::now();
-    let copied_database_bytes = std::fs::copy(source_database, &working_database)
-        .with_context(|| format!("copy benchmark database {}", source_database.display()))?;
-    let database_copy_seconds = copy_started.elapsed().as_secs_f64();
-
     let mut run_options = options.clone();
     run_options.clear_existing = true;
     run_options.use_existing_matches = false;
@@ -129,6 +119,8 @@ pub fn benchmark_match_pairs(
     let session_initialization_seconds = session.initialization_seconds();
     let mut runs = Vec::with_capacity(repetitions);
     for run_index in 0..repetitions {
+        let working_database =
+            copy_benchmark_snapshot_for_run(&source_snapshot, work_dir.path(), run_index)?;
         let control = SfmTaskControl::new();
         let mut sink = |_event| {};
         let mut task = SfmTaskContext::new(&control, &mut sink);
@@ -282,21 +274,68 @@ mod tests {
     }
 
     #[test]
-    fn match_pair_benchmark_rejects_source_with_uncheckpointed_wal() {
+    fn match_pair_benchmark_snapshots_source_with_uncheckpointed_wal() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("database.db");
         write_empty_feature_database(&source);
-        std::fs::write(dir.path().join("database.db-wal"), b"pending").unwrap();
+        let writer = rusqlite::Connection::open(&source).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE benchmark_marker(value INTEGER NOT NULL);
+                 INSERT INTO benchmark_marker(value) VALUES(42);",
+            )
+            .unwrap();
+        assert!(dir.path().join("database.db-wal").metadata().unwrap().len() > 0);
+        let before = std::fs::read(&source).unwrap();
 
-        let error = benchmark_match_pairs(
+        let report = benchmark_match_pairs(
             &source,
             1,
             Some(1),
             1,
             &crate::MatchFeaturesOptions::default(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("non-empty SQLite WAL"));
+        assert_eq!(report.pair_count, 1);
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        drop(writer);
+    }
+
+    #[test]
+    fn match_pair_benchmark_run_databases_start_from_independent_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.db");
+        write_empty_feature_database(&snapshot);
+        let matches = vec![FeatureMatch::new(3, 7)];
+        let geometry = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: matches.clone(),
+            ..ColmapTwoViewGeometry::default()
+        };
+        let database = ColmapDatabase::open(&snapshot).unwrap();
+        database.write_matches(1, 2, &matches).unwrap();
+        database.write_two_view_geometry(1, 2, &geometry).unwrap();
+        drop(database);
+
+        let run0 = copy_benchmark_snapshot_for_run(&snapshot, dir.path(), 0).unwrap();
+        let run1 = copy_benchmark_snapshot_for_run(&snapshot, dir.path(), 1).unwrap();
+        let database = ColmapDatabase::open(&run0).unwrap();
+        database.clear_matches().unwrap();
+        database.clear_two_view_geometries().unwrap();
+        drop(database);
+
+        assert!(ColmapDatabase::open_read_only(&run0)
+            .unwrap()
+            .read_matches(1, 2)
+            .unwrap()
+            .is_empty());
+        for path in [&snapshot, &run1] {
+            let database = ColmapDatabase::open_read_only(path).unwrap();
+            assert_eq!(database.read_matches(1, 2).unwrap(), matches);
+            assert_eq!(database.read_two_view_geometry(1, 2).unwrap(), geometry);
+        }
     }
 }
