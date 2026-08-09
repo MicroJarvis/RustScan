@@ -7,6 +7,8 @@ use crate::sift::{SiftExtractionOptions, SiftFeatures};
 #[cfg(feature = "gpu-wgpu")]
 use anyhow::Context;
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+use std::ops::AddAssign;
 
 #[cfg(feature = "gpu-wgpu")]
 mod context;
@@ -40,6 +42,72 @@ pub(crate) use pnp_scorer::{GpuPnpImagePoint, GpuPnpModel, GpuPnpObjectPoint};
 pub(crate) use scorer::WgpuModelScoringSession;
 #[cfg(feature = "gpu-wgpu")]
 pub use scorer::{GpuModelSupport, TwoViewModelKind, WgpuModelScorer};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WgpuModelScorerTiming {
+    pub buffer_prepare_seconds: f64,
+    pub submit_seconds: f64,
+    pub readback_total_seconds: f64,
+    pub readback_copy_submit_seconds: f64,
+    pub readback_wait_seconds: f64,
+    pub readback_map_decode_seconds: f64,
+    pub score_calls: usize,
+    pub mask_calls: usize,
+    pub models_scored: usize,
+    pub readback_calls: usize,
+    pub readback_bytes: u64,
+}
+
+impl AddAssign for WgpuModelScorerTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.buffer_prepare_seconds += rhs.buffer_prepare_seconds;
+        self.submit_seconds += rhs.submit_seconds;
+        self.readback_total_seconds += rhs.readback_total_seconds;
+        self.readback_copy_submit_seconds += rhs.readback_copy_submit_seconds;
+        self.readback_wait_seconds += rhs.readback_wait_seconds;
+        self.readback_map_decode_seconds += rhs.readback_map_decode_seconds;
+        self.score_calls = self.score_calls.saturating_add(rhs.score_calls);
+        self.mask_calls = self.mask_calls.saturating_add(rhs.mask_calls);
+        self.models_scored = self.models_scored.saturating_add(rhs.models_scored);
+        self.readback_calls = self.readback_calls.saturating_add(rhs.readback_calls);
+        self.readback_bytes = self.readback_bytes.saturating_add(rhs.readback_bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WgpuRansacStageTiming {
+    pub session_prepare_seconds: f64,
+    pub candidate_generation_seconds: f64,
+    pub cpu_refinement_seconds: f64,
+    pub scorer: WgpuModelScorerTiming,
+}
+
+impl AddAssign for WgpuRansacStageTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.session_prepare_seconds += rhs.session_prepare_seconds;
+        self.candidate_generation_seconds += rhs.candidate_generation_seconds;
+        self.cpu_refinement_seconds += rhs.cpu_refinement_seconds;
+        self.scorer += rhs.scorer;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WgpuGeometryTiming {
+    pub essential: WgpuRansacStageTiming,
+    pub fundamental: WgpuRansacStageTiming,
+    pub homography: WgpuRansacStageTiming,
+}
+
+impl AddAssign for WgpuGeometryTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.essential += rhs.essential;
+        self.fundamental += rhs.fundamental;
+        self.homography += rhs.homography;
+    }
+}
 
 #[cfg(feature = "gpu-wgpu")]
 use self::sift::{SiftDescriptorComputer, SiftDetector, SiftOrientationAssigner, SiftPyramid};
@@ -438,6 +506,98 @@ mod tests {
     #[cfg(feature = "gpu-wgpu")]
     use wgpu::util::DeviceExt;
 
+    #[test]
+    fn gpu_geometry_timing_accumulates_model_scorer_work() {
+        let mut total = WgpuModelScorerTiming {
+            buffer_prepare_seconds: 0.2,
+            submit_seconds: 0.3,
+            readback_total_seconds: 0.4,
+            readback_copy_submit_seconds: 0.05,
+            readback_wait_seconds: 0.25,
+            readback_map_decode_seconds: 0.3,
+            score_calls: 1,
+            mask_calls: 0,
+            models_scored: 64,
+            readback_calls: 1,
+            readback_bytes: 512,
+        };
+        total += WgpuModelScorerTiming {
+            buffer_prepare_seconds: 1.0,
+            submit_seconds: 2.0,
+            readback_total_seconds: 3.0,
+            readback_copy_submit_seconds: 0.5,
+            readback_wait_seconds: 2.0,
+            readback_map_decode_seconds: 2.5,
+            score_calls: 0,
+            mask_calls: 1,
+            models_scored: 0,
+            readback_calls: 1,
+            readback_bytes: 1024,
+        };
+
+        assert_eq!(total.score_calls, 1);
+        assert_eq!(total.mask_calls, 1);
+        assert_eq!(total.models_scored, 64);
+        assert_eq!(total.readback_calls, 2);
+        assert_eq!(total.readback_bytes, 1536);
+        assert!((total.buffer_prepare_seconds - 1.2).abs() < 1.0e-12);
+        assert!((total.readback_wait_seconds - 2.25).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn gpu_geometry_timing_preserves_ransac_stage_attribution() {
+        let mut total = WgpuGeometryTiming {
+            essential: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            fundamental: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 10,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            homography: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 100,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        total += WgpuGeometryTiming {
+            essential: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            fundamental: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 20,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            homography: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 200,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(total.essential.scorer.score_calls, 3);
+        assert_eq!(total.fundamental.scorer.score_calls, 30);
+        assert_eq!(total.homography.scorer.score_calls, 300);
+    }
+
     #[cfg(all(feature = "gpu-wgpu", not(feature = "gpu-vulkan")))]
     #[test]
     fn wgpu_context_reports_a_real_adapter_when_available() -> Result<()> {
@@ -686,6 +846,70 @@ mod tests {
             )?,
             vec![true, true, true]
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_profiled_reports_support_and_mask_work() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping profiled GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let points = [[0.0, 0.0, 1.0], [1.0, 2.0, 1.0], [-3.0, 4.0, 1.0]];
+        let session = scorer.prepare_homogeneous_session(&points, &points)?;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let translated = [1.0, 0.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let models = [identity, translated];
+
+        let (supports, score_timing) = session.score_two_view_models_profiled(
+            &models,
+            0.1,
+            TwoViewModelKind::HomographyForward,
+        )?;
+        let (mask, mask_timing) =
+            session.inlier_mask_profiled(&identity, 0.1, TwoViewModelKind::HomographyForward)?;
+        let (empty_supports, empty_timing) = session.score_two_view_models_profiled(
+            &[],
+            0.1,
+            TwoViewModelKind::HomographyForward,
+        )?;
+
+        assert_eq!(supports[0].inliers, 3);
+        assert!(supports[0].residual_sum.abs() < 1.0e-6);
+        assert_eq!(supports[1].inliers, 0);
+        assert_eq!(mask, vec![true, true, true]);
+        assert_eq!(score_timing.score_calls, 1);
+        assert_eq!(score_timing.mask_calls, 0);
+        assert_eq!(score_timing.models_scored, models.len());
+        assert_eq!(score_timing.readback_calls, 1);
+        assert_eq!(mask_timing.score_calls, 0);
+        assert_eq!(mask_timing.mask_calls, 1);
+        assert_eq!(mask_timing.models_scored, 0);
+        assert_eq!(mask_timing.readback_calls, 1);
+        assert!(score_timing.readback_bytes > 0);
+        assert!(mask_timing.readback_bytes > 0);
+        assert!(score_timing.readback_map_decode_seconds >= score_timing.readback_wait_seconds);
+        assert!(empty_supports.is_empty());
+        assert_eq!(empty_timing, WgpuModelScorerTiming::default());
+        for seconds in [
+            score_timing.buffer_prepare_seconds,
+            score_timing.submit_seconds,
+            score_timing.readback_total_seconds,
+            score_timing.readback_copy_submit_seconds,
+            score_timing.readback_wait_seconds,
+            score_timing.readback_map_decode_seconds,
+            mask_timing.buffer_prepare_seconds,
+            mask_timing.submit_seconds,
+            mask_timing.readback_total_seconds,
+            mask_timing.readback_copy_submit_seconds,
+            mask_timing.readback_wait_seconds,
+            mask_timing.readback_map_decode_seconds,
+        ] {
+            assert!(seconds.is_finite());
+            assert!(seconds >= 0.0);
+        }
         Ok(())
     }
 

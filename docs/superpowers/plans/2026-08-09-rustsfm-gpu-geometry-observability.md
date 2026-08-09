@@ -196,7 +196,7 @@ git commit -m "fix(rustsfm): complete fifo timing report"
 - Modify: `RustSFM/src/gpu/scorer.rs`
 - Test: `RustSFM/src/gpu/mod.rs`
 
-- [ ] **Step 1: Add failing CPU-only aggregation tests**
+- [x] **Step 1: Add failing CPU-only aggregation tests**
 
 Add `gpu_geometry_timing_accumulates_model_scorer_work` in `gpu::tests`. Construct two
 `WgpuModelScorerTiming` values representing one score call and one mask call, add them, and assert
@@ -241,7 +241,7 @@ assert!((total.readback_wait_seconds - 2.25).abs() < 1.0e-12);
 Also add a `WgpuGeometryTiming` aggregation test. Put distinct `score_calls` values in Essential,
 Fundamental, and Homography and prove stage attribution survives `+=`.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run:
 
@@ -253,7 +253,7 @@ CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
 Expected: compilation failure because `WgpuModelScorerTiming`, `WgpuRansacStageTiming`, and
 `WgpuGeometryTiming` do not exist.
 
-- [ ] **Step 3: Add always-available timing DTOs**
+- [x] **Step 3: Add always-available timing DTOs**
 
 In `gpu/mod.rs`, outside `#[cfg(feature = "gpu-wgpu")]`, add serde-compatible DTOs with these exact
 fields:
@@ -296,7 +296,7 @@ pub struct WgpuGeometryTiming {
 Implement `AddAssign` for all three types. Add durations normally and use `saturating_add` for every
 integer count. Do not add global state or feature-gated fields.
 
-- [ ] **Step 4: Add profiled scorer methods**
+- [x] **Step 4: Add profiled scorer methods**
 
 In `gpu/scorer.rs`, keep `score_two_view_models` and `inlier_mask` as wrappers. Move their bodies to
 new methods with these signatures:
@@ -330,7 +330,7 @@ self.score_two_view_models_profiled(models, threshold, kind)
 
 and the equivalent mask wrapper, ensuring profiling performs no extra dispatch.
 
-- [ ] **Step 5: Add adapter-optional result and accounting smoke tests**
+- [x] **Step 5: Add adapter-optional result and accounting smoke tests**
 
 Extend the existing model-scorer test fixture. When `WgpuContext::try_new_optional()` returns
 `None`, print an explicit skip and return `Ok(())`. Otherwise call the profiled support method once
@@ -352,7 +352,7 @@ assert!(score_timing.readback_map_decode_seconds >= score_timing.readback_wait_s
 Compare the returned support and mask values with the existing fixture expectations, not only their
 lengths.
 
-- [ ] **Step 6: Verify Task 1 and commit**
+- [x] **Step 6: Verify Task 1 and commit**
 
 Run:
 
