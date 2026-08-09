@@ -144,6 +144,20 @@ counts and wait durations across repetitions without imposing a wall-clock pass 
 2,890-pair benchmark only after the bounded results are stable, and never concurrently with another
 flowers2 GPU benchmark.
 
+Before using the harness for this measurement, create the source snapshot through SQLite's online
+backup API and read image IDs from that completed snapshot. Each repetition receives its own copy of
+the stable snapshot and performs the existing timed `clear_existing=true` operation. This guarantees
+that concurrent WAL or rollback-journal writers cannot produce a torn copy and that every repetition
+starts with identical match and geometry rows.
+
+Readback component durations intentionally overlap: `readback_map_decode_seconds` spans callback
+registration, the nested device wait, callback delivery, mapping, and decode. It must therefore be
+interpreted as callback-to-decode latency and must not be summed with `readback_wait_seconds`.
+
+Backward compatibility in this design means serialized-report compatibility and unchanged runtime
+call signatures. `MatchFeaturesReport` is a workspace-internal version-0.1 Rust type; adding a public
+field is not claimed to preserve external struct-literal source compatibility.
+
 ## Decision Gate After Measurement
 
 - If summary readback wait dominates and calls scale with 64-trial chunks, design a larger or
