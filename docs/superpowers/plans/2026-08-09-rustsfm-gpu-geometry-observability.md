@@ -132,7 +132,7 @@ git commit -m "fix(rustsfm): isolate match-pair benchmark runs"
 - Modify: `docs/superpowers/plans/2026-08-08-rustsfm-match-pair-observability.md`
 - Test: `RustSFM/src/feature/feature_matching_db.rs`
 
-- [ ] **Step 1: Write failing FIFO timing tests**
+- [x] **Step 1: Write failing FIFO timing tests**
 
 Extend `controlled_fifo_trace_is_independent_of_task_commit_batch_size` and the replay counterpart.
 For each returned report assert exact attempted-pair, produced-report, and committed-batch counts;
@@ -140,17 +140,17 @@ assert `pair_compute_seconds`, `database_commit_seconds`, and `event_sink_second
 non-negative. Assert classified timings do not exceed `matching_seconds` except for floating-point
 epsilon.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 ```bash
 CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
-  --lib controlled_fifo_ -- --nocapture
+  --lib --no-default-features --features gpu-wgpu controlled_fifo_ -- --nocapture
 ```
 
 Expected: count assertions may pass, but commit/event timing assertions fail because FIFO currently
 synthesizes only counts after the helper returns.
 
-- [ ] **Step 3: Thread batch timing through live and replay FIFO helpers**
+- [x] **Step 3: Thread batch timing through live and replay FIFO helpers**
 
 Pass `&mut MatchFeaturesTimingReport` through `run_controlled_colmap_fifo_batches`,
 `run_controlled_colmap_replay_batches`, and `commit_ready_fifo_prefixes`. Capture the
@@ -162,20 +162,20 @@ and event deltas recorded during that call and add the remaining non-negative du
 `pair_compute_seconds`. This includes FIFO scheduling and worker wait as part of pair computation
 without summing per-worker durations or double-counting commit/event time.
 
-- [ ] **Step 4: Document overlapping readback timing and API compatibility**
+- [x] **Step 4: Document overlapping readback timing and API compatibility**
 
 Update the completed observability plan to state that `gpu_readback_map_decode_seconds` is an
 overlapping callback-to-decode latency containing the nested wait and must not be summed with
 `gpu_readback_wait_seconds`. State that serde compatibility is preserved, while external Rust struct
 literals are not a supported compatibility guarantee for this workspace-internal 0.1 API.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
-  --lib controlled_fifo_ -- --nocapture
+  --lib --no-default-features --features gpu-wgpu controlled_fifo_ -- --nocapture
 CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
-  --lib match_feature_timing -- --nocapture
+  --lib --no-default-features --features gpu-wgpu match_feature_timing -- --nocapture
 cargo fmt --all -- --check
 git diff --check
 ```

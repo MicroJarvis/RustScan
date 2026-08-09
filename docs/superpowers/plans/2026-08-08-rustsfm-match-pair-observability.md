@@ -173,6 +173,14 @@ git commit -m "feat(rustsfm): profile gpu match-pair work"
 
 Self-review must confirm byte/call accounting, timer nesting, empty-input behavior, and exact result equivalence. No shader, pair scheduling, database, event, pause/cancel, backend selection, or keyframe-count behavior may change.
 
+`gpu_readback_map_decode_seconds` is overlapping callback-to-decode latency: it starts before callback
+registration and includes the nested device wait, callback delivery, mapping, and decode. It must not
+be added to `gpu_readback_wait_seconds` when interpreting the timing breakdown.
+
+Backward compatibility here guarantees serde compatibility for stored reports and unchanged runtime
+call signatures. `MatchFeaturesReport` is a workspace-internal version-0.1 Rust type, so external Rust
+struct-literal source compatibility is not a supported guarantee.
+
 ### Task 3: Repeatable Match-Pair Benchmark Harness
 
 **Files:**

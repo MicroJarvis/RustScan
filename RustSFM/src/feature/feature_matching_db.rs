@@ -345,7 +345,10 @@ pub fn match_features_to_database_with_task(
                 MatchPairInput::Computed { .. } => unreachable!(),
             })
             .collect::<Vec<_>>();
-        run_controlled_colmap_fifo_batches(
+        let fifo_started = Instant::now();
+        let commit_before = timings.database_commit_seconds;
+        let event_before = timings.event_sink_seconds;
+        let trace = run_controlled_colmap_fifo_batches(
             fifo_pairs,
             &frames,
             &cameras,
@@ -359,7 +362,13 @@ pub fn match_features_to_database_with_task(
             &mut total_matches,
             &mut completed,
             &mut did_clear,
-        )?
+            &mut timings,
+        )?;
+        let fifo_overhead = (timings.database_commit_seconds - commit_before)
+            + (timings.event_sink_seconds - event_before);
+        timings.pair_compute_seconds +=
+            (fifo_started.elapsed().as_secs_f64() - fifo_overhead).max(0.0);
+        trace
     } else {
         for batch in input_pairs.chunks(batch_size) {
             task.checkpoint()?;
@@ -425,11 +434,6 @@ pub fn match_features_to_database_with_task(
             .cmp(&right.left_image)
             .then_with(|| left.right_image.cmp(&right.right_image))
     });
-    if fifo_enabled {
-        timings.attempted_pairs = pair_count;
-        timings.produced_pair_reports = reports.len();
-        timings.committed_batches = pair_count.div_ceil(batch_size);
-    }
     let matching_seconds = started.elapsed().as_secs_f64();
     timings.finish(matching_seconds);
 
@@ -1305,6 +1309,7 @@ fn commit_ready_fifo_prefixes(
     reports: &mut Vec<MatchFeaturesPairReport>,
     total_matches: &mut usize,
     completed: &mut usize,
+    timings: &mut MatchFeaturesTimingReport,
 ) -> Result<()> {
     while *next_commit_start < input_indices.len() {
         let end = (*next_commit_start + task_batch_size).min(input_indices.len());
@@ -1324,7 +1329,7 @@ fn commit_ready_fifo_prefixes(
                     .expect("ready FIFO prefix contains every report")
             })
             .collect::<Vec<_>>();
-        commit_and_emit_pair_batch(
+        let batch_timing = commit_and_emit_pair_batch(
             db,
             frames,
             image_id_by_index,
@@ -1338,6 +1343,7 @@ fn commit_ready_fifo_prefixes(
             total_matches,
             completed,
         )?;
+        timings.record_batch(batch.len(), batch_timing);
         *next_commit_start = end;
     }
     Ok(())
@@ -1358,6 +1364,7 @@ fn run_controlled_colmap_fifo_batches(
     total_matches: &mut usize,
     completed: &mut usize,
     did_clear: &mut bool,
+    timings: &mut MatchFeaturesTimingReport,
 ) -> Result<Option<MatchFeaturesVerifierTrace>> {
     if let Some(trace_path) = colmap_fifo_replay_trace_path() {
         return run_controlled_colmap_replay_batches(
@@ -1374,6 +1381,7 @@ fn run_controlled_colmap_fifo_batches(
             total_matches,
             completed,
             did_clear,
+            timings,
             &trace_path,
         );
     }
@@ -1479,6 +1487,7 @@ fn run_controlled_colmap_fifo_batches(
                     reports,
                     total_matches,
                     completed,
+                    timings,
                 )?;
             }
             if next_commit_start != input_indices.len() {
@@ -1691,6 +1700,7 @@ fn run_controlled_colmap_replay_batches(
     total_matches: &mut usize,
     completed: &mut usize,
     did_clear: &mut bool,
+    timings: &mut MatchFeaturesTimingReport,
     trace_path: &Path,
 ) -> Result<Option<MatchFeaturesVerifierTrace>> {
     let schedule = load_colmap_fifo_replay_schedule(trace_path)?;
@@ -1842,6 +1852,7 @@ fn run_controlled_colmap_replay_batches(
                     reports,
                     total_matches,
                     completed,
+                    timings,
                 )?;
             }
             if next_commit_start != input_indices.len() {
@@ -2257,6 +2268,42 @@ mod tests {
     use tempfile::tempdir;
 
     static MATCHING_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn assert_fifo_timing_report(
+        report: &MatchFeaturesReport,
+        expected_pairs: usize,
+        task_pair_batch_size: usize,
+    ) {
+        assert_eq!(report.timings.attempted_pairs, expected_pairs);
+        assert_eq!(report.timings.produced_pair_reports, expected_pairs);
+        assert_eq!(
+            report.timings.committed_batches,
+            expected_pairs.div_ceil(task_pair_batch_size)
+        );
+        for (name, seconds) in [
+            ("pair_compute_seconds", report.timings.pair_compute_seconds),
+            (
+                "database_commit_seconds",
+                report.timings.database_commit_seconds,
+            ),
+            ("event_sink_seconds", report.timings.event_sink_seconds),
+        ] {
+            assert!(seconds.is_finite(), "{name} must be finite: {seconds}");
+            assert!(seconds >= 0.0, "{name} must be non-negative: {seconds}");
+        }
+
+        let classified_seconds = report.timings.backend_initialization_seconds
+            + report.timings.database_prepare_seconds
+            + report.timings.pair_compute_seconds
+            + report.timings.database_commit_seconds
+            + report.timings.event_sink_seconds;
+        const TIMING_EPSILON_SECONDS: f64 = 1.0e-9;
+        assert!(
+            classified_seconds <= report.matching_seconds + TIMING_EPSILON_SECONDS,
+            "classified timing {classified_seconds} exceeded matching time {}",
+            report.matching_seconds
+        );
+    }
 
     #[test]
     fn match_features_task_batch_default_is_32() {
@@ -2677,7 +2724,9 @@ mod tests {
 
     #[test]
     fn controlled_fifo_trace_is_independent_of_task_commit_batch_size() -> Result<()> {
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (_dir, db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
         let _env = MatchingEnvGuard::fifo_trace(2);
 
@@ -2690,6 +2739,7 @@ mod tests {
             );
         }
         let report = match_features_to_database(&db_path, &controlled_fifo_geometry_options(2))?;
+        assert_fifo_timing_report(&report, input_pairs.len(), 2);
         let trace = report.verifier_trace.as_ref().expect("live FIFO trace");
         assert_eq!(trace.worker_count, 2);
         assert_eq!(trace.events.len(), input_pairs.len());
@@ -2705,7 +2755,9 @@ mod tests {
 
     #[test]
     fn controlled_fifo_replay_is_independent_of_task_commit_batch_size() -> Result<()> {
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let trace_dir = tempdir()?;
         let trace_path = trace_dir.path().join("trace.json");
         std::fs::write(
@@ -2731,6 +2783,9 @@ mod tests {
         large_options.task_pair_batch_size = 32;
         let small = match_features_to_database(&small_db_path, &small_options)?;
         let large = match_features_to_database(&large_db_path, &large_options)?;
+
+        assert_fifo_timing_report(&small, input_pairs.len(), 1);
+        assert_fifo_timing_report(&large, input_pairs.len(), 32);
 
         assert_eq!(
             serde_json::to_value(&small.pairs)?,
@@ -2779,7 +2834,9 @@ mod tests {
     fn controlled_live_fifo_cancel_commits_only_first_prefix() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
 
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (_dir, db_path, input_pairs) = controlled_fifo_geometry_fixture()?;
         let _env = MatchingEnvGuard::fifo_trace(2);
         let control = SfmTaskControl::new();
@@ -2818,7 +2875,9 @@ mod tests {
     fn controlled_replay_fifo_cancel_commits_only_first_prefix() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
 
-        let _env_guard = MATCHING_ENV_LOCK.lock().expect("matching env lock");
+        let _env_guard = MATCHING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let trace_dir = tempdir()?;
         let trace_path = trace_dir.path().join("trace.json");
         write_fifo_replay_trace(&trace_path)?;
