@@ -171,8 +171,10 @@ pub fn benchmark_match_pairs(
 mod tests {
     use super::*;
     use crate::colmap::ColmapCamera;
+    use crate::correspondence_graph::FeatureMatch;
     use crate::database::{
         ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors,
+        ColmapTwoViewGeometry,
     };
     use crate::types::COLMAP_PINHOLE;
 
@@ -244,6 +246,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("database.db");
         write_empty_feature_database(&source);
+        let original_matches = vec![FeatureMatch::new(3, 7)];
+        let original_geometry = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: original_matches.clone(),
+            e_matrix: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            ..ColmapTwoViewGeometry::default()
+        };
+        let database = ColmapDatabase::open(&source).unwrap();
+        database.write_matches(1, 2, &original_matches).unwrap();
+        database
+            .write_two_view_geometry(1, 2, &original_geometry)
+            .unwrap();
+        drop(database);
         let before = std::fs::read(&source).unwrap();
 
         let report =
@@ -258,6 +273,12 @@ mod tests {
             .iter()
             .all(|run| run.timings.backend_initialization_seconds == 0.0));
         assert_eq!(std::fs::read(&source).unwrap(), before);
+        let database = ColmapDatabase::open_read_only(&source).unwrap();
+        assert_eq!(database.read_matches(1, 2).unwrap(), original_matches);
+        assert_eq!(
+            database.read_two_view_geometry(1, 2).unwrap(),
+            original_geometry
+        );
     }
 
     #[test]
