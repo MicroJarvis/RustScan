@@ -422,13 +422,18 @@ SHA-256 to this plan. Do not commit the binary or JSON.
   `cargo check` and release `cargo build` both exited 0; all three commands emitted only dead-code
   warnings.
 - Preserved executable: `/tmp/rustsfm-gpu-ransac-chunk-64` (executable Mach-O arm64), SHA-256
-  `880c7d726f789621d641f89ad6dbae7c990137adb29cda6789dbda57d8792541`.
+  `880c7d726f789621d641f89ad6dbae7c990137adb29cda6789dbda57d8792541`. It was built from commit
+  `c8f28b425b7611f7b51acfd11bd2c5ca14d1e1b1` with source tree
+  `a587bd507e70bb2cdb4e6734f36b53a2d10da1e0`.
 - Benchmark: generic wgpu with no forced backend, source database from the command above, `window=5`,
   `pair_limit=96`, `repetitions=3`, GPU enabled, and `random_seed=0`; the process gate found no
   running `benchmark-match-pairs` or `rustsfm`. The sandbox probe had no compatible adapter, so the
   required non-sandboxed run produced `/tmp/rustsfm-gpu-ransac-chunk-64-96x3.json` using a
-  635285504-byte database snapshot. Backend was `wgpu_match_and_score` in every run.
-- Output was identical in runs 1-3: `matched_pairs=96`, `verified_pairs=96`,
+  635285504-byte database snapshot. The baseline JSON SHA-256 is
+  `4c56571897acfd0dd8d95079d26ad78cb0196fd5bce15fc28f1cf2b28cdea159`; the source database
+  SHA-256 is `dcf79fa307a6294195a8e5db1cddb185bbc1baca2ee490061b89f2a5961a052c`. Backend was
+  `wgpu_match_and_score` in every run.
+- Selected-pair database output was bit-identical in runs 1-3: `matched_pairs=96`, `verified_pairs=96`,
   `total_matches=62409`, fingerprint
   `5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed`.
 - Run 1: `matching_seconds=18.969614875`, descriptor/geometry seconds
@@ -520,6 +525,20 @@ git commit -m "perf(rustsfm): test 512-trial gpu ransac chunks"
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-10-rustsfm-ransac-chunk-512-experiment.md`
+
+Before any 512 benchmark or full comparison, reverify all three preserved baseline inputs and stop if
+any value differs:
+
+```bash
+shasum -a 256 /tmp/rustsfm-gpu-ransac-chunk-64
+shasum -a 256 /tmp/rustsfm-gpu-ransac-chunk-64-96x3.json
+shasum -a 256 /Users/tfjiang/Projects/RustScan/test_data/flowers2/out9/Untitled.rustscanproject/Cache/.staging/keyframe_sfm-1/rustsfm/Cache/database.db
+```
+
+Require, in command order,
+`880c7d726f789621d641f89ad6dbae7c990137adb29cda6789dbda57d8792541`,
+`4c56571897acfd0dd8d95079d26ad78cb0196fd5bce15fc28f1cf2b28cdea159`, and
+`dcf79fa307a6294195a8e5db1cddb185bbc1baca2ee490061b89f2a5961a052c`.
 
 - [ ] **Step 1: Build the 512 release CLI**
 
