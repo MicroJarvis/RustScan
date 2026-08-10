@@ -561,8 +561,10 @@ CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo build -p rustsfm 
 ```bash
 jq -e --slurpfile baseline /tmp/rustsfm-gpu-ransac-chunk-64-96x3.json '
   .pair_count == 96 and .repetitions == 3 and
+  (.runs | length) == 3 and
   all(.runs[]; .matched_pairs == 96 and .verified_pairs == 96 and
-      .total_matches == 62409) and
+      .total_matches == 62409 and .backend == "wgpu_match_and_score" and
+      (.result_fingerprint | test("^[0-9a-f]{64}$"))) and
   ([.runs[].result_fingerprint] | unique | length) == 1 and
   .runs[0].result_fingerprint == $baseline[0].runs[0].result_fingerprint and
   all(.. | numbers; (isnan | not) and (isinfinite | not))
@@ -607,17 +609,26 @@ git commit -m "docs(rustsfm): record 512-chunk experiment"
 
 #### Task 5 evidence (2026-08-10)
 
+- Before building or running the 512 candidate, the stop-on-mismatch preflight was armed and freshly
+  verified the preserved 64 binary SHA-256
+  `880c7d726f789621d641f89ad6dbae7c990137adb29cda6789dbda57d8792541`, preserved 64 bounded JSON
+  SHA-256 `4c56571897acfd0dd8d95079d26ad78cb0196fd5bce15fc28f1cf2b28cdea159`, and source database
+  SHA-256 `dcf79fa307a6294195a8e5db1cddb185bbc1baca2ee490061b89f2a5961a052c`. The baseline jq gate and
+  its supplemental `wgpu_match_and_score` backend assertion both exited 0, and the process preflight
+  found no benchmark conflict.
 - The strict bounded gate **FAILED solely on output fingerprint parity**. The preserved 64-chunk
   baseline fingerprint was
   `5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed`; all three 512-chunk
   repetitions produced the internally stable fingerprint
   `d8d08eb30c53210f388c24b9f15ab3e59d30afb4fa349c175a49b3e38108decd`. Therefore these results
   do not demonstrate output parity.
-- Every other bounded predicate passed: `pair_count=96`, `repetitions=3`, and each run had
-  `matched_pairs=96`, `verified_pairs=96`, `total_matches=62409`, backend
-  `wgpu_match_and_score`, a 64-character fingerprint, and only finite numeric values. The exact
-  plan `jq --slurpfile` gate returned `false` with exit 1 because the candidate fingerprint did not
-  equal the baseline fingerprint.
+- Every other strengthened bounded predicate passed: `pair_count=96`, `repetitions=3`, exactly
+  three run objects, and each run had `matched_pairs=96`, `verified_pairs=96`,
+  `total_matches=62409`, backend `wgpu_match_and_score`, a lowercase hexadecimal 64-character
+  fingerprint, and only finite numeric values. The updated exact plan `jq --slurpfile` gate returned
+  `false` with exit 1 because the candidate fingerprint did not equal the baseline fingerprint. A
+  diagnostic jq gate with only that equality predicate removed returned `true` with exit 0,
+  confirming that every other strengthened predicate passed.
 - Exactly one real non-sandboxed generic-wgpu bounded run was executed, with no forced Metal,
   Vulkan, or other wgpu backend setting and no concurrent benchmark process. No 2,890-pair
   benchmark was run.
