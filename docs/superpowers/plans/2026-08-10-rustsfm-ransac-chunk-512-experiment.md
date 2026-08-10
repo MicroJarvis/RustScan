@@ -415,6 +415,38 @@ jq -e '
 Append the exact fingerprint, three matching times, geometry/scorer calls, readback waits, and binary
 SHA-256 to this plan. Do not commit the binary or JSON.
 
+#### Task 3 evidence (2026-08-10)
+
+- Source proof: `rg` found exactly `2198:const GPU_RANSAC_CHUNK_TRIALS: usize = 64;`.
+  The targeted chunk test passed (`1 passed; 0 failed; 658 filtered out`), and the requested
+  `cargo check` and release `cargo build` both exited 0; all three commands emitted only dead-code
+  warnings.
+- Preserved executable: `/tmp/rustsfm-gpu-ransac-chunk-64` (executable Mach-O arm64), SHA-256
+  `880c7d726f789621d641f89ad6dbae7c990137adb29cda6789dbda57d8792541`.
+- Benchmark: generic wgpu with no forced backend, source database from the command above, `window=5`,
+  `pair_limit=96`, `repetitions=3`, GPU enabled, and `random_seed=0`; the process gate found no
+  running `benchmark-match-pairs` or `rustsfm`. The sandbox probe had no compatible adapter, so the
+  required non-sandboxed run produced `/tmp/rustsfm-gpu-ransac-chunk-64-96x3.json` using a
+  635285504-byte database snapshot. Backend was `wgpu_match_and_score` in every run.
+- Output was identical in runs 1-3: `matched_pairs=96`, `verified_pairs=96`,
+  `total_matches=62409`, fingerprint
+  `5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed`.
+- Run 1: `matching_seconds=18.969614875`, descriptor/geometry seconds
+  `6.5157951700000005`/`12.074102664999998`; matcher direction/readback calls `192`/`192`, matcher
+  readback wait `6.199151996999999`. Essential, fundamental, and homography scorer
+  score/mask/readback calls were `192/249/441`, `192/180/372`, and `5066/656/5722`; their readback
+  waits were `0.670638922`, `0.5658994169999998`, and `8.644388290000006` seconds.
+- Run 2: `matching_seconds=18.899943125`, descriptor/geometry seconds
+  `6.506449707000002`/`11.989519454999998`; matcher direction/readback calls `192`/`192`, matcher
+  readback wait `6.199279754000002`. Scorer call counts matched run 1; essential, fundamental, and
+  homography readback waits were `0.6716153760000001`, `0.566310135`, and `8.638828708` seconds.
+- Run 3: `matching_seconds=18.926185916`, descriptor/geometry seconds
+  `6.503120993999999`/`12.053072455000002`; matcher direction/readback calls `192`/`192`, matcher
+  readback wait `6.190427672000002`. Scorer call counts matched run 1; essential, fundamental, and
+  homography readback waits were `0.672624138`, `0.5658347960000001`, and `8.655256307` seconds.
+- The exact `jq -e` gate above returned `true` with exit 0, including the finite-number check and the
+  single-fingerprint check.
+
 - [ ] **Step 5: Commit Task 3 evidence**
 
 ```bash
