@@ -714,6 +714,21 @@ git diff --check
 Document the exact known external-fixture or adapter prerequisite failures; do not describe a
 non-zero test command as fully passing.
 
+#### Task 6 regression evidence (2026-08-10)
+
+- The primary full library command completed with exit 101: 659 tests ran, 631 passed, 28 failed,
+  0 ignored, 0 measured, and 0 filtered out. Nineteen failures required the absent
+  `flowers2_colmap/sparse/text` fixture, and the remaining nine required a compatible wgpu adapter.
+  A filtered rerun remained non-zero but varied to 639 passed and 20 failed as adapter availability
+  changed; this prerequisite-dependent variation does not establish a regression. No observed
+  failure targeted the GPU RANSAC chunk-boundary behavior, and the suite is not recorded as passing.
+- `cargo check` completed with exit 0 and 38 warnings. `cargo fmt --all -- --check` and
+  `git diff --check` both completed with exit 0, and the verification worktree was clean.
+- The exact strict bounded jq gate remained `false` with exit 1, while the diagnostic gate with only
+  fingerprint equality removed returned `true` with exit 0. No 2,890-pair JSON artifacts or active
+  benchmark process were present.
+- Final decision: **NO MERGE**. No full benchmark, merge, production edit, or cleanup was performed.
+
 - [ ] **Step 3: Integrate only after strict bounded and full parity**
 
 If both strict gates passed, synchronize the branch with current `main`, rerun affected tests, merge
