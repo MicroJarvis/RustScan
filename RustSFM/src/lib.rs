@@ -156,7 +156,8 @@ pub use mapper::{
     ReconstructionSeed, ReconstructionSummary, ReferenceCameraSetup,
 };
 pub use match_pair_benchmark::{
-    benchmark_match_pairs, MatchPairBenchmarkReport, MatchPairBenchmarkRun,
+    benchmark_match_pairs, benchmark_match_pairs_with_artifacts, MatchPairBenchmarkReport,
+    MatchPairBenchmarkRun,
 };
 pub use parity::{compare_database_parity, ParityReport};
 pub use retrieval::{

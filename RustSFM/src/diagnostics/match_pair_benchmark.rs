@@ -14,7 +14,7 @@ fn copy_benchmark_snapshot_for_run(
     work_dir: &Path,
     run_index: usize,
 ) -> Result<PathBuf> {
-    let database = work_dir.join(format!("run-{run_index}.db"));
+    let database = work_dir.join(format!("run-{}.db", run_index + 1));
     std::fs::copy(snapshot, &database)
         .with_context(|| format!("copy benchmark snapshot for run {}", run_index + 1))?;
     Ok(database)
@@ -78,6 +78,48 @@ pub fn benchmark_match_pairs(
     repetitions: usize,
     options: &MatchFeaturesOptions,
 ) -> Result<MatchPairBenchmarkReport> {
+    validate_benchmark_controls(window, pair_limit, repetitions)?;
+    let work_dir = tempfile::tempdir().context("create match-pair benchmark directory")?;
+    benchmark_match_pairs_in_directory(
+        source_database,
+        window,
+        pair_limit,
+        repetitions,
+        options,
+        work_dir.path(),
+    )
+}
+
+pub fn benchmark_match_pairs_with_artifacts(
+    source_database: &Path,
+    window: usize,
+    pair_limit: Option<usize>,
+    repetitions: usize,
+    options: &MatchFeaturesOptions,
+    artifacts_dir: &Path,
+) -> Result<MatchPairBenchmarkReport> {
+    validate_benchmark_controls(window, pair_limit, repetitions)?;
+    std::fs::create_dir(artifacts_dir).with_context(|| {
+        format!(
+            "create match-pair benchmark artifacts directory {} (path must not already exist)",
+            artifacts_dir.display()
+        )
+    })?;
+    benchmark_match_pairs_in_directory(
+        source_database,
+        window,
+        pair_limit,
+        repetitions,
+        options,
+        artifacts_dir,
+    )
+}
+
+fn validate_benchmark_controls(
+    window: usize,
+    pair_limit: Option<usize>,
+    repetitions: usize,
+) -> Result<()> {
     if window == 0 {
         bail!("match-pair benchmark window must be greater than zero");
     }
@@ -87,8 +129,18 @@ pub fn benchmark_match_pairs(
     if repetitions == 0 {
         bail!("match-pair benchmark repetitions must be greater than zero");
     }
-    let work_dir = tempfile::tempdir().context("create match-pair benchmark directory")?;
-    let source_snapshot = work_dir.path().join("source-snapshot.db");
+    Ok(())
+}
+
+fn benchmark_match_pairs_in_directory(
+    source_database: &Path,
+    window: usize,
+    pair_limit: Option<usize>,
+    repetitions: usize,
+    options: &MatchFeaturesOptions,
+    work_dir: &Path,
+) -> Result<MatchPairBenchmarkReport> {
+    let source_snapshot = work_dir.join("source-snapshot.db");
     let copy_started = Instant::now();
     let source = ColmapDatabase::open_read_only(source_database)
         .with_context(|| format!("open benchmark source {}", source_database.display()))?;
@@ -122,7 +174,7 @@ pub fn benchmark_match_pairs(
     let mut runs = Vec::with_capacity(repetitions);
     for run_index in 0..repetitions {
         let working_database =
-            copy_benchmark_snapshot_for_run(&source_snapshot, work_dir.path(), run_index)?;
+            copy_benchmark_snapshot_for_run(&source_snapshot, work_dir, run_index)?;
         let control = SfmTaskControl::new();
         let mut sink = |_event| {};
         let mut task = SfmTaskContext::new(&control, &mut sink);
@@ -290,6 +342,98 @@ mod tests {
             database.read_two_view_geometry(1, 2).unwrap(),
             original_geometry
         );
+    }
+
+    #[test]
+    fn match_pair_benchmark_retains_independent_artifact_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("database.db");
+        let artifacts = dir.path().join("benchmark-artifacts");
+        write_empty_feature_database(&source);
+        let marker = rusqlite::Connection::open(&source).unwrap();
+        marker
+            .execute_batch(
+                "CREATE TABLE benchmark_marker(value INTEGER NOT NULL);
+                 INSERT INTO benchmark_marker(value) VALUES(42);",
+            )
+            .unwrap();
+        drop(marker);
+        let before = std::fs::read(&source).unwrap();
+
+        let report = benchmark_match_pairs_with_artifacts(
+            &source,
+            1,
+            Some(1),
+            2,
+            &crate::MatchFeaturesOptions::default(),
+            &artifacts,
+        )
+        .unwrap();
+
+        assert_eq!(report.runs.len(), 2);
+        let snapshot = artifacts.join("source-snapshot.db");
+        let run1 = artifacts.join("run-1.db");
+        let run2 = artifacts.join("run-2.db");
+        for path in [&snapshot, &run1, &run2] {
+            assert!(
+                path.is_file(),
+                "missing retained database {}",
+                path.display()
+            );
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+
+        let first_run = rusqlite::Connection::open(&run1).unwrap();
+        first_run
+            .execute("UPDATE benchmark_marker SET value = 99", [])
+            .unwrap();
+        drop(first_run);
+        let marker_value = |path: &Path| {
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap()
+                .query_row("SELECT value FROM benchmark_marker", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(marker_value(&run1), 99);
+        for path in [&source, &snapshot, &run2] {
+            assert_eq!(
+                marker_value(path),
+                42,
+                "database changed: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn match_pair_benchmark_rejects_existing_artifacts_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("database.db");
+        write_empty_feature_database(&source);
+        let existing_dir = dir.path().join("existing-dir");
+        std::fs::create_dir(&existing_dir).unwrap();
+        let existing_file = dir.path().join("existing-file");
+        std::fs::write(&existing_file, b"do not overwrite").unwrap();
+
+        for artifacts in [&existing_dir, &existing_file] {
+            let result = benchmark_match_pairs_with_artifacts(
+                &source,
+                1,
+                Some(1),
+                1,
+                &crate::MatchFeaturesOptions::default(),
+                artifacts,
+            );
+            assert!(
+                result.is_err(),
+                "accepted existing artifacts path {}",
+                artifacts.display()
+            );
+        }
+        assert!(existing_dir.read_dir().unwrap().next().is_none());
+        assert_eq!(std::fs::read(existing_file).unwrap(), b"do not overwrite");
     }
 
     #[test]

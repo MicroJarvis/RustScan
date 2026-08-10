@@ -350,6 +350,8 @@ struct BenchmarkMatchPairsArgs {
     random_seed: i32,
     #[arg(long)]
     output_json: Option<PathBuf>,
+    #[arg(long)]
+    artifacts_dir: Option<PathBuf>,
     #[arg(long, default_value = "info")]
     log_level: String,
 }
@@ -755,6 +757,27 @@ mod tests {
         assert_eq!(args.repetitions, 3);
         assert!(args.use_gpu);
         assert_eq!(args.output_json, Some(PathBuf::from("report.json")));
+    }
+
+    #[test]
+    fn benchmark_match_pairs_parses_artifacts_directory() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "benchmark-match-pairs",
+            "--database",
+            "database.db",
+            "--artifacts-dir",
+            "benchmark-artifacts",
+        ])
+        .unwrap();
+
+        let Commands::BenchmarkMatchPairs(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(
+            args.artifacts_dir,
+            Some(PathBuf::from("benchmark-artifacts"))
+        );
     }
 
     #[test]
