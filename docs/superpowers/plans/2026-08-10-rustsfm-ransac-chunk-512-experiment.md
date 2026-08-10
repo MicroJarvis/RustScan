@@ -1,0 +1,592 @@
+# RustSFM GPU RANSAC 512-Chunk Experiment Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Test a fixed GPU two-view RANSAC chunk size of 512 against the current size of 64, merging it only when fixed-seed SQLite match and geometry outputs are bit-for-bit identical.
+
+**Architecture:** Add a canonical BLAKE3 fingerprint for the selected pairs' raw `matches` and `two_view_geometries` SQLite rows, expose it in each isolated benchmark run, and record a 64 baseline before changing the chunk constant. Compare the 512 bounded and full runs against binaries built from the same fingerprint implementation, with no public chunk-size option and no changes to matching semantics beyond the experimental constant.
+
+**Tech Stack:** Rust, rusqlite, BLAKE3, serde, wgpu, Cargo tests, jq, the existing `benchmark-match-pairs` CLI.
+
+---
+
+### Task 1: Canonical Selected-Pair Output Fingerprint
+
+**Files:**
+- Modify: `RustSFM/Cargo.toml`
+- Modify: `RustSFM/src/io/database.rs`
+- Test: `RustSFM/src/io/database.rs`
+
+- [ ] **Step 1: Add the direct BLAKE3 dependency and write the failing fingerprint test**
+
+Add to `RustSFM/Cargo.toml`:
+
+```toml
+blake3 = "1"
+```
+
+In the `database.rs` test module, add these helpers and a test. The test calls the wished-for method
+with forward and reversed pair-list order, proves the fingerprint is lowercase/order-independent,
+then mutates and restores every covered raw column:
+
+```rust
+fn seed_fingerprint_pair(
+    db: &ColmapDatabase,
+    left: ImageId,
+    right: ImageId,
+    offset: u32,
+) -> Result<()> {
+    let matches = vec![m(offset, offset + 1), m(offset + 2, offset + 3)];
+    db.write_matches(left, right, &matches)?;
+    db.write_two_view_geometry(
+        left,
+        right,
+        &ColmapTwoViewGeometry {
+            config: COLMAP_TWO_VIEW_CALIBRATED,
+            inlier_matches: vec![matches[0].clone()],
+            f_matrix: Some([1.0 + offset as f64; 9]),
+            e_matrix: Some([2.0 + offset as f64; 9]),
+            h_matrix: Some([3.0 + offset as f64; 9]),
+            qvec: Some([1.0, 0.0, 0.0, offset as f64]),
+            tvec: Some([offset as f64, 1.0, 2.0]),
+        },
+    )?;
+    Ok(())
+}
+
+fn assert_raw_pair_column_affects_fingerprint(
+    db: &ColmapDatabase,
+    pair_id: i64,
+    table: &str,
+    column: &str,
+    replacement: rusqlite::types::Value,
+    pairs: &[(ImageId, ImageId)],
+    baseline: &str,
+) -> Result<()> {
+    let select = format!("SELECT {column} FROM {table} WHERE pair_id = ?1");
+    let update = format!("UPDATE {table} SET {column} = ?1 WHERE pair_id = ?2");
+    let original = db
+        .conn
+        .query_row(&select, params![pair_id], |row| row.get::<_, rusqlite::types::Value>(0))?;
+    db.conn.execute(&update, params![replacement, pair_id])?;
+    assert_ne!(db.selected_pair_output_fingerprint(pairs)?, baseline);
+    db.conn.execute(&update, params![original, pair_id])?;
+    assert_eq!(db.selected_pair_output_fingerprint(pairs)?, baseline);
+    Ok(())
+}
+
+#[test]
+fn selected_pair_output_fingerprint_is_order_independent_and_bit_exact() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("database.db");
+    let db = ColmapDatabase::open(&path)?;
+    let pairs = [(1, 2), (2, 3)];
+    seed_fingerprint_pair(&db, 1, 2, 3)?;
+    seed_fingerprint_pair(&db, 2, 3, 4)?;
+
+    let baseline = db.selected_pair_output_fingerprint(&pairs)?;
+    assert_eq!(baseline.len(), 64);
+    assert!(baseline
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    assert_eq!(
+        baseline,
+        db.selected_pair_output_fingerprint(&[(3, 2), (2, 1)])?
+    );
+
+    let pair_id = image_pair_to_pair_id(1, 2).unwrap() as i64;
+    for (table, column, replacement) in [
+        ("matches", "rows", rusqlite::types::Value::Integer(17)),
+        ("matches", "cols", rusqlite::types::Value::Integer(19)),
+        ("matches", "data", rusqlite::types::Value::Blob(vec![0x01])),
+        ("two_view_geometries", "rows", rusqlite::types::Value::Integer(23)),
+        ("two_view_geometries", "cols", rusqlite::types::Value::Integer(29)),
+        ("two_view_geometries", "data", rusqlite::types::Value::Blob(vec![0x02])),
+        ("two_view_geometries", "config", rusqlite::types::Value::Integer(31)),
+        ("two_view_geometries", "F", rusqlite::types::Value::Blob(vec![0x03; 72])),
+        ("two_view_geometries", "E", rusqlite::types::Value::Blob(vec![0x04; 72])),
+        ("two_view_geometries", "H", rusqlite::types::Value::Blob(vec![0x05; 72])),
+        ("two_view_geometries", "qvec", rusqlite::types::Value::Blob(vec![0x06; 32])),
+        ("two_view_geometries", "tvec", rusqlite::types::Value::Blob(vec![0x07; 24])),
+    ] {
+        assert_raw_pair_column_affects_fingerprint(
+            &db,
+            pair_id,
+            table,
+            column,
+            replacement,
+            &pairs,
+            &baseline,
+        )?;
+    }
+    Ok(())
+}
+```
+
+Do not compare whole SQLite file bytes.
+
+- [ ] **Step 2: Run the test and verify RED**
+
+Run:
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features database::tests::selected_pair_output_fingerprint \
+  -- --nocapture
+```
+
+Expected: compilation fails because `selected_pair_output_fingerprint` does not exist.
+
+- [ ] **Step 3: Implement the raw-row canonical encoder**
+
+Add private length-prefixed hashing helpers near the database blob encoders:
+
+```rust
+fn fingerprint_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn fingerprint_optional_blob(hasher: &mut blake3::Hasher, blob: Option<&[u8]>) {
+    match blob {
+        Some(bytes) => {
+            hasher.update(&[1]);
+            fingerprint_bytes(hasher, bytes);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn fingerprint_i64(hasher: &mut blake3::Hasher, value: i64) {
+    hasher.update(&value.to_le_bytes());
+}
+```
+
+Add this public read-only method on `ColmapDatabase`:
+
+```rust
+pub fn selected_pair_output_fingerprint(
+    &self,
+    image_pairs: &[(ImageId, ImageId)],
+) -> Result<String> {
+    let mut pair_ids = image_pairs
+        .iter()
+        .map(|&(left, right)| {
+            image_pair_to_pair_id(left, right).map_err(|err| anyhow::anyhow!("{err:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pair_ids.sort_unstable();
+    pair_ids.dedup();
+    if pair_ids.len() != image_pairs.len() {
+        bail!("selected-pair fingerprint requires unique canonical pairs");
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rustsfm-selected-pair-output-v1\0");
+    hasher.update(&(pair_ids.len() as u64).to_le_bytes());
+    for pair_id in pair_ids {
+        hasher.update(&(pair_id as u64).to_le_bytes());
+        let matches = self
+            .conn
+            .query_row(
+                "SELECT rows, cols, data FROM matches WHERE pair_id = ?1",
+                params![pair_id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match matches {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some((rows, cols, data)) => {
+                hasher.update(&[1]);
+                fingerprint_i64(&mut hasher, rows);
+                fingerprint_i64(&mut hasher, cols);
+                fingerprint_optional_blob(&mut hasher, data.as_deref());
+            }
+        }
+
+        let geometry = self
+            .conn
+            .query_row(
+                "SELECT rows, cols, data, config, F, E, H, qvec, tvec
+                 FROM two_view_geometries WHERE pair_id = ?1",
+                params![pair_id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                        row.get::<_, Option<Vec<u8>>>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match geometry {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some((rows, cols, data, config, f, e, h, qvec, tvec)) => {
+                hasher.update(&[1]);
+                fingerprint_i64(&mut hasher, rows);
+                fingerprint_i64(&mut hasher, cols);
+                fingerprint_optional_blob(&mut hasher, data.as_deref());
+                fingerprint_i64(&mut hasher, config);
+                for blob in [&f, &e, &h, &qvec, &tvec] {
+                    fingerprint_optional_blob(&mut hasher, blob.as_deref());
+                }
+            }
+        }
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+```
+
+Use these exact read-only queries, preserving `NULL` versus empty blob:
+
+```sql
+SELECT rows, cols, data FROM matches WHERE pair_id = ?1;
+SELECT rows, cols, data, config, F, E, H, qvec, tvec
+FROM two_view_geometries WHERE pair_id = ?1;
+```
+
+Hash row absence with tag `0` and row presence with tag `1`. Do not decode matches, matrices, or
+poses, and do not hash timing or unrelated pairs.
+
+- [ ] **Step 4: Verify GREEN and the database regressions**
+
+Run:
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features database::tests::selected_pair_output_fingerprint \
+  -- --nocapture
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features database::tests::matches_roundtrip \
+  -- --nocapture
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features database::tests::two_view_geometry_roundtrip \
+  -- --nocapture
+cargo fmt --all -- --check
+git diff --check
+```
+
+Expected: all focused tests and checks pass.
+
+- [ ] **Step 5: Commit Task 1**
+
+```bash
+git add RustSFM/Cargo.toml Cargo.lock RustSFM/src/io/database.rs
+git commit -m "feat(rustsfm): fingerprint pair benchmark outputs"
+```
+
+### Task 2: Benchmark Fingerprint Reporting
+
+**Files:**
+- Modify: `RustSFM/src/diagnostics/match_pair_benchmark.rs`
+- Test: `RustSFM/src/diagnostics/match_pair_benchmark.rs`
+
+- [ ] **Step 1: Write failing benchmark and serde tests**
+
+Add a serde-defaulted field:
+
+```rust
+#[serde(default)]
+pub result_fingerprint: String,
+```
+
+to the wished-for `MatchPairBenchmarkRun` in the tests first. Extend
+`match_pair_benchmark_repeats_without_modifying_source_database` to assert:
+
+```rust
+assert!(report.runs.iter().all(|run| run.result_fingerprint.len() == 64));
+assert_eq!(
+    report.runs.iter().map(|run| &run.result_fingerprint).collect::<BTreeSet<_>>().len(),
+    1
+);
+```
+
+Add `match_pair_benchmark_run_deserializes_without_fingerprint` using a legacy JSON run and assert
+that `result_fingerprint` defaults to the empty string.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features match_pair_benchmark -- --nocapture
+```
+
+Expected: compile failure because the production run DTO does not contain `result_fingerprint`.
+
+- [ ] **Step 3: Compute the fingerprint before each temporary run database is dropped**
+
+Add the serde-defaulted field to `MatchPairBenchmarkRun`. Immediately after matching and before
+constructing the run DTO, open the working database read-only and compute:
+
+```rust
+let result_fingerprint = ColmapDatabase::open_read_only(&working_database)?
+    .selected_pair_output_fingerprint(&image_pairs)
+    .with_context(|| format!("fingerprint benchmark run {} outputs", run_index + 1))?;
+```
+
+Store it in the run DTO. Do not include fingerprint time in `matching_seconds` or any timing field.
+
+- [ ] **Step 4: Verify and commit Task 2**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features match_pair_benchmark -- --nocapture
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --bin rustsfm --no-default-features benchmark_match_pairs -- --nocapture
+cargo fmt --all -- --check
+git diff --check
+git add RustSFM/src/diagnostics/match_pair_benchmark.rs
+git commit -m "feat(rustsfm): report benchmark result fingerprint"
+```
+
+Expected: library and CLI tests pass; the source database preservation test remains byte-for-byte
+unchanged.
+
+### Task 3: Record The 64-Chunk Baseline
+
+**Files:**
+- Modify: `docs/superpowers/plans/2026-08-10-rustsfm-ransac-chunk-512-experiment.md`
+
+- [ ] **Step 1: Prove the source still uses 64 and run pre-baseline regressions**
+
+```bash
+rg -n "GPU_RANSAC_CHUNK_TRIALS: usize = 64" RustSFM/src/geometry/two_view.rs
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu gpu_ransac_chunk_ -- --nocapture
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo check -p rustsfm \
+  --no-default-features --features gpu-wgpu
+```
+
+Expected: the constant search finds exactly one line, the chunk test passes, and the check succeeds.
+
+- [ ] **Step 2: Build and preserve the 64 release binary**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo build -p rustsfm \
+  --release --no-default-features --features gpu-wgpu
+cp /Users/tfjiang/Projects/RustScan/target/release/rustsfm \
+  /tmp/rustsfm-gpu-ransac-chunk-64
+```
+
+Verify `/tmp/rustsfm-gpu-ransac-chunk-64` is executable. This binary includes fingerprint reporting
+and retains chunk 64 even after the source changes.
+
+- [ ] **Step 3: Ensure no benchmark is running and run the 64 bounded baseline**
+
+Run exactly one non-sandboxed generic-wgpu benchmark:
+
+```bash
+/tmp/rustsfm-gpu-ransac-chunk-64 benchmark-match-pairs \
+  --database /Users/tfjiang/Projects/RustScan/test_data/flowers2/out9/Untitled.rustscanproject/Cache/.staging/keyframe_sfm-1/rustsfm/Cache/database.db \
+  --window 5 --pair-limit 96 --repetitions 3 --use-gpu --random-seed 0 \
+  --output-json /tmp/rustsfm-gpu-ransac-chunk-64-96x3.json
+```
+
+- [ ] **Step 4: Validate and record the baseline**
+
+```bash
+jq -e '
+  .pair_count == 96 and .repetitions == 3 and
+  all(.runs[]; .matched_pairs == 96 and .verified_pairs == 96 and
+      .total_matches == 62409 and (.result_fingerprint | length) == 64) and
+  ([.runs[].result_fingerprint] | unique | length) == 1 and
+  all(.. | numbers; (isnan | not) and (isinfinite | not))
+' /tmp/rustsfm-gpu-ransac-chunk-64-96x3.json
+```
+
+Append the exact fingerprint, three matching times, geometry/scorer calls, readback waits, and binary
+SHA-256 to this plan. Do not commit the binary or JSON.
+
+- [ ] **Step 5: Commit Task 3 evidence**
+
+```bash
+git add docs/superpowers/plans/2026-08-10-rustsfm-ransac-chunk-512-experiment.md
+git commit -m "docs(rustsfm): record 64-chunk fingerprint baseline"
+```
+
+### Task 4: Change The GPU RANSAC Chunk To 512 With TDD
+
+**Files:**
+- Modify: `RustSFM/src/geometry/two_view.rs`
+- Test: `RustSFM/src/geometry/two_view.rs`
+
+- [ ] **Step 1: Change only the boundary test and verify RED**
+
+Change the first assertion in `gpu_ransac_chunk_end_applies_dynamic_limits_at_boundaries` and add a
+post-first-chunk dynamic-stop assertion:
+
+```rust
+assert_eq!(gpu_ransac_chunk_end(0, 10_000, 10_000, 100), 512);
+assert_eq!(gpu_ransac_chunk_end(512, 10_000, 24, 100), 101);
+assert_eq!(gpu_ransac_chunk_end(9_980, 10_000, usize::MAX, 100), 10_000);
+```
+
+Run:
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu gpu_ransac_chunk_ -- --nocapture
+```
+
+Expected: FAIL because the first result remains 64.
+
+- [ ] **Step 2: Make the minimal production change and verify GREEN**
+
+Change exactly:
+
+```rust
+const GPU_RANSAC_CHUNK_TRIALS: usize = 512;
+```
+
+Run the same command. Expected: the boundary test passes.
+
+- [ ] **Step 3: Run GPU geometry regressions**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu gpu_geometry_profiled \
+  -- --nocapture
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu two_view::tests \
+  -- --nocapture
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu controlled_computed_matching_ \
+  -- --nocapture
+cargo fmt --all -- --check
+git diff --check
+```
+
+Expected: all deterministic CPU tests pass; adapter-required tests either pass on a real adapter or
+take their existing explicit skip path. No pair ordering, transaction, or progress test changes.
+
+- [ ] **Step 4: Commit Task 4**
+
+```bash
+git add RustSFM/src/geometry/two_view.rs
+git commit -m "perf(rustsfm): test 512-trial gpu ransac chunks"
+```
+
+### Task 5: Strict 512 Benchmark Gate
+
+**Files:**
+- Modify: `docs/superpowers/plans/2026-08-10-rustsfm-ransac-chunk-512-experiment.md`
+
+- [ ] **Step 1: Build the 512 release CLI**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo build -p rustsfm \
+  --release --no-default-features --features gpu-wgpu
+```
+
+- [ ] **Step 2: Run the bounded candidate with no concurrent benchmark**
+
+```bash
+/Users/tfjiang/Projects/RustScan/target/release/rustsfm benchmark-match-pairs \
+  --database /Users/tfjiang/Projects/RustScan/test_data/flowers2/out9/Untitled.rustscanproject/Cache/.staging/keyframe_sfm-1/rustsfm/Cache/database.db \
+  --window 5 --pair-limit 96 --repetitions 3 --use-gpu --random-seed 0 \
+  --output-json /tmp/rustsfm-gpu-ransac-chunk-512-96x3.json
+```
+
+- [ ] **Step 3: Enforce the strict bounded gate**
+
+```bash
+jq -e --slurpfile baseline /tmp/rustsfm-gpu-ransac-chunk-64-96x3.json '
+  .pair_count == 96 and .repetitions == 3 and
+  all(.runs[]; .matched_pairs == 96 and .verified_pairs == 96 and
+      .total_matches == 62409) and
+  ([.runs[].result_fingerprint] | unique | length) == 1 and
+  .runs[0].result_fingerprint == $baseline[0].runs[0].result_fingerprint and
+  all(.. | numbers; (isnan | not) and (isinfinite | not))
+' /tmp/rustsfm-gpu-ransac-chunk-512-96x3.json
+```
+
+If this command fails, record both fingerprints and counts, do not run full benchmarks, do not merge
+the code, and proceed directly to review/documentation and unmerged cleanup.
+
+- [ ] **Step 4: If bounded parity passes, run sequential 64 and 512 full benchmarks**
+
+First run the preserved 64 binary:
+
+```bash
+/tmp/rustsfm-gpu-ransac-chunk-64 benchmark-match-pairs \
+  --database /Users/tfjiang/Projects/RustScan/test_data/flowers2/out9/Untitled.rustscanproject/Cache/.staging/keyframe_sfm-1/rustsfm/Cache/database.db \
+  --window 5 --pair-limit 2890 --repetitions 1 --use-gpu --random-seed 0 \
+  --output-json /tmp/rustsfm-gpu-ransac-chunk-64-2890.json
+```
+
+After it exits, run the 512 binary:
+
+```bash
+/Users/tfjiang/Projects/RustScan/target/release/rustsfm benchmark-match-pairs \
+  --database /Users/tfjiang/Projects/RustScan/test_data/flowers2/out9/Untitled.rustscanproject/Cache/.staging/keyframe_sfm-1/rustsfm/Cache/database.db \
+  --window 5 --pair-limit 2890 --repetitions 1 --use-gpu --random-seed 0 \
+  --output-json /tmp/rustsfm-gpu-ransac-chunk-512-2890.json
+```
+
+Require both runs to have 2,890 matched/verified pairs, 2,958,062 matches, and identical
+`result_fingerprint` values. A mismatch fails the experiment regardless of speed.
+
+- [ ] **Step 5: Record the decision and commit evidence**
+
+Append exact bounded/full fingerprints, counts, timings, score/mask/readback calls, waits, and the
+merge/no-merge decision to this plan. Run `git diff --check`, then commit only the plan:
+
+```bash
+git add docs/superpowers/plans/2026-08-10-rustsfm-ransac-chunk-512-experiment.md
+git commit -m "docs(rustsfm): record 512-chunk experiment"
+```
+
+### Task 6: Review, Regression, Integration, And Cleanup
+
+**Files:**
+- Modify only when a reviewer identifies a verified defect.
+
+- [ ] **Step 1: Dispatch independent specification and code-quality reviewers**
+
+Review all experiment commits against the design. Critical/Important findings block integration.
+Reviewers must verify fingerprint coverage, no public backend forcing, no default cap, no extra GPU
+dispatch/readback beyond the changed chunk behavior, and no source-database mutation.
+
+- [ ] **Step 2: Resolve findings with RED/GREEN tests and run final verification**
+
+```bash
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo test -p rustsfm \
+  --lib --no-default-features --features gpu-wgpu -- --nocapture
+CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo check -p rustsfm \
+  --no-default-features --features gpu-wgpu
+cargo fmt --all -- --check
+git diff --check
+```
+
+Document the exact known external-fixture or adapter prerequisite failures; do not describe a
+non-zero test command as fully passing.
+
+- [ ] **Step 3: Integrate only after strict bounded and full parity**
+
+If both strict gates passed, synchronize the branch with current `main`, rerun affected tests, merge
+locally into `main`, and verify the merged constant/fingerprint tests. If either gate failed, do not
+merge any experiment commit.
+
+- [ ] **Step 4: Clean up the isolated worktree and branch**
+
+After preserving the final decision in the user report (and in `main` only when the experiment is
+merged), remove `.worktrees/ransac-chunk-512` and delete `codex/ransac-chunk-512-experiment` with
+`git branch -d` when merged or `git branch -D` only after explicit confirmation when unmerged.
