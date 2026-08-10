@@ -30,6 +30,8 @@ pub struct MatchPairBenchmarkRun {
     pub total_matches: usize,
     pub matching_seconds: f64,
     pub timings: MatchFeaturesTimingReport,
+    #[serde(default)]
+    pub result_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +133,9 @@ pub fn benchmark_match_pairs(
             &session,
             &mut task,
         )?;
+        let result_fingerprint = ColmapDatabase::open_read_only(&working_database)?
+            .selected_pair_output_fingerprint(&image_pairs)
+            .with_context(|| format!("fingerprint benchmark run {} outputs", run_index + 1))?;
         let mut timings = report.timings;
         timings.backend_initialization_seconds = 0.0;
         timings.finish(report.matching_seconds);
@@ -143,6 +148,7 @@ pub fn benchmark_match_pairs(
             total_matches: report.total_matches,
             matching_seconds: report.matching_seconds,
             timings,
+            result_fingerprint,
         });
     }
 
@@ -264,6 +270,19 @@ mod tests {
             .runs
             .iter()
             .all(|run| run.timings.backend_initialization_seconds == 0.0));
+        assert!(report
+            .runs
+            .iter()
+            .all(|run| run.result_fingerprint.len() == 64));
+        assert_eq!(
+            report
+                .runs
+                .iter()
+                .map(|run| run.result_fingerprint.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
         assert_eq!(std::fs::read(&source).unwrap(), before);
         let database = ColmapDatabase::open_read_only(&source).unwrap();
         assert_eq!(database.read_matches(1, 2).unwrap(), original_matches);
@@ -271,6 +290,24 @@ mod tests {
             database.read_two_view_geometry(1, 2).unwrap(),
             original_geometry
         );
+    }
+
+    #[test]
+    fn match_pair_benchmark_run_deserializes_without_fingerprint() {
+        let legacy_run = serde_json::json!({
+            "run_index": 1,
+            "backend": "cpu",
+            "pair_count": 2,
+            "matched_pairs": 2,
+            "verified_pairs": 1,
+            "total_matches": 16,
+            "matching_seconds": 0.25,
+            "timings": MatchFeaturesTimingReport::default(),
+        });
+
+        let run: MatchPairBenchmarkRun = serde_json::from_value(legacy_run).unwrap();
+
+        assert_eq!(run.result_fingerprint, "");
     }
 
     #[test]
