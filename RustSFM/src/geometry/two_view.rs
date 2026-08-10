@@ -2195,7 +2195,7 @@ fn dynamic_ransac_num_trials(
 }
 
 #[cfg(feature = "gpu-wgpu")]
-const GPU_RANSAC_CHUNK_TRIALS: usize = 64;
+const GPU_RANSAC_CHUNK_TRIALS: usize = 512;
 
 #[cfg(feature = "gpu-wgpu")]
 fn gpu_ransac_chunk_end(
@@ -4780,8 +4780,8 @@ mod tests {
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn gpu_ransac_chunk_end_applies_dynamic_limits_at_boundaries() {
-        assert_eq!(gpu_ransac_chunk_end(0, 10_000, 10_000, 100), 64);
-        assert_eq!(gpu_ransac_chunk_end(64, 10_000, 24, 100), 101);
+        assert_eq!(gpu_ransac_chunk_end(0, 10_000, 10_000, 100), 512);
+        assert_eq!(gpu_ransac_chunk_end(512, 10_000, 24, 100), 101);
         assert_eq!(gpu_ransac_chunk_end(96, 10_000, 24, 100), 101);
         assert_eq!(gpu_ransac_chunk_end(101, 10_000, 24, 100), 101);
         assert_eq!(gpu_ransac_chunk_end(9_980, 10_000, usize::MAX, 100), 10_000);
