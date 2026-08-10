@@ -560,9 +560,47 @@ CARGO_TARGET_DIR=/Users/tfjiang/Projects/RustScan/target cargo build -p rustsfm 
 
 ```bash
 jq -e --slurpfile baseline /tmp/rustsfm-gpu-ransac-chunk-64-96x3.json '
+  def numeric_fields($fields):
+    . as $object |
+    ($object | type) == "object" and
+    all($fields[]; . as $field |
+        ($object | has($field)) and ($object[$field] | type) == "number");
+  def scorer_shape:
+    numeric_fields(["score_calls", "mask_calls", "readback_calls", "readback_wait_seconds"]);
+  def geometry_detail_shape:
+    . as $detail |
+    ($detail | type) == "object" and
+    all(["essential", "fundamental", "homography"][]; . as $model |
+        ($detail | has($model)) and ($detail[$model] | type) == "object" and
+        ($detail[$model] | has("scorer")) and ($detail[$model].scorer | scorer_shape));
+  def timings_shape:
+    numeric_fields([
+      "backend_initialization_seconds", "database_prepare_seconds", "pair_compute_seconds",
+      "database_commit_seconds", "event_sink_seconds", "unclassified_seconds",
+      "attempted_pairs", "produced_pair_reports", "committed_batches",
+      "gpu_descriptor_match_seconds", "gpu_geometry_seconds", "gpu_descriptor_pack_seconds",
+      "gpu_buffer_prepare_seconds", "gpu_submit_seconds", "gpu_readback_total_seconds",
+      "gpu_readback_copy_submit_seconds", "gpu_readback_wait_seconds",
+      "gpu_readback_map_decode_seconds", "gpu_cpu_postprocess_seconds",
+      "gpu_match_direction_calls", "gpu_readback_calls", "gpu_readback_bytes"
+    ]) and has("gpu_geometry_detail") and (.gpu_geometry_detail | geometry_detail_shape);
+  def run_shape:
+    numeric_fields([
+      "run_index", "pair_count", "matched_pairs", "verified_pairs", "total_matches",
+      "matching_seconds"
+    ]) and (.backend | type) == "string" and (.result_fingerprint | type) == "string" and
+    has("timings") and (.timings | timings_shape);
+  def report_shape:
+    . as $report |
+    ($report | type) == "object" and
+    ($report | numeric_fields(["pair_count", "repetitions"])) and
+    ($report.runs | type) == "array" and ($report.runs | length) == 3 and
+    all($report.runs[]; run_shape);
+
+  ($baseline | type) == "array" and ($baseline | length) == 1 and
+  report_shape and ($baseline[0] | report_shape) and
   .pair_count == 96 and .repetitions == 3 and
-  (.runs | length) == 3 and
-  all(.runs[]; .matched_pairs == 96 and .verified_pairs == 96 and
+  all(.runs[]; .pair_count == 96 and .matched_pairs == 96 and .verified_pairs == 96 and
       .total_matches == 62409 and .backend == "wgpu_match_and_score" and
       (.result_fingerprint | test("^[0-9a-f]{64}$"))) and
   ([.runs[].result_fingerprint] | unique | length) == 1 and
@@ -622,13 +660,15 @@ git commit -m "docs(rustsfm): record 512-chunk experiment"
   repetitions produced the internally stable fingerprint
   `d8d08eb30c53210f388c24b9f15ab3e59d30afb4fa349c175a49b3e38108decd`. Therefore these results
   do not demonstrate output parity.
-- Every other strengthened bounded predicate passed: `pair_count=96`, `repetitions=3`, exactly
-  three run objects, and each run had `matched_pairs=96`, `verified_pairs=96`,
-  `total_matches=62409`, backend `wgpu_match_and_score`, a lowercase hexadecimal 64-character
-  fingerprint, and only finite numeric values. The updated exact plan `jq --slurpfile` gate returned
-  `false` with exit 1 because the candidate fingerprint did not equal the baseline fingerprint. A
-  diagnostic jq gate with only that equality predicate removed returned `true` with exit 0,
-  confirming that every other strengthened predicate passed.
+- Every other strengthened bounded predicate passed: both real reports satisfied the exact root,
+  run, timing/counter, GPU geometry-detail, and nested scorer shape/type gate; `pair_count=96`,
+  `repetitions=3`, and exactly three runs were present; and each candidate run had
+  `pair_count=96`, `matched_pairs=96`, `verified_pairs=96`, `total_matches=62409`, backend
+  `wgpu_match_and_score`, a lowercase hexadecimal 64-character fingerprint, and only finite numeric
+  values. The strengthened exact plan `jq --slurpfile` gate remained `false` with exit 1 because the
+  candidate fingerprint did not equal the baseline fingerprint. A diagnostic jq gate with only that
+  equality predicate removed returned `true` with exit 0. The same exact gate rejected a synthetic
+  report with one structurally incomplete run, returning `false` with exit 1.
 - Exactly one real non-sandboxed generic-wgpu bounded run was executed, with no forced Metal,
   Vulkan, or other wgpu backend setting and no concurrent benchmark process. No 2,890-pair
   benchmark was run.
@@ -645,8 +685,9 @@ git commit -m "docs(rustsfm): record 512-chunk experiment"
   SHA-256 was `f001782380776a03191d46be2f69494174f82cfb45641d161a162213efb96486`.
 - The source database SHA-256 remained
   `dcf79fa307a6294195a8e5db1cddb185bbc1baca2ee490061b89f2a5961a052c` after the run.
-- Decision: **NO MERGE**. The full gate and Task 6 were skipped by design after the bounded parity
-  failure.
+- Decision: **NO MERGE**. The 2,890-pair full benchmarks were skipped after the bounded parity
+  failure, and integration/merge-dependent Task 6 work is skipped/not applicable. Task 6 review,
+  applicable regression/documentation work, and unmerged cleanup proceed.
 
 ### Task 6: Review, Regression, Integration, And Cleanup
 
