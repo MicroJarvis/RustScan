@@ -16,6 +16,7 @@ vlfeat-sift = []
 [dependencies]
 rustscan-types = { path = "../rustscan-types" }
 anyhow = "1"
+blake3 = "1"
 bytemuck = { version = "1.25", features = ["derive"], optional = true }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"

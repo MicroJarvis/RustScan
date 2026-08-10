@@ -7111,6 +7111,7 @@ name = "rustsfm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bytemuck",
  "cc",
  "ceres-solver",
