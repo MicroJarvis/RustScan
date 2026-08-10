@@ -605,6 +605,38 @@ git add docs/superpowers/plans/2026-08-10-rustsfm-ransac-chunk-512-experiment.md
 git commit -m "docs(rustsfm): record 512-chunk experiment"
 ```
 
+#### Task 5 evidence (2026-08-10)
+
+- The strict bounded gate **FAILED solely on output fingerprint parity**. The preserved 64-chunk
+  baseline fingerprint was
+  `5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed`; all three 512-chunk
+  repetitions produced the internally stable fingerprint
+  `d8d08eb30c53210f388c24b9f15ab3e59d30afb4fa349c175a49b3e38108decd`. Therefore these results
+  do not demonstrate output parity.
+- Every other bounded predicate passed: `pair_count=96`, `repetitions=3`, and each run had
+  `matched_pairs=96`, `verified_pairs=96`, `total_matches=62409`, backend
+  `wgpu_match_and_score`, a 64-character fingerprint, and only finite numeric values. The exact
+  plan `jq --slurpfile` gate returned `false` with exit 1 because the candidate fingerprint did not
+  equal the baseline fingerprint.
+- Exactly one real non-sandboxed generic-wgpu bounded run was executed, with no forced Metal,
+  Vulkan, or other wgpu backend setting and no concurrent benchmark process. No 2,890-pair
+  benchmark was run.
+
+| Run | Matching seconds | Descriptor / geometry seconds | Matcher direction / readback calls / wait | Essential score / mask / readback calls / wait | Fundamental score / mask / readback calls / wait | Homography score / mask / readback calls / wait |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `10.413036542` | `6.226976296999998` / `3.876795419` | `192` / `192` / `6.086479377999997` | `96` / `386` / `482` / `0.6124437380000002` | `96` / `272` / `368` / `0.46784329800000013` | `682` / `657` / `1339` / `1.7043951580000005` |
+| 2 | `10.462031292` | `6.238785755000001` / `3.9246934209999997` | `192` / `192` / `6.090471703999998` | `96` / `386` / `482` / `0.6139514099999998` | `96` / `272` / `368` / `0.46852012899999984` | `682` / `657` / `1339` / `1.704563249000001` |
+| 3 | `10.425532583` | `6.250543418` / `3.882857169` | `192` / `192` / `6.107325626000003` | `96` / `386` / `482` / `0.6126029610000001` | `96` / `272` / `368` / `0.467680545` | `682` / `657` / `1339` / `1.703518597` |
+
+- The candidate was built from HEAD `c037f175899995598affd9db72ee62b9f7a6a8ae`, source tree
+  `7570eee5452b624771963de85d938e9c00fdbcb1`. Its release binary SHA-256 was
+  `4a3768dae529402ff4971f9c5233eb14225b0ab654b97f715902144a4ef3d254`; the bounded candidate JSON
+  SHA-256 was `f001782380776a03191d46be2f69494174f82cfb45641d161a162213efb96486`.
+- The source database SHA-256 remained
+  `dcf79fa307a6294195a8e5db1cddb185bbc1baca2ee490061b89f2a5961a052c` after the run.
+- Decision: **NO MERGE**. The full gate and Task 6 were skipped by design after the bounded parity
+  failure.
+
 ### Task 6: Review, Regression, Integration, And Cleanup
 
 **Files:**
