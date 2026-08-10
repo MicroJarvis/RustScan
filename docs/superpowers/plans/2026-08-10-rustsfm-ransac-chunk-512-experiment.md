@@ -740,3 +740,63 @@ merge any experiment commit.
 After preserving the final decision in the user report (and in `main` only when the experiment is
 merged), remove `.worktrees/ransac-chunk-512` and delete `codex/ransac-chunk-512-experiment` with
 `git branch -d` when merged or `git branch -D` only after explicit confirmation when unmerged.
+
+### Root-Cause Investigation Evidence (2026-08-10)
+
+- The failed experiment remains isolated and unmerged. Commit
+  `54a443677683e4622ff7a02bbf406886f83065bd` added an opt-in `--artifacts-dir` diagnostic to retain
+  the SQLite online-backup snapshot and each independent run database. The old
+  `benchmark_match_pairs(...)` API and default temporary-directory behavior remain unchanged.
+  Specification and quality reviews found no Critical or Important issues. Both noted only that
+  the retained-artifact path does not duplicate the existing default-path uncheckpointed-WAL test;
+  both paths use the same online-backup implementation.
+- Existing preserved 64 and 512 binaries first narrowed the mismatch to the first selected pair.
+  With `--window 5 --pair-limit 1 --repetitions 1 --use-gpu --random-seed 0`, both runs selected
+  image `1` (`00000000.png`) and image `2` (`00000001.png`), matched and verified the pair, and
+  produced exactly `1419` descriptor matches. Their result fingerprints differed:
+  `c8e440cd266b3609f75c90e5c90260f41af1b765a9e709e0202cf605ec7eb5f5` for chunk 64 and
+  `6cedfadfce9845310087f28104a92479a19c4ae7edc2ab2e2f32adf7786e0af9` for chunk 512.
+- Fresh diagnostic binaries were built from the same `54a4436` source, differing only by the
+  temporary chunk constant used for each build. Their SHA-256 values are
+  `f441876c99db3d5903c2003e5c1edb0139611829c67032c2e622e345a025914b` (64) and
+  `7f2c1accdb86242d6b73e337a30598ec35addfb44401bb843153dd5c67a640be` (512). The worktree was
+  restored to the committed 512 constant and verified clean immediately after the builds.
+- The two retained `source-snapshot.db` files are byte-identical with SHA-256
+  `75b8b7948bfa39bb5f484a528b73f542cad3360eb8c6ba17cc81bf88f05f27be`. The live source database
+  remained unchanged at SHA-256
+  `dcf79fa307a6294195a8e5db1cddb185bbc1baca2ee490061b89f2a5961a052c`.
+- Raw SQLite comparison for canonical pair ID `2147483649` proved the `matches` row is bit-identical:
+  presence, `rows=1419`, `cols=2`, and the full `data` BLOB all match. The geometry rows have the
+  same presence, `cols=2`, calibrated `config=2`, and identical `H`, but differ in `rows`, `data`,
+  `F`, `E`, `qvec`, and `tvec`. Chunk 64 stored `1383` inliers; chunk 512 stored `1384`. The inlier
+  sets share `1379` correspondences, with four unique to 64 and five unique to 512.
+- The single-pair GPU counters expose where the behavior diverges. Chunk 64 used Essential
+  score/mask/model counts `2/3/434`, Fundamental `2/1/233`, and Homography `8/6/480`. Chunk 512
+  used Essential `1/4/2230`, Fundamental `1/2/1234`, and Homography `1/6/510`. E and F therefore
+  evaluated roughly five times as many candidate models and each accepted one extra candidate for
+  mask/refinement, while raw descriptor matching and the stored homography remained identical.
+- Source tracing explains the semantic change. `gpu_ransac_chunk_end` applies the current dynamic
+  trial limit only before a chunk is generated and scored. Essential, Fundamental, and Homography
+  then process every candidate in that already-generated chunk; best-model updates and a reduced
+  `dynamic_max_trials` affect only the next chunk. With the fixed seed and source differing only in
+  the chunk constant, both variants draw the same deterministic candidate-stream prefix. Chunk 64
+  introduces a dynamic-limit decision checkpoint after 64 trials, while chunk 512 does not
+  introduce one until after its first chunk; the counters confirm that 512 scored materially more
+  E/F models. This couples GPU dispatch size to the RANSAC decision frontier rather than changing
+  only the transfer batch size.
+- The retained artifacts do not record the exact final trial boundary or winning candidate trial.
+  Increasing `GPU_RANSAC_CHUNK_TRIALS` therefore changes the candidate set eligible for selection
+  before the next dynamic-limit check and is the leading explanation for the parity loss, but the
+  specific claim that a post-101 candidate replaced the 64-chunk winner remains unproven. Confirm
+  that path by recording trial indices and best-model updates before implementing a parity fix. A
+  parity-preserving optimization is expected to decouple large GPU scoring batches from the
+  original 64-trial decision checkpoints; simply raising the chunk constant cannot be merged.
+
+Preserved diagnostic artifacts:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `/tmp/rustsfm-chunk64-pair1-artifacts-20260810-1730.json` | `5453eb1d985500319e9be77798ff50d5ce5ffd5456e20face2d907431c7354b4` |
+| `/tmp/rustsfm-chunk512-pair1-artifacts-20260810-1730.json` | `cadc5815bab3a5c6d66536c6afd06a409694bf387afbb645b5fefb3ec4ad845a` |
+| `/tmp/rustsfm-chunk64-pair1-artifacts-20260810-1730/run-1.db` | `1df67e3fbf8ad3e4e55219be5f8db0cc2069888f36725b02612e78656b277194` |
+| `/tmp/rustsfm-chunk512-pair1-artifacts-20260810-1730/run-1.db` | `84d5d059ff66257c1702698a9d5ce2706facefc65d4909164bd25c834c3355c9` |
