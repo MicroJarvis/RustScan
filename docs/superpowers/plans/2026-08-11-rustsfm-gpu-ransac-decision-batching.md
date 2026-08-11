@@ -494,7 +494,7 @@ Implement this exact order:
 
 1. Generate GpuRansacTrialGroup values through the physical score end, including empty groups.
 2. Stop generation after a short sample and retain the generated prefix plus exhaustion trial.
-3. Convert candidates in order. Retain the first conversion/capacity failure with its trial and score only the valid prefix before it.
+3. Convert candidates in order. Retain the first conversion/capacity failure with its trial and score only complete trial groups before the failing group; never submit an earlier model from the same trial separately.
 4. Submit the valid prefix using gpu_ransac_score_slices and append summaries in candidate order.
 5. Advance decision_end with gpu_ransac_batch_end using config.policy.decision_trials.
 6. Before consuming a window, return a deferred conversion/capacity error only when its trial is less than decision_end.
@@ -563,6 +563,7 @@ Create the sampler as today, then call run_gpu_ransac_batches with:
 - family = "Essential"
 - sample_size = 5 or 8
 - dynamic_support_observations = active_indices.len(), preserving the current dynamic trial formula; num_observations remains only in the existing sampler-seed construction
+- observation_count = pts1.len().min(pts2.len()), preserving the current full-mask expansion size
 - kind = TwoViewModelKind::Sampson
 - generator = five-point vector or lightweight eight-point option converted to a vector
 - refiner = local_optimize_essential_support with all existing arguments
@@ -616,7 +617,7 @@ Expected RED: policy-injected Fundamental helper missing.
 
 - [ ] **Step 2: Replace only the Fundamental chunk loop**
 
-Call the shared runner with sample_size 7, dynamic_support_observations active_indices.len(), Sampson scoring, estimate_fundamental_seven_point_indexed, and refine_fundamental_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback eight-point estimation and final refinement.
+Call the shared runner with sample_size 7, dynamic_support_observations active_indices.len(), observation_count pts1.len().min(pts2.len()), Sampson scoring, estimate_fundamental_seven_point_indexed, and refine_fundamental_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback eight-point estimation and final refinement.
 
 - [ ] **Step 3: Verify GREEN and multi-model ordering**
 
@@ -664,7 +665,7 @@ Expected RED: policy-injected Homography helper missing.
 
 - [ ] **Step 2: Replace only the Homography chunk loop**
 
-Call the shared runner with sample_size 4, dynamic_support_observations active_indices.len(), HomographyForward scoring, estimate_homography_dlt_indexed converted to a zero-or-one vector, and refine_homography_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback DLT and final refinement.
+Call the shared runner with sample_size 4, dynamic_support_observations active_indices.len(), observation_count pts1.len().min(pts2.len()), HomographyForward scoring, estimate_homography_dlt_indexed converted to a zero-or-one vector, and refine_homography_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback DLT and final refinement.
 
 Remove the last legacy gpu_ransac_chunk_end call and its compatibility helper. Production E/F/H wrappers must all select gpu_ransac_batch_policy(shared_stream).
 
