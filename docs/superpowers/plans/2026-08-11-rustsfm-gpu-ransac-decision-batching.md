@@ -334,6 +334,7 @@ git commit -m "feat(rustsfm): retain gpu ransac trial batches"
 Introduce this private scorer seam and implement it for WgpuModelScoringSession without changing the public API:
 
 ~~~rust
+#[cfg(feature = "gpu-wgpu")]
 trait GpuRansacScoring {
     fn max_models_per_score(&self) -> usize;
     fn score_models_profiled(
@@ -350,6 +351,7 @@ trait GpuRansacScoring {
     ) -> anyhow::Result<(Vec<bool>, crate::gpu::WgpuModelScorerTiming)>;
 }
 
+#[cfg(feature = "gpu-wgpu")]
 impl GpuRansacScoring for WgpuModelScoringSession<'_> {
     fn max_models_per_score(&self) -> usize {
         self.max_two_view_models_per_score()
@@ -406,6 +408,7 @@ Also add focused RED tests named:
 
 - gpu_ransac_empty_trials_advance_the_decision_cursor
 - gpu_ransac_sampler_exhaustion_matches_the_legacy_prefix
+- gpu_ransac_multi_model_boundary_trial_is_atomic
 - gpu_ransac_discarded_suffix_requests_no_mask_or_refinement
 - gpu_ransac_deferred_conversion_error_is_ignored_after_frontier_closes
 - gpu_ransac_deferred_conversion_error_fails_when_frontier_reaches_it
@@ -422,9 +425,10 @@ Name that test gpu_ransac_shared_stream_does_not_consume_speculative_samples. Th
 
 - Empty trials: return no models for trials 0 through 62 and one model for trial 63; assert the consumed model log is [63] while the sampler log is 0 through 63.
 - Sampler exhaustion: return a full sample for trials 0 through 36 and a short sample at trial 37; assert candidates from 0 through 36 are scored and consumed in order, no trial 37 model exists, and no later sample occurs.
+- Multi-model boundary: make trial 100 emit two models. Let model 0 lower the dynamic limit below 100 and model 1 have strictly better support; assert both (100, 0) and (100, 1) are consumed in order, model 1 wins, and trial 101 is not consumed. This proves the frontier advances by trials only after the complete boundary group.
 - Discarded suffix: use the primary 63/100/101 support script; assert trial 101 appears in the 512 score log but not in the consumed, mask, refinement, or best-update logs.
-- Ignored conversion error: emit Matrix3::repeat(f64::MAX) at trial 101 with min_num_trials 100; assert the run succeeds with winner 100 and no trial 101 action.
-- Reached conversion error: use the same invalid trial 101 with min_num_trials 127; assert the run returns an error containing trial 101 before any trial 64 through 127 candidate is consumed.
+- Ignored conversion error: emit Matrix3::repeat(f64::MAX) at trial 101 with min_num_trials 100. Assert the nominal 64..128 window was not speculatively submitted, the actual 64..101 prefix is then scored on demand, the run succeeds with winner 100, and trial 101 appears in no score/mask/refinement/best-update log.
+- Reached conversion error: use the same invalid trial 101 with min_num_trials 127; assert the run returns an error containing trial 101 with zero score calls/models and zero consumption for the entire 64..128 logical window.
 - Ignored invalid summary: return residual_sum = f32::NAN for trial 101 with min_num_trials 100; assert winner 100 and no trial 101 mask, refinement, or best update.
 - Reached invalid summary: use the same NaN summary with min_num_trials 127; assert candidates before trial 101 retain their baseline actions and the runner then returns the existing non-finite residual error at trial 101.
 - Summary count mismatch: make the first score call return one fewer summary than models; assert an immediate family-context error and zero mask/refinement calls regardless of the current dynamic frontier.
@@ -438,6 +442,7 @@ Run:
 cargo test -p rustsfm --features gpu-wgpu gpu_ransac_frontier_ -- --nocapture
 cargo test -p rustsfm --features gpu-wgpu gpu_ransac_empty_trials_ -- --nocapture
 cargo test -p rustsfm --features gpu-wgpu gpu_ransac_sampler_exhaustion_ -- --nocapture
+cargo test -p rustsfm --features gpu-wgpu gpu_ransac_multi_model_boundary_ -- --nocapture
 cargo test -p rustsfm --features gpu-wgpu gpu_ransac_discarded_suffix_ -- --nocapture
 cargo test -p rustsfm --features gpu-wgpu gpu_ransac_deferred_conversion_ -- --nocapture
 cargo test -p rustsfm --features gpu-wgpu gpu_ransac_invalid_summary_ -- --nocapture
@@ -494,17 +499,17 @@ Implement this exact order:
 
 1. Generate GpuRansacTrialGroup values through the physical score end, including empty groups.
 2. Stop generation after a short sample and retain the generated prefix plus exhaustion trial.
-3. Convert candidates in order. Retain the first conversion/capacity failure with its trial and score only complete trial groups before the failing group; never submit an earlier model from the same trial separately.
-4. Submit the valid prefix using gpu_ransac_score_slices and append summaries in candidate order.
+3. Convert candidates in order and partition them into nominal decision windows. Retain the first conversion/capacity failure with its trial; do not speculatively submit any candidate from its nominal window.
+4. Submit only complete valid nominal windows before the deferred window using gpu_ransac_score_slices and append summaries in candidate order. Never split one trial group.
 5. Advance decision_end with gpu_ransac_batch_end using config.policy.decision_trials.
-6. Before consuming a window, return a deferred conversion/capacity error only when its trial is less than decision_end.
+6. Before consuming a deferred nominal window, compute the actual decision_end. If the error trial is less than decision_end, return it before any submission or consumption from that window. Otherwise score only complete groups with trial less than decision_end on demand, consume that partial prefix, and discard the invalid suffix.
 7. Consume candidates with trial less than decision_end in order. Preserve gpu_summary_support, strict is_better_support, mask readback, gpu_masked_support, local refinement, dynamic_ransac_num_trials, and best update order.
 8. Log physical boundaries, logical boundaries, discarded suffixes, and accepted best updates with log::trace; never call the scorer solely for logging.
 9. Stop after the decision window containing sampler exhaustion. Ignore exhaustion in a suffix discarded by an earlier dynamic stop.
 
 - [ ] **Step 4: Verify GREEN and deterministic counters**
 
-Run all nine commands from Step 2. Expected: every scripted test passes and the 512/64 case has fewer score/readback calls with identical consumed candidate, mask, refinement, best, and dynamic-limit behavior.
+Run all ten commands from Step 2. Expected: every scripted test passes and the 512/64 case has fewer score/readback calls with identical consumed candidate, mask, refinement, best, and dynamic-limit behavior.
 
 - [ ] **Step 5: Commit Task 3**
 
@@ -531,6 +536,10 @@ assert_eq!(reference.2, candidate.2);
 assert_eq!(reference_timing.scorer.mask_calls, candidate_timing.scorer.mask_calls);
 assert!(candidate_timing.scorer.score_calls < reference_timing.scorer.score_calls);
 ~~~
+
+Run the 512/64 call a second time with the same seed and inputs. Apply assert_matrix_bits_eq to the
+two candidate matrices and require identical mask, inlier count, residual_sum.to_bits(), success,
+score_calls, mask_calls, and models_scored.
 
 Define and reuse this exact matrix helper for all three model families:
 
@@ -607,6 +616,9 @@ assert_eq!(reference_timing.scorer.mask_calls, candidate_timing.scorer.mask_call
 assert!(candidate_timing.scorer.score_calls < reference_timing.scorer.score_calls);
 ~~~
 
+Repeat the 512/64 Fundamental call once and require exact matrix/support/success plus identical
+score_calls, mask_calls, and models_scored between the two candidate runs.
+
 Run:
 
 ~~~bash
@@ -654,6 +666,9 @@ assert_eq!(reference.2, candidate.2);
 assert_eq!(reference_timing.scorer.mask_calls, candidate_timing.scorer.mask_calls);
 assert!(candidate_timing.scorer.score_calls < reference_timing.scorer.score_calls);
 ~~~
+
+Repeat the 512/64 Homography call once and require exact matrix/support/success plus identical
+score_calls, mask_calls, and models_scored between the two candidate runs.
 
 Run:
 
@@ -803,18 +818,37 @@ Create another unique parent and run exactly:
 
 ~~~bash
 RUSTSFM_96_ROOT=$(mktemp -d /tmp/rustsfm-decision-96x3.XXXXXX)
+/tmp/rustsfm-chunk64-diagnostics benchmark-match-pairs \
+  --database /Users/tfjiang/Projects/RustScan/test_data/flowers2/out9/Untitled.rustscanproject/Cache/.staging/keyframe_sfm-1/rustsfm/Cache/database.db \
+  --window 5 --pair-limit 96 --repetitions 3 --use-gpu --random-seed 0 \
+  --artifacts-dir "$RUSTSFM_96_ROOT/baseline-artifacts" \
+  --output-json "$RUSTSFM_96_ROOT/baseline.json"
 /Users/tfjiang/Projects/RustScan/target/release/rustsfm benchmark-match-pairs \
   --database /Users/tfjiang/Projects/RustScan/test_data/flowers2/out9/Untitled.rustscanproject/Cache/.staging/keyframe_sfm-1/rustsfm/Cache/database.db \
   --window 5 --pair-limit 96 --repetitions 3 --use-gpu --random-seed 0 \
-  --artifacts-dir "$RUSTSFM_96_ROOT/artifacts" \
+  --artifacts-dir "$RUSTSFM_96_ROOT/candidate-artifacts" \
   --output-json "$RUSTSFM_96_ROOT/report.json"
-jq -e '
+jq -e --slurpfile fresh "$RUSTSFM_96_ROOT/baseline.json" '
+  def score_calls:
+    .timings.gpu_geometry_detail |
+    [.essential.scorer.score_calls, .fundamental.scorer.score_calls,
+     .homography.scorer.score_calls] | add;
+  def readback_calls:
+    .timings.gpu_geometry_detail |
+    [.essential.scorer.readback_calls, .fundamental.scorer.readback_calls,
+     .homography.scorer.readback_calls] | add;
   .pair_count == 96 and .repetitions == 3 and (.runs | length) == 3 and
   all(.runs[];
     .backend == "wgpu_match_and_score" and
     .matched_pairs == 96 and .verified_pairs == 96 and .total_matches == 62409 and
     .result_fingerprint == "5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed" and
-    all(.. | numbers; (isnan | not) and (isinfinite | not)))
+    all(.. | numbers; (isnan | not) and (isinfinite | not))) and
+  all($fresh[0].runs[];
+    .result_fingerprint == "5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed") and
+  (([.runs[].matching_seconds] | add / length) <=
+   ([$fresh[0].runs[].matching_seconds] | add / length)) and
+  (([.runs[] | score_calls] | add) < ([$fresh[0].runs[] | score_calls] | add)) and
+  (([.runs[] | readback_calls] | add) < ([$fresh[0].runs[] | readback_calls] | add))
 ' "$RUSTSFM_96_ROOT/report.json"
 ~~~
 
@@ -824,7 +858,11 @@ Require every run fingerprint:
 5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed
 ~~~
 
-Require 96 matched, 96 verified, and 62,409 total matches in every run. Compare score_calls, readback_calls, models_scored, and mean runtime to the pinned 64 baseline. Score/readback calls must decrease and bounded mean runtime must not regress.
+Require 96 matched, 96 verified, and 62,409 total matches in every run. Compare score_calls,
+readback_calls, models_scored, and mean runtime to the fresh adjacent 64/64 run on the same adapter.
+Score/readback calls must decrease and bounded mean runtime must not regress. The pinned prior JSON
+is used only to confirm the historical fingerprint and counter provenance, never as the runtime
+comparator.
 
 - [ ] **Step 5: Record and commit bounded gate evidence**
 
@@ -908,6 +946,15 @@ Follow RED/GREEN for behavioral fixes. Repeat review until approved.
 - [ ] **Step 5: Synchronize with main and rerun affected checks**
 
 Fetch local main state, merge or rebase it into codex/ransac-chunk-512-experiment without discarding user changes, then rerun Task 7 focused checks and Task 8 single-pair/96x3 strict gates. A changed main invalidates old integration evidence.
+
+Before the post-synchronization performance rerun, build a fresh 64/64 reference from the exact
+synchronized HEAD in a detached temporary worktree. Change only
+GPU_RANSAC_SCORE_BATCH_TRIALS from 512 to 64 there with apply_patch, build rustsfm release with
+--no-default-features --features gpu-wgpu and an isolated CARGO_TARGET_DIR, and preserve the binary
+as /tmp/rustsfm-decision-reference-after-sync. Record the synchronized HEAD, reference diff, and
+binary SHA-256, then remove the detached reference worktree. Rerun Task 8 with this binary in place
+of /tmp/rustsfm-chunk64-diagnostics. This makes the runtime comparator identical to the candidate
+source except for physical score width.
 
 - [ ] **Step 6: Merge only after every gate is green**
 

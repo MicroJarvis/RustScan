@@ -133,12 +133,16 @@ The physical prefetch may perform extra candidate generation and score work, but
 are not eligible to change `best` once the 64-trial decision frontier closes.
 
 Candidate f64-to-f32 conversion is speculative for trials beyond the current logical window. The
-physical batch records conversion results by 64-trial logical window. A window containing an
-invalid model is not submitted, while all complete valid windows before it may still be coalesced
-into one score call. The invalid model is retained as a deferred candidate error: it is returned
-before any candidate in that window is consumed if the logical frontier reaches it, and ignored if
-an earlier dynamic stop discards the whole window. This matches the baseline's convert-before-score
-behavior at each 64-trial boundary.
+physical batch records conversion results by nominal 64-trial window. A nominal window containing
+an invalid model is not submitted speculatively, while all complete valid windows before it may
+still be coalesced into one score call.
+
+When the frontier reaches the start of a deferred window, first compute the actual decision end
+from the updated dynamic limit. If the invalid trial is before that end, return the error before
+submitting or consuming any candidate from the window. If the invalid trial is at or beyond that
+end, the invalid suffix is outside the baseline's actual partial window: score and consume only the
+complete trial groups before the actual end, then stop at the frontier. This matches the baseline's
+convert-before-score behavior even when a dynamic limit truncates a nominal 64-trial window.
 
 Device capacity is not discovered by submitting an oversized batch or parsing an `anyhow` error
 string. `WgpuModelScoringSession` exposes an internal read-only maximum model count derived from
@@ -188,11 +192,15 @@ Implementation follows RED/GREEN TDD.
 - Verify independent 512 score and 64 decision ends, including min-trial, max-trial, overflow, and
   already-finished cases.
 - Verify multi-model trials remain contiguous and candidate ordering is stable.
+- Verify every model from a multi-model trial on the last eligible trial is consumed before the
+  dynamic frontier is recomputed, even when its first model lowers the trial limit.
 - Simulate a dynamic limit reduced inside the first logical window and prove trials beyond the next
   eligible boundary cannot be consumed even when their summaries were prefetched.
 - Verify a discarded suffix performs zero mask/refinement/best-update actions.
-- Verify a non-finite model or invalid summary in a discarded suffix is ignored, while the same
-  error inside an eligible logical window is returned.
+- Verify an eligible window containing a non-finite model receives zero score submissions and
+  returns the conversion error before consumption; verify a dynamic partial window ending before
+  that model scores only its eligible prefix and ignores the suffix. An invalid summary remains a
+  post-score ordered error: it is ignored in a discarded suffix and returned when consumed.
 - Verify a physical-batch capacity subdivision reuses the same retained trials through ordered
   score slices, never splits one trial's models, and never resamples.
 - Verify a single over-capacity trial group fails only if its 64-trial logical window is reached.
@@ -221,9 +229,11 @@ Implementation follows RED/GREEN TDD.
    equal the chunk-64 fingerprint
    `5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed`, with
    `96 matched / 96 verified / 62,409 matches`.
-3. Require fewer score-summary calls/readbacks than the 64 baseline and no bounded mean-runtime
-   regression. Report the measured speedup; do not hide a small or negative result behind timing
-   noise.
+3. Rerun a 64/64 reference adjacent to the candidate on the same adapter and source snapshot.
+   Require fewer score-summary calls/readbacks and no bounded mean-runtime regression against that
+   fresh reference. The pinned historical JSON remains a fingerprint/counter provenance check, not
+   a runtime comparator. Report the measured speedup; do not hide a small or negative result behind
+   timing noise.
 4. Only after the bounded parity gate passes, run the sequential 2,890-pair comparison and require
    the full raw-output fingerprints and aggregate counts to match.
 
