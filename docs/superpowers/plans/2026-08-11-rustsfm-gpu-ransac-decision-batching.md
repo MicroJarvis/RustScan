@@ -458,7 +458,7 @@ Use these private types so all three model families share one scheduler:
 struct GpuRansacRunConfig<'a> {
     family: &'static str,
     sample_size: usize,
-    dynamic_observations: usize,
+    dynamic_support_observations: usize,
     observation_count: usize,
     threshold: f32,
     kind: TwoViewModelKind,
@@ -562,7 +562,7 @@ Create the sampler as today, then call run_gpu_ransac_batches with:
 
 - family = "Essential"
 - sample_size = 5 or 8
-- dynamic_observations = num_observations
+- dynamic_support_observations = active_indices.len(), preserving the current dynamic trial formula; num_observations remains only in the existing sampler-seed construction
 - kind = TwoViewModelKind::Sampson
 - generator = five-point vector or lightweight eight-point option converted to a vector
 - refiner = local_optimize_essential_support with all existing arguments
@@ -616,7 +616,7 @@ Expected RED: policy-injected Fundamental helper missing.
 
 - [ ] **Step 2: Replace only the Fundamental chunk loop**
 
-Call the shared runner with sample_size 7, dynamic_observations active_indices.len(), Sampson scoring, estimate_fundamental_seven_point_indexed, and refine_fundamental_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback eight-point estimation and final refinement.
+Call the shared runner with sample_size 7, dynamic_support_observations active_indices.len(), Sampson scoring, estimate_fundamental_seven_point_indexed, and refine_fundamental_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback eight-point estimation and final refinement.
 
 - [ ] **Step 3: Verify GREEN and multi-model ordering**
 
@@ -664,7 +664,7 @@ Expected RED: policy-injected Homography helper missing.
 
 - [ ] **Step 2: Replace only the Homography chunk loop**
 
-Call the shared runner with sample_size 4, dynamic_observations active_indices.len(), HomographyForward scoring, estimate_homography_dlt_indexed converted to a zero-or-one vector, and refine_homography_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback DLT and final refinement.
+Call the shared runner with sample_size 4, dynamic_support_observations active_indices.len(), HomographyForward scoring, estimate_homography_dlt_indexed converted to a zero-or-one vector, and refine_homography_support using COLMAP_LORANSAC_LOCAL_TRIALS. Preserve fallback DLT and final refinement.
 
 Remove the last legacy gpu_ransac_chunk_end call and its compatibility helper. Production E/F/H wrappers must all select gpu_ransac_batch_policy(shared_stream).
 
