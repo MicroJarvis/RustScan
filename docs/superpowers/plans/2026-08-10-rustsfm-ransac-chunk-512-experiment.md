@@ -800,3 +800,32 @@ Preserved diagnostic artifacts:
 | `/tmp/rustsfm-chunk512-pair1-artifacts-20260810-1730.json` | `cadc5815bab3a5c6d66536c6afd06a409694bf387afbb645b5fefb3ec4ad845a` |
 | `/tmp/rustsfm-chunk64-pair1-artifacts-20260810-1730/run-1.db` | `1df67e3fbf8ad3e4e55219be5f8db0cc2069888f36725b02612e78656b277194` |
 | `/tmp/rustsfm-chunk512-pair1-artifacts-20260810-1730/run-1.db` | `84d5d059ff66257c1702698a9d5ce2706facefc65d4909164bd25c834c3355c9` |
+
+### Follow-up implementation evidence (2026-08-11)
+
+- The parity-preserving runner is committed on the isolated branch as `99d5ecb`
+  (`perf(rustsfm): preserve gpu ransac decision frontier`). It keeps a 512-trial owned-sampler
+  score batch, advances a 64-trial decision frontier, preserves shared-stream 64/64 draws, and
+  defers both f32 model-conversion and per-trial score-capacity failures until their logical
+  window is reached. E/F/H adapters use the same runner; private policy injection is covered by
+  an adapter-level parity test when a compatible adapter exists.
+- New scripted boundary coverage passed: 20 GPU-RANSAC tests, including empty trials, sampler
+  exhaustion, multi-model decision-boundary atomicity, discarded suffixes, deferred conversion and
+  capacity errors, invalid summaries, summary-count mismatch, capacity slicing, shared-stream
+  draw parity, and 64/64 versus 512/64 frontier equivalence. The complete `two_view::tests`
+  filter passed 63/63 with `--no-default-features --features gpu-wgpu`.
+- Fresh bounded real-device gate passed. The 512 candidate JSON
+  `/tmp/rustsfm-gpu-ransac-chunk-512-96x3.json` has SHA-256
+  `9f1169ad3a862996e657910544fb245b5eea445770f5a068784ab3e654b2a0f7`; all three runs have
+  `matched_pairs=96`, `verified_pairs=96`, `total_matches=62409`, and the exact baseline
+  fingerprint `5e05ca629b63c98ae63c95ce0f37fe49a43eb870760e598352c8f8ef3d84e8ed`.
+- Fresh full 64 baseline completed on the same device with
+  `/tmp/rustsfm-gpu-ransac-chunk-64-2890.json` SHA-256
+  `932069e3ea69d69744a7399b9ffdc7e2ff106a210f9e1fa123739db35816d8d7`; it produced
+  `matched_pairs=2890`, `verified_pairs=2890`, `total_matches=2958062`, fingerprint
+  `ebfd8001e17daf280227df8856beb05d74fced38f9908d9704899d368a7f9da2`, and
+  `matching_seconds=574.732527833`.
+- The 2,890-pair 512 candidate has **not** run: both attempts to request the required non-sandboxed
+  execution were rejected by the approval service because its review stream was overloaded. No
+  candidate JSON was created, and no merge or worktree cleanup is authorized. Final decision for
+  this follow-up remains **NO MERGE** until the full candidate fingerprint is verified.
