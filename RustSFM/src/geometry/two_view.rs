@@ -1593,11 +1593,12 @@ fn estimate_essential_ransac_gpu(
     let mut sampler_exhausted = false;
 
     while iteration < max_iterations {
-        let chunk_end = gpu_ransac_chunk_end(
+        let chunk_end = gpu_ransac_batch_end(
             iteration,
             max_iterations,
             dynamic_max_trials,
             ransac_options.min_num_trials,
+            GPU_RANSAC_SCORE_BATCH_TRIALS,
         );
         if iteration >= chunk_end {
             break;
@@ -2195,21 +2196,45 @@ fn dynamic_ransac_num_trials(
 }
 
 #[cfg(feature = "gpu-wgpu")]
-const GPU_RANSAC_CHUNK_TRIALS: usize = 512;
+const GPU_RANSAC_SCORE_BATCH_TRIALS: usize = 512;
 
 #[cfg(feature = "gpu-wgpu")]
-fn gpu_ransac_chunk_end(
+const GPU_RANSAC_DECISION_BATCH_TRIALS: usize = 64;
+
+#[cfg(feature = "gpu-wgpu")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuRansacBatchPolicy {
+    score_trials: usize,
+    decision_trials: usize,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_batch_policy(shared_stream: bool) -> GpuRansacBatchPolicy {
+    let score_trials = if shared_stream {
+        GPU_RANSAC_DECISION_BATCH_TRIALS
+    } else {
+        GPU_RANSAC_SCORE_BATCH_TRIALS
+    };
+    GpuRansacBatchPolicy {
+        score_trials,
+        decision_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_batch_end(
     iteration: usize,
     max_num_trials: usize,
     dynamic_max_trials: usize,
     min_num_trials: usize,
+    batch_trials: usize,
 ) -> usize {
     let effective_end = dynamic_max_trials
         .max(min_num_trials)
         .saturating_add(1)
         .min(max_num_trials);
     iteration
-        .saturating_add(GPU_RANSAC_CHUNK_TRIALS)
+        .saturating_add(batch_trials.max(1))
         .min(effective_end)
 }
 
@@ -2518,11 +2543,12 @@ fn estimate_fundamental_ransac_gpu(
     let mut sampler_exhausted = false;
 
     while iteration < max_iterations {
-        let chunk_end = gpu_ransac_chunk_end(
+        let chunk_end = gpu_ransac_batch_end(
             iteration,
             max_iterations,
             dynamic_max_trials,
             ransac_options.min_num_trials,
+            GPU_RANSAC_SCORE_BATCH_TRIALS,
         );
         if iteration >= chunk_end {
             break;
@@ -3156,11 +3182,12 @@ fn estimate_homography_ransac_gpu(
     let mut sampler_exhausted = false;
 
     while iteration < max_iterations {
-        let chunk_end = gpu_ransac_chunk_end(
+        let chunk_end = gpu_ransac_batch_end(
             iteration,
             max_iterations,
             dynamic_max_trials,
             ransac_options.min_num_trials,
+            GPU_RANSAC_SCORE_BATCH_TRIALS,
         );
         if iteration >= chunk_end {
             break;
@@ -4779,12 +4806,39 @@ mod tests {
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
-    fn gpu_ransac_chunk_end_applies_dynamic_limits_at_boundaries() {
-        assert_eq!(gpu_ransac_chunk_end(0, 10_000, 10_000, 100), 512);
-        assert_eq!(gpu_ransac_chunk_end(512, 10_000, 24, 100), 101);
-        assert_eq!(gpu_ransac_chunk_end(96, 10_000, 24, 100), 101);
-        assert_eq!(gpu_ransac_chunk_end(101, 10_000, 24, 100), 101);
-        assert_eq!(gpu_ransac_chunk_end(9_980, 10_000, usize::MAX, 100), 10_000);
+    fn gpu_ransac_policy_decouples_score_and_decision_batches() {
+        assert_eq!(
+            gpu_ransac_batch_policy(false),
+            GpuRansacBatchPolicy {
+                score_trials: 512,
+                decision_trials: 64,
+            }
+        );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_policy_preserves_shared_stream_draws() {
+        assert_eq!(
+            gpu_ransac_batch_policy(true),
+            GpuRansacBatchPolicy {
+                score_trials: 64,
+                decision_trials: 64,
+            }
+        );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_batch_end_applies_dynamic_limits_at_selected_boundary() {
+        assert_eq!(gpu_ransac_batch_end(0, 10_000, 10_000, 100, 512), 512);
+        assert_eq!(gpu_ransac_batch_end(64, 10_000, 24, 100, 64), 101);
+        assert_eq!(gpu_ransac_batch_end(96, 10_000, 24, 100, 64), 101);
+        assert_eq!(gpu_ransac_batch_end(101, 10_000, 24, 100, 64), 101);
+        assert_eq!(
+            gpu_ransac_batch_end(9_980, 10_000, usize::MAX, 100, 512),
+            10_000
+        );
     }
 
     #[cfg(feature = "gpu-wgpu")]
