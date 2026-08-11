@@ -2239,6 +2239,83 @@ fn gpu_ransac_batch_end(
 }
 
 #[cfg(feature = "gpu-wgpu")]
+#[derive(Debug)]
+struct GpuRansacTrialGroup {
+    trial: usize,
+    sample: Vec<usize>,
+    models: Vec<Matrix3<f64>>,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl GpuRansacTrialGroup {
+    fn new(trial: usize, sample: Vec<usize>, models: Vec<Matrix3<f64>>) -> Self {
+        Self {
+            trial,
+            sample,
+            models,
+        }
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[derive(Debug)]
+struct GpuRansacCandidate<'a> {
+    trial: usize,
+    model_index: usize,
+    models_in_trial: usize,
+    sample: &'a [usize],
+    model: &'a Matrix3<f64>,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_candidates(groups: &[GpuRansacTrialGroup]) -> Vec<GpuRansacCandidate<'_>> {
+    groups
+        .iter()
+        .flat_map(|group| {
+            let models_in_trial = group.models.len();
+            group
+                .models
+                .iter()
+                .enumerate()
+                .map(move |(model_index, model)| GpuRansacCandidate {
+                    trial: group.trial,
+                    model_index,
+                    models_in_trial,
+                    sample: &group.sample,
+                    model,
+                })
+        })
+        .collect()
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_ransac_score_slices(
+    model_counts: &[(usize, usize)],
+    capacity: usize,
+) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+    let mut slices = Vec::new();
+    let mut slice_start = 0usize;
+    let mut slice_len = 0usize;
+
+    for &(trial, count) in model_counts {
+        if count > capacity {
+            anyhow::bail!("GPU RANSAC trial {trial} emits {count} models, capacity is {capacity}");
+        }
+        if count > 0 && slice_len > 0 && slice_len.saturating_add(count) > capacity {
+            slices.push(slice_start..slice_start + slice_len);
+            slice_start += slice_len;
+            slice_len = 0;
+        }
+        slice_len = slice_len.saturating_add(count);
+    }
+
+    if slice_len > 0 {
+        slices.push(slice_start..slice_start + slice_len);
+    }
+    Ok(slices)
+}
+
+#[cfg(feature = "gpu-wgpu")]
 fn gpu_ransac_points(
     points: &[Vector3<f64>],
     active_indices: &[usize],
@@ -4839,6 +4916,45 @@ mod tests {
             gpu_ransac_batch_end(9_980, 10_000, usize::MAX, 100, 512),
             10_000
         );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_candidates_keep_trial_and_model_ordinals() {
+        let groups = vec![
+            GpuRansacTrialGroup::new(
+                8,
+                vec![1, 2],
+                vec![Matrix3::identity(), Matrix3::repeat(2.0)],
+            ),
+            GpuRansacTrialGroup::new(9, vec![3, 4], Vec::new()),
+            GpuRansacTrialGroup::new(10, vec![5, 6], vec![Matrix3::repeat(3.0)]),
+        ];
+        let candidates = gpu_ransac_candidates(&groups);
+        let ordinals = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.trial,
+                    candidate.model_index,
+                    candidate.models_in_trial,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, vec![(8, 0, 2), (8, 1, 2), (10, 0, 1)]);
+        assert_eq!(groups[1].trial, 9);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_score_slices_never_split_one_trial() {
+        let model_counts = vec![(0, 3), (1, 2), (2, 4), (3, 1)];
+        assert_eq!(
+            gpu_ransac_score_slices(&model_counts, 5).unwrap(),
+            vec![0..5, 5..10]
+        );
+        let error = gpu_ransac_score_slices(&[(7, 6)], 5).unwrap_err();
+        assert!(error.to_string().contains("trial 7"));
     }
 
     #[cfg(feature = "gpu-wgpu")]

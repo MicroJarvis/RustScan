@@ -309,6 +309,18 @@ impl WgpuModelScorer {
 }
 
 impl WgpuModelScoringSession<'_> {
+    pub(crate) fn max_two_view_models_per_score(&self) -> usize {
+        let limits = self.scorer.context.device().limits();
+        let storage_bytes = limits
+            .max_buffer_size
+            .min(u64::from(limits.max_storage_buffer_binding_size));
+        two_view_model_capacity(
+            limits.max_compute_workgroups_per_dimension,
+            storage_bytes,
+            storage_bytes,
+        )
+    }
+
     pub(crate) fn score_two_view_models(
         &self,
         models: &[[f32; 9]],
@@ -572,6 +584,19 @@ fn buffer_size<T>(count: usize) -> Result<u64> {
         .context("GPU model scorer buffer size overflow")
 }
 
+fn two_view_model_capacity(
+    max_workgroups: u32,
+    model_buffer_bytes: u64,
+    summary_buffer_bytes: u64,
+) -> usize {
+    let dispatch = max_workgroups as usize;
+    let models = model_buffer_bytes / std::mem::size_of::<[f32; 9]>() as u64;
+    let summaries = summary_buffer_bytes / std::mem::size_of::<GpuModelSupport>() as u64;
+    dispatch
+        .min(usize::try_from(models).unwrap_or(usize::MAX))
+        .min(usize::try_from(summaries).unwrap_or(usize::MAX))
+}
+
 fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -582,5 +607,17 @@ fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutE
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::two_view_model_capacity;
+
+    #[test]
+    fn two_view_model_capacity_uses_the_tightest_device_limit() {
+        assert_eq!(two_view_model_capacity(100, 36 * 80, 8 * 90), 80);
+        assert_eq!(two_view_model_capacity(70, u64::MAX, u64::MAX), 70);
+        assert_eq!(two_view_model_capacity(100, 35, u64::MAX), 0);
     }
 }
