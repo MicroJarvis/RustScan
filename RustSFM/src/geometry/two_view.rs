@@ -1568,6 +1568,41 @@ fn estimate_essential_ransac_gpu(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
 )> {
+    estimate_essential_ransac_gpu_with_policy(
+        scorer,
+        pts1,
+        pts2,
+        active_indices,
+        num_observations,
+        ransac_options,
+        random_seed,
+        lo_steps,
+        shared_stream,
+        use_five_point,
+        use_hartley_refinement,
+        gpu_ransac_batch_policy(shared_stream),
+    )
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn estimate_essential_ransac_gpu_with_policy(
+    scorer: &WgpuModelScorer,
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    num_observations: usize,
+    ransac_options: ColmapRansacOptions,
+    random_seed: u64,
+    lo_steps: usize,
+    shared_stream: bool,
+    use_five_point: bool,
+    use_hartley_refinement: bool,
+    policy: GpuRansacBatchPolicy,
+) -> anyhow::Result<(
+    Option<(Matrix3<f64>, ModelSupport, bool)>,
+    WgpuRansacStageTiming,
+)> {
     let mut timing = WgpuRansacStageTiming::default();
     let sample_size = if use_five_point { 5 } else { 8 };
     if active_indices.len() < sample_size {
@@ -1599,7 +1634,7 @@ fn estimate_essential_ransac_gpu(
             threshold,
             kind: TwoViewModelKind::Sampson,
             options: &ransac_options,
-            policy: gpu_ransac_batch_policy(shared_stream),
+            policy,
         },
         |_| sampler.sample(sample_size),
         |sample| {
@@ -2403,6 +2438,15 @@ where
         if iteration >= physical_end {
             break;
         }
+        log::trace!(
+            "GPU RANSAC physical batch family={} trials=[{}, {}) score_trials={} decision_trials={} dynamic_max_trials={}",
+            config.family,
+            iteration,
+            physical_end,
+            config.policy.score_trials,
+            config.policy.decision_trials,
+            dynamic_max_trials
+        );
         let generation_started = Instant::now();
         let batch_start = iteration;
         let mut groups = Vec::new();
@@ -2425,8 +2469,22 @@ where
         timing.candidate_generation_seconds += generation_started.elapsed().as_secs_f64();
         let candidates = gpu_ransac_candidates(&groups);
         let mut gpu_models = vec![None; candidates.len()];
-        let mut conversion_error = None;
+        let mut deferred_error = None;
+        let max_models_per_score = scorer.max_models_per_score();
         for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.model_index == 0 && candidate.models_in_trial > max_models_per_score {
+                deferred_error = Some((
+                    candidate.trial,
+                    anyhow::anyhow!(
+                        "GPU {} RANSAC trial {} emits {} models, capacity is {}",
+                        config.family,
+                        candidate.trial,
+                        candidate.models_in_trial,
+                        max_models_per_score
+                    ),
+                ));
+                break;
+            }
             match gpu_ransac_model(candidate.model).with_context(|| {
                 format!(
                     "GPU {} RANSAC trial {} model {} conversion failed",
@@ -2435,12 +2493,12 @@ where
             }) {
                 Ok(model) => gpu_models[index] = Some(model),
                 Err(error) => {
-                    conversion_error = Some((candidate.trial, error));
+                    deferred_error = Some((candidate.trial, error));
                     break;
                 }
             }
         }
-        let deferred_window_start = conversion_error
+        let deferred_window_start = deferred_error
             .as_ref()
             .map(|(trial, _)| {
                 batch_start
@@ -2448,6 +2506,16 @@ where
                         * config.policy.decision_trials.max(1)
             })
             .unwrap_or(iteration);
+        if let Some((trial, error)) = &deferred_error {
+            log::trace!(
+                "GPU RANSAC deferred error family={} trial={} window_start={} physical_end={} error={}",
+                config.family,
+                trial,
+                deferred_window_start,
+                physical_end,
+                error
+            );
+        }
         let scored_prefix_len = candidates
             .iter()
             .take_while(|candidate| candidate.trial < deferred_window_start)
@@ -2477,10 +2545,34 @@ where
                 config.policy.decision_trials,
             );
             if decision_end <= decision_cursor {
+                if decision_cursor < physical_end {
+                    log::trace!(
+                        "GPU RANSAC discarded suffix family={} trials=[{}, {}) dynamic_max_trials={} min_num_trials={}",
+                        config.family,
+                        decision_cursor,
+                        physical_end,
+                        dynamic_max_trials,
+                        config.options.min_num_trials
+                    );
+                }
                 break;
             }
-            if let Some((error_trial, error)) = &conversion_error {
+            log::trace!(
+                "GPU RANSAC decision batch family={} trials=[{}, {}) dynamic_max_trials={}",
+                config.family,
+                decision_cursor,
+                decision_end,
+                dynamic_max_trials
+            );
+            if let Some((error_trial, error)) = &deferred_error {
                 if *error_trial >= decision_cursor && *error_trial < decision_end {
+                    log::trace!(
+                        "GPU RANSAC deferred error reached frontier family={} trial={} decision=[{}, {})",
+                        config.family,
+                        error_trial,
+                        decision_cursor,
+                        decision_end
+                    );
                     return Err(anyhow::anyhow!(error.to_string()));
                 }
                 if *error_trial < decision_cursor {
@@ -2859,6 +2951,35 @@ fn estimate_fundamental_ransac_gpu(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
 )> {
+    estimate_fundamental_ransac_gpu_with_policy(
+        scorer,
+        pts1,
+        pts2,
+        active_indices,
+        ransac_options,
+        random_seed,
+        lo_steps,
+        shared_stream,
+        gpu_ransac_batch_policy(shared_stream),
+    )
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn estimate_fundamental_ransac_gpu_with_policy(
+    scorer: &WgpuModelScorer,
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    ransac_options: ColmapRansacOptions,
+    random_seed: u64,
+    lo_steps: usize,
+    shared_stream: bool,
+    policy: GpuRansacBatchPolicy,
+) -> anyhow::Result<(
+    Option<(Matrix3<f64>, ModelSupport, bool)>,
+    WgpuRansacStageTiming,
+)> {
     let mut timing = WgpuRansacStageTiming::default();
     if active_indices.len() < 7 {
         return Ok((None, timing));
@@ -2889,7 +3010,7 @@ fn estimate_fundamental_ransac_gpu(
             threshold,
             kind: TwoViewModelKind::Sampson,
             options: &ransac_options,
-            policy: gpu_ransac_batch_policy(shared_stream),
+            policy,
         },
         |_| sampler.sample(7),
         |sample| estimate_fundamental_seven_point_indexed(pts1, pts2, sample),
@@ -3427,6 +3548,35 @@ fn estimate_homography_ransac_gpu(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
 )> {
+    estimate_homography_ransac_gpu_with_policy(
+        scorer,
+        pts1,
+        pts2,
+        active_indices,
+        ransac_options,
+        random_seed,
+        lo_steps,
+        shared_stream,
+        gpu_ransac_batch_policy(shared_stream),
+    )
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn estimate_homography_ransac_gpu_with_policy(
+    scorer: &WgpuModelScorer,
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+    active_indices: &[usize],
+    ransac_options: ColmapRansacOptions,
+    random_seed: u64,
+    lo_steps: usize,
+    shared_stream: bool,
+    policy: GpuRansacBatchPolicy,
+) -> anyhow::Result<(
+    Option<(Matrix3<f64>, ModelSupport, bool)>,
+    WgpuRansacStageTiming,
+)> {
     let mut timing = WgpuRansacStageTiming::default();
     if active_indices.len() < 4 {
         return Ok((None, timing));
@@ -3456,7 +3606,7 @@ fn estimate_homography_ransac_gpu(
             threshold,
             kind: TwoViewModelKind::HomographyForward,
             options: &ransac_options,
-            policy: gpu_ransac_batch_policy(shared_stream),
+            policy,
         },
         |_| sampler.sample(4),
         |sample| {
@@ -4944,7 +5094,11 @@ fn matrix3_from_row_array(matrix: [f64; 9]) -> Matrix3<f64> {
 mod tests {
     use super::*;
     use rustslam::{colmap_ransac_num_trials, ColmapMt19937, ColmapRandomSampler};
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeMap,
+        rc::Rc,
+    };
 
     fn default_test_options() -> TwoViewOptions {
         TwoViewOptions {
@@ -5127,33 +5281,83 @@ mod tests {
     struct ScriptedGpuRansacScorer {
         score_calls: Rc<Cell<usize>>,
         mask_calls: Rc<Cell<usize>>,
+        score_log: Rc<RefCell<Vec<Vec<usize>>>>,
+        mask_log: Rc<RefCell<Vec<usize>>>,
         observations: usize,
         max_models: usize,
+        support_by_trial: BTreeMap<usize, u32>,
+        default_support: u32,
+        invalid_summary_trial: Option<usize>,
+        truncate_first_score: bool,
     }
 
     #[cfg(feature = "gpu-wgpu")]
     impl ScriptedGpuRansacScorer {
         fn new(max_models: usize, observations: usize) -> (Self, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+            let (scorer, score_calls, mask_calls, _, _) =
+                Self::new_with_logs(max_models, observations);
+            (scorer, score_calls, mask_calls)
+        }
+
+        fn new_with_logs(
+            max_models: usize,
+            observations: usize,
+        ) -> (
+            Self,
+            Rc<Cell<usize>>,
+            Rc<Cell<usize>>,
+            Rc<RefCell<Vec<Vec<usize>>>>,
+            Rc<RefCell<Vec<usize>>>,
+        ) {
+            Self::new_with_logs_and_supports(
+                max_models,
+                observations,
+                2,
+                BTreeMap::from([(63, 25), (100, 26)]),
+            )
+        }
+
+        fn new_with_logs_and_supports(
+            max_models: usize,
+            observations: usize,
+            default_support: u32,
+            support_by_trial: BTreeMap<usize, u32>,
+        ) -> (
+            Self,
+            Rc<Cell<usize>>,
+            Rc<Cell<usize>>,
+            Rc<RefCell<Vec<Vec<usize>>>>,
+            Rc<RefCell<Vec<usize>>>,
+        ) {
             let score_calls = Rc::new(Cell::new(0));
             let mask_calls = Rc::new(Cell::new(0));
+            let score_log = Rc::new(RefCell::new(Vec::new()));
+            let mask_log = Rc::new(RefCell::new(Vec::new()));
             (
                 Self {
                     score_calls: score_calls.clone(),
                     mask_calls: mask_calls.clone(),
+                    score_log: score_log.clone(),
+                    mask_log: mask_log.clone(),
                     observations,
                     max_models,
+                    support_by_trial,
+                    default_support,
+                    invalid_summary_trial: None,
+                    truncate_first_score: false,
                 },
                 score_calls,
                 mask_calls,
+                score_log,
+                mask_log,
             )
         }
 
-        fn support_for_trial(trial: usize) -> u32 {
-            match trial {
-                63 => 10,
-                100 => 11,
-                _ => 2,
-            }
+        fn support_for_trial(&self, trial: usize) -> u32 {
+            self.support_by_trial
+                .get(&trial)
+                .copied()
+                .unwrap_or(self.default_support)
         }
     }
 
@@ -5170,13 +5374,23 @@ mod tests {
             _kind: TwoViewModelKind,
         ) -> anyhow::Result<(Vec<GpuModelSupport>, crate::gpu::WgpuModelScorerTiming)> {
             self.score_calls.set(self.score_calls.get() + 1);
-            let supports = models
+            self.score_log
+                .borrow_mut()
+                .push(models.iter().map(|model| model[0] as usize).collect());
+            let mut supports = models
                 .iter()
                 .map(|model| GpuModelSupport {
-                    inliers: Self::support_for_trial(model[0] as usize),
-                    residual_sum: 1.0,
+                    inliers: self.support_for_trial(model[0] as usize),
+                    residual_sum: if self.invalid_summary_trial == Some(model[0] as usize) {
+                        f32::NAN
+                    } else {
+                        1.0
+                    },
                 })
                 .collect::<Vec<_>>();
+            if self.truncate_first_score && self.score_calls.get() == 1 {
+                supports.pop();
+            }
             Ok((
                 supports,
                 crate::gpu::WgpuModelScorerTiming {
@@ -5194,7 +5408,8 @@ mod tests {
             _kind: TwoViewModelKind,
         ) -> anyhow::Result<(Vec<bool>, crate::gpu::WgpuModelScorerTiming)> {
             self.mask_calls.set(self.mask_calls.get() + 1);
-            let count = Self::support_for_trial(model[0] as usize) as usize;
+            self.mask_log.borrow_mut().push(model[0] as usize);
+            let count = self.support_for_trial(model[0] as usize) as usize;
             let mut mask = vec![false; self.observations];
             let inlier_count = count.min(mask.len());
             mask[..inlier_count].fill(true);
@@ -5211,10 +5426,23 @@ mod tests {
     #[cfg(feature = "gpu-wgpu")]
     fn run_scripted_gpu_ransac(
         policy: GpuRansacBatchPolicy,
-    ) -> anyhow::Result<(GpuRansacRunResult, usize, usize)> {
-        let (scorer, score_calls, mask_calls) = ScriptedGpuRansacScorer::new(1024, 128);
+    ) -> anyhow::Result<(
+        GpuRansacRunResult,
+        usize,
+        usize,
+        Vec<Vec<usize>>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+    )> {
+        let (scorer, score_calls, mask_calls, score_log, mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs(1024, 128);
         let options = test_ransac_options(100, 128, 0.999);
         let active_indices = (0..128).collect::<Vec<_>>();
+        let sampled_trials = Rc::new(RefCell::new(Vec::new()));
+        let sampled_trials_for_closure = sampled_trials.clone();
+        let refined_trials = Rc::new(RefCell::new(Vec::new()));
+        let refined_trials_for_closure = refined_trials.clone();
         let result = run_gpu_ransac_batches(
             &scorer,
             &active_indices,
@@ -5228,22 +5456,42 @@ mod tests {
                 options: &options,
                 policy,
             },
-            |trial| vec![trial],
+            move |trial| {
+                sampled_trials_for_closure.borrow_mut().push(trial);
+                vec![trial]
+            },
             |sample| vec![Matrix3::from_diagonal_element(sample[0] as f64)],
-            |model, support| (model, support),
+            move |model, support| {
+                refined_trials_for_closure
+                    .borrow_mut()
+                    .push(model[(0, 0)] as usize);
+                (model, support)
+            },
         )?;
-        Ok((result, score_calls.get(), mask_calls.get()))
+        let score_log = score_log.borrow().clone();
+        let mask_log = mask_log.borrow().clone();
+        let sampled_trials = sampled_trials.borrow().clone();
+        let refined_trials = refined_trials.borrow().clone();
+        Ok((
+            result,
+            score_calls.get(),
+            mask_calls.get(),
+            score_log,
+            mask_log,
+            sampled_trials,
+            refined_trials,
+        ))
     }
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn gpu_ransac_frontier_is_independent_of_score_batch_size() -> anyhow::Result<()> {
-        let (reference, reference_score_calls, reference_mask_calls) =
+        let (reference, reference_score_calls, reference_mask_calls, _, _, _, _) =
             run_scripted_gpu_ransac(GpuRansacBatchPolicy {
                 score_trials: 64,
                 decision_trials: 64,
             })?;
-        let (candidate, candidate_score_calls, candidate_mask_calls) =
+        let (candidate, candidate_score_calls, candidate_mask_calls, _, _, _, _) =
             run_scripted_gpu_ransac(GpuRansacBatchPolicy {
                 score_trials: 512,
                 decision_trials: 64,
@@ -5264,6 +5512,528 @@ mod tests {
         );
         assert!(candidate_score_calls < reference_score_calls);
         assert_eq!(candidate_mask_calls, reference_mask_calls);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_discarded_suffix_requests_no_mask_or_refinement() -> anyhow::Result<()> {
+        let (result, _, _, score_log, mask_log, _, refined_trials) =
+            run_scripted_gpu_ransac(GpuRansacBatchPolicy {
+                score_trials: 512,
+                decision_trials: 64,
+            })?;
+        assert_eq!(
+            result
+                .best
+                .as_ref()
+                .map(|(model, _)| model[(0, 0)] as usize),
+            Some(100)
+        );
+        assert_eq!(score_log, vec![(0..128).collect::<Vec<_>>()]);
+        assert_eq!(mask_log, vec![0, 63, 100]);
+        assert_eq!(refined_trials, vec![0, 63, 100]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn run_scripted_shared_stream_draws(
+        policy: GpuRansacBatchPolicy,
+    ) -> anyhow::Result<Vec<usize>> {
+        let (scorer, _score_calls, _mask_calls) = ScriptedGpuRansacScorer::new(1024, 128);
+        let options = test_ransac_options(100, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let sampled_trials = Rc::new(RefCell::new(Vec::new()));
+        let sampled_trials_for_closure = sampled_trials.clone();
+        run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-shared-stream",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy,
+            },
+            move |trial| {
+                sampled_trials_for_closure.borrow_mut().push(trial);
+                vec![trial]
+            },
+            |sample| vec![Matrix3::from_diagonal_element(sample[0] as f64)],
+            |model, support| (model, support),
+        )?;
+        let sampled_trials = sampled_trials.borrow().clone();
+        Ok(sampled_trials)
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_shared_stream_does_not_consume_speculative_samples() -> anyhow::Result<()> {
+        let shared_draws = run_scripted_shared_stream_draws(gpu_ransac_batch_policy(true))?;
+        let reference_draws = run_scripted_shared_stream_draws(GpuRansacBatchPolicy {
+            score_trials: 64,
+            decision_trials: 64,
+        })?;
+        assert_eq!(shared_draws, (0..101).collect::<Vec<_>>());
+        assert_eq!(shared_draws, reference_draws);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn run_scripted_conversion_case(min_num_trials: usize) -> anyhow::Result<()> {
+        let (scorer, _score_calls, _mask_calls) = ScriptedGpuRansacScorer::new(1024, 128);
+        let options = test_ransac_options(
+            min_num_trials
+                .try_into()
+                .expect("scripted test iteration count must fit u32"),
+            128,
+            0.999,
+        );
+        let active_indices = (0..128).collect::<Vec<_>>();
+        run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-conversion",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 512,
+                    decision_trials: 64,
+                },
+            },
+            |trial| vec![trial],
+            |sample| {
+                if sample[0] == 101 {
+                    vec![Matrix3::repeat(f64::MAX)]
+                } else {
+                    vec![Matrix3::from_diagonal_element(sample[0] as f64)]
+                }
+            },
+            |model, support| (model, support),
+        )
+        .map(|_| ())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_deferred_conversion_error_is_ignored_after_frontier_closes() -> anyhow::Result<()>
+    {
+        run_scripted_conversion_case(100)
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_deferred_conversion_error_fails_when_frontier_reaches_it() {
+        let error = run_scripted_conversion_case(127).unwrap_err();
+        assert!(error.to_string().contains("trial 101"));
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn run_scripted_invalid_summary_case(
+        min_num_trials: u32,
+    ) -> anyhow::Result<(Vec<usize>, Vec<usize>)> {
+        let (mut scorer, _score_calls, _mask_calls, _score_log, mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs(1024, 128);
+        scorer.invalid_summary_trial = Some(101);
+        let options = test_ransac_options(min_num_trials, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let refined_trials = Rc::new(RefCell::new(Vec::new()));
+        let refined_trials_for_closure = refined_trials.clone();
+        run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-invalid-summary",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 512,
+                    decision_trials: 64,
+                },
+            },
+            |trial| vec![trial],
+            |sample| vec![Matrix3::from_diagonal_element(sample[0] as f64)],
+            move |model, support| {
+                refined_trials_for_closure
+                    .borrow_mut()
+                    .push(model[(0, 0)] as usize);
+                (model, support)
+            },
+        )?;
+        let mask_log = mask_log.borrow().clone();
+        let refined_trials = refined_trials.borrow().clone();
+        Ok((mask_log, refined_trials))
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_invalid_summary_is_ignored_after_frontier_closes() -> anyhow::Result<()> {
+        let (mask_log, refined_trials) = run_scripted_invalid_summary_case(100)?;
+        assert_eq!(mask_log, vec![0, 63, 100]);
+        assert_eq!(refined_trials, vec![0, 63, 100]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_invalid_summary_fails_when_frontier_reaches_it() {
+        let error = run_scripted_invalid_summary_case(127).unwrap_err();
+        assert!(
+            error.to_string().contains("trial 101 summary is invalid"),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("support residual sum is not finite"));
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_summary_count_mismatch_fails_immediately() {
+        let (mut scorer, _score_calls, mask_calls, _score_log, _mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs(1024, 128);
+        scorer.truncate_first_score = true;
+        let options = test_ransac_options(100, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let refined_trials = Rc::new(RefCell::new(Vec::new()));
+        let refined_trials_for_closure = refined_trials.clone();
+        let result = run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-summary-count",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 512,
+                    decision_trials: 64,
+                },
+            },
+            |trial| vec![trial],
+            |sample| vec![Matrix3::from_diagonal_element(sample[0] as f64)],
+            move |model, support| {
+                refined_trials_for_closure
+                    .borrow_mut()
+                    .push(model[(0, 0)] as usize);
+                (model, support)
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("summary count mismatch should fail before consumption"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("returned 127 summaries for 128 candidates"));
+        assert_eq!(mask_calls.get(), 0);
+        assert!(refined_trials.borrow().is_empty());
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_empty_trials_advance_the_decision_cursor() -> anyhow::Result<()> {
+        let (scorer, _score_calls, _mask_calls, score_log, mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs(1024, 128);
+        let options = test_ransac_options(0, 64, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let sampled_trials = Rc::new(RefCell::new(Vec::new()));
+        let sampled_trials_for_closure = sampled_trials.clone();
+        let refined_trials = Rc::new(RefCell::new(Vec::new()));
+        let refined_trials_for_closure = refined_trials.clone();
+        let result = run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-empty",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 64,
+                    decision_trials: 64,
+                },
+            },
+            move |trial| {
+                sampled_trials_for_closure.borrow_mut().push(trial);
+                vec![trial]
+            },
+            |sample| {
+                (sample[0] == 63)
+                    .then(|| Matrix3::from_diagonal_element(sample[0] as f64))
+                    .into_iter()
+                    .collect()
+            },
+            move |model, support| {
+                refined_trials_for_closure
+                    .borrow_mut()
+                    .push(model[(0, 0)] as usize);
+                (model, support)
+            },
+        )?;
+        assert_eq!(
+            result
+                .best
+                .as_ref()
+                .map(|(model, _)| model[(0, 0)] as usize),
+            Some(63)
+        );
+        assert_eq!(*sampled_trials.borrow(), (0..64).collect::<Vec<_>>());
+        assert_eq!(*score_log.borrow(), vec![vec![63]]);
+        assert_eq!(*mask_log.borrow(), vec![63]);
+        assert_eq!(*refined_trials.borrow(), vec![63]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_sampler_exhaustion_matches_the_legacy_prefix() -> anyhow::Result<()> {
+        let support_by_trial = (0..37)
+            .map(|trial| (trial, trial as u32 + 1))
+            .collect::<BTreeMap<_, _>>();
+        let (scorer, _score_calls, _mask_calls, score_log, mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs_and_supports(1024, 128, 1, support_by_trial);
+        let options = test_ransac_options(0, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let sampled_trials = Rc::new(RefCell::new(Vec::new()));
+        let sampled_trials_for_closure = sampled_trials.clone();
+        let refined_trials = Rc::new(RefCell::new(Vec::new()));
+        let refined_trials_for_closure = refined_trials.clone();
+        run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-exhaustion",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 512,
+                    decision_trials: 64,
+                },
+            },
+            move |trial| {
+                sampled_trials_for_closure.borrow_mut().push(trial);
+                (trial < 37).then_some(trial).into_iter().collect()
+            },
+            |sample| vec![Matrix3::from_diagonal_element(sample[0] as f64)],
+            move |model, support| {
+                refined_trials_for_closure
+                    .borrow_mut()
+                    .push(model[(0, 0)] as usize);
+                (model, support)
+            },
+        )?;
+        assert_eq!(*sampled_trials.borrow(), (0..=37).collect::<Vec<_>>());
+        assert_eq!(*score_log.borrow(), vec![(0..37).collect::<Vec<_>>()]);
+        assert_eq!(*mask_log.borrow(), (0..37).collect::<Vec<_>>());
+        assert_eq!(*refined_trials.borrow(), (0..37).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_multi_model_boundary_trial_is_atomic() -> anyhow::Result<()> {
+        let (scorer, _score_calls, _mask_calls, _score_log, mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs_and_supports(
+                1024,
+                128,
+                2,
+                BTreeMap::from([(630, 25), (1000, 26), (1001, 27)]),
+            );
+        let options = test_ransac_options(100, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let refined_trials = Rc::new(RefCell::new(Vec::new()));
+        let refined_trials_for_closure = refined_trials.clone();
+        let result = run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-multi-model",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 512,
+                    decision_trials: 64,
+                },
+            },
+            |trial| vec![trial],
+            |sample| {
+                let marker = sample[0] * 10;
+                if sample[0] == 100 {
+                    vec![
+                        Matrix3::from_diagonal_element(marker as f64),
+                        Matrix3::from_diagonal_element((marker + 1) as f64),
+                    ]
+                } else {
+                    vec![Matrix3::from_diagonal_element(marker as f64)]
+                }
+            },
+            move |model, support| {
+                refined_trials_for_closure
+                    .borrow_mut()
+                    .push(model[(0, 0)] as usize);
+                (model, support)
+            },
+        )?;
+        assert_eq!(
+            result
+                .best
+                .as_ref()
+                .map(|(model, _)| model[(0, 0)] as usize),
+            Some(1001)
+        );
+        assert_eq!(*mask_log.borrow(), vec![0, 630, 1000, 1001]);
+        assert_eq!(*refined_trials.borrow(), vec![0, 630, 1000, 1001]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_deferred_capacity_error_is_ignored_after_frontier_closes() -> anyhow::Result<()> {
+        let (scorer, _score_calls, _mask_calls) = ScriptedGpuRansacScorer::new(1, 128);
+        let options = test_ransac_options(100, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let result = run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-capacity",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 512,
+                    decision_trials: 64,
+                },
+            },
+            |trial| vec![trial],
+            |sample| {
+                let model = Matrix3::from_diagonal_element(sample[0] as f64);
+                if sample[0] == 101 {
+                    vec![model, model]
+                } else {
+                    vec![model]
+                }
+            },
+            |model, support| (model, support),
+        )?;
+        assert_eq!(
+            result
+                .best
+                .as_ref()
+                .map(|(model, _)| model[(0, 0)] as usize),
+            Some(100)
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_deferred_capacity_error_fails_when_frontier_reaches_it() {
+        let (scorer, _score_calls, _mask_calls) = ScriptedGpuRansacScorer::new(1, 128);
+        let options = test_ransac_options(127, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let result = run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-capacity",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 512,
+                    decision_trials: 64,
+                },
+            },
+            |trial| vec![trial],
+            |sample| {
+                let model = Matrix3::from_diagonal_element(sample[0] as f64);
+                if sample[0] == 101 {
+                    vec![model, model]
+                } else {
+                    vec![model]
+                }
+            },
+            |model, support| (model, support),
+        );
+        let error = match result {
+            Ok(_) => panic!("capacity error should be reported when frontier reaches trial 101"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("trial 101"));
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_capacity_slices_do_not_resample_or_reorder_trials() -> anyhow::Result<()> {
+        let (scorer, _score_calls, _mask_calls, score_log, _mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs(5, 128);
+        let options = test_ransac_options(0, 4, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let sampled_trials = Rc::new(RefCell::new(Vec::new()));
+        let sampled_trials_for_closure = sampled_trials.clone();
+        run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-capacity-slices",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: 4,
+                    decision_trials: 64,
+                },
+            },
+            move |trial| {
+                sampled_trials_for_closure.borrow_mut().push(trial);
+                vec![trial]
+            },
+            |sample| {
+                let model = Matrix3::from_diagonal_element(sample[0] as f64);
+                vec![model; 3]
+            },
+            |model, support| (model, support),
+        )?;
+        assert_eq!(*sampled_trials.borrow(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            *score_log.borrow(),
+            vec![vec![0, 0, 0], vec![1, 1, 1], vec![2, 2, 2], vec![3, 3, 3]]
+        );
         Ok(())
     }
 
@@ -5346,6 +6116,158 @@ mod tests {
         assert!(first.1.inliers >= 20);
         assert!(first.1.residual_sum.is_finite());
         assert_eq!(first.1.inlier_mask, second.1.inlier_mask);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_model_families_are_policy_parity_stable() -> anyhow::Result<()> {
+        let Some(context) = crate::gpu::WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU E/F/H policy parity test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = crate::gpu::WgpuModelScorer::from_context(context)?;
+        let rotation = Rotation3::from_euler_angles(0.02, -0.03, 0.01).into_inner();
+        let translation = Vector3::new(0.15, -0.04, 0.08);
+        let mut rays1 = Vec::new();
+        let mut rays2 = Vec::new();
+        let mut pixels1 = Vec::new();
+        let mut pixels2 = Vec::new();
+        for index in 0..32 {
+            let point = Vector3::new(
+                (index % 8) as f64 * 0.12 - 0.4,
+                (index / 8) as f64 * 0.15 - 0.25,
+                2.5 + (index % 5) as f64 * 0.2,
+            );
+            let left = Vector3::new(point.x / point.z, point.y / point.z, 1.0);
+            let transformed = rotation * point + translation;
+            let right = Vector3::new(
+                transformed.x / transformed.z,
+                transformed.y / transformed.z,
+                1.0,
+            );
+            rays1.push(left);
+            rays2.push(right);
+            pixels1.push(left);
+            pixels2.push(right);
+        }
+        let active_indices = (0..rays1.len()).collect::<Vec<_>>();
+        let options = test_ransac_options(0, 128, 0.999);
+        let reference_policy = GpuRansacBatchPolicy {
+            score_trials: 64,
+            decision_trials: 64,
+        };
+        let candidate_policy = GpuRansacBatchPolicy {
+            score_trials: 512,
+            decision_trials: 64,
+        };
+        let fingerprint = |result: &Option<(Matrix3<f64>, ModelSupport, bool)>| {
+            result.as_ref().map(|(model, support, success)| {
+                (
+                    matrix3_to_row_array(*model),
+                    support.inliers,
+                    support.residual_sum.to_bits(),
+                    support.inlier_mask.clone(),
+                    *success,
+                )
+            })
+        };
+
+        let (essential_reference, _) = estimate_essential_ransac_gpu_with_policy(
+            &scorer,
+            &rays1,
+            &rays2,
+            &active_indices,
+            rays1.len(),
+            options,
+            42,
+            0,
+            false,
+            false,
+            true,
+            reference_policy,
+        )?;
+        let (essential_candidate, _) = estimate_essential_ransac_gpu_with_policy(
+            &scorer,
+            &rays1,
+            &rays2,
+            &active_indices,
+            rays1.len(),
+            options,
+            42,
+            0,
+            false,
+            false,
+            true,
+            candidate_policy,
+        )?;
+        assert_eq!(
+            fingerprint(&essential_reference),
+            fingerprint(&essential_candidate)
+        );
+
+        let (fundamental_reference, _) = estimate_fundamental_ransac_gpu_with_policy(
+            &scorer,
+            &pixels1,
+            &pixels2,
+            &active_indices,
+            options,
+            42,
+            0,
+            false,
+            reference_policy,
+        )?;
+        let (fundamental_candidate, _) = estimate_fundamental_ransac_gpu_with_policy(
+            &scorer,
+            &pixels1,
+            &pixels2,
+            &active_indices,
+            options,
+            42,
+            0,
+            false,
+            candidate_policy,
+        )?;
+        assert_eq!(
+            fingerprint(&fundamental_reference),
+            fingerprint(&fundamental_candidate)
+        );
+
+        let mut homography_points1 = Vec::new();
+        let mut homography_points2 = Vec::new();
+        for y in 0..4 {
+            for x in 0..8 {
+                homography_points1.push(Vector3::new(x as f64, y as f64, 1.0));
+                homography_points2.push(Vector3::new(x as f64 + 2.0, y as f64 - 1.0, 1.0));
+            }
+        }
+        let homography_indices = (0..homography_points1.len()).collect::<Vec<_>>();
+        let (homography_reference, _) = estimate_homography_ransac_gpu_with_policy(
+            &scorer,
+            &homography_points1,
+            &homography_points2,
+            &homography_indices,
+            options,
+            42,
+            0,
+            false,
+            reference_policy,
+        )?;
+        let (homography_candidate, _) = estimate_homography_ransac_gpu_with_policy(
+            &scorer,
+            &homography_points1,
+            &homography_points2,
+            &homography_indices,
+            options,
+            42,
+            0,
+            false,
+            candidate_policy,
+        )?;
+        assert_eq!(
+            fingerprint(&homography_reference),
+            fingerprint(&homography_candidate)
+        );
         Ok(())
     }
 
