@@ -825,7 +825,14 @@ Preserved diagnostic artifacts:
   `matched_pairs=2890`, `verified_pairs=2890`, `total_matches=2958062`, fingerprint
   `ebfd8001e17daf280227df8856beb05d74fced38f9908d9704899d368a7f9da2`, and
   `matching_seconds=574.732527833`.
-- The 2,890-pair 512 candidate has **not** run: both attempts to request the required non-sandboxed
-  execution were rejected by the approval service because its review stream was overloaded. No
-  candidate JSON was created, and no merge or worktree cleanup is authorized. Final decision for
-  this follow-up remains **NO MERGE** until the full candidate fingerprint is verified.
+- The 2,890-pair 512 candidate has now completed successfully after the approval service recovered.
+  It wrote `/tmp/rustsfm-gpu-ransac-chunk-512-2890.json` (SHA-256
+  `6a37f6b8ebae811cf92a7c1ee4e99b3f24d09eeabca4e60315e0bc0427a4c360`) with
+  `matching_seconds=300.787595292`,
+  `matched_pairs=2890`, `verified_pairs=2890`, `total_matches=2958062`, and result fingerprint
+  `ebfd8001e17daf280227df8856beb05d74fced38f9908d9704899d368a7f9da2`.
+- The full 512 output fingerprint and counts exactly match the preserved 64 full baseline above.
+  The strict full parity gate therefore **PASSED**. The candidate reduced matching time from
+  `574.732527833` seconds to `300.787595292` seconds (approximately 47.7% faster).
+- Decision for the completed experiment: **MERGE**. This supersedes the earlier bounded-only
+  NO MERGE decision, which was recorded before the full candidate could run.
