@@ -11,7 +11,7 @@
 
 本轮 RustSFM 硬化后的本地验证结果是：
 
-- `cargo test -p rustsfm --lib`: `708 passed; 0 failed; 19 ignored`
+- `cargo test -p rustsfm --lib`: `709 passed; 0 failed; 19 ignored`
 - `cargo test -p rustsfm --lib --no-default-features`: `581 passed; 0 failed; 19 ignored`
 - `cargo test -p rustsfm --test sequence_registration --no-default-features`: `62 passed; 0 failed`
 

@@ -24,7 +24,7 @@ This README is intentionally brief. Current status lives in a small set of canon
 
 RustSFM was verified in this workspace on 2026-08-14:
 
-- Default RustSFM library suite: `708 passed; 0 failed; 19 ignored external-fixture tests`
+- Default RustSFM library suite: `709 passed; 0 failed; 19 ignored external-fixture tests`
 - Minimal RustSFM library suite: `581 passed; 0 failed; 19 ignored external-fixture tests`
 - Minimal `sequence_registration` integration suite: `62 passed; 0 failed`
 

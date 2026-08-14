@@ -2,6 +2,8 @@ use super::{GpuBackendKind, GpuSiftCapabilities};
 use anyhow::{Context, Result};
 use bytemuck::Pod;
 use std::sync::{mpsc, Arc};
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -20,6 +22,9 @@ pub struct WgpuContext {
     queue: wgpu::Queue,
     backend: wgpu::Backend,
     capabilities: GpuSiftCapabilities,
+    #[cfg(test)]
+    // Keep Metal shader compilation from overlapping across unit-test threads.
+    _test_gpu_context_lease: MutexGuard<'static, ()>,
 }
 
 impl WgpuContext {
@@ -32,6 +37,8 @@ impl WgpuContext {
     }
 
     async fn new_async() -> Result<Option<Arc<Self>>> {
+        #[cfg(test)]
+        let test_gpu_context_lease = test_gpu_context_lease();
         #[cfg(feature = "gpu-vulkan")]
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -75,6 +82,8 @@ impl WgpuContext {
                 backend: gpu_backend_kind(info.backend),
                 device_name: info.name,
             },
+            #[cfg(test)]
+            _test_gpu_context_lease: test_gpu_context_lease,
         })))
     }
 
@@ -195,5 +204,40 @@ fn gpu_backend_kind(backend: wgpu::Backend) -> GpuBackendKind {
         GpuBackendKind::Vulkan
     } else {
         GpuBackendKind::Wgpu
+    }
+}
+
+#[cfg(test)]
+fn test_gpu_context_lease_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+fn test_gpu_context_lease() -> MutexGuard<'static, ()> {
+    test_gpu_context_lease_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(test)]
+fn try_test_gpu_context_lease() -> Option<MutexGuard<'static, ()>> {
+    match test_gpu_context_lease_lock().try_lock() {
+        Ok(lease) => Some(lease),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_test_context_lease_excludes_parallel_initialization() {
+        let first = test_gpu_context_lease();
+        assert!(try_test_gpu_context_lease().is_none());
+        drop(first);
+        assert!(try_test_gpu_context_lease().is_some());
     }
 }
