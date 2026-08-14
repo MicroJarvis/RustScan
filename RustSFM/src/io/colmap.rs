@@ -2307,6 +2307,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the external test_data/flowers2_colmap fixture"]
     fn real_colmap_sparse_tracks_recover_registered_image_pose_with_pnp() -> Result<()> {
         let sparse = read_colmap_sparse_files_with_format(
             Path::new("../test_data/flowers2_colmap/sparse/text"),

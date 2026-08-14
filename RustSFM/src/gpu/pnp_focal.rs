@@ -260,18 +260,18 @@ impl WgpuPnPFocalCandidateGenerator {
             ],
             immediate_size: 0,
         });
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rustsfm gpu pnp-focal P3P candidate pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("generate_p3p_candidates"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-        if let Some(error) = pollster::block_on(error_scope.pop()) {
-            bail!("gpu pnp-focal candidate pipeline creation failed: {error}");
-        }
+        let pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm gpu pnp-focal P3P candidate pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("generate_p3p_candidates"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "gpu pnp-focal candidate pipeline creation failed",
+        )?;
         let batch_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("rustsfm gpu pnp-focal candidate batch pipeline layout"),
@@ -283,18 +283,18 @@ impl WgpuPnPFocalCandidateGenerator {
                 ],
                 immediate_size: 0,
             });
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let batch_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rustsfm gpu pnp-focal P3P candidate batch pipeline"),
-            layout: Some(&batch_pipeline_layout),
-            module: &shader,
-            entry_point: Some("generate_p3p_candidate_batch"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-        if let Some(error) = pollster::block_on(error_scope.pop()) {
-            bail!("gpu pnp-focal candidate batch pipeline creation failed: {error}");
-        }
+        let batch_pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm gpu pnp-focal P3P candidate batch pipeline"),
+                layout: Some(&batch_pipeline_layout),
+                module: &shader,
+                entry_point: Some("generate_p3p_candidate_batch"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "gpu pnp-focal candidate batch pipeline creation failed",
+        )?;
         Ok(Self {
             context,
             bind_group_layout,
@@ -939,18 +939,18 @@ impl WgpuPnPFocalRefiner {
             bind_group_layouts: &[None, None, None, None, Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rustsfm gpu pnp-focal refinement pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("refine_focal_model"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-        if let Some(error) = pollster::block_on(error_scope.pop()) {
-            bail!("gpu pnp-focal refinement pipeline creation failed: {error}");
-        }
+        let pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm gpu pnp-focal refinement pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("refine_focal_model"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "gpu pnp-focal refinement pipeline creation failed",
+        )?;
         Ok(Self {
             context,
             bind_group_layout,
@@ -1249,18 +1249,18 @@ impl WgpuPnPFocalSampler {
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rustsfm gpu pnp-focal sampler pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("sample_four_points"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-        if let Some(error) = pollster::block_on(error_scope.pop()) {
-            bail!("gpu pnp-focal sampler pipeline creation failed: {error}");
-        }
+        let pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm gpu pnp-focal sampler pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("sample_four_points"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "gpu pnp-focal sampler pipeline creation failed",
+        )?;
         Ok(Self {
             context,
             bind_group_layout,
@@ -1387,6 +1387,50 @@ fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutE
         },
         count: None,
     }
+}
+
+#[cfg(test)]
+fn has_known_agx_compiler_failure_signature(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("XPC_ERROR_CONNECTION_INTERRUPTED") && message.contains("AGXMetal")
+}
+
+#[cfg(test)]
+pub(super) fn is_known_macos_agx_pipeline_failure(error: &anyhow::Error) -> bool {
+    cfg!(target_os = "macos") && has_known_agx_compiler_failure_signature(error)
+}
+
+#[cfg(test)]
+pub(super) fn skip_known_macos_agx_pipeline_failure<T>(
+    result: Result<T>,
+    test_name: &str,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if is_known_macos_agx_pipeline_failure(&error) => {
+            eprintln!("skipping {test_name}: known macOS AGX compiler service failure: {error:#}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_compute_pipeline_checked(
+    device: &wgpu::Device,
+    descriptor: &wgpu::ComputePipelineDescriptor<'_>,
+    failure_context: &str,
+) -> Result<wgpu::ComputePipeline> {
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let out_of_memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let pipeline = device.create_compute_pipeline(descriptor);
+    let internal_error = pollster::block_on(internal_scope.pop());
+    let out_of_memory_error = pollster::block_on(out_of_memory_scope.pop());
+    let validation_error = pollster::block_on(validation_scope.pop());
+    if let Some(error) = internal_error.or(out_of_memory_error).or(validation_error) {
+        return Err(anyhow::Error::new(error).context(failure_context.to_owned()));
+    }
+    Ok(pipeline)
 }
 
 fn checked_gpu_storage_bytes<T>(count: usize, storage_limit: u64, label: &str) -> Result<u64> {
@@ -1524,23 +1568,30 @@ impl WgpuPnPFocalScorer {
             bind_group_layouts: &[None, None, Some(&bind_group_layout)],
             immediate_size: 0,
         });
-        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let score_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rustsfm gpu pnp-focal support pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("score_focal_models"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-        let mask_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rustsfm gpu pnp-focal mask pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("write_focal_mask"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let score_pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm gpu pnp-focal support pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("score_focal_models"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "gpu pnp-focal support pipeline creation failed",
+        )?;
+        let mask_pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm gpu pnp-focal mask pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("write_focal_mask"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "gpu pnp-focal mask pipeline creation failed",
+        )?;
         let selection_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rustsfm gpu pnp-focal selection bind group layout"),
@@ -1566,14 +1617,18 @@ impl WgpuPnPFocalScorer {
                 ],
                 immediate_size: 0,
             });
-        let selection_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rustsfm gpu pnp-focal selection pipeline"),
-            layout: Some(&selection_pipeline_layout),
-            module: &shader,
-            entry_point: Some("select_focal_model"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let selection_pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm gpu pnp-focal selection pipeline"),
+                layout: Some(&selection_pipeline_layout),
+                module: &shader,
+                entry_point: Some("select_focal_model"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "gpu pnp-focal selection pipeline creation failed",
+        )?;
         let acceptance_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rustsfm gpu pnp-focal acceptance bind group layout"),
@@ -1602,18 +1657,18 @@ impl WgpuPnPFocalScorer {
                 ],
                 immediate_size: 0,
             });
-        let acceptance_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let acceptance_pipeline = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
                 label: Some("rustsfm gpu pnp-focal acceptance pipeline"),
                 layout: Some(&acceptance_pipeline_layout),
                 module: &shader,
                 entry_point: Some("accept_refined_focal_candidate"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
-            });
-        if let Some(error) = pollster::block_on(error_scope.pop()) {
-            bail!("gpu pnp-focal scoring pipeline creation failed: {error}");
-        }
+            },
+            "gpu pnp-focal acceptance pipeline creation failed",
+        )?;
         Ok(Self {
             context,
             bind_group_layout,
@@ -2748,6 +2803,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agx_compiler_failure_signature_requires_xpc_and_metal_domain() {
+        let known = anyhow::anyhow!(
+            "Compilation failed: XPC_ERROR_CONNECTION_INTERRUPTED; domain: AGXMetalG17X"
+        );
+        let xpc_only = anyhow::anyhow!("Compilation failed: XPC_ERROR_CONNECTION_INTERRUPTED");
+        let domain_only = anyhow::anyhow!("Compilation failed; domain: AGXMetalG17X");
+
+        assert!(has_known_agx_compiler_failure_signature(&known));
+        assert!(!has_known_agx_compiler_failure_signature(&xpc_only));
+        assert!(!has_known_agx_compiler_failure_signature(&domain_only));
+    }
+
+    #[test]
+    fn agx_pipeline_failure_skip_is_macos_only_and_preserves_other_errors() {
+        let known = skip_known_macos_agx_pipeline_failure::<()>(
+            Err(anyhow::anyhow!(
+                "XPC_ERROR_CONNECTION_INTERRUPTED; domain: AGXMetalG17X"
+            )),
+            "known failure test",
+        );
+        if cfg!(target_os = "macos") {
+            assert!(matches!(known, Ok(None)));
+        } else {
+            assert!(known.is_err());
+        }
+
+        let unrelated = skip_known_macos_agx_pipeline_failure::<()>(
+            Err(anyhow::anyhow!("WGSL validation failed")),
+            "unrelated failure test",
+        );
+        assert!(unrelated.is_err());
+    }
+
+    #[test]
+    fn checked_pipeline_error_preserves_typed_wgpu_source() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let device = context.device();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("typed pipeline error test shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                "@compute @workgroup_size(1) fn available_entry_point() {}".into(),
+            ),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("typed pipeline error test layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+
+        let error = create_compute_pipeline_checked(
+            device,
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("typed pipeline error test pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("missing_entry_point"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+            "typed pipeline creation failed",
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<wgpu::Error>().is_some(), "{error:#}");
+        assert!(error.to_string().contains("typed pipeline creation failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn pnp_focal_pipeline_initialization_does_not_unwind() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            WgpuPnPFocalSolver::from_context(context)
+        }));
+        assert!(result.is_ok(), "pnp-focal pipeline initialization panicked");
+        Ok(())
+    }
+
     fn candidate_reprojects_sample(
         model: GpuPnpFocalModel,
         image: &[[f32; 2]],
@@ -2890,7 +3028,13 @@ mod tests {
             eprintln!("skipping GPU PnP-focal column-zero test: no compatible adapter");
             return Ok(());
         };
-        let generator = WgpuPnPFocalCandidateGenerator::from_context(context)?;
+        let Some(generator) = skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalCandidateGenerator::from_context(context),
+            "GPU PnP-focal column-zero test",
+        )?
+        else {
+            return Ok(());
+        };
         let candidates = generator.generate_p3p(&image, &world, [0, 1, 2, 3], focal, 0)?;
 
         assert!(candidates
@@ -3000,7 +3144,13 @@ mod tests {
             .iter()
             .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
             .collect::<Vec<_>>();
-        let generator = WgpuPnPFocalCandidateGenerator::from_context(context)?;
+        let Some(generator) = skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalCandidateGenerator::from_context(context),
+            "GPU PnP-focal P3P ordering test",
+        )?
+        else {
+            return Ok(());
+        };
         let candidates = generator.generate_p3p(&image, &world, [0, 1, 2, 3], focal, 0)?;
 
         assert!(candidates.iter().any(|model| {

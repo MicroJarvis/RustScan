@@ -1,12 +1,16 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[path = "src/build_support.rs"]
+mod build_support;
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(colmap_freeimage)");
     println!("cargo:rustc-check-cfg=cfg(colmap_eigen)");
     println!("cargo:rerun-if-env-changed=POSELIB_ROOT");
     println!("cargo:rerun-if-env-changed=EIGEN3_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=VLFEAT_ROOT");
+    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
 
     if env::var_os("CARGO_FEATURE_POSELIB").is_some() {
         build_poselib_bridge();
@@ -142,13 +146,10 @@ fn resolve_vlfeat_root() -> Option<PathBuf> {
     let candidates = env::var_os("VLFEAT_ROOT")
         .map(PathBuf::from)
         .into_iter()
-        .chain([
-            PathBuf::from("third_party/vlfeat"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third_party/vlfeat"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("third_party/vlfeat"),
-        ]);
+        .chain(build_support::source_root_candidates(
+            &build_support::manifest_dir_from_env(),
+            Path::new("third_party/vlfeat"),
+        ));
     candidates
         .map(|path| path.canonicalize().unwrap_or(path))
         .find(|path| path.join(marker).exists())
@@ -159,13 +160,10 @@ fn resolve_poselib_root() -> Option<PathBuf> {
     let candidates = env::var_os("POSELIB_ROOT")
         .map(PathBuf::from)
         .into_iter()
-        .chain([
-            PathBuf::from("third_party/PoseLib"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third_party/PoseLib"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("third_party/PoseLib"),
-        ]);
+        .chain(build_support::source_root_candidates(
+            &build_support::manifest_dir_from_env(),
+            Path::new("third_party/PoseLib"),
+        ));
     candidates
         .map(|path| path.canonicalize().unwrap_or(path))
         .find(|path| path.join(marker).exists())

@@ -34,6 +34,10 @@ pub(crate) use pnp_focal::{
     GpuPnpFocalCandidate, GpuPnpFocalModel, GpuPnpFocalResult, WgpuPnPFocalCandidateGenerator,
     WgpuPnPFocalSampler, WgpuPnPFocalScorer,
 };
+#[cfg(all(feature = "gpu-wgpu", test))]
+pub(crate) fn is_known_macos_agx_pipeline_failure(error: &anyhow::Error) -> bool {
+    pnp_focal::is_known_macos_agx_pipeline_failure(error)
+}
 #[cfg(feature = "gpu-wgpu")]
 pub use pnp_scorer::WgpuPnpModelScorer;
 #[cfg(all(feature = "gpu-wgpu", test))]
@@ -1146,7 +1150,13 @@ mod tests {
             point[1] -= 400.0;
         }
 
-        let solver = WgpuPnPFocalSolver::from_context(context)?;
+        let Some(solver) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalSolver::from_context(context),
+            "GPU PnP-focal solver test",
+        )?
+        else {
+            return Ok(());
+        };
         let result = solver
             .solve(&image, &world, 2.0, 7, 512, 150.0, 1_400.0)?
             .expect("valid synthetic PnP-focal solution");
@@ -1163,6 +1173,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn wgpu_pnp_focal_search_grid_spans_configured_bounds() {
         let focal_grid = super::pnp_focal::focal_search_grid(150.0, 1_400.0, 8).unwrap();
@@ -1180,6 +1191,7 @@ mod tests {
             .all(|pair| (pair[0] - pair[1]).abs() < 1.0e-5));
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn wgpu_pnp_focal_selection_prefers_support_then_residual_then_index() {
         use rustslam::tracker::PnPModelSupport;
@@ -1268,7 +1280,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let solver = WgpuPnPFocalSolver::from_context(context)?;
+        let Some(solver) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalSolver::from_context(context),
+            "GPU PnP-focal refinement test",
+        )?
+        else {
+            return Ok(());
+        };
         let result = solver
             .solve(&image, &world, 2.0, 7, 512, 150.0, 1_400.0)?
             .expect("noisy synthetic PnP-focal solution");
@@ -1303,7 +1321,13 @@ mod tests {
             .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
             .collect::<Vec<_>>();
 
-        let solver = WgpuPnPFocalSolver::from_context(context)?;
+        let Some(solver) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalSolver::from_context(context),
+            "GPU PnP-focal bounds test",
+        )?
+        else {
+            return Ok(());
+        };
         assert!(solver
             .solve(&image, &world, 0.01, 7, 256, 0.5, 1.0)?
             .is_none());
@@ -1328,7 +1352,13 @@ mod tests {
             .iter()
             .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
             .collect::<Vec<_>>();
-        let generator = WgpuPnPFocalCandidateGenerator::from_context(context)?;
+        let Some(generator) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalCandidateGenerator::from_context(context),
+            "GPU PnP-focal P3P candidate test",
+        )?
+        else {
+            return Ok(());
+        };
         let candidates = generator.generate_p3p(&image, &world, [0, 1, 2, 3], focal, 0)?;
 
         assert!(candidates
@@ -1355,7 +1385,13 @@ mod tests {
             .iter()
             .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
             .collect::<Vec<_>>();
-        let generator = WgpuPnPFocalCandidateGenerator::from_context(context)?;
+        let Some(generator) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalCandidateGenerator::from_context(context),
+            "GPU PnP-focal P3P batch candidate test",
+        )?
+        else {
+            return Ok(());
+        };
         let candidates =
             generator.generate_p3p_batch(&image, &world, &[([0, 1, 2, 3], focal, 0)])?;
 

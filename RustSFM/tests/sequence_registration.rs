@@ -471,7 +471,7 @@ fn keyframe_stage_rejects_vocab_tree_before_touching_the_database() {
 }
 
 #[test]
-fn keyframe_stage_prepares_fixed_database_and_stable_keyframe_links() {
+fn keyframe_stage_prepares_fixed_database_and_cleans_failed_private_snapshot() {
     let input = tempdir().unwrap();
     let output = tempdir().unwrap();
     let first = input.path().join("capture-A.png");
@@ -506,14 +506,19 @@ fn keyframe_stage_prepares_fixed_database_and_stable_keyframe_links() {
 
     assert!(!error.to_string().contains("not implemented"));
     assert!(output.path().join("Cache/database.db").is_file());
-    assert!(output
-        .path()
-        .join("Cache/keyframes/capture-A.png")
-        .is_file());
-    assert!(output
-        .path()
-        .join("Cache/keyframes/capture-Z.png")
-        .is_file());
+    assert!(!output.path().join("Cache/keyframes").exists());
+    assert!(std::fs::read_dir(output.path().join("Cache"))
+        .unwrap()
+        .all(|entry| {
+            !entry
+                .map(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".keyframe-input-")
+                })
+                .unwrap_or(false)
+        }));
 }
 
 #[test]
@@ -1253,6 +1258,134 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
 
     assert!(result.has_complete_coverage(), "{:#?}", result.diagnostics);
     assert_eq!(result.registered_frames, 6);
+    Ok(())
+}
+
+#[test]
+fn keyframe_stage_uses_private_snapshot_and_removes_legacy_shared_directory() -> anyhow::Result<()>
+{
+    let (_temp, output, frames, _old_keyframes, mut mapper_config) =
+        synthetic_sequence_fixture(None)?;
+    if output.join("sparse").exists() {
+        std::fs::remove_dir_all(output.join("sparse"))?;
+    }
+    let keyframe_input = output.join("Cache/keyframes");
+    std::fs::create_dir_all(&keyframe_input)?;
+    let stale_image = keyframe_input.join("obsolete.png");
+    image::GrayImage::new(32, 32).save(&stale_image)?;
+
+    mapper_config.multiple_models = false;
+    mapper_config.copy_images = false;
+    mapper_config.init_num_trials = 1;
+    mapper_config.init_min_num_inliers = 16;
+    mapper_config.init_min_tri_angle_deg = 0.5;
+    mapper_config.abs_pose_min_num_inliers = 16;
+    mapper_config.ignore_two_view_tracks = false;
+    let keyframe_ids = SYNTHETIC_KEYFRAME_INDICES
+        .iter()
+        .map(|&index| frames[index].id)
+        .collect::<Vec<_>>();
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result =
+        run_keyframe_reconstruction(&frames, &keyframe_ids, &mapper_config, &output, &mut task)?;
+
+    assert_eq!(result.keyframe_ids, keyframe_ids);
+    assert!(!stale_image.exists());
+    assert!(!keyframe_input.exists());
+    assert!(output.join("Cache/keyframes.lock").is_file());
+    assert!(std::fs::read_dir(output.join("Cache"))?.all(|entry| {
+        !entry
+            .map(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".keyframe-input-")
+            })
+            .unwrap_or(false)
+    }));
+    Ok(())
+}
+
+#[test]
+fn keyframe_database_metadata_uses_private_snapshot_after_source_replacement() -> anyhow::Result<()>
+{
+    let input = tempdir()?;
+    let output = tempdir()?;
+    let source = input.path().join("frame.png");
+    image::GrayImage::new(64, 48).save(&source)?;
+    let frames = vec![SequenceFrame {
+        id: 42,
+        image_path: source.clone(),
+        timestamp_us: Some(0),
+    }];
+
+    let cache = output.path().join("Cache");
+    std::fs::create_dir_all(&cache)?;
+    let database_path = cache.join("database.db");
+    drop(ColmapDatabase::open(&database_path)?);
+    let database_lock = rusqlite::Connection::open(&database_path)?;
+    database_lock.execute_batch("BEGIN EXCLUSIVE TRANSACTION;")?;
+
+    let runner_frames = frames.clone();
+    let runner_output = output.path().to_path_buf();
+    let control = SfmTaskControl::new();
+    let runner_control = control.clone();
+    let runner = std::thread::spawn(move || {
+        let mut sink = |_| {};
+        let mut task = SfmTaskContext::new(&runner_control, &mut sink);
+        run_keyframe_reconstruction(
+            &runner_frames,
+            &[42],
+            &MapperConfig::default(),
+            &runner_output,
+            &mut task,
+        )
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let staged_image = std::fs::read_dir(&cache)?
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".keyframe-input-")
+                    .then(|| entry.path().join("frame.png"))
+            });
+        let snapshot_is_complete = staged_image.is_some_and(|path| {
+            std::fs::metadata(&path).ok().map(|metadata| metadata.len())
+                == std::fs::metadata(&source)
+                    .ok()
+                    .map(|metadata| metadata.len())
+                && matches!(image::image_dimensions(path), Ok((64, 48)))
+        });
+        if snapshot_is_complete {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            database_lock.execute_batch("ROLLBACK;")?;
+            let _ = runner.join();
+            anyhow::bail!("timed out waiting for the private keyframe snapshot");
+        }
+        std::thread::yield_now();
+    }
+
+    image::GrayImage::new(7, 5).save(&source)?;
+    control.request_cancel();
+    database_lock.execute_batch("ROLLBACK;")?;
+
+    let result = runner
+        .join()
+        .map_err(|_| anyhow::anyhow!("keyframe reconstruction thread panicked"))?;
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    let database = ColmapDatabase::open_read_only(&database_path)?;
+    let camera = database.read_camera(1)?.expect("keyframe camera");
+    assert_eq!((camera.camera.width, camera.camera.height), (64, 48));
     Ok(())
 }
 

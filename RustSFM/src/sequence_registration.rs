@@ -211,13 +211,20 @@ pub fn run_keyframe_reconstruction(
     task.checkpoint().map_err(anyhow::Error::new)?;
 
     let cache = output.join("Cache");
-    let keyframe_input = cache.join("keyframes");
+    std::fs::create_dir_all(&cache)?;
+    let _keyframe_lock = acquire_keyframe_cache_lock(&cache)?;
+    let legacy_keyframe_input = cache.join("keyframes");
+    let keyframe_snapshot =
+        stage_stable_image_directory(frames, &keyframe_indices, &legacy_keyframe_input)?;
+    let keyframe_input = keyframe_snapshot.path().to_path_buf();
     let database = cache.join("database.db");
-    std::fs::create_dir_all(&keyframe_input)?;
-    for &index in &keyframe_indices {
-        link_or_copy_stable_image(&frames[index].image_path, &keyframe_input)?;
-    }
-    import_database_images(frames, &keyframe_indices, mapper_config, &database)?;
+    import_database_images_from_directory(
+        frames,
+        &keyframe_indices,
+        mapper_config,
+        &keyframe_input,
+        &database,
+    )?;
     let keyframe_database_ids =
         database_image_ids_for_indices(frames, &keyframe_indices, &database)?;
 
@@ -277,6 +284,8 @@ pub fn run_keyframe_reconstruction(
         );
     }
     let sparse_model = persist_keyframe_sparse_snapshot(output, &model.reconstruction)?;
+    drop(keyframe_snapshot);
+    remove_path_if_present(&legacy_keyframe_input)?;
 
     Ok(KeyframeReconstructionResult {
         imported_frames: frames.len(),
@@ -300,7 +309,7 @@ fn persist_keyframe_sparse_snapshot(
     let temporary = snapshot_root.join("0.tmp");
     let backup = snapshot_root.join("0.backup");
     std::fs::create_dir_all(&snapshot_root)?;
-    std::fs::File::open(&cache)?.sync_all()?;
+    sync_parent_directory(&cache)?;
     recover_sparse_publish_paths(&destination, &temporary, &backup)?;
 
     let stage_result = (|| -> anyhow::Result<()> {
@@ -329,10 +338,12 @@ pub(super) fn link_or_copy_stable_image(
 ) -> anyhow::Result<PathBuf> {
     let name = source
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("input image {} has no file name", source.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("input image {} has no file name", source.display()))?
+        .to_owned();
+    let source = validated_regular_image_source(source)?;
     let destination = destination_dir.join(name);
     if destination.exists() {
-        if files_have_same_contents(source, &destination)? {
+        if files_have_same_contents(&source, &destination)? {
             return Ok(destination);
         }
         anyhow::bail!(
@@ -341,10 +352,155 @@ pub(super) fn link_or_copy_stable_image(
             source.display()
         );
     }
-    if std::fs::hard_link(source, &destination).is_err() {
-        std::fs::copy(source, &destination)?;
+    if std::fs::hard_link(&source, &destination).is_err() {
+        std::fs::copy(&source, &destination)?;
     }
     Ok(destination)
+}
+
+fn validated_regular_image_source(source: &Path) -> anyhow::Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("input image {} is a symbolic link", source.display());
+    }
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("input image {} is not a regular file", source.display());
+    }
+    let canonical = std::fs::canonicalize(source)?;
+    if !std::fs::symlink_metadata(&canonical)?.file_type().is_file() {
+        anyhow::bail!(
+            "input image {} does not resolve to a regular file",
+            source.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn acquire_keyframe_cache_lock(cache: &Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = cache.join("keyframes.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!(
+                "keyframe reconstruction is already in progress for {}",
+                cache.display()
+            )
+        }
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn remove_path_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => remove_file_or_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn copy_new_staged_image(source: &Path, destination_dir: &Path) -> anyhow::Result<PathBuf> {
+    use std::io::Write;
+
+    let name = source
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("input image {} has no file name", source.display()))?
+        .to_owned();
+    let source = validated_regular_image_source(source)?;
+    let destination = destination_dir.join(name);
+    let mut input = std::fs::File::open(&source)?;
+    let mut output = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!(
+                "staged image destination collision for {}",
+                destination.display()
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = std::io::copy(&mut input, &mut output).and_then(|_| output.flush()) {
+        drop(output);
+        let _ = std::fs::remove_file(&destination);
+        return Err(error.into());
+    }
+    Ok(destination)
+}
+
+fn stage_stable_image_directory(
+    frames: &[SequenceFrame],
+    indices: &[usize],
+    destination: &Path,
+) -> anyhow::Result<tempfile::TempDir> {
+    let parent = destination.parent().ok_or_else(|| {
+        anyhow::anyhow!("image directory has no parent: {}", destination.display())
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".keyframe-input-")
+        .tempdir_in(parent)?;
+    for &index in indices {
+        let frame = frames.get(index).ok_or_else(|| {
+            anyhow::anyhow!("keyframe index {index} is outside the frame collection")
+        })?;
+        copy_new_staged_image(&frame.image_path, temporary.path())?;
+    }
+    validate_staged_image_directory(temporary.path(), frames, indices)?;
+    Ok(temporary)
+}
+
+fn validate_staged_image_directory(
+    staged: &Path,
+    frames: &[SequenceFrame],
+    indices: &[usize],
+) -> anyhow::Result<()> {
+    let mut expected_names = BTreeSet::new();
+    for &index in indices {
+        let frame = frames.get(index).ok_or_else(|| {
+            anyhow::anyhow!("keyframe index {index} is outside the frame collection")
+        })?;
+        let name = frame.image_path.file_name().ok_or_else(|| {
+            anyhow::anyhow!(
+                "input image {} has no file name",
+                frame.image_path.display()
+            )
+        })?;
+        if !expected_names.insert(name.to_owned()) {
+            anyhow::bail!(
+                "staged image destination collision for {}",
+                name.to_string_lossy()
+            );
+        }
+    }
+
+    let mut actual_names = BTreeSet::new();
+    for entry in std::fs::read_dir(staged)? {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() {
+            anyhow::bail!(
+                "staged image {} is not a regular file",
+                entry.path().display()
+            );
+        }
+        actual_names.insert(entry.file_name());
+    }
+    if actual_names.len() != indices.len() || actual_names != expected_names {
+        anyhow::bail!(
+            "staged image snapshot contains {} entries for {} selected frames",
+            actual_names.len(),
+            indices.len()
+        );
+    }
+    Ok(())
 }
 
 fn files_have_same_contents(left: &Path, right: &Path) -> anyhow::Result<bool> {
@@ -375,6 +531,32 @@ pub(super) fn import_database_images(
     mapper_config: &MapperConfig,
     database: &Path,
 ) -> anyhow::Result<()> {
+    import_database_images_with_image_directory(frames, indices, mapper_config, None, database)
+}
+
+fn import_database_images_from_directory(
+    frames: &[SequenceFrame],
+    indices: &[usize],
+    mapper_config: &MapperConfig,
+    image_directory: &Path,
+    database: &Path,
+) -> anyhow::Result<()> {
+    import_database_images_with_image_directory(
+        frames,
+        indices,
+        mapper_config,
+        Some(image_directory),
+        database,
+    )
+}
+
+fn import_database_images_with_image_directory(
+    frames: &[SequenceFrame],
+    indices: &[usize],
+    mapper_config: &MapperConfig,
+    image_directory: Option<&Path>,
+    database: &Path,
+) -> anyhow::Result<()> {
     let db = ColmapDatabase::open(database)?;
     for &index in indices {
         let frame = &frames[index];
@@ -384,7 +566,10 @@ pub(super) fn import_database_images(
             .file_name()
             .and_then(|name| name.to_str())
             .expect("stable file name was validated");
-        let expected_camera = expected_database_camera(frame, mapper_config, image_id)?;
+        let staged_image_path = image_directory.map(|directory| directory.join(expected_name));
+        let metadata_image_path = staged_image_path.as_deref().unwrap_or(&frame.image_path);
+        let expected_camera =
+            expected_database_camera(metadata_image_path, mapper_config, image_id)?;
         if let Some(existing_image) = db.read_image(image_id)? {
             if existing_image.name != expected_name || existing_image.frame_id.is_some() {
                 anyhow::bail!("database image_id={image_id} metadata does not match frame");
@@ -422,11 +607,11 @@ pub(super) fn import_database_images(
 }
 
 fn expected_database_camera(
-    frame: &SequenceFrame,
+    image_path: &Path,
     mapper_config: &MapperConfig,
     camera_id: u32,
 ) -> anyhow::Result<ColmapDatabaseCamera> {
-    let (width, height) = image::image_dimensions(&frame.image_path)?;
+    let (width, height) = image::image_dimensions(image_path)?;
     let focal = width.max(height) as f64 * 1.2;
     let fx = mapper_config.fx.map(f64::from).unwrap_or(focal);
     let fy = mapper_config.fy.map(f64::from).unwrap_or(focal);
@@ -517,7 +702,8 @@ fn validate_keyframe_artifacts(
                 image.camera_id
             )
         })?;
-        let expected_camera = expected_database_camera(frame, mapper_config, image.camera_id)?;
+        let expected_camera =
+            expected_database_camera(&frame.image_path, mapper_config, image.camera_id)?;
         if !database_camera_metadata_matches(&camera, &expected_camera) {
             anyhow::bail!(
                 "keyframe database camera metadata does not match frame {}",
@@ -1033,14 +1219,16 @@ fn recover_sparse_publish_paths(
     temporary: &Path,
     backup: &Path,
 ) -> anyhow::Result<()> {
-    if backup.exists() {
-        if destination.exists() {
+    if path_entry_exists(backup)? {
+        if path_entry_exists(destination)? {
             remove_file_or_directory(backup)?;
+        } else if std::fs::symlink_metadata(backup)?.file_type().is_symlink() {
+            std::fs::remove_file(backup)?;
         } else {
             std::fs::rename(backup, destination)?;
         }
     }
-    if temporary.exists() {
+    if path_entry_exists(temporary)? {
         remove_file_or_directory(temporary)?;
     }
     Ok(())
@@ -1052,7 +1240,7 @@ fn replace_sparse_directory(
     backup: &Path,
 ) -> anyhow::Result<()> {
     replace_sparse_directory_with_sync(destination, temporary, backup, |parent| {
-        std::fs::File::open(parent)?.sync_all()
+        sync_parent_directory(parent)
     })
 }
 
@@ -1065,9 +1253,22 @@ fn replace_sparse_directory_with_sync<F>(
 where
     F: FnMut(&Path) -> std::io::Result<()>,
 {
-    let had_destination = destination.exists();
+    let had_destination = path_entry_exists(destination)?;
     if had_destination {
-        std::fs::rename(destination, backup)?;
+        if let Err(move_error) = std::fs::rename(destination, backup) {
+            let cleanup_result = remove_path_if_present(temporary);
+            let _ = sync_parent(
+                destination
+                    .parent()
+                    .expect("sparse destination has a parent"),
+            );
+            return match cleanup_result {
+                Ok(()) => Err(move_error.into()),
+                Err(cleanup_error) => anyhow::bail!(
+                    "failed to move existing sparse model ({move_error}) and clean staged model ({cleanup_error})"
+                ),
+            };
+        }
     }
     if let Err(publish_error) = std::fs::rename(temporary, destination) {
         let restore_result = if had_destination {
@@ -1118,16 +1319,49 @@ where
 fn sync_directory_files(root: &Path) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let path = entry?.path();
-        if path.is_file() {
-            std::fs::File::open(path)?.sync_all()?;
+        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+            anyhow::bail!("staged artifact {} is not a regular file", path.display());
         }
+        sync_regular_file(&path)?;
     }
-    std::fs::File::open(root)?.sync_all()?;
+    sync_parent_directory(root)?;
     Ok(())
 }
 
+fn sync_regular_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    #[cfg(not(windows))]
+    let file = std::fs::File::open(path)?;
+    file.sync_all()
+}
+
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        // Rust does not expose a portable flush operation for directory handles on Windows.
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn remove_file_or_directory(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
+    if std::fs::symlink_metadata(path)?.file_type().is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
@@ -1242,7 +1476,7 @@ fn write_registration_result_atomic(
     result: &SequenceRegistrationResult,
 ) -> anyhow::Result<()> {
     write_registration_result_atomic_with_sync(output, result, |parent| {
-        std::fs::File::open(parent)?.sync_all()
+        sync_parent_directory(parent)
     })
 }
 
@@ -2317,6 +2551,193 @@ mod task6_tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stable_image_reuse_rejects_symlink_source() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::create_dir_all(&destination_dir)?;
+        std::fs::write(source_dir.join("target.png"), b"current-frame")?;
+        let source = source_dir.join("frame.png");
+        symlink("target.png", &source)?;
+
+        let error = link_or_copy_stable_image(&source, &destination_dir).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(!destination_dir.join("frame.png").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn keyframe_stage_rejects_destination_collision_and_preserves_previous_snapshot(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first_source = temp.path().join("first");
+        let second_source = temp.path().join("second");
+        let destination = temp.path().join("keyframes");
+        std::fs::create_dir_all(&first_source)?;
+        std::fs::create_dir_all(&second_source)?;
+        std::fs::create_dir_all(&destination)?;
+        std::fs::write(first_source.join("frame.png"), b"same-frame")?;
+        std::fs::write(second_source.join("frame.png"), b"same-frame")?;
+        std::fs::write(destination.join("previous.marker"), b"previous-snapshot")?;
+        let frames = vec![
+            SequenceFrame {
+                id: 1,
+                image_path: first_source.join("frame.png"),
+                timestamp_us: Some(0),
+            },
+            SequenceFrame {
+                id: 2,
+                image_path: second_source.join("frame.png"),
+                timestamp_us: Some(1),
+            },
+        ];
+
+        let error = stage_stable_image_directory(&frames, &[0, 1], &destination).unwrap_err();
+
+        assert!(error.to_string().contains("collision"));
+        assert_eq!(
+            std::fs::read(destination.join("previous.marker"))?,
+            b"previous-snapshot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keyframe_stage_holds_unique_immutable_snapshot_until_guard_drop() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source_dir = temp.path().join("source");
+        let cache = temp.path().join("Cache");
+        let legacy_destination = cache.join("keyframes");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::create_dir_all(&cache)?;
+        let source = source_dir.join("frame.png");
+        std::fs::write(&source, b"original-frame")?;
+        let frames = vec![SequenceFrame {
+            id: 1,
+            image_path: source.clone(),
+            timestamp_us: Some(0),
+        }];
+
+        let staged = stage_stable_image_directory(&frames, &[0], &legacy_destination)?;
+        let staged_paths = std::fs::read_dir(&cache)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".keyframe-input-")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+
+        assert_eq!(staged_paths.len(), 1);
+        let staged_path = staged_paths[0].clone();
+        assert_eq!(
+            std::fs::read(staged_path.join("frame.png"))?,
+            b"original-frame"
+        );
+        std::fs::write(&source, b"mutated-source")?;
+        assert_eq!(
+            std::fs::read(staged_path.join("frame.png"))?,
+            b"original-frame"
+        );
+        drop(staged);
+        assert!(!staged_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn keyframe_stage_matches_destination_filesystem_name_equivalence() -> anyhow::Result<()> {
+        for (case_index, (first_name, second_name)) in [
+            ("Frame.png", "frame.png"),
+            ("\u{00e9}.png", "e\u{0301}.png"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = tempfile::tempdir()?;
+            let first_source = temp.path().join("first");
+            let second_source = temp.path().join("second");
+            let cache = temp.path().join("Cache");
+            let probe = cache.join(format!("probe-{case_index}"));
+            std::fs::create_dir_all(&first_source)?;
+            std::fs::create_dir_all(&second_source)?;
+            std::fs::create_dir_all(&probe)?;
+            std::fs::write(first_source.join(first_name), b"first-frame")?;
+            std::fs::write(second_source.join(second_name), b"second-frame")?;
+            std::fs::write(probe.join(first_name), b"probe")?;
+            let names_are_equivalent = probe.join(second_name).exists();
+            std::fs::remove_dir_all(&probe)?;
+            let frames = vec![
+                SequenceFrame {
+                    id: 1,
+                    image_path: first_source.join(first_name),
+                    timestamp_us: Some(0),
+                },
+                SequenceFrame {
+                    id: 2,
+                    image_path: second_source.join(second_name),
+                    timestamp_us: Some(1),
+                },
+            ];
+
+            let result = stage_stable_image_directory(&frames, &[0, 1], &cache.join("keyframes"));
+            if names_are_equivalent {
+                assert!(result.unwrap_err().to_string().contains("collision"));
+            } else {
+                let staged = result?;
+                let actual = std::fs::read_dir(staged.path())?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<BTreeSet<_>>>()?;
+                assert_eq!(
+                    actual,
+                    [first_name.into(), second_name.into()]
+                        .into_iter()
+                        .collect()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn keyframe_reconstruction_fails_fast_when_output_lock_is_held() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = temp.path().join("Cache");
+        std::fs::create_dir_all(&cache)?;
+        let lock_path = cache.join("keyframes.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)?;
+        lock.try_lock()?;
+        let image_path = temp.path().join("frame.png");
+        image::GrayImage::new(32, 32).save(&image_path)?;
+        let frames = vec![single_frame(image_path)];
+        let control = crate::task::SfmTaskControl::new();
+        let mut sink = |_| {};
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+
+        let error = run_keyframe_reconstruction(
+            &frames,
+            &[42],
+            &MapperConfig::default(),
+            temp.path(),
+            &mut task,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("already in progress"));
+        Ok(())
+    }
+
     #[test]
     fn database_import_rejects_stale_existing_image_metadata() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -2381,6 +2802,55 @@ mod task6_tests {
         );
         assert!(!backup.exists());
         assert!(!missing_staged.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_directory_replace_cleans_stage_when_first_rename_fails() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("0");
+        let staged = temp.path().join("0.tmp");
+        let occupied_backup = temp.path().join("0.backup");
+        std::fs::create_dir(&destination)?;
+        std::fs::write(destination.join("marker"), b"original-model")?;
+        std::fs::create_dir(&staged)?;
+        std::fs::write(staged.join("marker"), b"staged-model")?;
+        std::fs::create_dir(&occupied_backup)?;
+        std::fs::write(occupied_backup.join("marker"), b"occupied-backup")?;
+
+        let error = replace_sparse_directory(&destination, &staged, &occupied_backup).unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            std::fs::read(destination.join("marker"))?,
+            b"original-model"
+        );
+        assert!(!staged.exists());
+        assert_eq!(
+            std::fs::read(occupied_backup.join("marker"))?,
+            b"occupied-backup"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_publish_recovery_removes_dangling_backup_link() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("0");
+        let staged = temp.path().join("0.tmp");
+        let backup = temp.path().join("0.backup");
+        symlink("missing-snapshot", &backup)?;
+
+        recover_sparse_publish_paths(&destination, &staged, &backup)?;
+
+        assert!(matches!(
+            std::fs::symlink_metadata(&backup),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!destination.exists());
         Ok(())
     }
 
