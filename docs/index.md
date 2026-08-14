@@ -1,8 +1,8 @@
 # RustScan Documentation Index
 
-**Updated:** 2026-04-10
+**Updated:** 2026-08-14
 
-`docs/` 目录只列出当前仍作为执行依据、验证依据或状态依据的文档。已经被当前代码状态淘汰的 RustGS legacy/兼容层计划文档已移除；如需追溯，请直接查看 git 历史。
+此索引列出当前仍作为执行、验证或状态依据的文档。历史计划可能仍保留在 `docs/superpowers/` 供追溯，但不替代下列当前入口。
 
 ## Canonical Status Docs
 
@@ -10,6 +10,15 @@
 |---|---|
 | [current-project-status.md](current-project-status.md) | 当前仓库主线状态、已验证结果与下一步优先级 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前 workspace 结构与 RustGS 训练架构边界 |
+
+## Active RustSFM Docs
+
+| Document | Purpose |
+|---|---|
+| [../RustSFM/README.md](../RustSFM/README.md) | RustSFM build, test, optional parity-fixture, and CLI entry points |
+| [../RustSFM/PARITY_ROADMAP.md](../RustSFM/PARITY_ROADMAP.md) | COLMAP parity status and remaining numerical work |
+| [../RustSFM/COLMAP_COMPAT_TODO.md](../RustSFM/COLMAP_COMPAT_TODO.md) | COLMAP compatibility backlog |
+| [superpowers/plans/2026-08-14-rustsfm-review-hardening.md](superpowers/plans/2026-08-14-rustsfm-review-hardening.md) | Current RustSFM output, build, CI, and GPU error-handling hardening |
 
 ## Active RustGS Docs
 
@@ -23,5 +32,5 @@
 
 ## Retention Rule
 
-- 只保留和当前代码事实一致的文档。
-- 已被删除 API、旧 scene/map ownership、`training_pipeline.rs`、`legacy/` 兼容层相关计划不再保留在 active docs 集合里。
+- 当前文档必须明确命令前提、外部夹具和验证日期。
+- 历史设计记录不构成当前 API、测试或 workspace 状态的权威来源。

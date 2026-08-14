@@ -17,23 +17,28 @@ This README is intentionally brief. Current status lives in a small set of canon
 - `RustGS`: Gaussian splatting training and rendering.
 - `RustMesh`: mesh connectivity, IO, processing algorithms, OpenMesh comparison tooling.
 - `RustViewer`: visualization and inspection UI.
+- `RustFF`: feed-forward reconstruction experiments.
+- `RustSFM`: COLMAP-style incremental structure-from-motion.
 
-## Verified Snapshot
+## Current Verification
 
-As verified in the `rm-opt` worktree on 2026-04-05:
+RustSFM was verified in this workspace on 2026-08-14:
 
-- RustMesh library tests: `214 passed; 0 failed`
-- RustMesh decimation tests: `12 passed; 0 failed`
-- RustMesh remeshing tests: `7 passed; 0 failed`
-- RustMesh VDPM tests: `7 passed; 0 failed`
-- `openmesh_compare_decimation_trace` matches OpenMesh for the first 10 traced steps under the default `OpenMeshParity` import mode
-- RustSLAM library tests are not fully green in this worktree: `261 passed; 2 failed`
+- Default RustSFM library suite: `708 passed; 0 failed; 19 ignored external-fixture tests`
+- Minimal RustSFM library suite: `581 passed; 0 failed; 19 ignored external-fixture tests`
+- Minimal `sequence_registration` integration suite: `62 passed; 0 failed`
+
+The ignored `real_colmap_sparse_*` tests require the external
+`test_data/flowers2_colmap` fixture, which is not distributed through Git or
+submodules. See the RustSFM README for the explicit parity command.
 
 ## Documentation
 
 - Workspace overview: [`docs/index.md`](./docs/index.md)
 - Project summary: [`docs/project-overview.md`](./docs/project-overview.md)
 - RustMesh crate overview: [`RustMesh/README.md`](./RustMesh/README.md)
+- RustSFM crate overview: [`RustSFM/README.md`](./RustSFM/README.md)
+- RustSFM COLMAP parity roadmap: [`RustSFM/PARITY_ROADMAP.md`](./RustSFM/PARITY_ROADMAP.md)
 - RustMesh `rm-opt` status: [`docs/RustMesh-OpenMesh-Progress-2026-04-05.md`](./docs/RustMesh-OpenMesh-Progress-2026-04-05.md)
 - Forward roadmap: [`ROADMAP.md`](./ROADMAP.md)
 
@@ -48,6 +53,10 @@ cargo test --manifest-path RustMesh/Cargo.toml --lib
 
 # RustSLAM
 cargo test --manifest-path RustSLAM/Cargo.toml --lib
+
+# RustSFM
+cargo test -p rustsfm --lib
+cargo test -p rustsfm --lib --no-default-features
 ```
 
 ## Notes
