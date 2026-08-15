@@ -1,6 +1,6 @@
 # RustScan Current Project Status
 
-**Updated:** 2026-08-14
+**Updated:** 2026-08-15
 **Branch:** `main`
 
 ## Overall
@@ -20,7 +20,7 @@
 ## Current Progress
 
 - RustSFM 是 workspace 的主动维护 crate，提供 COLMAP-style 特征、匹配、两视图验证、增量 mapper、序列注册和文本导出。
-- 当前 RustSFM 硬化将 keyframe mapper 输入固定为私有快照，序列化共享输出，并将 GPU PnP-focal 管线失败返回给现有 CPU fallback。
+- RustSFM 硬化已合并：keyframe mapper 输入固定为私有快照，共享输出被序列化，GPU PnP-focal 管线失败会返回既有 CPU fallback，macOS GPU context 测试也已串行化。
 - RustViewer 维护导入媒体、运行 RustSFM、消费 COLMAP 产物并衔接 RustGS 训练的桌面工作流。
 - RustGS 的公开训练路径仍收口到 splat-first API；其细节和质量路线见架构文档及 RustGS 专项文档。
 
@@ -28,9 +28,11 @@
 
 - `flowers2_colmap` parity fixture 的来源、版本和 CI 获取方式尚未固化；默认测试不会再假设它存在。
 - RustSFM 的 COLMAP 数值 parity、RustGS 的 LiteGS parity/TUM PSNR，以及 RustViewer 的端到端真实媒体验证仍需要各自的专门验收。
+- RustSLAM 的 dependency-minimal library suite 在 2026-08-15 实测为 `244 passed; 1 failed`；失败项为 `tracker::vo::tests::test_initialize_keeps_relocalized_pose_in_global_frame`。
+- RustFF 的默认 library suite 在 2026-08-15 为 `2 passed; 0 failed`，但可选 `onnx-ort` feature 仍使用旧 ORT API，当前不能编译。
 
 ## Next Priorities
 
 1. 固化并可复现地提供 RustSFM `flowers2_colmap` parity fixture，作为独立 opt-in CI 验收。
-2. 提交并发布当前 RustSFM 硬化与 CI 覆盖。
+2. 维护 RustSFM default/minimal-feature 测试与 macOS GPU context 串行化的 CI 覆盖。
 3. 继续 RustGS parity/TUM 质量闭环，并在完成后更新其专项状态。

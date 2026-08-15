@@ -1,96 +1,55 @@
 # RustViewer
 
-Interactive 3D visualization GUI for RustScan SLAM results.
+RustViewer is the desktop reconstruction workbench and 3D result viewer for
+RustScan. It manages image-sequence projects, orchestrates RustSFM and RustGS,
+and displays sparse points, trained splats, meshes, and camera/navigation state.
 
-## Overview
+## Current Workflow
 
-RustViewer is a desktop application for visualizing SLAM reconstruction results, including:
+1. **Import Images** creates a managed `.rustscanproject` from image files.
+2. **Run Reconstruction** executes keyframe RustSFM followed by full-frame pose
+   registration through the persistent project pipeline.
+3. A successful pose stage publishes a validated COLMAP sparse model and
+   normalized image artifacts.
+4. RustViewer loads the committed COLMAP output, starts RustGS training, and
+   displays snapshots in the wgpu viewport.
 
-- **Camera trajectory** — Polylines showing camera motion path
-- **Sparse point cloud** — Map points from SLAM reconstruction
-- **Gaussian point cloud** — 3DGS scene from training
-- **Mesh** — Extracted mesh with solid/wireframe rendering
+Image sequences are the supported reconstruction input in the current UI.
+Video ingestion/project support exists in the media layer, but video pose solve
+remains explicitly unavailable in the workbench until it has complete pose and
+artifact-validation coverage.
 
-## Reconstruction Workflow
+The viewer can also open existing `.rustscanproject` packages and offline
+COLMAP, checkpoint, Gaussian (`.ply`/`.splat`), and mesh (`.obj`/`.ply`) assets.
 
-1. Select **Import Images** and choose a folder with at least two JPEG or PNG images.
-2. Select **Run Reconstruction**. Each RustSFM result is written below the input folder at `<input>/.rustviewer/rustsfm/<run-id>/`; older runs are never overwritten.
-3. RustSFM uses automatic single-camera intrinsics. After it produces a valid COLMAP sparse model, RustViewer loads it, starts RustGS 3DGS training automatically, and displays training snapshots.
+## Module Boundaries
 
-Runtime boundaries:
+- `app.rs`: application state, dialogs, project activation, and action routing.
+- `project/`: manifest, artifact, project-store, library, and session state.
+- `pipeline/`: persistent stage coordinator and RustSFM worker boundaries.
+- `media/`: image and video ingestion plus keyframe selection.
+- `loader/`: COLMAP, checkpoint, Gaussian, and mesh loading.
+- `training/`: RustGS session, preview, and shared GPU viewport integration.
+- `renderer/`: scene, camera, and wgpu render pipelines.
+- `ui/`: workbench, panels, viewport, and theme.
 
-- On macOS, wgpu uses Metal rather than native Vulkan.
-- This release cannot cancel a running RustSFM reconstruction.
-- Existing RustGS training cancellation remains available.
+## Run And Verify
 
-## Features
-
-- **Offline file loading** — Load `pipeline.json`, `scene.ply`, `mesh.obj/ply`
-- **3D navigation** — Arcball camera with mouse orbit/pan/zoom
-- **Layer visibility** — Toggle trajectory, points, Gaussians, mesh
-- **Apple HIG design** — Clean, native-feeling UI
-
-## Reconstruction Workflow
-
-RustViewer can create a managed `.rustscanproject` from an image sequence. The workbench then
-runs RustSFM keyframe reconstruction and full-frame registration through the persistent project
-pipeline. It writes the verified COLMAP sparse model and normalized images into the committed
-FullFramePnP artifact. RustGS training is enabled only after every imported image has a pose; its
-latest Gaussian snapshot is rendered in the RustViewer wgpu viewport.
-
-The desktop workbench currently accepts image sequences only. Video import and video PnP are
-intentionally disabled in the UI until the dedicated video reconstruction path has the same
-complete-pose and artifact-validation guarantees.
-
-## Architecture
-
-```
-RustViewer/
-├── Cargo.toml              # Crate config with eframe/egui deps
-├── src/
-│   ├── main.rs             # Binary entry point
-│   ├── lib.rs              # Library root, module declarations
-│   ├── app.rs              # Main eframe app struct
-│   ├── reconstruction.rs   # RustSFM runner and output validation
-│   ├── loader/             # File loading utilities
-│   │   ├── mod.rs          # Loader trait and exports
-│   │   ├── checkpoint.rs   # Checkpoint JSON loader
-│   │   ├── gaussian.rs     # Gaussian PLY loader
-│   │   └── mesh.rs         # OBJ/PLY mesh loader
-│   ├── renderer/           # 3D rendering
-│   │   ├── mod.rs          # Renderer trait and scene graph
-│   │   ├── camera.rs       # Arcball camera controller
-│   │   ├── scene.rs        # Scene graph and data buffers
-│   │   └── pipelines.rs    # wgpu render pipelines
-│   └── ui/                 # User interface
-│       ├── mod.rs          # UI panel exports
-│       ├── panel.rs        # Side panel with controls
-│       ├── viewport.rs     # 3D viewport widget
-│       └── theme.rs        # egui theme/styling
-└── tests/                  # Integration tests
-```
-
-## Usage
+From the workspace root:
 
 ```bash
-# Run the viewer
 cargo run -p rust-viewer
-
-# Build release
 cargo build -p rust-viewer --release
+cargo test -p rust-viewer --all-targets
 ```
 
-## Dependencies
+On macOS, the wgpu stack uses the Metal adapter selected by eframe/wgpu. The
+RustGS and RustSFM crate documentation owns their backend and fixture
+prerequisites.
 
-- **eframe/egui** — Immediate mode GUI framework
-- **wgpu** — Cross-platform GPU rendering (via eframe)
-- **glam** — SIMD-accelerated math library
-- **rustslam** — SLAM library with `viewer-types` feature
-- **rustsfm** — Image pose solving and COLMAP sparse-model export
-- **rustgs** — 3D Gaussian Splatting training
+## Related Docs
 
-## Notes
-
-- RustViewer uses `viewer-types` feature from RustSLAM to avoid heavy dependencies (ffmpeg, candle)
-- GPU rendering is handled through eframe's wgpu integration
-- The crate compiles without the `--features default` flag and still functions correctly
+- [Workspace documentation index](../docs/index.md)
+- [Current project status](../docs/current-project-status.md)
+- [RustSFM overview](../RustSFM/README.md)
+- [RustGS overview](../RustGS/README.md)

@@ -1,167 +1,75 @@
 # RustSLAM
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Rust-1.75+-dea584?style=for-the-badge&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge" alt="License">
-</p>
+RustSLAM is the workspace's pure-Rust visual SLAM crate. It contains feature
+extraction and matching, visual odometry, mapping, loop-closing primitives,
+bundle-adjustment support, video input, and optional fusion/mesh utilities.
 
-A pure Rust implementation of Visual SLAM (Simultaneous Localization and Mapping) supporting monocular, stereo, and RGB-D cameras.
+RustSFM is the preferred COLMAP-style sparse reconstruction path for the
+current RustViewer workflow. RustSLAM remains available for SLAM-specific
+experiments and pipeline integration.
 
-## 📋 Features
+## Modules
 
-### Core SLAM
-- ✅ **Visual Odometry** - Monocular/Stereo/RGB-D
-- ✅ **Bundle Adjustment** - Gauss-Newton optimization
-- ✅ **Loop Closing** - BoW-based detection
-- ✅ **Relocalization** - Recover from tracking loss
+- `core`: frames, keyframes, map points, maps, cameras, and poses.
+- `features`: ORB, Harris/FAST, descriptors, and feature matching.
+- `tracker`: visual odometry and pose/triangulation solvers.
+- `mapping` and `optimizer`: local mapping and bundle-adjustment support.
+- `loop_closing`: vocabulary, loop detection, and relocalization components.
+- `fusion`: Gaussian, TSDF, marching-cubes, and mesh export utilities.
+- `pipeline` and `cli`: checkpoints, realtime orchestration, and the optional
+  command-line pipeline.
 
-### Features
-- ✅ **ORB Feature Extraction**
-- ✅ **Harris/FAST Corner Detection**
-- ✅ **Feature Matching** - BFMatcher, KNN, Lowe Ratio Test
+The source tree and feature gates are the authority for implementation status;
+this README intentionally avoids dated completion percentages and test counts.
 
-### Map Representations (Switchable)
-- 🏗️ **Sparse Map** - Traditional feature point SLAM (done)
-- 🔮 **Dense Map** - 3D Gaussian Splatting (Phase 1 ✅)
+## Features
 
-## 📁 Project Structure
+- `default = ["slam-pipeline"]`: enables the video/CLI pipeline dependencies.
+- `slam-pipeline`: enables the CLI, video decoding, frame cache, and system
+  information support.
+- `viewer-types`: enables the lightweight types consumed by RustViewer.
+- `opencv`: enables the optional OpenCV integration.
+- `deep-learning`: enables the optional `tch` integration.
+- `image`: enables the optional image-loading dependency.
 
-```
-RustSLAM/
-├── src/
-│   ├── core/              # Core data structures
-│   │   ├── frame.rs       # Frame
-│   │   ├── keyframe.rs    # KeyFrame
-│   │   ├── map_point.rs   # MapPoint
-│   │   ├── map.rs         # Map
-│   │   ├── camera.rs      # Camera model
-│   │   └── pose.rs        # SE3 Pose
-│   │
-│   ├── features/          # Feature extraction
-│   │   ├── orb.rs         # ORB extractor
-│   │   ├── pure_rust.rs   # Harris/FAST
-│   │   ├── matcher.rs     # Feature matching
-│   │   └── knn_matcher.rs # KNN matching
-│   │
-│   ├── tracker/           # Visual Odometry
-│   │   ├── vo.rs          # Main VO pipeline
-│   │   └── solver.rs      # PnP, Essential Matrix, Triangulation
-│   │
-│   ├── mapping/           # Local Mapping
-│   │   └── local_mapping.rs
-│   │
-│   ├── optimizer/         # Bundle Adjustment
-│   │   └── ba.rs
-│   │
-│   ├── loop_closing/      # Loop Detection
-│   │   ├── vocabulary.rs  # BoW Vocabulary
-│   │   ├── database.rs    # KeyFrame Database
-│   │   ├── detector.rs    # Loop Detector
-│   │   └── relocalization.rs
-│   │
-│   ├── fusion/            # Dense Fusion (Coming Soon)
-│   │   └── gaussian.rs    # 3D Gaussian
-│   │
-│   └── viewer/            # Visualization
-│       └── mod.rs
-│
-├── examples/              # Examples
-│   └── run_vo.rs
-│
-├── Cargo.toml
-└── DESIGN.md             # Design document
-```
+## Build And Test
 
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Rust 1.75+
-- (Optional) OpenCV 4.x for enhanced features
-
-### Build
+From the workspace root:
 
 ```bash
-cd RustSLAM
-cargo build --release
+cargo build -p rustslam
+cargo test -p rustslam --lib
 ```
 
-### Run Visual Odometry
+For the library without the default video/CLI dependencies:
 
 ```bash
-cargo run --example run_vo
+cargo check -p rustslam --no-default-features --lib
+cargo test -p rustslam --no-default-features --lib
 ```
 
-### Tests
+On 2026-08-15, the dependency-minimal library suite completed with 244 passing
+tests and one known failure:
+`tracker::vo::tests::test_initialize_keeps_relocalized_pose_in_global_frame`.
+Treat the command above as a regression check until that failure is resolved.
+
+The source example `src/examples/run_vo.rs` is an internal example module,
+not a Cargo `--example` target. Supported Cargo examples include:
 
 ```bash
-cargo test
+cargo run -p rustslam --example load_tum_dataset --features image -- /path/to/tum/dataset
+cargo run -p rustslam --example e2e_slam_to_mesh --features image
 ```
 
-## 📊 Test Results
+## Design And Current Status
 
-```
-test result: ok. 77 passed, 0 failed
-```
+- [Design notes](DESIGN.md)
+- [Workspace documentation index](../docs/index.md)
+- [Current project status](../docs/current-project-status.md)
 
-## 🗺️ Roadmap
+The current cross-crate status, external fixtures, and verification dates live
+in the workspace documents above rather than in this crate overview.
 
-### Phase 1: Core SLAM ✅
-- [x] SE3 Pose
-- [x] ORB Feature Extraction
-- [x] Feature Matching
-- [x] Visual Odometry
-- [x] Bundle Adjustment
-- [x] Loop Closing
-- [x] Relocalization
+## License
 
-### Phase 2: Dense Reconstruction ✅ COMPLETE
-- [x] 3D Gaussian data structures
-- [x] Gaussian Renderer (color + depth)
-- [x] **Tiled Rasterization**
-- [x] **Depth Sorting**
-- [x] **Alpha Blending**
-- [x] Gaussian Tracking (ICP)
-- [x] Incremental Gaussian Mapping
-- [x] **Densification** (Gaussian splitting)
-- [x] **Pruning** (Opacity-based)
-- [x] Differentiable Renderer (Candle + Metal MPS)
-- [x] Training Pipeline (Trainer + Adam optimizer)
-- [x] TRUE Backward Propagation (Var + backward() + gradients.get())
-- [x] **SLAM Integration** (Sparse + Dense fusion)
-
-### Phase 3: Advanced Features
-- [ ] IMU Integration
-- [ ] Multi-map SLAM
-- [ ] Semantic Mapping
-
-## 🔬 Comparison with pySLAM
-
-| Feature | pySLAM | RustSLAM |
-|---------|--------|-----------|
-| Visual Odometry | ✅ | ✅ |
-| Bundle Adjustment | ✅ | ✅ |
-| BoW Vocabulary | ✅ | ✅ |
-| KeyFrame Database | ✅ | ✅ |
-| Loop Closing | ✅ | ✅ |
-| Relocalization | ✅ | ✅ |
-| 3D Gaussian | ✅ | 🔄 Coming |
-| Volumetric | ✅ | ❌ |
-| Depth Prediction | ✅ | ❌ |
-
-## 📖 References
-
-- [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3)
-- [pySLAM](https://github.com/luigifreda/pyslam)
-- [RTG-SLAM](https://github.com/MisEty/RTG-SLAM) - Real-time 3DGS
-- [SplaTAM](https://github.com/spla-tam/SplaTAM) - CVPR 2024
-
-## 📄 License
-
-MIT License - see LICENSE file for details.
-
----
-
-<p align="center">
-Built with ❤️ in Rust
-</p>
+MIT License - see the repository license file.

@@ -1,42 +1,49 @@
 # RustScan Roadmap
 
-**Updated:** 2026-04-05
+**Updated:** 2026-08-15
 
-This roadmap is intentionally high level. Current branch facts live in `README.md` and `docs/RustMesh-OpenMesh-Progress-2026-04-05.md`; this file only tracks forward work.
+This roadmap is intentionally high level. Verified branch facts live in
+[`docs/current-project-status.md`](./docs/current-project-status.md) and the
+crate-specific READMEs; this file only tracks forward work.
 
 ## Current State
 
-- The workspace is functional enough to build and iterate on RustMesh, RustSLAM, RustGS, and RustViewer in one repository.
-- RustMesh is the most actively validated crate in the current `rm-opt` worktree.
-- RustSLAM remains active development and is not fully green in the current worktree.
+- RustSFM, RustViewer, and RustGS are the current reconstruction workflow focus.
+- RustMesh and RustSLAM remain independently buildable workspace crates.
+- The current verified RustSFM test snapshot and known gaps are recorded in
+  `docs/current-project-status.md`.
 
 ## Near-Term Priorities
 
-### 1. RustMesh OpenMesh Follow-Through
+### 1. RustSFM COLMAP parity
 
-- Keep decimation parity stable with stronger automated regression coverage.
-- Replace remeshing shortcuts with more robust topology operations where needed.
-- Add the missing normalized progressive-mesh LOD API.
-- Expand parity coverage beyond the current decimation trace baseline where it is worth the maintenance cost.
+- Provision and version the external `flowers2_colmap` fixture.
+- Close the remaining numerical and bundle-adjustment parity gaps against COLMAP.
+- Keep default and dependency-minimal test paths reproducible in CI.
 
-### 2. RustSLAM Quality and Reliability
+### 2. RustViewer end-to-end workflow
 
-- Fix the current failing library tests in bundle adjustment and relocalization paths.
-- Continue tightening video-input and real-data pipeline behavior.
-- Improve correctness before adding more user-facing claims about readiness.
+- Validate reconstruction, sparse export, RustGS handoff, and artifact loading on
+  real image sequences.
+- Keep unsupported video paths explicitly gated until they have the same artifact
+  validation guarantees.
 
-### 3. Documentation Discipline
+### 3. RustGS quality loop
+
+- Continue LiteGS parity and TUM PSNR validation with dated, reproducible reports.
+- Keep the splat-first public API and `HostSplats`/device ownership boundaries stable.
+
+### 4. Documentation discipline
 
 - Keep only one maintained status source per topic.
-- Use redirect documents for backwards compatibility instead of duplicating state.
-- Avoid percent-complete tables unless they are backed by a reproducible checklist.
+- Keep dated plans as historical records only when they still provide audit value.
+- Avoid claims that cannot be reproduced from a documented command and fixture.
 
-## RustMesh-Specific Backlog
+## RustMesh and RustSLAM
 
-For the detailed RustMesh backlog, use:
-
-- [`docs/RustMesh-OpenMesh-Parity-Roadmap.md`](./docs/RustMesh-OpenMesh-Parity-Roadmap.md)
-- [`docs/RustMesh-OpenMesh-Progress-2026-04-05.md`](./docs/RustMesh-OpenMesh-Progress-2026-04-05.md)
+Use each crate README for current capabilities and commands. Do not infer current
+status from the historical `rm-opt` worktree notes that were removed from the
+maintained documentation set.
 
 ## Workspace Direction
 

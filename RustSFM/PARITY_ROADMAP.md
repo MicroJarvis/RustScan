@@ -1,13 +1,19 @@
 # RustSFM COLMAP Parity Roadmap (non-GUI)
 
+**Updated:** 2026-08-15 (fixture availability and verification policy; dated
+numerical measurements below retain their original observation dates)
+
 Target: 100% COLMAP behavior parity excluding Qt GUI and Python bindings.
 GPU: **wgpu** only (no CUDA/SiftGPU).
 
-## Phase 0 — Parity harness (done)
+## Phase 0 — Parity harness (in progress)
 
 - [x] Stage-based `compare` (`features`, `matches`, `twoview`, `registration`, `tracks`, `ba`)
-- [x] flowers2 + flowers2_colmap fixtures
-- [x] CI build matrix: default / `poselib` / `--no-default-features`
+- [x] Tests and adapters for the external `flowers2_colmap` sparse fixture
+- [x] CI execution for default and `--no-default-features` RustSFM suites
+- [ ] Versioned source and opt-in CI provisioning for `test_data/flowers2_colmap`;
+      the fixture is not distributed by Git or submodules and its tests are
+      ignored by default
 
 ## Phase 1 — Sparse SfM core → 100% (in progress)
 

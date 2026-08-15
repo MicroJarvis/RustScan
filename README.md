@@ -35,11 +35,15 @@ submodules. See the RustSFM README for the explicit parity command.
 ## Documentation
 
 - Workspace overview: [`docs/index.md`](./docs/index.md)
-- Project summary: [`docs/project-overview.md`](./docs/project-overview.md)
+- Current project status: [`docs/current-project-status.md`](./docs/current-project-status.md)
+- Workspace architecture: [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)
 - RustMesh crate overview: [`RustMesh/README.md`](./RustMesh/README.md)
+- RustSLAM crate overview: [`RustSLAM/README.md`](./RustSLAM/README.md)
 - RustSFM crate overview: [`RustSFM/README.md`](./RustSFM/README.md)
 - RustSFM COLMAP parity roadmap: [`RustSFM/PARITY_ROADMAP.md`](./RustSFM/PARITY_ROADMAP.md)
-- RustMesh `rm-opt` status: [`docs/RustMesh-OpenMesh-Progress-2026-04-05.md`](./docs/RustMesh-OpenMesh-Progress-2026-04-05.md)
+- RustGS crate overview: [`RustGS/README.md`](./RustGS/README.md)
+- RustViewer crate overview: [`RustViewer/README.md`](./RustViewer/README.md)
+- RustFF experiment overview: [`RustFF/README.md`](./RustFF/README.md)
 - Forward roadmap: [`ROADMAP.md`](./ROADMAP.md)
 
 ## Getting Started
@@ -61,5 +65,6 @@ cargo test -p rustsfm --lib --no-default-features
 
 ## Notes
 
-- The compatibility entry points under `docs/README.md`, `docs/RustMesh-README.md`, and `docs/ROADMAP.md` are intentionally thin wrappers around the canonical docs above.
-- For branch-specific OpenMesh parity work, use the progress and roadmap docs instead of older planning artifacts.
+- The documents above are the maintained entry points. Dated plans and review records
+  under `docs/plans/`, `docs/reviews/`, and `docs/superpowers/` are historical context,
+  not current API or status contracts.
