@@ -1,10 +1,10 @@
 # RustScan Architecture
 
-**Updated:** 2026-04-10
+**Updated:** 2026-08-14
 
 ## Overview
 
-RustScan 是一个多 crate 的 3D 重建工作区，但当前主线已经明确收敛到 RustGS 的纯 3DGS 训练架构。RustGS 不再把 SLAM 输出、scene/map ownership、或 legacy compatibility API 当作核心设计前提。
+RustScan 是一个多 crate 的 3D 重建工作区。RustSFM、RustViewer 和 RustGS 是当前活跃的重建工作流；RustGS 的纯 3DGS 训练架构仍不把 SLAM 输出、scene/map ownership 或 legacy compatibility API 当作核心设计前提。
 
 ## Workspace Crates
 
@@ -14,13 +14,14 @@ RustScan 是一个多 crate 的 3D 重建工作区，但当前主线已经明确
 - `RustMesh`: 网格处理与 OpenMesh 对齐算法。
 - `RustViewer`: 结果检查与可视化。
 - `RustFF`: 前馈式推理实验工具。
+- `RustSFM`: COLMAP-style 特征、匹配、两视图验证、增量 SfM 与序列注册。
 
 ## Cross-Crate Flow
 
-1. 外部数据源或 `RustSLAM` 提供图像、位姿和可选稀疏点。
-2. `RustGS` 将 COLMAP sparse reconstruction 解析为 `TrainingDataset`。
-3. `RustGS` 初始化并训练 splats，导出 splat PLY、checkpoint 与评估摘要。
-4. `RustViewer` 或其他工具消费导出的 splat/checkpoint 产物。
+1. 外部图像、视频或 `RustSLAM` 提供图像、位姿和可选稀疏点。
+2. `RustSFM` 可从图像生成 COLMAP-compatible sparse reconstruction；`RustViewer` 负责其项目级编排。
+3. `RustGS` 将 COLMAP sparse reconstruction 解析为 `TrainingDataset`，训练 splats 并导出 PLY、checkpoint 与评估摘要。
+4. `RustViewer` 或其他工具消费重建与训练产物。
 5. `RustMesh` 只在需要网格后处理时介入，不参与 RustGS 核心训练状态设计。
 
 ## Current RustGS Training Architecture
@@ -127,6 +128,8 @@ Metal runtime 也已经从单体模块拆解为：
 ## Canonical Companion Docs
 
 - [current-project-status.md](current-project-status.md)
+- [../RustSFM/README.md](../RustSFM/README.md)
+- [../RustSFM/PARITY_ROADMAP.md](../RustSFM/PARITY_ROADMAP.md)
 - [plans/2026-04-06-rustgs-refactor-guardrails.md](plans/2026-04-06-rustgs-refactor-guardrails.md)
 - [../RustGS/docs/plans/2026-04-09-rustgs-soa-splat-architecture-proposal.md](../RustGS/docs/plans/2026-04-09-rustgs-soa-splat-architecture-proposal.md)
 - [plans/2026-04-05-litegs-parity-roadmap-refresh.md](plans/2026-04-05-litegs-parity-roadmap-refresh.md)

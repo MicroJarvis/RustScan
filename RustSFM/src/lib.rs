@@ -1,6 +1,24 @@
 pub mod ba;
+pub mod sequence_registration;
+pub mod task;
 
 pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
+pub use sequence_registration::{
+    register_remaining_sequence_frames, require_complete_pose_coverage,
+    run_adaptive_keyframe_selection, run_keyframe_reconstruction, run_sequence_registration,
+    select_adaptive_keyframes_from_metrics, AdaptiveKeyframePairDiagnostic,
+    AdaptiveKeyframePairMetrics, AdaptiveKeyframeSelectionConfig,
+    AdaptiveKeyframeSelectionDecision, AdaptiveKeyframeSelectionError,
+    AdaptiveKeyframeSelectionResult, FrameRegistrationDiagnostic, FrameRegistrationStatus,
+    KeyframeReconstructionResult, RegistrationRound, SequenceFrame, SequenceRegistrationConfig,
+    SequenceRegistrationError, SequenceRegistrationPlan, SequenceRegistrationResult,
+    MAX_DYNAMIC_SUPPORT_CANDIDATES, MAX_SEQUENCE_NEIGHBORS, MAX_SEQUENCE_PLAN_FRAMES,
+    MAX_TIMESTAMP_PLATEAU, MAX_TOTAL_SUPPORT_ENTRIES,
+};
+pub use task::{
+    SfmControlState, SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskEventKind,
+    SfmTaskEventSink, SfmTaskIssue, SfmTaskOperation, SfmTaskStage, SfmTaskStop,
+};
 
 // I/O, COLMAP compatibility, and persistent graph/cache formats.
 #[path = "io/colmap.rs"]
@@ -91,10 +109,14 @@ pub mod visibility_pyramid;
 // Diagnostics and validation harnesses.
 #[path = "diagnostics/compare.rs"]
 pub mod compare;
+#[path = "diagnostics/match_pair_benchmark.rs"]
+pub mod match_pair_benchmark;
 #[path = "diagnostics/parity.rs"]
 pub mod parity;
 
 pub mod gpu;
+
+pub use gpu::{WgpuGeometryTiming, WgpuModelScorerTiming, WgpuRansacStageTiming};
 
 pub use compare::{
     compare_colmap, compare_colmap_stages, parse_compare_stages, CompareReport, CompareStage,
@@ -102,13 +124,15 @@ pub use compare::{
 };
 pub use feature_extraction::{
     compare_extracted_sift_features, extract_features_to_database,
-    extract_features_to_database_with_extractor, ExtractFeaturesReport, SiftFeatureExtractor,
+    extract_features_to_database_with_extractor,
+    extract_features_to_database_with_extractor_and_task, extract_features_to_database_with_task,
+    ExtractFeaturesReport, SiftFeatureExtractor,
 };
 pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use feature_matching_db::{
-    debug_two_view_database_pair, match_features_to_database, DebugTwoViewOptions,
-    DebugTwoViewReport, MatchFeaturesOptions, MatchFeaturesReport, MatchFeaturesVerifierEvent,
-    MatchFeaturesVerifierTrace,
+    debug_two_view_database_pair, match_features_to_database, match_features_to_database_with_task,
+    DebugTwoViewOptions, DebugTwoViewReport, MatchFeaturesOptions, MatchFeaturesReport,
+    MatchFeaturesTimingReport, MatchFeaturesVerifierEvent, MatchFeaturesVerifierTrace,
 };
 pub use global_mapper::{
     pairwise_matches_from_pairs, run_global_mapper, run_global_reconstruction,
@@ -126,10 +150,14 @@ pub use joint_global_positioning::{
 };
 pub use mapper::{
     reference_camera_setup, run_incremental_pipeline, run_reconstruction,
-    run_reconstruction_with_callbacks, FeatureType, ImageSelectionMethod,
-    IncrementalPipelineCallback, IncrementalPipelineResult, IncrementalPipelineStatus,
-    MapperConfig, PipelineCallbackEvent, PipelineCallbackSink, ReconstructionSeed,
-    ReconstructionSummary, ReferenceCameraSetup,
+    run_reconstruction_with_callbacks, run_reconstruction_with_task, FeatureType,
+    ImageSelectionMethod, IncrementalPipelineCallback, IncrementalPipelineResult,
+    IncrementalPipelineStatus, MapperConfig, PipelineCallbackEvent, PipelineCallbackSink,
+    ReconstructionSeed, ReconstructionSummary, ReferenceCameraSetup,
+};
+pub use match_pair_benchmark::{
+    benchmark_match_pairs, benchmark_match_pairs_with_artifacts, MatchPairBenchmarkReport,
+    MatchPairBenchmarkRun,
 };
 pub use parity::{compare_database_parity, ParityReport};
 pub use retrieval::{

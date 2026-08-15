@@ -601,6 +601,20 @@ impl Default for DatabaseCache {
 }
 
 impl ColmapDatabase {
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<u64> {
+        let destination = destination.as_ref();
+        let mut target = Connection::open(destination)
+            .with_context(|| format!("open SQLite backup destination {}", destination.display()))?;
+        let backup = rusqlite::backup::Backup::new(&self.conn, &mut target)
+            .context("initialize SQLite online backup")?;
+        backup
+            .run_to_completion(256, std::time::Duration::from_millis(1), None)
+            .context("copy SQLite online backup")?;
+        drop(backup);
+        drop(target);
+        Ok(std::fs::metadata(destination)?.len())
+    }
+
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("open COLMAP database read-only")?;
@@ -1069,6 +1083,108 @@ impl ColmapDatabase {
         let pair_id = image_pair_to_pair_id(image_id1, image_id2)
             .map_err(|err| anyhow::anyhow!("{err:?}"))?;
         self.exists_row_id("two_view_geometries", "pair_id", pair_id as i64)
+    }
+
+    pub fn selected_pair_output_fingerprint(
+        &self,
+        image_pairs: &[(ImageId, ImageId)],
+    ) -> Result<String> {
+        fn hash_nullable_blob(hasher: &mut blake3::Hasher, blob: Option<&[u8]>) {
+            match blob {
+                None => {
+                    hasher.update(&[0]);
+                }
+                Some(bytes) => {
+                    hasher.update(&[1]);
+                    hasher.update(&(bytes.len() as u64).to_le_bytes());
+                    hasher.update(bytes);
+                }
+            }
+        }
+
+        let mut pair_ids = image_pairs
+            .iter()
+            .map(|&(image_id1, image_id2)| {
+                image_pair_to_pair_id(image_id1, image_id2)
+                    .map_err(|err| anyhow::anyhow!("{err:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        pair_ids.sort_unstable();
+        if let Some(duplicate) = pair_ids.windows(2).find(|pair| pair[0] == pair[1]) {
+            bail!("duplicate canonical image pair id {}", duplicate[0]);
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"rustsfm-selected-pair-output-v1\0");
+        hasher.update(&(pair_ids.len() as u64).to_le_bytes());
+
+        for pair_id in pair_ids {
+            hasher.update(&(pair_id as u64).to_le_bytes());
+
+            let matches_row = self
+                .conn
+                .query_row(
+                    "SELECT rows, cols, data FROM matches WHERE pair_id=?1",
+                    params![pair_id as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match matches_row {
+                None => {
+                    hasher.update(&[0]);
+                }
+                Some((rows, cols, data)) => {
+                    hasher.update(&[1]);
+                    hasher.update(&rows.to_le_bytes());
+                    hasher.update(&cols.to_le_bytes());
+                    hash_nullable_blob(&mut hasher, data.as_deref());
+                }
+            }
+
+            let two_view_geometry_row = self
+                .conn
+                .query_row(
+                    "SELECT rows, cols, data, config, F, E, H, qvec, tvec FROM two_view_geometries WHERE pair_id=?1",
+                    params![pair_id as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
+                            row.get::<_, Option<Vec<u8>>>(5)?,
+                            row.get::<_, Option<Vec<u8>>>(6)?,
+                            row.get::<_, Option<Vec<u8>>>(7)?,
+                            row.get::<_, Option<Vec<u8>>>(8)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            match two_view_geometry_row {
+                None => {
+                    hasher.update(&[0]);
+                }
+                Some((rows, cols, data, config, f, e, h, qvec, tvec)) => {
+                    hasher.update(&[1]);
+                    hasher.update(&rows.to_le_bytes());
+                    hasher.update(&cols.to_le_bytes());
+                    hash_nullable_blob(&mut hasher, data.as_deref());
+                    hasher.update(&config.to_le_bytes());
+                    for blob in [f, e, h, qvec, tvec] {
+                        hash_nullable_blob(&mut hasher, blob.as_deref());
+                    }
+                }
+            }
+        }
+
+        Ok(hasher.finalize().to_hex().to_string())
     }
 
     fn exists_row_id(&self, table_name: &str, column_name: &str, value: i64) -> Result<bool> {
@@ -3409,6 +3525,38 @@ mod tests {
     }
 
     #[test]
+    fn database_backup_captures_committed_wal_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let backup = dir.path().join("backup.db");
+        drop(ColmapDatabase::open(&source).unwrap());
+
+        let writer = Connection::open(&source).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE benchmark_marker(value INTEGER NOT NULL);
+                 INSERT INTO benchmark_marker(value) VALUES(42);",
+            )
+            .unwrap();
+
+        let database = ColmapDatabase::open_read_only(&source).unwrap();
+        let copied_bytes = database.backup_to(&backup).unwrap();
+        assert!(copied_bytes > 0);
+        let copied =
+            Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            copied
+                .query_row("SELECT value FROM benchmark_marker", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            42
+        );
+        drop(writer);
+    }
+
+    #[test]
     fn negative_keypoint_rows_are_rejected_before_usize_conversion() {
         let dir = tempdir().unwrap();
         let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
@@ -4647,6 +4795,155 @@ mod tests {
         assert_eq!(
             db.read_num_matches().unwrap(),
             vec![(image_pair_to_pair_id(9, 2).unwrap(), 2)]
+        );
+    }
+
+    #[test]
+    fn selected_pair_output_fingerprint_is_order_independent_and_bit_exact() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        let pair1 = image_pair_to_pair_id(9, 2).unwrap();
+        let pair2 = image_pair_to_pair_id(7, 3).unwrap();
+
+        db.conn
+            .execute(
+                "INSERT INTO matches(pair_id, rows, cols, data) VALUES(?1, 2, 2, X'01020304');",
+                params![pair1 as i64],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO two_view_geometries(
+                     pair_id, rows, cols, data, config, F, E, H, qvec, tvec
+                 ) VALUES(
+                     ?1, 1, 2, X'1112', 3, X'21', X'22', X'23', X'24', X'25'
+                 );",
+                params![pair1 as i64],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO matches(pair_id, rows, cols, data) VALUES(?1, 3, 2, X'31323334');",
+                params![pair2 as i64],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO two_view_geometries(
+                     pair_id, rows, cols, data, config, F, E, H, qvec, tvec
+                 ) VALUES(
+                     ?1, 4, 2, X'4142', 8, X'51', X'52', X'53', X'54', X'55'
+                 );",
+                params![pair2 as i64],
+            )
+            .unwrap();
+
+        let selected_pairs = [(9, 2), (7, 3)];
+        let baseline = db
+            .selected_pair_output_fingerprint(&selected_pairs)
+            .unwrap();
+        assert_eq!(baseline.len(), 64);
+        assert!(baseline
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_eq!(
+            db.selected_pair_output_fingerprint(&[(3, 7), (2, 9)])
+                .unwrap(),
+            baseline
+        );
+        assert!(db
+            .selected_pair_output_fingerprint(&[(9, 2), (2, 9)])
+            .is_err());
+
+        let assert_update_changes = |update: &str, restore: &str| {
+            db.conn.execute(update, params![pair1 as i64]).unwrap();
+            assert_ne!(
+                db.selected_pair_output_fingerprint(&selected_pairs)
+                    .unwrap(),
+                baseline,
+                "fingerprint did not change after {update}"
+            );
+            db.conn.execute(restore, params![pair1 as i64]).unwrap();
+            assert_eq!(
+                db.selected_pair_output_fingerprint(&selected_pairs)
+                    .unwrap(),
+                baseline,
+                "fingerprint did not return to baseline after {restore}"
+            );
+        };
+
+        assert_update_changes(
+            "UPDATE matches SET rows = 9 WHERE pair_id = ?1;",
+            "UPDATE matches SET rows = 2 WHERE pair_id = ?1;",
+        );
+        assert_update_changes(
+            "UPDATE matches SET cols = 6 WHERE pair_id = ?1;",
+            "UPDATE matches SET cols = 2 WHERE pair_id = ?1;",
+        );
+        assert_update_changes(
+            "UPDATE matches SET data = X'ff' WHERE pair_id = ?1;",
+            "UPDATE matches SET data = X'01020304' WHERE pair_id = ?1;",
+        );
+        assert_update_changes(
+            "UPDATE two_view_geometries SET rows = 9 WHERE pair_id = ?1;",
+            "UPDATE two_view_geometries SET rows = 1 WHERE pair_id = ?1;",
+        );
+        assert_update_changes(
+            "UPDATE two_view_geometries SET cols = 6 WHERE pair_id = ?1;",
+            "UPDATE two_view_geometries SET cols = 2 WHERE pair_id = ?1;",
+        );
+        assert_update_changes(
+            "UPDATE two_view_geometries SET data = X'ff' WHERE pair_id = ?1;",
+            "UPDATE two_view_geometries SET data = X'1112' WHERE pair_id = ?1;",
+        );
+        assert_update_changes(
+            "UPDATE two_view_geometries SET config = 9 WHERE pair_id = ?1;",
+            "UPDATE two_view_geometries SET config = 3 WHERE pair_id = ?1;",
+        );
+        for (column, original) in [
+            ("F", "21"),
+            ("E", "22"),
+            ("H", "23"),
+            ("qvec", "24"),
+            ("tvec", "25"),
+        ] {
+            assert_update_changes(
+                &format!("UPDATE two_view_geometries SET {column} = X'ff' WHERE pair_id = ?1;"),
+                &format!(
+                    "UPDATE two_view_geometries SET {column} = X'{original}' WHERE pair_id = ?1;"
+                ),
+            );
+        }
+
+        db.conn
+            .execute(
+                "UPDATE matches SET data = NULL WHERE pair_id = ?1;",
+                params![pair1 as i64],
+            )
+            .unwrap();
+        let null_blob = db
+            .selected_pair_output_fingerprint(&selected_pairs)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE matches SET data = X'' WHERE pair_id = ?1;",
+                params![pair1 as i64],
+            )
+            .unwrap();
+        let empty_blob = db
+            .selected_pair_output_fingerprint(&selected_pairs)
+            .unwrap();
+        assert_ne!(null_blob, empty_blob);
+        db.conn
+            .execute(
+                "UPDATE matches SET data = X'01020304' WHERE pair_id = ?1;",
+                params![pair1 as i64],
+            )
+            .unwrap();
+        assert_eq!(
+            db.selected_pair_output_fingerprint(&selected_pairs)
+                .unwrap(),
+            baseline
         );
     }
 

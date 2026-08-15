@@ -3,7 +3,9 @@ use crate::sift::SiftMatchingOptions;
 use anyhow::{Context, Result};
 use rustslam::Match;
 use std::collections::HashSet;
+use std::ops::AddAssign;
 use std::sync::Arc;
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 
 const MATCHING_SHADER: &str = include_str!("shaders/sift_matching.wgsl");
@@ -32,6 +34,37 @@ struct MatchCandidate {
     pad0: u32,
     pad1: u32,
     pad2: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WgpuSiftMatcherTiming {
+    pub descriptor_pack_seconds: f64,
+    pub buffer_prepare_seconds: f64,
+    pub submit_seconds: f64,
+    pub readback_total_seconds: f64,
+    pub readback_copy_submit_seconds: f64,
+    pub readback_wait_seconds: f64,
+    pub readback_map_decode_seconds: f64,
+    pub cpu_postprocess_seconds: f64,
+    pub direction_calls: usize,
+    pub readback_calls: usize,
+    pub readback_bytes: u64,
+}
+
+impl AddAssign for WgpuSiftMatcherTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.descriptor_pack_seconds += rhs.descriptor_pack_seconds;
+        self.buffer_prepare_seconds += rhs.buffer_prepare_seconds;
+        self.submit_seconds += rhs.submit_seconds;
+        self.readback_total_seconds += rhs.readback_total_seconds;
+        self.readback_copy_submit_seconds += rhs.readback_copy_submit_seconds;
+        self.readback_wait_seconds += rhs.readback_wait_seconds;
+        self.readback_map_decode_seconds += rhs.readback_map_decode_seconds;
+        self.cpu_postprocess_seconds += rhs.cpu_postprocess_seconds;
+        self.direction_calls = self.direction_calls.saturating_add(rhs.direction_calls);
+        self.readback_calls = self.readback_calls.saturating_add(rhs.readback_calls);
+        self.readback_bytes = self.readback_bytes.saturating_add(rhs.readback_bytes);
+    }
 }
 
 pub struct WgpuSiftMatcher {
@@ -95,24 +128,39 @@ impl WgpuSiftMatcher {
         targets: &[[u8; 128]],
         options: &SiftMatchingOptions,
     ) -> Result<Vec<Match>> {
+        self.match_descriptors_profiled(queries, targets, options)
+            .map(|(matches, _)| matches)
+    }
+
+    pub fn match_descriptors_profiled(
+        &self,
+        queries: &[[u8; 128]],
+        targets: &[[u8; 128]],
+        options: &SiftMatchingOptions,
+    ) -> Result<(Vec<Match>, WgpuSiftMatcherTiming)> {
         options.check()?;
         if queries.is_empty() || targets.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), WgpuSiftMatcherTiming::default()));
         }
-        let forward = self.match_one_way(queries, targets, options)?;
+        let (forward, mut timing) = self.match_one_way(queries, targets, options)?;
         let mut matches = if options.cross_check {
-            let reverse = self.match_one_way(targets, queries, options)?;
+            let (reverse, reverse_timing) = self.match_one_way(targets, queries, options)?;
+            timing += reverse_timing;
+            let postprocess_started = Instant::now();
             let reverse_pairs = reverse
                 .into_iter()
                 .map(|value| (value.query_idx, value.train_idx))
                 .collect::<HashSet<_>>();
-            forward
+            let matches = forward
                 .into_iter()
                 .filter(|value| reverse_pairs.contains(&(value.train_idx, value.query_idx)))
-                .collect()
+                .collect();
+            timing.cpu_postprocess_seconds += postprocess_started.elapsed().as_secs_f64();
+            matches
         } else {
             forward
         };
+        let postprocess_started = Instant::now();
         matches.sort_by(|left, right| {
             left.distance
                 .total_cmp(&right.distance)
@@ -122,7 +170,8 @@ impl WgpuSiftMatcher {
         if options.max_num_matches > 0 {
             matches.truncate(options.max_num_matches);
         }
-        Ok(matches)
+        timing.cpu_postprocess_seconds += postprocess_started.elapsed().as_secs_f64();
+        Ok((matches, timing))
     }
 
     fn match_one_way(
@@ -130,13 +179,16 @@ impl WgpuSiftMatcher {
         queries: &[[u8; 128]],
         targets: &[[u8; 128]],
         options: &SiftMatchingOptions,
-    ) -> Result<Vec<Match>> {
+    ) -> Result<(Vec<Match>, WgpuSiftMatcherTiming)> {
         let query_count =
             u32::try_from(queries.len()).context("GPU SIFT query count exceeds u32")?;
         let target_count =
             u32::try_from(targets.len()).context("GPU SIFT target count exceeds u32")?;
+        let pack_started = Instant::now();
         let query_values = pack_descriptors(queries);
         let target_values = pack_descriptors(targets);
+        let descriptor_pack_seconds = pack_started.elapsed().as_secs_f64();
+        let buffer_prepare_started = Instant::now();
         let params = MatchParams {
             query_count,
             target_count,
@@ -203,11 +255,16 @@ impl WgpuSiftMatcher {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(query_count.div_ceil(64), 1, 1);
         }
-        self.context.queue().submit(Some(encoder.finish()));
-        let candidates = self
+        let command_buffer = encoder.finish();
+        let buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
+        let submit_started = Instant::now();
+        self.context.queue().submit(Some(command_buffer));
+        let submit_seconds = submit_started.elapsed().as_secs_f64();
+        let (candidates, readback) = self
             .context
-            .read_buffer::<MatchCandidate>(&output, queries.len())?;
-        Ok(candidates
+            .read_buffer_profiled::<MatchCandidate>(&output, queries.len())?;
+        let postprocess_started = Instant::now();
+        let matches = candidates
             .into_iter()
             .enumerate()
             .filter(|(_, candidate)| candidate.valid != 0)
@@ -216,7 +273,24 @@ impl WgpuSiftMatcher {
                 train_idx: candidate.best_index,
                 distance: candidate.best_distance.sqrt() / 512.0,
             })
-            .collect())
+            .collect();
+        let cpu_postprocess_seconds = postprocess_started.elapsed().as_secs_f64();
+        Ok((
+            matches,
+            WgpuSiftMatcherTiming {
+                descriptor_pack_seconds,
+                buffer_prepare_seconds,
+                submit_seconds,
+                readback_total_seconds: readback.total_seconds,
+                readback_copy_submit_seconds: readback.copy_submit_seconds,
+                readback_wait_seconds: readback.wait_seconds,
+                readback_map_decode_seconds: readback.map_decode_seconds,
+                cpu_postprocess_seconds,
+                direction_calls: 1,
+                readback_calls: readback.calls,
+                readback_bytes: readback.bytes,
+            },
+        ))
     }
 }
 

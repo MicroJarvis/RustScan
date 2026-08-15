@@ -10,10 +10,16 @@ use crate::ui::theme::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelAction {
+    ImportImageFiles,
+    ImportImageFolder,
+    SolvePoses,
     OpenCheckpoint,
     OpenGaussian,
     OpenMesh,
+    OpenProject,
     OpenColmap,
+    OpenImages,
+    RunReconstruction,
     StartTraining,
     StopTraining,
     AutoFitScene,
@@ -24,6 +30,17 @@ pub enum PanelAction {
     FlipRobotGround,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceSelection {
+    Images,
+}
+
+pub fn panel_action_for_primary_import(selection: SourceSelection) -> PanelAction {
+    match selection {
+        SourceSelection::Images => PanelAction::ImportImageFiles,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DatasetUiSummary {
     pub root_path: String,
@@ -31,6 +48,27 @@ pub struct DatasetUiSummary {
     pub sparse_point_count: usize,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageSourceSummary {
+    pub root_path: String,
+    pub image_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconstructionUiState {
+    Idle,
+    Ready,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl Default for ReconstructionUiState {
+    fn default() -> Self {
+        Self::Idle
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +99,11 @@ pub struct UiState {
     pub is_loading: bool,
     pub loading_message: Option<String>,
     pub dataset_summary: Option<DatasetUiSummary>,
+    pub image_source: Option<ImageSourceSummary>,
+    pub reconstruction_state: ReconstructionUiState,
+    pub reconstruction_registered_images: usize,
+    pub reconstruction_points: usize,
+    pub reconstruction_error: Option<String>,
     pub training_controls: TrainingControls,
     pub training_state: TrainingSessionState,
     pub training_progress: TrainingProgress,
@@ -79,6 +122,11 @@ impl Default for UiState {
             is_loading: false,
             loading_message: None,
             dataset_summary: None,
+            image_source: None,
+            reconstruction_state: ReconstructionUiState::Idle,
+            reconstruction_registered_images: 0,
+            reconstruction_points: 0,
+            reconstruction_error: None,
             training_controls: TrainingControls::default(),
             training_state: TrainingSessionState::Idle,
             training_progress: TrainingProgress::default(),
@@ -90,6 +138,41 @@ impl Default for UiState {
             robot_move_speed: 1.0,
         }
     }
+}
+
+impl UiState {
+    pub fn can_load_colmap(&self) -> bool {
+        !self.is_loading
+            && !reconstruction_is_running(self.reconstruction_state)
+            && !reconstruction_is_blocked_by_training(self.training_state)
+    }
+
+    pub fn can_run_reconstruction(&self) -> bool {
+        self.image_source.is_some()
+            && !self.is_loading
+            && !reconstruction_is_running(self.reconstruction_state)
+            && !reconstruction_is_blocked_by_training(self.training_state)
+    }
+
+    pub fn can_start_training(&self) -> bool {
+        self.dataset_summary.is_some()
+            && !self.is_loading
+            && !reconstruction_is_running(self.reconstruction_state)
+    }
+}
+
+pub(crate) fn reconstruction_is_running(state: ReconstructionUiState) -> bool {
+    matches!(state, ReconstructionUiState::Running)
+}
+
+pub(crate) fn reconstruction_is_blocked_by_training(state: TrainingSessionState) -> bool {
+    matches!(
+        state,
+        TrainingSessionState::Loading
+            | TrainingSessionState::Starting
+            | TrainingSessionState::Training
+            | TrainingSessionState::Stopping
+    )
 }
 
 /// Draw the left-side control panel.
@@ -129,8 +212,28 @@ pub fn draw_side_panel(
             actions.push(PanelAction::OpenMesh);
         }
 
-        if draw_blue_button(ui, "🗂", "Load COLMAP") {
+        if draw_blue_button(ui, "🗂", "Open RustScan Project") {
+            actions.push(PanelAction::OpenProject);
+        }
+
+        let load_colmap_clicked = ui
+            .add_enabled_ui(state.can_load_colmap(), |ui| {
+                draw_blue_button(ui, "🗂", "Load COLMAP")
+            })
+            .inner;
+        if load_colmap_clicked {
             actions.push(PanelAction::OpenColmap);
+        }
+
+        let importing_images_enabled =
+            !matches!(state.reconstruction_state, ReconstructionUiState::Running);
+        let import_images_clicked = ui
+            .add_enabled_ui(importing_images_enabled, |ui| {
+                draw_blue_button(ui, "🖼", "Import Images")
+            })
+            .inner;
+        if import_images_clicked {
+            actions.push(PanelAction::OpenImages);
         }
 
         // Divider
@@ -285,6 +388,9 @@ fn draw_training_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut 
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 10.0);
 
+            draw_reconstruction_controls(ui, state, actions);
+            draw_divider(ui);
+
             draw_metric_row(ui, "State", training_state_label(state.training_state));
 
             ui.add(
@@ -356,13 +462,7 @@ fn draw_training_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut 
                 format_duration(state.training_progress.elapsed),
             );
 
-            let dataset_ready = state.dataset_summary.is_some();
-            let training_active = matches!(
-                state.training_state,
-                TrainingSessionState::Starting
-                    | TrainingSessionState::Training
-                    | TrainingSessionState::Stopping
-            );
+            let training_active = reconstruction_is_blocked_by_training(state.training_state);
 
             let button_label = if training_active {
                 "Stop Training"
@@ -373,7 +473,7 @@ fn draw_training_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut 
             let clicked = if training_active {
                 draw_secondary_button(ui, button_icon, button_label)
             } else {
-                ui.add_enabled_ui(dataset_ready, |ui| {
+                ui.add_enabled_ui(state.can_start_training(), |ui| {
                     draw_blue_button(ui, button_icon, button_label)
                 })
                 .inner
@@ -388,6 +488,51 @@ fn draw_training_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut 
             }
         });
     });
+}
+
+fn draw_reconstruction_controls(
+    ui: &mut egui::Ui,
+    state: &UiState,
+    actions: &mut Vec<PanelAction>,
+) {
+    draw_metric_row(
+        ui,
+        "Reconstruction",
+        reconstruction_state_label(state.reconstruction_state),
+    );
+
+    if let Some(source) = &state.image_source {
+        ui.label(
+            egui::RichText::new(source.root_path.as_str())
+                .size(11.0)
+                .color(TEXT_SECONDARY),
+        );
+        draw_metric_row(ui, "Images", source.image_count.to_string());
+    }
+
+    if matches!(state.reconstruction_state, ReconstructionUiState::Running) {
+        draw_metric_row(
+            ui,
+            "Registered Images",
+            state.reconstruction_registered_images.to_string(),
+        );
+        draw_metric_row(ui, "Sparse Points", state.reconstruction_points.to_string());
+    }
+
+    if matches!(state.reconstruction_state, ReconstructionUiState::Failed) {
+        if let Some(error) = &state.reconstruction_error {
+            ui.label(egui::RichText::new(error).size(11.0).color(SYSTEM_RED));
+        }
+    }
+
+    let run_reconstruction_clicked = ui
+        .add_enabled_ui(state.can_run_reconstruction(), |ui| {
+            draw_blue_button(ui, "▶", "Run Reconstruction")
+        })
+        .inner;
+    if run_reconstruction_clicked {
+        actions.push(PanelAction::RunReconstruction);
+    }
 }
 
 fn draw_robot_controls(ui: &mut egui::Ui, state: &mut UiState, actions: &mut Vec<PanelAction>) {
@@ -471,6 +616,16 @@ fn training_state_label(state: TrainingSessionState) -> String {
         TrainingSessionState::Cancelled => "cancelled",
     }
     .to_string()
+}
+
+pub fn reconstruction_state_label(state: ReconstructionUiState) -> &'static str {
+    match state {
+        ReconstructionUiState::Idle => "idle",
+        ReconstructionUiState::Ready => "ready",
+        ReconstructionUiState::Running => "solving poses",
+        ReconstructionUiState::Completed => "completed",
+        ReconstructionUiState::Failed => "failed",
+    }
 }
 
 fn format_duration(duration: std::time::Duration) -> String {
@@ -804,4 +959,92 @@ fn draw_stats_cards(ui: &mut egui::Ui, scene: &Scene) {
             });
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconstruction_can_run_only_with_source_and_idle_state() {
+        let mut state = UiState::default();
+        assert!(!state.can_run_reconstruction());
+        state.image_source = Some(ImageSourceSummary {
+            root_path: "/captures/chair".to_owned(),
+            image_count: 24,
+        });
+        assert!(state.can_run_reconstruction());
+        state.reconstruction_state = ReconstructionUiState::Running;
+        assert!(!state.can_run_reconstruction());
+        state.reconstruction_state = ReconstructionUiState::Ready;
+        state.training_state = TrainingSessionState::Training;
+        assert!(!state.can_run_reconstruction());
+    }
+
+    #[test]
+    fn reconstruction_and_colmap_operations_exclude_conflicts() {
+        let mut state = UiState::default();
+        state.dataset_summary = Some(DatasetUiSummary {
+            root_path: "/captures/chair/sparse".to_owned(),
+            frame_count: 24,
+            sparse_point_count: 1_024,
+            width: 1_920,
+            height: 1_080,
+        });
+        state.image_source = Some(ImageSourceSummary {
+            root_path: "/captures/chair".to_owned(),
+            image_count: 24,
+        });
+
+        assert!(state.can_load_colmap());
+        assert!(state.can_run_reconstruction());
+
+        state.is_loading = true;
+        assert!(!state.can_load_colmap());
+        assert!(!state.can_run_reconstruction());
+
+        state.is_loading = false;
+        state.reconstruction_state = ReconstructionUiState::Running;
+        assert!(!state.can_load_colmap());
+
+        state.reconstruction_state = ReconstructionUiState::Ready;
+        state.training_state = TrainingSessionState::Training;
+        assert!(!state.can_load_colmap());
+    }
+
+    #[test]
+    fn reconstruction_running_blocks_training_start() {
+        let mut state = UiState::default();
+        state.dataset_summary = Some(DatasetUiSummary {
+            root_path: "/captures/chair".to_owned(),
+            frame_count: 24,
+            sparse_point_count: 1_024,
+            width: 1_920,
+            height: 1_080,
+        });
+        assert!(state.can_start_training());
+
+        state.is_loading = true;
+        assert!(!state.can_start_training());
+
+        state.is_loading = false;
+        state.reconstruction_state = ReconstructionUiState::Running;
+        assert!(!state.can_start_training());
+    }
+
+    #[test]
+    fn reconstruction_labels_are_operator_facing() {
+        assert_eq!(
+            reconstruction_state_label(ReconstructionUiState::Ready),
+            "ready"
+        );
+        assert_eq!(
+            reconstruction_state_label(ReconstructionUiState::Running),
+            "solving poses"
+        );
+        assert_eq!(
+            reconstruction_state_label(ReconstructionUiState::Failed),
+            "failed"
+        );
+    }
 }

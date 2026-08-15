@@ -26,7 +26,7 @@ GR8P local refit bridge for non-panoramic rigs in default builds, with
 BA-backed pose-only generalized absolute-pose refinement for rig frames and
 COLMAP-style fallback to central PnP when a rig camera still needs focal-length
 estimation. PoseLib v2.0.5 is pinned as the `third_party/PoseLib` submodule.
-Initialize dependencies and run the default solver tests with:
+Initialize native dependencies and run the self-contained default solver tests with:
 
 ```bash
 git submodule update --init --recursive
@@ -39,6 +39,15 @@ the explicit missing-solver fallback available:
 
 ```bash
 cargo test -p rustsfm --lib --no-default-features
+```
+
+The `real_colmap_sparse_*` parity tests require a compatible external
+`test_data/flowers2_colmap` 24-image sparse fixture. That fixture is not part
+of the repository or its submodules, so these tests are ignored by default.
+After provisioning it at the workspace root, run them explicitly with:
+
+```bash
+cargo test -p rustsfm --lib -- --ignored
 ```
 Incremental registration is absolute-pose driven with COLMAP-style next-image
 ranking methods, registration trial bookkeeping, inlier-ratio checks, and

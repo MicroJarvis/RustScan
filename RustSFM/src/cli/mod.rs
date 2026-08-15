@@ -23,6 +23,7 @@ enum Commands {
     CompareExtract(CompareExtractArgs),
     Parity(ParityArgs),
     BenchmarkSift(BenchmarkSiftArgs),
+    BenchmarkMatchPairs(BenchmarkMatchPairsArgs),
     ExtractFeatures(ExtractFeaturesArgs),
     MatchFeatures(MatchFeaturesArgs),
     DebugTwoview(DebugTwoViewArgs),
@@ -329,6 +330,28 @@ struct MatchFeaturesArgs {
     random_seed: i32,
     #[arg(long)]
     output_json: Option<PathBuf>,
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+#[derive(Debug, Parser)]
+struct BenchmarkMatchPairsArgs {
+    #[arg(long)]
+    database: PathBuf,
+    #[arg(long, default_value = "5")]
+    window: usize,
+    #[arg(long)]
+    pair_limit: Option<usize>,
+    #[arg(long, default_value = "1")]
+    repetitions: usize,
+    #[arg(long, default_value_t = false)]
+    use_gpu: bool,
+    #[arg(long, default_value = "0")]
+    random_seed: i32,
+    #[arg(long)]
+    output_json: Option<PathBuf>,
+    #[arg(long)]
+    artifacts_dir: Option<PathBuf>,
     #[arg(long, default_value = "info")]
     log_level: String,
 }
@@ -706,6 +729,55 @@ mod tests {
             panic!("wrong command")
         };
         assert!(args.use_gpu);
+    }
+
+    #[test]
+    fn benchmark_match_pairs_parses_bounded_repetitions() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "benchmark-match-pairs",
+            "--database",
+            "database.db",
+            "--window",
+            "5",
+            "--pair-limit",
+            "96",
+            "--repetitions",
+            "3",
+            "--use-gpu",
+            "--output-json",
+            "report.json",
+        ])
+        .unwrap();
+        let Commands::BenchmarkMatchPairs(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.window, 5);
+        assert_eq!(args.pair_limit, Some(96));
+        assert_eq!(args.repetitions, 3);
+        assert!(args.use_gpu);
+        assert_eq!(args.output_json, Some(PathBuf::from("report.json")));
+    }
+
+    #[test]
+    fn benchmark_match_pairs_parses_artifacts_directory() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "benchmark-match-pairs",
+            "--database",
+            "database.db",
+            "--artifacts-dir",
+            "benchmark-artifacts",
+        ])
+        .unwrap();
+
+        let Commands::BenchmarkMatchPairs(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(
+            args.artifacts_dir,
+            Some(PathBuf::from("benchmark-artifacts"))
+        );
     }
 
     #[test]

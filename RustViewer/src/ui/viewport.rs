@@ -4,63 +4,36 @@ use crate::renderer::camera::ArcballCamera;
 use crate::ui::theme::*;
 use egui::Vec2;
 
+struct EmptyStateCopy {
+    heading: &'static str,
+    detail: &'static str,
+}
+
+fn empty_state_copy() -> EmptyStateCopy {
+    EmptyStateCopy {
+        heading: "No reconstruction loaded",
+        detail: "Open a project or load a COLMAP workspace to begin.",
+    }
+}
+
 /// Draw an empty-state overlay when no scene data is loaded.
 pub fn draw_empty_state(ui: &mut egui::Ui) {
+    let copy = empty_state_copy();
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
-            ui.add_space(80.0);
-
-            // Large icon
             ui.label(
-                egui::RichText::new("📂")
-                    .size(64.0)
-                    .color(TEXT_DISABLED.gamma_multiply(0.85)),
-            );
-
-            ui.add_space(24.0);
-
-            // Title
-            ui.label(
-                egui::RichText::new("No SLAM Data Loaded")
-                    .size(20.0)
+                egui::RichText::new(copy.heading)
+                    .size(18.0)
                     .strong()
                     .color(TEXT_PRIMARY),
             );
 
-            ui.add_space(24.0);
+            ui.add_space(10.0);
 
-            // Description
             ui.label(
-                egui::RichText::new(
-                    "Load checkpoint, Gaussian, or mesh files to visualize 3D results",
-                )
-                .size(13.0)
-                .color(TEXT_SECONDARY),
-            );
-
-            ui.add_space(24.0);
-
-            // Open Files button (placeholder - actual file opening is in sidebar)
-            let button_width = 120.0;
-            let button_height = 32.0;
-            let (rect, response) = ui
-                .allocate_exact_size(Vec2::new(button_width, button_height), egui::Sense::click());
-
-            let bg_color = if response.clicked() {
-                egui::Color32::from_rgb(0, 85, 200)
-            } else if response.hovered() {
-                egui::Color32::from_rgb(0, 110, 230)
-            } else {
-                SYSTEM_BLUE
-            };
-
-            ui.painter().rect_filled(rect, 6.0, bg_color);
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "Open Files",
-                egui::FontId::proportional(13.0),
-                egui::Color32::WHITE,
+                egui::RichText::new(copy.detail)
+                    .size(12.0)
+                    .color(TEXT_SECONDARY),
             );
         });
     });
@@ -127,6 +100,22 @@ pub fn draw_viewport_overlay(ui: &mut egui::Ui, camera: &ArcballCamera, has_data
             ),
             egui::FontId::proportional(10.0),
             TEXT_PRIMARY,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_state_copy_guides_users_to_a_project_or_colmap_workspace() {
+        let copy = empty_state_copy();
+
+        assert_eq!(copy.heading, "No reconstruction loaded");
+        assert_eq!(
+            copy.detail,
+            "Open a project or load a COLMAP workspace to begin."
         );
     }
 }

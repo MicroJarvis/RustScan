@@ -11,12 +11,36 @@ RustViewer is a desktop application for visualizing SLAM reconstruction results,
 - **Gaussian point cloud** — 3DGS scene from training
 - **Mesh** — Extracted mesh with solid/wireframe rendering
 
+## Reconstruction Workflow
+
+1. Select **Import Images** and choose a folder with at least two JPEG or PNG images.
+2. Select **Run Reconstruction**. Each RustSFM result is written below the input folder at `<input>/.rustviewer/rustsfm/<run-id>/`; older runs are never overwritten.
+3. RustSFM uses automatic single-camera intrinsics. After it produces a valid COLMAP sparse model, RustViewer loads it, starts RustGS 3DGS training automatically, and displays training snapshots.
+
+Runtime boundaries:
+
+- On macOS, wgpu uses Metal rather than native Vulkan.
+- This release cannot cancel a running RustSFM reconstruction.
+- Existing RustGS training cancellation remains available.
+
 ## Features
 
 - **Offline file loading** — Load `pipeline.json`, `scene.ply`, `mesh.obj/ply`
 - **3D navigation** — Arcball camera with mouse orbit/pan/zoom
 - **Layer visibility** — Toggle trajectory, points, Gaussians, mesh
 - **Apple HIG design** — Clean, native-feeling UI
+
+## Reconstruction Workflow
+
+RustViewer can create a managed `.rustscanproject` from an image sequence. The workbench then
+runs RustSFM keyframe reconstruction and full-frame registration through the persistent project
+pipeline. It writes the verified COLMAP sparse model and normalized images into the committed
+FullFramePnP artifact. RustGS training is enabled only after every imported image has a pose; its
+latest Gaussian snapshot is rendered in the RustViewer wgpu viewport.
+
+The desktop workbench currently accepts image sequences only. Video import and video PnP are
+intentionally disabled in the UI until the dedicated video reconstruction path has the same
+complete-pose and artifact-validation guarantees.
 
 ## Architecture
 
@@ -27,6 +51,7 @@ RustViewer/
 │   ├── main.rs             # Binary entry point
 │   ├── lib.rs              # Library root, module declarations
 │   ├── app.rs              # Main eframe app struct
+│   ├── reconstruction.rs   # RustSFM runner and output validation
 │   ├── loader/             # File loading utilities
 │   │   ├── mod.rs          # Loader trait and exports
 │   │   ├── checkpoint.rs   # Checkpoint JSON loader
@@ -61,6 +86,8 @@ cargo build -p rust-viewer --release
 - **wgpu** — Cross-platform GPU rendering (via eframe)
 - **glam** — SIMD-accelerated math library
 - **rustslam** — SLAM library with `viewer-types` feature
+- **rustsfm** — Image pose solving and COLMAP sparse-model export
+- **rustgs** — 3D Gaussian Splatting training
 
 ## Notes
 

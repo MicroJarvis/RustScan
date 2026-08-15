@@ -67,8 +67,24 @@ jobs:
             libeigen3-dev
       - name: RustSFM format
         run: cargo fmt --package rustsfm --check
-      - name: RustSFM sparse parity build matrix
+      - name: RustSFM sparse parity tests
         run: |
-          cargo test -p rustsfm --lib --no-run
-          cargo test -p rustsfm --lib --features poselib --no-run
-          cargo test -p rustsfm --lib --no-default-features --no-run
+          cargo test -p rustsfm --lib
+          cargo test -p rustsfm --lib --no-default-features
+      - name: RustSFM minimal integration tests
+        run: >-
+          cargo test -p rustsfm
+          --test adaptive_keyframes
+          --test build_support
+          --test sequence_registration
+          --no-default-features
+
+  rustsfm-windows-filesystem:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: RustSFM filesystem publication tests
+        run: >-
+          cargo test -p rustsfm --lib --no-default-features
+          sequence_registration::task6_tests

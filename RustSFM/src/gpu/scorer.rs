@@ -1,6 +1,7 @@
-use super::WgpuContext;
+use super::{WgpuContext, WgpuModelScorerTiming};
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 
 const MODEL_SCORING_SHADER: &str = include_str!("shaders/model_scoring.wgsl");
@@ -308,22 +309,45 @@ impl WgpuModelScorer {
 }
 
 impl WgpuModelScoringSession<'_> {
+    pub(crate) fn max_two_view_models_per_score(&self) -> usize {
+        let limits = self.scorer.context.device().limits();
+        let storage_bytes = limits
+            .max_buffer_size
+            .min(u64::from(limits.max_storage_buffer_binding_size));
+        two_view_model_capacity(
+            limits.max_compute_workgroups_per_dimension,
+            storage_bytes,
+            storage_bytes,
+        )
+    }
+
     pub(crate) fn score_two_view_models(
         &self,
         models: &[[f32; 9]],
         threshold: f32,
         kind: TwoViewModelKind,
     ) -> Result<Vec<GpuModelSupport>> {
+        self.score_two_view_models_profiled(models, threshold, kind)
+            .map(|(supports, _)| supports)
+    }
+
+    pub(crate) fn score_two_view_models_profiled(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> Result<(Vec<GpuModelSupport>, WgpuModelScorerTiming)> {
         validate_threshold(threshold)?;
         let model_count = u32::try_from(models.len()).context("GPU model count exceeds u32")?;
         if models.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), WgpuModelScorerTiming::default()));
         }
         self.scorer.validate_dispatch_count(model_count, "model")?;
         self.scorer.validate_storage_slice("models", models)?;
         self.scorer
             .validate_storage_elements::<GpuModelSupport>("support summaries", models.len())?;
 
+        let buffer_prepare_started = Instant::now();
         let params = ScoringParams {
             model_count,
             observation_count: self.observation_count,
@@ -356,10 +380,31 @@ impl WgpuModelScoringSession<'_> {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(model_count, 1, 1);
         }
-        self.scorer.context.queue().submit(Some(encoder.finish()));
-        self.scorer
+        let command_buffer = encoder.finish();
+        let buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
+        let submit_started = Instant::now();
+        self.scorer.context.queue().submit(Some(command_buffer));
+        let submit_seconds = submit_started.elapsed().as_secs_f64();
+        let (supports, readback) = self
+            .scorer
             .context
-            .read_buffer::<GpuModelSupport>(&summaries, models.len())
+            .read_buffer_profiled::<GpuModelSupport>(&summaries, models.len())?;
+        Ok((
+            supports,
+            WgpuModelScorerTiming {
+                buffer_prepare_seconds,
+                submit_seconds,
+                readback_total_seconds: readback.total_seconds,
+                readback_copy_submit_seconds: readback.copy_submit_seconds,
+                readback_wait_seconds: readback.wait_seconds,
+                readback_map_decode_seconds: readback.map_decode_seconds,
+                score_calls: 1,
+                mask_calls: 0,
+                models_scored: models.len(),
+                readback_calls: readback.calls,
+                readback_bytes: readback.bytes,
+            },
+        ))
     }
 
     pub(crate) fn inlier_mask(
@@ -368,6 +413,16 @@ impl WgpuModelScoringSession<'_> {
         threshold: f32,
         kind: TwoViewModelKind,
     ) -> Result<Vec<bool>> {
+        self.inlier_mask_profiled(model, threshold, kind)
+            .map(|(mask, _)| mask)
+    }
+
+    pub(crate) fn inlier_mask_profiled(
+        &self,
+        model: &[f32; 9],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> Result<(Vec<bool>, WgpuModelScorerTiming)> {
         validate_threshold(threshold)?;
         let workgroups = self.observation_count.div_ceil(64);
         self.scorer.validate_dispatch_count(workgroups, "mask")?;
@@ -376,6 +431,7 @@ impl WgpuModelScoringSession<'_> {
         self.scorer
             .validate_storage_elements::<u32>("inlier mask", self.observation_len)?;
 
+        let buffer_prepare_started = Instant::now();
         let params = ScoringParams {
             model_count: 1,
             observation_count: self.observation_count,
@@ -408,14 +464,31 @@ impl WgpuModelScoringSession<'_> {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
-        self.scorer.context.queue().submit(Some(encoder.finish()));
-        Ok(self
+        let command_buffer = encoder.finish();
+        let buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
+        let submit_started = Instant::now();
+        self.scorer.context.queue().submit(Some(command_buffer));
+        let submit_seconds = submit_started.elapsed().as_secs_f64();
+        let (mask, readback) = self
             .scorer
             .context
-            .read_buffer::<u32>(&mask, self.observation_len)?
-            .into_iter()
-            .map(|value| value != 0)
-            .collect())
+            .read_buffer_profiled::<u32>(&mask, self.observation_len)?;
+        Ok((
+            mask.into_iter().map(|value| value != 0).collect(),
+            WgpuModelScorerTiming {
+                buffer_prepare_seconds,
+                submit_seconds,
+                readback_total_seconds: readback.total_seconds,
+                readback_copy_submit_seconds: readback.copy_submit_seconds,
+                readback_wait_seconds: readback.wait_seconds,
+                readback_map_decode_seconds: readback.map_decode_seconds,
+                score_calls: 0,
+                mask_calls: 1,
+                models_scored: 0,
+                readback_calls: readback.calls,
+                readback_bytes: readback.bytes,
+            },
+        ))
     }
 
     fn create_bind_group(
@@ -511,6 +584,19 @@ fn buffer_size<T>(count: usize) -> Result<u64> {
         .context("GPU model scorer buffer size overflow")
 }
 
+fn two_view_model_capacity(
+    max_workgroups: u32,
+    model_buffer_bytes: u64,
+    summary_buffer_bytes: u64,
+) -> usize {
+    let dispatch = max_workgroups as usize;
+    let models = model_buffer_bytes / std::mem::size_of::<[f32; 9]>() as u64;
+    let summaries = summary_buffer_bytes / std::mem::size_of::<GpuModelSupport>() as u64;
+    dispatch
+        .min(usize::try_from(models).unwrap_or(usize::MAX))
+        .min(usize::try_from(summaries).unwrap_or(usize::MAX))
+}
+
 fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -521,5 +607,17 @@ fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutE
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::two_view_model_capacity;
+
+    #[test]
+    fn two_view_model_capacity_uses_the_tightest_device_limit() {
+        assert_eq!(two_view_model_capacity(100, 36 * 80, 8 * 90), 80);
+        assert_eq!(two_view_model_capacity(70, u64::MAX, u64::MAX), 70);
+        assert_eq!(two_view_model_capacity(100, 35, u64::MAX), 0);
     }
 }

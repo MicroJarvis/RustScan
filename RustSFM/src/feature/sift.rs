@@ -1186,6 +1186,10 @@ mod tests {
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn benchmark_reports_wgpu_for_explicit_gpu_options() -> Result<()> {
+        if crate::gpu::WgpuContext::try_new_optional()?.is_none() {
+            eprintln!("skipping GPU SIFT benchmark test: no compatible adapter");
+            return Ok(());
+        }
         let input = tempfile::tempdir()?;
         let report = benchmark_sift_extraction(
             input.path(),

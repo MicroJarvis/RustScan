@@ -1,32 +1,43 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides contributor guidance for working with code in this repository.
 
 ## Project Overview
 
-RustScan is a pure Rust implementation of 3D scanning algorithms, comprising two main libraries:
+RustScan is a Rust workspace for 3D reconstruction. The active workspace crates are:
 
-- **RustMesh**: A mesh processing library (Rust port of OpenMesh)
-- **RustSLAM**: A Visual SLAM library with 3D Gaussian Splatting support
+- **rustscan-types**: shared cross-crate data structures.
+- **RustMesh**: mesh processing and OpenMesh comparison tooling.
+- **RustSLAM**: visual SLAM and sparse mapping.
+- **RustGS**: Gaussian splatting training and rendering.
+- **RustViewer**: reconstruction workflow and inspection UI.
+- **RustFF**: feed-forward reconstruction experiments.
+- **RustSFM**: COLMAP-style incremental structure-from-motion.
+
+Use [`docs/current-project-status.md`](docs/current-project-status.md) and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for current cross-crate status;
+crate READMEs own their build and test prerequisites.
 
 ## Common Commands
 
 ### Build
 ```bash
-# Build RustMesh
-cd RustMesh && cargo build
+# Build the workspace
+cargo build --workspace
 
-# Build RustSLAM
-cd RustSLAM && cargo build --release
+# Build RustSFM with its default native solvers
+cargo build -p rustsfm
 ```
 
 ### Test
 ```bash
-# Test RustMesh
-cd RustMesh && cargo test
+# Test RustMesh and RustSLAM
+cargo test -p rustmesh
+cargo test -p rustslam
 
-# Test RustSLAM
-cd RustSLAM && cargo test
+# RustSFM: default and dependency-minimal suites
+cargo test -p rustsfm --lib
+cargo test -p rustsfm --lib --no-default-features
 ```
 
 ### Run Examples
@@ -70,7 +81,10 @@ RustMesh/src/
     └── quadric.rs      # Quadric error computation
 ```
 
-### RustSLAM (`RustSLAM/`)
+### Historical RustSLAM (`RustSLAM/`)
+
+The following RustSLAM module map is retained as implementation background. Its
+status table is a dated review record, not current project status.
 
 Visual SLAM library with sparse feature-based VO and dense 3D Gaussian Splatting reconstruction.
 
@@ -125,7 +139,7 @@ RustSLAM/src/
 
 ## Module Status
 
-### RustSLAM Progress (~80% functional — Code Review 2026-02-23)
+### Historical RustSLAM Progress (~80% functional — Code Review 2026-02-23)
 
 | Feature | Status |
 |---------|--------|

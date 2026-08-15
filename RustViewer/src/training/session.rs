@@ -4,9 +4,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rustgs::{
-    train_splats, HostSplats, TrainingConfig, TrainingControl, TrainingDataset, TrainingError,
-    TrainingEvent, TrainingEventCadence, TrainingIterationProgress, TrainingOptions, TrainingRun,
-    TrainingRunReport, TrainingSnapshotReady,
+    train_splats, HostSplats, TrainingCheckpointReady, TrainingConfig, TrainingControl,
+    TrainingDataset, TrainingError, TrainingEvent, TrainingEventCadence, TrainingIterationProgress,
+    TrainingOptions, TrainingRun, TrainingRunPaused, TrainingRunReport, TrainingSnapshotReady,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +385,13 @@ impl TrainingManager {
         self.session.is_some()
     }
 
+    pub fn is_training_active(&self) -> bool {
+        self.session
+            .as_ref()
+            .map(|session| !session.is_terminal())
+            .unwrap_or(false)
+    }
+
     pub fn clear_terminal_session(&mut self) {
         let should_clear = self
             .session
@@ -566,6 +573,22 @@ fn apply_backend_event(
             });
             return;
         }
+        TrainingEvent::CheckpointReady(TrainingCheckpointReady {
+            iteration,
+            checkpoint,
+            ..
+        }) => {
+            guard.progress.latest_iteration = Some(*iteration);
+            guard.progress.latest_loss = checkpoint.latest_loss;
+            guard.progress.gaussian_count = Some(checkpoint.splats.len());
+        }
+        TrainingEvent::RunPaused(TrainingRunPaused {
+            completed_iterations,
+            elapsed,
+        }) => {
+            guard.progress.elapsed = *elapsed;
+            guard.progress.latest_iteration = Some(*completed_iterations);
+        }
         TrainingEvent::RunCancelled(cancelled) => {
             guard.progress.elapsed = cancelled.elapsed;
             guard.progress.latest_iteration = Some(cancelled.completed_iterations);
@@ -662,7 +685,7 @@ mod tests {
 
     use rustgs::{
         Intrinsics, ScenePose, TrainingEventRoute, TrainingPlanSelected, TrainingRunCompleted,
-        TrainingRunStarted, SE3,
+        TrainingRunDisposition, TrainingRunPaused, TrainingRunStarted, SE3,
     };
 
     struct SuccessRunner;
@@ -686,12 +709,14 @@ mod tests {
 
             let report = TrainingRunReport {
                 elapsed: Duration::from_millis(12),
+                training_loop_elapsed: Duration::from_millis(12),
                 final_loss: Some(0.42),
                 final_step_loss: Some(0.42),
                 gaussian_count: 64,
                 sh_degree: 0,
                 completed_iterations: config.iterations,
                 cancelled: false,
+                disposition: TrainingRunDisposition::Completed,
                 telemetry: None,
             };
             on_event(TrainingEvent::RunCompleted(TrainingRunCompleted {
@@ -727,12 +752,14 @@ mod tests {
                         splats: HostSplats::default(),
                         report: TrainingRunReport {
                             elapsed: Duration::from_millis(125),
+                            training_loop_elapsed: Duration::from_millis(125),
                             final_loss: None,
                             final_step_loss: None,
                             gaussian_count: 0,
                             sh_degree: 0,
                             completed_iterations: 0,
                             cancelled: true,
+                            disposition: TrainingRunDisposition::Cancelled,
                             telemetry: None,
                         },
                     });
@@ -744,12 +771,14 @@ mod tests {
 
             let report = TrainingRunReport {
                 elapsed: Duration::from_millis(250),
+                training_loop_elapsed: Duration::from_millis(250),
                 final_loss: Some(0.11),
                 final_step_loss: Some(0.11),
                 gaussian_count: 128,
                 sh_degree: 0,
                 completed_iterations: config.iterations,
                 cancelled: false,
+                disposition: TrainingRunDisposition::Completed,
                 telemetry: None,
             };
             on_event(TrainingEvent::RunCompleted(TrainingRunCompleted {
@@ -838,6 +867,56 @@ mod tests {
         assert_eq!(manager.state(), TrainingSessionState::Cancelled);
         assert!(manager.latest_report().is_none());
         assert!(manager.latest_snapshot().is_none());
+    }
+
+    #[test]
+    fn manager_reports_training_activity_for_non_terminal_sessions() {
+        let mut manager = TrainingManager::new();
+        assert!(!manager.is_training_active());
+
+        manager
+            .start_with_runner(
+                dummy_dataset(),
+                TrainingConfig::default(),
+                TrainingControlOptions::default(),
+                SlowRunner,
+            )
+            .unwrap();
+        assert!(manager.is_training_active());
+
+        manager.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            manager.poll_events();
+            if manager.state().is_terminal() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(manager.state().is_terminal());
+        assert!(!manager.is_training_active());
+    }
+
+    #[test]
+    fn paused_backend_event_updates_progress_without_adding_a_session_state() {
+        let shared = Arc::new(Mutex::new(SessionShared::default()));
+        let (event_tx, _event_rx) = mpsc::channel();
+
+        apply_backend_event(
+            &shared,
+            &TrainingEvent::RunPaused(TrainingRunPaused {
+                completed_iterations: 7,
+                elapsed: Duration::from_millis(33),
+            }),
+            &event_tx,
+        );
+
+        let guard = lock_unpoison(&shared);
+        assert_eq!(guard.progress.latest_iteration, Some(7));
+        assert_eq!(guard.progress.elapsed, Duration::from_millis(33));
+        assert_eq!(guard.progress.event_count, 1);
+        assert_eq!(guard.state, TrainingSessionState::Idle);
     }
 
     fn collect_until_terminal(

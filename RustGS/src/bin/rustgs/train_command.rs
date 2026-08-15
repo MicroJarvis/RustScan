@@ -8,7 +8,240 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(feature = "gpu")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "gpu")]
 use std::time::Duration;
+
+const DEFAULT_CHECKPOINT_EVERY: usize = 1_000;
+#[cfg(feature = "gpu")]
+const MAX_CHECKPOINT_RETENTION_PASSES: usize = 3;
+#[cfg(feature = "gpu")]
+static NON_PERIODIC_CHECKPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn effective_checkpoint_every(args: &TrainArgs) -> Option<usize> {
+    args.checkpoint_dir
+        .as_ref()
+        .map(|_| args.checkpoint_every.unwrap_or(DEFAULT_CHECKPOINT_EVERY))
+}
+
+#[cfg(feature = "gpu")]
+struct CheckpointPersistence<S> {
+    directory: PathBuf,
+    save_checkpoint: S,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, PartialEq, Eq)]
+struct CheckpointPersistenceOutcome {
+    path: PathBuf,
+    retention_warning: Option<String>,
+}
+
+#[cfg(feature = "gpu")]
+impl<S> CheckpointPersistence<S> {
+    fn new(directory: PathBuf, save_checkpoint: S) -> Self {
+        Self {
+            directory,
+            save_checkpoint,
+        }
+    }
+
+    fn persist<T, E>(
+        &mut self,
+        reason: rustgs::TrainingCheckpointReason,
+        iteration: usize,
+        checkpoint: &T,
+    ) -> Result<CheckpointPersistenceOutcome, E>
+    where
+        S: FnMut(&Path, &T) -> Result<(), E>,
+        E: From<std::io::Error>,
+    {
+        self.persist_with_retention(reason, iteration, checkpoint, |directory| {
+            prune_periodic_checkpoints_with(directory, |path| fs::remove_file(path))
+        })
+    }
+
+    fn persist_with_retention<T, E, R>(
+        &mut self,
+        reason: rustgs::TrainingCheckpointReason,
+        iteration: usize,
+        checkpoint: &T,
+        mut retain: R,
+    ) -> Result<CheckpointPersistenceOutcome, E>
+    where
+        S: FnMut(&Path, &T) -> Result<(), E>,
+        E: From<std::io::Error>,
+        R: FnMut(&Path) -> std::io::Result<()>,
+    {
+        let path = if reason == rustgs::TrainingCheckpointReason::Periodic {
+            self.directory
+                .join(format!("iteration-{iteration:06}.rgscp"))
+        } else {
+            let prefix = match reason {
+                rustgs::TrainingCheckpointReason::Pause => "pause",
+                rustgs::TrainingCheckpointReason::Shutdown => "shutdown",
+                rustgs::TrainingCheckpointReason::Periodic => unreachable!(),
+            };
+            self.unique_non_periodic_path(prefix, iteration)
+                .map_err(E::from)?
+        };
+        (self.save_checkpoint)(&path, checkpoint)?;
+        let retention_warning = retain(&self.directory).err().map(|error| {
+            format!(
+                "checkpoint retention failed in {}: {error}",
+                self.directory.display()
+            )
+        });
+        Ok(CheckpointPersistenceOutcome {
+            path,
+            retention_warning,
+        })
+    }
+
+    fn unique_non_periodic_path(&self, prefix: &str, iteration: usize) -> std::io::Result<PathBuf> {
+        let sequence = NON_PERIODIC_CHECKPOINT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let stem = format!("{prefix}-{iteration:06}-{}-{sequence}", std::process::id());
+        self.available_non_periodic_sibling_path(&stem)
+    }
+
+    fn available_non_periodic_sibling_path(&self, stem: &str) -> std::io::Result<PathBuf> {
+        let mut suffix = 0usize;
+        loop {
+            let file_name = if suffix == 0 {
+                format!("{stem}.rgscp")
+            } else {
+                format!("{stem}-{suffix}.rgscp")
+            };
+            let path = self.directory.join(file_name);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+                Err(error) => return Err(error),
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                std::io::Error::other("exhausted non-periodic checkpoint suffixes")
+            })?;
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn prune_periodic_checkpoints_with<R>(directory: &Path, mut remove: R) -> std::io::Result<()>
+where
+    R: FnMut(&Path) -> std::io::Result<()>,
+{
+    let mut last_error = None;
+    for _ in 0..MAX_CHECKPOINT_RETENTION_PASSES {
+        let periodic = scan_periodic_checkpoints(directory)?;
+        let remove_count = periodic.len().saturating_sub(3);
+        if remove_count == 0 {
+            return Ok(());
+        }
+        for (_, path) in periodic.into_iter().take(remove_count) {
+            match remove(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+    }
+
+    let remaining = scan_periodic_checkpoints(directory)?;
+    if remaining.len() <= 3 {
+        return Ok(());
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other(format!(
+            "checkpoint retention still has {} periodic files after {MAX_CHECKPOINT_RETENTION_PASSES} passes",
+            remaining.len()
+        ))
+    }))
+}
+
+#[cfg(feature = "gpu")]
+fn scan_periodic_checkpoints(directory: &Path) -> std::io::Result<Vec<(usize, PathBuf)>> {
+    let mut periodic = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(iteration) = periodic_checkpoint_iteration(&entry.file_name()) else {
+            continue;
+        };
+        periodic.push((iteration, entry.path()));
+    }
+    periodic.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(periodic)
+}
+
+#[cfg(feature = "gpu")]
+fn periodic_checkpoint_iteration(file_name: &std::ffi::OsStr) -> Option<usize> {
+    let file_name = file_name.to_str()?;
+    let digits = file_name
+        .strip_prefix("iteration-")?
+        .strip_suffix(".rgscp")?;
+    if digits.len() < 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let iteration = digits.parse::<usize>().ok()?;
+    (format!("{iteration:06}") == digits).then_some(iteration)
+}
+
+#[cfg(feature = "gpu")]
+pub(super) fn training_options(
+    args: &TrainArgs,
+    dataset: &rustscan_types::TrainingDataset,
+    config: &rustgs::TrainingConfig,
+) -> anyhow::Result<rustgs::TrainingOptions<'static>> {
+    let checkpoint_every = effective_checkpoint_every(args);
+    if checkpoint_every.is_none() && args.resume.is_none() {
+        return Ok(rustgs::TrainingOptions::default());
+    }
+
+    let reconstruction = rustgs::fingerprint_colmap_sparse_model(&args.input)?;
+    let identity =
+        rustgs::TrainingIdentity::from_canonical_content(dataset, &reconstruction, config)?;
+    let mut options = rustgs::TrainingOptions::default().with_identity(identity);
+
+    if let Some(resume_path) = &args.resume {
+        let checkpoint = rustgs::load_training_checkpoint(resume_path).with_context(|| {
+            format!("failed to load resume checkpoint {}", resume_path.display())
+        })?;
+        options = options.with_resume_checkpoint(checkpoint);
+    }
+
+    if let (Some(directory), Some(every)) = (&args.checkpoint_dir, checkpoint_every) {
+        let mut persistence = CheckpointPersistence::new(
+            directory.clone(),
+            rustgs::save_training_checkpoint
+                as fn(&Path, &rustgs::TrainingCheckpoint) -> Result<(), rustgs::TrainingError>,
+        );
+        options = options
+            .with_checkpoint_policy(rustgs::TrainingCheckpointPolicy { every: Some(every) })
+            .with_checkpoint_sink(move |ready| {
+                let outcome =
+                    persistence.persist(ready.reason, ready.iteration, &ready.checkpoint)?;
+                log::info!(
+                    "Saved {:?} training checkpoint to {}",
+                    ready.reason,
+                    outcome.path.display()
+                );
+                if let Some(warning) = outcome.retention_warning {
+                    log::warn!(
+                        "Saved {:?} training checkpoint to {}, but {}",
+                        ready.reason,
+                        outcome.path.display(),
+                        warning
+                    );
+                }
+                Ok(())
+            });
+    }
+
+    Ok(options)
+}
 
 #[cfg(feature = "gpu")]
 pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> anyhow::Result<()> {
@@ -62,7 +295,8 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
     log::info!("Frame shuffle seed: {}", config.data.frame_shuffle_seed);
     log_litegs_training_config(&config);
 
-    let training_run = rustgs::train_splats(&dataset, &config, rustgs::TrainingOptions::default())?;
+    let options = training_options(&args, &dataset, &config)?;
+    let training_run = rustgs::train_splats(&dataset, &config, options)?;
     let rustgs::TrainingRun {
         splats,
         report: training_report,
@@ -116,6 +350,7 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
 #[cfg(not(feature = "gpu"))]
 pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> anyhow::Result<()> {
     let args = effective_train_args_with_sources(args, &sources)?;
+    let _ = effective_checkpoint_every(&args);
     env_logger::Builder::new()
         .parse_filters(&args.log_level)
         .init();
@@ -1790,6 +2025,7 @@ fn ensure_sparse_initialization_points(
     );
 }
 
+#[cfg(feature = "gpu")]
 pub(super) fn maybe_write_litegs_parity_report(
     input: &Path,
     output: &Path,
@@ -1817,6 +2053,7 @@ pub(super) fn maybe_write_litegs_parity_report(
     )
 }
 
+#[cfg(feature = "gpu")]
 pub(super) fn maybe_write_litegs_parity_report_with_manifest_dir(
     input: &Path,
     output: &Path,
@@ -1964,6 +2201,7 @@ pub(super) fn maybe_write_litegs_parity_report_with_manifest_dir(
     Ok(())
 }
 
+#[cfg(feature = "gpu")]
 fn resolve_parity_reference_report_path_from_manifest_dir(
     fixture_id: &str,
     manifest_dir: &Path,
@@ -1973,6 +2211,7 @@ fn resolve_parity_reference_report_path_from_manifest_dir(
         .find_map(|path| rustgs::resolve_litegs_parity_reference_report_path(fixture_id, path))
 }
 
+#[cfg(feature = "gpu")]
 fn inferred_initialization_gaussian_count(
     dataset: &rustscan_types::TrainingDataset,
     _config: &rustgs::TrainingConfig,
@@ -1985,6 +2224,7 @@ fn inferred_initialization_gaussian_count(
     }
 }
 
+#[cfg(feature = "gpu")]
 fn gaussian_count_delta_ratio(current: Option<usize>, reference: Option<usize>) -> Option<f32> {
     match (current, reference) {
         (Some(current), Some(reference)) if reference > 0 => {
@@ -2002,4 +2242,367 @@ fn splats_have_non_finite(splats: &rustgs::HostSplats) -> bool {
         || view.rotations.iter().any(|value| !value.is_finite())
         || view.opacity_logits.iter().any(|value| !value.is_finite())
         || view.sh_coeffs.iter().any(|value| !value.is_finite())
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod checkpoint_persistence_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn write_test_checkpoint(path: &Path, checkpoint: &usize) -> io::Result<()> {
+        fs::write(path, checkpoint.to_string())
+    }
+
+    #[test]
+    fn checkpoint_persistence_retains_only_the_newest_three_periodic_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+
+        for iteration in 1..=4 {
+            persistence
+                .persist(
+                    rustgs::TrainingCheckpointReason::Periodic,
+                    iteration,
+                    &iteration,
+                )
+                .unwrap();
+        }
+
+        assert!(!temp.path().join("iteration-000001.rgscp").exists());
+        for iteration in 2..=4 {
+            assert!(temp
+                .path()
+                .join(format!("iteration-{iteration:06}.rgscp"))
+                .exists());
+        }
+    }
+
+    #[test]
+    fn checkpoint_persistence_never_prunes_non_periodic_reasons() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+
+        let pause_path = persistence
+            .persist(rustgs::TrainingCheckpointReason::Pause, 1, &1)
+            .unwrap()
+            .path;
+        let shutdown_path = persistence
+            .persist(rustgs::TrainingCheckpointReason::Shutdown, 1, &1)
+            .unwrap()
+            .path;
+        for iteration in 1..=5 {
+            persistence
+                .persist(
+                    rustgs::TrainingCheckpointReason::Periodic,
+                    iteration,
+                    &iteration,
+                )
+                .unwrap();
+        }
+
+        assert!(pause_path.exists());
+        assert!(shutdown_path.exists());
+        let pause_name = pause_path.file_name().unwrap().to_string_lossy();
+        let shutdown_name = shutdown_path.file_name().unwrap().to_string_lossy();
+        assert!(pause_name.starts_with("pause-000001-"));
+        assert!(pause_name.ends_with(".rgscp"));
+        assert!(shutdown_name.starts_with("shutdown-000001-"));
+        assert!(shutdown_name.ends_with(".rgscp"));
+    }
+
+    #[test]
+    fn checkpoint_persistence_restores_periodic_retention_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        for iteration in 1..=4 {
+            fs::write(
+                temp.path().join(format!("iteration-{iteration:06}.rgscp")),
+                iteration.to_string(),
+            )
+            .unwrap();
+        }
+        let pause_path = temp.path().join("pause-000001.rgscp");
+        let shutdown_path = temp.path().join("shutdown-000001.rgscp");
+        fs::write(&pause_path, "pause").unwrap();
+        fs::write(&shutdown_path, "shutdown").unwrap();
+
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+        persistence
+            .persist(rustgs::TrainingCheckpointReason::Periodic, 5, &5)
+            .unwrap();
+
+        for iteration in 1..=2 {
+            assert!(!temp
+                .path()
+                .join(format!("iteration-{iteration:06}.rgscp"))
+                .exists());
+        }
+        for iteration in 3..=5 {
+            assert!(temp
+                .path()
+                .join(format!("iteration-{iteration:06}.rgscp"))
+                .exists());
+        }
+        assert!(pause_path.exists());
+        assert!(shutdown_path.exists());
+    }
+
+    #[test]
+    fn checkpoint_persistence_ignores_noncanonical_periodic_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let overpadded = temp.path().join("iteration-0000001.rgscp");
+        fs::write(&overpadded, "not a canonical periodic checkpoint").unwrap();
+        for iteration in 1..=3 {
+            fs::write(
+                temp.path().join(format!("iteration-{iteration:06}.rgscp")),
+                iteration.to_string(),
+            )
+            .unwrap();
+        }
+
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+        persistence
+            .persist(rustgs::TrainingCheckpointReason::Periodic, 4, &4)
+            .unwrap();
+
+        assert!(overpadded.exists());
+        assert!(!temp.path().join("iteration-000001.rgscp").exists());
+        for iteration in 2..=4 {
+            assert!(temp
+                .path()
+                .join(format!("iteration-{iteration:06}.rgscp"))
+                .exists());
+        }
+    }
+
+    #[test]
+    fn periodic_checkpoint_names_are_canonical_at_large_iterations() {
+        assert_eq!(
+            periodic_checkpoint_iteration(std::ffi::OsStr::new("iteration-1000000.rgscp")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            periodic_checkpoint_iteration(std::ffi::OsStr::new("iteration-0000001.rgscp")),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_non_periodic_checkpoints_use_unique_paths_across_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        for reason in [
+            rustgs::TrainingCheckpointReason::Pause,
+            rustgs::TrainingCheckpointReason::Shutdown,
+        ] {
+            let first_path = {
+                let mut persistence =
+                    CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+                persistence.persist(reason, 1, &1).unwrap().path
+            };
+            let second_path = {
+                let mut persistence =
+                    CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+                persistence.persist(reason, 1, &2).unwrap().path
+            };
+
+            assert_ne!(first_path, second_path);
+            assert_eq!(fs::read_to_string(first_path).unwrap(), "1");
+            assert_eq!(fs::read_to_string(second_path).unwrap(), "2");
+        }
+        let names = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 4);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("pause-000001-"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("shutdown-000001-"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_non_periodic_path_selection_does_not_collide() {
+        let temp = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn_writer = |checkpoint: usize| {
+            let directory = temp.path().to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut persistence = CheckpointPersistence::new(
+                    directory,
+                    move |path: &Path, value: &usize| -> io::Result<()> {
+                        barrier.wait();
+                        fs::write(path, value.to_string())
+                    },
+                );
+                persistence
+                    .persist(rustgs::TrainingCheckpointReason::Pause, 1, &checkpoint)
+                    .unwrap()
+                    .path
+            })
+        };
+
+        let first = spawn_writer(1);
+        let second = spawn_writer(2);
+        let first_path = first.join().unwrap();
+        let second_path = second.join().unwrap();
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+    }
+
+    #[test]
+    fn non_periodic_sibling_probe_handles_reuse_and_ignores_temp_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let stem = "pause-000001-123-0";
+        fs::write(temp.path().join(format!("{stem}.rgscp")), "existing").unwrap();
+        fs::create_dir(temp.path().join(format!("{stem}-1.rgscp"))).unwrap();
+        fs::write(
+            temp.path().join(format!("{stem}-2.rgscp.tmp")),
+            "atomic temp",
+        )
+        .unwrap();
+        let persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+
+        let path = persistence
+            .available_non_periodic_sibling_path(stem)
+            .unwrap();
+
+        assert_eq!(path.file_name().unwrap(), "pause-000001-123-0-2.rgscp");
+    }
+
+    #[test]
+    fn duplicate_periodic_checkpoint_replaces_the_canonical_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+
+        let first_path = persistence
+            .persist(rustgs::TrainingCheckpointReason::Periodic, 1, &1)
+            .unwrap()
+            .path;
+        let second_path = persistence
+            .persist(rustgs::TrainingCheckpointReason::Periodic, 1, &2)
+            .unwrap()
+            .path;
+
+        assert_eq!(first_path, second_path);
+        assert_eq!(first_path.file_name().unwrap(), "iteration-000001.rgscp");
+        assert_eq!(fs::read_to_string(first_path).unwrap(), "2");
+    }
+
+    #[test]
+    fn committed_checkpoint_reports_retention_failure_as_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut persistence =
+            CheckpointPersistence::new(temp.path().to_path_buf(), write_test_checkpoint);
+
+        let outcome = persistence
+            .persist_with_retention(rustgs::TrainingCheckpointReason::Periodic, 1, &1, |_| {
+                Err(io::Error::other("injected retention failure"))
+            })
+            .unwrap();
+
+        assert!(outcome.path.exists());
+        assert!(outcome
+            .retention_warning
+            .as_deref()
+            .unwrap()
+            .contains("injected retention failure"));
+    }
+
+    #[test]
+    fn periodic_pruning_ignores_not_found_and_removes_later_victims() {
+        let temp = tempfile::tempdir().unwrap();
+        for iteration in 1..=5 {
+            fs::write(
+                temp.path().join(format!("iteration-{iteration:06}.rgscp")),
+                iteration.to_string(),
+            )
+            .unwrap();
+        }
+        let injected_not_found = Cell::new(false);
+
+        prune_periodic_checkpoints_with(temp.path(), |path| {
+            if !injected_not_found.replace(true) {
+                fs::remove_file(path)?;
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            fs::remove_file(path)
+        })
+        .unwrap();
+
+        let mut remaining = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            [
+                "iteration-000003.rgscp",
+                "iteration-000004.rgscp",
+                "iteration-000005.rgscp"
+            ]
+        );
+    }
+
+    #[test]
+    fn checkpoint_persistence_does_not_prune_when_save_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let retention_called = Cell::new(false);
+        let mut persistence = CheckpointPersistence::new(
+            temp.path().to_path_buf(),
+            |path: &Path, checkpoint: &usize| -> io::Result<()> {
+                if *checkpoint == 4 {
+                    return Err(io::Error::other("injected checkpoint save failure"));
+                }
+                fs::write(path, checkpoint.to_string())
+            },
+        );
+        for iteration in 1..=3 {
+            persistence
+                .persist(
+                    rustgs::TrainingCheckpointReason::Periodic,
+                    iteration,
+                    &iteration,
+                )
+                .unwrap();
+        }
+
+        let error = persistence
+            .persist_with_retention(rustgs::TrainingCheckpointReason::Periodic, 4, &4, |_| {
+                retention_called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!retention_called.get());
+        for iteration in 1..=3 {
+            assert!(temp
+                .path()
+                .join(format!("iteration-{iteration:06}.rgscp"))
+                .exists());
+        }
+        assert!(!temp.path().join("iteration-000004.rgscp").exists());
+    }
 }

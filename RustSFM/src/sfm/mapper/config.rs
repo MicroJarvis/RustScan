@@ -56,6 +56,11 @@ pub struct MapperConfig {
     pub output: PathBuf,
     pub reference: Option<PathBuf>,
     pub database: Option<PathBuf>,
+    /// Search for `database.db` beside the input images when no database is explicit.
+    ///
+    /// Explicit `database` paths are always honored. This defaults to true to
+    /// preserve the existing mapper behavior.
+    pub discover_database: bool,
     pub write_two_view_geometries: bool,
     pub ignore_database_two_view_poses: bool,
     pub write_database: bool,
@@ -75,6 +80,11 @@ pub struct MapperConfig {
     pub sift_matching: SiftMatchingOptions,
     pub max_hamming_distance: f32,
     pub local_matching: bool,
+    /// Reuse one automatically estimated camera for local image-only reconstruction.
+    ///
+    /// This is opt-in because the legacy image-only fallback assigns a camera to
+    /// each image, matching the behavior of existing callers.
+    pub single_camera: bool,
     pub local_window: usize,
     pub matching_pair_strategy: MatchingPairStrategy,
     pub experimental_sequence_heuristics: bool,
@@ -145,6 +155,7 @@ impl Default for MapperConfig {
             output: PathBuf::new(),
             reference: None,
             database: None,
+            discover_database: true,
             write_two_view_geometries: false,
             ignore_database_two_view_poses: false,
             write_database: false,
@@ -164,6 +175,7 @@ impl Default for MapperConfig {
             sift_matching: SiftMatchingOptions::default(),
             max_hamming_distance: 160.0,
             local_matching: false,
+            single_camera: false,
             local_window: 0,
             matching_pair_strategy: MatchingPairStrategy::default(),
             experimental_sequence_heuristics: false,

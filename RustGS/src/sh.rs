@@ -1,5 +1,6 @@
 pub const SH_C0: f32 = 0.282_094_8;
 
+#[cfg(feature = "gpu")]
 pub const fn sh_coeff_count_for_degree(degree: usize) -> usize {
     (degree + 1) * (degree + 1)
 }

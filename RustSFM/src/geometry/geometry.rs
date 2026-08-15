@@ -1,7 +1,8 @@
+use crate::gpu::WgpuGeometryTiming;
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::WgpuModelScorer;
 #[cfg(feature = "gpu-wgpu")]
-use crate::two_view::estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu;
+use crate::two_view::estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu_profiled;
 use crate::two_view::{
     essential_to_fundamental, estimate_calibrated_two_view_with_observations_rays_and_cameras,
     squared_sampson_error, triangulate_world_point, TwoViewOptions,
@@ -197,6 +198,7 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         min_triangulated,
         options,
         PairGeometryScoringBackend::Cpu(std::marker::PhantomData),
+        None,
     )
     .expect("CPU pair-geometry scoring backend is infallible")
 }
@@ -218,7 +220,43 @@ pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu(
     min_triangulated: usize,
     options: PairEstimationOptions,
 ) -> Result<Option<PairGeometry>> {
-    estimate_pair_geometry_with_options_and_cameras_impl(
+    estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
+        scorer,
+        left_idx,
+        right_idx,
+        left,
+        right,
+        matches,
+        left_camera,
+        right_camera,
+        essential_threshold,
+        essential_iterations,
+        min_inliers,
+        min_triangulated,
+        options,
+    )
+    .map(|(geometry, _)| geometry)
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
+    scorer: &WgpuModelScorer,
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+    options: PairEstimationOptions,
+) -> Result<(Option<PairGeometry>, WgpuGeometryTiming)> {
+    let mut timing = WgpuGeometryTiming::default();
+    let geometry = estimate_pair_geometry_with_options_and_cameras_impl(
         left_idx,
         right_idx,
         left,
@@ -232,7 +270,9 @@ pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu(
         min_triangulated,
         options,
         PairGeometryScoringBackend::Wgpu(scorer),
-    )
+        Some(&mut timing),
+    )?;
+    Ok((geometry, timing))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -250,6 +290,7 @@ fn estimate_pair_geometry_with_options_and_cameras_impl(
     min_triangulated: usize,
     options: PairEstimationOptions,
     scoring_backend: PairGeometryScoringBackend<'_>,
+    _gpu_timing: Option<&mut WgpuGeometryTiming>,
 ) -> Result<Option<PairGeometry>> {
     if matches.len() < min_inliers.max(8) {
         return Ok(None);
@@ -337,18 +378,23 @@ fn estimate_pair_geometry_with_options_and_cameras_impl(
         }
         #[cfg(feature = "gpu-wgpu")]
         PairGeometryScoringBackend::Wgpu(scorer) => {
-            estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu(
-                scorer,
-                &norm_left,
-                &norm_right,
-                &obs_left_px,
-                &obs_right_px,
-                Some(&ray_left),
-                Some(&ray_right),
-                left_camera,
-                right_camera,
-                &two_view_options,
-            )?
+            let (estimate, timing) =
+                estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu_profiled(
+                    scorer,
+                    &norm_left,
+                    &norm_right,
+                    &obs_left_px,
+                    &obs_right_px,
+                    Some(&ray_left),
+                    Some(&ray_right),
+                    left_camera,
+                    right_camera,
+                    &two_view_options,
+                )?;
+            if let Some(total) = _gpu_timing {
+                *total += timing;
+            }
+            estimate
         }
     };
     let Some(estimate) = estimate else {
@@ -1074,8 +1120,167 @@ pub fn mean_pair_reprojection_error_with_cameras(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "gpu-wgpu")]
+    fn synthetic_geometry_frame(id: usize, points: &[[f32; 2]]) -> ImageFrame {
+        ImageFrame {
+            id,
+            name: format!("image-{id}.jpg"),
+            path: std::path::PathBuf::from(format!("image-{id}.jpg")),
+            width: 640,
+            height: 480,
+            keypoints: points
+                .iter()
+                .map(|point| rustslam::KeyPoint::new(point[0], point[1]))
+                .collect(),
+            descriptors: rustslam::Descriptors::new(),
+            sift: crate::sift::SiftFeatures::default(),
+            wide_descriptors: crate::wide::WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            },
+            strong_feature_indices: Vec::new(),
+            colors: vec![[128, 128, 128]; points.len()],
+        }
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn assert_pair_geometry_equal(
+        compatibility: &Option<PairGeometry>,
+        profiled: &Option<PairGeometry>,
+    ) {
+        match (compatibility, profiled) {
+            (None, None) => {}
+            (Some(left), Some(right)) => {
+                assert_eq!(left.left, right.left);
+                assert_eq!(left.right, right.right);
+                assert_eq!(left.two_view_config, right.two_view_config);
+                assert_eq!(left.f_matrix, right.f_matrix);
+                assert_eq!(left.e_matrix, right.e_matrix);
+                assert_eq!(left.h_matrix, right.h_matrix);
+                assert_eq!(left.qvec, right.qvec);
+                assert_eq!(left.tvec, right.tvec);
+                let match_records = |values: &[Match]| {
+                    values
+                        .iter()
+                        .map(|value| (value.query_idx, value.train_idx, value.distance.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(match_records(&left.matches), match_records(&right.matches));
+                assert_eq!(
+                    match_records(&left.inlier_matches),
+                    match_records(&right.inlier_matches)
+                );
+                assert_eq!(
+                    left.relative_pose.quaternion(),
+                    right.relative_pose.quaternion()
+                );
+                assert_eq!(
+                    left.relative_pose.translation(),
+                    right.relative_pose.translation()
+                );
+                assert_eq!(left.inliers, right.inliers);
+                assert_eq!(left.triangulated, right.triangulated);
+                assert_eq!(
+                    left.mean_reprojection_error_px,
+                    right.mean_reprojection_error_px
+                );
+                assert_eq!(left.rotation_deg, right.rotation_deg);
+                assert_eq!(
+                    left.median_triangulation_angle_deg,
+                    right.median_triangulation_angle_deg
+                );
+                assert_eq!(left.pose_graph_only, right.pose_graph_only);
+            }
+            _ => panic!("profiled and compatibility geometry presence differed"),
+        }
+    }
+
     #[test]
     fn pair_estimation_options_default_to_colmap_nondeterministic_seed() {
         assert_eq!(PairEstimationOptions::default().ransac_random_seed, -1);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_geometry_profiled_matches_compatibility_entry_point() -> anyhow::Result<()> {
+        let Some(context) = crate::gpu::WgpuContext::try_new_optional()? else {
+            eprintln!("skipping profiled GPU geometry test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let rotation = nalgebra::Rotation3::from_euler_angles(0.03, -0.04, 0.02).into_inner();
+        let translation = Vector3::new(0.2, -0.03, 0.05);
+        let mut left_points = Vec::new();
+        let mut right_points = Vec::new();
+        for index in 0..24 {
+            let point = Vector3::new(
+                (index % 6) as f64 * 0.25 - 0.6,
+                (index / 6) as f64 * 0.22 - 0.35,
+                3.0 + (index % 5) as f64 * 0.35,
+            );
+            let left = camera
+                .img_from_cam(point.x, point.y, point.z)
+                .expect("left projection");
+            let transformed = rotation * point + translation;
+            let mut right = camera
+                .img_from_cam(transformed.x, transformed.y, transformed.z)
+                .expect("right projection");
+            if index >= 20 {
+                right[0] += 200.0 + 25.0 * (index - 20) as f64;
+                right[1] -= 150.0;
+            }
+            left_points.push([left[0] as f32, left[1] as f32]);
+            right_points.push([right[0] as f32, right[1] as f32]);
+        }
+        let left = synthetic_geometry_frame(0, &left_points);
+        let right = synthetic_geometry_frame(1, &right_points);
+        let matches = (0..left_points.len())
+            .map(|index| Match {
+                query_idx: index as u32,
+                train_idx: index as u32,
+                distance: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let options = PairEstimationOptions {
+            ransac_random_seed: 17,
+            refine_sampson: false,
+            expand_dense_inliers: false,
+            use_five_point: false,
+            ..PairEstimationOptions::default()
+        };
+
+        let compatibility = estimate_pair_geometry_with_options_and_cameras_gpu(
+            &scorer, 0, 1, &left, &right, &matches, camera, camera, 4.0, 256, 15, 8, options,
+        )?;
+        let (profiled, timing) = estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
+            &scorer, 0, 1, &left, &right, &matches, camera, camera, 4.0, 256, 15, 8, options,
+        )?;
+
+        assert_pair_geometry_equal(&compatibility, &profiled);
+        for stage in [timing.essential, timing.fundamental, timing.homography] {
+            assert!(stage.session_prepare_seconds.is_finite());
+            assert!(stage.session_prepare_seconds >= 0.0);
+            assert!(stage.candidate_generation_seconds.is_finite());
+            assert!(stage.candidate_generation_seconds >= 0.0);
+            assert!(stage.cpu_refinement_seconds.is_finite());
+            assert!(stage.cpu_refinement_seconds >= 0.0);
+            for seconds in [
+                stage.scorer.buffer_prepare_seconds,
+                stage.scorer.submit_seconds,
+                stage.scorer.readback_total_seconds,
+                stage.scorer.readback_copy_submit_seconds,
+                stage.scorer.readback_wait_seconds,
+                stage.scorer.readback_map_decode_seconds,
+            ] {
+                assert!(seconds.is_finite());
+                assert!(seconds >= 0.0);
+            }
+        }
+        assert!(timing.essential.scorer.score_calls > 0);
+        assert!(timing.fundamental.scorer.score_calls > 0);
+        assert!(timing.homography.scorer.score_calls > 0);
+        Ok(())
     }
 }
