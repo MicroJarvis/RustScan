@@ -1,6 +1,6 @@
 # RustScan Architecture
 
-**Updated:** 2026-08-14
+**Updated:** 2026-08-15
 
 ## Overview
 
@@ -37,8 +37,8 @@ RustScan 是一个多 crate 的 3D 重建工作区。RustSFM、RustViewer 和 Ru
 - `rustgs::runtime_from_splats`
 - `rustgs::save_splats_ply`
 - `rustgs::load_splats_ply`
-- `rustgs::metal_available`
-- `rustgs::run_metal_training_benchmark`
+- `rustgs::gpu_available`
+- `rustgs::TrainingCheckpoint` and `rustgs::SharedWgpuContext`
 - CLI `rustgs train`
 
 已经删除的 legacy public surface 不再属于架构契约：
@@ -56,57 +56,48 @@ RustScan 是一个多 crate 的 3D 重建工作区。RustSFM、RustViewer 和 Ru
 RustGS 当前的 splat 表示是分层但单向的：
 
 - `TrainingDataset`: 输入训练样本。
-- `training::HostSplats`: host 侧 SoA 边界类型，用于初始化、checkpoint、PLY 导入导出。
-- `diff::Splats`: device/runtime 侧可微训练状态，是 step loop 的 canonical owner。
-- `training::SplatView`: host 侧只读借用视图。
+- `HostSplats`: host 侧 SoA 边界类型，用于初始化、checkpoint、PLY 导入导出。
+- `training::engine::DeviceSplats`: GPU step loop 中的可微内部状态；不构成 public API。
+- `TrainingCheckpoint`: 可恢复训练的持久化边界，包含 `HostSplats`、optimizer 和 topology 状态。
+- `SplatView`: `HostSplats` 的 host 侧只读借用视图。
 
 `render::Gaussian` 仍然存在，但它只是 CPU renderer / 测试 / 局部兼容路径的 AoS 适配类型，不再是 RustGS 核心 ownership 模型的一部分。
 
 ### Data and Initialization
 
-- `data_loading.rs`: `TrainingDataset` 到训练载荷的转换。
-- `frame_loader.rs`: 帧解码与缓存。
-- `init_map.rs`: 稀疏点或帧驱动初始化。
-- `chunk_planner.rs`: chunk planning 与 per-chunk 数据集物化。
-- `splats.rs`: `HostSplats`、`SplatView` 以及 host/device 边界能力。
-- `splat_interop.rs`: `HostSplats <-> render::Gaussian` 适配，仅保留必要兼容桥接。
+- `training/data/frame_loader.rs`: 帧解码、缓存和预取。
+- `training/data/frame_targets.rs`: 训练目标准备。
+- `training/data/init_map.rs`: 从稀疏点或帧初始化 `HostSplats`。
+- `training/engine/splats.rs`: `HostSplats` 与内部 `DeviceSplats` 的显式上传/读回边界。
+- `core`: `HostSplats`、`SplatView`、相机和其他训练中立的数据类型。
 
 ### Execution Planning
 
-`RustGS/src/training/mod.rs` 已经缩成训练装配层，活跃逻辑分散到更窄的模块：
+`RustGS/src/training/mod.rs` 负责 public re-export 与训练入口；实际执行由
+`training/engine` 装配：
 
-- `config.rs`: `TrainingConfig`、`TrainingProfile`、LiteGS 配置。
-- `orchestrator.rs`: `train_splats()` 路由。
-- `execution_plan.rs`: standard / chunked route 选择。
-- `chunk_training.rs`: sequential chunk 执行。
-- `export.rs`: chunk artifact / report 持久化。
+- `config.rs`: `TrainingConfig`、`TrainingBackend::Wgpu` 和 LiteGS 配置。
+- `events.rs`: 训练进度、暂停、取消、snapshot 与 checkpoint 事件边界。
+- `checkpoint.rs`: 版本化 checkpoint 和训练 identity 校验。
+- `engine/runtime.rs`: `train_splats()` 的运行时编排、frame 顺序和 resume 流程。
+- `engine/trainer.rs`: 训练 step、snapshot、topology 累积和 telemetry。
+- `engine/optimizer.rs` 与 `engine/loss.rs`: Adam 状态及损失计算。
 
 ### Step Execution and Runtime
 
-Metal 训练路径已经拆成显式子模块：
+GPU 渲染与梯度路径按前向/反向阶段拆分：
 
-- `metal_forward.rs`
-- `metal_loss.rs`
-- `metal_backward.rs`
-- `metal_optimizer.rs`
-- `metal_trainer.rs`
-
-Metal runtime 也已经从单体模块拆解为：
-
-- `metal_kernels.rs`
-- `metal_pipelines.rs`
-- `metal_resources.rs`
-- `metal_dispatch.rs`
-- `metal_projection.rs`
-- `metal_raster.rs`
-- `metal_runtime.rs`
+- `forward/`: projection、visibility compaction、tile mapping、sorting 和 rasterization。
+- `backward/`: rasterization/projection 的反向传播与 Burn autodiff 接入。
+- `gpu_primitives/`: radix sort 与 prefix sum。
+- `engine/backend.rs`: Burn/CubeCL wgpu backend 类型与 device 绑定。
 
 ### Topology and Evaluation
 
-- `topology.rs`: densify / prune / opacity reset 调度与 mutation。
-- `density_controller.rs`: LiteGS reference/parity adapter。
-- `parity_harness.rs`: LiteGS parity gate 与对照报告。
-- `eval.rs`: PSNR、evaluation summary、post-train 评估。
+- `topology/`: densify、prune、opacity reset 的调度、选择、snapshot 和 mutation。
+- `evaluation/core.rs`: PSNR、evaluation summary、GPU renderer 和共享 wgpu context。
+- `evaluation/parity.rs`: LiteGS fixture、threshold、comparison 与 gate。
+- `reporting/`: training metrics、parity telemetry 与最后一次训练 telemetry。
 
 ### Removed Legacy Structure
 
@@ -120,17 +111,18 @@ Metal runtime 也已经从单体模块拆解为：
 
 ## Current Architectural Constraints
 
-- RustGS 仍然是 Metal-first 训练后端，没有引入多后端抽象。
-- 用户侧默认训练 profile 已经收口到 `LiteGsMacV1` 语义；legacy 只体现在 removed-surface 说明与显式拒绝旧 flag 的测试上，不再体现在活跃实现里。
+- RustGS 的唯一训练后端是 Burn/CubeCL 上的 wgpu；macOS 通过 wgpu 选择 Metal adapter，而不是维护一套独立的 Metal runtime。
+- `TrainingBackend` 只保留 `Wgpu`，用于兼容既有配置构造方式。
+- 旧 JSON checkpoint 仍通过显式的 `legacy` namespace 与 deprecated alias 提供读取兼容；可恢复 checkpoint 使用版本化的 `TrainingCheckpoint`。
 - 训练核心已经是 SoA，但评估/CPU renderer 周边仍有少量 `Gaussian` AoS 适配层。
 - 质量侧工作仍未结束，TUM PSNR、scene-scale-aware normalization、parity gate 仍是后续重点。
 
-## Canonical Companion Docs
+## Companion Docs
 
 - [current-project-status.md](current-project-status.md)
+- [../RustGS/README.md](../RustGS/README.md)
 - [../RustSFM/README.md](../RustSFM/README.md)
 - [../RustSFM/PARITY_ROADMAP.md](../RustSFM/PARITY_ROADMAP.md)
-- [plans/2026-04-06-rustgs-refactor-guardrails.md](plans/2026-04-06-rustgs-refactor-guardrails.md)
-- [../RustGS/docs/plans/2026-04-09-rustgs-soa-splat-architecture-proposal.md](../RustGS/docs/plans/2026-04-09-rustgs-soa-splat-architecture-proposal.md)
-- [plans/2026-04-05-litegs-parity-roadmap-refresh.md](plans/2026-04-05-litegs-parity-roadmap-refresh.md)
-- [RustGS-TUM-Profile-Comparison-2026-04-06.md](RustGS-TUM-Profile-Comparison-2026-04-06.md)
+
+The dated RustGS design and benchmark documents listed in `docs/index.md` are
+historical evidence. They do not define the current module layout or public API.

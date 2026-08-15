@@ -1,8 +1,8 @@
 # RustScan Documentation Index
 
-**Updated:** 2026-08-14
+**Updated:** 2026-08-15
 
-此索引列出当前仍作为执行、验证或状态依据的文档。历史计划可能仍保留在 `docs/superpowers/` 供追溯，但不替代下列当前入口。
+此索引先列出当前作为执行、验证或状态依据的文档；带日期的设计、计划和实验记录仅在其仍有审计价值时保留，不替代当前入口。
 
 ## Canonical Status Docs
 
@@ -18,19 +18,27 @@
 | [../RustSFM/README.md](../RustSFM/README.md) | RustSFM build, test, optional parity-fixture, and CLI entry points |
 | [../RustSFM/PARITY_ROADMAP.md](../RustSFM/PARITY_ROADMAP.md) | COLMAP parity status and remaining numerical work |
 | [../RustSFM/COLMAP_COMPAT_TODO.md](../RustSFM/COLMAP_COMPAT_TODO.md) | COLMAP compatibility backlog |
-| [superpowers/plans/2026-08-14-rustsfm-review-hardening.md](superpowers/plans/2026-08-14-rustsfm-review-hardening.md) | Current RustSFM output, build, CI, and GPU error-handling hardening |
 
-## Active RustGS Docs
+## Historical RustSFM Records
 
 | Document | Purpose |
 |---|---|
-| [plans/2026-04-06-rustgs-refactor-guardrails.md](plans/2026-04-06-rustgs-refactor-guardrails.md) | 当前 public surface、回归基线与 guardrail 命令 |
-| [../RustGS/docs/plans/2026-04-09-rustgs-soa-splat-architecture-proposal.md](../RustGS/docs/plans/2026-04-09-rustgs-soa-splat-architecture-proposal.md) | RustGS 当前唯一的 splat 表示设计文档与收口状态 |
-| [plans/2026-04-05-litegs-parity-roadmap-refresh.md](plans/2026-04-05-litegs-parity-roadmap-refresh.md) | 当前剩余 LiteGS parity 工作与优先级 |
-| [RustGS-TUM-Profile-Comparison-2026-04-06.md](RustGS-TUM-Profile-Comparison-2026-04-06.md) | 当前有效的 TUM 训练对照记录与 topology-freeze 决策依据 |
-| [rustgs-benchmark-datasets.md](rustgs-benchmark-datasets.md) | RustGS 下一批公开训练/评测数据集、准备脚本与运行口径 |
+| [superpowers/plans/2026-08-14-rustsfm-review-hardening.md](superpowers/plans/2026-08-14-rustsfm-review-hardening.md) | Completed build, output, CI, and GPU error-handling hardening record |
+
+## Current RustGS Docs
+
+| Document | Purpose |
+|---|---|
+| [../RustGS/README.md](../RustGS/README.md) | build、test、CLI 与 artifact contract |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | 当前 wgpu training module layout、public surface 和 ownership boundary |
+
+The dated RustGS TUM benchmark and dataset-research records remain outside the
+maintained entry set. Read them only as historical evidence and verify every
+command against the current RustGS CLI.
 
 ## Retention Rule
 
 - 当前文档必须明确命令前提、外部夹具和验证日期。
 - 历史设计记录不构成当前 API、测试或 workspace 状态的权威来源。
+- `docs/plans/`、`docs/reviews/`、`docs/superpowers/` 中的日期文档只有在仍有
+  审计价值时保留；完成或被后续设计取代的文档不再作为入口引用。
