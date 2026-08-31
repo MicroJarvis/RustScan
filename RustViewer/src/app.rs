@@ -1772,7 +1772,7 @@ fn draw_ground_pick_overlay(
     for point in &ground_pick.points {
         if let Some(screen) = world_to_screen(camera, viewport_rect, *point) {
             painter.circle_filled(screen, 5.0, Color32::from_rgb(48, 209, 88));
-            painter.circle_stroke(screen, 7.0, egui::Stroke::new(1.5, Color32::BLACK));
+            painter.circle_stroke(screen, 7.0, egui::Stroke::new(1.5_f32, Color32::BLACK));
         }
     }
 }
