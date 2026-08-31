@@ -705,7 +705,7 @@ fn draw_secondary_button(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
     ui.painter().rect_stroke(
         rect,
         6.0,
-        egui::Stroke::new(1.0, SEPARATOR),
+        egui::Stroke::new(1.0_f32, SEPARATOR),
         egui::StrokeKind::Outside,
     );
 
@@ -771,7 +771,7 @@ fn draw_layer_toggle(ui: &mut egui::Ui, checked: &mut bool, label: &str, color: 
         ui.painter().rect_stroke(
             checkbox_rect,
             4.0,
-            egui::Stroke::new(1.0, SYSTEM_GRAY),
+            egui::Stroke::new(1.0_f32, SYSTEM_GRAY),
             egui::StrokeKind::Outside,
         );
     }
