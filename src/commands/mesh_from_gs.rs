@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use clap::Args;
 use glam::{Mat4, Vec3};
-use rustgs::{GaussianCamera, GaussianRenderer, HostSplats};
+use rustgs::{EvaluationDevice, GaussianCamera, HostSplats, SplatEvaluationRenderer};
 use rustmesh::RustMesh;
 use rustscan_types::{Intrinsics, ScenePose, TrainingDataset, SE3};
 use rustslam::fusion::{Mesh, MeshExtractionConfig, MeshExtractor, TsdfConfig};
@@ -139,7 +139,13 @@ pub fn run_mesh_from_gs(args: MeshFromGsArgs) -> anyhow::Result<()> {
         render_width as u32,
         render_height as u32,
     );
-    let renderer = GaussianRenderer::new(render_width, render_height);
+    let mut renderer = SplatEvaluationRenderer::new(
+        render_width,
+        render_height,
+        EvaluationDevice::Gpu,
+        rustgs::DEFAULT_RASTER_COV_BLUR,
+    )
+    .map_err(anyhow::Error::from)?;
     let selected_poses = selected_poses(&dataset, args.view_stride, args.max_views);
 
     log::info!(
@@ -161,9 +167,21 @@ pub fn run_mesh_from_gs(args: MeshFromGsArgs) -> anyhow::Result<()> {
     let mut integrated = 0usize;
     for pose in selected_poses {
         let camera = GaussianCamera::new(scaled_intrinsics, pose.pose.inverse());
-        let (depth, color) = renderer
-            .render_depth_and_color_splats(&splats, &camera)
+        let rendered = renderer
+            .render_with_depth(&splats, &camera)
             .with_context(|| format!("failed to render depth for frame {}", pose.frame_id))?;
+        let color: Vec<[u8; 3]> = rendered
+            .color
+            .chunks_exact(3)
+            .map(|rgb| {
+                [
+                    (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                ]
+            })
+            .collect();
+        let depth = rendered.depth;
         if depth.iter().all(|value| *value <= 0.0) {
             log::warn!("frame {} rendered no valid depth; skipping", pose.frame_id);
             continue;

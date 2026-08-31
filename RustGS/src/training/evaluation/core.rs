@@ -362,6 +362,16 @@ pub struct SplatEvaluationRenderer {
     backend: SplatEvaluationRendererBackend,
 }
 
+/// GPU-rendered RGB and depth buffers for one splat camera view.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplatEvaluationRenderOutput {
+    /// RGB pixels in row-major order, normalized to the range [0, 1].
+    pub color: Vec<f32>,
+    /// Positive camera-space depth for covered pixels, with zero for the background.
+    pub depth: Vec<f32>,
+}
+
 #[cfg(feature = "gpu")]
 enum SplatEvaluationRendererBackend {
     Gpu(GpuSplatEvaluationRenderer),
@@ -468,8 +478,19 @@ impl SplatEvaluationRenderer {
         splats: &HostSplats,
         camera: &GaussianCamera,
     ) -> Result<Vec<f32>, SplatEvaluationError> {
+        Ok(self.render_with_depth(splats, camera)?.color)
+    }
+
+    /// Render RGB and depth buffers from the same GPU splat pass.
+    pub fn render_with_depth(
+        &mut self,
+        splats: &HostSplats,
+        camera: &GaussianCamera,
+    ) -> Result<SplatEvaluationRenderOutput, SplatEvaluationError> {
         match &mut self.backend {
-            SplatEvaluationRendererBackend::Gpu(renderer) => renderer.render(splats, camera),
+            SplatEvaluationRendererBackend::Gpu(renderer) => {
+                renderer.render_with_depth(splats, camera)
+            }
         }
     }
 }
@@ -514,11 +535,11 @@ impl GpuSplatEvaluationRenderer {
         })
     }
 
-    fn render(
+    fn render_with_depth(
         &mut self,
         splats: &HostSplats,
         camera: &GaussianCamera,
-    ) -> Result<Vec<f32>, SplatEvaluationError> {
+    ) -> Result<SplatEvaluationRenderOutput, SplatEvaluationError> {
         self.ensure_device_splats(splats);
         let cached = self.cached_splats.as_ref().ok_or_else(|| {
             SplatEvaluationError::InvalidInput("gpu splat cache was not initialized".to_string())
@@ -538,7 +559,7 @@ impl GpuSplatEvaluationRenderer {
             })?,
         );
 
-        self.runtime.block_on(render_gpu_rgb_f32(
+        self.runtime.block_on(render_gpu_color_and_depth(
             &cached.splats,
             camera,
             img_size,
@@ -566,13 +587,13 @@ impl GpuSplatEvaluationRenderer {
 }
 
 #[cfg(feature = "gpu")]
-async fn render_gpu_rgb_f32(
+async fn render_gpu_color_and_depth(
     splats: &DeviceSplats<GsBackendBase>,
     camera: &GaussianCamera,
     img_size: (u32, u32),
     device: &<GsBackendBase as Backend>::Device,
     raster_cov_blur: f32,
-) -> Result<Vec<f32>, SplatEvaluationError> {
+) -> Result<SplatEvaluationRenderOutput, SplatEvaluationError> {
     let rendered = forward::render_forward::<GsBackendBase>(
         splats,
         camera,
@@ -603,12 +624,32 @@ async fn render_gpu_rgb_f32(
         )));
     }
 
+    let depth = rendered
+        .depth
+        .into_data_async()
+        .await
+        .map_err(|err| {
+            SplatEvaluationError::InvalidInput(format!("gpu depth readback failed: {err}"))
+        })?
+        .into_vec::<f32>()
+        .map_err(|err| {
+            SplatEvaluationError::InvalidInput(format!("gpu depth output was not f32: {err}"))
+        })?;
+    let expected_depth = img_size.0 as usize * img_size.1 as usize;
+    if depth.len() != expected_depth {
+        return Err(SplatEvaluationError::InvalidInput(format!(
+            "gpu depth output length {} does not match expected {}",
+            depth.len(),
+            expected_depth
+        )));
+    }
+
     let mut rgb = Vec::with_capacity(img_size.0 as usize * img_size.1 as usize * 3);
     for px in rgba.chunks_exact(4) {
         rgb.extend_from_slice(&px[..3]);
     }
 
-    Ok(rgb)
+    Ok(SplatEvaluationRenderOutput { color: rgb, depth })
 }
 
 #[cfg(feature = "gpu")]
@@ -631,6 +672,21 @@ pub fn render_evaluation_frame(
     let camera = scaled_camera_for_pose(pose.pose, dataset.intrinsics, render_width, render_height);
     let rendered = renderer.render(trainable, &camera)?;
     Ok((target, rendered))
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluation_renderer_exposes_color_and_depth_frame_api() {
+        let _render: fn(
+            &mut SplatEvaluationRenderer,
+            &HostSplats,
+            &GaussianCamera,
+        ) -> Result<SplatEvaluationRenderOutput, SplatEvaluationError> =
+            SplatEvaluationRenderer::render_with_depth;
+    }
 }
 
 #[cfg(feature = "gpu")]

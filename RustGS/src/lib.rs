@@ -95,7 +95,9 @@ pub use crate::training::{
     TrainingSnapshotReady,
 };
 #[cfg(feature = "gpu")]
-pub use crate::training::{SharedWgpuContext, SplatEvaluationRenderer};
+pub use crate::training::{
+    SharedWgpuContext, SplatEvaluationRenderOutput, SplatEvaluationRenderer,
+};
 pub use crate::training::{TrainingBackend, TrainingConfig, TrainingResult};
 #[cfg(feature = "gpu")]
 pub use crate::viewport::{BurnViewportDepth, BurnViewportRenderer, BurnViewportResolution};
