@@ -52,7 +52,7 @@ pub use evaluation::{
     evaluate_splats, evaluation_device, render_evaluation_frame, runtime_from_splats,
 };
 #[cfg(feature = "gpu")]
-pub use evaluation::{SharedWgpuContext, SplatEvaluationRenderer};
+pub use evaluation::{SharedWgpuContext, SplatEvaluationRenderOutput, SplatEvaluationRenderer};
 #[cfg(feature = "gpu")]
 pub use events::{
     TrainingCheckpointPolicy, TrainingCheckpointReady, TrainingCheckpointReason,
