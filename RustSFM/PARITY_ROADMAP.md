@@ -14,6 +14,17 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
 - [ ] Versioned source and opt-in CI provisioning for `test_data/flowers2_colmap`;
       the fixture is not distributed by Git or submodules and its tests are
       ignored by default
+  - 2026-08-31: local provisioning is now pinned by
+    `scripts/provision_flowers2_colmap_fixture.sh` (SHA-256-verified copy of
+    the 2026-06-30 archived COLMAP text export). The external hosted source and
+    opt-in CI fetch remain open.
+  - 2026-08-31 measured ignored suite: `17 passed; 2 failed`.
+    The failures are deterministic and fixture-independent:
+    `real_colmap_sparse_seed_mapper_pnp_prior_global_ba_skips_normalization` and
+    `real_colmap_sparse_seed_mapper_pnp_survives_scheduled_global_ba` expect a
+    `global_ba reason=scheduled` log entry that the mapper does not emit under
+    the test configuration (only `initial`/`final` fire). This is the known
+    BA-orchestration gap tracked below.
 
 ## Phase 1 — Sparse SfM core → 100% (in progress)
 

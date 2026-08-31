@@ -44,9 +44,11 @@ cargo test -p rustsfm --lib --no-default-features
 The `real_colmap_sparse_*` parity tests require a compatible external
 `test_data/flowers2_colmap` 24-image sparse fixture. That fixture is not part
 of the repository or its submodules, so these tests are ignored by default.
-After provisioning it at the workspace root, run them explicitly with:
+Provision it from the archived COLMAP text export with the pinned-provenance
+script (content is verified by SHA-256), then run the tests explicitly with:
 
 ```bash
+./scripts/provision_flowers2_colmap_fixture.sh
 cargo test -p rustsfm --lib -- --ignored
 ```
 Incremental registration is absolute-pose driven with COLMAP-style next-image
