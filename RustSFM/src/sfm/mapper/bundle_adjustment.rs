@@ -1,4 +1,5 @@
 use super::*;
+use rustslam::loop_closing::detector::compute_sim3_from_matches;
 use std::fmt;
 
 pub(super) fn global_reconstruction_options_from_config(
@@ -764,4 +765,281 @@ pub(super) fn expand_images_to_registration_frames(
     expanded.sort_unstable();
     expanded.dedup();
     expanded
+}
+
+/// Similarity transform (Sim3) `p' = scale * rotation * p + translation`,
+/// mirroring COLMAP's `Sim3d` alignment primitive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct PosePriorAlignment {
+    pub scale: f32,
+    pub rotation: glam::Mat3,
+    pub translation: glam::Vec3,
+}
+
+impl PosePriorAlignment {
+    pub fn transform_pose(&self, pose: SE3) -> SE3 {
+        // Pipeline poses are stored camera_from_world (projection applies
+        // `pose.transform_point` directly). Apply the world similarity to the
+        // inverse (world_from_camera) and invert back, so that
+        // `transform_pose(pose).transform_point(transform_point(p))` equals the
+        // camera-frame coordinates of `p` scaled by the similarity.
+        let world_from_camera = pose.inverse();
+        let rotation = glam::Quat::from_mat3(&self.rotation)
+            * glam::Quat::from_array(world_from_camera.quaternion());
+        let translation = self.scale
+            * (self.rotation * glam::Vec3::from_array(world_from_camera.translation()))
+            + self.translation;
+        SE3::from_quat_translation(rotation, translation).inverse()
+    }
+
+    pub fn transform_point(&self, point: glam::Vec3) -> glam::Vec3 {
+        self.scale * (self.rotation * point) + self.translation
+    }
+}
+
+/// COLMAP `PosePriorBundleAdjuster::AlignReconstruction`: estimate the Sim3
+/// that maps the registered camera centers onto their pose-prior positions and
+/// apply it to the reconstruction so the pose-prior bundle adjustment solves
+/// in the prior (metric) frame. Requires at least three registered priors,
+/// like COLMAP's `AlignReconstructionToPosePriors`.
+pub(super) fn align_reconstruction_to_pose_priors(
+    reconstruction: &mut Reconstruction,
+    priors: &[crate::ba::BundleAdjustmentPosePrior],
+    random_seed: i32,
+) -> Option<PosePriorAlignment> {
+    let mut src = Vec::new();
+    let mut tgt = Vec::new();
+    for prior in priors {
+        let Some(pose) = reconstruction.poses.get(prior.image).copied().flatten() else {
+            continue;
+        };
+        src.push(camera_center(pose));
+        tgt.push(glam::Vec3::new(
+            prior.position[0] as f32,
+            prior.position[1] as f32,
+            prior.position[2] as f32,
+        ));
+    }
+    if src.len() < 3 {
+        return None;
+    }
+    let max_error = pose_prior_alignment_max_error(priors)?;
+    let transform = estimate_sim3_robust(&src, &tgt, max_error, random_seed)?;
+    for pose in reconstruction.poses.iter_mut().flatten() {
+        *pose = transform.transform_pose(*pose);
+    }
+    for point in reconstruction.points.iter_mut() {
+        point.xyz = transform
+            .transform_point(glam::Vec3::from_array(point.xyz))
+            .to_array();
+    }
+    for frame in reconstruction.frames.iter_mut() {
+        frame.rig_from_world =
+            Rigid3::from_se3(transform.transform_pose(frame.rig_from_world.to_se3()));
+    }
+    Some(transform)
+}
+
+/// COLMAP `PosePriorBundleAdjuster::AlignReconstruction` max-error derivation:
+/// when the RANSAC `max_error` is unset it is derived from the median RMS
+/// variance of the valid prior covariances, scaled to a 95% chi-square radius
+/// with three degrees of freedom.
+fn pose_prior_alignment_max_error(priors: &[crate::ba::BundleAdjustmentPosePrior]) -> Option<f32> {
+    let mut rms_vars = priors
+        .iter()
+        .filter(|prior| {
+            prior
+                .position_covariance
+                .iter()
+                .all(|value| value.is_finite())
+                && prior.position_covariance[0] > 0.0
+                && prior.position_covariance[4] > 0.0
+                && prior.position_covariance[8] > 0.0
+        })
+        .map(|prior| {
+            (prior.position_covariance[0]
+                + prior.position_covariance[4]
+                + prior.position_covariance[8])
+                / 3.0
+        })
+        .collect::<Vec<_>>();
+    if rms_vars.is_empty() {
+        return None;
+    }
+    rms_vars.sort_by(f64::total_cmp);
+    let median = rms_vars[rms_vars.len() / 2];
+    const CHI_SQUARE_95_3DOF: f64 = 7.814_727_9;
+    let max_error = (CHI_SQUARE_95_3DOF * median).max(0.0).sqrt();
+    if !max_error.is_finite() || max_error <= 0.0 {
+        return None;
+    }
+    Some(max_error as f32)
+}
+
+fn estimate_sim3_robust(
+    src: &[glam::Vec3],
+    tgt: &[glam::Vec3],
+    max_error: f32,
+    random_seed: i32,
+) -> Option<PosePriorAlignment> {
+    const CONFIDENCE: f64 = 0.9999;
+    const MAX_NUM_TRIALS: usize = 1000;
+    const MIN_INLIER_RATIO: f64 = 0.25;
+
+    let src = src.iter().map(|p| p.to_array()).collect::<Vec<_>>();
+    let tgt = tgt.iter().map(|p| p.to_array()).collect::<Vec<_>>();
+    if src.len() < 3 {
+        return None;
+    }
+    let min_inliers = ((src.len() as f64 * MIN_INLIER_RATIO).ceil() as usize).max(3);
+    let max_error_sq = (max_error as f64) * (max_error as f64);
+    let mut rng = XorShift64::new(random_seed);
+    let mut best_inliers: Vec<usize> = Vec::new();
+    let mut best: Option<rustslam::loop_closing::detector::Sim3> = None;
+    let mut trial = 0usize;
+    while trial < MAX_NUM_TRIALS {
+        trial += 1;
+        let sample = sample_three_distinct(&mut rng, src.len());
+        let sample_src = [src[sample[0]], src[sample[1]], src[sample[2]]];
+        let sample_tgt = [tgt[sample[0]], tgt[sample[1]], tgt[sample[2]]];
+        let Some(model) = compute_sim3_from_matches(&sample_src, &sample_tgt) else {
+            continue;
+        };
+        let inliers = sim3_inliers(&src, &tgt, &model, max_error_sq);
+        if inliers.len() < min_inliers || inliers.len() <= best_inliers.len() {
+            continue;
+        }
+        best_inliers = inliers;
+        best = Some(model);
+        // Adaptive stopping based on the best inlier ratio so far.
+        let ratio = best_inliers.len() as f64 / src.len() as f64;
+        let needed = ((1.0 - CONFIDENCE).ln() / (1.0 - ratio.powi(3)).ln()).ceil();
+        if needed as usize <= trial {
+            break;
+        }
+    }
+    best.as_ref()?;
+    let inlier_src = best_inliers.iter().map(|&idx| src[idx]).collect::<Vec<_>>();
+    let inlier_tgt = best_inliers.iter().map(|&idx| tgt[idx]).collect::<Vec<_>>();
+    let refined = compute_sim3_from_matches(&inlier_src, &inlier_tgt)?;
+    let mut rotation = sim3_rotation_matrix(&refined.rotation);
+    remove_degenerate_alignment_rotation(&mut rotation, &src);
+    Some(PosePriorAlignment {
+        scale: refined.scale,
+        rotation,
+        translation: glam::Vec3::from_array(refined.translation),
+    })
+}
+
+/// COLMAP's position-only Sim3 alignment cannot observe the rotation around
+/// the line of a nearly collinear prior-position set (a short straight camera
+/// trajectory, for example); the SVD then realizes an arbitrary rotation about
+/// that line, which would rotate the whole reconstruction away from the prior
+/// frame. Among the rotations that fit the position pairs equally well, keep
+/// the one with minimal angular change. Non-degenerate data is unaffected.
+pub(super) fn remove_degenerate_alignment_rotation(rotation: &mut glam::Mat3, src: &[[f32; 3]]) {
+    const DEGENERACY_RATIO: f32 = 1.0e-3;
+    let n = src.len() as f32;
+    let center = src.iter().fold(glam::Vec3::ZERO, |sum, point| {
+        sum + glam::Vec3::from_array(*point)
+    }) / n;
+    let mut covariance = nalgebra::Matrix3::<f32>::zeros();
+    for point in src {
+        let delta = glam::Vec3::from_array(*point) - center;
+        let column = nalgebra::Vector3::new(delta.x, delta.y, delta.z);
+        covariance += column * column.transpose();
+    }
+    let eigen = covariance.symmetric_eigen();
+    let eigenvalues = eigen.eigenvalues;
+    let max_index = eigenvalues.imax();
+    let max_eigenvalue = eigenvalues[max_index];
+    if !(max_eigenvalue > 0.0) {
+        return;
+    }
+    let transverse = (0..3)
+        .filter(|idx| *idx != max_index)
+        .map(|idx| eigenvalues[idx])
+        .fold(0.0f32, f32::max);
+    if transverse > DEGENERACY_RATIO * max_eigenvalue {
+        return;
+    }
+    let line_axis = eigen.eigenvectors.column(max_index);
+    let line_axis = glam::Vec3::new(line_axis.x, line_axis.y, line_axis.z).normalize_or_zero();
+    if line_axis.length_squared() < 0.5 {
+        return;
+    }
+    let current = glam::Quat::from_mat3(rotation);
+    let (current_axis, current_angle) = current.to_axis_angle();
+    let degenerate_component = current_angle * current_axis.dot(line_axis);
+    let correction = glam::Quat::from_axis_angle(line_axis, -degenerate_component);
+    *rotation = glam::Mat3::from_quat(correction * current);
+}
+
+/// Sim3 rotation rows are indexed (row, column); glam's `Mat3` is
+/// column-major, so the row arrays are transposed into columns here.
+fn sim3_rotation_matrix(rotation: &[[f32; 3]; 3]) -> glam::Mat3 {
+    glam::Mat3::from_cols_array_2d(&[
+        [rotation[0][0], rotation[1][0], rotation[2][0]],
+        [rotation[0][1], rotation[1][1], rotation[2][1]],
+        [rotation[0][2], rotation[1][2], rotation[2][2]],
+    ])
+}
+
+fn sim3_inliers(
+    src: &[[f32; 3]],
+    tgt: &[[f32; 3]],
+    model: &rustslam::loop_closing::detector::Sim3,
+    max_error_sq: f64,
+) -> Vec<usize> {
+    let rotation = sim3_rotation_matrix(&model.rotation);
+    let translation = glam::Vec3::from_array(model.translation);
+    (0..src.len())
+        .filter(|&idx| {
+            let predicted =
+                model.scale * (rotation * glam::Vec3::from_array(src[idx])) + translation;
+            let diff = predicted - glam::Vec3::from_array(tgt[idx]);
+            (diff.length_squared() as f64) <= max_error_sq
+        })
+        .collect()
+}
+
+fn sample_three_distinct(rng: &mut XorShift64, n: usize) -> [usize; 3] {
+    let a = rng.below(n);
+    let b = rng.below(n);
+    let c = rng.below(n);
+    if a == b || a == c || b == c {
+        return sample_three_distinct(rng, n);
+    }
+    [a, b, c]
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: i32) -> Self {
+        let value = if seed >= 0 {
+            (seed as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0xBF58_476D_1CE4_E5B9)
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        };
+        Self(value.max(1))
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
 }

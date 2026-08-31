@@ -4544,6 +4544,30 @@ fn refine_initial_global_bundle(
     } else {
         crate::ba::BundleAdjustmentGauge::TwoCamsFromWorld
     };
+    if uses_prior_position {
+        let Some(transform) = align_reconstruction_to_pose_priors(
+            reconstruction,
+            &ba_options.pose_priors,
+            config.random_seed,
+        ) else {
+            debug_log.push(format!(
+                "global_ba reason=initial round=1 skipped skip_reason=prior_alignment_failed gauge_images={:?} observations={}",
+                gauge_images, observations_before
+            ));
+            return false;
+        };
+        debug_log.push(format!(
+            "global_ba_align_priors reason=initial round=1 scale={:.6} rotation=({:.4},{:.4},{:.4},{:.4}) translation=({:.6},{:.6},{:.6})",
+            transform.scale,
+            glam::Quat::from_mat3(&transform.rotation).x,
+            glam::Quat::from_mat3(&transform.rotation).y,
+            glam::Quat::from_mat3(&transform.rotation).z,
+            glam::Quat::from_mat3(&transform.rotation).w,
+            transform.translation.x,
+            transform.translation.y,
+            transform.translation.z
+        ));
+    }
     let report = match refine_bundle_adjustment_checked(frames, reconstruction, config, ba_options)
     {
         Ok(report) => report,
@@ -4697,6 +4721,30 @@ fn refine_global_bundle_with_postprocessing(
         } else {
             crate::ba::BundleAdjustmentGauge::TwoCamsFromWorld
         };
+        if uses_prior_position && round == 0 {
+            let Some(transform) = align_reconstruction_to_pose_priors(
+                reconstruction,
+                &ba_options.pose_priors,
+                config.random_seed,
+            ) else {
+                debug_log.push(format!(
+                    "global_ba reason={reason} round=1 skipped skip_reason=prior_alignment_failed gauge_images={:?} observations={}",
+                    gauge_images, observations_before
+                ));
+                break;
+            };
+            debug_log.push(format!(
+                "global_ba_align_priors reason={reason} round=1 scale={:.6} rotation=({:.4},{:.4},{:.4},{:.4}) translation=({:.6},{:.6},{:.6})",
+                transform.scale,
+                glam::Quat::from_mat3(&transform.rotation).x,
+                glam::Quat::from_mat3(&transform.rotation).y,
+                glam::Quat::from_mat3(&transform.rotation).z,
+                glam::Quat::from_mat3(&transform.rotation).w,
+                transform.translation.x,
+                transform.translation.y,
+                transform.translation.z
+            ));
+        }
         let report = match refine_bundle_adjustment_checked(
             frames,
             reconstruction,
@@ -4860,14 +4908,10 @@ fn should_run_global_ba(
     let point_ratio_hit = config.global_ba_points_ratio > 1.0
         && schedule.prev_points > 0
         && points as f32 >= schedule.prev_points as f32 * config.global_ba_points_ratio;
-    let ratio_growth_ready = registered
-        >= schedule
-            .prev_registered_frames
-            .saturating_add(MIN_GLOBAL_BA_RATIO_FRAME_GROWTH);
-    image_freq_hit || point_freq_hit || (ratio_growth_ready && (image_ratio_hit || point_ratio_hit))
+    // COLMAP's CheckRunGlobalRefinement applies the ratio thresholds with no
+    // minimum-growth gate: the first frame past the ratio threshold triggers.
+    image_freq_hit || point_freq_hit || image_ratio_hit || point_ratio_hit
 }
-
-const MIN_GLOBAL_BA_RATIO_FRAME_GROWTH: usize = 5;
 
 fn should_run_final_global_ba(
     schedule: &GlobalBaSchedule,
@@ -4896,9 +4940,11 @@ fn final_global_ba_normalizes_reconstruction(_config: &MapperConfig) -> bool {
 
 fn global_ba_uses_prior_position(
     options: &crate::ba::BundleAdjustmentOptions,
-    reconstruction: &Reconstruction,
+    _reconstruction: &Reconstruction,
 ) -> bool {
-    options.pose_priors.len() > 0 && registered_image_count(reconstruction) > 2
+    // COLMAP's AdjustGlobalBundle switches to the pose-prior adjuster when at
+    // least three registered images carry valid pose priors.
+    options.pose_priors.len() >= 3
 }
 
 fn global_ba_redundant_point_ids(
@@ -15916,8 +15962,11 @@ mod tests {
     }
 
     #[test]
-    fn global_ba_schedule_ratio_waits_for_five_new_frames() {
-        let frames = (0..7)
+    fn global_ba_schedule_ratio_triggers_on_first_frame_past_ratio() {
+        // COLMAP's CheckRunGlobalRefinement applies the frame ratio threshold
+        // with no minimum-growth gate: from a 2-frame baseline with ratio 1.1,
+        // the third registered frame (3 >= 2.2) must trigger immediately.
+        let frames = (0..3)
             .map(|image| minimal_frame(image, &format!("image_{image}.jpg")))
             .collect::<Vec<_>>();
         let mut reconstruction = test_reconstruction(&frames);
@@ -15944,20 +15993,71 @@ mod tests {
             global_ba_images_freq: 0,
             global_ba_points_freq: 0,
             global_ba_images_ratio: 1.1,
-            global_ba_points_ratio: 1.1,
+            global_ba_points_ratio: 10.0,
             ..MapperConfig::default()
         };
 
         reconstruction.points.push(point);
         assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
 
-        for image in 2..6 {
-            reconstruction.poses[image] = Some(SE3::identity());
-            assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
-        }
-
-        reconstruction.poses[6] = Some(SE3::identity());
+        reconstruction.poses[2] = Some(SE3::identity());
         assert!(should_run_global_ba(&schedule, &reconstruction, &config));
+    }
+
+    #[test]
+    fn pose_prior_alignment_keeps_pose_and_point_transforms_consistent() {
+        let alignment = PosePriorAlignment {
+            scale: 0.4,
+            rotation: glam::Mat3::from_quat(glam::Quat::from_rotation_y(0.7)),
+            translation: glam::Vec3::new(3.0, -1.0, 2.0),
+        };
+        let pose = SE3::from_quat_translation(
+            glam::Quat::from_rotation_x(0.3),
+            glam::Vec3::new(1.0, 2.0, 3.0),
+        );
+        let point = glam::Vec3::new(0.5, -0.25, 4.0);
+        let camera_point = glam::Vec3::from_array(pose.transform_point(&point.to_array()));
+        let transformed_camera_point = glam::Vec3::from_array(
+            alignment
+                .transform_pose(pose)
+                .transform_point(&alignment.transform_point(point).to_array()),
+        );
+        let expected = alignment.scale * camera_point;
+        assert!(
+            (transformed_camera_point - expected).length() < 1.0e-4,
+            "pose and point transforms must stay projection-consistent"
+        );
+    }
+
+    #[test]
+    fn degenerate_prior_alignment_rotation_removes_line_component() {
+        // Nearly collinear prior positions: the rotation about the position
+        // line is unobservable and must be removed from the alignment.
+        let src = [[0.0, 0.0, 0.0], [1.0, 0.001, 0.002], [2.0, 0.003, 0.001]];
+        let mut rotation = glam::Mat3::from_quat(glam::Quat::from_rotation_x(0.2));
+        remove_degenerate_alignment_rotation(&mut rotation, &src);
+        let (_, angle) = glam::Quat::from_mat3(&rotation).to_axis_angle();
+        assert!(
+            angle.abs() < 1.0e-2,
+            "line rotation component must be removed"
+        );
+    }
+
+    #[test]
+    fn well_conditioned_prior_alignment_rotation_is_kept() {
+        let src = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let mut rotation = glam::Mat3::from_quat(glam::Quat::from_rotation_z(0.3));
+        remove_degenerate_alignment_rotation(&mut rotation, &src);
+        let (_, angle) = glam::Quat::from_mat3(&rotation).to_axis_angle();
+        assert!(
+            (angle - 0.3).abs() < 1.0e-4,
+            "well-conditioned rotation must stay"
+        );
     }
 
     #[test]

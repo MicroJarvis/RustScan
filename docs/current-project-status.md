@@ -11,11 +11,12 @@
 
 本轮 RustSFM 硬化后的本地验证结果是：
 
-- `cargo test -p rustsfm --lib`: `709 passed; 0 failed; 19 ignored`
-- `cargo test -p rustsfm --lib --no-default-features`: `581 passed; 0 failed; 19 ignored`
+- `cargo test -p rustsfm --lib`: `712 passed; 0 failed; 19 ignored`
+- `cargo test -p rustsfm --lib --no-default-features`: `584 passed; 0 failed; 19 ignored`
 - `cargo test -p rustsfm --test sequence_registration --no-default-features`: `62 passed; 0 failed`
+- `cargo test -p rustsfm --lib -- --ignored`（本地 provision 夹具后）: `19 passed; 0 failed`
 
-被忽略的 `real_colmap_sparse_*` 测试需要工作区外部的 `test_data/flowers2_colmap` 夹具；该夹具不在 Git 或 submodule 中，必须显式用 `--ignored` 执行。2026-08-31 通过 `scripts/provision_flowers2_colmap_fixture.sh`（SHA-256 固定内容）重新 provision 并实测：`cargo test -p rustsfm --lib -- --ignored` 为 `17 passed; 2 failed`。两个失败均为确定性、与夹具内容无关：`real_colmap_sparse_seed_mapper_pnp_prior_global_ba_skips_normalization` 与 `real_colmap_sparse_seed_mapper_pnp_survives_scheduled_global_ba` 期望 `global_ba reason=scheduled` 日志，而 mapper 在该测试配置下只发出 `initial`/`final` 两轮 BA——即 BA 编排的已知缺口（见 PARITY_ROADMAP）。
+被忽略的 `real_colmap_sparse_*` 测试需要工作区外部的 `test_data/flowers2_colmap` 夹具；该夹具不在 Git 或 submodule 中，必须显式用 `--ignored` 执行。2026-08-31 通过 `scripts/provision_flowers2_colmap_fixture.sh`（SHA-256 固定内容）重新 provision 后实测为 `19 passed; 0 failed`。此前两个失败项（scheduled global BA 不触发、先验位置 BA 未对齐）已按 COLMAP `CheckRunGlobalRefinement`/`PosePriorBundleAdjuster` 语义修复（见 PARITY_ROADMAP 的 BA orchestration 修复记录）。
 
 ## Current Progress
 

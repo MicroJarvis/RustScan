@@ -1,7 +1,8 @@
 # RustSFM COLMAP Parity Roadmap (non-GUI)
 
-**Updated:** 2026-08-15 (fixture availability and verification policy; dated
-numerical measurements below retain their original observation dates)
+**Updated:** 2026-08-31 (fixture provisioning, scheduled-BA triggers, and
+pose-prior alignment; dated numerical measurements below retain their
+original observation dates)
 
 Target: 100% COLMAP behavior parity excluding Qt GUI and Python bindings.
 GPU: **wgpu** only (no CUDA/SiftGPU).
@@ -18,13 +19,8 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
     `scripts/provision_flowers2_colmap_fixture.sh` (SHA-256-verified copy of
     the 2026-06-30 archived COLMAP text export). The external hosted source and
     opt-in CI fetch remain open.
-  - 2026-08-31 measured ignored suite: `17 passed; 2 failed`.
-    The failures are deterministic and fixture-independent:
-    `real_colmap_sparse_seed_mapper_pnp_prior_global_ba_skips_normalization` and
-    `real_colmap_sparse_seed_mapper_pnp_survives_scheduled_global_ba` expect a
-    `global_ba reason=scheduled` log entry that the mapper does not emit under
-    the test configuration (only `initial`/`final` fire). This is the known
-    BA-orchestration gap tracked below.
+  - 2026-08-31 measured ignored suite: `19 passed; 0 failed` (after the
+    scheduled-BA trigger and pose-prior alignment fixes recorded below).
 
 ## Phase 1 — Sparse SfM core → 100% (in progress)
 
@@ -36,8 +32,20 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
 | optim/RANSAC | 90% | recorded FIFO verifier schedule now replays exactly; default parallel `random_seed=-1` remains schedule-realization dependent |
 | Two-view geometry | 96% | recorded COLMAP verifier trace now matches config/inliers/masks exactly; default schedule replay remains diagnostic |
 | Pose solvers | 65% | Ceres generalized refinement/covariance |
-| BA orchestration | 70% | exact local/global BA scheduling and final-all pose drift after exact two-view propagation |
+| BA orchestration | 78% | scheduled-BA growth triggers and pose-prior alignment closed (2026-08-31); remaining: exact final-all scheduling and pose drift after exact two-view propagation |
 | BA/Ceres | 88% | large-scene numerical parity |
+
+### BA orchestration fixes (2026-08-31)
+
+- Scheduled global BA now triggers on the first frame past the COLMAP
+  `CheckRunGlobalRefinement` ratio/frequency thresholds; the previous
+  minimum-5-frame growth gate (a July perf deviation) was removed.
+- Pose-prior global BA (>= 3 registered pose priors, like COLMAP's
+  `use_prior_position` path) aligns the reconstruction to the prior frame with
+  a RANSAC Sim3 before solving, skips normalization, and removes the
+  unobservable rotation about a nearly collinear prior-position line
+  (minimal-rotation tie-break; plain umeyama, as in COLMAP, leaves that
+  rotation arbitrary and can rotate the reconstruction away from the priors).
 
 **Phase 1 exit:** flowers2 sparse model matches COLMAP within tolerance on poses, registration order, and point counts.
 
