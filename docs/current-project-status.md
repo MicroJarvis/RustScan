@@ -21,7 +21,7 @@
 ## Current Progress
 
 - RustSFM 是 workspace 的主动维护 crate，提供 COLMAP-style 特征、匹配、两视图验证、增量 mapper、序列注册和文本导出。
-- RustSFM 硬化已合并：keyframe mapper 输入固定为私有快照，共享输出被序列化，GPU PnP-focal 管线失败或不支持的路由（generalized rig/structureless）会返回既有 CPU fallback 并记录遥测，macOS GPU context 测试也已串行化。
+- RustSFM 硬化已合并：keyframe mapper 输入固定为私有快照，共享输出被序列化，GPU PnP-focal 管线失败或不支持的路由（generalized rig/structureless）会返回既有 CPU fallback 并记录遥测，BA 重投影残差对负深度连续求值（`img_from_cam_unchecked`，COLMAP 语义，2026-09-02），macOS GPU context 测试也已串行化。
 - RustViewer 维护导入媒体、运行 RustSFM、消费 COLMAP 产物并衔接 RustGS 训练的桌面工作流。
 - RustGS 的公开训练路径仍收口到 splat-first API；其细节和质量路线见架构文档及 RustGS 专项文档。
 

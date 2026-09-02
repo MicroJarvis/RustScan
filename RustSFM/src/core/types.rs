@@ -206,99 +206,70 @@ impl CameraModel {
     }
 
     pub fn img_from_cam(&self, u: f64, v: f64, w: f64) -> Option<[f64; 2]> {
+        if w < f64::EPSILON {
+            return None;
+        }
+        self.img_from_cam_unchecked(u, v, w)
+    }
+
+    /// COLMAP's bundle-adjustment projection is continuous across negative
+    /// depth: points that drift behind a camera mid-solve project to mirrored
+    /// image coordinates instead of aborting the iteration. Only non-finite
+    /// results fail.
+    pub fn img_from_cam_unchecked(&self, u: f64, v: f64, w: f64) -> Option<[f64; 2]> {
         let p = &self.params;
         let xy = match self.model_id {
-            COLMAP_SIMPLE_PINHOLE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
-                [p[0] * u / w + p[1], p[0] * v / w + p[2]]
-            }
-            COLMAP_PINHOLE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
-                [p[0] * u / w + p[2], p[1] * v / w + p[3]]
-            }
+            COLMAP_SIMPLE_PINHOLE => [p[0] * u / w + p[1], p[0] * v / w + p[2]],
+            COLMAP_PINHOLE => [p[0] * u / w + p[2], p[1] * v / w + p[3]],
             COLMAP_SIMPLE_RADIAL => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let uu = u / w;
                 let vv = v / w;
                 let [du, dv] = distortion(self.model_id, &p[3..4], uu, vv)?;
                 [p[0] * (uu + du) + p[1], p[0] * (vv + dv) + p[2]]
             }
             COLMAP_RADIAL => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let uu = u / w;
                 let vv = v / w;
                 let [du, dv] = distortion(self.model_id, &p[3..5], uu, vv)?;
                 [p[0] * (uu + du) + p[1], p[0] * (vv + dv) + p[2]]
             }
             COLMAP_OPENCV => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let uu = u / w;
                 let vv = v / w;
                 let [du, dv] = distortion(self.model_id, &p[4..8], uu, vv)?;
                 [p[0] * (uu + du) + p[2], p[1] * (vv + dv) + p[3]]
             }
             COLMAP_OPENCV_FISHEYE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
                 let [duu, dvv] = distortion(self.model_id, &p[4..8], uu, vv)?;
                 [p[0] * (uu + duu) + p[2], p[1] * (vv + dvv) + p[3]]
             }
             COLMAP_FULL_OPENCV => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let uu = u / w;
                 let vv = v / w;
                 let [du, dv] = distortion(self.model_id, &p[4..12], uu, vv)?;
                 [p[0] * (uu + du) + p[2], p[1] * (vv + dv) + p[3]]
             }
             COLMAP_FOV => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [xd, yd] = fov_distortion(p[4], u / w, v / w);
                 [p[0] * xd + p[2], p[1] * yd + p[3]]
             }
             COLMAP_SIMPLE_RADIAL_FISHEYE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
                 let [duu, dvv] = distortion(self.model_id, &p[3..4], uu, vv)?;
                 [p[0] * (uu + duu) + p[1], p[0] * (vv + dvv) + p[2]]
             }
             COLMAP_RADIAL_FISHEYE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
                 let [duu, dvv] = distortion(self.model_id, &p[3..5], uu, vv)?;
                 [p[0] * (uu + duu) + p[1], p[0] * (vv + dvv) + p[2]]
             }
             COLMAP_THIN_PRISM_FISHEYE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
                 let [duu, dvv] = distortion(self.model_id, &p[4..12], uu, vv)?;
                 [p[0] * (uu + duu) + p[2], p[1] * (vv + dvv) + p[3]]
             }
             COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
                 let [duu, dvv] = distortion(self.model_id, &p[4..16], uu, vv)?;
                 [p[0] * (uu + duu) + p[2], p[1] * (vv + dvv) + p[3]]
@@ -322,23 +293,14 @@ impl CameraModel {
                 [p[0] * r * u + p[2], p[1] * r * v + p[3]]
             }
             COLMAP_SIMPLE_FISHEYE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
                 [p[0] * uu + p[1], p[0] * vv + p[2]]
             }
             COLMAP_FISHEYE => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
                 [p[0] * uu + p[2], p[1] * vv + p[3]]
             }
             COLMAP_EUCM => {
-                if w < f64::EPSILON {
-                    return None;
-                }
                 let alpha = p[4];
                 let beta = p[5];
                 let rho2 = beta * (u * u + v * v) + w * w;
@@ -1309,6 +1271,32 @@ mod tests {
             1.0e-12,
         );
         assert!((camera.cam_from_img_threshold(2.0) - 2.0 / 505.0).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn img_from_cam_keeps_cheirality_guard_while_unchecked_projects_negative_depth() {
+        let camera =
+            CameraModel::from_colmap(COLMAP_PINHOLE, 800, 600, &[500.0, 510.0, 400.0, 300.0])
+                .unwrap();
+
+        // The cheirality-guarded projection rejects points at or behind the
+        // camera; the unchecked variant used by bundle adjustment mirrors
+        // them continuously like COLMAP's cost function.
+        assert!(camera.img_from_cam(0.2, -0.1, -2.0).is_none());
+        assert!(camera.img_from_cam(0.2, -0.1, 0.0).is_none());
+        assert_close2(
+            camera.img_from_cam_unchecked(0.2, -0.1, -2.0).unwrap(),
+            [350.0, 325.5],
+            1.0e-12,
+        );
+        assert_close2(
+            camera.img_from_cam_unchecked(0.2, -0.1, 2.0).unwrap(),
+            [450.0, 274.5],
+            1.0e-12,
+        );
+        // The unchecked variant still rejects non-finite results.
+        assert!(camera.img_from_cam_unchecked(f64::NAN, 0.0, 1.0).is_none());
+        assert!(camera.img_from_cam_unchecked(0.0, 0.0, 0.0).is_none());
     }
 
     #[test]

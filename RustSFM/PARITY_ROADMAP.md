@@ -47,6 +47,19 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
   (minimal-rotation tie-break; plain umeyama, as in COLMAP, leaves that
   rotation arbitrary and can rotate the reconstruction away from the priors).
 
+### BA numerics fix (2026-09-02)
+
+- The ceres reprojection residual used to abort the iteration whenever a point
+  drifted behind a camera mid-solve (`w < EPSILON`), producing repeated
+  "Residual and Jacobian evaluation failed" warnings and wasted iterations on
+  larger scenes. The BA path now uses `img_from_cam_unchecked`, which projects
+  negative depth continuously (mirrored), like COLMAP's cost function; the
+  cheirality guard remains for observation filtering. Verified on the 944-image
+  home dataset: eval failures reduced from repeated per-BA occurrences to zero.
+  Occasional CHOLMOD not-positive-definite warnings at initialization are a
+  separate transient (degenerate small system; the trust region recovers) and
+  remain unaddressed.
+
 **Phase 1 exit:** flowers2 sparse model matches COLMAP within tolerance on poses, registration order, and point counts.
 
 ### flowers2 end-to-end measured parity (2026-06-27)

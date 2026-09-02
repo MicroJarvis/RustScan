@@ -1253,7 +1253,7 @@ fn project_image_pose_point(
     point: [f32; 3],
 ) -> Option<[f64; 2]> {
     let cam_point = image_pose_cam_point(pose_params, point)?;
-    camera.img_from_cam(cam_point[0], cam_point[1], cam_point[2])
+    camera.img_from_cam_unchecked(cam_point[0], cam_point[1], cam_point[2])
 }
 
 fn project_frame_pose_point(
@@ -1263,7 +1263,7 @@ fn project_frame_pose_point(
     point: [f32; 3],
 ) -> Option<[f64; 2]> {
     let cam_point = frame_pose_cam_point(sensor_pose_params, rig_pose_params, point)?;
-    camera.img_from_cam(cam_point[0], cam_point[1], cam_point[2])
+    camera.img_from_cam_unchecked(cam_point[0], cam_point[1], cam_point[2])
 }
 
 fn image_pose_cam_point(pose_params: &[f64], point: [f32; 3]) -> Option<[f64; 3]> {
