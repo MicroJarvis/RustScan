@@ -4708,7 +4708,7 @@ fn refine_global_bundle_with_postprocessing(
         let mut ba_options = mapper_global_ba_options(
             config,
             reconstruction,
-            global_ba_iterations_for_reconstruction(config, reconstruction),
+            global_ba_iterations_for_reason(config, reconstruction, reason),
             None,
             if config.fix_existing_frames {
                 registration_stats
@@ -4946,6 +4946,20 @@ fn global_ba_max_refinements_for_reason(config: &MapperConfig, reason: &str) -> 
             .min(MAX_SCHEDULED_REFINEMENTS)
     } else {
         config.global_ba_max_refinements
+    }
+}
+
+fn global_ba_iterations_for_reason(
+    config: &MapperConfig,
+    reconstruction: &Reconstruction,
+    reason: &str,
+) -> usize {
+    const MAX_SCHEDULED_ITERATIONS: usize = 25;
+    let configured = global_ba_iterations_for_reconstruction(config, reconstruction);
+    if reason == "scheduled" {
+        configured.min(MAX_SCHEDULED_ITERATIONS)
+    } else {
+        configured
     }
 }
 
@@ -16151,6 +16165,22 @@ mod tests {
             1
         );
         assert_eq!(global_ba_max_refinements_for_reason(&config, "final"), 1);
+
+        let reconstruction = test_reconstruction(&structureless_frames(3));
+        config.global_ba_iterations = 50;
+        assert_eq!(
+            global_ba_iterations_for_reason(&config, &reconstruction, "scheduled"),
+            25
+        );
+        assert_eq!(
+            global_ba_iterations_for_reason(&config, &reconstruction, "final"),
+            50
+        );
+        config.global_ba_iterations = 10;
+        assert_eq!(
+            global_ba_iterations_for_reason(&config, &reconstruction, "scheduled"),
+            10
+        );
     }
 
     #[test]

@@ -65,13 +65,15 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
 - A fixed-seed, single-model 60-image home slice showed that trigger frequency
   was not excessive (12 global-BA triggers, less frequent than COLMAP's default
   1.1 growth ratio), but each scheduled trigger averaged more than four full
-  refinement rounds. Capping only scheduled BA at two rounds reduced wall time
-  from 74.9s to 53.6s (28%) while keeping all 60 images registered; initial and
-  final BA retain the configured five-round quality budget. A global two-round
-  cap was faster (37.8s) but was rejected because it also weakened final
-  quality closure. Enabling redundant-point omission was also rejected as a
-  default: it reduced the same run to 26.6s but registered 57/60 images and
-  reduced points from 22,847 to 9,466.
+  refinement rounds and exhausted the 50-iteration solver budget. Capping only
+  scheduled BA at two rounds and 25 iterations reduced wall time from 74.9s to
+  46.3s (38%) while keeping all 60 images registered; points changed from
+  23,510 to 23,368 (-0.6%). Initial and final BA retain the configured five
+  rounds and 50 iterations for quality closure. A global two-round cap was
+  faster (37.8s) but was rejected because it also weakened final quality.
+  Enabling redundant-point omission was also rejected as a default: it reduced
+  the same run to 26.6s but registered 57/60 images and reduced points from
+  22,847 to 9,466.
 
 **Phase 1 exit:** flowers2 sparse model matches COLMAP within tolerance on poses, registration order, and point counts.
 
