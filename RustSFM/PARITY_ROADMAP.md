@@ -60,6 +60,19 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
   separate transient (degenerate small system; the trust region recovers) and
   remain unaddressed.
 
+### BA scheduled-refinement budget (2026-09-02)
+
+- A fixed-seed, single-model 60-image home slice showed that trigger frequency
+  was not excessive (12 global-BA triggers, less frequent than COLMAP's default
+  1.1 growth ratio), but each scheduled trigger averaged more than four full
+  refinement rounds. Capping only scheduled BA at two rounds reduced wall time
+  from 74.9s to 53.6s (28%) while keeping all 60 images registered; initial and
+  final BA retain the configured five-round quality budget. A global two-round
+  cap was faster (37.8s) but was rejected because it also weakened final
+  quality closure. Enabling redundant-point omission was also rejected as a
+  default: it reduced the same run to 26.6s but registered 57/60 images and
+  reduced points from 22,847 to 9,466.
+
 **Phase 1 exit:** flowers2 sparse model matches COLMAP within tolerance on poses, registration order, and point counts.
 
 ### flowers2 end-to-end measured parity (2026-06-27)

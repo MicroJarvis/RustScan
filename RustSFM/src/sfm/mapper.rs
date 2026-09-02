@@ -4683,7 +4683,7 @@ fn refine_global_bundle_with_postprocessing(
     }
 
     let mut attempted = false;
-    for round in 0..config.global_ba_max_refinements {
+    for round in 0..global_ba_max_refinements_for_reason(config, reason) {
         let observations_before = reconstruction_num_observations(reconstruction);
         if observations_before == 0 {
             break;
@@ -4933,6 +4933,20 @@ fn should_run_final_global_ba(
 
 fn global_ba_enabled(config: &MapperConfig) -> bool {
     config.global_ba && global_ba_iterations(config) > 0 && config.global_ba_max_refinements > 0
+}
+
+// Scheduled BA recurs on model-growth thresholds, so repeated full refinements
+// have diminishing value before the next trigger. Keep the full configured
+// budget for initial/final quality closure and cap only intermediate passes.
+fn global_ba_max_refinements_for_reason(config: &MapperConfig, reason: &str) -> usize {
+    const MAX_SCHEDULED_REFINEMENTS: usize = 2;
+    if reason == "scheduled" {
+        config
+            .global_ba_max_refinements
+            .min(MAX_SCHEDULED_REFINEMENTS)
+    } else {
+        config.global_ba_max_refinements
+    }
 }
 
 fn incremental_global_ba_normalizes_reconstruction(_config: &MapperConfig) -> bool {
@@ -16118,6 +16132,25 @@ mod tests {
         assert!(incremental_global_ba_normalizes_reconstruction(
             &MapperConfig::default()
         ));
+    }
+
+    #[test]
+    fn scheduled_global_ba_caps_refinements_while_initial_and_final_keep_config() {
+        let mut config = MapperConfig::default();
+        config.global_ba_max_refinements = 5;
+        assert_eq!(
+            global_ba_max_refinements_for_reason(&config, "scheduled"),
+            2
+        );
+        assert_eq!(global_ba_max_refinements_for_reason(&config, "initial"), 5);
+        assert_eq!(global_ba_max_refinements_for_reason(&config, "final"), 5);
+
+        config.global_ba_max_refinements = 1;
+        assert_eq!(
+            global_ba_max_refinements_for_reason(&config, "scheduled"),
+            1
+        );
+        assert_eq!(global_ba_max_refinements_for_reason(&config, "final"), 1);
     }
 
     #[test]
