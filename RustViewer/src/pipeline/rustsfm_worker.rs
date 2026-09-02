@@ -825,13 +825,16 @@ mod tests {
     }
 
     #[test]
-    fn project_gpu_configuration_enables_all_rustsfm_gpu_paths() {
+    fn project_default_configuration_prefers_parallel_cpu_sift_on_macos() {
         let (_temp, request) = fixture_request();
 
         let mapper_config = super::mapper_config_for(&request);
         let registration_config = super::registration_config_for(&request);
 
-        assert!(mapper_config.sift_extraction.use_gpu);
+        assert_eq!(
+            mapper_config.sift_extraction.use_gpu,
+            !cfg!(target_os = "macos")
+        );
         assert!(mapper_config.sift_matching.use_gpu);
         assert!(mapper_config.use_gpu_pnp);
         assert!(mapper_config.local_matching);

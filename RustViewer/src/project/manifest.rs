@@ -257,13 +257,20 @@ pub enum KeyframeSelectionMode {
     AllImages,
 }
 
+fn default_use_gpu_sift() -> bool {
+    // The current wgpu SIFT path synchronizes multiple readbacks per image.
+    // On macOS, the CPU VLFeat backend now extracts images in parallel and is
+    // both faster and more feature-complete for the supported workflow.
+    !cfg!(target_os = "macos")
+}
+
 impl Default for SfmConfigSnapshot {
     fn default() -> Self {
         Self {
             keyframe_selection: KeyframeSelectionMode::default(),
             adaptive_keyframes: rustsfm::AdaptiveKeyframeSelectionConfig::default(),
             use_all_images: true,
-            use_gpu_sift: true,
+            use_gpu_sift: default_use_gpu_sift(),
             use_gpu_matching: true,
         }
     }

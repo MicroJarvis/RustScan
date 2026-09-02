@@ -1,6 +1,8 @@
 use crate::colmap_image::load_colmap_grayscale_u8;
 use crate::compare::{compare_feature_counts, FeaturesCompareReport};
-use crate::database::{ColmapDatabase, ColmapDescriptors, ColmapKeypoint, COLMAP_FEATURE_SIFT};
+use crate::database::{
+    ColmapDatabase, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint, COLMAP_FEATURE_SIFT,
+};
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::WgpuSiftExtractor;
 use crate::sift::{extract_sift_from_grayscale_u8, SiftExtractionOptions, SiftFeatures};
@@ -154,7 +156,18 @@ pub fn extract_features_to_database(
     options: &SiftExtractionOptions,
 ) -> Result<ExtractFeaturesReport> {
     let backend = SiftExtractionBackend::from_options(options)?;
-    extract_features_to_database_with_extractor(database_path, images_dir, options, &backend)
+    match &backend {
+        SiftExtractionBackend::Cpu(extractor) => {
+            extract_features_to_database_cpu_parallel(database_path, images_dir, options, extractor)
+        }
+        #[cfg(feature = "gpu-wgpu")]
+        SiftExtractionBackend::Wgpu(extractor) => extract_features_to_database_with_extractor(
+            database_path,
+            images_dir,
+            options,
+            extractor,
+        ),
+    }
 }
 
 pub fn extract_features_to_database_with_task(
@@ -164,13 +177,27 @@ pub fn extract_features_to_database_with_task(
     task: &mut SfmTaskContext<'_>,
 ) -> Result<ExtractFeaturesReport> {
     let backend = SiftExtractionBackend::from_options(options)?;
-    extract_features_to_database_with_extractor_and_task(
-        database_path,
-        images_dir,
-        options,
-        &backend,
-        task,
-    )
+    match &backend {
+        SiftExtractionBackend::Cpu(extractor) => {
+            extract_features_to_database_cpu_parallel_with_task(
+                database_path,
+                images_dir,
+                options,
+                extractor,
+                task,
+            )
+        }
+        #[cfg(feature = "gpu-wgpu")]
+        SiftExtractionBackend::Wgpu(extractor) => {
+            extract_features_to_database_with_extractor_and_task(
+                database_path,
+                images_dir,
+                options,
+                extractor,
+                task,
+            )
+        }
+    }
 }
 
 pub fn extract_features_to_database_with_extractor<E: SiftFeatureExtractor>(
@@ -208,6 +235,41 @@ pub fn extract_features_to_database_with_extractor_and_task<E: SiftFeatureExtrac
     )
 }
 
+fn extract_features_to_database_cpu_parallel(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    extractor: &CpuSiftExtractor,
+) -> Result<ExtractFeaturesReport> {
+    let control = SfmTaskControl::new();
+    let mut sink = |_event: SfmTaskEvent| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+    extract_features_to_database_cpu_parallel_with_task(
+        database_path,
+        images_dir,
+        options,
+        extractor,
+        &mut task,
+    )
+}
+
+fn extract_features_to_database_cpu_parallel_with_task(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    extractor: &CpuSiftExtractor,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<ExtractFeaturesReport> {
+    extract_selected_features_to_database_cpu_parallel_with_task(
+        database_path,
+        images_dir,
+        options,
+        &[],
+        extractor,
+        task,
+    )
+}
+
 pub(crate) fn extract_selected_features_to_database_with_task(
     database_path: &Path,
     images_dir: &Path,
@@ -216,14 +278,166 @@ pub(crate) fn extract_selected_features_to_database_with_task(
     task: &mut SfmTaskContext<'_>,
 ) -> Result<ExtractFeaturesReport> {
     let backend = SiftExtractionBackend::from_options(options)?;
-    extract_selected_features_to_database_with_extractor_and_task(
-        database_path,
-        images_dir,
-        options,
-        image_ids,
-        &backend,
-        task,
-    )
+    match &backend {
+        SiftExtractionBackend::Cpu(extractor) => {
+            extract_selected_features_to_database_cpu_parallel_with_task(
+                database_path,
+                images_dir,
+                options,
+                image_ids,
+                extractor,
+                task,
+            )
+        }
+        #[cfg(feature = "gpu-wgpu")]
+        SiftExtractionBackend::Wgpu(extractor) => {
+            extract_selected_features_to_database_with_extractor_and_task(
+                database_path,
+                images_dir,
+                options,
+                image_ids,
+                extractor,
+                task,
+            )
+        }
+    }
+}
+
+fn read_selected_feature_images(
+    db: &ColmapDatabase,
+    image_ids: &[u32],
+) -> Result<Vec<ColmapDatabaseImage>> {
+    let mut images = db.read_all_images()?;
+    if images.is_empty() {
+        bail!("database has no images; import images before feature extraction");
+    }
+    images.sort_unstable_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.image_id.cmp(&right.image_id))
+    });
+    if image_ids.is_empty() {
+        return Ok(images);
+    }
+    let selected = image_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if selected.len() != image_ids.len() {
+        bail!("selected feature extraction image IDs must be unique");
+    }
+    let available = images
+        .iter()
+        .map(|image| image.image_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(missing) = selected.difference(&available).next() {
+        bail!("selected feature extraction references missing image_id={missing}");
+    }
+    images.retain(|image| selected.contains(&image.image_id));
+    Ok(images)
+}
+
+fn extract_selected_features_to_database_cpu_parallel_with_task(
+    database_path: &Path,
+    images_dir: &Path,
+    options: &SiftExtractionOptions,
+    image_ids: &[u32],
+    extractor: &CpuSiftExtractor,
+    task: &mut SfmTaskContext<'_>,
+) -> Result<ExtractFeaturesReport> {
+    options.check()?;
+    let db = ColmapDatabase::open(database_path)?;
+    let images = read_selected_feature_images(&db, image_ids)?;
+    let started = Instant::now();
+    let image_count = images.len();
+    let mut reports = Vec::with_capacity(image_count);
+    // Keep no more decoded/described images live than one worker batch. SQLite
+    // writes and task events remain ordered and serial after each batch.
+    let batch_size = rayon::current_num_threads().max(1);
+    for batch in images.chunks(batch_size) {
+        task.checkpoint()?;
+        let extracted = batch
+            .par_iter()
+            .map(|image| -> Result<_> {
+                let image_path = images_dir.join(&image.name);
+                if !image_path.exists() {
+                    bail!(
+                        "missing image file for database image {}: {}",
+                        image.name,
+                        image_path.display()
+                    );
+                }
+                let extract_started = Instant::now();
+                let decoded = load_colmap_grayscale_u8(&image_path)
+                    .with_context(|| format!("failed to load {}", image_path.display()))?;
+                let features = extractor.extract_grayscale(
+                    &decoded.data,
+                    decoded.width,
+                    decoded.height,
+                    options,
+                )?;
+                let keypoints = sift_features_to_colmap_keypoints(&features);
+                let descriptors = sift_features_to_colmap_descriptors(&features)?;
+                Ok((
+                    image.image_id,
+                    image.name.clone(),
+                    keypoints,
+                    descriptors,
+                    extract_started.elapsed().as_secs_f64() * 1000.0,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (image_id, image_name, keypoints, descriptors, extract_ms) in extracted {
+            task.checkpoint()?;
+            let write_started = Instant::now();
+            db.with_transaction(|| {
+                db.upsert_keypoints(image_id, &keypoints)?;
+                db.upsert_descriptors(image_id, &descriptors)?;
+                Ok(())
+            })?;
+            reports.push(ExtractFeaturesImageReport {
+                image_name: image_name.clone(),
+                num_keypoints: keypoints.len(),
+                elapsed_ms: extract_ms + write_started.elapsed().as_secs_f64() * 1000.0,
+            });
+            task.emit(SfmTaskEvent {
+                sequence: 0,
+                elapsed_ms: 0,
+                stage: SfmTaskStage::FeatureExtraction,
+                operation: SfmTaskOperation::ExtractImage,
+                kind: SfmTaskEventKind::Progress,
+                completed: Some(reports.len()),
+                total: Some(image_count),
+                registered_images: None,
+                sparse_points: None,
+                image_id: Some(image_id),
+                pair: None,
+                message: Some(image_name),
+                issue: None,
+            });
+            task.checkpoint()?;
+        }
+    }
+    reports.sort_unstable_by(|left, right| left.image_name.cmp(&right.image_name));
+    let total_keypoints = reports
+        .iter()
+        .map(|image| image.num_keypoints)
+        .sum::<usize>();
+    let mean_keypoints = if image_count == 0 {
+        0.0
+    } else {
+        total_keypoints as f64 / image_count as f64
+    };
+    Ok(ExtractFeaturesReport {
+        database: database_path.to_path_buf(),
+        images_dir: images_dir.to_path_buf(),
+        backend: extractor.backend_name(),
+        image_count,
+        total_keypoints,
+        mean_keypoints,
+        extraction_seconds: started.elapsed().as_secs_f64(),
+        images: reports,
+    })
 }
 
 fn extract_selected_features_to_database_with_extractor_and_task<E: SiftFeatureExtractor>(
@@ -236,32 +450,7 @@ fn extract_selected_features_to_database_with_extractor_and_task<E: SiftFeatureE
 ) -> Result<ExtractFeaturesReport> {
     options.check()?;
     let db = ColmapDatabase::open(database_path)?;
-    let mut images = db.read_all_images()?;
-    if images.is_empty() {
-        bail!("database has no images; import images before feature extraction");
-    }
-    images.sort_unstable_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.image_id.cmp(&right.image_id))
-    });
-    if !image_ids.is_empty() {
-        let selected = image_ids
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        if selected.len() != image_ids.len() {
-            bail!("selected feature extraction image IDs must be unique");
-        }
-        let available = images
-            .iter()
-            .map(|image| image.image_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        if let Some(missing) = selected.difference(&available).next() {
-            bail!("selected feature extraction references missing image_id={missing}");
-        }
-        images.retain(|image| selected.contains(&image.image_id));
-    }
+    let images = read_selected_feature_images(&db, image_ids)?;
 
     let started = Instant::now();
     let image_count = images.len();
