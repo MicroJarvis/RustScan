@@ -66,10 +66,10 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
   was not excessive (12 global-BA triggers, less frequent than COLMAP's default
   1.1 growth ratio), but each scheduled trigger averaged more than four full
   refinement rounds and exhausted the 50-iteration solver budget. Capping only
-  scheduled BA at two rounds and 20 iterations reduced wall time from 74.9s to
-  43.6s (42%) while keeping all 60 images registered; points changed from
-  23,510 to 24,774 (+5.4%), observations from 124,419 to 125,828 (+1.1%),
-  and mean reprojection error from 1.157px to 1.097px. Initial and final BA
+  scheduled BA at two rounds and 15 iterations reduced wall time from 74.9s to
+  42.6s (43%) while keeping all 60 images registered; points changed from
+  23,510 to 24,954 (+6.1%), observations from 124,419 to 125,937 (+1.2%),
+  and mean reprojection error from 1.157px to 1.079px. Initial and final BA
   retain the configured five rounds and 50 iterations for quality closure. A global two-round cap was
   faster (37.8s) but was rejected because it also weakened final quality.
   Enabling redundant-point omission was also rejected as a default: it reduced

@@ -4954,7 +4954,7 @@ fn global_ba_iterations_for_reason(
     reconstruction: &Reconstruction,
     reason: &str,
 ) -> usize {
-    const MAX_SCHEDULED_ITERATIONS: usize = 20;
+    const MAX_SCHEDULED_ITERATIONS: usize = 15;
     let configured = global_ba_iterations_for_reconstruction(config, reconstruction);
     if reason == "scheduled" {
         configured.min(MAX_SCHEDULED_ITERATIONS)
@@ -16170,7 +16170,7 @@ mod tests {
         config.global_ba_iterations = 50;
         assert_eq!(
             global_ba_iterations_for_reason(&config, &reconstruction, "scheduled"),
-            20
+            15
         );
         assert_eq!(
             global_ba_iterations_for_reason(&config, &reconstruction, "final"),
