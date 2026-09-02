@@ -474,33 +474,20 @@ fn validate_gpu_pnp_config(config: &MapperConfig, has_global_mapper: bool) -> Re
     Ok(())
 }
 
-fn validate_gpu_pnp_route(
-    _estimate_focal: bool,
-    generalized: bool,
-    structureless: bool,
-) -> Result<()> {
-    if generalized {
-        return Err(gpu_pnp_mapper_error(
-            "gpu pnp does not support generalized rig absolute pose",
-        ));
-    }
-    if structureless {
-        return Err(gpu_pnp_mapper_error(
-            "gpu pnp does not support structureless absolute pose",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_gpu_pnp_registration_route(
+fn record_gpu_pnp_route_fallback(
     config: &MapperConfig,
-    generalized: bool,
-    structureless: bool,
-) -> Result<()> {
+    telemetry: &mut IncrementalRegistrationTelemetry,
+    reason: &str,
+) {
+    // The GPU PnP pipeline only covers structure-based central PnP-focal.
+    // Generalized-rig and structureless routes are always solved by the
+    // existing CPU solvers, so GPU PnP users fall back instead of failing.
+    #[cfg(feature = "gpu-wgpu")]
     if config.use_gpu_pnp {
-        validate_gpu_pnp_route(false, generalized, structureless)?;
+        telemetry.record_gpu_pnp_focal_fallback(reason);
     }
-    Ok(())
+    #[cfg(not(feature = "gpu-wgpu"))]
+    let _ = (config, telemetry, reason);
 }
 
 pub(crate) fn create_gpu_pnp_scorer(
@@ -3672,7 +3659,10 @@ struct IncrementalRegistrationTelemetry {
 impl IncrementalRegistrationTelemetry {
     #[cfg(feature = "gpu-wgpu")]
     fn record_gpu_pnp_focal_fallback(&mut self, reason: impl std::fmt::Display) {
-        self.gpu_pnp_focal_fallbacks.push(reason.to_string());
+        let reason = reason.to_string();
+        if !self.gpu_pnp_focal_fallbacks.contains(&reason) {
+            self.gpu_pnp_focal_fallbacks.push(reason);
+        }
     }
 
     fn format_log(&self) -> String {
@@ -4014,7 +4004,11 @@ fn registration_choice_for_image_with_pnp_scorer(
                 camera_has_prior_focal_length,
                 registration_stats,
             ) {
-                validate_gpu_pnp_registration_route(config, true, false)?;
+                record_gpu_pnp_route_fallback(
+                    config,
+                    telemetry,
+                    "generalized rig absolute pose is solved on the CPU",
+                );
                 let Some(abs_pose) = solve_generalized_frame_absolute_pose(
                     image,
                     frames,
@@ -4048,7 +4042,11 @@ fn registration_choice_for_image_with_pnp_scorer(
             }
         }
         NextImageRegistrationMode::StructureLess => {
-            validate_gpu_pnp_registration_route(config, false, true)?;
+            record_gpu_pnp_route_fallback(
+                config,
+                telemetry,
+                "structureless absolute pose is solved on the CPU",
+            );
             let Some(abs_pose) = solve_structureless_absolute_pose(
                 image,
                 frames,
@@ -4218,7 +4216,11 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
             camera_has_prior_focal_length,
             registration_stats,
         ) {
-            validate_gpu_pnp_registration_route(config, true, false)?;
+            record_gpu_pnp_route_fallback(
+                config,
+                &mut telemetry,
+                "generalized rig absolute pose is solved on the CPU",
+            );
             solve_generalized_frame_absolute_pose(
                 image,
                 frames,
@@ -4248,7 +4250,11 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
         let pose = if structure_based_pose.is_some() {
             structure_based_pose
         } else {
-            validate_gpu_pnp_registration_route(config, false, true)?;
+            record_gpu_pnp_route_fallback(
+                config,
+                &mut telemetry,
+                "structureless absolute pose is solved on the CPU",
+            );
             solve_structureless_absolute_pose(
                 image,
                 frames,
@@ -10945,28 +10951,26 @@ mod tests {
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
-    fn mapper_gpu_pnp_keeps_generalized_and_structureless_rejections() {
-        let error =
-            validate_gpu_pnp_route(false, true, false).expect_err("generalized route must reject");
-        assert!(error.to_string().contains("generalized"));
-        let error = validate_gpu_pnp_route(false, false, true)
-            .expect_err("structureless route must reject");
-        assert!(error.to_string().contains("structureless"));
-    }
-
-    #[cfg(feature = "gpu-wgpu")]
-    #[test]
-    fn mapper_gpu_pnp_rejects_unsupported_routes_without_a_gpu_scorer() {
+    fn mapper_gpu_pnp_unsupported_routes_fall_back_to_cpu_with_telemetry() {
         let config = MapperConfig {
             use_gpu_pnp: true,
             ..MapperConfig::default()
         };
-        let error = validate_gpu_pnp_registration_route(&config, true, false)
-            .expect_err("generalized GPU PnP route must reject without a scorer");
-        assert!(error.to_string().contains("generalized"));
-        let error = validate_gpu_pnp_registration_route(&config, false, true)
-            .expect_err("structureless GPU PnP route must reject without a scorer");
-        assert!(error.to_string().contains("structureless"));
+        let mut telemetry = IncrementalRegistrationTelemetry::default();
+        record_gpu_pnp_route_fallback(&config, &mut telemetry, "generalized rig route");
+        record_gpu_pnp_route_fallback(&config, &mut telemetry, "structureless route");
+        record_gpu_pnp_route_fallback(&config, &mut telemetry, "structureless route");
+        assert_eq!(telemetry.gpu_pnp_focal_fallbacks.len(), 2);
+        assert!(telemetry.gpu_pnp_focal_fallbacks[0].contains("generalized"));
+        assert!(telemetry.gpu_pnp_focal_fallbacks[1].contains("structureless"));
+
+        let mut disabled_telemetry = IncrementalRegistrationTelemetry::default();
+        record_gpu_pnp_route_fallback(
+            &MapperConfig::default(),
+            &mut disabled_telemetry,
+            "structureless route",
+        );
+        assert!(disabled_telemetry.gpu_pnp_focal_fallbacks.is_empty());
     }
 
     #[test]
