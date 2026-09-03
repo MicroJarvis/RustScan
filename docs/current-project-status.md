@@ -29,7 +29,7 @@
 
 - `flowers2_colmap` parity fixture 的来源、版本和 CI 获取方式尚未固化；默认测试不会再假设它存在。
 - RustSFM 的 COLMAP 数值 parity、RustGS 的 LiteGS parity/TUM PSNR，以及 RustViewer 的端到端真实媒体验证仍需要各自的专门验收。
-- RustSLAM 的 dependency-minimal library suite 在 2026-08-15 实测为 `244 passed; 1 failed`；失败项为 `tracker::vo::tests::test_initialize_keeps_relocalized_pose_in_global_frame`。
+- RustSLAM 的 dependency-minimal library suite 在 2026-09-03 实测为 `245 passed; 0 failed`。此前 `tracker::vo::tests::test_initialize_keeps_relocalized_pose_in_global_frame` 的 fixture 仅有 10 个点，其中 7 个可三角化，误触发生产的 8 点退化保护；fixture 已扩展至 16 个空间分布点，生产门槛保持不变。
 - RustFF 的默认 library suite 在 2026-08-15 为 `2 passed; 0 failed`，但可选 `onnx-ort` feature 仍使用旧 ORT API，当前不能编译。
 
 ## Next Priorities
