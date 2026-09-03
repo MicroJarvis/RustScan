@@ -15,7 +15,10 @@ use image::DynamicImage;
 use log::info;
 
 #[cfg(feature = "onnx-ort")]
-use ort::{Session, SessionBuilder, Value};
+use ort::{
+    session::{builder::SessionBuilder, Session},
+    value::Tensor,
+};
 
 /// Spann3R inference engine
 ///
@@ -139,26 +142,24 @@ impl Spann3RInference {
 
     /// Encode frame features using the encoder ONNX model
     #[cfg(feature = "onnx-ort")]
-    fn encode_frame(&self, preprocessed: &[f32]) -> Result<Vec<f32>, InferenceError> {
+    fn encode_frame(&mut self, preprocessed: &[f32]) -> Result<Vec<f32>, InferenceError> {
         let img_size = self.config.image_size as i64;
 
         // Create input tensor [1, 3, H, W]
-        let input = Value::from_array(
-            self.encoder_session.allocator()?,
-            &[[[preprocessed
-                .chunks((img_size * img_size) as usize)
-                .collect::<Vec<_>>()]]],
-        )?;
+        let input = Tensor::<f32>::from_array((
+            [1usize, 3, img_size as usize, img_size as usize],
+            preprocessed.to_vec().into_boxed_slice(),
+        ))?;
 
-        let outputs = self.encoder_session.run(vec![input])?;
-        let output = outputs[0].try_extract_tensor::<f32>()?;
+        let outputs = self.encoder_session.run(ort::inputs![input])?;
+        let (_, output) = outputs[0].try_extract_tensor::<f32>()?;
 
-        Ok(output.iter().copied().collect())
+        Ok(output.to_vec())
     }
 
     /// Encode frame - stub for non-ORT backends
     #[cfg(not(feature = "onnx-ort"))]
-    fn encode_frame(&self, _preprocessed: &[f32]) -> Result<Vec<f32>, InferenceError> {
+    fn encode_frame(&mut self, _preprocessed: &[f32]) -> Result<Vec<f32>, InferenceError> {
         Err(InferenceError::Inference(
             "No ONNX backend enabled. Enable 'onnx-ort' feature.".to_string(),
         ))
@@ -241,5 +242,23 @@ impl Spann3RInference {
     pub fn reset(&mut self) {
         self.memory_bank.clear();
         self.frame_count = 0;
+    }
+}
+
+#[cfg(all(test, feature = "onnx-ort"))]
+mod ort_api_tests {
+    use super::*;
+
+    #[test]
+    fn ort_rc12_encoder_constructor_api_is_linked() {
+        // This is intentionally compile-only: model fixtures and ONNX Runtime
+        // initialization are external dependencies, but this catches an API
+        // regression in the feature-gated constructor without loading a dylib.
+        let _constructor: fn(
+            &str,
+            &str,
+            InferenceConfig,
+        ) -> Result<Spann3RInference, InferenceError> = Spann3RInference::from_onnx_with_config;
+        let _session_builder = Session::builder;
     }
 }
