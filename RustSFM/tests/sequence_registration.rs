@@ -644,7 +644,7 @@ fn remaining_stage_rejects_mismatched_keyframe_database_camera() -> anyhow::Resu
 }
 
 #[test]
-fn partial_keyframe_model_keeps_missing_selected_keyframe_unresolved() -> anyhow::Result<()> {
+fn partial_keyframe_model_retries_missing_selected_keyframe() -> anyhow::Result<()> {
     let (_temp, output, frames, mut keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
     let mut reconstruction = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
     let removed_image = reconstruction.image_names.len() - 1;
@@ -678,20 +678,17 @@ fn partial_keyframe_model_keeps_missing_selected_keyframe_unresolved() -> anyhow
         &mut task,
     )?;
 
-    assert!(!result.has_complete_coverage());
-    assert_eq!(result.registered_frames, 5);
-    let missing = result
+    assert!(result.has_complete_coverage(), "{:#?}", result.diagnostics);
+    assert_eq!(result.registered_frames, 6);
+    let recovered = result
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.frame_id == 606)
         .unwrap();
-    assert_eq!(missing.status, FrameRegistrationStatus::Unresolved);
-    assert_eq!(missing.attempts, 0);
-    assert_eq!(
-        missing.message.as_deref(),
-        Some("keyframe was not registered")
-    );
-    assert!(require_complete_pose_coverage(&result).is_err());
+    assert_eq!(recovered.status, FrameRegistrationStatus::Registered);
+    assert!(recovered.attempts > 0);
+    assert!(recovered.message.is_some());
+    require_complete_pose_coverage(&result)?;
     Ok(())
 }
 

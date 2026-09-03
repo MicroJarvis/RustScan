@@ -2482,4 +2482,45 @@ mod tests {
 
         assert!((hit - Vec3::ZERO).length() < 1e-4);
     }
+
+    #[test]
+    #[ignore = "runs RustSFM reconstruction and GPU matching on real home images"]
+    fn home_images_project_reconstructs_and_loads_as_rustgs_dataset(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let images_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test_data/home/images");
+        let mut images = fs::read_dir(&images_root)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| is_supported_image_file(path))
+            .collect::<Vec<_>>();
+        images.sort();
+        images.truncate(12);
+        assert_eq!(images.len(), 12, "home fixture must provide 12 images");
+
+        let temp = tempfile::tempdir()?;
+        let project =
+            create_image_sequence_project(images, temp.path().join("Home.rustscanproject"))?;
+        let mut store = ProjectStore::open(&project.path)?;
+        let mut sfm_config = store.manifest().sfm_config.clone();
+        sfm_config.keyframe_selection = crate::project::KeyframeSelectionMode::AllImages;
+        store.update_sfm_config(sfm_config)?;
+        drop(store);
+        let mut pipeline = new_project_pipeline(&project.path)?;
+        pipeline.send(PipelineCommand::StartThrough {
+            stage: ProjectStage::FullFramePnp,
+        })?;
+        pipeline.drive_until_idle()?;
+
+        let manifest = pipeline.store().manifest();
+        assert_eq!(
+            manifest.try_stage(ProjectStage::FullFramePnp)?.state(),
+            crate::project::StageState::Succeeded
+        );
+        let colmap_root = committed_project_colmap_root(pipeline.store().root(), manifest)
+            .expect("FullFramePnP must publish a COLMAP sparse artifact");
+        let loaded = load_colmap_training_dataset(&colmap_root, &ColmapConfig::default())?;
+        assert!(loaded.summary.frame_count >= 2);
+        assert!(loaded.summary.sparse_point_count > 0);
+        Ok(())
+    }
 }

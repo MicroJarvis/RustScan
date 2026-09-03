@@ -558,9 +558,15 @@ fn import_database_images_with_image_directory(
     database: &Path,
 ) -> anyhow::Result<()> {
     let db = ColmapDatabase::open(database)?;
+    let camera_id_for_sequence = if mapper_config.single_camera { 1 } else { 0 };
     for &index in indices {
         let frame = &frames[index];
         let image_id = u32::try_from(index + 1)?;
+        let camera_id = if mapper_config.single_camera {
+            camera_id_for_sequence
+        } else {
+            image_id
+        };
         let expected_name = frame
             .image_path
             .file_name()
@@ -569,7 +575,7 @@ fn import_database_images_with_image_directory(
         let staged_image_path = image_directory.map(|directory| directory.join(expected_name));
         let metadata_image_path = staged_image_path.as_deref().unwrap_or(&frame.image_path);
         let expected_camera =
-            expected_database_camera(metadata_image_path, mapper_config, image_id)?;
+            expected_database_camera(metadata_image_path, mapper_config, camera_id)?;
         if let Some(existing_image) = db.read_image(image_id)? {
             if existing_image.name != expected_name || existing_image.frame_id.is_some() {
                 anyhow::bail!("database image_id={image_id} metadata does not match frame");
@@ -586,9 +592,9 @@ fn import_database_images_with_image_directory(
             continue;
         }
 
-        if let Some(existing_camera) = db.read_camera(image_id)? {
+        if let Some(existing_camera) = db.read_camera(camera_id)? {
             if !database_camera_metadata_matches(&existing_camera, &expected_camera) {
-                anyhow::bail!("database camera_id={image_id} metadata does not match frame");
+                anyhow::bail!("database camera_id={camera_id} metadata does not match frame");
             }
         } else {
             db.write_camera(&expected_camera, true)?;
@@ -597,7 +603,7 @@ fn import_database_images_with_image_directory(
             &ColmapDatabaseImage {
                 image_id,
                 name: expected_name.to_owned(),
-                camera_id: image_id,
+                camera_id,
                 frame_id: None,
             },
             true,
@@ -853,9 +859,12 @@ pub fn register_remaining_sequence_frames(
         mapper_config,
         output,
     )?;
+    let initial_registered_names = registered_image_names(&initial_reconstruction);
+    let registered_keyframe_indices =
+        registered_keyframe_indices(frames, &keyframe_indices, &initial_registered_names)?;
     let plan = SequenceRegistrationPlan::build_from_frames(
         frames,
-        &keyframe_indices,
+        &registered_keyframe_indices,
         config.narrow_neighbors_each_side,
         config.wide_neighbors_each_side,
     )?;
@@ -872,8 +881,7 @@ pub fn register_remaining_sequence_frames(
             FrameRegistrationDiagnostic::new(frame.id, FrameRegistrationStatus::Unresolved)
         })
         .collect::<Vec<_>>();
-    let initial_registered_names = registered_image_names(&initial_reconstruction);
-    for &keyframe in &keyframe_indices {
+    for &keyframe in &registered_keyframe_indices {
         let name = stable_image_name(&frames[keyframe])?;
         if initial_registered_names.contains(name) {
             diagnostics[keyframe].status = FrameRegistrationStatus::Keyframe;
@@ -1403,6 +1411,22 @@ fn registered_image_names(reconstruction: &Reconstruction) -> HashSet<&str> {
         .iter()
         .zip(&reconstruction.poses)
         .filter_map(|(name, pose)| pose.is_some().then_some(name.as_str()))
+        .collect()
+}
+
+fn registered_keyframe_indices(
+    frames: &[SequenceFrame],
+    selected_keyframe_indices: &[usize],
+    registered_names: &HashSet<&str>,
+) -> anyhow::Result<Vec<usize>> {
+    selected_keyframe_indices
+        .iter()
+        .copied()
+        .filter_map(|index| {
+            stable_image_name(&frames[index])
+                .map(|name| registered_names.contains(name).then_some(index))
+                .transpose()
+        })
         .collect()
 }
 
@@ -2387,6 +2411,32 @@ mod task6_tests {
     use super::*;
 
     #[test]
+    fn incomplete_keyframe_selection_only_anchors_registered_frames() {
+        let frames = vec![
+            SequenceFrame {
+                id: 10,
+                image_path: PathBuf::from("anchor.jpg"),
+                timestamp_us: Some(0),
+            },
+            SequenceFrame {
+                id: 11,
+                image_path: PathBuf::from("retry.jpg"),
+                timestamp_us: Some(1),
+            },
+            SequenceFrame {
+                id: 12,
+                image_path: PathBuf::from("other.jpg"),
+                timestamp_us: Some(2),
+            },
+        ];
+        let registered = HashSet::from(["anchor.jpg", "other.jpg"]);
+        let anchors = registered_keyframe_indices(&frames, &[0, 1, 2], &registered).unwrap();
+        assert_eq!(anchors, vec![0, 2]);
+        let plan = SequenceRegistrationPlan::build_from_frames(&frames, &anchors, 1, 2).unwrap();
+        assert_eq!(plan.pending_frames(), &[1]);
+    }
+
+    #[test]
     fn registration_diagnostic_keeps_gpu_focal_fallback_context() {
         let message = append_registration_diagnostic_message(
             Some("registered in Narrow round".to_owned()),
@@ -2735,6 +2785,41 @@ mod task6_tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("already in progress"));
+        Ok(())
+    }
+
+    #[test]
+    fn single_camera_database_import_reuses_one_camera_for_all_frames() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        image::GrayImage::new(32, 24).save(&first)?;
+        image::GrayImage::new(32, 24).save(&second)?;
+        let frames = vec![
+            SequenceFrame {
+                id: 10,
+                image_path: first,
+                timestamp_us: Some(0),
+            },
+            SequenceFrame {
+                id: 11,
+                image_path: second,
+                timestamp_us: Some(1),
+            },
+        ];
+        let database_path = temp.path().join("database.db");
+        let config = MapperConfig {
+            single_camera: true,
+            ..MapperConfig::default()
+        };
+        import_database_images(&frames, &[0, 1], &config, &database_path)?;
+
+        let database = ColmapDatabase::open_read_only(&database_path)?;
+        let first_image = database.read_image(1)?.expect("first image");
+        let second_image = database.read_image(2)?.expect("second image");
+        assert_eq!(first_image.camera_id, 1);
+        assert_eq!(second_image.camera_id, 1);
+        assert!(database.read_camera(2)?.is_none());
         Ok(())
     }
 
