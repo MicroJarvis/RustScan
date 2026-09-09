@@ -19,7 +19,10 @@ use crate::colmap::{
     read_colmap_sparse_model, write_colmap_sparse_binary, ColmapCamera, ColmapSparseFormat,
 };
 use crate::database::{ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage};
-use crate::feature_extraction::extract_selected_features_to_database_with_task;
+use crate::feature_extraction::{
+    db_memory_plan, extract_selected_features_to_database_with_plan_and_task,
+    extract_selected_features_to_database_with_task, FeatureMemoryPlan,
+};
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::feature_matching_db::{
     match_explicit_image_pairs_to_database_with_session,
@@ -27,8 +30,9 @@ use crate::feature_matching_db::{
     MatchFeaturesOptions,
 };
 use crate::mapper::{
-    create_gpu_pnp_scorer, register_single_target_from_database_with_pnp_scorer,
-    run_reconstruction_with_task, FeatureType, MapperConfig,
+    create_gpu_pnp_scorer, global_ba_enabled, refine_global_bundle_once,
+    register_single_target_from_database_with_pnp_scorer, run_reconstruction_with_task,
+    FeatureType, MapperConfig,
 };
 use crate::task::{SfmTaskContext, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage};
 use crate::types::{Reconstruction, COLMAP_PINHOLE};
@@ -191,14 +195,144 @@ pub struct KeyframeReconstructionResult {
     pub sparse_model: PathBuf,
 }
 
-pub fn run_keyframe_reconstruction(
+// The configured floor is the caller's allowance for live model, matching, BA,
+// caches and other work. It is NOT an estimate of those allocations. Add SIFT
+// scratch to it; neither these plans nor admission are a lifecycle/RSS bound.
+struct SequenceFeaturePlan {
+    images: Vec<(u32, PathBuf)>,
+    memory: FeatureMemoryPlan,
+}
+
+fn sequence_feature_plan(
     frames: &[SequenceFrame],
-    keyframe_ids: &[u32],
+    indices: &[usize],
+    database: &Path,
     mapper_config: &MapperConfig,
-    output: &Path,
+    task: &SfmTaskContext<'_>,
+    threads: usize,
+) -> anyhow::Result<Option<SequenceFeaturePlan>> {
+    if mapper_config.feature_type != FeatureType::Sift || !task.has_feature_memory_estimate() {
+        return Ok(None);
+    }
+    let (other_work_bytes, budget) = task.feature_memory_limits()?;
+    let mut options = mapper_config.sift_extraction.clone();
+    options.max_num_features = mapper_config.max_features;
+    let control = task.control();
+    // Probe support before DB/header IO; unsupported backends keep the old path.
+    if db_memory_plan(
+        &[],
+        &options,
+        true,
+        threads,
+        budget,
+        other_work_bytes,
+        &control,
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+    let db = database
+        .is_file()
+        .then(|| ColmapDatabase::open_read_only(database))
+        .transpose()?;
+    let mut missing = Vec::new();
+    for &index in indices {
+        let frame = &frames[index];
+        let image_id = u32::try_from(index + 1)?;
+        let name = stable_image_name(frame)?;
+        if let Some(db) = &db {
+            if let Some(image) = db.read_image(image_id)? {
+                anyhow::ensure!(
+                    image.name == name && image.frame_id.is_none(),
+                    "database image_id={image_id} metadata does not match frame"
+                );
+                if db.exists_keypoints(image_id)? && db.exists_descriptors(image_id)? {
+                    continue;
+                }
+            }
+        }
+        missing.push((name, image_id, frame.image_path.clone()));
+    }
+    missing.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let images = missing
+        .into_iter()
+        .map(|(_, id, path)| (id, path))
+        .collect::<Vec<_>>();
+    let paths = images
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    Ok(db_memory_plan(
+        &paths,
+        &options,
+        true,
+        threads,
+        budget,
+        other_work_bytes,
+        &control,
+    )?
+    .map(|memory| SequenceFeaturePlan { images, memory }))
+}
+
+fn extract_sequence_features(
+    database: &Path,
+    images_dir: &Path,
+    options: &crate::sift::SiftExtractionOptions,
+    image_ids: &[u32],
+    planned: Option<&SequenceFeaturePlan>,
     task: &mut SfmTaskContext<'_>,
-) -> anyhow::Result<KeyframeReconstructionResult> {
-    let keyframe_indices = validate_runner_inputs(frames, keyframe_ids)?;
+) -> anyhow::Result<()> {
+    if image_ids.is_empty() {
+        return Ok(());
+    }
+    if let Some(planned) = planned {
+        let actual = image_ids.iter().copied().collect::<BTreeSet<_>>();
+        let expected = planned
+            .images
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            actual == expected,
+            "sequence feature cache changed after memory planning"
+        );
+        extract_selected_features_to_database_with_plan_and_task(
+            database,
+            images_dir,
+            options,
+            &planned.images,
+            &planned.memory,
+            task,
+        )?;
+    } else {
+        extract_selected_features_to_database_with_task(
+            database, images_dir, options, image_ids, task,
+        )?;
+    }
+    Ok(())
+}
+
+fn sequence_target_plans(
+    frames: &[SequenceFrame],
+    indices: &[usize],
+    database: &Path,
+    mapper_config: &MapperConfig,
+    task: &SfmTaskContext<'_>,
+) -> anyhow::Result<std::collections::BTreeMap<usize, SequenceFeaturePlan>> {
+    let mut plans = std::collections::BTreeMap::new();
+    for &index in indices {
+        // Targets are extracted lazily, one at a time, never as a batched subset.
+        if let Some(plan) =
+            sequence_feature_plan(frames, &[index], database, mapper_config, task, 1)?
+        {
+            plans.insert(index, plan);
+        }
+    }
+    Ok(plans)
+}
+
+fn validate_keyframe_reconstruction_config(mapper_config: &MapperConfig) -> anyhow::Result<()> {
     if mapper_config.feature_type != FeatureType::Sift {
         anyhow::bail!("sequence registration requires SIFT features");
     }
@@ -208,6 +342,62 @@ pub fn run_keyframe_reconstruction(
     ) {
         anyhow::bail!("keyframe-only vocabulary-tree matching is unsupported");
     }
+    Ok(())
+}
+
+/// With an explicit taskflow binding, the configured stage-memory floor is the
+/// caller's allowance for model/matching/BA/cache residency. Supported SIFT
+/// extraction scratch is added to that allowance before admission. This is an
+/// allocation plan, not a bound on RSS or the reconstruction's full lifecycle.
+pub fn run_keyframe_reconstruction(
+    frames: &[SequenceFrame],
+    keyframe_ids: &[u32],
+    mapper_config: &MapperConfig,
+    output: &Path,
+    task: &mut SfmTaskContext<'_>,
+) -> anyhow::Result<KeyframeReconstructionResult> {
+    validate_keyframe_reconstruction_config(mapper_config)?;
+    task.inherit_ba_taskflow(mapper_config)?;
+    let keyframe_indices = validate_runner_inputs(frames, keyframe_ids)?;
+    let planned = sequence_feature_plan(
+        frames,
+        &keyframe_indices,
+        &output.join("Cache/database.db"),
+        mapper_config,
+        task,
+        mapper_config.threads.unwrap_or(4),
+    )?;
+    task.execute_with_memory_and_gpu(
+        "keyframe reconstruction and export",
+        mapper_config.sift_extraction.use_gpu
+            || mapper_config.sift_matching.use_gpu
+            || mapper_config.use_gpu_pnp,
+        planned
+            .as_ref()
+            .map_or(0, |plan| plan.memory.request_bytes()),
+        mapper_config.threads.unwrap_or(4),
+        |task| {
+            run_keyframe_reconstruction_planned(
+                frames,
+                keyframe_ids,
+                mapper_config,
+                output,
+                planned.as_ref(),
+                task,
+            )
+        },
+    )
+}
+
+fn run_keyframe_reconstruction_planned(
+    frames: &[SequenceFrame],
+    keyframe_ids: &[u32],
+    mapper_config: &MapperConfig,
+    output: &Path,
+    planned: Option<&SequenceFeaturePlan>,
+    task: &mut SfmTaskContext<'_>,
+) -> anyhow::Result<KeyframeReconstructionResult> {
+    let keyframe_indices = validate_runner_inputs(frames, keyframe_ids)?;
     task.checkpoint().map_err(anyhow::Error::new)?;
 
     let cache = output.join("Cache");
@@ -237,11 +427,12 @@ pub fn run_keyframe_reconstruction(
         }
     }
     if !missing_feature_image_ids.is_empty() {
-        extract_selected_features_to_database_with_task(
+        extract_sequence_features(
             &database,
             &keyframe_input,
             &sift_extraction,
             &missing_feature_image_ids,
+            planned,
             task,
         )?;
     }
@@ -269,6 +460,7 @@ pub fn run_keyframe_reconstruction(
     reconstruction_config.database = Some(database.clone());
     reconstruction_config.local_matching = false;
     reconstruction_config.write_database = false;
+    reconstruction_config.global_ba = false;
     let summary = run_reconstruction_with_task(&reconstruction_config, task)?;
     let published_sparse_model = output.join("sparse").join("0");
     let sparse_files =
@@ -819,6 +1011,10 @@ pub(super) fn validate_runner_inputs(
     Ok(keyframe_indices)
 }
 
+/// Resume artifacts (including the existing reconstruction) are loaded and
+/// validated before pause/memory admission. With a taskflow binding, the caller
+/// must size the stage-memory floor for live model/matching/BA/cache work;
+/// supported per-target SIFT scratch is additive. Targets remain lazily extracted.
 pub fn register_remaining_sequence_frames(
     frames: &[SequenceFrame],
     keyframe_ids: &[u32],
@@ -828,6 +1024,33 @@ pub fn register_remaining_sequence_frames(
     output: &Path,
     task: &mut SfmTaskContext<'_>,
 ) -> anyhow::Result<SequenceRegistrationResult> {
+    register_remaining_sequence_frames_planned(
+        frames,
+        keyframe_ids,
+        keyframe_result,
+        mapper_config,
+        config,
+        output,
+        None,
+        task,
+    )
+}
+
+fn register_remaining_sequence_frames_planned(
+    frames: &[SequenceFrame],
+    keyframe_ids: &[u32],
+    keyframe_result: &KeyframeReconstructionResult,
+    mapper_config: &MapperConfig,
+    config: &SequenceRegistrationConfig,
+    output: &Path,
+    preplanned: Option<&std::collections::BTreeMap<usize, SequenceFeaturePlan>>,
+    task: &mut SfmTaskContext<'_>,
+) -> anyhow::Result<SequenceRegistrationResult> {
+    task.inherit_ba_taskflow(mapper_config)?;
+    let mut controlled_mapper_config = mapper_config.clone();
+    task.bind_ba_taskflow(&mut controlled_mapper_config);
+
+    let mapper_config = &controlled_mapper_config;
     let keyframe_indices = validate_runner_inputs(frames, keyframe_ids)?;
     config.validate().map_err(anyhow::Error::new)?;
     let normalized_keyframe_ids = keyframe_indices
@@ -868,290 +1091,412 @@ pub fn register_remaining_sequence_frames(
         config.narrow_neighbors_each_side,
         config.wide_neighbors_each_side,
     )?;
-    task.checkpoint().map_err(anyhow::Error::new)?;
-
-    let sequence_input = output.join("Cache").join("sequence");
-    std::fs::create_dir_all(&sequence_input)?;
-    for frame in frames {
-        link_or_copy_stable_image(&frame.image_path, &sequence_input)?;
-    }
-    let mut diagnostics = frames
-        .iter()
-        .map(|frame| {
-            FrameRegistrationDiagnostic::new(frame.id, FrameRegistrationStatus::Unresolved)
-        })
-        .collect::<Vec<_>>();
-    for &keyframe in &registered_keyframe_indices {
-        let name = stable_image_name(&frames[keyframe])?;
-        if initial_registered_names.contains(name) {
-            diagnostics[keyframe].status = FrameRegistrationStatus::Keyframe;
-        } else {
-            diagnostics[keyframe].message = Some("keyframe was not registered".to_owned());
-        }
-    }
-    task.emit(SfmTaskEvent {
-        sequence: 0,
-        elapsed_ms: 0,
-        stage: SfmTaskStage::FullFrameRegistration,
-        operation: SfmTaskOperation::Begin,
-        kind: SfmTaskEventKind::Started,
-        completed: Some(0),
-        total: Some(plan.pending_frames().len()),
-        registered_images: Some(initial_registered_names.len()),
-        sparse_points: Some(initial_reconstruction.points.len()),
-        image_id: None,
-        pair: None,
-        message: None,
-        issue: None,
-    });
-
-    let mut current_reconstruction = initial_reconstruction;
-    let mut current_reference = keyframe_result.sparse_model.clone();
-    let mut available_from_prior_rounds = Vec::<usize>::new();
-    let mut extracted_targets = HashSet::<usize>::new();
-    let match_options = sequence_match_options(mapper_config);
-    let mut target_mapper_config = mapper_config.clone();
-    target_mapper_config.abs_pose_min_num_inliers = config.min_inliers.max(4);
-    target_mapper_config.abs_pose_min_inlier_ratio = config.min_inlier_ratio as f32;
-    target_mapper_config.pnp_threshold_px = config.max_reprojection_error as f32;
-    target_mapper_config.use_gpu_pnp = config.use_gpu_pnp;
-    target_mapper_config.local_ba = false;
-    target_mapper_config.global_ba = false;
-    target_mapper_config.fix_existing_frames = true;
-    let has_pending_frames = !plan.pending_frames().is_empty();
-    let matching_session = has_pending_frames
-        .then(|| ExplicitPairMatchingSession::new(&match_options))
-        .transpose()?;
-    let mut pnp_scorer = if has_pending_frames {
-        create_gpu_pnp_scorer(&target_mapper_config)?
+    drop(initial_registered_names);
+    // Artifact/model loading deliberately precedes planning, pause and admission.
+    // The loaded reconstruction is outside admission; its residency and subsequent
+    // model growth are covered only by the caller's other-work allowance contract.
+    let owned_plans;
+    let target_plans = if let Some(plans) = preplanned {
+        plans
     } else {
-        None
+        owned_plans = sequence_target_plans(
+            frames,
+            plan.pending_frames(),
+            &keyframe_result.database,
+            mapper_config,
+            task,
+        )?;
+        &owned_plans
     };
+    let request = target_plans
+        .values()
+        .map(|plan| plan.memory.request_bytes())
+        .max()
+        .unwrap_or(0);
+    task.execute_with_memory_and_gpu(
+        "remaining registration and final export",
+        mapper_config.sift_extraction.use_gpu
+            || mapper_config.sift_matching.use_gpu
+            || config.use_gpu_pnp,
+        request,
+        mapper_config.threads.unwrap_or(4),
+        |task| {
+            task.checkpoint().map_err(anyhow::Error::new)?;
+            let initial_registered_names = registered_image_names(&initial_reconstruction);
 
-    for round in [RegistrationRound::Narrow, RegistrationRound::Wide] {
-        let mut accepted_this_round = Vec::<usize>::new();
-        for &target in plan.pending_frames() {
-            if diagnostics[target].status == FrameRegistrationStatus::Registered {
-                continue;
+            let sequence_input = output.join("Cache").join("sequence");
+            std::fs::create_dir_all(&sequence_input)?;
+            for frame in frames {
+                link_or_copy_stable_image(&frame.image_path, &sequence_input)?;
             }
-            if extracted_targets.insert(target) {
-                import_database_images(
-                    frames,
-                    &[target],
-                    mapper_config,
-                    &keyframe_result.database,
-                )?;
-                let target_database_id = u32::try_from(target + 1)?;
-                if !database_features_exist(&keyframe_result.database, target_database_id)? {
-                    let mut sift_extraction = mapper_config.sift_extraction.clone();
-                    sift_extraction.max_num_features = mapper_config.max_features;
-                    extract_selected_features_to_database_with_task(
-                        &keyframe_result.database,
-                        &sequence_input,
-                        &sift_extraction,
-                        &[target_database_id],
-                        task,
-                    )?;
+            let mut diagnostics = frames
+                .iter()
+                .map(|frame| {
+                    FrameRegistrationDiagnostic::new(frame.id, FrameRegistrationStatus::Unresolved)
+                })
+                .collect::<Vec<_>>();
+            for &keyframe in &registered_keyframe_indices {
+                let name = stable_image_name(&frames[keyframe])?;
+                if initial_registered_names.contains(name) {
+                    diagnostics[keyframe].status = FrameRegistrationStatus::Keyframe;
+                } else {
+                    diagnostics[keyframe].message = Some("keyframe was not registered".to_owned());
                 }
             }
-            let mut support =
-                plan.attempts_for_with_sorted_support(target, round, &available_from_prior_rounds)?;
-            let registered_names = registered_image_names(&current_reconstruction);
-            support.retain(|&index| {
-                stable_image_name(&frames[index])
-                    .map(|name| registered_names.contains(name))
-                    .unwrap_or(false)
-            });
-            let support_frame_ids = support
-                .iter()
-                .map(|&index| frames[index].id)
-                .collect::<Vec<_>>();
-            let attempt_seed =
-                sequence_attempt_random_seed(mapper_config.random_seed, frames[target].id, round);
-            task.checkpoint().map_err(anyhow::Error::new)?;
             task.emit(SfmTaskEvent {
                 sequence: 0,
                 elapsed_ms: 0,
                 stage: SfmTaskStage::FullFrameRegistration,
-                operation: SfmTaskOperation::RegisterFrameAttempt,
-                kind: SfmTaskEventKind::Progress,
-                completed: Some(diagnostics.iter().map(|item| item.attempts).sum::<usize>() + 1),
-                total: None,
-                registered_images: Some(registered_names.len()),
-                sparse_points: Some(current_reconstruction.points.len()),
-                image_id: Some(frames[target].id),
+                operation: SfmTaskOperation::Begin,
+                kind: SfmTaskEventKind::Started,
+                completed: Some(0),
+                total: Some(plan.pending_frames().len()),
+                registered_images: Some(initial_registered_names.len()),
+                sparse_points: Some(initial_reconstruction.points.len()),
+                image_id: None,
                 pair: None,
-                message: Some(format!(
-                    "round={round:?} seed={attempt_seed} support={support_frame_ids:?}"
-                )),
+                message: None,
                 issue: None,
             });
-            if support.is_empty() {
-                diagnostics[target].record_attempt(
-                    FrameRegistrationStatus::Unresolved,
-                    support_frame_ids,
-                    0,
-                    0.0,
-                    None,
-                    Some("no registered temporal support".to_owned()),
+
+            let mut current_reconstruction = initial_reconstruction;
+            let mut current_reference = keyframe_result.sparse_model.clone();
+            let mut available_from_prior_rounds = Vec::<usize>::new();
+            let mut extracted_targets = HashSet::<usize>::new();
+            let match_options = sequence_match_options(mapper_config);
+            let mut target_mapper_config = mapper_config.clone();
+            target_mapper_config.abs_pose_min_num_inliers = config.min_inliers.max(4);
+            target_mapper_config.abs_pose_min_inlier_ratio = config.min_inlier_ratio as f32;
+            target_mapper_config.pnp_threshold_px = config.max_reprojection_error as f32;
+            target_mapper_config.use_gpu_pnp = config.use_gpu_pnp;
+            target_mapper_config.threads = target_mapper_config.threads.map(|requested| {
+                requested
+                    .max(1)
+                    .min(crate::execution::active_threads().unwrap_or(requested.max(1)))
+            });
+            target_mapper_config.local_ba = false;
+            target_mapper_config.global_ba = false;
+            target_mapper_config.fix_existing_frames = true;
+            let has_pending_frames = !plan.pending_frames().is_empty();
+            let matching_session = has_pending_frames
+                .then(|| ExplicitPairMatchingSession::new(&match_options))
+                .transpose()?;
+            let mut pnp_scorer = if has_pending_frames {
+                create_gpu_pnp_scorer(&target_mapper_config)?
+            } else {
+                None
+            };
+
+            for round in [RegistrationRound::Narrow, RegistrationRound::Wide] {
+                let mut accepted_this_round = Vec::<usize>::new();
+                for &target in plan.pending_frames() {
+                    if diagnostics[target].status == FrameRegistrationStatus::Registered {
+                        continue;
+                    }
+                    if extracted_targets.insert(target) {
+                        import_database_images(
+                            frames,
+                            &[target],
+                            mapper_config,
+                            &keyframe_result.database,
+                        )?;
+                        let target_database_id = u32::try_from(target + 1)?;
+                        if !database_features_exist(&keyframe_result.database, target_database_id)?
+                        {
+                            let mut sift_extraction = mapper_config.sift_extraction.clone();
+                            sift_extraction.max_num_features = mapper_config.max_features;
+                            extract_sequence_features(
+                                &keyframe_result.database,
+                                &sequence_input,
+                                &sift_extraction,
+                                &[target_database_id],
+                                target_plans.get(&target),
+                                task,
+                            )?;
+                        }
+                    }
+                    let mut support = plan.attempts_for_with_sorted_support(
+                        target,
+                        round,
+                        &available_from_prior_rounds,
+                    )?;
+                    let registered_names = registered_image_names(&current_reconstruction);
+                    support.retain(|&index| {
+                        stable_image_name(&frames[index])
+                            .map(|name| registered_names.contains(name))
+                            .unwrap_or(false)
+                    });
+                    let support_frame_ids = support
+                        .iter()
+                        .map(|&index| frames[index].id)
+                        .collect::<Vec<_>>();
+                    let attempt_seed = sequence_attempt_random_seed(
+                        mapper_config.random_seed,
+                        frames[target].id,
+                        round,
+                    );
+                    task.checkpoint().map_err(anyhow::Error::new)?;
+                    task.emit(SfmTaskEvent {
+                        sequence: 0,
+                        elapsed_ms: 0,
+                        stage: SfmTaskStage::FullFrameRegistration,
+                        operation: SfmTaskOperation::RegisterFrameAttempt,
+                        kind: SfmTaskEventKind::Progress,
+                        completed: Some(
+                            diagnostics.iter().map(|item| item.attempts).sum::<usize>() + 1,
+                        ),
+                        total: None,
+                        registered_images: Some(registered_names.len()),
+                        sparse_points: Some(current_reconstruction.points.len()),
+                        image_id: Some(frames[target].id),
+                        pair: None,
+                        message: Some(format!(
+                            "round={round:?} seed={attempt_seed} support={support_frame_ids:?}"
+                        )),
+                        issue: None,
+                    });
+                    if support.is_empty() {
+                        diagnostics[target].record_attempt(
+                            FrameRegistrationStatus::Unresolved,
+                            support_frame_ids,
+                            0,
+                            0.0,
+                            None,
+                            Some("no registered temporal support".to_owned()),
+                        );
+                        continue;
+                    }
+
+                    let target_database_id = u32::try_from(target + 1)?;
+                    let pairs = support
+                        .iter()
+                        .map(|&index| Ok((target_database_id, u32::try_from(index + 1)?)))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    let mut attempt_match_options = match_options.clone();
+                    attempt_match_options.random_seed = attempt_seed;
+                    match_explicit_image_pairs_to_database_with_session(
+                        &keyframe_result.database,
+                        &pairs,
+                        &attempt_match_options,
+                        matching_session
+                            .as_ref()
+                            .expect("pending frames initialized a matching session"),
+                        task,
+                    )?;
+                    let target_name = stable_image_name(&frames[target])?;
+                    let support_names = support
+                        .iter()
+                        .map(|&index| stable_image_name(&frames[index]).map(str::to_owned))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    let mut attempt_mapper_config = target_mapper_config.clone();
+                    attempt_mapper_config.random_seed = attempt_seed;
+                    let attempt = register_single_target_from_database_with_pnp_scorer(
+                        &sequence_input,
+                        &keyframe_result.database,
+                        &current_reference,
+                        target_name,
+                        &support_names,
+                        &attempt_mapper_config,
+                        pnp_scorer.as_deref_mut(),
+                    )?;
+                    let candidate = attempt.candidate;
+                    let (inlier_count, inlier_ratio, mean_error) = candidate
+                        .as_ref()
+                        .map(|candidate| {
+                            (
+                                candidate.inlier_count,
+                                candidate.inlier_ratio,
+                                Some(candidate.mean_reprojection_error),
+                            )
+                        })
+                        .unwrap_or((0, 0.0, None));
+                    diagnostics[target].record_attempt(
+                        FrameRegistrationStatus::Unresolved,
+                        support_frame_ids,
+                        inlier_count,
+                        inlier_ratio,
+                        mean_error,
+                        append_registration_diagnostic_message(
+                            candidate
+                                .is_none()
+                                .then(|| "PnP did not produce a finite pose".to_owned()),
+                            &attempt.debug_log,
+                        ),
+                    );
+                    if let Some(message) =
+                        append_registration_diagnostic_message(None, &attempt.debug_log)
+                    {
+                        task.emit(SfmTaskEvent {
+                            sequence: 0,
+                            elapsed_ms: 0,
+                            stage: SfmTaskStage::FullFrameRegistration,
+                            operation: SfmTaskOperation::RegisterFrameAttempt,
+                            kind: SfmTaskEventKind::Progress,
+                            completed: Some(diagnostics.iter().map(|item| item.attempts).sum()),
+                            total: None,
+                            registered_images: Some(registered_names.len()),
+                            sparse_points: Some(current_reconstruction.points.len()),
+                            image_id: Some(frames[target].id),
+                            pair: None,
+                            message: Some(message),
+                            issue: None,
+                        });
+                    }
+                    if !accepts_registration(&diagnostics[target], config) {
+                        continue;
+                    }
+                    let candidate =
+                        candidate.expect("accepted diagnostic requires a candidate model");
+                    validate_sparse_reconstruction(&candidate.reconstruction)
+                        .map_err(|error| error.context("invalid accepted registration model"))?;
+                    let accepted_root = output
+                        .join("Cache")
+                        .join("accepted")
+                        .join(match round {
+                            RegistrationRound::Narrow => "narrow",
+                            RegistrationRound::Wide => "wide",
+                        })
+                        .join(frames[target].id.to_string());
+                    if accepted_root.exists() {
+                        std::fs::remove_dir_all(&accepted_root)?;
+                    }
+                    export_colmap(&accepted_root, &candidate.reconstruction, false)?;
+                    let accepted_sparse = accepted_root.join("sparse").join("0");
+                    let accepted_model = read_colmap_sparse_model(&accepted_sparse)?;
+                    validate_sparse_reconstruction(&accepted_model.reconstruction)
+                        .map_err(|error| error.context("invalid exported registration model"))?;
+                    let accepted_files = read_colmap_sparse_files_with_format(
+                        &accepted_sparse,
+                        ColmapSparseFormat::Text,
+                    )?;
+                    write_colmap_sparse_binary(&accepted_sparse, &accepted_files)?;
+                    task.checkpoint().map_err(anyhow::Error::new)?;
+
+                    current_reconstruction = candidate.reconstruction;
+                    current_reference = accepted_sparse;
+                    diagnostics[target].status = FrameRegistrationStatus::Registered;
+                    diagnostics[target].message = append_registration_diagnostic_message(
+                        Some(format!("registered in {round:?} round")),
+                        &attempt.debug_log,
+                    );
+                    match accepted_this_round.binary_search(&target) {
+                        Ok(_) => {}
+                        Err(position) => accepted_this_round.insert(position, target),
+                    }
+                }
+                available_from_prior_rounds = merge_sorted_support(
+                    &available_from_prior_rounds,
+                    &accepted_this_round,
+                    usize::MAX,
                 );
-                continue;
             }
 
-            let target_database_id = u32::try_from(target + 1)?;
-            let pairs = support
-                .iter()
-                .map(|&index| Ok((target_database_id, u32::try_from(index + 1)?)))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let mut attempt_match_options = match_options.clone();
-            attempt_match_options.random_seed = attempt_seed;
-            match_explicit_image_pairs_to_database_with_session(
-                &keyframe_result.database,
-                &pairs,
-                &attempt_match_options,
-                matching_session
-                    .as_ref()
-                    .expect("pending frames initialized a matching session"),
-                task,
-            )?;
-            let target_name = stable_image_name(&frames[target])?;
-            let support_names = support
-                .iter()
-                .map(|&index| stable_image_name(&frames[index]).map(str::to_owned))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let mut attempt_mapper_config = target_mapper_config.clone();
-            attempt_mapper_config.random_seed = attempt_seed;
-            let attempt = register_single_target_from_database_with_pnp_scorer(
-                &sequence_input,
-                &keyframe_result.database,
-                &current_reference,
-                target_name,
-                &support_names,
-                &attempt_mapper_config,
-                pnp_scorer.as_deref_mut(),
-            )?;
-            let candidate = attempt.candidate;
-            let (inlier_count, inlier_ratio, mean_error) = candidate
-                .as_ref()
-                .map(|candidate| {
-                    (
-                        candidate.inlier_count,
-                        candidate.inlier_ratio,
-                        Some(candidate.mean_reprojection_error),
-                    )
-                })
-                .unwrap_or((0, 0.0, None));
-            diagnostics[target].record_attempt(
-                FrameRegistrationStatus::Unresolved,
-                support_frame_ids,
-                inlier_count,
-                inlier_ratio,
-                mean_error,
-                append_registration_diagnostic_message(
-                    candidate
-                        .is_none()
-                        .then(|| "PnP did not produce a finite pose".to_owned()),
-                    &attempt.debug_log,
-                ),
-            );
-            if let Some(message) = append_registration_diagnostic_message(None, &attempt.debug_log)
-            {
+            validate_sparse_reconstruction(&current_reconstruction).map_err(|error| {
+                error.context("invalid merged sequence model before final global BA")
+            })?;
+            if global_ba_enabled(mapper_config) {
+                task.checkpoint().map_err(anyhow::Error::new)?;
                 task.emit(SfmTaskEvent {
                     sequence: 0,
                     elapsed_ms: 0,
-                    stage: SfmTaskStage::FullFrameRegistration,
-                    operation: SfmTaskOperation::RegisterFrameAttempt,
-                    kind: SfmTaskEventKind::Progress,
-                    completed: Some(diagnostics.iter().map(|item| item.attempts).sum()),
+                    stage: SfmTaskStage::BundleAdjustment,
+                    operation: SfmTaskOperation::GlobalBundleAdjustment,
+                    kind: SfmTaskEventKind::Started,
+                    completed: None,
                     total: None,
-                    registered_images: Some(registered_names.len()),
+                    registered_images: Some(current_reconstruction.poses.iter().flatten().count()),
                     sparse_points: Some(current_reconstruction.points.len()),
-                    image_id: Some(frames[target].id),
+                    image_id: None,
                     pair: None,
-                    message: Some(message),
+                    message: Some("final sequence global BA".to_owned()),
                     issue: None,
                 });
+                let global_ba_result = refine_global_bundle_once(
+                    &mut current_reconstruction,
+                    mapper_config,
+                )
+                .and_then(|report| {
+                    report.ok_or_else(|| {
+                        anyhow::anyhow!("final sequence global BA had no solvable observations")
+                    })
+                });
+                // Preserve typed pause/cancel errors even when mapper BA validation has
+                // wrapped an admission failure in its diagnostic skip reason.
+                task.checkpoint().map_err(anyhow::Error::new)?;
+                if let Err(error) = &global_ba_result {
+                    task.emit(SfmTaskEvent {
+                        sequence: 0,
+                        elapsed_ms: 0,
+                        stage: SfmTaskStage::BundleAdjustment,
+                        operation: SfmTaskOperation::GlobalBundleAdjustment,
+                        kind: SfmTaskEventKind::Error,
+                        completed: None,
+                        total: None,
+                        registered_images: Some(
+                            current_reconstruction.poses.iter().flatten().count(),
+                        ),
+                        sparse_points: Some(current_reconstruction.points.len()),
+                        image_id: None,
+                        pair: None,
+                        message: Some(error.to_string()),
+                        issue: None,
+                    });
+                }
+                global_ba_result?;
+                task.emit(SfmTaskEvent {
+                    sequence: 0,
+                    elapsed_ms: 0,
+                    stage: SfmTaskStage::BundleAdjustment,
+                    operation: SfmTaskOperation::GlobalBundleAdjustment,
+                    kind: SfmTaskEventKind::Completed,
+                    completed: None,
+                    total: None,
+                    registered_images: Some(current_reconstruction.poses.iter().flatten().count()),
+                    sparse_points: Some(current_reconstruction.points.len()),
+                    image_id: None,
+                    pair: None,
+                    message: Some("final sequence global BA".to_owned()),
+                    issue: None,
+                });
+                task.checkpoint().map_err(anyhow::Error::new)?;
             }
-            if !accepts_registration(&diagnostics[target], config) {
-                continue;
-            }
-            let candidate = candidate.expect("accepted diagnostic requires a candidate model");
-            validate_sparse_reconstruction(&candidate.reconstruction)
-                .map_err(|error| error.context("invalid accepted registration model"))?;
-            let accepted_root = output
-                .join("Cache")
-                .join("accepted")
-                .join(match round {
-                    RegistrationRound::Narrow => "narrow",
-                    RegistrationRound::Wide => "wide",
-                })
-                .join(frames[target].id.to_string());
-            if accepted_root.exists() {
-                std::fs::remove_dir_all(&accepted_root)?;
-            }
-            export_colmap(&accepted_root, &candidate.reconstruction, false)?;
-            let accepted_sparse = accepted_root.join("sparse").join("0");
-            let accepted_model = read_colmap_sparse_model(&accepted_sparse)?;
-            validate_sparse_reconstruction(&accepted_model.reconstruction)
-                .map_err(|error| error.context("invalid exported registration model"))?;
-            let accepted_files =
-                read_colmap_sparse_files_with_format(&accepted_sparse, ColmapSparseFormat::Text)?;
-            write_colmap_sparse_binary(&accepted_sparse, &accepted_files)?;
-            task.checkpoint().map_err(anyhow::Error::new)?;
-
-            current_reconstruction = candidate.reconstruction;
-            current_reference = accepted_sparse;
-            diagnostics[target].status = FrameRegistrationStatus::Registered;
-            diagnostics[target].message = append_registration_diagnostic_message(
-                Some(format!("registered in {round:?} round")),
-                &attempt.debug_log,
-            );
-            match accepted_this_round.binary_search(&target) {
-                Ok(_) => {}
-                Err(position) => accepted_this_round.insert(position, target),
-            }
-        }
-        available_from_prior_rounds = merge_sorted_support(
-            &available_from_prior_rounds,
-            &accepted_this_round,
-            usize::MAX,
-        );
-    }
-
-    validate_sparse_reconstruction(&current_reconstruction)
-        .map_err(|error| error.context("invalid merged sequence model"))?;
-    let sparse_model = publish_sparse_model_atomic(output, &current_reconstruction, task)?;
-    let merged_model = read_colmap_sparse_model(&sparse_model)?;
-    validate_sparse_reconstruction(&merged_model.reconstruction)
-        .map_err(|error| error.context("invalid exported merged sequence model"))?;
-    let registered_frames = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.status.is_registered())
-        .count();
-    let result = SequenceRegistrationResult {
-        imported_frames: frames.len(),
-        registered_frames,
-        frame_ids: frames.iter().map(|frame| frame.id).collect(),
-        diagnostics,
-        sparse_model,
-    };
-    write_registration_result_atomic(output, &result)?;
-    task.emit(SfmTaskEvent {
-        sequence: 0,
-        elapsed_ms: 0,
-        stage: SfmTaskStage::FullFrameRegistration,
-        operation: SfmTaskOperation::Complete,
-        kind: SfmTaskEventKind::Completed,
-        completed: Some(registered_frames),
-        total: Some(frames.len()),
-        registered_images: Some(registered_frames),
-        sparse_points: Some(merged_model.reconstruction.points.len()),
-        image_id: None,
-        pair: None,
-        message: None,
-        issue: None,
-    });
-    Ok(result)
+            validate_sparse_reconstruction(&current_reconstruction).map_err(|error| {
+                error.context("invalid merged sequence model after final global BA")
+            })?;
+            let sparse_model = publish_sparse_model_atomic(output, &current_reconstruction, task)?;
+            let merged_model = read_colmap_sparse_model(&sparse_model)?;
+            validate_sparse_reconstruction(&merged_model.reconstruction)
+                .map_err(|error| error.context("invalid exported merged sequence model"))?;
+            let registered_frames = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.status.is_registered())
+                .count();
+            let result = SequenceRegistrationResult {
+                imported_frames: frames.len(),
+                registered_frames,
+                frame_ids: frames.iter().map(|frame| frame.id).collect(),
+                diagnostics,
+                sparse_model,
+            };
+            write_registration_result_atomic(output, &result)?;
+            task.emit(SfmTaskEvent {
+                sequence: 0,
+                elapsed_ms: 0,
+                stage: SfmTaskStage::FullFrameRegistration,
+                operation: SfmTaskOperation::Complete,
+                kind: SfmTaskEventKind::Completed,
+                completed: Some(registered_frames),
+                total: Some(frames.len()),
+                registered_images: Some(registered_frames),
+                sparse_points: Some(merged_model.reconstruction.points.len()),
+                image_id: None,
+                pair: None,
+                message: None,
+                issue: None,
+            });
+            Ok(result)
+        },
+    )
 }
 
 fn publish_sparse_model_atomic(
@@ -1376,6 +1721,9 @@ fn remove_file_or_directory(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Plan missing supported SIFT work before submitting the two-node chain. Each
+/// node uses the maximum stage requirement, including the caller's configured
+/// other-work allowance; this does not make model residency an RSS/lifecycle cap.
 pub fn run_sequence_registration(
     frames: &[SequenceFrame],
     keyframe_ids: &[u32],
@@ -1384,16 +1732,82 @@ pub fn run_sequence_registration(
     output: &Path,
     task: &mut SfmTaskContext<'_>,
 ) -> anyhow::Result<SequenceRegistrationResult> {
-    let keyframes = run_keyframe_reconstruction(frames, keyframe_ids, mapper_config, output, task)?;
-    register_remaining_sequence_frames(
+    validate_keyframe_reconstruction_config(mapper_config)?;
+    task.inherit_ba_taskflow(mapper_config)?;
+    let gpu = mapper_config.sift_extraction.use_gpu || mapper_config.sift_matching.use_gpu;
+    let threads = mapper_config.threads.unwrap_or(4);
+    let keyframe_indices = validate_runner_inputs(frames, keyframe_ids)?;
+    config.validate().map_err(anyhow::Error::new)?;
+    let database = output.join("Cache/database.db");
+    let keyframe_plan = sequence_feature_plan(
         frames,
-        keyframe_ids,
-        &keyframes,
+        &keyframe_indices,
+        &database,
         mapper_config,
-        config,
-        output,
         task,
-    )
+        threads,
+    )?;
+    // Registration success is not known before the first node. Include every
+    // possible target, but only missing features; extraction remains lazy.
+    let target_plans = sequence_target_plans(
+        frames,
+        &(0..frames.len()).collect::<Vec<_>>(),
+        &database,
+        mapper_config,
+        task,
+    )?;
+    let request = keyframe_plan
+        .as_ref()
+        .map_or(0, |plan| plan.memory.request_bytes())
+        .max(
+            target_plans
+                .values()
+                .map(|plan| plan.memory.request_bytes())
+                .max()
+                .unwrap_or(0),
+        );
+    let mut keyframes = None;
+    let mut result = None;
+    task.sequence_with_memory(
+        &[
+            (
+                "keyframe reconstruction",
+                gpu || mapper_config.use_gpu_pnp,
+                threads,
+            ),
+            (
+                "remaining registration and final export",
+                gpu || config.use_gpu_pnp,
+                threads,
+            ),
+        ],
+        request,
+        |index, task| {
+            if index == 0 {
+                keyframes = Some(run_keyframe_reconstruction_planned(
+                    frames,
+                    keyframe_ids,
+                    mapper_config,
+                    output,
+                    keyframe_plan.as_ref(),
+                    task,
+                )?);
+            } else {
+                result = Some(register_remaining_sequence_frames_planned(
+                    frames,
+                    keyframe_ids,
+                    keyframes.as_ref().expect("DAG predecessor completed"),
+                    mapper_config,
+                    config,
+                    output,
+                    Some(&target_plans),
+                    task,
+                )?);
+            }
+            Ok(())
+        },
+    )?;
+    result.ok_or_else(|| anyhow::anyhow!("sequence graph completed without a reconstruction"))
 }
 
 fn stable_image_name(frame: &SequenceFrame) -> anyhow::Result<&str> {
@@ -2409,6 +2823,272 @@ where
 #[cfg(test)]
 mod task6_tests {
     use super::*;
+
+    #[test]
+    fn sequence_memory_review_adaptive_gpu_flags_ignore_pnp_under_cpu_parent() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let frames = ["a.png", "b.png"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let image_path = dir.path().join(name);
+                image::GrayImage::new(16, 16).save(&image_path).unwrap();
+                SequenceFrame {
+                    id: index as u32,
+                    image_path,
+                    timestamp_us: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        for (extract_gpu, match_gpu) in [(false, false), (true, false), (false, true)] {
+            let mut config = MapperConfig::default();
+            config.use_gpu_pnp = true;
+            config.sift_extraction.use_gpu = extract_gpu;
+            config.sift_matching.use_gpu = match_gpu;
+            config.max_features = 8;
+            config.threads = Some(1);
+            let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(Default::default())?);
+            let control = crate::SfmTaskControl::new();
+            let began = std::cell::Cell::new(false);
+            let mut sink = |event: SfmTaskEvent| {
+                if event.operation == SfmTaskOperation::Begin {
+                    began.set(true);
+                    control.request_pause();
+                }
+            };
+            let mut task = SfmTaskContext::new(&control, &mut sink)
+                .with_taskflow(crate::SfmTaskflow::new(runtime, 1024 * 1024)?);
+            let error = task
+                .execute_with_memory_and_gpu("CPU parent", false, 64 * 1024 * 1024, 1, |task| {
+                    run_adaptive_keyframe_selection(
+                        &frames,
+                        &Default::default(),
+                        &config,
+                        &dir.path().join("output"),
+                        task,
+                    )
+                })
+                .unwrap_err();
+            if extract_gpu || match_gpu {
+                assert!(!began.get());
+                assert!(
+                    error.to_string().contains("nested inside a CPU-only stage"),
+                    "{error:#}"
+                );
+            } else {
+                assert!(began.get(), "PnP-only flag rejected selection: {error:#}");
+                assert_eq!(
+                    error.downcast_ref::<crate::SfmTaskStop>(),
+                    Some(&crate::SfmTaskStop::Paused)
+                );
+                assert!(
+                    task.stage_reports()
+                        .iter()
+                        .any(|r| r.stage_name == "adaptive keyframe selection"
+                            && r.granted_memory > 0)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_memory_review_static_errors_precede_headers_and_admission() -> anyhow::Result<()> {
+        for chain in [false, true] {
+            for vocab in [false, true] {
+                for bad_header in [false, true] {
+                    for budget in [1, 64 * 1024 * 1024] {
+                        let dir = tempfile::tempdir()?;
+                        let image_path = dir.path().join("frame.png");
+                        if bad_header {
+                            std::fs::write(&image_path, b"not an image header")?;
+                        } else {
+                            image::GrayImage::new(16, 16).save(&image_path)?;
+                        }
+                        let frames = vec![SequenceFrame {
+                            id: 42,
+                            image_path,
+                            timestamp_us: None,
+                        }];
+                        let mut config = MapperConfig::default();
+                        config.sift_extraction.use_gpu = false;
+                        config.sift_matching.use_gpu = false;
+                        config.use_gpu_pnp = false;
+                        let expected = if vocab {
+                            config.matching_pair_strategy =
+                                MatchingPairStrategy::VocabTree { num_images: 1 };
+                            "keyframe-only vocabulary-tree matching is unsupported"
+                        } else {
+                            config.feature_type = FeatureType::Orb;
+                            "sequence registration requires SIFT features"
+                        };
+                        let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(
+                            rustscan_taskflow::RuntimeConfig {
+                                budget: rustscan_taskflow::Budget {
+                                    cpu_threads: 1,
+                                    memory_bytes: budget,
+                                    io_slots: 1,
+                                },
+                                ..Default::default()
+                            },
+                        )?);
+                        let control = crate::SfmTaskControl::new();
+                        let mut events = Vec::new();
+                        let mut sink = |event| events.push(event);
+                        // In the low-budget case even the configured floor cannot
+                        // be admitted. Static unsupported errors must win anyway.
+                        let mut task = SfmTaskContext::new(&control, &mut sink)
+                            .with_taskflow(crate::SfmTaskflow::new(runtime, 2)?);
+                        let output = dir.path().join("output");
+                        let error = if chain {
+                            run_sequence_registration(
+                                &frames,
+                                &[42],
+                                &config,
+                                &Default::default(),
+                                &output,
+                                &mut task,
+                            )
+                            .unwrap_err()
+                        } else {
+                            run_keyframe_reconstruction(&frames, &[42], &config, &output, &mut task)
+                                .unwrap_err()
+                        };
+                        assert_eq!(
+                            error.to_string(),
+                            expected,
+                            "chain={chain} vocab={vocab} bad_header={bad_header} budget={budget}"
+                        );
+                        assert!(task.stage_reports().is_empty());
+                        assert!(!output.exists());
+                        drop(task);
+                        drop(sink);
+                        assert!(events.is_empty());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_memory_unbound_and_unsupported_preserve_missing_paths() -> anyhow::Result<()> {
+        let frames = vec![SequenceFrame {
+            id: 42,
+            image_path: PathBuf::from("absent.png"),
+            timestamp_us: None,
+        }];
+        let control = crate::SfmTaskControl::new();
+        let mut sink = |_| {};
+        let mut task = SfmTaskContext::new(&control, &mut sink);
+        let mut config = MapperConfig::default();
+        assert!(
+            sequence_feature_plan(&frames, &[0], Path::new("absent.db"), &config, &task, 4)?
+                .is_none()
+        );
+        let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(Default::default())?);
+        task = task.with_taskflow(crate::SfmTaskflow::new(runtime, 128)?);
+        config.sift_extraction.use_gpu = true;
+        assert!(
+            sequence_feature_plan(&frames, &[0], Path::new("absent.db"), &config, &task, 4)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+    #[test]
+    fn sequence_memory_sorted_missing_cache_single_targets_and_additive_allowance(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let frames = ["z.png", "a.png"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let image_path = dir.path().join(name);
+                image::GrayImage::new(32, 24).save(&image_path).unwrap();
+                SequenceFrame {
+                    id: index as u32 + 10,
+                    image_path,
+                    timestamp_us: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let database = dir.path().join("database.db");
+        let mut config = MapperConfig::default();
+        config.sift_extraction.use_gpu = false;
+        config.max_features = 8;
+        import_database_images(&frames, &[0, 1], &config, &database)?;
+        let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(Default::default())?);
+        let control = crate::SfmTaskControl::new();
+        let mut sink = |_| {};
+        let task = SfmTaskContext::new(&control, &mut sink)
+            .with_taskflow(crate::SfmTaskflow::new(runtime, 77)?);
+        let plan = sequence_feature_plan(&frames, &[0, 1], &database, &config, &task, 2)?.unwrap();
+        assert_eq!(
+            plan.images,
+            vec![
+                (2, frames[1].image_path.clone()),
+                (1, frames[0].image_path.clone())
+            ]
+        );
+        assert_eq!(plan.memory.options().max_num_features, 8);
+        let paths = plan.memory.paths();
+        let scratch = db_memory_plan(
+            paths,
+            plan.memory.options(),
+            true,
+            2,
+            task.feature_memory_limits()?.1,
+            0,
+            &control,
+        )?
+        .unwrap();
+        assert_eq!(plan.memory.request_bytes(), 77 + scratch.request_bytes());
+        let singles = sequence_target_plans(&frames, &[0, 1], &database, &config, &task)?;
+        for (index, single) in &singles {
+            assert_eq!(
+                single.images,
+                vec![(*index as u32 + 1, frames[*index].image_path.clone())]
+            );
+            assert_eq!(single.memory.paths().len(), 1);
+            assert_eq!(single.memory.batch_size(), 1);
+            assert!(single.memory.request_bytes() <= plan.memory.request_bytes());
+        }
+        assert!(sequence_target_plans(&frames, &[], &database, &config, &task)?.is_empty());
+        let db = ColmapDatabase::open(&database)?;
+        for id in [1, 2] {
+            db.write_keypoints(id, &[])?;
+            db.write_descriptors(
+                id,
+                &crate::database::ColmapDescriptors::new(
+                    crate::database::COLMAP_FEATURE_SIFT,
+                    0,
+                    128,
+                    Vec::new(),
+                )?,
+            )?;
+        }
+        drop(db);
+        // Empty stored features are cache hits too. Planning must not touch headers.
+        for frame in &frames {
+            std::fs::remove_file(&frame.image_path)?;
+        }
+        let cached =
+            sequence_feature_plan(&frames, &[0, 1], &database, &config, &task, 2)?.unwrap();
+        assert!(cached.images.is_empty());
+        assert_eq!(cached.memory.request_bytes(), 77);
+        control.request_pause();
+        let error = sequence_feature_plan(&frames, &[0, 1], &database, &config, &task, 2)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<crate::SfmTaskStop>(),
+            Some(&crate::SfmTaskStop::Paused)
+        );
+        Ok(())
+    }
 
     #[test]
     fn incomplete_keyframe_selection_only_anchors_registered_frames() {

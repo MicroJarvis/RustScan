@@ -37,6 +37,9 @@ the terms of the BSD license (see the COPYING file).
 #include "imopv.h"
 #include "imopv_sse2.h"
 #include "mathop.h"
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #define FLT VL_TYPE_FLOAT
 #define VL_IMOPV_INSTANTIATING
@@ -139,6 +142,47 @@ VL_XCAT(vl_imconvcol_v, SFX)
      filt,filt_begin,filt_end,
      step,flags) ;
     return ;
+  }
+#endif
+
+#if defined(__aarch64__) && (FLT == VL_TYPE_FLOAT)
+  /* Independent columns retain descending taps and the scalar fused multiply-add.
+   * Keep the three original chunks: bottom continuity reuses v, which remains
+   * zero when shifted support never enters either the top or interior chunk. */
+  if (vl_get_simd_enabled()) {
+    for (; x + 4 <= (signed)src_width; x += 4) {
+      for (y = 0; y < (signed)src_height; y += step) {
+        float32x4_t acc = vdupq_n_f32(0);
+        float32x4_t v = vdupq_n_f32(0);
+        vl_index k = filt_end;
+        vl_index stop = filt_end - y;
+        vl_index row = -stop;
+        if (stop > 0) {
+          if (!zeropad) v = vld1q_f32(src + x);
+          for (; k > y; --k, ++row) {
+            acc = vfmaq_n_f32(acc, v, filt[k - filt_begin]);
+          }
+        }
+        stop = VL_MAX(filt_begin, y - (signed)src_height + 1);
+        for (; k >= stop; --k, ++row) {
+          v = vld1q_f32(src + row * src_stride + x);
+          acc = vfmaq_n_f32(acc, v, filt[k - filt_begin]);
+        }
+        if (zeropad) v = vdupq_n_f32(0);
+        for (; k >= filt_begin; --k) {
+          acc = vfmaq_n_f32(acc, v, filt[k - filt_begin]);
+        }
+        if (transp) {
+          float lanes[4];
+          vst1q_f32(lanes, acc);
+          for (int lane = 0; lane < 4; ++lane)
+            dst[lane * dst_stride + y / step] = lanes[lane];
+        } else {
+          vst1q_f32(dst + (y / step) * dst_stride, acc);
+        }
+      }
+      dst += transp ? 4 * dst_stride : 4;
+    }
   }
 #endif
 

@@ -1,8 +1,12 @@
 pub mod ba;
+mod execution;
 pub mod sequence_registration;
 pub mod task;
+pub use execution::{SfmStageReport, SfmTaskflow};
 
-pub use ba::{BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra};
+pub use ba::{
+    BundleAdjustmentLinearSolverPreference, BundleAdjustmentSparseLinearAlgebra, CeresBaTaskflow,
+};
 pub use sequence_registration::{
     register_remaining_sequence_frames, require_complete_pose_coverage,
     run_adaptive_keyframe_selection, run_keyframe_reconstruction, run_sequence_registration,
@@ -126,7 +130,7 @@ pub use feature_extraction::{
     compare_extracted_sift_features, extract_features_to_database,
     extract_features_to_database_with_extractor,
     extract_features_to_database_with_extractor_and_task, extract_features_to_database_with_task,
-    ExtractFeaturesReport, SiftFeatureExtractor,
+    CpuFeatureTaskflow, ExtractFeaturesReport, SiftFeatureExtractor,
 };
 pub use feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 pub use feature_matching_db::{

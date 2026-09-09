@@ -223,6 +223,7 @@ mod tests {
             models: 0,
             elapsed_ms: 1.0,
             debug_log: Vec::new(),
+            stage_reports: Vec::new(),
         };
         assert!(validate_completed_summary(&empty).is_err());
     }
@@ -237,6 +238,7 @@ mod tests {
             models: 1,
             elapsed_ms: 1.0,
             debug_log: Vec::new(),
+            stage_reports: Vec::new(),
         };
         assert!(validate_completed_summary(&complete).is_ok());
     }

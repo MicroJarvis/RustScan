@@ -665,6 +665,14 @@ Gaussian window size is set to have standard deviation
 #include <math.h>
 #include <stdio.h>
 
+#if ! defined(VL_DISABLE_THREADS)
+#if defined(VL_THREADS_POSIX)
+#include <pthread.h>
+#elif defined(VL_THREADS_WIN)
+#include <Windows.h>
+#endif
+#endif
+
 /** @internal @brief Use bilinear interpolation to compute orientations */
 #define VL_SIFT_BILINEAR_ORIENTATIONS 1
 
@@ -710,13 +718,45 @@ fast_expn (double x)
  ** @brief Initialize tables for ::fast_expn
  **/
 
-VL_INLINE void
-fast_expn_init ()
+static void
+fast_expn_init (void)
 {
   int k  ;
   for(k = 0 ; k < EXPN_SZ + 1 ; ++ k) {
     expn_tab [k] = exp (- (double) k * (EXPN_MAX / EXPN_SZ)) ;
   }
+}
+
+#if ! defined(VL_DISABLE_THREADS) && defined(VL_THREADS_WIN)
+static BOOL CALLBACK
+fast_expn_init_callback (PINIT_ONCE once, PVOID parameter, PVOID * context)
+{
+  (void) once ;
+  (void) parameter ;
+  (void) context ;
+  fast_expn_init () ;
+  return TRUE ;
+}
+#endif
+
+static void
+fast_expn_init_once (void)
+{
+  /* Publish the complete table before any filter can read it. Only table
+     initialization is synchronized; descriptor extraction stays lock-free. */
+#if defined(VL_DISABLE_THREADS)
+  static vl_bool initialized = VL_FALSE ;
+  if (! initialized) {
+    fast_expn_init () ;
+    initialized = VL_TRUE ;
+  }
+#elif defined(VL_THREADS_POSIX)
+  static pthread_once_t once = PTHREAD_ONCE_INIT ;
+  pthread_once (&once, fast_expn_init) ;
+#elif defined(VL_THREADS_WIN)
+  static INIT_ONCE once = INIT_ONCE_STATIC_INIT ;
+  InitOnceExecuteOnce (&once, fast_expn_init_callback, NULL, NULL) ;
+#endif
 }
 
 /** ------------------------------------------------------------------
@@ -928,7 +968,7 @@ vl_sift_new (int width, int height,
   f-> grad_o  = o_min - 1 ;
 
   /* initialize fast_expn stuff */
-  fast_expn_init () ;
+  fast_expn_init_once () ;
 
   return f ;
 }

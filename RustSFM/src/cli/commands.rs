@@ -721,7 +721,42 @@ pub(super) fn run() -> Result<()> {
                 args.sift_force_covariant,
             );
             options.use_gpu = args.use_gpu;
-            let report = extract_features_to_database(&args.database, &args.images, &options)?;
+            let report = if args.taskflow {
+                let mut config = rustscan_taskflow::RuntimeConfig::default();
+                if let Some(threads) = args.taskflow_cpu_threads {
+                    config.budget.cpu_threads = threads;
+                }
+                config.budget.memory_bytes = args
+                    .taskflow_memory_mib
+                    .checked_mul(1024 * 1024)
+                    .context("Taskflow memory budget overflow")?;
+                config.budget.io_slots = config.budget.cpu_threads;
+                let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(config)?);
+                let executor = rustsfm::CpuFeatureTaskflow::new(
+                    runtime.clone(),
+                    args.taskflow_image_memory_mib
+                        .checked_mul(1024 * 1024)
+                        .context("Taskflow per-image memory overflow")?,
+                    32,
+                )?;
+                let control = rustsfm::SfmTaskControl::new();
+                let mut sink = |_| {};
+                let mut task = rustsfm::SfmTaskContext::new(&control, &mut sink)
+                    .with_cpu_feature_taskflow(&executor);
+                let report = rustsfm::extract_features_to_database_with_task(
+                    &args.database,
+                    &args.images,
+                    &options,
+                    &mut task,
+                )?;
+                log::info!(
+                    "Taskflow feature extraction finished: {:?}",
+                    runtime.snapshot()?
+                );
+                report
+            } else {
+                extract_features_to_database(&args.database, &args.images, &options)?
+            };
             println!(
                 "extract-features: backend={} images={} total_keypoints={} mean_keypoints={:.1} seconds={:.3}",
                 report.backend,

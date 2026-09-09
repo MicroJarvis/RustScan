@@ -9,8 +9,8 @@ use super::{
     database_features_exist, database_image_ids_for_indices, import_database_images,
     link_or_copy_stable_image, sequence_match_options, validate_runner_inputs, SequenceFrame,
 };
+use super::{extract_sequence_features, sequence_feature_plan, SequenceFeaturePlan};
 use crate::database::ColmapDatabase;
-use crate::feature_extraction::extract_selected_features_to_database_with_task;
 use crate::feature_matching_db::{
     match_explicit_image_pairs_to_database_with_session, ExplicitPairMatchingSession,
 };
@@ -245,6 +245,10 @@ where
     })
 }
 
+/// With an explicit taskflow binding, missing supported SIFT extraction scratch
+/// is added to the configured stage-memory floor before admission. The caller
+/// must cover retained feature/matching/cache work in that floor; the allocation
+/// plan is not an RSS bound. Selection and matching policies are unchanged.
 pub fn run_adaptive_keyframe_selection(
     frames: &[SequenceFrame],
     config: &AdaptiveKeyframeSelectionConfig,
@@ -252,6 +256,7 @@ pub fn run_adaptive_keyframe_selection(
     output: &Path,
     task: &mut SfmTaskContext<'_>,
 ) -> anyhow::Result<AdaptiveKeyframeSelectionResult> {
+    task.inherit_ba_taskflow(mapper_config)?;
     config.validate().map_err(anyhow::Error::new)?;
     if frames.len() < 2 {
         return Err(anyhow::Error::new(
@@ -265,6 +270,44 @@ pub fn run_adaptive_keyframe_selection(
     }
     let frame_ids = frames.iter().map(|frame| frame.id).collect::<Vec<_>>();
     let frame_indices = validate_runner_inputs(frames, &frame_ids)?;
+    let planned = sequence_feature_plan(
+        frames,
+        &frame_indices,
+        &output.join("Cache/database.db"),
+        mapper_config,
+        task,
+        mapper_config.threads.unwrap_or(4),
+    )?;
+    task.execute_with_memory_and_gpu(
+        "adaptive keyframe selection",
+        mapper_config.sift_extraction.use_gpu || mapper_config.sift_matching.use_gpu,
+        planned
+            .as_ref()
+            .map_or(0, |plan| plan.memory.request_bytes()),
+        mapper_config.threads.unwrap_or(4),
+        |task| {
+            run_adaptive_keyframe_selection_planned(
+                frames,
+                config,
+                mapper_config,
+                output,
+                &frame_indices,
+                planned.as_ref(),
+                task,
+            )
+        },
+    )
+}
+
+fn run_adaptive_keyframe_selection_planned(
+    frames: &[SequenceFrame],
+    config: &AdaptiveKeyframeSelectionConfig,
+    mapper_config: &MapperConfig,
+    output: &Path,
+    frame_indices: &[usize],
+    planned: Option<&SequenceFeaturePlan>,
+    task: &mut SfmTaskContext<'_>,
+) -> anyhow::Result<AdaptiveKeyframeSelectionResult> {
     task.checkpoint().map_err(anyhow::Error::new)?;
     task.emit(selection_event(
         SfmTaskOperation::Begin,
@@ -282,8 +325,8 @@ pub fn run_adaptive_keyframe_selection(
     for frame in frames {
         link_or_copy_stable_image(&frame.image_path, &sequence_input)?;
     }
-    import_database_images(frames, &frame_indices, mapper_config, &database)?;
-    let database_ids = database_image_ids_for_indices(frames, &frame_indices, &database)?;
+    import_database_images(frames, frame_indices, mapper_config, &database)?;
+    let database_ids = database_image_ids_for_indices(frames, frame_indices, &database)?;
 
     let mut sift_extraction = mapper_config.sift_extraction.clone();
     sift_extraction.max_num_features = mapper_config.max_features;
@@ -297,11 +340,12 @@ pub fn run_adaptive_keyframe_selection(
         .collect::<Vec<_>>();
     if !missing_feature_ids.is_empty() {
         task.checkpoint().map_err(anyhow::Error::new)?;
-        extract_selected_features_to_database_with_task(
+        extract_sequence_features(
             &database,
             &sequence_input,
             &sift_extraction,
             &missing_feature_ids,
+            planned,
             task,
         )?;
     }

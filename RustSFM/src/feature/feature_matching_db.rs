@@ -276,6 +276,18 @@ pub fn match_features_to_database_with_task(
     options: &MatchFeaturesOptions,
     task: &mut SfmTaskContext<'_>,
 ) -> Result<MatchFeaturesReport> {
+    if crate::execution::active_threads().is_none() {
+        return task.execute(
+            "feature matching and verification",
+            options.sift_matching.use_gpu,
+            if colmap_fifo_verifier_enabled(options) {
+                colmap_fifo_verifier_threads()
+            } else {
+                4
+            },
+            |task| match_features_to_database_with_task(database_path, options, task),
+        );
+    }
     options.sift_matching.check()?;
     task.checkpoint()?;
     let started = Instant::now();
@@ -501,6 +513,21 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_task(
     options: &MatchFeaturesOptions,
     task: &mut SfmTaskContext<'_>,
 ) -> Result<MatchFeaturesReport> {
+    if crate::execution::active_threads().is_none() {
+        return task.execute(
+            "explicit pair matching",
+            options.sift_matching.use_gpu,
+            4,
+            |task| {
+                match_explicit_image_pairs_to_database_with_task(
+                    database_path,
+                    image_pairs,
+                    options,
+                    task,
+                )
+            },
+        );
+    }
     let session = ExplicitPairMatchingSession::new(options)?;
     let mut report = match_explicit_image_pairs_to_database_with_session(
         database_path,
@@ -1152,17 +1179,21 @@ fn computed_match_pair_reports_for_inputs(
         });
     }
     Ok(ComputedMatchPairBatch {
-        reports: pairs
-            .par_iter()
-            .filter_map(|&(left, right)| {
-                let matches = match_sift_with_options(
-                    &frames[left].sift,
-                    &frames[right].sift,
-                    &options.sift_matching,
-                );
-                estimate_existing_or_computed_pair(left, right, matches, frames, cameras, options)
-            })
-            .collect(),
+        reports: crate::execution::parallel(|| {
+            pairs
+                .par_iter()
+                .filter_map(|&(left, right)| {
+                    let matches = match_sift_with_options(
+                        &frames[left].sift,
+                        &frames[right].sift,
+                        &options.sift_matching,
+                    );
+                    estimate_existing_or_computed_pair(
+                        left, right, matches, frames, cameras, options,
+                    )
+                })
+                .collect()
+        }),
         gpu_descriptor_match_seconds: 0.0,
         gpu_geometry_seconds: 0.0,
         gpu_geometry_timing: WgpuGeometryTiming::default(),
@@ -1208,27 +1239,29 @@ fn existing_match_pair_reports_for_inputs(
     if options.sift_matching.use_gpu {
         bail!("RustSFM was built without gpu-wgpu support");
     }
-    Ok(batch
-        .par_iter()
-        .filter_map(|pair| {
-            let MatchPairInput::Existing {
-                left,
-                right,
-                matches,
-            } = pair
-            else {
-                unreachable!()
-            };
-            estimate_existing_or_computed_pair(
-                *left,
-                *right,
-                matches.clone(),
-                frames,
-                cameras,
-                options,
-            )
-        })
-        .collect())
+    Ok(crate::execution::parallel(|| {
+        batch
+            .par_iter()
+            .filter_map(|pair| {
+                let MatchPairInput::Existing {
+                    left,
+                    right,
+                    matches,
+                } = pair
+                else {
+                    unreachable!()
+                };
+                estimate_existing_or_computed_pair(
+                    *left,
+                    *right,
+                    matches.clone(),
+                    frames,
+                    cameras,
+                    options,
+                )
+            })
+            .collect()
+    }))
 }
 
 fn load_database_frames_and_cameras(
@@ -1305,7 +1338,7 @@ fn colmap_fifo_verifier_threads() -> usize {
                 .map(usize::from)
                 .unwrap_or(1)
         });
-    requested
+    crate::execution::active_threads().map_or(requested, |granted| requested.min(granted))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1746,6 +1779,11 @@ fn run_controlled_colmap_replay_batches(
     }
 
     let worker_count = schedule.worker_count;
+    if crate::execution::active_threads().is_some_and(|granted| worker_count > granted) {
+        bail!(
+            "verifier replay requires {worker_count} threads; current stage grant is insufficient"
+        );
+    }
     let assignments = colmap_fifo_replay_assignments(&input_pairs, &schedule)?;
     let mut events_by_pair = schedule
         .events

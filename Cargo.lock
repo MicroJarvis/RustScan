@@ -7098,6 +7098,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscan-taskflow"
+version = "0.1.0"
+dependencies = [
+ "pollster 0.3.0",
+ "rayon",
+ "sysinfo 0.30.13",
+ "thiserror 1.0.69",
+ "wgpu",
+]
+
+[[package]]
 name = "rustscan-types"
 version = "0.1.0"
 dependencies = [
@@ -7126,6 +7137,7 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "rusqlite",
+ "rustscan-taskflow",
  "rustscan-types",
  "rustslam",
  "serde",

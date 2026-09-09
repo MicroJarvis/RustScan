@@ -1,0 +1,20 @@
+[package]
+name = "rustscan-taskflow"
+version = "0.1.0"
+edition = "2021"
+description = "In-process resource-aware CPU/GPU task graphs for RustScan"
+authors = ["RustScan Developers"]
+
+[features]
+default = []
+system-monitor = ["dep:sysinfo"]
+wgpu-backend = ["dep:wgpu"]
+
+[dependencies]
+rayon = "1.11"
+thiserror = { workspace = true }
+sysinfo = { version = "0.30.13", default-features = false, optional = true }
+wgpu = { version = "29.0.1", optional = true, features = ["wgsl"] }
+
+[dev-dependencies]
+pollster = "0.3"

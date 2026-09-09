@@ -276,6 +276,17 @@ struct ExtractFeaturesArgs {
     database: PathBuf,
     #[arg(long)]
     images: PathBuf,
+    /// Use per-image CPU DAGs and explicit budgets instead of default stage admission.
+    #[arg(long, conflicts_with = "use_gpu")]
+    taskflow: bool,
+    #[arg(long, requires = "taskflow")]
+    taskflow_cpu_threads: Option<usize>,
+    /// Shared admission budget, not an allocator limit.
+    #[arg(long, requires = "taskflow", default_value_t = 2048)]
+    taskflow_memory_mib: u64,
+    /// Estimated peak decode/SIFT/output bytes per image, retained until commit.
+    #[arg(long, requires = "taskflow", default_value_t = 512)]
+    taskflow_image_memory_mib: u64,
     #[arg(long, default_value = "8192")]
     max_features: usize,
     #[arg(long, default_value_t = false)]
@@ -679,6 +690,43 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn cpu_feature_taskflow_cli_is_opt_in_and_rejects_gpu() {
+        let base = [
+            "rustsfm",
+            "extract-features",
+            "--database",
+            "db",
+            "--images",
+            "images",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Commands::ExtractFeatures(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert!(!args.taskflow);
+        let mut scheduled = base.to_vec();
+        scheduled.extend([
+            "--taskflow",
+            "--taskflow-cpu-threads",
+            "3",
+            "--taskflow-memory-mib",
+            "1024",
+        ]);
+        let cli = Cli::try_parse_from(&scheduled).unwrap();
+        let Commands::ExtractFeatures(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert!(args.taskflow);
+        assert_eq!(args.taskflow_cpu_threads, Some(3));
+        assert_eq!(args.taskflow_memory_mib, 1024);
+        scheduled.push("--use-gpu");
+        assert!(Cli::try_parse_from(&scheduled).is_err());
+        let mut missing_flag = base.to_vec();
+        missing_flag.extend(["--taskflow-cpu-threads", "3"]);
+        assert!(Cli::try_parse_from(missing_flag).is_err());
+    }
+
+    #[test]
     fn colmap_feature_extractor_accepts_gpu_one() {
         let cli = Cli::try_parse_from([
             "rustsfm",
@@ -799,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn native_reconstruct_parses_ba_backend_options() {
+    fn reconstruct_parses_ceres_ba_backend_options() {
         let cli = Cli::try_parse_from([
             "rustsfm",
             "reconstruct",
@@ -812,7 +860,7 @@ mod tests {
             "--ba-sparse-backend",
             "accelerate-sparse",
         ])
-        .expect("native BA backend flags");
+        .expect("Ceres BA backend flags");
         let Commands::Reconstruct(args) = cli.command else {
             panic!("reconstruct command")
         };

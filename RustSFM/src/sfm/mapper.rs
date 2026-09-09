@@ -5,6 +5,7 @@ use crate::colmap::{
 };
 use crate::correspondence_graph::{image_pair_to_pair_id, CorrespondenceGraph, ImagePairId};
 use crate::database::{ColmapDatabase, ColmapTwoViewGeometry, DatabaseCache, DatabaseCacheOptions};
+use crate::feature_extraction::{db_memory_plan, retained_memory_plan, FeatureMemoryPlan};
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
 use crate::generalized_pose::{
     estimate_generalized_absolute_pose, estimate_structureless_absolute_pose,
@@ -28,7 +29,7 @@ use crate::joint_global_positioning::JointGlobalPositioningOptions;
 use crate::observation_manager::ObservationManager;
 use crate::pose_graph::initialize_pose_graph;
 use crate::rotation_averaging::RotationAveragingOptions;
-use crate::sift::{match_sift_guided_with_options, match_sift_with_options, SiftMatchingOptions};
+use crate::sift::{match_sift_guided_with_options, SiftMatchingOptions};
 use crate::task::{SfmTaskContext, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage, SfmTaskStop};
 use crate::track_establishment::TrackEstablishmentOptions;
 use crate::track_triangulation::TrackTriangulationOptions;
@@ -79,7 +80,7 @@ use diagnostics::{
     pair_config_summary, pair_connectivity_summary, pair_quality_summary,
     pair_reference_error_summary, pair_two_view_metadata_summary,
 };
-use image_features::extract_frames;
+use image_features::{extract_frames, FeatureProfile};
 use pipeline_types::MapperEventBridge;
 pub use pipeline_types::{
     IncrementalPipelineCallback, IncrementalPipelineMapResult, IncrementalPipelineResult,
@@ -458,7 +459,10 @@ pub(crate) fn register_single_target_from_database_with_pnp_scorer(
 
 pub fn run_reconstruction(config: &MapperConfig) -> Result<ReconstructionSummary> {
     let mut events = MapperEventBridge::Silent;
-    run_reconstruction_impl(config, &mut events)
+    let reports = crate::execution::new_stage_report_sink();
+    let mut summary = run_reconstruction_impl(config, &mut events, reports.clone())?;
+    summary.stage_reports = crate::execution::stage_reports(&reports);
+    Ok(summary)
 }
 
 fn validate_gpu_pnp_config(config: &MapperConfig, has_global_mapper: bool) -> Result<()> {
@@ -528,33 +532,224 @@ pub fn run_reconstruction_with_callbacks(
         Some(sink) => MapperEventBridge::Legacy(sink),
         None => MapperEventBridge::Silent,
     };
-    run_reconstruction_impl(config, &mut events)
+    let reports = crate::execution::new_stage_report_sink();
+    let mut summary = run_reconstruction_impl(config, &mut events, reports.clone())?;
+    summary.stage_reports = crate::execution::stage_reports(&reports);
+    Ok(summary)
 }
 
 pub fn run_reconstruction_with_task(
     config: &MapperConfig,
     task: &mut SfmTaskContext<'_>,
 ) -> Result<ReconstructionSummary> {
-    let mut events = MapperEventBridge::Task(task);
-    run_reconstruction_impl(config, &mut events)
+    task.inherit_ba_taskflow(config)?;
+    let prepared = prepare_mapper_features(config, task)?;
+    let reports = task.stage_report_sink();
+    let bytes = prepared
+        .as_ref()
+        .and_then(|input| input.plan.as_ref())
+        .map(FeatureMemoryPlan::request_bytes);
+    let work = |task: &mut SfmTaskContext<'_>| {
+        let mut events = MapperEventBridge::Task(task);
+        run_reconstruction_prepared(config, &mut events, reports.clone(), prepared)
+    };
+    let gpu = mapper_uses_gpu(config);
+    let mut summary = if let Some(bytes) = bytes {
+        task.execute_with_memory_and_gpu(
+            "reconstruction",
+            gpu,
+            bytes,
+            config.threads.unwrap_or(4),
+            work,
+        )
+    } else {
+        task.execute("reconstruction", gpu, config.threads.unwrap_or(4), work)
+    }?;
+    summary.stage_reports = crate::execution::stage_reports(&reports);
+    Ok(summary)
+}
+
+fn mapper_uses_gpu(config: &MapperConfig) -> bool {
+    config.sift_extraction.use_gpu || config.sift_matching.use_gpu || config.use_gpu_pnp
+}
+
+struct PreparedMapperFeatures {
+    paths: Vec<PathBuf>,
+    database_path: Option<PathBuf>,
+    database: Option<reconstruction_input::MapperDatabaseInput>,
+    plan: Option<FeatureMemoryPlan>,
+}
+
+fn prepare_mapper_features(
+    config: &MapperConfig,
+    task: &SfmTaskContext<'_>,
+) -> Result<Option<PreparedMapperFeatures>> {
+    task.checkpoint()?;
+    if !task.has_feature_memory_estimate() || !matches!(config.feature_type, FeatureType::Sift) {
+        return Ok(None);
+    }
+    let (floor, budget) = task.feature_memory_limits()?;
+    let mut options = config.sift_extraction.clone();
+    options.max_num_features = config.max_features;
+    // Probe support without header IO so unsupported backends keep legacy ordering.
+    if db_memory_plan(
+        &[],
+        &options,
+        true,
+        config.threads.unwrap_or(4),
+        budget,
+        floor,
+        &task.control(),
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+    let paths = collect_images(&config.input, config.max_images)?;
+    if paths.len() < 2 {
+        bail!("need at least two images");
+    }
+    let database_path = resolve_mapper_database_path(config)?;
+    let database = if database_path.as_ref().is_some_and(|path| path.exists()) {
+        load_mapper_database_for_paths(database_path.as_deref(), &paths, config.min_matches)?
+    } else {
+        None
+    };
+    task.checkpoint()?;
+    // This mapper reuses DB frames wholesale; it does not extract missing DB features.
+    let plan = if database.is_some() {
+        db_memory_plan(
+            &[],
+            &options,
+            true,
+            config.threads.unwrap_or(4),
+            budget,
+            floor,
+            &task.control(),
+        )?
+    } else {
+        retained_memory_plan(
+            &paths,
+            &options,
+            true,
+            config.threads.unwrap_or(4),
+            budget,
+            floor,
+            &task.control(),
+        )?
+    };
+    Ok(Some(PreparedMapperFeatures {
+        paths,
+        database_path,
+        database,
+        plan,
+    }))
 }
 
 fn run_reconstruction_impl(
     config: &MapperConfig,
     events: &mut MapperEventBridge<'_, '_>,
+    reports: crate::execution::StageReportSink,
+) -> Result<ReconstructionSummary> {
+    if let Some(adapter) = &config.ba_taskflow {
+        events.checkpoint()?;
+        let control = crate::task::SfmTaskControl::new();
+        let mut sink = |_| {};
+        let mut task =
+            SfmTaskContext::new(&control, &mut sink).with_taskflow(adapter.stage_taskflow()?);
+        let prepared = prepare_mapper_features(config, &task)?;
+        let bytes = prepared
+            .as_ref()
+            .and_then(|input| input.plan.as_ref())
+            .map(FeatureMemoryPlan::request_bytes);
+        let work = |_: &mut SfmTaskContext<'_>| {
+            run_reconstruction_prepared(config, events, reports.clone(), prepared)
+        };
+        let result = match bytes {
+            Some(bytes) => task.execute_with_memory_and_gpu(
+                "reconstruction",
+                mapper_uses_gpu(config),
+                bytes,
+                config.threads.unwrap_or(4),
+                work,
+            ),
+            None => task.execute(
+                "reconstruction",
+                mapper_uses_gpu(config),
+                config.threads.unwrap_or(4),
+                work,
+            ),
+        };
+        reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(task.stage_reports());
+        return result;
+    }
+    run_reconstruction_prepared(config, events, reports, None)
+}
+
+fn run_reconstruction_prepared(
+    config: &MapperConfig,
+    events: &mut MapperEventBridge<'_, '_>,
+    reports: crate::execution::StageReportSink,
+    prepared: Option<PreparedMapperFeatures>,
 ) -> Result<ReconstructionSummary> {
     events.checkpoint()?;
+    if crate::execution::active_threads().is_none() {
+        let control = crate::task::SfmTaskControl::new();
+        let executor = config
+            .ba_taskflow
+            .as_ref()
+            .map(|adapter| adapter.stage_taskflow())
+            .unwrap_or_else(crate::SfmTaskflow::shared)?;
+        return executor.run_with_reports(
+            "reconstruction",
+            config.sift_extraction.use_gpu || config.sift_matching.use_gpu || config.use_gpu_pnp,
+            config.threads.unwrap_or(4),
+            &control,
+            &reports,
+            || run_reconstruction_impl(config, events, reports.clone()),
+        );
+    }
+    if let Some(plan) = prepared.as_ref().and_then(|input| input.plan.as_ref()) {
+        let control = match events {
+            MapperEventBridge::Task(task) => task.control(),
+            _ => crate::task::SfmTaskControl::new(),
+        };
+        // Admission may have waited while files changed. Check before even
+        // fallback_camera's decode; never replan against the acquired grant.
+        plan.validate_inputs(&control).context(
+            "mapper planned inputs changed before decode; refusing the admitted request",
+        )?;
+    }
     let mut runtime_config = config.clone();
+    runtime_config.threads = runtime_config.threads.map(|requested| {
+        requested
+            .max(1)
+            .min(crate::execution::active_threads().unwrap_or(requested.max(1)))
+    });
+    if let MapperEventBridge::Task(task) = events {
+        task.bind_ba_taskflow(&mut runtime_config);
+    }
     let config = &mut runtime_config;
     validate_gpu_pnp_config(config, config.global_mapper)?;
     let mut pnp_scorer = create_gpu_pnp_scorer(config)?;
-    if let Some(threads) = config.threads {
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads.max(1))
-            .build_global();
-    }
+
     let start = Instant::now();
-    let paths = collect_images(&config.input, config.max_images)?;
+    let (paths, prepared_database, feature_plan) = if let Some(input) = prepared {
+        (
+            input.paths,
+            Some((input.database_path, input.database)),
+            input.plan,
+        )
+    } else {
+        (
+            collect_images(&config.input, config.max_images)?,
+            None,
+            None,
+        )
+    };
     if paths.len() < 2 {
         bail!("need at least two images");
     }
@@ -616,21 +811,35 @@ fn run_reconstruction_impl(
     sift_extraction.max_num_features = config.max_features;
     let mut sift_matching = config.sift_matching.clone();
     sift_matching.max_ratio = config.match_ratio as f32;
-    let database_path = resolve_mapper_database_path(config)?;
-    let mapper_database = if database_path.as_ref().is_some_and(|path| path.exists()) {
-        load_mapper_database_for_paths(database_path.as_deref(), &paths, config.min_matches)?
+    let (database_path, mapper_database) = if let Some(database) = prepared_database {
+        database
     } else {
-        None
+        let path = resolve_mapper_database_path(config)?;
+        let database = if path.as_ref().is_some_and(|path| path.exists()) {
+            load_mapper_database_for_paths(path.as_deref(), &paths, config.min_matches)?
+        } else {
+            None
+        };
+        (path, database)
     };
+    let mut feature_profile: Option<FeatureProfile> = None;
+    let mut debug_log = Vec::new();
     let mut frames = if let Some(database) = mapper_database.as_ref() {
         database_frames(&paths, database)?
     } else {
-        extract_frames(
+        let (frames, profile) = extract_frames(
             &paths,
             config.max_features,
             config.feature_type,
             &sift_extraction,
-        )?
+            feature_plan.as_ref(),
+            &match events {
+                MapperEventBridge::Task(task) => task.control(),
+                _ => crate::task::SfmTaskControl::new(),
+            },
+        )?;
+        feature_profile = profile;
+        frames
     };
     if let Some(database) = mapper_database.as_ref() {
         config.pose_priors = database.cache.pose_priors.clone();
@@ -669,6 +878,12 @@ fn run_reconstruction_impl(
     }
     apply_color_extraction_policy(&mut frames, config.extract_colors);
     let frames_elapsed_ms = frames_start.elapsed().as_secs_f64() * 1000.0;
+    if let Some(feature_profile) = feature_profile {
+        debug_log.push(format!(
+            "feature_profile {}",
+            serde_json::to_string(&feature_profile)?
+        ));
+    }
     if reference_camera_setup.is_none() {
         camera.width = frames[0].width;
         camera.height = frames[0].height;
@@ -695,13 +910,13 @@ fn run_reconstruction_impl(
             reference_camera_setup.as_ref(),
             config,
             &sift_matching,
+            &mut debug_log,
         )?
     };
     let pair_elapsed_ms = pair_start.elapsed().as_secs_f64() * 1000.0;
     if pairs.is_empty() {
         bail!("no verified image pairs");
     }
-    let mut debug_log = Vec::new();
     debug_log.push(format!(
         "timing_extract_ms={:.2} timing_pairs_ms={:.2}",
         frames_elapsed_ms, pair_elapsed_ms
@@ -962,6 +1177,7 @@ fn run_reconstruction_impl(
         models: reconstructions.len(),
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         debug_log,
+        stage_reports: crate::execution::stage_reports(&reports),
     })
 }
 
@@ -1124,13 +1340,34 @@ fn reset_bogus_frame_cameras_from_priors(
     }
 }
 
+#[derive(Default, serde::Serialize)]
+struct PairTiming {
+    left: usize,
+    right: usize,
+    left_name: String,
+    right_name: String,
+    left_descriptors: usize,
+    right_descriptors: usize,
+    matching_ms: f64,
+    geometry_ms: f64,
+    guided_matching_and_geometry_ms: f64,
+    total_ms: f64,
+    matches: usize,
+    inliers: usize,
+    accepted_before_graph_filters: bool,
+    sift: crate::sift::SiftMatchingTiming,
+}
+
 fn build_pair_graph(
     frames: &[ImageFrame],
     camera: CameraModel,
     reference_camera_setup: Option<&ReferenceCameraSetup>,
     config: &MapperConfig,
     sift_matching: &SiftMatchingOptions,
+    debug_log: &mut Vec<String>,
 ) -> Result<Vec<PairGeometry>> {
+    let profiling = std::env::var("RUSTSFM_PROFILE_PAIRS").is_ok_and(|value| value == "1");
+    let candidate_start = profiling.then(Instant::now);
     let matcher = HammingMatcher::new(2).with_ratio_threshold(config.match_ratio);
     let mut candidates = match config.matching_pair_strategy {
         MatchingPairStrategy::VocabTree { num_images } => {
@@ -1145,38 +1382,73 @@ fn build_pair_graph(
     if config.experimental_sequence_heuristics {
         add_segment_bridge_candidates(frames.len(), &mut candidates);
     }
-    let mut pairs = candidates
-        .par_iter()
-        .filter_map(|&(left, right)| {
-            let left_camera = setup_camera_for_image(reference_camera_setup, left, camera);
-            let right_camera = setup_camera_for_image(reference_camera_setup, right, camera);
-            estimate_candidate_pair(
-                left,
-                right,
-                frames,
-                left_camera,
-                right_camera,
-                config,
-                Some(&matcher),
-                sift_matching,
-            )
-        })
-        .collect::<Vec<_>>();
+    let candidate_ms = candidate_start.map(|start| start.elapsed().as_secs_f64() * 1000.0);
+    let evaluate = |left: usize, right: usize, matcher: Option<&HammingMatcher>| {
+        let mut timing = profiling.then(|| PairTiming {
+            left,
+            right,
+            left_name: frames[left].name.clone(),
+            right_name: frames[right].name.clone(),
+            left_descriptors: if config.feature_type == FeatureType::Sift {
+                frames[left].sift.descriptors.len()
+            } else {
+                frames[left].descriptors.count
+            },
+            right_descriptors: if config.feature_type == FeatureType::Sift {
+                frames[right].sift.descriptors.len()
+            } else {
+                frames[right].descriptors.count
+            },
+            ..Default::default()
+        });
+        let start = profiling.then(Instant::now);
+        let pair = estimate_candidate_pair(
+            left,
+            right,
+            frames,
+            setup_camera_for_image(reference_camera_setup, left, camera),
+            setup_camera_for_image(reference_camera_setup, right, camera),
+            config,
+            matcher,
+            sift_matching,
+            timing.as_mut(),
+        );
+        if let (Some(timing), Some(start)) = (&mut timing, start) {
+            timing.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            timing.accepted_before_graph_filters = pair.is_some();
+        }
+        (pair, timing)
+    };
+    let (mut pairs, mut profiles) = if profiling {
+        let (pair_results, profiles): (Vec<_>, Vec<_>) = crate::execution::parallel(|| {
+            candidates
+                .par_iter()
+                .map(|&(left, right)| evaluate(left, right, Some(&matcher)))
+                .unzip()
+        });
+        (
+            pair_results.into_iter().flatten().collect::<Vec<_>>(),
+            profiles,
+        )
+    } else {
+        (
+            crate::execution::parallel(|| {
+                candidates
+                    .par_iter()
+                    .filter_map(|&(left, right)| evaluate(left, right, Some(&matcher)).0)
+                    .collect::<Vec<_>>()
+            }),
+            Vec::new(),
+        )
+    };
     if config.experimental_ring_closure || std::env::var_os("RUSTSFM_RING_CLOSURE").is_some() {
         let mut closure_pairs = Vec::new();
         for (left, right) in intra_segment_ring_candidates(frames.len(), 192) {
-            let left_camera = setup_camera_for_image(reference_camera_setup, left, camera);
-            let right_camera = setup_camera_for_image(reference_camera_setup, right, camera);
-            if let Some(pair) = estimate_candidate_pair(
-                left,
-                right,
-                frames,
-                left_camera,
-                right_camera,
-                config,
-                None,
-                sift_matching,
-            ) {
+            let (pair, timing) = evaluate(left, right, None);
+            if profiling {
+                profiles.push(timing);
+            }
+            if let Some(pair) = pair {
                 closure_pairs.push(pair);
             }
         }
@@ -1187,6 +1459,16 @@ fn build_pair_graph(
         enforce_adjacent_translation_continuity(&mut pairs);
         regularize_low_parallax_adjacent_translations(&mut pairs);
         filter_translation_outlier_pairs(&mut pairs);
+    }
+    if let Some(candidate_ms) = candidate_ms {
+        debug_log.push(format!(
+            "pair_profile_summary candidate_ms={candidate_ms:.3} base_candidates={} attempted_pairs={} retained_pairs={} cpu_grant={:?}",
+            candidates.len(), profiles.len(), pairs.len(), crate::execution::active_threads()
+        ));
+        // Serialize only after parallel work; no worker logging or shared counters.
+        for timing in profiles.into_iter().flatten() {
+            debug_log.push(format!("pair_profile {}", serde_json::to_string(&timing)?));
+        }
     }
     Ok(pairs)
 }
@@ -1270,58 +1552,65 @@ fn estimate_database_pair_geometries(
     config: &MapperConfig,
 ) -> Result<Vec<PairGeometry>> {
     let pair_matches = database_pair_matches_for_frames(frames, cache)?;
-    let pairs = pair_matches
-        .par_iter()
-        .filter_map(|pair| {
-            let left_camera = setup_camera_for_image(reference_camera_setup, pair.left, camera);
-            let right_camera = setup_camera_for_image(reference_camera_setup, pair.right, camera);
-            let stored_pair = (!config.ignore_database_two_view_poses)
-                .then(|| {
-                    database_pair_geometry_from_stored_pose(
-                        pair,
-                        frames,
-                        cache,
-                        stored_geometries,
-                        left_camera,
-                        right_camera,
-                        config,
-                    )
-                })
-                .flatten();
-            stored_pair
-                .filter(|pair| keep_pair_for_mapping(pair, config))
-                .or_else(|| {
-                    let stored_geometry =
-                        stored_database_geometry_for_pair(pair, frames, cache, stored_geometries);
-                    let mut estimated = estimate_pair_geometry_with_options_and_cameras(
-                        pair.left,
-                        pair.right,
-                        &frames[pair.left],
-                        &frames[pair.right],
-                        &pair.matches,
-                        left_camera,
-                        right_camera,
-                        config.essential_threshold_px,
-                        config.essential_iterations,
-                        config.min_inliers,
-                        config.min_triangulated,
-                        PairEstimationOptions {
-                            ransac_random_seed: config.random_seed,
-                            ..PairEstimationOptions::default()
-                        },
-                    )?;
-                    if let Some(geometry) = stored_geometry {
-                        estimated.two_view_config = geometry.config;
-                        estimated.f_matrix = geometry.f_matrix.or(estimated.f_matrix);
-                        estimated.e_matrix = geometry.e_matrix.or(estimated.e_matrix);
-                        estimated.h_matrix = geometry.h_matrix.or(estimated.h_matrix);
-                        keep_pair_for_mapping(&estimated, config).then_some(estimated)
-                    } else {
-                        keep_pair_for_mapping(&estimated, config).then_some(estimated)
-                    }
-                })
-        })
-        .collect::<Vec<_>>();
+    let pairs = crate::execution::parallel(|| {
+        pair_matches
+            .par_iter()
+            .filter_map(|pair| {
+                let left_camera = setup_camera_for_image(reference_camera_setup, pair.left, camera);
+                let right_camera =
+                    setup_camera_for_image(reference_camera_setup, pair.right, camera);
+                let stored_pair = (!config.ignore_database_two_view_poses)
+                    .then(|| {
+                        database_pair_geometry_from_stored_pose(
+                            pair,
+                            frames,
+                            cache,
+                            stored_geometries,
+                            left_camera,
+                            right_camera,
+                            config,
+                        )
+                    })
+                    .flatten();
+                stored_pair
+                    .filter(|pair| keep_pair_for_mapping(pair, config))
+                    .or_else(|| {
+                        let stored_geometry = stored_database_geometry_for_pair(
+                            pair,
+                            frames,
+                            cache,
+                            stored_geometries,
+                        );
+                        let mut estimated = estimate_pair_geometry_with_options_and_cameras(
+                            pair.left,
+                            pair.right,
+                            &frames[pair.left],
+                            &frames[pair.right],
+                            &pair.matches,
+                            left_camera,
+                            right_camera,
+                            config.essential_threshold_px,
+                            config.essential_iterations,
+                            config.min_inliers,
+                            config.min_triangulated,
+                            PairEstimationOptions {
+                                ransac_random_seed: config.random_seed,
+                                ..PairEstimationOptions::default()
+                            },
+                        )?;
+                        if let Some(geometry) = stored_geometry {
+                            estimated.two_view_config = geometry.config;
+                            estimated.f_matrix = geometry.f_matrix.or(estimated.f_matrix);
+                            estimated.e_matrix = geometry.e_matrix.or(estimated.e_matrix);
+                            estimated.h_matrix = geometry.h_matrix.or(estimated.h_matrix);
+                            keep_pair_for_mapping(&estimated, config).then_some(estimated)
+                        } else {
+                            keep_pair_for_mapping(&estimated, config).then_some(estimated)
+                        }
+                    })
+            })
+            .collect::<Vec<_>>()
+    });
     Ok(pairs)
 }
 
@@ -1516,47 +1805,62 @@ fn estimate_candidate_pair(
     config: &MapperConfig,
     matcher: Option<&HammingMatcher>,
     sift_matching: &SiftMatchingOptions,
+    mut timing: Option<&mut PairTiming>,
 ) -> Option<PairGeometry> {
-    let matches = if config.feature_type == FeatureType::Sift {
-        if is_ring_bridge_candidate(left, right) {
-            let left_strong = limited_indices(&frames[left].strong_feature_indices, 1024);
-            let right_strong = limited_indices(&frames[right].strong_feature_indices, 1024);
-            match_wide_mutual_indices(
+    let matching_start = timing.as_ref().map(|_| Instant::now());
+    let matches = (|| {
+        Some(if config.feature_type == FeatureType::Sift {
+            if is_ring_bridge_candidate(left, right) {
+                let left_strong = limited_indices(&frames[left].strong_feature_indices, 1024);
+                let right_strong = limited_indices(&frames[right].strong_feature_indices, 1024);
+                match_wide_mutual_indices(
+                    &frames[left].wide_descriptors,
+                    &frames[right].wide_descriptors,
+                    left_strong,
+                    right_strong,
+                    0.9,
+                    0.85,
+                )
+            } else {
+                crate::sift::match_sift_with_options_profiled(
+                    &frames[left].sift,
+                    &frames[right].sift,
+                    sift_matching,
+                    timing.as_mut().map(|t| &mut t.sift),
+                )
+            }
+        } else if is_ring_bridge_candidate(left, right) {
+            let loose = HammingMatcher::new(2).with_ratio_threshold(0.92);
+            let mut matches = loose
+                .match_descriptors(&frames[left].descriptors, &frames[right].descriptors)
+                .ok()?
+                .into_iter()
+                .filter(|m| m.distance <= config.max_hamming_distance.max(180.0))
+                .collect::<Vec<_>>();
+            let wide = match_wide_mutual(
                 &frames[left].wide_descriptors,
                 &frames[right].wide_descriptors,
-                left_strong,
-                right_strong,
                 0.9,
                 0.85,
-            )
+            );
+            merge_matches(&mut matches, wide);
+            matches
         } else {
-            match_sift_with_options(&frames[left].sift, &frames[right].sift, sift_matching)
-        }
-    } else if is_ring_bridge_candidate(left, right) {
-        let loose = HammingMatcher::new(2).with_ratio_threshold(0.92);
-        let mut matches = loose
-            .match_descriptors(&frames[left].descriptors, &frames[right].descriptors)
-            .ok()?
-            .into_iter()
-            .filter(|m| m.distance <= config.max_hamming_distance.max(180.0))
-            .collect::<Vec<_>>();
-        let wide = match_wide_mutual(
-            &frames[left].wide_descriptors,
-            &frames[right].wide_descriptors,
-            0.9,
-            0.85,
-        );
-        merge_matches(&mut matches, wide);
-        matches
-    } else {
-        let matcher = matcher?;
-        mutual_matches(matcher, &frames[left], &frames[right])
-            .ok()?
-            .into_iter()
-            .filter(|m| m.distance <= config.max_hamming_distance)
-            .collect::<Vec<_>>()
-    };
-    let mut pair = if is_ring_bridge_candidate(left, right) {
+            let matcher = matcher?;
+            mutual_matches(matcher, &frames[left], &frames[right])
+                .ok()?
+                .into_iter()
+                .filter(|m| m.distance <= config.max_hamming_distance)
+                .collect::<Vec<_>>()
+        })
+    })();
+    if let (Some(timing), Some(start)) = (&mut timing, matching_start) {
+        timing.matching_ms = start.elapsed().as_secs_f64() * 1000.0;
+        timing.matches = matches.as_ref().map_or(0, Vec::len);
+    }
+    let matches = matches?;
+    let geometry_start = timing.as_ref().map(|_| Instant::now());
+    let pair = if is_ring_bridge_candidate(left, right) {
         estimate_pair_geometry_with_options_and_cameras(
             left,
             right,
@@ -1596,12 +1900,17 @@ fn estimate_candidate_pair(
                 ..PairEstimationOptions::default()
             },
         )
-    }?;
+    };
+    if let (Some(timing), Some(start)) = (&mut timing, geometry_start) {
+        timing.geometry_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
+    let mut pair = pair?;
     if config.feature_type == FeatureType::Sift
         && sift_matching.guided_matching
         && !is_ring_bridge_candidate(left, right)
     {
         if let Some(f_matrix) = pair.f_matrix {
+            let guided_start = timing.as_ref().map(|_| Instant::now());
             let guided = match_sift_guided_with_options(
                 &frames[left].sift,
                 &frames[right].sift,
@@ -1631,7 +1940,13 @@ fn estimate_candidate_pair(
                     }
                 }
             }
+            if let (Some(timing), Some(start)) = (&mut timing, guided_start) {
+                timing.guided_matching_and_geometry_ms = start.elapsed().as_secs_f64() * 1000.0;
+            }
         }
+    }
+    if let Some(timing) = timing {
+        timing.inliers = pair.inliers;
     }
     if is_ring_bridge_candidate(left, right) {
         pair.pose_graph_only = true;
@@ -2410,15 +2725,43 @@ pub fn run_incremental_pipeline(
         Some(sink) => MapperEventBridge::Legacy(sink),
         None => MapperEventBridge::Silent,
     };
-    match incremental_pipeline_map_with_pnp_scorer_and_events(
-        frames,
-        camera,
-        reference_camera_setup,
-        pairs,
-        config,
-        &mut events,
-        None,
-    ) {
+    let control = crate::SfmTaskControl::new();
+    let mut compute = || {
+        let mut bounded = config.clone();
+        bounded.threads = bounded.threads.map(|requested| {
+            requested
+                .max(1)
+                .min(crate::execution::active_threads().unwrap_or(requested.max(1)))
+        });
+        incremental_pipeline_map_with_pnp_scorer_and_events(
+            frames,
+            camera,
+            reference_camera_setup,
+            pairs,
+            &bounded,
+            &mut events,
+            None,
+        )
+    };
+    let result = if crate::execution::active_threads().is_some() {
+        compute()
+    } else {
+        config
+            .ba_taskflow
+            .as_ref()
+            .map(|adapter| adapter.stage_taskflow())
+            .unwrap_or_else(crate::SfmTaskflow::shared)
+            .and_then(|executor| {
+                executor.run(
+                    "incremental pipeline",
+                    config.use_gpu_pnp,
+                    config.threads.unwrap_or(4),
+                    &control,
+                    compute,
+                )
+            })
+    };
+    match result {
         Ok(result) => IncrementalPipelineResult {
             status: IncrementalPipelineStatus::Success,
             reconstructions: result.reconstructions,
@@ -2808,7 +3151,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             &mut triangulation_state,
         )
     } else {
-        refine_global_bundle_with_postprocessing(
+        let outcome = refine_global_bundle_with_postprocessing(
             frames,
             pairs,
             &mut reconstruction,
@@ -2820,7 +3163,9 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             Some(&mut registration_stats),
             Some(&mut filtered_units),
             &mut triangulation_state,
-        )
+        );
+        global_ba_schedule.record_outcome(&reconstruction, outcome);
+        outcome.completed()
     };
     if initial_global_ba_ran {
         global_ba_schedule.mark(&reconstruction);
@@ -3122,6 +3467,9 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             events.checkpoint()?;
             continue;
         }
+        // This registration survived rollback; filtering may later restore the
+        // old counts without restoring the old poses, cameras or observations.
+        global_ba_schedule.dirty = true;
         registration_stats.register_frame_for_image_event(&reconstruction, choice.image);
         retry_state.record_success(
             &reconstruction,
@@ -3188,7 +3536,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 SfmTaskOperation::GlobalBundleAdjustment,
                 SfmTaskEventKind::Started,
             );
-            let global_ba_ran = refine_global_bundle_with_postprocessing(
+            let outcome = refine_global_bundle_with_postprocessing(
                 frames,
                 pairs,
                 &mut reconstruction,
@@ -3207,9 +3555,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 SfmTaskEventKind::Completed,
             );
             events.checkpoint()?;
-            if global_ba_ran {
-                global_ba_schedule.mark(&reconstruction);
-            }
+            global_ba_schedule.record_outcome(&reconstruction, outcome);
         }
         let color_report =
             extract_colors_for_registration_unit(frames, &mut reconstruction, choice.image, config);
@@ -3265,6 +3611,20 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             SfmTaskEventKind::Completed,
         );
         events.checkpoint()?;
+    } else {
+        let skip_reason = if !global_ba_enabled(config) {
+            "disabled"
+        } else if registered_image_count(&reconstruction) < 2 {
+            "insufficient_registered_images"
+        } else if reconstruction.points.is_empty() {
+            "no_points"
+        } else {
+            "unchanged_since_success"
+        };
+        debug_log.push(format!(
+            "global_ba reason=final skipped skip_reason={skip_reason} dirty={}",
+            global_ba_schedule.dirty
+        ));
     }
     let final_color_report =
         extract_colors_for_all_registered_images(frames, &mut reconstruction, config);
@@ -4448,6 +4808,51 @@ struct GlobalBaSchedule {
     prev_registered_images: usize,
     prev_registered_frames: usize,
     prev_points: usize,
+    dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalBaStatus {
+    NotAttempted,
+    Failed,
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlobalBaOutcome {
+    status: GlobalBaStatus,
+    committed_rounds: usize,
+    // Describes the latest committed main solve, not whether a later solve failed.
+    postprocessing_complete: bool,
+}
+
+impl GlobalBaOutcome {
+    fn not_attempted() -> Self {
+        Self {
+            status: GlobalBaStatus::NotAttempted,
+            committed_rounds: 0,
+            postprocessing_complete: false,
+        }
+    }
+
+    fn failed(mut self) -> Self {
+        self.status = GlobalBaStatus::Failed;
+        self
+    }
+
+    fn commit_round(&mut self) {
+        self.status = GlobalBaStatus::Committed;
+        self.committed_rounds += 1;
+        self.postprocessing_complete = false;
+    }
+
+    fn complete_postprocessing(&mut self) {
+        self.postprocessing_complete = true;
+    }
+
+    fn completed(self) -> bool {
+        self.status == GlobalBaStatus::Committed && self.postprocessing_complete
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4493,6 +4898,17 @@ impl GlobalBaSchedule {
             prev_registered_images: registered_image_count(reconstruction),
             prev_registered_frames: registered_frame_count(reconstruction),
             prev_points: reconstruction.points.len(),
+            dirty: true,
+        }
+    }
+
+    fn record_outcome(&mut self, reconstruction: &Reconstruction, outcome: GlobalBaOutcome) {
+        if outcome.completed() {
+            self.mark(reconstruction);
+        } else {
+            // Preparation/alignment and earlier rounds may have changed the model
+            // even when the final attempted solve did not commit.
+            self.dirty = true;
         }
     }
 
@@ -4500,7 +4916,93 @@ impl GlobalBaSchedule {
         self.prev_registered_images = registered_image_count(reconstruction);
         self.prev_registered_frames = registered_frame_count(reconstruction);
         self.prev_points = reconstruction.points.len();
+        self.dirty = false;
     }
+}
+
+/// Runs one global BA solver pass, followed by outlier filtering without a
+/// second refinement pass. Sequence reconstruction uses this after all frame
+/// registration attempts have finished.
+pub(crate) fn refine_global_bundle_once(
+    reconstruction: &mut Reconstruction,
+    config: &MapperConfig,
+) -> Result<Option<crate::ba::BundleAdjustmentReport>> {
+    if !global_ba_enabled(config)
+        || registered_image_count(reconstruction) < 2
+        || reconstruction.points.is_empty()
+        || reconstruction_num_observations(reconstruction) == 0
+    {
+        return Ok(None);
+    }
+
+    let gauge_images = global_ba_gauge_images(reconstruction);
+    if gauge_images.is_empty() {
+        return Ok(None);
+    }
+    let frames = (0..reconstruction.poses.len())
+        .map(|image| {
+            let camera = reconstruction.camera_for_image(image);
+            ImageFrame {
+                id: image,
+                name: reconstruction
+                    .image_names
+                    .get(image)
+                    .cloned()
+                    .unwrap_or_else(|| image.to_string()),
+                path: reconstruction
+                    .image_paths
+                    .get(image)
+                    .cloned()
+                    .unwrap_or_default(),
+                width: camera.width,
+                height: camera.height,
+                keypoints: reconstruction
+                    .keypoints
+                    .get(image)
+                    .cloned()
+                    .unwrap_or_default(),
+                descriptors: rustslam::Descriptors::new(),
+                sift: crate::sift::SiftFeatures::default(),
+                wide_descriptors: crate::wide::WideDescriptors {
+                    data: Vec::new(),
+                    dim: 0,
+                    count: 0,
+                },
+                strong_feature_indices: Vec::new(),
+                colors: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut ba_options = mapper_global_ba_options(
+        config,
+        reconstruction,
+        global_ba_iterations_for_reconstruction(config, reconstruction),
+        None,
+        Vec::new(),
+        None,
+        None,
+    );
+    let uses_prior_position = global_ba_uses_prior_position(&ba_options, reconstruction);
+    ba_options.gauge = if uses_prior_position {
+        crate::ba::BundleAdjustmentGauge::None
+    } else {
+        crate::ba::BundleAdjustmentGauge::TwoCamsFromWorld
+    };
+    if uses_prior_position
+        && align_reconstruction_to_pose_priors(
+            reconstruction,
+            &ba_options.pose_priors,
+            config.random_seed,
+        )
+        .is_none()
+    {
+        bail!("final global BA could not align the reconstruction to pose priors");
+    }
+
+    let report = refine_bundle_adjustment_checked(&frames, reconstruction, config, ba_options)
+        .map_err(|reason| anyhow::anyhow!("final global BA failed: {reason}"))?;
+    filter_reprojection_tracks(&frames, &[], reconstruction, config);
+    Ok(Some(report))
 }
 
 fn refine_initial_global_bundle(
@@ -4656,15 +5158,55 @@ fn refine_global_bundle_with_postprocessing(
     reason: &str,
     normalize_reconstruction: bool,
     debug_log: &mut Vec<String>,
+    registration_stats: Option<&mut RegistrationStats>,
+    filtered_units: Option<&mut HashSet<RegistrationUnitKey>>,
+    triangulation_state: &mut IncrementalTriangulatorState,
+) -> GlobalBaOutcome {
+    refine_global_bundle_with_postprocessing_using_solver(
+        frames,
+        pairs,
+        reconstruction,
+        tri_options,
+        config,
+        reason,
+        normalize_reconstruction,
+        debug_log,
+        registration_stats,
+        filtered_units,
+        triangulation_state,
+        refine_bundle_adjustment_checked,
+    )
+}
+
+// Keep failure injection local to each invocation; production always uses the
+// checked solver above, with the same options and refinement policy.
+fn refine_global_bundle_with_postprocessing_using_solver(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    tri_options: &IncrementalTriangulatorOptions,
+    config: &MapperConfig,
+    reason: &str,
+    normalize_reconstruction: bool,
+    debug_log: &mut Vec<String>,
     mut registration_stats: Option<&mut RegistrationStats>,
     mut filtered_units: Option<&mut HashSet<RegistrationUnitKey>>,
     triangulation_state: &mut IncrementalTriangulatorState,
-) -> bool {
+    mut solve: impl FnMut(
+        &[ImageFrame],
+        &mut Reconstruction,
+        &MapperConfig,
+        crate::ba::BundleAdjustmentOptions,
+    ) -> std::result::Result<
+        crate::ba::BundleAdjustmentReport,
+        BundleAdjustmentSkipReason,
+    >,
+) -> GlobalBaOutcome {
     if !global_ba_enabled(config)
         || registered_image_count(reconstruction) < 2
         || reconstruction.points.is_empty()
     {
-        return false;
+        return GlobalBaOutcome::not_attempted();
     }
 
     let (pre_completed, pre_merged, retriangulated) = {
@@ -4682,7 +5224,7 @@ fn refine_global_bundle_with_postprocessing(
         ));
     }
 
-    let mut attempted = false;
+    let mut outcome = GlobalBaOutcome::not_attempted();
     for round in 0..global_ba_max_refinements_for_reason(config, reason) {
         let observations_before = reconstruction_num_observations(reconstruction);
         if observations_before == 0 {
@@ -4692,7 +5234,6 @@ fn refine_global_bundle_with_postprocessing(
         if gauge_images.is_empty() {
             break;
         }
-        attempted = true;
         let redundant_point_ids = global_ba_redundant_point_ids(config, reconstruction);
         if let Some(redundant_point_ids) = redundant_point_ids.as_ref() {
             debug_log.push(format!(
@@ -4737,7 +5278,7 @@ fn refine_global_bundle_with_postprocessing(
                     "global_ba reason={reason} round=1 skipped skip_reason=prior_alignment_failed gauge_images={:?} observations={}",
                     gauge_images, observations_before
                 ));
-                break;
+                return outcome.failed();
             };
             debug_log.push(format!(
                 "global_ba_align_priors reason={reason} round=1 scale={:.6} rotation=({:.4},{:.4},{:.4},{:.4}) translation=({:.6},{:.6},{:.6})",
@@ -4751,12 +5292,7 @@ fn refine_global_bundle_with_postprocessing(
                 transform.translation.z
             ));
         }
-        let report = match refine_bundle_adjustment_checked(
-            frames,
-            reconstruction,
-            config,
-            ba_options,
-        ) {
+        let report = match solve(frames, reconstruction, config, ba_options) {
             Ok(report) => report,
             Err(skip_reason) => {
                 debug_log.push(format!(
@@ -4766,18 +5302,15 @@ fn refine_global_bundle_with_postprocessing(
                     gauge_images,
                     observations_before
                 ));
-                break;
+                return outcome.failed();
             }
         };
+        outcome.commit_round();
         if let Some(redundant_point_ids) = redundant_point_ids {
             let redundant_ba_options =
                 redundant_point_global_ba_options(config, reconstruction, redundant_point_ids);
-            let redundant_report = match refine_bundle_adjustment_checked(
-                frames,
-                reconstruction,
-                config,
-                redundant_ba_options,
-            ) {
+            let redundant_report = match solve(frames, reconstruction, config, redundant_ba_options)
+            {
                 Ok(report) => report,
                 Err(skip_reason) => {
                     debug_log.push(format!(
@@ -4785,7 +5318,7 @@ fn refine_global_bundle_with_postprocessing(
                         round + 1,
                         skip_reason
                     ));
-                    break;
+                    return outcome.failed();
                 }
             };
             debug_log.push(format!(
@@ -4877,11 +5410,12 @@ fn refine_global_bundle_with_postprocessing(
                 transform.translation.z
             ));
         }
+        outcome.complete_postprocessing();
         if changed <= config.global_ba_max_refinement_change {
             break;
         }
     }
-    attempted
+    outcome
 }
 
 fn should_run_global_ba(
@@ -4927,11 +5461,12 @@ fn should_run_final_global_ba(
     global_ba_enabled(config)
         && registered_image_count(reconstruction) >= 2
         && !reconstruction.points.is_empty()
-        && (registered_frame_count(reconstruction) != schedule.prev_registered_frames
+        && (schedule.dirty
+            || registered_frame_count(reconstruction) != schedule.prev_registered_frames
             || reconstruction.points.len() != schedule.prev_points)
 }
 
-fn global_ba_enabled(config: &MapperConfig) -> bool {
+pub(crate) fn global_ba_enabled(config: &MapperConfig) -> bool {
     config.global_ba && global_ba_iterations(config) > 0 && config.global_ba_max_refinements > 0
 }
 
@@ -6007,13 +6542,15 @@ fn choose_initial_pair_parallel(
         camera_has_prior_focal_length,
         selection_state,
     );
-    let results = candidates
-        .par_iter()
-        .map(|candidate| {
-            probe_initial_pair_candidate(pairs, reconstruction, config, candidate)
-                .map(|pair| (candidate.pair_id, pair))
-        })
-        .collect::<Vec<_>>();
+    let results = crate::execution::parallel(|| {
+        candidates
+            .par_iter()
+            .map(|candidate| {
+                probe_initial_pair_candidate(pairs, reconstruction, config, candidate)
+                    .map(|pair| (candidate.pair_id, pair))
+            })
+            .collect::<Vec<_>>()
+    });
 
     for (candidate, result) in candidates.iter().zip(results) {
         selection_state.init_image_pairs.insert(candidate.pair_id);
@@ -6708,6 +7245,7 @@ fn refine_generalized_frame_absolute_pose(
         point_ids: Some(constant_points.clone()),
         constant_point_ids: Some(constant_points),
         allow_single_observation_points: true,
+        taskflow: config.ba_taskflow.clone(),
         ..crate::ba::BundleAdjustmentOptions::default()
     };
     options.constant_sensor_from_rig = scratch
@@ -10970,6 +11508,37 @@ mod tests {
             experimental_structureless_pair_pose_fallback: true,
             ..MapperConfig::default()
         }
+    }
+
+    #[test]
+    fn pair_profile_preserves_rejected_geometry_and_records_elapsed_time() {
+        let frames = [minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        let camera = CameraModel::new_pinhole(100, 100, 80.0, 80.0, 50.0, 50.0);
+        let config = MapperConfig::default();
+        let options = SiftMatchingOptions::default();
+        let mut timing = PairTiming::default();
+        assert!(estimate_candidate_pair(
+            0, 1, &frames, camera, camera, &config, None, &options, None
+        )
+        .is_none());
+        assert!(estimate_candidate_pair(
+            0,
+            1,
+            &frames,
+            camera,
+            camera,
+            &config,
+            None,
+            &options,
+            Some(&mut timing)
+        )
+        .is_none());
+        assert_eq!(timing.matches, 0);
+        assert_eq!(timing.inliers, 0);
+        assert!(timing.matching_ms.is_finite() && timing.matching_ms >= 0.0);
+        assert!(timing.geometry_ms.is_finite() && timing.geometry_ms >= 0.0);
+        assert_eq!(timing.guided_matching_and_geometry_ms, 0.0);
+        assert!(serde_json::to_string(&timing).is_ok());
     }
 
     #[test]
@@ -15932,6 +16501,253 @@ mod tests {
         );
     }
 
+    fn global_ba_schedule_fixture() -> (Vec<ImageFrame>, Reconstruction, MapperConfig) {
+        let frames = (0..3)
+            .map(|image| minimal_frame(image, &format!("ba_{image}.jpg")))
+            .collect::<Vec<_>>();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses.fill(Some(SE3::identity()));
+        add_test_point3d(
+            &mut reconstruction,
+            1,
+            (0..3)
+                .map(|image| TrackObservation { image, feature: 0 })
+                .collect(),
+        );
+        let config = MapperConfig {
+            global_ba: true,
+            global_ba_iterations: 3,
+            global_ba_max_refinements: 2,
+            ..MapperConfig::default()
+        };
+        (frames, reconstruction, config)
+    }
+
+    #[test]
+    fn global_ba_schedule_first_alignment_failure_does_not_mark_success() {
+        let (frames, mut reconstruction, mut config) = global_ba_schedule_fixture();
+        let covariance = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        config.pose_priors = (1..=3)
+            .map(|id| test_pose_prior(id, 1, id as u64, [id as f64, 0.0, 0.0], covariance))
+            .collect();
+        // All source camera centers coincide: no similarity alignment exists.
+        let mut state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+        let mut schedule = GlobalBaSchedule::new(&reconstruction);
+        schedule.mark(&reconstruction);
+        let mut log = Vec::new();
+        let outcome = refine_global_bundle_with_postprocessing_using_solver(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "scheduled",
+            false,
+            &mut log,
+            None,
+            None,
+            &mut state,
+            |_, _, _, _| panic!("alignment failure must precede the checked solve"),
+        );
+        assert_eq!(outcome, GlobalBaOutcome::not_attempted().failed());
+        assert!(log
+            .iter()
+            .any(|line| line.contains("prior_alignment_failed")));
+        schedule.record_outcome(&reconstruction, outcome);
+        assert_eq!(schedule.prev_registered_frames, 3);
+        assert_eq!(schedule.prev_points, 1);
+        assert!(should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+    }
+
+    #[test]
+    fn global_ba_schedule_first_solver_failure_does_not_mark_success() {
+        let (frames, mut reconstruction, config) = global_ba_schedule_fixture();
+        let mut state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+        let mut schedule = GlobalBaSchedule::new(&reconstruction);
+        schedule.mark(&reconstruction);
+        let mut calls = 0;
+        let outcome = refine_global_bundle_with_postprocessing_using_solver(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "scheduled",
+            false,
+            &mut Vec::new(),
+            None,
+            None,
+            &mut state,
+            |_, _, _, _| {
+                calls += 1;
+                Err(BundleAdjustmentSkipReason::SolverReturnedNone)
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(outcome, GlobalBaOutcome::not_attempted().failed());
+        schedule.record_outcome(&reconstruction, outcome);
+        assert_eq!(schedule.prev_registered_frames, 3);
+        assert_eq!(schedule.prev_points, 1);
+        assert!(should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+    }
+
+    #[test]
+    fn global_ba_schedule_partial_success_never_advances_watermark() {
+        let (_, mut reconstruction, config) = global_ba_schedule_fixture();
+        let mut schedule = GlobalBaSchedule::new(&reconstruction);
+        schedule.mark(&reconstruction);
+        let watermark = (
+            schedule.prev_registered_images,
+            schedule.prev_registered_frames,
+            schedule.prev_points,
+        );
+        reconstruction.points.push(reconstruction.points[0].clone());
+        reconstruction.point_ids.push(2);
+
+        // Pure outcome control flow: first main solve committed but its redundant
+        // solve failed, so normalization/track maintenance never completed.
+        let mut first_commit = GlobalBaOutcome::not_attempted();
+        first_commit.commit_round();
+        let redundant_failure = first_commit.failed();
+        assert_eq!(redundant_failure.committed_rounds, 1);
+        assert!(!redundant_failure.postprocessing_complete);
+
+        // A complete earlier round must not hide a later main-solve failure.
+        first_commit.complete_postprocessing();
+        let later_main_failure = first_commit.failed();
+        assert_eq!(later_main_failure.committed_rounds, 1);
+        assert!(later_main_failure.postprocessing_complete);
+
+        // A later main solve can also commit before its redundant solve fails.
+        first_commit.commit_round();
+        let later_redundant_failure = first_commit.failed();
+        assert_eq!(later_redundant_failure.committed_rounds, 2);
+        assert!(!later_redundant_failure.postprocessing_complete);
+        for outcome in [
+            redundant_failure,
+            later_main_failure,
+            later_redundant_failure,
+        ] {
+            assert_eq!(outcome.status, GlobalBaStatus::Failed);
+            assert!(!outcome.completed());
+            schedule.record_outcome(&reconstruction, outcome);
+            assert_eq!(
+                (
+                    schedule.prev_registered_images,
+                    schedule.prev_registered_frames,
+                    schedule.prev_points
+                ),
+                watermark
+            );
+            assert!(should_run_final_global_ba(
+                &schedule,
+                &reconstruction,
+                &config
+            ));
+        }
+    }
+
+    #[test]
+    fn global_ba_schedule_complete_success_clears_dirty_without_forcing_final() {
+        let (_, mut reconstruction, config) = global_ba_schedule_fixture();
+        let mut schedule = GlobalBaSchedule::new(&reconstruction);
+        let mut outcome = GlobalBaOutcome::not_attempted();
+        outcome.commit_round();
+        assert!(!outcome.completed());
+        outcome.complete_postprocessing();
+        outcome.commit_round();
+        assert!(!outcome.completed());
+        outcome.complete_postprocessing();
+        assert_eq!(outcome.committed_rounds, 2);
+        schedule.record_outcome(&reconstruction, outcome);
+        assert!(!schedule.dirty);
+        assert!(!should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+        assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+
+        // A retained registration/local refinement can change geometry/tracks
+        // without net frame or point growth. Only final, not scheduled, is due.
+        reconstruction.points[0].xyz[0] += 0.25;
+        schedule.dirty = true;
+        assert!(should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+        assert!(!should_run_global_ba(&schedule, &reconstruction, &config));
+        schedule.record_outcome(&reconstruction, outcome);
+        assert!(!should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+    }
+
+    #[test]
+    fn global_ba_schedule_not_attempted_stays_dirty_but_respects_final_gates() {
+        let (frames, mut reconstruction, mut config) = global_ba_schedule_fixture();
+        let mut schedule = GlobalBaSchedule::new(&reconstruction);
+        assert!(should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+        let mut state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+        config.global_ba = false;
+        let outcome = refine_global_bundle_with_postprocessing_using_solver(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &mapper_triangulator_options(&config),
+            &config,
+            "scheduled",
+            false,
+            &mut Vec::new(),
+            None,
+            None,
+            &mut state,
+            |_, _, _, _| panic!("disabled BA must not invoke the solver"),
+        );
+        assert_eq!(outcome, GlobalBaOutcome::not_attempted());
+        schedule.record_outcome(&reconstruction, outcome);
+        assert!(schedule.dirty);
+        assert!(!should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+        config.global_ba = true;
+        assert!(should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+        reconstruction.poses[1..].fill(None);
+        assert!(!should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+        reconstruction.poses.fill(Some(SE3::identity()));
+        reconstruction.points.clear();
+        assert!(!should_run_final_global_ba(
+            &schedule,
+            &reconstruction,
+            &config
+        ));
+    }
+
     #[test]
     fn global_ba_schedule_absolute_frequency_triggers_on_image_or_point_growth() {
         let frames = vec![
@@ -18365,6 +19181,7 @@ mod tests {
                 && line.contains("registered_frames=3")));
     }
 
+    #[cfg(feature = "ceres-ba")]
     #[test]
     fn pipeline_final_global_ba_skips_normalization_like_colmap_final_all() {
         let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
@@ -18751,6 +19568,7 @@ mod tests {
         assert_eq!(exported.reconstruction.points.len(), 12);
     }
 
+    #[cfg(feature = "ceres-ba")]
     #[test]
     fn controlled_mapper_reports_local_and_global_ba_operation_boundaries() {
         use crate::task::{
@@ -20849,6 +21667,7 @@ mod tests {
         assert!(log.contains("frontier_cycles=1"), "{log}");
     }
 
+    #[cfg(feature = "ceres-ba")]
     #[test]
     fn synthetic_local_ba_filters_only_its_modified_frontier() {
         let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
@@ -21441,7 +22260,8 @@ mod tests {
             Some(&mut stats),
             Some(&mut filtered_units),
             &mut triangulation_state,
-        ));
+        )
+        .completed());
 
         let prepare = debug_log
             .iter()
@@ -21524,7 +22344,8 @@ mod tests {
             Some(&mut stats),
             Some(&mut filtered_units),
             &mut triangulation_state,
-        ));
+        )
+        .completed());
 
         let prepare = debug_log
             .iter()
@@ -21649,7 +22470,8 @@ mod tests {
             Some(&mut stats),
             Some(&mut filtered_units),
             &mut triangulation_state,
-        ));
+        )
+        .completed());
 
         let prepare = debug_log
             .iter()
@@ -21747,7 +22569,8 @@ mod tests {
             Some(&mut stats),
             Some(&mut filtered_units),
             &mut triangulation_state,
-        ));
+        )
+        .completed());
 
         let prepare = debug_log
             .iter()
@@ -21836,7 +22659,8 @@ mod tests {
             Some(&mut stats),
             Some(&mut filtered_units),
             &mut triangulation_state,
-        ));
+        )
+        .completed());
 
         let global_ba = debug_log
             .iter()

@@ -118,6 +118,7 @@ pub struct MapperConfig {
     pub global_ba: bool,
     pub ba_linear_solver: BundleAdjustmentLinearSolverPreference,
     pub ba_sparse_backend: BundleAdjustmentSparseLinearAlgebra,
+    pub ba_taskflow: Option<crate::ba::CeresBaTaskflow>,
     pub global_ba_iterations: usize,
     pub global_ba_images_ratio: f32,
     pub global_ba_points_ratio: f32,
@@ -209,6 +210,7 @@ impl Default for MapperConfig {
             global_ba: true,
             ba_linear_solver: BundleAdjustmentLinearSolverPreference::Auto,
             ba_sparse_backend: BundleAdjustmentSparseLinearAlgebra::Auto,
+            ba_taskflow: None,
             global_ba_iterations: 50,
             global_ba_images_ratio: 1.5,
             global_ba_points_ratio: 1.5,
@@ -249,4 +251,6 @@ pub struct ReconstructionSummary {
     pub models: usize,
     pub elapsed_ms: f64,
     pub debug_log: Vec<String>,
+    #[serde(default)]
+    pub stage_reports: Vec<crate::SfmStageReport>,
 }

@@ -103,6 +103,7 @@ pub(super) fn global_reconstruction_options_from_config(
         },
         run_global_ba: config.global_ba,
         global_ba_iterations: global_ba_iterations(config),
+        ba_taskflow: config.ba_taskflow.clone(),
         component_splitting: ViewGraphComponentSplittingOptions {
             enabled: config.multiple_models,
             min_component_size: config.min_model_size.max(2),
@@ -253,6 +254,7 @@ pub(super) fn mapper_ba_options(
         iterations,
         linear_solver: config.ba_linear_solver,
         sparse_linear_algebra: config.ba_sparse_backend,
+        taskflow: config.ba_taskflow.clone(),
         loss_function: mapper_global_ba_loss_function(),
         max_observation_error_px: global_ba_max_observation_error_px(config),
         variable_images,
@@ -455,6 +457,7 @@ pub(super) fn mapper_local_ba_options(
 pub(super) enum BundleAdjustmentSkipReason {
     PreBogusCameras(Vec<usize>),
     SolverReturnedNone,
+    AdmissionFailed(String),
     UnusableSolution(crate::ba::BundleAdjustmentReport),
     PostBogusCameras(Vec<usize>),
 }
@@ -466,6 +469,7 @@ impl fmt::Display for BundleAdjustmentSkipReason {
                 write!(f, "pre_bogus_cameras={indices:?}")
             }
             Self::SolverReturnedNone => f.write_str("solver_returned_none"),
+            Self::AdmissionFailed(error) => write!(f, "ba_admission_failed={error}"),
             Self::UnusableSolution(report) => {
                 write!(f, "unusable_solution {}", report.brief_report())
             }
@@ -495,7 +499,8 @@ pub(super) fn refine_bundle_adjustment_checked(
         .map(|point| point.xyz)
         .collect::<Vec<_>>();
 
-    let report = crate::ba::refine_bundle_adjustment(frames, reconstruction, options);
+    let report = crate::ba::try_refine_bundle_adjustment(frames, reconstruction, options)
+        .map_err(|error| BundleAdjustmentSkipReason::AdmissionFailed(format!("{error:#}")))?;
     let Some(report) = report else {
         restore_ba_state(
             reconstruction,

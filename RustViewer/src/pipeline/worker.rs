@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
@@ -56,23 +56,26 @@ pub struct StageRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct WorkerControl(Arc<AtomicU8>);
+pub struct WorkerControl(rustsfm::SfmTaskControl);
 
 impl WorkerControl {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(0)))
+        Self(rustsfm::SfmTaskControl::new())
     }
     pub(crate) fn request_pause(&self) {
-        self.0.store(1, Ordering::Release);
+        self.0.request_pause();
     }
     pub(crate) fn request_cancel(&self) {
-        self.0.store(2, Ordering::Release);
+        self.0.request_cancel();
+    }
+    pub(crate) fn sfm_control(&self) -> rustsfm::SfmTaskControl {
+        self.0.clone()
     }
     pub fn pause_requested(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 1
+        self.0.state() == rustsfm::SfmControlState::PauseRequested
     }
     pub fn cancel_requested(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 2
+        self.0.state() == rustsfm::SfmControlState::CancelRequested
     }
 }
 
@@ -165,5 +168,26 @@ impl PipelineWorkers {
             pnp: Arc::new(pnp),
             training: Arc::new(training),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sfm_control_observes_stop_without_progress_events_and_cancel_is_final() {
+        let control = WorkerControl::new();
+        let sfm = control.sfm_control();
+        control.request_pause();
+        assert_eq!(sfm.checkpoint(), Err(rustsfm::SfmTaskStop::Paused));
+        let peer = control.clone();
+        std::thread::spawn(move || peer.request_cancel())
+            .join()
+            .unwrap();
+        assert_eq!(sfm.checkpoint(), Err(rustsfm::SfmTaskStop::Cancelled));
+        control.request_pause();
+        assert!(control.cancel_requested());
+        assert!(!control.pause_requested());
     }
 }

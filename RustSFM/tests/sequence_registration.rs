@@ -331,6 +331,422 @@ fn synthetic_sequence_fixture(
     Ok((temp, output, frames, keyframe_result, mapper_config))
 }
 
+fn sequence_memory_executor() -> anyhow::Result<rustsfm::SfmTaskflow> {
+    let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(
+        rustscan_taskflow::RuntimeConfig {
+            budget: rustscan_taskflow::Budget {
+                cpu_threads: 2,
+                memory_bytes: 512 * 1024 * 1024,
+                io_slots: 2,
+            },
+            ..Default::default()
+        },
+    )?);
+    rustsfm::SfmTaskflow::new(runtime, 128 * 1024 * 1024)
+}
+
+#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+#[test]
+fn sequence_memory_missing_entries_use_fixed_plans_and_typed_pause() -> anyhow::Result<()> {
+    for entry in ["keyframe", "adaptive", "remaining", "chain"] {
+        let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+        config.sift_extraction.use_gpu = false;
+        config.use_gpu_pnp = false;
+        config.threads = Some(1);
+        config.max_features = 8;
+        let db = ColmapDatabase::open(&keyframes.database)?;
+        db.clear_descriptors()?;
+        drop(db);
+        let control = SfmTaskControl::new();
+        let mut sink = |event: rustsfm::SfmTaskEvent| {
+            if event.operation == rustsfm::SfmTaskOperation::ExtractImage
+                && event.completed == Some(1)
+            {
+                control.request_pause();
+            }
+        };
+        let mut task =
+            SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+        let error = match entry {
+            "keyframe" => run_keyframe_reconstruction(
+                &frames,
+                &keyframes.keyframe_ids,
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            "adaptive" => rustsfm::run_adaptive_keyframe_selection(
+                &frames,
+                &Default::default(),
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            "remaining" => register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            _ => run_sequence_registration(
+                &frames,
+                &keyframes.keyframe_ids,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+        };
+        assert_eq!(
+            error.downcast_ref::<rustsfm::SfmTaskStop>(),
+            Some(&rustsfm::SfmTaskStop::Paused),
+            "{entry}: {error:#}"
+        );
+        let reports = task.stage_reports();
+        let extraction = reports
+            .iter()
+            .find(|r| r.stage_name == "selected feature extraction")
+            .expect(entry);
+        assert!(extraction.requested_memory > 128 * 1024 * 1024, "{entry}");
+        assert!(
+            extraction.requested_memory <= extraction.granted_memory,
+            "{entry}"
+        );
+        let db = ColmapDatabase::open_read_only(&keyframes.database)?;
+        // Remaining starts at index 1, not a keyframe. No eager extraction of
+        // later targets, and a larger parent does not regroup the fixed chunks.
+        let first_id = if entry == "remaining" { 2 } else { 1 };
+        for id in 1..=6 {
+            assert_eq!(
+                db.exists_descriptors(id)?,
+                id == first_id,
+                "{entry}: image {id}"
+            );
+        }
+        if entry == "chain" {
+            assert!(!reports.iter().any(|r| r.stage_name
+                == "remaining registration and final export"
+                && r.granted_memory > 0));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+#[test]
+fn sequence_memory_chain_plans_missing_remaining_before_first_node() -> anyhow::Result<()> {
+    let (_temp, output, mut frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(1);
+    config.max_features = 8;
+    let source = frames[1].image_path.with_extension("bmp");
+    image::GrayImage::new(1, 1).save(&source)?;
+    let mut header = std::fs::read(&source)?;
+    // Header-only estimate: no large pixel buffer or real large-image decode.
+    header[18..22].copy_from_slice(&4096i32.to_le_bytes());
+    header[22..26].copy_from_slice(&3072i32.to_le_bytes());
+    std::fs::write(&source, header)?;
+    frames[1].image_path = source;
+    let db = ColmapDatabase::open(&keyframes.database)?;
+    let mut target = db.read_image(2)?.unwrap();
+    target.name = frames[1]
+        .image_path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    db.update_image(&target)?;
+    db.clear_descriptors()?;
+    for id in [1, 3, 4, 5, 6] {
+        write_synthetic_descriptors(&db, id, false)?;
+    }
+    drop(db);
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let error = run_sequence_registration(
+        &frames,
+        &keyframes.keyframe_ids,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<rustscan_taskflow::Error>(),
+            Some(rustscan_taskflow::Error::Unschedulable(_))
+        ),
+        "{error:#}"
+    );
+    assert!(!output.join("Cache/keyframes.lock").exists());
+    assert!(!output.join("Cache/sequence").exists());
+    assert!(task.stage_reports().iter().all(|r| r.granted_memory == 0));
+    drop(task);
+    drop(sink);
+    assert!(events.is_empty());
+    Ok(())
+}
+
+#[test]
+fn sequence_memory_cached_independent_entries_keep_floor_and_typed_pause() -> anyhow::Result<()> {
+    for entry in ["keyframe", "adaptive", "remaining"] {
+        let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+        config.sift_extraction.use_gpu = false;
+        config.use_gpu_pnp = false;
+        config.threads = Some(1);
+        let control = SfmTaskControl::new();
+        let mut sink = |_: rustsfm::SfmTaskEvent| control.request_pause();
+        let mut task =
+            SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+        let error = match entry {
+            "keyframe" => run_keyframe_reconstruction(
+                &frames,
+                &keyframes.keyframe_ids,
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            "adaptive" => rustsfm::run_adaptive_keyframe_selection(
+                &frames,
+                &Default::default(),
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            _ => register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+        };
+        assert_eq!(
+            error.downcast_ref::<rustsfm::SfmTaskStop>(),
+            Some(&rustsfm::SfmTaskStop::Paused),
+            "{entry}: {error:#}"
+        );
+        let reports = task.stage_reports();
+        assert!(reports.iter().any(|r| r.granted_memory > 0), "{entry}");
+        assert!(
+            reports
+                .iter()
+                .all(|r| r.requested_memory == 128 * 1024 * 1024),
+            "{entry}"
+        );
+        assert!(
+            !reports
+                .iter()
+                .any(|r| r.stage_name == "selected feature extraction"),
+            "{entry}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn sequence_memory_resume_artifact_error_precedes_pause_and_admission() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, config) = synthetic_sequence_fixture(None)?;
+    keyframes.registered_keyframes += 1;
+    let control = SfmTaskControl::new();
+    control.request_pause();
+    let mut sink = |_| {};
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("registered keyframe count"),
+        "{error:#}"
+    );
+    assert!(error.downcast_ref::<rustsfm::SfmTaskStop>().is_none());
+    assert!(task.stage_reports().is_empty());
+    Ok(())
+}
+
+#[test]
+fn sequence_memory_cached_chain_keeps_two_nodes_and_final_ba_order() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(2);
+    config.multiple_models = false;
+    config.copy_images = false;
+    config.init_num_trials = 1;
+    config.init_min_num_inliers = 16;
+    config.init_min_tri_angle_deg = 0.5;
+    config.abs_pose_min_num_inliers = 16;
+    config.ignore_two_view_tracks = false;
+    // No-default builds have no BA solver; still exercise the complete cached
+    // chain and assert that the disabled operation emits no BA events.
+    config.global_ba = cfg!(feature = "ceres-ba");
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let result = run_sequence_registration(
+        &frames,
+        &keyframes.keyframe_ids,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert_eq!(result.registered_frames, frames.len());
+    let reports = task.stage_reports();
+    let first = reports
+        .iter()
+        .filter(|r| r.stage_name == "keyframe reconstruction")
+        .collect::<Vec<_>>();
+    assert_eq!(first.len(), 1);
+    let remaining = reports
+        .iter()
+        .filter(|r| r.stage_name == "remaining registration and final export")
+        .collect::<Vec<_>>();
+    // One chain node plus the existing inline borrowed remaining-stage report;
+    // no enclosing keyframe/sequence admission is introduced.
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(first[0].requested_memory, 128 * 1024 * 1024);
+    assert!(remaining
+        .iter()
+        .all(|r| r.requested_memory == first[0].requested_memory));
+    assert!(!reports
+        .iter()
+        .any(|r| r.stage_name == "keyframe reconstruction and export"
+            || r.stage_name == "selected feature extraction"));
+    drop(task);
+    drop(sink);
+    assert!(!events
+        .iter()
+        .any(|e| e.operation == rustsfm::SfmTaskOperation::ExtractImage));
+    let ba = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.operation == rustsfm::SfmTaskOperation::GlobalBundleAdjustment)
+        .collect::<Vec<_>>();
+    let last_attempt = events
+        .iter()
+        .rposition(|e| e.operation == rustsfm::SfmTaskOperation::RegisterFrameAttempt)
+        .unwrap();
+    let publish = events
+        .iter()
+        .position(|e| {
+            e.stage == rustsfm::SfmTaskStage::Export
+                && e.operation == rustsfm::SfmTaskOperation::ValidateArtifacts
+                && e.kind == rustsfm::SfmTaskEventKind::Progress
+        })
+        .unwrap();
+    assert!(last_attempt < publish);
+    if config.global_ba {
+        assert_eq!(ba.len(), 2);
+        assert_eq!(ba[0].1.kind, rustsfm::SfmTaskEventKind::Started);
+        assert_eq!(ba[1].1.kind, rustsfm::SfmTaskEventKind::Completed);
+        assert!(last_attempt < ba[0].0);
+        assert!(ba[1].0 < publish);
+    } else {
+        assert!(ba.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn sequence_memory_no_pending_uses_only_caller_floor() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(2);
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert_eq!(result.registered_frames, frames.len());
+    let model = read_colmap_sparse_model(&result.sparse_model)?;
+    export_colmap_sparse_snapshot(&keyframes.sparse_model, &model.reconstruction)?;
+    write_colmap_sparse_binary(
+        &keyframes.sparse_model,
+        &rustsfm::colmap::read_colmap_sparse_files_with_format(
+            &keyframes.sparse_model,
+            rustsfm::colmap::ColmapSparseFormat::Text,
+        )?,
+    )?;
+    keyframes.keyframe_ids = frames.iter().map(|frame| frame.id).collect();
+    keyframes.registered_keyframes = frames.len();
+    drop(task);
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert!(result
+        .diagnostics
+        .iter()
+        .all(|d| d.status == FrameRegistrationStatus::Keyframe && d.attempts == 0));
+    let reports = task.stage_reports();
+    let outer = reports
+        .iter()
+        .find(|r| r.stage_name == "remaining registration and final export")
+        .unwrap();
+    assert_eq!(outer.requested_memory, 128 * 1024 * 1024);
+    drop(task);
+    drop(sink);
+    assert!(!events.iter().any(|e| matches!(
+        e.operation,
+        rustsfm::SfmTaskOperation::ExtractImage | rustsfm::SfmTaskOperation::RegisterFrameAttempt
+    )));
+    Ok(())
+}
+
 fn synthetic_sequence_config() -> SequenceRegistrationConfig {
     SequenceRegistrationConfig {
         narrow_neighbors_each_side: 2,
@@ -748,6 +1164,115 @@ fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::R
     Ok(())
 }
 
+#[cfg(feature = "ceres-ba")]
+#[test]
+fn taskflow_sequence_preserves_typed_pause_before_final_ba() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mut mapper_config) = synthetic_sequence_fixture(None)?;
+    mapper_config.global_ba = true;
+    let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(Default::default())?);
+    let ba = rustsfm::CeresBaTaskflow::new(runtime.clone(), 2, 128 * 1024 * 1024)?;
+    let control = SfmTaskControl::new();
+    let mut sink = |event: rustsfm::SfmTaskEvent| {
+        if event.operation == rustsfm::SfmTaskOperation::GlobalBundleAdjustment
+            && event.kind == rustsfm::SfmTaskEventKind::Started
+        {
+            control.request_pause();
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink).with_ceres_ba_taskflow(&ba);
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<rustsfm::SfmTaskStop>(),
+        Some(&rustsfm::SfmTaskStop::Paused)
+    );
+    assert_eq!(runtime.snapshot()?.pending_tasks, 0);
+    assert!(!output.join("sparse/0").exists());
+    Ok(())
+}
+
+#[cfg(feature = "ceres-ba")]
+#[test]
+fn taskflow_sequence_waits_for_budget_and_runs_final_global_ba_once() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mut mapper_config) = synthetic_sequence_fixture(None)?;
+    mapper_config.global_ba = true;
+    let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(
+        rustscan_taskflow::RuntimeConfig {
+            budget: rustscan_taskflow::Budget {
+                cpu_threads: 2,
+                memory_bytes: 256 * 1024 * 1024,
+                io_slots: 2,
+            },
+            ..Default::default()
+        },
+    )?);
+    let ceiling = runtime.snapshot()?.budget;
+    let mut paused = ceiling;
+    paused.cpu_threads = 0;
+    runtime.set_budget(paused)?;
+    let ba = rustsfm::CeresBaTaskflow::new(runtime.clone(), 2, 128 * 1024 * 1024)?;
+    let (result, events) = std::thread::scope(|scope| -> anyhow::Result<_> {
+        let workflow = scope.spawn(|| -> anyhow::Result<_> {
+            let control = SfmTaskControl::new();
+            let mut events = Vec::new();
+            let mut sink = |event| events.push(event);
+            let mut task = SfmTaskContext::new(&control, &mut sink).with_ceres_ba_taskflow(&ba);
+            let result = register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &mapper_config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )?;
+            Ok((result, events))
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime.snapshot()?.pending_tasks == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let queued = runtime.snapshot()?.pending_tasks;
+        // Always unblock the worker before asserting, even on regression.
+        runtime.set_budget(ceiling)?;
+        let result = workflow.join().unwrap()?;
+        assert_eq!(
+            queued, 1,
+            "sequence computation bypassed the shared admission controller"
+        );
+        Ok(result)
+    })?;
+    assert!(result.has_complete_coverage());
+    let global: Vec<_> = events
+        .iter()
+        .filter(|event| event.operation == rustsfm::SfmTaskOperation::GlobalBundleAdjustment)
+        .collect();
+    assert_eq!(global.len(), 2);
+    assert_eq!(global[0].kind, rustsfm::SfmTaskEventKind::Started);
+    assert_eq!(global[1].kind, rustsfm::SfmTaskEventKind::Completed);
+    assert_eq!(global[0].registered_images, Some(6));
+    let last_registration = events
+        .iter()
+        .filter(|event| event.operation == rustsfm::SfmTaskOperation::RegisterFrameAttempt)
+        .map(|event| event.sequence)
+        .max()
+        .unwrap();
+    assert!(global[0].sequence > last_registration);
+    let used = runtime.snapshot()?;
+    assert_eq!(used.cpu_threads, 0);
+    assert_eq!(used.memory_bytes, 0);
+    assert_eq!(used.pending_tasks, 0);
+    Ok(())
+}
+
 #[test]
 fn pause_before_sparse_publish_preserves_old_model_byte_for_byte() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
@@ -1127,6 +1652,7 @@ fn pause_between_stages_does_not_repeat_or_modify_keyframe_work() -> anyhow::Res
     Ok(())
 }
 
+#[cfg(feature = "ceres-ba")]
 #[test]
 fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -> anyhow::Result<()>
 {
@@ -1168,6 +1694,10 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
     mapper_config.init_min_tri_angle_deg = 0.5;
     mapper_config.abs_pose_min_num_inliers = 16;
     mapper_config.ignore_two_view_tracks = false;
+    mapper_config.local_ba = true;
+    mapper_config.local_ba_iterations = 2;
+    mapper_config.global_ba = true;
+    mapper_config.global_ba_iterations = 2;
     let control = SfmTaskControl::new();
     let mut events = Vec::new();
     let mut sink = |event| events.push(event);
@@ -1209,6 +1739,19 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
         0,
         "preseeded keyframe features must be reused"
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.operation == rustsfm::SfmTaskOperation::GlobalBundleAdjustment
+            })
+            .count(),
+        0,
+        "keyframe mapping must defer global BA until all sequence frames are loaded"
+    );
+    assert!(events
+        .iter()
+        .any(|event| { event.operation == rustsfm::SfmTaskOperation::LocalBundleAdjustment }));
     let keyframe_database_ids = [1u32, 3, 5, 6]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1240,7 +1783,8 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
     }
     drop(database);
 
-    let mut sink = |_| {};
+    let mut remaining_events = Vec::new();
+    let mut sink = |event| remaining_events.push(event);
     let mut task = SfmTaskContext::new(&control, &mut sink);
 
     let result = register_remaining_sequence_frames(
@@ -1252,9 +1796,28 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
         &output,
         &mut task,
     )?;
+    drop(task);
+    drop(sink);
 
     assert!(result.has_complete_coverage(), "{:#?}", result.diagnostics);
     assert_eq!(result.registered_frames, 6);
+    let global_ba_events = remaining_events
+        .iter()
+        .filter(|event| event.operation == rustsfm::SfmTaskOperation::GlobalBundleAdjustment)
+        .collect::<Vec<_>>();
+    assert_eq!(global_ba_events.len(), 2);
+    let last_registration_sequence = remaining_events
+        .iter()
+        .filter(|event| event.operation == rustsfm::SfmTaskOperation::RegisterFrameAttempt)
+        .map(|event| event.sequence)
+        .max()
+        .unwrap();
+    assert!(last_registration_sequence < global_ba_events[0].sequence);
+    assert_eq!(global_ba_events[0].kind, rustsfm::SfmTaskEventKind::Started);
+    assert_eq!(
+        global_ba_events[1].kind,
+        rustsfm::SfmTaskEventKind::Completed
+    );
     Ok(())
 }
 

@@ -15,6 +15,7 @@ vlfeat-sift = []
 
 [dependencies]
 rustscan-types = { path = "../rustscan-types" }
+rustscan-taskflow = { path = "../rustscan-taskflow" }
 anyhow = "1"
 blake3 = "1"
 bytemuck = { version = "1.25", features = ["derive"], optional = true }

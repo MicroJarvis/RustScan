@@ -114,6 +114,7 @@ pub struct GlobalReconstructionOptions {
     pub run_global_ba: bool,
     /// Global BA iteration count per refinement round.
     pub global_ba_iterations: usize,
+    pub ba_taskflow: Option<crate::ba::CeresBaTaskflow>,
     /// Split the view graph into connected components and reconstruct each
     /// qualifying component as an independent model.
     pub component_splitting: ViewGraphComponentSplittingOptions,
@@ -135,6 +136,7 @@ impl Default for GlobalReconstructionOptions {
             },
             run_global_ba: true,
             global_ba_iterations: 50,
+            ba_taskflow: None,
             component_splitting: ViewGraphComponentSplittingOptions::default(),
         }
     }
@@ -290,6 +292,23 @@ pub fn run_global_reconstructions(
     camera: CameraModel,
     options: &GlobalReconstructionOptions,
 ) -> Option<GlobalReconstructionsResult> {
+    if crate::execution::active_threads().is_none() {
+        let control = crate::SfmTaskControl::new();
+        return options
+            .ba_taskflow
+            .as_ref()
+            .map(|adapter| adapter.stage_taskflow())
+            .unwrap_or_else(crate::SfmTaskflow::shared)
+            .and_then(|executor| {
+                executor.run("global reconstruction", false, 4, &control, || {
+                    Ok(run_global_reconstructions(frames, pairs, camera, options))
+                })
+            })
+            .unwrap_or_else(|error| {
+                log::error!("global reconstruction admission failed: {error:#}");
+                None
+            });
+    }
     if frames.len() < 2 {
         return None;
     }
@@ -637,6 +656,7 @@ fn run_iterative_global_refinement(
         rounds = round + 1;
         let ba_options = BundleAdjustmentOptions {
             iterations: options.global_ba_iterations,
+            taskflow: options.ba_taskflow.clone(),
             constant_images: vec![registered[0]],
             variable_images: Some(registered.clone()),
             allow_single_observation_points: false,

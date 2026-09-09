@@ -4,12 +4,35 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "covdet.h"
 #include "sift.h"
 
 enum { DESCRIPTOR_DIM = 128 };
 enum { COVDET_MAX_OCTAVE_RESOLUTION = 1000 };
+
+static double rustsfm_vlfeat_now_ms(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0.0;
+    }
+#else
+    if (timespec_get(&ts, TIME_UTC) != TIME_UTC) {
+        return 0.0;
+    }
+#endif
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+static void rustsfm_vlfeat_add_timing(
+    double* destination,
+    double start) {
+    if (destination != NULL) {
+        *destination += rustsfm_vlfeat_now_ms() - start;
+    }
+}
 
 typedef struct LevelData {
     RustSfmVlfeatSiftKeypoint* keypoints;
@@ -347,7 +370,8 @@ static int extract_sift_covdet(
     int width,
     int height,
     const RustSfmVlfeatSiftOptions* options,
-    RustSfmVlfeatSiftFeatures* out) {
+    RustSfmVlfeatSiftFeatures* out,
+    RustSfmVlfeatSiftTiming* timing) {
     if (options->octave_resolution > COVDET_MAX_OCTAVE_RESOLUTION) {
         set_error(out, "octave_resolution too large for covdet");
         return 0;
@@ -365,6 +389,7 @@ static int extract_sift_covdet(
     vl_covdet_set_edge_threshold(covdet, options->edge_threshold);
 
     size_t image_size = (size_t)width * (size_t)height;
+    double input_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     float* data_float = (float*)malloc(image_size * sizeof(float));
     if (data_float == NULL) {
         vl_covdet_delete(covdet);
@@ -374,7 +399,11 @@ static int extract_sift_covdet(
     for (size_t i = 0; i < image_size; ++i) {
         data_float[i] = (float)gray_u8[i] / 255.0f;
     }
+    rustsfm_vlfeat_add_timing(
+        timing != NULL ? &timing->input_conversion_ms : NULL,
+        input_start);
 
+    double scale_space_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     if (vl_covdet_put_image(covdet, data_float, (vl_size)width, (vl_size)height)) {
         free(data_float);
         vl_covdet_delete(covdet);
@@ -382,14 +411,25 @@ static int extract_sift_covdet(
         return 0;
     }
     free(data_float);
+    rustsfm_vlfeat_add_timing(
+        timing != NULL ? &timing->scale_space_ms : NULL,
+        scale_space_start);
 
+    double detection_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     vl_covdet_detect(covdet, (vl_size)options->max_num_features);
+    rustsfm_vlfeat_add_timing(
+        timing != NULL ? &timing->detection_ms : NULL,
+        detection_start);
+    double orientation_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     if (options->estimate_affine_shape) {
         vl_covdet_extract_affine_shape(covdet);
     }
     if (!options->upright) {
         vl_covdet_extract_orientations(covdet);
     }
+    rustsfm_vlfeat_add_timing(
+        timing != NULL ? &timing->orientation_ms : NULL,
+        orientation_start);
 
     int num_features = (int)vl_covdet_get_num_features(covdet);
     VlCovDetFeature* features = vl_covdet_get_features(covdet);
@@ -493,6 +533,7 @@ static int extract_sift_covdet(
     }
     vl_sift_set_magnif(sift, 3.0);
 
+    double descriptor_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     for (size_t i = 0; i < kept; ++i) {
         for (int s = 0; s < dsp_num_scales; ++s) {
             const float dsp_scale = dsp_min_scale + (float)s * dsp_scale_step;
@@ -554,6 +595,9 @@ static int extract_sift_covdet(
         quantize_descriptor(desc, &descriptors[i * DESCRIPTOR_DIM], DESCRIPTOR_DIM);
         transform_vlfeat_to_ubc(&descriptors[i * DESCRIPTOR_DIM]);
     }
+    rustsfm_vlfeat_add_timing(
+        timing != NULL ? &timing->descriptor_ms : NULL,
+        descriptor_start);
 
     free(patch);
     free(patch_xy);
@@ -561,7 +605,11 @@ static int extract_sift_covdet(
     vl_sift_delete(sift);
     vl_covdet_delete(covdet);
 
+    double output_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     int ok = allocate_features_output(out, kept, keypoints, descriptors);
+    if (timing != NULL) {
+        rustsfm_vlfeat_add_timing(&timing->output_assembly_ms, output_start);
+    }
     free(keypoints);
     free(descriptors);
     return ok;
@@ -572,7 +620,8 @@ static int extract_sift_standard(
     int width,
     int height,
     const RustSfmVlfeatSiftOptions* options,
-    RustSfmVlfeatSiftFeatures* out) {
+    RustSfmVlfeatSiftFeatures* out,
+    RustSfmVlfeatSiftTiming* timing) {
     VlSiftFilt* sift = vl_sift_new(
         width,
         height,
@@ -588,6 +637,7 @@ static int extract_sift_standard(
     vl_sift_set_edge_thresh(sift, options->edge_threshold);
 
     size_t image_size = (size_t)width * (size_t)height;
+    double input_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     float* data_float = (float*)malloc(image_size * sizeof(float));
     if (data_float == NULL) {
         vl_sift_delete(sift);
@@ -597,6 +647,9 @@ static int extract_sift_standard(
     for (size_t i = 0; i < image_size; ++i) {
         data_float[i] = (float)gray_u8[i] / 255.0f;
     }
+    rustsfm_vlfeat_add_timing(
+        timing != NULL ? &timing->input_conversion_ms : NULL,
+        input_start);
 
     LevelData* levels = NULL;
     size_t* level_num_features = NULL;
@@ -604,16 +657,28 @@ static int extract_sift_standard(
     int first_octave = 1;
 
     while (1) {
+        double scale_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
+        int octave_error;
         if (first_octave) {
-            if (vl_sift_process_first_octave(sift, data_float)) {
-                break;
+            octave_error = vl_sift_process_first_octave(sift, data_float);
+            if (!octave_error) {
+                first_octave = 0;
             }
-            first_octave = 0;
-        } else if (vl_sift_process_next_octave(sift)) {
+        } else {
+            octave_error = vl_sift_process_next_octave(sift);
+        }
+        rustsfm_vlfeat_add_timing(
+            timing != NULL ? &timing->scale_space_ms : NULL,
+            scale_start);
+        if (octave_error) {
             break;
         }
 
+        double detection_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
         vl_sift_detect(sift);
+        rustsfm_vlfeat_add_timing(
+            timing != NULL ? &timing->detection_ms : NULL,
+            detection_start);
         const VlSiftKeypoint* vl_keypoints = vl_sift_get_keypoints(sift);
         const int num_keypoints = vl_sift_get_nkeypoints(sift);
         if (num_keypoints <= 0) {
@@ -660,6 +725,7 @@ static int extract_sift_standard(
 
             double angles[4];
             int num_orientations;
+            double orientation_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
             if (options->upright) {
                 num_orientations = 1;
                 angles[0] = 0.0;
@@ -667,6 +733,9 @@ static int extract_sift_standard(
                 num_orientations =
                     vl_sift_calc_keypoint_orientations(sift, angles, &vl_keypoints[i]);
             }
+            rustsfm_vlfeat_add_timing(
+                timing != NULL ? &timing->orientation_ms : NULL,
+                orientation_start);
 
             int num_used_orientations = num_orientations;
             if (num_used_orientations > options->max_num_orientations) {
@@ -696,6 +765,7 @@ static int extract_sift_standard(
                 kp->a21 = 0.0f;
                 kp->a22 = 0.0f;
 
+                double descriptor_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
                 vl_sift_calc_keypoint_descriptor(
                     sift, desc, &vl_keypoints[i], angles[o]);
                 if (options->normalization_l1_root) {
@@ -707,6 +777,9 @@ static int extract_sift_standard(
                 uint8_t* row = &level->descriptors[level_idx * DESCRIPTOR_DIM];
                 quantize_descriptor(desc, row, DESCRIPTOR_DIM);
                 transform_vlfeat_to_ubc(row);
+                rustsfm_vlfeat_add_timing(
+                    timing != NULL ? &timing->descriptor_ms : NULL,
+                    descriptor_start);
                 level_idx += 1;
             }
         }
@@ -716,6 +789,7 @@ static int extract_sift_standard(
         }
     }
 
+    double output_start = timing != NULL ? rustsfm_vlfeat_now_ms() : 0.0;
     free(data_float);
     vl_sift_delete(sift);
 
@@ -765,6 +839,9 @@ static int extract_sift_standard(
     levels_free(levels, num_levels);
     free(level_num_features);
     int ok = allocate_features_output(out, k, keypoints, descriptors);
+    if (timing != NULL) {
+        rustsfm_vlfeat_add_timing(&timing->output_assembly_ms, output_start);
+    }
     free(keypoints);
     free(descriptors);
     return ok;
@@ -775,11 +852,15 @@ int rustsfm_vlfeat_extract_sift(
     int width,
     int height,
     const RustSfmVlfeatSiftOptions* options,
-    RustSfmVlfeatSiftFeatures* out) {
+    RustSfmVlfeatSiftFeatures* out,
+    RustSfmVlfeatSiftTiming* timing) {
     if (out == NULL || gray_u8 == NULL || options == NULL) {
         return 0;
     }
     memset(out, 0, sizeof(*out));
+    if (timing != NULL) {
+        memset(timing, 0, sizeof(*timing));
+    }
 
     if (width <= 0 || height <= 0) {
         set_error(out, "invalid image dimensions");
@@ -792,7 +873,7 @@ int rustsfm_vlfeat_extract_sift(
 
     if (options->force_covariant_extractor || options->estimate_affine_shape ||
          options->domain_size_pooling) {
-        return extract_sift_covdet(gray_u8, width, height, options, out);
+        return extract_sift_covdet(gray_u8, width, height, options, out, timing);
     }
 
     if (options->max_num_orientations <= 0) {
@@ -800,7 +881,7 @@ int rustsfm_vlfeat_extract_sift(
         return 0;
     }
 
-    return extract_sift_standard(gray_u8, width, height, options, out);
+    return extract_sift_standard(gray_u8, width, height, options, out, timing);
 }
 
 void rustsfm_vlfeat_free_features(RustSfmVlfeatSiftFeatures* features) {

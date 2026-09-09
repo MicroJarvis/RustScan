@@ -1170,16 +1170,15 @@ uses **wgpu** (Vulkan/Metal/DX12) instead.
       the damped reduced system being symmetric positive definite.
     - Added `ceres-ba` feature (`ceres-solver` 0.5 with bundled source build),
       **enabled by default**. The `ba/` module splits types/dispatch (`mod.rs`),
-      shared observation/gauge helpers (`shared.rs`), the hand-rolled native LM
-      reference backend (`native.rs`), and the Ceres backend (`ceres.rs`).
-      `refine_bundle_adjustment` always uses Ceres with **no fallback** to
-      native. Unsupported configs return `None`. Native BA remains for
-      `--no-default-features` builds and native-specific unit tests.
+      shared observation/gauge helpers (`shared.rs`), Ceres parameterization and
+      Jacobian support (`ceres_support.rs`), and the Ceres backend (`ceres.rs`).
+      `refine_bundle_adjustment` uses Ceres with no alternate BA backend;
+      disabling `ceres-ba` leaves BA unavailable.
     - Ceres backend (`ceres_problem.rs`) now builds full problems with
       image/frame/sensor pose blocks, intrinsics refinement, fixed poses, and
       gauge policies (`THREE_POINTS`, `TWO_CAMS_FROM_WORLD`). Ceres cost
-      callbacks reuse native analytic projection/frame/sensor/camera
-      Jacobians with numeric fallback.
+      callbacks reuse shared analytic projection/frame/sensor/camera Jacobians
+      with numeric fallback.
     - Ceres image-pose cost callbacks now evaluate COLMAP's raw Eigen
       quaternion rotation formula and fill exact 2x7 ambient Jacobians for
       ordinary image pose blocks, matching
@@ -1216,19 +1215,10 @@ uses **wgpu** (Vulkan/Metal/DX12) instead.
     - Remaining work: exact Ceres/Eigen sparse backend behavior, broader
       COLMAP prior-position numerical comparisons, and large-reconstruction
       solver-summary parity.
-    - **Update 2026-06-21 (LM damping):** native LM now mirrors Ceres'
-      `LevenbergMarquardtStrategy`: diagonal damping uses
-      `diag(JᵀJ) / trust_region_radius` with diagonal clamped to
-      `[1e-6, 1e32]`, accepted steps grow the radius via
-      `radius / max(1/3, 1 - (2ρ - 1)³)`, and rejected/invalid steps shrink it
-      with doubling `decrease_factor` recovery. `bundle_adjustment_refines_sensor_from_rig_when_not_constant`
-      and the full lib suite (370 tests) stay green.
-    - **Update 2026-06-21 (sparse Schur):** native BA now accumulates reduced
-      camera Schur complements in CSC lower-triangle storage with simplicial
-      Cholesky when pose entities exceed the Ceres `DENSE_SCHUR` threshold (50);
-      smaller problems keep the dense path. `sparse_cholesky.rs` adds
-      `SymmetricSparseMatrix` + `SimplicialSparseCholesky` with dense Cholesky/LU
-      fallback (373 lib tests).
+    - **Update 2026-06-21 (historical):** the former Native LM backend mirrored
+      Ceres trust-region damping and sparse Schur behavior. That solver was
+      removed after Ceres became the sole BA backend. The retained sparse Schur
+      accumulator is used for post-BA covariance construction.
 20. Match COLMAP local BA image selection, gauge fixing, robust losses,
     constant camera/rig controls, and short-track point selection.
     - Added a first COLMAP-style local BA pass after each successful
@@ -1316,8 +1306,8 @@ uses **wgpu** (Vulkan/Metal/DX12) instead.
       large-reconstruction global BA can ignore those points in the main solve
       and then re-optimize only the redundant points while fixing all poses,
       camera intrinsics, rig poses, and non-reference sensor-from-rig poses.
-      Native BA now supports this point-only refinement path for
-      no-default-features builds.
+      Ceres supports this point-only refinement path; builds without
+      `ceres-ba` do not provide bundle adjustment.
     - Mapper-level database pose priors now feed local/global BA option
       construction for registered variable poses and are filtered out of
       point-only redundant BA passes.

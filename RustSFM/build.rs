@@ -33,10 +33,8 @@ fn build_vlfeat_sift() {
 
     println!("cargo:rerun-if-changed=src/native/vlfeat_sift.c");
     println!("cargo:rerun-if-changed=src/native/vlfeat_sift.h");
-    println!(
-        "cargo:rerun-if-changed={}",
-        vlfeat_root.join("sift.c").display()
-    );
+    // Track all sources, headers and recursive templates, including external roots.
+    println!("cargo:rerun-if-changed={}", vlfeat_root.display());
 
     let mut build = cc::Build::new();
     build

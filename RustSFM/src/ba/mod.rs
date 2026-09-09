@@ -4,16 +4,23 @@ use std::fmt;
 use std::str::FromStr;
 
 mod covariance;
-mod native;
 mod pose_prior;
-mod shared;
+mod taskflow;
+pub use taskflow::{BaSchedulingReport, CeresBaTaskflow};
 
 #[cfg(feature = "ceres-ba")]
 mod ceres;
 #[cfg(feature = "ceres-ba")]
 mod ceres_problem;
+#[cfg(all(test, feature = "ceres-ba"))]
+pub(crate) use ceres::tests::rig_sensor_ba_fixture;
+#[cfg(feature = "ceres-ba")]
+mod ceres_support;
+#[cfg(feature = "ceres-ba")]
+mod shared;
 
 pub use covariance::{compute_pose_covariances, BundleAdjustmentCovariance, CovariancePoseBlock};
+#[cfg(feature = "ceres-ba")]
 pub(crate) use pose_prior::POSE_PRIOR_JACOBIAN_EPS;
 pub use pose_prior::{
     camera_center_pose_jacobian, camera_center_world, position_prior_information_matrix,
@@ -196,6 +203,8 @@ pub struct BundleAdjustmentOptions {
     pub parameter_tolerance: f64,
     pub max_linear_solver_iterations: usize,
     pub num_threads: isize,
+    /// Optional shared admission controller; None preserves direct Ceres execution.
+    pub taskflow: Option<CeresBaTaskflow>,
     pub min_num_residuals_for_multi_threading: usize,
     pub max_num_consecutive_invalid_steps: usize,
     pub max_consecutive_nonmonotonic_steps: usize,
@@ -230,6 +239,7 @@ impl Default for BundleAdjustmentOptions {
             parameter_tolerance: 0.0,
             max_linear_solver_iterations: 200,
             num_threads: -1,
+            taskflow: None,
             min_num_residuals_for_multi_threading: 50_000,
             max_num_consecutive_invalid_steps: 10,
             max_consecutive_nonmonotonic_steps: 10,
@@ -309,6 +319,9 @@ pub enum BundleAdjustmentTerminationReason {
 
 #[derive(Debug, Clone)]
 pub struct BundleAdjustmentReport {
+    /// Thread limit passed to Ceres, not a measurement of active OS threads.
+    pub solver_num_threads: usize,
+    pub scheduling: Option<BaSchedulingReport>,
     pub iterations: usize,
     pub attempted_iterations: usize,
     pub successful_steps: usize,
@@ -346,7 +359,7 @@ impl BundleAdjustmentReport {
 
     pub fn brief_report(&self) -> String {
         format!(
-            "termination={:?} reason={:?} solver={:?} sparse_backend={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} elapsed_ms={:.2}",
+            "termination={:?} reason={:?} solver={:?} sparse_backend={:?} residuals={} parameters={} iterations={}/{} linear_iterations={} cost={:.6}->{:.6} step_quality={:.6} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} elapsed_ms={:.2} solver_threads={} scheduling={:?}",
             self.termination_type,
             self.termination_reason,
             self.linear_solver,
@@ -362,7 +375,9 @@ impl BundleAdjustmentReport {
             self.setup_ms,
             self.solve_ms,
             self.postprocess_ms,
-            self.elapsed_ms
+            self.elapsed_ms,
+            self.solver_num_threads,
+            self.scheduling
         )
     }
 }
@@ -372,16 +387,51 @@ pub fn refine_bundle_adjustment(
     reconstruction: &mut Reconstruction,
     options: BundleAdjustmentOptions,
 ) -> Option<BundleAdjustmentReport> {
-    if !options.loss_function.has_colmap_valid_scale() {
-        return None;
-    }
+    try_refine_bundle_adjustment(frames, reconstruction, options).unwrap_or_else(|error| {
+        log::error!("BA admission/execution failed: {error:#}");
+        None
+    })
+}
 
+/// Like `refine_bundle_adjustment`, but preserves admission and cooperative-stop
+/// errors instead of mapping them to the legacy Option return type.
+pub fn try_refine_bundle_adjustment(
+    frames: &[ImageFrame],
+    reconstruction: &mut Reconstruction,
+    mut options: BundleAdjustmentOptions,
+) -> anyhow::Result<Option<BundleAdjustmentReport>> {
+    if !options.loss_function.has_colmap_valid_scale() {
+        return Ok(None);
+    }
+    if let Some(executor) = options.taskflow.take() {
+        return executor.refine(frames, reconstruction, options);
+    }
     #[cfg(feature = "ceres-ba")]
     {
-        return ceres::refine_bundle_adjustment_ceres(frames, reconstruction, options);
+        if let Some(control) = crate::execution::active_control() {
+            control.checkpoint()?;
+            let result = ceres_problem::solve_bundle_adjustment_ceres(
+                frames,
+                reconstruction,
+                options,
+                Some(&control),
+            );
+            if result.is_none() {
+                control.checkpoint()?;
+            }
+            return Ok(result);
+        }
+        Ok(ceres::refine_bundle_adjustment_ceres(
+            frames,
+            reconstruction,
+            options,
+        ))
     }
     #[cfg(not(feature = "ceres-ba"))]
-    native::refine_bundle_adjustment_native(frames, reconstruction, options)
+    {
+        let _ = (frames, reconstruction, options);
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

@@ -100,6 +100,7 @@ impl WgpuContext {
     }
 
     pub(crate) fn queue(&self) -> &wgpu::Queue {
+        crate::execution::register_gpu_device(self as *const Self as usize, &self.device);
         &self.queue
     }
 
@@ -148,7 +149,7 @@ impl WgpuContext {
                 label: Some("rustsfm wgpu readback encoder"),
             });
         encoder.copy_buffer_to_buffer(source, 0, &staging, 0, byte_len);
-        let submission = self.queue.submit(Some(encoder.finish()));
+        let submission = self.queue().submit(Some(encoder.finish()));
         let copy_submit_seconds = copy_submit_started.elapsed().as_secs_f64();
 
         let slice = staging.slice(..);

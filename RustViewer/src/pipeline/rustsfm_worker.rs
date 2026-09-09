@@ -85,8 +85,8 @@ impl SfmWorker for RustSfmWorker {
         };
         let mapper_config = mapper_config_for(&request);
 
-        let sfm_control = rustsfm::SfmTaskControl::new();
-        let mut task_sink = progress_sink(&control, &events, &sfm_control);
+        let sfm_control = control.sfm_control();
+        let mut task_sink = progress_sink(&events);
         let mut task = rustsfm::SfmTaskContext::new(&sfm_control, &mut task_sink);
         let selection = resolve_keyframe_selection_with(
             request.manifest.sfm_config.keyframe_selection,
@@ -103,7 +103,8 @@ impl SfmWorker for RustSfmWorker {
                 drop(task);
                 drop(task_sink);
                 let _ = fs::remove_dir_all(&output);
-                return worker_failure(ProjectStage::KeyframeSfm, error);
+                return requested_stop(&control)
+                    .unwrap_or_else(|| worker_failure(ProjectStage::KeyframeSfm, error));
             }
         };
         if let Some(outcome) = requested_stop(&control) {
@@ -189,8 +190,8 @@ impl PnpWorker for RustSfmWorker {
             }
         };
 
-        let sfm_control = rustsfm::SfmTaskControl::new();
-        let mut task_sink = progress_sink(&control, &events, &sfm_control);
+        let sfm_control = control.sfm_control();
+        let mut task_sink = progress_sink(&events);
         let mut task = rustsfm::SfmTaskContext::new(&sfm_control, &mut task_sink);
         let result = run_remaining_registration_with(
             &sequence.frames,
@@ -587,17 +588,8 @@ fn worker_output_directory(request: &StageRequest) -> Result<PathBuf, RustSfmWor
     Ok(output)
 }
 
-fn progress_sink<'a>(
-    control: &'a WorkerControl,
-    events: &'a WorkerEventSink,
-    sfm_control: &'a rustsfm::SfmTaskControl,
-) -> impl FnMut(rustsfm::SfmTaskEvent) + 'a {
+fn progress_sink(events: &WorkerEventSink) -> impl FnMut(rustsfm::SfmTaskEvent) + '_ {
     move |event| {
-        if control.cancel_requested() {
-            sfm_control.request_cancel();
-        } else if control.pause_requested() {
-            sfm_control.request_pause();
-        }
         events.progress(
             event.completed.map(|value| value as u64),
             event.total.map(|value| value as u64),
@@ -1281,11 +1273,9 @@ mod tests {
 
     #[test]
     fn match_pair_batch_progress_uses_user_facing_label() {
-        let control = crate::pipeline::WorkerControl::new();
-        let sfm_control = rustsfm::SfmTaskControl::new();
         let (sender, receiver) = crossbeam_channel::bounded(1);
         let events = crate::pipeline::WorkerEventSink::new(ProjectStage::KeyframeSfm, 3, sender);
-        let mut sink = super::progress_sink(&control, &events, &sfm_control);
+        let mut sink = super::progress_sink(&events);
 
         sink(rustsfm::SfmTaskEvent {
             sequence: 11,

@@ -2,7 +2,7 @@
 //!
 //! COLMAP's production implementation wraps CHOLMOD supernodal LLT and falls
 //! back to Eigen's simplicial LDLT. RustSFM adds a CSC lower-triangle storage
-//! path with simplicial Cholesky for native BA Schur complements above the
+//! path with simplicial Cholesky for BA covariance Schur complements above the
 //! COLMAP/Ceres dense threshold (50 pose entities). Small systems and the LAD
 //! path still use the dense `nalgebra` backend.
 
@@ -110,85 +110,6 @@ impl SparseCholeskyWithFallbackSolver {
 
 /// COLMAP/Ceres `DENSE_SCHUR` vs `SPARSE_SCHUR` threshold on pose entities.
 pub const DENSE_SCHUR_MAX_POSE_ENTITIES: usize = 50;
-/// COLMAP/Ceres `SPARSE_SCHUR` vs `ITERATIVE_SCHUR` threshold on pose entities.
-pub const SPARSE_SCHUR_MAX_POSE_ENTITIES: usize = 1000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchurParameterBlock {
-    pub offset: usize,
-    pub dim: usize,
-}
-
-pub fn solve_symmetric_pcg<F, P>(
-    n: usize,
-    mat_vec: F,
-    precondition: P,
-    rhs: &DVector<f64>,
-    max_iterations: usize,
-    tolerance: f64,
-) -> Option<DVector<f64>>
-where
-    F: Fn(&DVector<f64>) -> DVector<f64>,
-    P: Fn(&DVector<f64>) -> DVector<f64>,
-{
-    if rhs.len() != n || max_iterations == 0 {
-        return None;
-    }
-    let mut x = DVector::<f64>::zeros(n);
-    let mut r = rhs - mat_vec(&x);
-    let mut z = precondition(&r);
-    let mut p = z.clone();
-    let mut rz_old = r.dot(&z);
-    if !rz_old.is_finite() || rz_old <= 0.0 {
-        return None;
-    }
-    let rhs_norm = rhs.norm().max(1.0);
-    for _ in 0..max_iterations {
-        if r.norm() / rhs_norm <= tolerance {
-            break;
-        }
-        let ap = mat_vec(&p);
-        let alpha = rz_old / p.dot(&ap).max(1.0e-24);
-        if !alpha.is_finite() {
-            return None;
-        }
-        x += alpha * &p;
-        r -= alpha * &ap;
-        z = precondition(&r);
-        let rz_new = r.dot(&z);
-        if !rz_new.is_finite() {
-            return None;
-        }
-        p = z + (rz_new / rz_old) * &p;
-        rz_old = rz_new;
-    }
-    x.iter().all(|value| value.is_finite()).then_some(x)
-}
-
-pub fn schur_jacobi_preconditioner<'a>(
-    blocks: &'a [SchurParameterBlock],
-    get: impl Fn(usize, usize) -> f64 + 'a,
-    dim: usize,
-) -> impl Fn(&DVector<f64>) -> DVector<f64> + 'a {
-    move |residual: &DVector<f64>| {
-        let mut out = DVector::<f64>::zeros(dim);
-        for block in blocks {
-            let mut sub = DMatrix::<f64>::zeros(block.dim, block.dim);
-            for row in 0..block.dim {
-                for col in 0..block.dim {
-                    sub[(row, col)] = get(block.offset + row, block.offset + col);
-                }
-            }
-            let rhs = residual.rows(block.offset, block.dim);
-            let delta = sub
-                .try_inverse()
-                .and_then(|inv| Some(inv * rhs))
-                .unwrap_or_else(|| rhs.into_owned());
-            out.rows_mut(block.offset, block.dim).copy_from(&delta);
-        }
-        out
-    }
-}
 
 /// Lower-triangle accumulator for symmetric sparse systems (Schur complements).
 #[derive(Debug, Clone)]
@@ -514,20 +435,6 @@ mod tests {
         let mut x = DVector::<f64>::zeros(3);
         assert!(solver.solve(&b, &mut x));
         assert!((x - DVector::from_row_slice(&[2.0, 3.0, 5.0])).norm() <= 1.0e-10);
-    }
-
-    #[test]
-    fn solve_symmetric_pcg_matches_direct_solver_on_spd_chain() {
-        let n = 32;
-        let a_dense = chain_laplacian_gauge_fixed(n);
-        let b = DVector::from_iterator(n, (1..=n).map(|value| value as f64));
-        let direct = a_dense.clone().cholesky().unwrap().solve(&b);
-        let mat_vec = |vector: &DVector<f64>| &a_dense * vector;
-        let blocks = vec![SchurParameterBlock { offset: 0, dim: n }];
-        let precondition = schur_jacobi_preconditioner(&blocks, |row, col| a_dense[(row, col)], n);
-        let pcg =
-            solve_symmetric_pcg(n, mat_vec, precondition, &b, 200, 1.0e-8).expect("pcg solve");
-        assert!((pcg - direct).norm() <= 1.0e-6);
     }
 
     #[test]

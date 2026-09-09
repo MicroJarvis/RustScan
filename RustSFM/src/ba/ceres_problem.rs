@@ -1,4 +1,4 @@
-use super::native::{
+use super::ceres_support::{
     analytic_frame_pose_jacobian, analytic_img_from_cam_jacobian, analytic_sensor_pose_jacobian,
     apply_two_cams_from_world_gauge, camera_by_index, camera_param_jacobian, camera_param_specs,
     count_variable_residuals, frame_sensor_from_rig, frame_sensor_key_for_image,
@@ -89,6 +89,7 @@ pub fn solve_bundle_adjustment_ceres(
     frames: &[ImageFrame],
     reconstruction: &mut Reconstruction,
     options: BundleAdjustmentOptions,
+    control: Option<&crate::task::SfmTaskControl>,
 ) -> Option<BundleAdjustmentReport> {
     let ba_started = Instant::now();
     let setup_started = Instant::now();
@@ -377,8 +378,16 @@ pub fn solve_bundle_adjustment_ceres(
     let (solver_options, solver_policy, sparse_backend) =
         ceres_solver_options(&options, pose_entity_registry.len(), bindings * 2)?;
     let setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
+    if let Some(control) = control {
+        control.checkpoint().ok()?;
+    }
     let solve_started = Instant::now();
     let solution = problem.solve(&solver_options).ok()?;
+    // Ceres optimizes separate parameter storage. A stop requested during Solve
+    // can therefore discard it before mutating the caller's reconstruction.
+    if let Some(control) = control {
+        control.checkpoint().ok()?;
+    }
     let solve_ms = solve_started.elapsed().as_secs_f64() * 1000.0;
     let postprocess_started = Instant::now();
 
@@ -401,7 +410,7 @@ pub fn solve_bundle_adjustment_ceres(
     let covariance = options
         .compute_covariance
         .then(|| {
-            super::native::compute_bundle_adjustment_covariance(
+            super::ceres_support::compute_bundle_adjustment_covariance(
                 reconstruction,
                 &observations,
                 &pose_blocks,
@@ -424,7 +433,27 @@ pub fn solve_bundle_adjustment_ceres(
     let effective_parameters_reduced = summary.num_effective_parameters_reduced().max(0) as usize;
     let postprocess_ms = postprocess_started.elapsed().as_secs_f64() * 1000.0;
     let elapsed_ms = ba_started.elapsed().as_secs_f64() * 1000.0;
+    // Emit after the existing timer boundaries; diagnostic formatting and I/O
+    // must not be attributed to native solve or postprocessing.
+    if std::env::var("RUSTSFM_PROFILE_CERES").is_ok_and(|value| value == "1") {
+        eprintln!(
+            "RUSTSFM_CERES_PROFILE {}",
+            serde_json::json!({
+                "observations": observations.len(),
+                "residuals": residuals_reduced,
+                "effective_parameters": effective_parameters_reduced,
+                "initial_cost": summary.initial_cost(),
+                "final_cost": summary.final_cost(),
+                "solve_wrapper_ms": solve_ms,
+                "ba_elapsed_ms": elapsed_ms,
+                "message": summary.message(),
+                "full_report": summary.full_report(),
+            })
+        );
+    }
     Some(BundleAdjustmentReport {
+        solver_num_threads: ceres_num_threads(&options, bindings * 2) as usize,
+        scheduling: None,
         iterations: successful_steps,
         attempted_iterations: successful_steps + unsuccessful_steps,
         successful_steps,
@@ -533,8 +562,8 @@ fn param_ref(
 fn build_pose_eval(
     reconstruction: &Reconstruction,
     image: usize,
-    pose_blocks: &super::native::PoseBlockSet,
-    sensor_lookup: &HashMap<SensorPoseKey, &super::native::SensorPoseSpec>,
+    pose_blocks: &super::ceres_support::PoseBlockSet,
+    sensor_lookup: &HashMap<SensorPoseKey, &super::ceres_support::SensorPoseSpec>,
     pose_entity_registry: &HashMap<PoseEntityKey, usize>,
 ) -> Option<PoseEval> {
     let Some(block_idx) = pose_blocks.image_to_block.get(image).copied().flatten() else {
@@ -619,7 +648,8 @@ fn append_camera_parameters(
     param_indices: &mut Vec<usize>,
     param_roles: &mut Vec<ParamRole>,
 ) {
-    let Some(camera_idx) = super::native::camera_index_for_image(reconstruction, image) else {
+    let Some(camera_idx) = super::ceres_support::camera_index_for_image(reconstruction, image)
+    else {
         return;
     };
     for spec in camera_param_specs {
@@ -1462,12 +1492,12 @@ fn write_back_solution(
     internal_to_storage: &HashMap<usize, usize>,
     pose_entity_registry: &HashMap<PoseEntityKey, usize>,
     frame_images: &HashMap<usize, Vec<usize>>,
-    sensor_pose_specs: &[super::native::SensorPoseSpec],
+    sensor_pose_specs: &[super::ceres_support::SensorPoseSpec],
     camera_param_registry: &HashMap<(usize, usize), usize>,
     camera_param_specs: &[CameraParamSpec],
     point_registry: &HashMap<usize, usize>,
     constant_point_filter: &HashSet<usize>,
-    pose_blocks: &super::native::PoseBlockSet,
+    pose_blocks: &super::ceres_support::PoseBlockSet,
 ) {
     let mut changed_sensors = Vec::new();
 
@@ -1648,14 +1678,6 @@ struct CeresSolverPolicy {
     preconditioner: Option<PreconditionerType>,
 }
 
-fn ceres_solver_policy(num_pose_entities: usize, has_sparse_backend: bool) -> CeresSolverPolicy {
-    ceres_solver_policy_for_preference(
-        BundleAdjustmentLinearSolverPreference::Auto,
-        num_pose_entities,
-        has_sparse_backend,
-    )
-}
-
 fn ceres_solver_policy_for_preference(
     preference: BundleAdjustmentLinearSolverPreference,
     num_pose_entities: usize,
@@ -1759,6 +1781,18 @@ fn ceres_has_sparse_backend() -> bool {
 }
 
 fn ceres_num_threads(options: &BundleAdjustmentOptions, num_residuals: usize) -> i32 {
+    if let Some(granted) = crate::execution::active_threads() {
+        let requested = if options.num_threads > 0 {
+            options.num_threads as usize
+        } else {
+            granted
+        };
+        return if num_residuals < options.min_num_residuals_for_multi_threading {
+            1
+        } else {
+            granted.min(requested).min(i32::MAX as usize) as i32
+        };
+    }
     if num_residuals < options.min_num_residuals_for_multi_threading {
         1
     } else if options.num_threads <= 0 {
@@ -2038,6 +2072,7 @@ mod tests {
                 allow_single_observation_points: true,
                 ..BundleAdjustmentOptions::default()
             },
+            None,
         )
         .expect("ba should succeed");
         assert!(report.gradient_max_norm.is_finite());
@@ -2111,6 +2146,7 @@ mod tests {
                 loss_function: BundleAdjustmentLoss::Trivial,
                 ..BundleAdjustmentOptions::default()
             },
+            None,
         )
         .expect("trivial loss should be explicit and Ceres-compatible");
 
@@ -2215,35 +2251,31 @@ mod tests {
     }
 
     #[test]
-    fn ceres_solver_policy_matches_colmap_solver_type_thresholds() {
-        let policy = ceres_solver_policy(50, true);
-        assert!(policy.linear_solver == LinearSolverType::DENSE_SCHUR);
-        assert!(policy.preconditioner.is_none());
-
-        let policy = ceres_solver_policy(51, true);
-        assert!(policy.linear_solver == LinearSolverType::SPARSE_SCHUR);
-        assert!(policy.preconditioner.is_none());
-
-        let policy = ceres_solver_policy(1000, true);
-        assert!(policy.linear_solver == LinearSolverType::SPARSE_SCHUR);
-        assert!(policy.preconditioner.is_none());
-
-        let policy = ceres_solver_policy(1001, true);
-        assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
-        assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
-
+    fn ceres_auto_solver_policy_covers_thresholds_and_sparse_availability() {
+        for (poses, sparse, expected) in [
+            (50, true, LinearSolverType::DENSE_SCHUR),
+            (51, true, LinearSolverType::SPARSE_SCHUR),
+            (1000, true, LinearSolverType::SPARSE_SCHUR),
+            (1001, true, LinearSolverType::ITERATIVE_SCHUR),
+            (51, false, LinearSolverType::ITERATIVE_SCHUR),
+            (1000, false, LinearSolverType::ITERATIVE_SCHUR),
+        ] {
+            let policy = ceres_solver_policy_for_preference(
+                BundleAdjustmentLinearSolverPreference::Auto,
+                poses,
+                sparse,
+            );
+            assert!(
+                policy.linear_solver == expected,
+                "poses={poses} sparse={sparse}"
+            );
+            assert!(
+                policy.preconditioner
+                    == (expected == LinearSolverType::ITERATIVE_SCHUR)
+                        .then_some(PreconditionerType::SCHUR_JACOBI)
+            );
+        }
         assert!(ceres_solver_options(&BundleAdjustmentOptions::default(), 1001, 2).is_some());
-    }
-
-    #[test]
-    fn ceres_solver_policy_matches_colmap_sparse_backend_gate() {
-        let policy = ceres_solver_policy(51, false);
-        assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
-        assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
-
-        let policy = ceres_solver_policy(1000, false);
-        assert!(policy.linear_solver == LinearSolverType::ITERATIVE_SCHUR);
-        assert!(policy.preconditioner == Some(PreconditionerType::SCHUR_JACOBI));
     }
 
     #[test]

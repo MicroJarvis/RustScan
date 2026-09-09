@@ -39,6 +39,15 @@ typedef struct RustSfmVlfeatSiftKeypoint {
     float a22;
 } RustSfmVlfeatSiftKeypoint;
 
+typedef struct RustSfmVlfeatSiftTiming {
+    double input_conversion_ms;
+    double scale_space_ms;
+    double detection_ms;
+    double orientation_ms;
+    double descriptor_ms;
+    double output_assembly_ms;
+} RustSfmVlfeatSiftTiming;
+
 typedef struct RustSfmVlfeatSiftFeatures {
     RustSfmVlfeatSiftKeypoint* keypoints;
     float* descriptors;
@@ -51,7 +60,8 @@ int rustsfm_vlfeat_extract_sift(
     int width,
     int height,
     const RustSfmVlfeatSiftOptions* options,
-    RustSfmVlfeatSiftFeatures* out);
+    RustSfmVlfeatSiftFeatures* out,
+    RustSfmVlfeatSiftTiming* timing);
 
 void rustsfm_vlfeat_free_features(RustSfmVlfeatSiftFeatures* features);
 

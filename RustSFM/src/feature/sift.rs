@@ -6,10 +6,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::database::ColmapKeypoint;
-use crate::sift_index::SiftDescriptorIndex;
+use crate::sift_index::{colmap_uint8_l2_distance2, SiftDescriptorIndex};
 #[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
 use lowe_sift::{BbfConfig, Feature, GrayImage, Sift, SiftConfig};
 use rayon::prelude::*;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Default)]
 pub struct SiftFeatures {
@@ -194,6 +195,29 @@ pub fn extract_sift_from_grayscale_u8(
     height: u32,
     options: &SiftExtractionOptions,
 ) -> Result<SiftFeatures> {
+    extract_sift_from_grayscale_u8_impl(gray, width, height, options, None)
+        .map(|(features, _)| features)
+}
+
+pub(crate) fn extract_sift_from_grayscale_u8_with_timing(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+    options: &SiftExtractionOptions,
+) -> Result<(SiftFeatures, SiftExtractionTiming)> {
+    let mut timing = SiftExtractionTiming::default();
+    let features =
+        extract_sift_from_grayscale_u8_impl(gray, width, height, options, Some(&mut timing))?;
+    Ok((features.0, timing))
+}
+
+fn extract_sift_from_grayscale_u8_impl(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+    options: &SiftExtractionOptions,
+    mut timing: Option<&mut SiftExtractionTiming>,
+) -> Result<(SiftFeatures, SiftExtractionTiming)> {
     options.check()?;
     let expected = width as usize * height as usize;
     if gray.len() != expected {
@@ -204,15 +228,46 @@ pub fn extract_sift_from_grayscale_u8(
             height
         );
     }
+    let prepare_start = timing.as_ref().map(|_| Instant::now());
     let (gray, width, height) =
         prepare_grayscale_for_extraction(gray, width, height, options.max_image_size)?;
+    if let (Some(timing), Some(start)) = (timing.as_mut(), prepare_start) {
+        timing.preparation_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
     #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
     {
-        return extract_sift_features_vlfeat(&gray, width, height, options);
+        let backend_start = timing.as_ref().map(|_| Instant::now());
+        let features =
+            extract_sift_features_vlfeat(&gray, width, height, options, timing.as_deref_mut())?;
+        if let (Some(timing), Some(start)) = (timing.as_mut(), backend_start) {
+            timing.backend_kernel_ms =
+                (start.elapsed().as_secs_f64() * 1000.0 - timing.result_conversion_ms).max(0.0);
+        }
+        return Ok((
+            features,
+            timing.map(|timing| timing.clone()).unwrap_or_default(),
+        ));
     }
     #[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
     {
-        extract_sift_features_lowe_from_gray(&gray, width, height, options)
+        let backend_start = timing.as_ref().map(|_| Instant::now());
+        let features = extract_sift_features_lowe_from_gray(
+            &gray,
+            width,
+            height,
+            options,
+            timing.as_deref_mut(),
+        )?;
+        if let (Some(timing), Some(start)) = (timing.as_mut(), backend_start) {
+            timing.backend_kernel_ms = (start.elapsed().as_secs_f64() * 1000.0
+                - timing.result_conversion_ms
+                - timing.input_conversion_ms)
+                .max(0.0);
+        }
+        Ok((
+            features,
+            timing.map(|timing| timing.clone()).unwrap_or_default(),
+        ))
     }
 }
 
@@ -222,10 +277,20 @@ fn extract_sift_features_lowe_from_gray(
     width: u32,
     height: u32,
     options: &SiftExtractionOptions,
+    mut timing: Option<&mut SiftExtractionTiming>,
 ) -> Result<SiftFeatures> {
+    let input_start = timing.as_ref().map(|_| Instant::now());
     let gray_f32 = gray.iter().map(|&pixel| f32::from(pixel) / 255.0).collect();
     let gray_image = GrayImage::new(width as usize, height as usize, gray_f32)?;
+    if let (Some(timing), Some(start)) = (timing.as_mut(), input_start) {
+        timing.input_conversion_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
+    let kernel_start = timing.as_ref().map(|_| Instant::now());
     let mut features = Sift::new(options.to_lowe_config())?.detect_and_compute(&gray_image);
+    if let (Some(timing), Some(start)) = (timing.as_mut(), kernel_start) {
+        timing.backend_kernel_ms += start.elapsed().as_secs_f64() * 1000.0;
+    }
+    let result_start = timing.as_ref().map(|_| Instant::now());
     features.sort_by(|a, b| {
         feature_scale(b)
             .partial_cmp(&feature_scale(a))
@@ -238,7 +303,11 @@ fn extract_sift_features_lowe_from_gray(
             })
     });
     features.truncate(options.max_num_features.min(features.len()));
-    Ok(features_from_lowe(features, options))
+    let result = features_from_lowe(features, options);
+    if let (Some(timing), Some(start)) = (timing.as_mut(), result_start) {
+        timing.result_conversion_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
+    Ok(result)
 }
 
 #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
@@ -247,6 +316,7 @@ fn extract_sift_features_vlfeat(
     width: u32,
     height: u32,
     options: &SiftExtractionOptions,
+    mut timing: Option<&mut SiftExtractionTiming>,
 ) -> Result<SiftFeatures> {
     use std::ffi::CStr;
 
@@ -278,6 +348,12 @@ fn extract_sift_features_vlfeat(
         error_message: std::ptr::null_mut(),
     };
 
+    let mut backend_timing = RustSfmVlfeatSiftTiming::default();
+    let backend_timing_ptr = if timing.is_some() {
+        &mut backend_timing
+    } else {
+        std::ptr::null_mut()
+    };
     let ok = unsafe {
         rustsfm_vlfeat_extract_sift(
             gray_u8.as_ptr(),
@@ -285,6 +361,7 @@ fn extract_sift_features_vlfeat(
             height as i32,
             &c_options,
             &mut out,
+            backend_timing_ptr,
         )
     };
     if ok == 0 {
@@ -303,7 +380,20 @@ fn extract_sift_features_vlfeat(
         bail!(message);
     }
 
+    if let Some(timing) = timing.as_mut() {
+        timing.backend_input_conversion_ms = backend_timing.input_conversion_ms;
+        timing.backend_scale_space_ms = backend_timing.scale_space_ms;
+        timing.backend_detection_ms = backend_timing.detection_ms;
+        timing.backend_orientation_ms = backend_timing.orientation_ms;
+        timing.backend_descriptor_ms = backend_timing.descriptor_ms;
+        timing.backend_output_assembly_ms = backend_timing.output_assembly_ms;
+    }
+
+    let features_start = timing.as_ref().map(|_| Instant::now());
     let features = features_from_vlfeat(&out, options);
+    if let (Some(timing), Some(start)) = (timing.as_mut(), features_start) {
+        timing.result_conversion_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
     unsafe {
         rustsfm_vlfeat_free_features(&mut out);
     }
@@ -369,7 +459,7 @@ fn features_from_vlfeat(
 
 #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
 mod vlfeat_ffi {
-    use std::os::raw::{c_char, c_float, c_int};
+    use std::os::raw::{c_char, c_double, c_float, c_int};
 
     #[repr(C)]
     pub struct RustSfmVlfeatSiftOptions {
@@ -405,6 +495,17 @@ mod vlfeat_ffi {
     }
 
     #[repr(C)]
+    #[derive(Default)]
+    pub struct RustSfmVlfeatSiftTiming {
+        pub input_conversion_ms: c_double,
+        pub scale_space_ms: c_double,
+        pub detection_ms: c_double,
+        pub orientation_ms: c_double,
+        pub descriptor_ms: c_double,
+        pub output_assembly_ms: c_double,
+    }
+
+    #[repr(C)]
     pub struct RustSfmVlfeatSiftFeatures {
         pub keypoints: *mut RustSfmVlfeatSiftKeypoint,
         pub descriptors: *mut c_float,
@@ -419,6 +520,7 @@ mod vlfeat_ffi {
             height: c_int,
             options: *const RustSfmVlfeatSiftOptions,
             out: *mut RustSfmVlfeatSiftFeatures,
+            timing: *mut RustSfmVlfeatSiftTiming,
         ) -> c_int;
 
         pub fn rustsfm_vlfeat_free_features(out: *mut RustSfmVlfeatSiftFeatures);
@@ -433,7 +535,7 @@ mod vlfeat_ffi {
 #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
 use vlfeat_ffi::{
     rustsfm_vlfeat_extract_sift, rustsfm_vlfeat_free_features, RustSfmVlfeatSiftFeatures,
-    RustSfmVlfeatSiftOptions,
+    RustSfmVlfeatSiftOptions, RustSfmVlfeatSiftTiming,
 };
 
 const COLMAP_SIFT_DESCRIPTOR_NORM: f32 = 512.0 * 512.0;
@@ -463,19 +565,6 @@ fn sift_features_u8(features: &SiftFeatures) -> Vec<[u8; lowe_sift::DESCRIPTOR_L
         .collect()
 }
 
-fn colmap_uint8_l2_distance2(
-    left: &[u8; lowe_sift::DESCRIPTOR_LEN],
-    right: &[u8; lowe_sift::DESCRIPTOR_LEN],
-) -> f32 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(a, b)| {
-            let delta = i32::from(*a) - i32::from(*b);
-            (delta * delta) as f32
-        })
-        .sum()
-}
-
 fn colmap_normalized_distance(l2_dist: f32) -> f32 {
     (l2_dist / COLMAP_SIFT_DESCRIPTOR_NORM).sqrt()
 }
@@ -502,26 +591,78 @@ fn sift_pair_distance(left: &Descriptor, right: &Descriptor) -> f32 {
     }
 }
 
+/// Nested wall-clock measurements for one SIFT extraction. These are only
+/// collected by the explicit profiling path.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct SiftExtractionTiming {
+    pub preparation_ms: f64,
+    pub input_conversion_ms: f64,
+    pub backend_kernel_ms: f64,
+    pub backend_input_conversion_ms: f64,
+    pub backend_scale_space_ms: f64,
+    pub backend_detection_ms: f64,
+    pub backend_orientation_ms: f64,
+    pub backend_descriptor_ms: f64,
+    pub backend_output_assembly_ms: f64,
+    pub result_conversion_ms: f64,
+}
+
+/// Nested wall-clock measurements, not CPU time. Available for the uint8 backend.
+#[derive(Default, serde::Serialize)]
+pub(crate) struct SiftMatchingTiming {
+    pub uint8_backend: bool,
+    pub prepare_ms: f64,
+    pub index_build_ms: f64,
+    pub search_ms: f64,
+}
+
+#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+fn measure_matching<R>(elapsed: Option<&mut f64>, work: impl FnOnce() -> R) -> R {
+    let start = elapsed.as_ref().map(|_| std::time::Instant::now());
+    let result = work();
+    if let (Some(elapsed), Some(start)) = (elapsed, start) {
+        *elapsed += start.elapsed().as_secs_f64() * 1000.0;
+    }
+    result
+}
+
 #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
 fn match_sift_colmap_uint8(
     left: &SiftFeatures,
     right: &SiftFeatures,
     options: &SiftMatchingOptions,
+    mut timing: Option<&mut SiftMatchingTiming>,
 ) -> Vec<Match> {
-    let left_u8 = sift_features_u8(left);
-    let right_u8 = sift_features_u8(right);
+    if let Some(timing) = timing.as_mut() {
+        timing.uint8_backend = true;
+    }
+    let (left_u8, right_u8) = measure_matching(timing.as_mut().map(|t| &mut t.prepare_ms), || {
+        (sift_features_u8(left), sift_features_u8(right))
+    });
     let forward = if options.cpu_brute_force_matcher {
-        match_sift_colmap_one_way_brute(&left_u8, &right_u8, options)
+        measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
+            match_sift_colmap_one_way_brute(&left_u8, &right_u8, options)
+        })
     } else {
-        let index = SiftDescriptorIndex::build(&right_u8);
-        match_sift_colmap_one_way_indexed(&left_u8, &index, options)
+        let index = measure_matching(timing.as_mut().map(|t| &mut t.index_build_ms), || {
+            SiftDescriptorIndex::build(&right_u8)
+        });
+        measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
+            match_sift_colmap_one_way_indexed(&left_u8, &index, options)
+        })
     };
     if options.cross_check {
         let reverse_pairs: HashSet<(u32, u32)> = if options.cpu_brute_force_matcher {
-            match_sift_colmap_one_way_brute(&right_u8, &left_u8, options)
+            measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
+                match_sift_colmap_one_way_brute(&right_u8, &left_u8, options)
+            })
         } else {
-            let index = SiftDescriptorIndex::build(&left_u8);
-            match_sift_colmap_one_way_indexed(&right_u8, &index, options)
+            let index = measure_matching(timing.as_mut().map(|t| &mut t.index_build_ms), || {
+                SiftDescriptorIndex::build(&left_u8)
+            });
+            measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
+                match_sift_colmap_one_way_indexed(&right_u8, &index, options)
+            })
         }
         .into_iter()
         .collect();
@@ -565,32 +706,34 @@ fn match_sift_colmap_one_way_brute(
     options: &SiftMatchingOptions,
 ) -> Vec<(u32, u32)> {
     let max_l2_dist = COLMAP_SIFT_DESCRIPTOR_NORM * options.max_distance * options.max_distance;
-    left.par_iter()
-        .enumerate()
-        .filter_map(|(query_idx, left_desc)| {
-            let mut best_train = None::<usize>;
-            let mut best_l2 = f32::INFINITY;
-            let mut second_best_l2 = f32::INFINITY;
-            for (train_idx, right_desc) in right.iter().enumerate() {
-                let l2_dist = colmap_uint8_l2_distance2(left_desc, right_desc);
-                if l2_dist < best_l2 {
-                    second_best_l2 = best_l2;
-                    best_l2 = l2_dist;
-                    best_train = Some(train_idx);
-                } else if l2_dist < second_best_l2 {
-                    second_best_l2 = l2_dist;
+    crate::execution::parallel(|| {
+        left.par_iter()
+            .enumerate()
+            .filter_map(|(query_idx, left_desc)| {
+                let mut best_train = None::<usize>;
+                let mut best_l2 = f32::INFINITY;
+                let mut second_best_l2 = f32::INFINITY;
+                for (train_idx, right_desc) in right.iter().enumerate() {
+                    let l2_dist = colmap_uint8_l2_distance2(left_desc, right_desc);
+                    if l2_dist < best_l2 {
+                        second_best_l2 = best_l2;
+                        best_l2 = l2_dist;
+                        best_train = Some(train_idx);
+                    } else if l2_dist < second_best_l2 {
+                        second_best_l2 = l2_dist;
+                    }
                 }
-            }
-            let train_idx = best_train?;
-            if best_l2 > max_l2_dist {
-                return None;
-            }
-            if best_l2.sqrt() >= options.max_ratio * second_best_l2.sqrt() {
-                return None;
-            }
-            Some((query_idx as u32, train_idx as u32))
-        })
-        .collect()
+                let train_idx = best_train?;
+                if best_l2 > max_l2_dist {
+                    return None;
+                }
+                if best_l2.sqrt() >= options.max_ratio * second_best_l2.sqrt() {
+                    return None;
+                }
+                Some((query_idx as u32, train_idx as u32))
+            })
+            .collect()
+    })
 }
 
 fn match_sift_colmap_one_way_indexed(
@@ -599,33 +742,35 @@ fn match_sift_colmap_one_way_indexed(
     options: &SiftMatchingOptions,
 ) -> Vec<(u32, u32)> {
     let max_l2_dist = COLMAP_SIFT_DESCRIPTOR_NORM * options.max_distance * options.max_distance;
-    left.par_iter()
-        .enumerate()
-        .filter_map(|(query_idx, left_desc)| {
-            let neighbors = index.search_two_nearest(left_desc)?;
-            let (best_l2, best_index, second_best_l2) =
-                if neighbors.best_l2 <= neighbors.second_best_l2 {
-                    (
-                        neighbors.best_l2,
-                        neighbors.best_index,
-                        neighbors.second_best_l2,
-                    )
-                } else {
-                    (
-                        neighbors.second_best_l2,
-                        neighbors.second_best_index,
-                        neighbors.best_l2,
-                    )
-                };
-            if best_l2 > max_l2_dist {
-                return None;
-            }
-            if best_l2.sqrt() >= options.max_ratio * second_best_l2.sqrt() {
-                return None;
-            }
-            Some((query_idx as u32, best_index))
-        })
-        .collect()
+    crate::execution::parallel(|| {
+        left.par_iter()
+            .enumerate()
+            .filter_map(|(query_idx, left_desc)| {
+                let neighbors = index.search_two_nearest(left_desc)?;
+                let (best_l2, best_index, second_best_l2) =
+                    if neighbors.best_l2 <= neighbors.second_best_l2 {
+                        (
+                            neighbors.best_l2,
+                            neighbors.best_index,
+                            neighbors.second_best_l2,
+                        )
+                    } else {
+                        (
+                            neighbors.second_best_l2,
+                            neighbors.second_best_index,
+                            neighbors.best_l2,
+                        )
+                    };
+                if best_l2 > max_l2_dist {
+                    return None;
+                }
+                if best_l2.sqrt() >= options.max_ratio * second_best_l2.sqrt() {
+                    return None;
+                }
+                Some((query_idx as u32, best_index))
+            })
+            .collect()
+    })
 }
 
 #[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
@@ -708,6 +853,15 @@ pub fn match_sift_with_options(
     right: &SiftFeatures,
     options: &SiftMatchingOptions,
 ) -> Vec<Match> {
+    match_sift_with_options_profiled(left, right, options, None)
+}
+
+pub(crate) fn match_sift_with_options_profiled(
+    left: &SiftFeatures,
+    right: &SiftFeatures,
+    options: &SiftMatchingOptions,
+    timing: Option<&mut SiftMatchingTiming>,
+) -> Vec<Match> {
     if options.check().is_err() {
         return Vec::new();
     }
@@ -716,10 +870,11 @@ pub fn match_sift_with_options(
     }
     #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
     {
-        return match_sift_colmap_uint8(left, right, options);
+        return match_sift_colmap_uint8(left, right, options, timing);
     }
     #[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
     {
+        let _ = timing;
         match_sift_lowe_bbf(left, right, options)
     }
 }
@@ -1117,6 +1272,10 @@ pub fn benchmark_sift_extraction(
     })
 }
 
+#[cfg(all(test, feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+#[path = "sift_regression_tests.rs"]
+mod regression_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,6 +1472,169 @@ mod tests {
         assert_eq!(features.keypoints.len(), features.descriptors.len());
     }
 
+    // Serialize fields explicitly: native struct padding and float equality are
+    // not suitable for a bit-exact regression gate (notably signed zero).
+    fn sift_feature_bytes(features: &SiftFeatures) -> Vec<u8> {
+        let count = features.keypoints.len();
+        assert_eq!(features.colmap_keypoints.len(), count);
+        assert_eq!(features.descriptors.len(), count);
+        assert_eq!(features.descriptors_u8.len(), count);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(count as u64).to_le_bytes());
+        for kp in &features.keypoints {
+            for value in [kp.pt.0, kp.pt.1, kp.size, kp.angle, kp.response] {
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            bytes.extend_from_slice(&kp.octave.to_le_bytes());
+        }
+        for kp in &features.colmap_keypoints {
+            for value in [kp.x, kp.y, kp.a11, kp.a12, kp.a21, kp.a22] {
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        for descriptor in &features.descriptors {
+            for value in descriptor.as_slice() {
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        for descriptor in &features.descriptors_u8 {
+            bytes.extend_from_slice(descriptor);
+        }
+        bytes
+    }
+
+    #[test]
+    fn vlfeat_profiling_preserves_feature_bits() -> Result<()> {
+        // Odd rectangular dimensions exercise convolution tails and asymmetric
+        // texture avoids relying only on repeated checkerboard responses.
+        let (width, height) = (193u32, 157u32);
+        let gray = (0..width * height)
+            .map(|index| {
+                let x = index % width;
+                let y = index / width;
+                let tile = if (x / 13 + y / 17) % 2 == 0 { 180 } else { 20 };
+                (tile + (x * 7 + y * 11 + x * y % 31) % 55) as u8
+            })
+            .collect::<Vec<_>>();
+        for (name, options) in [
+            ("standard", SiftExtractionOptions::default()),
+            (
+                "standard_l2_upright",
+                SiftExtractionOptions {
+                    normalization: SiftDescriptorNormalization::L2,
+                    upright: true,
+                    first_octave: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "covdet_dsp",
+                SiftExtractionOptions {
+                    domain_size_pooling: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let baseline = extract_sift_from_grayscale_u8(&gray, width, height, &options)?;
+            assert!(!baseline.keypoints.is_empty(), "{name}: empty fixture");
+            let expected = sift_feature_bytes(&baseline);
+            // Independent pre-SIMD snapshots, verified with Apple clang 21.0.0
+            // and rustc 1.97.0 in release mode. Do not regenerate from a candidate.
+            // Other targets retain the repeat/profiling gate below, not these
+            // platform-specific floating-point expectations.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                let (count, hash) = match name {
+                    "standard" => (
+                        582,
+                        "6b5675e5f9b52de5094772730a717dcb25440bb1f3ee7131055c77187ea1fe70",
+                    ),
+                    "standard_l2_upright" => (
+                        177,
+                        "9f57e514d5ee246fc43ed86610c58f52a3f964fbea290ecd4878302ff8f03651",
+                    ),
+                    "covdet_dsp" => (
+                        608,
+                        "9ee1e70d22c5b6770a44f048c051c7bf7c7f53312a665460ba8bf71ed07a42f7",
+                    ),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    baseline.keypoints.len(),
+                    count,
+                    "{name}: preoptimization count"
+                );
+                assert_eq!(blake3::hash(&expected).to_hex().as_str(), hash,
+                    "{name}: preoptimization bits (toolchain changes require independent revalidation)");
+            }
+            for _ in 0..2 {
+                let repeated = extract_sift_from_grayscale_u8(&gray, width, height, &options)?;
+                let (profiled, _) =
+                    extract_sift_from_grayscale_u8_with_timing(&gray, width, height, &options)?;
+                assert_eq!(sift_feature_bytes(&repeated), expected, "{name}: repeat");
+                assert_eq!(sift_feature_bytes(&profiled), expected, "{name}: profiling");
+            }
+            eprintln!(
+                "{name}: {} features, blake3={}",
+                baseline.keypoints.len(),
+                blake3::hash(&expected)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn profiled_grayscale_extraction_reports_nested_sift_stages() -> Result<()> {
+        let width = 256u32;
+        let height = 256u32;
+        let gray = (0..width * height)
+            .map(|index| {
+                let x = index % width;
+                let y = index / width;
+                if ((x / 16) + (y / 16)) % 2 == 0 {
+                    240
+                } else {
+                    20
+                }
+            })
+            .collect::<Vec<_>>();
+        let options = SiftExtractionOptions {
+            max_num_features: 1024,
+            max_image_size: 256,
+            ..Default::default()
+        };
+        let (features, timing) =
+            extract_sift_from_grayscale_u8_with_timing(&gray, width, height, &options)?;
+        assert!(!features.keypoints.is_empty());
+        for (name, value) in [
+            ("preparation_ms", timing.preparation_ms),
+            ("input_conversion_ms", timing.input_conversion_ms),
+            ("backend_kernel_ms", timing.backend_kernel_ms),
+            (
+                "backend_input_conversion_ms",
+                timing.backend_input_conversion_ms,
+            ),
+            ("backend_scale_space_ms", timing.backend_scale_space_ms),
+            ("backend_detection_ms", timing.backend_detection_ms),
+            ("backend_orientation_ms", timing.backend_orientation_ms),
+            ("backend_descriptor_ms", timing.backend_descriptor_ms),
+            (
+                "backend_output_assembly_ms",
+                timing.backend_output_assembly_ms,
+            ),
+            ("result_conversion_ms", timing.result_conversion_ms),
+        ] {
+            assert!(value.is_finite() && value >= 0.0, "{name}={value}");
+        }
+        assert!(timing.backend_kernel_ms > 0.0);
+        assert!(timing.backend_scale_space_ms > 0.0);
+        assert!(timing.backend_detection_ms > 0.0);
+        assert!(timing.backend_descriptor_ms > 0.0);
+        assert!(timing.backend_input_conversion_ms > 0.0);
+        assert!(timing.backend_output_assembly_ms > 0.0);
+        Ok(())
+    }
+
     #[test]
     fn colmap_uint8_matching_applies_distance_and_ratio_thresholds() {
         let mut left = [0u8; lowe_sift::DESCRIPTOR_LEN];
@@ -1364,6 +1686,59 @@ mod tests {
     }
 
     #[test]
+    fn matching_profile_preserves_results_for_both_search_and_cross_check_modes() {
+        let descriptors_u8: Vec<[u8; 128]> = (0..8)
+            .map(|i| std::array::from_fn(|j| ((i * 37 + j * 17 + i * j * 3) % 251) as u8))
+            .collect();
+        let features = SiftFeatures {
+            descriptors: descriptors_u8
+                .iter()
+                .map(|d| Descriptor::new(d.map(|v| f32::from(v) / 512.0)))
+                .collect(),
+            descriptors_u8,
+            ..Default::default()
+        };
+        for brute in [false, true] {
+            for cross_check in [false, true] {
+                let options = SiftMatchingOptions {
+                    cpu_brute_force_matcher: brute,
+                    cross_check,
+                    ..Default::default()
+                };
+                let plain = match_sift_with_options(&features, &features, &options);
+                let mut timing = SiftMatchingTiming::default();
+                let profiled = match_sift_with_options_profiled(
+                    &features,
+                    &features,
+                    &options,
+                    Some(&mut timing),
+                );
+                assert!(!plain.is_empty());
+                let values = |matches: Vec<Match>| {
+                    matches
+                        .into_iter()
+                        .map(|m| (m.query_idx, m.train_idx, m.distance))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(values(plain), values(profiled));
+                assert_eq!(
+                    timing.uint8_backend,
+                    cfg!(all(
+                        feature = "vlfeat-sift",
+                        not(feature = "lowe-sift-backend")
+                    ))
+                );
+                for value in [timing.prepare_ms, timing.index_build_ms, timing.search_ms] {
+                    assert!(value.is_finite() && value >= 0.0);
+                }
+                if brute {
+                    assert_eq!(timing.index_build_ms, 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn indexed_matching_agrees_with_brute_force_on_toy_descriptors() {
         let mut left = [0u8; lowe_sift::DESCRIPTOR_LEN];
         let mut near = [0u8; lowe_sift::DESCRIPTOR_LEN];
@@ -1392,6 +1767,92 @@ mod tests {
             &options,
         );
         assert_eq!(brute, indexed);
+    }
+
+    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+    #[test]
+    fn uint8_matching_fixture_preserves_complete_output_semantics() {
+        fn descriptor(first: u8, fill: u8) -> [u8; lowe_sift::DESCRIPTOR_LEN] {
+            let mut value = [fill; lowe_sift::DESCRIPTOR_LEN];
+            value[0] = first;
+            value
+        }
+
+        fn features(rows: &[[u8; lowe_sift::DESCRIPTOR_LEN]]) -> SiftFeatures {
+            SiftFeatures {
+                descriptors: rows
+                    .iter()
+                    .map(|row| Descriptor::new(row.map(|value| f32::from(value) / 512.0)))
+                    .collect(),
+                descriptors_u8: rows.to_vec(),
+                ..Default::default()
+            }
+        }
+
+        fn fingerprint(label: &str, matches: &[Match], bytes: &mut Vec<u8>) {
+            bytes.extend_from_slice(&(label.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(label.as_bytes());
+            bytes.extend_from_slice(&(matches.len() as u32).to_le_bytes());
+            for m in matches {
+                bytes.extend_from_slice(&m.query_idx.to_le_bytes());
+                bytes.extend_from_slice(&m.train_idx.to_le_bytes());
+                bytes.extend_from_slice(&m.distance.to_bits().to_le_bytes());
+            }
+        }
+
+        let left_rows = [
+            descriptor(0, 0),
+            descriptor(10, 0),
+            descriptor(5, 0),
+            descriptor(0, 0),
+            descriptor(255, 255),
+            descriptor(20, 0),
+            descriptor(128, 128),
+        ];
+        let right_rows = [
+            descriptor(0, 0),
+            descriptor(10, 0),
+            descriptor(100, 0),
+            descriptor(255, 255),
+        ];
+        let left = features(&left_rows);
+        let right = features(&right_rows);
+        let base = SiftMatchingOptions {
+            max_ratio: 0.8,
+            max_distance: 0.7,
+            cross_check: false,
+            max_num_matches: 32768,
+            cpu_brute_force_matcher: false,
+            ..Default::default()
+        };
+        let mut fingerprint_bytes = Vec::new();
+        for (label, options) in [
+            ("forward", base.clone()),
+            (
+                "cross_check",
+                SiftMatchingOptions {
+                    cross_check: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "cross_check_max_two",
+                SiftMatchingOptions {
+                    cross_check: true,
+                    max_num_matches: 2,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            let matches = match_sift_with_options(&left, &right, &options);
+            fingerprint(label, &matches, &mut fingerprint_bytes);
+        }
+
+        let hash = blake3::hash(&fingerprint_bytes).to_hex().to_string();
+        assert_eq!(
+            hash,
+            "3e9d58d11f4f059fbd8c068a03bccacd15cd87b84af93cc56480199715e102d7"
+        );
     }
 
     #[test]

@@ -52,19 +52,113 @@ impl SiftDescriptorIndex {
     }
 }
 
-fn colmap_uint8_l2_distance2(left: &[u8; DESCRIPTOR_DIM], right: &[u8; DESCRIPTOR_DIM]) -> f32 {
+#[inline]
+pub(crate) fn colmap_uint8_l2_distance2(
+    left: &[u8; DESCRIPTOR_DIM],
+    right: &[u8; DESCRIPTOR_DIM],
+) -> f32 {
+    // The maximum sum is 128 * 255² = 8,323,200 < 2²⁴: both the old
+    // float reduction and this integer reduction are exact. Integer addition
+    // permits SIMD reassociation without changing distances or tie-breaking.
     left.iter()
         .zip(right.iter())
         .map(|(a, b)| {
             let delta = i32::from(*a) - i32::from(*b);
-            (delta * delta) as f32
+            (delta * delta) as u32
         })
-        .sum()
+        .sum::<u32>() as f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn float_reference(left: &[u8; 128], right: &[u8; 128]) -> f32 {
+        left.iter()
+            .zip(right)
+            .map(|(a, b)| {
+                let delta = i32::from(*a) - i32::from(*b);
+                (delta * delta) as f32
+            })
+            .sum()
+    }
+
+    #[test]
+    fn integer_distance_is_bit_exact_for_extremes_and_random_descriptors() {
+        use rand::{RngCore, SeedableRng};
+        assert_eq!(
+            colmap_uint8_l2_distance2(&[0; 128], &[255; 128]),
+            8_323_200.0
+        );
+        for a in [0, 1, 127, 128, 254, 255] {
+            for b in 0..=255 {
+                let left = [a; 128];
+                let right = [b; 128];
+                assert_eq!(
+                    colmap_uint8_l2_distance2(&left, &right).to_bits(),
+                    float_reference(&left, &right).to_bits()
+                );
+            }
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..4096 {
+            let mut left = [0; 128];
+            let mut right = [0; 128];
+            rng.fill_bytes(&mut left);
+            rng.fill_bytes(&mut right);
+            assert_eq!(
+                colmap_uint8_l2_distance2(&left, &right).to_bits(),
+                float_reference(&left, &right).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn nearest_two_preserve_float_reference_and_ties() {
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(123);
+        for count in [0, 1, 2, 17, 128] {
+            let mut train = vec![[0u8; 128]; count];
+            for descriptor in &mut train {
+                rng.fill_bytes(descriptor);
+            }
+            if count >= 2 {
+                train[1] = train[0];
+            }
+            let index = SiftDescriptorIndex::build(&train);
+            for query in train
+                .iter()
+                .copied()
+                .chain([[0; 128], [255; 128], [128; 128]])
+            {
+                let got = index.search_two_nearest(&query);
+                if count == 0 {
+                    assert!(got.is_none());
+                    continue;
+                }
+                let mut expected: Vec<_> = train
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| (float_reference(&query, row), i as u32))
+                    .collect();
+                expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                let first = expected[0];
+                let second = expected.get(1).copied().unwrap_or((f32::INFINITY, 0));
+                let got = got.unwrap();
+                assert_eq!(
+                    (got.best_index, got.best_l2.to_bits()),
+                    (first.1, first.0.to_bits())
+                );
+                assert_eq!(
+                    (got.second_best_index, got.second_best_l2.to_bits()),
+                    (second.1, second.0.to_bits())
+                );
+            }
+        }
+        let index = SiftDescriptorIndex::build(&[[0; 128], [2; 128], [0; 128]]);
+        let tied = index.search_two_nearest(&[1; 128]).unwrap();
+        assert_eq!((tied.best_index, tied.second_best_index), (0, 1));
+    }
 
     #[test]
     fn index_finds_exact_nearest_neighbor() {

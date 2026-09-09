@@ -7,24 +7,16 @@ use super::ceres_problem;
 use super::{BundleAdjustmentOptions, BundleAdjustmentReport};
 use crate::types::{ImageFrame, Reconstruction};
 
-/// Returns true when the Ceres backend can handle this problem configuration.
-pub fn supports_ceres_ba(
-    _reconstruction: &Reconstruction,
-    _options: &BundleAdjustmentOptions,
-) -> bool {
-    true
-}
-
 pub fn refine_bundle_adjustment_ceres(
     frames: &[ImageFrame],
     reconstruction: &mut Reconstruction,
     options: BundleAdjustmentOptions,
 ) -> Option<BundleAdjustmentReport> {
-    ceres_problem::solve_bundle_adjustment_ceres(frames, reconstruction, options)
+    ceres_problem::solve_bundle_adjustment_ceres(frames, reconstruction, options, None)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::shared::project_point;
     use super::super::{
         camera_center_world, refine_bundle_adjustment, BundleAdjustmentLoss,
@@ -137,15 +129,6 @@ mod tests {
             reconstruction.point_ids.push(idx as u64 + 1);
         }
 
-        assert!(supports_ceres_ba(
-            &reconstruction,
-            &BundleAdjustmentOptions {
-                variable_images: Some(vec![1]),
-                constant_images: vec![0],
-                ..BundleAdjustmentOptions::default()
-            }
-        ));
-
         let report = refine_bundle_adjustment(
             &frames,
             &mut reconstruction,
@@ -208,7 +191,7 @@ mod tests {
             .unwrap()
     }
 
-    fn rig_sensor_ba_fixture() -> (Vec<ImageFrame>, Reconstruction, SensorId, SE3, SE3) {
+    pub(crate) fn rig_sensor_ba_fixture() -> (Vec<ImageFrame>, Reconstruction, SensorId, SE3, SE3) {
         let mut frames = vec![frame(0), frame(1), frame(2), frame(3)];
         let camera = CameraModel::new_pinhole(160, 120, 90.0, 90.0, 80.0, 60.0);
         let ref_sensor = SensorId {
