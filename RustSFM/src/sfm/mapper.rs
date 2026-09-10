@@ -576,7 +576,7 @@ fn mapper_uses_gpu(config: &MapperConfig) -> bool {
 struct PreparedMapperFeatures {
     paths: Vec<PathBuf>,
     database_path: Option<PathBuf>,
-    database: Option<reconstruction_input::MapperDatabaseInput>,
+    database_preexisting: bool,
     plan: Option<FeatureMemoryPlan>,
 }
 
@@ -610,14 +610,12 @@ fn prepare_mapper_features(
         bail!("need at least two images");
     }
     let database_path = resolve_mapper_database_path(config)?;
-    let database = if database_path.as_ref().is_some_and(|path| path.exists()) {
-        load_mapper_database_for_paths(database_path.as_deref(), &paths, config.min_matches)?
-    } else {
-        None
-    };
+    let database_preexisting = database_path.as_ref().is_some_and(|path| path.exists());
     task.checkpoint()?;
     // This mapper reuses DB frames wholesale; it does not extract missing DB features.
-    let plan = if database.is_some() {
+    // The cache itself is deliberately loaded only after the reconstruction stage is
+    // admitted; before admission we only need to know which memory plan applies.
+    let plan = if database_preexisting {
         db_memory_plan(
             &[],
             &options,
@@ -641,7 +639,7 @@ fn prepare_mapper_features(
     Ok(Some(PreparedMapperFeatures {
         paths,
         database_path,
-        database,
+        database_preexisting,
         plan,
     }))
 }
@@ -738,9 +736,23 @@ fn run_reconstruction_prepared(
 
     let start = Instant::now();
     let (paths, prepared_database, feature_plan) = if let Some(input) = prepared {
+        let database = if input.database_preexisting {
+            let database_path = input
+                .database_path
+                .as_deref()
+                .context("database path disappeared after memory planning")?;
+            anyhow::ensure!(
+                database_path.exists(),
+                "database disappeared after memory planning: {}",
+                database_path.display()
+            );
+            load_mapper_database_for_paths(Some(database_path), &input.paths, config.min_matches)?
+        } else {
+            None
+        };
         (
             input.paths,
-            Some((input.database_path, input.database)),
+            Some((input.database_path, database)),
             input.plan,
         )
     } else {
@@ -12271,6 +12283,86 @@ mod tests {
         assert_eq!(setup.image_camera_indices, vec![0, 0]);
         assert_eq!(setup.camera_has_prior_focal_length, vec![true]);
         assert_eq!(setup.cameras[0].fx, 80.0);
+        Ok(())
+    }
+
+    #[test]
+    fn mapper_database_cache_load_is_deferred_until_admission() -> Result<()> {
+        use crate::task::SfmTaskControl;
+        use rustscan_taskflow::{Budget, Runtime, RuntimeConfig};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = tempdir()?;
+        let images = dir.path().join("images");
+        fs::create_dir_all(&images)?;
+        for name in ["left.png", "right.png"] {
+            image::RgbImage::from_pixel(16, 12, image::Rgb([12, 34, 56]))
+                .save(images.join(name))?;
+        }
+        // An existing but invalid DB distinguishes deferred loading from the old
+        // pre-admission cache load: cancellation must win while the stage is queued.
+        let database = dir.path().join("database.db");
+        fs::write(&database, [])?;
+
+        let runtime = Arc::new(Runtime::new(RuntimeConfig {
+            budget: Budget {
+                cpu_threads: 1,
+                memory_bytes: 64 * 1024 * 1024,
+                io_slots: 1,
+            },
+            ..Default::default()
+        })?);
+        let executor = crate::SfmTaskflow::new(runtime.clone(), 1024 * 1024)?;
+        let mut paused_budget = runtime.snapshot()?.budget;
+        paused_budget.cpu_threads = 0;
+        runtime.set_budget(paused_budget)?;
+        let control = SfmTaskControl::new();
+        let config = MapperConfig {
+            input: images,
+            database: Some(database),
+            max_images: Some(2),
+            threads: Some(1),
+            ..MapperConfig::default()
+        };
+
+        std::thread::scope(|scope| -> Result<()> {
+            let worker = scope.spawn(|| {
+                let mut events = Vec::new();
+                let mut sink = |event| events.push(event);
+                let mut task =
+                    SfmTaskContext::new(&control, &mut sink).with_taskflow(executor.clone());
+                run_reconstruction_with_task(&config, &mut task)
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while runtime.snapshot()?.pending_tasks == 0 {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("mapper stage did not reach admission queue");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            control.request_cancel();
+            let error = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("mapper worker panicked"))?
+                .expect_err("queued mapper must be cancelled before opening the DB");
+            assert_eq!(
+                error.downcast_ref::<SfmTaskStop>(),
+                Some(&SfmTaskStop::Cancelled)
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while runtime.snapshot()?.pending_tasks != 0 {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("cancelled mapper stage did not drain");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        })?;
+        let snapshot = runtime.snapshot()?;
+        assert_eq!(snapshot.cpu_threads, 0);
+        assert_eq!(snapshot.memory_bytes, 0);
+        assert_eq!(snapshot.pending_tasks, 0);
         Ok(())
     }
 

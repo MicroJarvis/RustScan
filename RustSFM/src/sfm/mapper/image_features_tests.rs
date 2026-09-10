@@ -405,7 +405,8 @@ fn composition_memory_mapper_selection_and_missing_output_db_use_retained_plan()
     cfg.write_database = true;
     cfg.sift_extraction.max_num_features = 999;
     let prepared = prepare_mapper_features(&cfg, &task)?.unwrap();
-    assert!(prepared.database.is_none());
+    assert!(!prepared.database_preexisting);
+    assert_eq!(prepared.database_path.as_ref(), cfg.database.as_ref());
     assert!(!cfg.database.as_ref().unwrap().exists());
     let plan = prepared.plan.unwrap();
     assert_eq!(plan.paths(), &paths[..2]);
@@ -472,8 +473,13 @@ fn composition_memory_mapper_cached_db_skips_invalid_image_headers() -> Result<(
     assert!(plan.paths().is_empty());
     assert_eq!(plan.request_bytes(), 128);
     assert_eq!(plan.retained_bytes(), 0);
-    let frames =
-        super::super::database_frames(&prepared.paths, prepared.database.as_ref().unwrap())?;
+    let database = super::super::load_mapper_database_for_paths(
+        Some(&db_path),
+        &prepared.paths,
+        cfg.min_matches,
+    )?
+    .expect("database input");
+    let frames = super::super::database_frames(&prepared.paths, &database)?;
     assert_eq!(frames.len(), 2);
     assert!(frames
         .iter()

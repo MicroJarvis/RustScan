@@ -50,13 +50,14 @@
 | R3 BA 失败状态闭环 | ✅ focused 回归通过 | outcome 区分未尝试/失败/提交及后处理；失败不推进成功 watermark，dirty 保留 final refinement 资格；未改变 solver、迭代预算或强制 full-budget final。global_ba_ 22 passed、6 ignored，schedule/caps筛选通过（有重叠）；见 `output/ba3_review_20260908T092053Z/REPORT.md` |
 | R4 Taskflow DAG artifact liveness 准入检查 | ✅ 完成并验证 | 提交前按依赖拓扑保守计算可能存活的前置 output lease，与 consumer working/output 共同检查；producer 900 + consumer working 200 在 1000 ceiling 下于 submit 阶段返回 `Unschedulable`，不进入执行；runtime focused 27 tests 通过。该检查可能拒绝依赖分支共享释放协议的极端图，仍不是精确全图内存证明 |
 | R5 queue timing decomposition | ✅ 完成并验证 | `queue_ms` 保留 workflow 创建到 task 开始的总等待，新增 `dependency_wait_ms` 与 `resource_wait_ms`；高层 stage/sequence report 和 runtime `TaskReport` 均接线，pre-admission 未获 grant 的失败/取消报告 timing 为 0；runtime 27、execution 23、BA 7 focused tests 通过。此修复只改善正确性与观测，不构成加速证据 |
+| R6 mapper DB cache 生命周期边界 | ✅ 完成并验证 | `prepare_mapper_features` 只在 admission 前解析路径和 SIFT 计划，不再预加载 `DatabaseCache`；已有 DB 在 reconstruction stage 获得 grant 后加载，等待期间 DB 消失则 fail closed。新增损坏 DB + queued cancellation 回归，mapper composition focused 9 tests 通过。sequence 的 initial reconstruction/model growth 仍遵循 caller allowance 合同 |
 
 - 内存/执行最终集成门：default/no-default memory 18/15、feature_extraction 31/27、execution 23/23，task_control 10；新增组合入口 focused 门：mapper 9/2、sequence memory 4/3、sequence integration memory 6/4、taskflow sequence 2/0、memory review 4/4。测试集合有重叠，不累加为独立总数。见 `output/feature_memory_gate_20260908T142841Z/FINAL_AUDIT.md`、`output/composition_memory_mapper_20260909/REPORT.md`、`output/sequence_memory_gates_20260909T090715Z/REPORT.md` 与 `output/memory_review_20260909T091946Z/REPORT.md`。
 - runtime `queue_time`/高层 `queue_ms` 现在表示从 workflow 创建到 task/stage 开始的总等待；`dependency_wait_time`/`dependency_wait_ms` 表示依赖完成前等待，`resource_wait_time`/`resource_wait_ms` 表示 ready 后等待资源。不要再把 `queue_ms` 单独解释为纯 resource wait；没有 runtime grant 的 pre-admission 失败/取消报告 timing 为 0。
-- 本轮只完成 fail-closed correctness 和 observability 修复，未运行新的真实 flowers2 大实验，不能据此宣称 Taskflow 加速；历史 C4/C5 结论不变。
+- 本轮只完成 fail-closed correctness、observability 和 mapper cache lifecycle 修复，未运行新的真实 flowers2 大实验，不能据此宣称 Taskflow 加速；历史 C4/C5 结论不变。
 - 独立只读复核确认异构窗口等待环、默认入口兼容性、transient budget 误拒绝、worker native 超额、mapper 排队后输入变化、adaptive 的 PnP-only GPU 误申请、取消错误优先级及 keyframe 静态校验顺序问题均已关闭。窗口 floor 依赖当前 scheduler 的 ready 顺序，并可能减少异构输入的并行度。
 - 估算是分配规划而非 RSS/allocator 上限，数据相关候选余量不是已证明的最坏上界。本轮未运行大图、真实重建或新的 C5 对照；历史性能结果不能用作新执行池的加速证据。
-- 下一步：处理组合入口中 admission 外预加载的常驻模型／artifact 生命周期边界，或在明确 caller allowance 合同后保留现状；随后重新检查时间/RSS 预算，在新目录做真实质量与性能对照。暂不拆 DAG、提高默认预算或扩至960帧。
+- 下一步：继续处理 sequence 入口中 admission 外加载的 `initial_reconstruction`、database/model growth 生命周期，明确 caller allowance 或移动可移动的加载边界；随后重新检查时间/RSS 预算，在新目录做真实质量与性能对照。暂不拆 DAG、提高默认预算或扩至960帧。
 
 ### B1：真实匹配输出回归门完成（2026-09-07）
 
