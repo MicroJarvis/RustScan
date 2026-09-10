@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 内存额度是**调用方估算的协作式准入控制**，不是 allocator/显存硬隔离，不保证不会 OOM。申请应包含工作集和输出，输入由已有 artifact 的 lease 计费。对于内部共享指针、外部缓存等逃逸生命周期，调用方必须自行保证申报和存活期一致。
 
-输出直到最后一个 handle/reader 释放才归还额度，workflow 完成不等于输出释放。及时将输入 handle 移入消费者、释放不再需要的克隆。即使每个节点单独能准入，DAG 的同时存活输入、输出及工作集仍可能超过预算，导致一直等待；此版本不做全图内存死锁证明、磁盘溢写或自动分批。
+输出直到最后一个 handle/reader 释放才归还额度，workflow 完成不等于输出释放。及时将输入 handle 移入消费者、释放不再需要的克隆。提交时会做保守的 DAG 内存存活检查：显式依赖上的前置输出按可能继续存活计入消费者的 working/output 请求；无法满足的图返回 `Error::Unschedulable`，而不是接受后永久等待。该检查可能拒绝依赖分支共享释放协议的图；此版本仍不做全图精确内存证明、磁盘溢写或自动分批。跨 workflow 的 output lease 仍按运行时 backpressure 处理，直到外部 handle/reader 释放。
 
 ### CPU 并行
 
@@ -124,7 +124,7 @@ Queue completion **不等于** validation/device-loss 错误检查。应用需�
 
 - `Runtime::snapshot()`：预算、已占资源和未完成任务数。
 - `RunHandle::try_event()`：提交、开始、CPU 提交结束、完成事件；有界队列满时丢弃观测事件，不丢 completion。
-- `RunReport`：每节点状态、错误、实际 grant、从 workflow 创建起的等待时间、执行时间、丢失事件数。
+- `RunReport`：每节点状态、错误、实际 grant、`queue_time`（从 workflow 创建到开始的总等待）、`dependency_wait_time`（等待依赖完成）和 `resource_wait_time`（ready 后等待资源准入）、执行时间、丢失事件数。
 
 在 workspace 根目录运行，全部使用 **release**：
 

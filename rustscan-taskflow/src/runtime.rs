@@ -37,6 +37,10 @@ pub struct TaskReport {
     pub error: Option<TaskError>,
     pub grant: Option<ExecutionGrant>,
     pub queue_time: Option<Duration>,
+    /// Time from workflow submission until all dependencies completed.
+    pub dependency_wait_time: Option<Duration>,
+    /// Time from becoming ready until resource admission.
+    pub resource_wait_time: Option<Duration>,
     pub execution_time: Option<Duration>,
 }
 
@@ -63,6 +67,8 @@ pub enum Event {
         task: TaskId,
         grant: ExecutionGrant,
         queue_time: Duration,
+        dependency_wait_time: Duration,
+        resource_wait_time: Duration,
     },
     /// CPU submission work and its scoped pool have finished; a GPU/backend
     /// may still be running. Other resource reservations remain held.
@@ -259,6 +265,7 @@ struct Job {
     consumers: Vec<Vec<usize>>,
     remaining_deps: Vec<usize>,
     ready: VecDeque<usize>,
+    ready_at: Vec<Instant>,
     bypasses: Vec<usize>,
     running: Vec<Option<Running>>,
     remaining: usize,
@@ -267,6 +274,7 @@ struct Job {
 impl Job {
     fn new(graph: TaskGraph, shared: Arc<SharedRun>, events: SyncSender<Event>) -> Self {
         let len = graph.len();
+        let created = Instant::now();
         let mut consumers = vec![Vec::new(); len];
         let mut ready = VecDeque::new();
         let reports = graph
@@ -293,6 +301,8 @@ impl Job {
                     error: None,
                     grant: None,
                     queue_time: None,
+                    dependency_wait_time: None,
+                    resource_wait_time: None,
                     execution_time: None,
                 }
             })
@@ -306,10 +316,11 @@ impl Job {
             reports,
             consumers,
             ready,
+            ready_at: vec![created; len],
             bypasses: vec![0; len],
             running: (0..len).map(|_| None).collect(),
             remaining: len,
-            created: Instant::now(),
+            created,
         }
     }
     fn emit(&mut self, event: Event) {
@@ -565,23 +576,38 @@ impl Scheduler {
             graph: job.graph.id,
             index: i,
         };
-        let context = TaskContext::new(grant.clone(), deps, job.shared.cancel.clone());
-        self.ledger.acquire(&grant);
-        let queue_time = job.created.elapsed();
+        let started = Instant::now();
+        let ready_at = job.ready_at[i];
+        let dependency_wait_time = ready_at.duration_since(job.created);
+        let resource_wait_time = started.duration_since(ready_at);
+        let queue_time = started.duration_since(job.created);
         job.reports[i].status = TaskStatus::Running;
         job.reports[i].grant = Some(grant.clone());
         job.reports[i].queue_time = Some(queue_time);
+        job.reports[i].dependency_wait_time = Some(dependency_wait_time);
+        job.reports[i].resource_wait_time = Some(resource_wait_time);
+        let context = TaskContext::new(
+            grant.clone(),
+            deps,
+            job.shared.cancel.clone(),
+            dependency_wait_time,
+            resource_wait_time,
+            queue_time,
+        );
+        self.ledger.acquire(&grant);
         job.running[i] = Some(Running {
-            grant: grant.clone(),
-            started: Instant::now(),
+            grant,
+            started,
             returned: false,
             submission_error: None,
             result: None,
         });
         job.emit(Event::Started {
             task: id,
-            grant,
+            grant: job.running[i].as_ref().unwrap().grant.clone(),
             queue_time,
+            dependency_wait_time,
+            resource_wait_time,
         });
         self.jobs.push_back(job);
         let sender = self.sender.clone();
@@ -653,6 +679,7 @@ impl Scheduler {
                     && job.reports[consumer].status == TaskStatus::Pending
                 {
                     job.reports[consumer].status = TaskStatus::Ready;
+                    job.ready_at[consumer] = Instant::now();
                     job.ready.push_back(consumer);
                 }
             }

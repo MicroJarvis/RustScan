@@ -246,6 +246,8 @@ impl<'a> SfmTaskContext<'a> {
                     requested_memory: requested,
                     granted_memory: 0,
                     queue_ms: 0.0,
+                    dependency_wait_ms: 0.0,
+                    resource_wait_ms: 0.0,
                     service_ms: 0.0,
                     total_ms: 0.0,
                     cancelled_or_failed: true,

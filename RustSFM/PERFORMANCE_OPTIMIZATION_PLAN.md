@@ -1,6 +1,6 @@
 # RustSFM 性能优化计划
 
-更新时间：2026-09-07
+更新时间：2026-09-10
 
 本文档记录 RustSFM 后续性能工作的执行顺序、测量边界和验收标准。目标是先用数据定位瓶颈，再做一次只改变一个变量的优化；不把 Taskflow、匹配算法、BA 质量和 Viewer 延迟问题混在同一轮实验中。
 
@@ -38,7 +38,7 @@
 
 **执行规则：**64 行候选已关闭，不再调 block size。B1 的真实 descriptor 固定输出及独立预期值已补齐，C2/C3、C4 已完成。C5 旧_01按监控失败停止且冻结保留；OS退出/信号/reap独立回归后已获新授权，在_02按smoke1→smoke2→serial-r1→parallel-r1→parallel-r2→serial-r2→serial-r3→parallel-r3逐条门禁全部通过，最终-O analyzer仅一次通过，C5有界对照验收完成但未证明加速。现止于C5，不自动重试/扩展、不改变默认或进入C6；任何后续诊断须另行授权。此前把人工 fixture 通过标为 B1 全部完成过早，本轮已补齐缺口；B2 已有微基准和历史汇编证据，但未测 cache miss，不能宣称缓存归因已证实。
 
-### Review 后修复进展（2026-09-09 更新）
+### Review 后修复进展（2026-09-10 更新）
 
 用户已授权推进 review Top3；以下更新取代上方 C5 当轮“止于 C5、后续另行授权”的执行停止点，但不改变历史实验结论。
 
@@ -48,8 +48,12 @@
 | R2a admission 执行池与 worker 上下文 | ✅ 合成回归通过 | 每次 admission 独占惰性池，弱引用 TLS 覆盖各 worker，嵌套借用父额度；本池 worker 的 native bridge 至多 CPU1，fixed minimum>1 拒绝，coordinator 保留原额度。default/no-default execution 各23 tests通过；不保证 detached spawn 或任意外部线程传播 |
 | R2b 特征内存规划 | ✅ 组合入口接线并通过 focused gates | 显式绑定的标准 CPU default/selected DB、mapper image-only、sequence keyframe/remaining/adaptive 均按尺寸规划；per-image 窗口统一最大估算 floor 避免异构任务与顺序 commit 等待环。mapper 在 admission 后、首个 decode 前复核尺寸/encoded length；动态预算不足仍等待/可取消，超 ceiling/父 grant 拒绝。默认无绑定、custom/nonstandard 保留旧估算契约，无自动工作集保障。existing reconstruction/artifact 在 admission 外预加载仍是明确边界。默认 mapper 9/9、no-default 2/2；sequence memory/taskflow default 4/6/2、no-default 3/4；memory review 4/4。见各 `output/*memory*` 报告 |
 | R3 BA 失败状态闭环 | ✅ focused 回归通过 | outcome 区分未尝试/失败/提交及后处理；失败不推进成功 watermark，dirty 保留 final refinement 资格；未改变 solver、迭代预算或强制 full-budget final。global_ba_ 22 passed、6 ignored，schedule/caps筛选通过（有重叠）；见 `output/ba3_review_20260908T092053Z/REPORT.md` |
+| R4 Taskflow DAG artifact liveness 准入检查 | ✅ 完成并验证 | 提交前按依赖拓扑保守计算可能存活的前置 output lease，与 consumer working/output 共同检查；producer 900 + consumer working 200 在 1000 ceiling 下于 submit 阶段返回 `Unschedulable`，不进入执行；runtime focused 27 tests 通过。该检查可能拒绝依赖分支共享释放协议的极端图，仍不是精确全图内存证明 |
+| R5 queue timing decomposition | ✅ 完成并验证 | `queue_ms` 保留 workflow 创建到 task 开始的总等待，新增 `dependency_wait_ms` 与 `resource_wait_ms`；高层 stage/sequence report 和 runtime `TaskReport` 均接线，pre-admission 未获 grant 的失败/取消报告 timing 为 0；runtime 27、execution 23、BA 7 focused tests 通过。此修复只改善正确性与观测，不构成加速证据 |
 
 - 内存/执行最终集成门：default/no-default memory 18/15、feature_extraction 31/27、execution 23/23，task_control 10；新增组合入口 focused 门：mapper 9/2、sequence memory 4/3、sequence integration memory 6/4、taskflow sequence 2/0、memory review 4/4。测试集合有重叠，不累加为独立总数。见 `output/feature_memory_gate_20260908T142841Z/FINAL_AUDIT.md`、`output/composition_memory_mapper_20260909/REPORT.md`、`output/sequence_memory_gates_20260909T090715Z/REPORT.md` 与 `output/memory_review_20260909T091946Z/REPORT.md`。
+- runtime `queue_time`/高层 `queue_ms` 现在表示从 workflow 创建到 task/stage 开始的总等待；`dependency_wait_time`/`dependency_wait_ms` 表示依赖完成前等待，`resource_wait_time`/`resource_wait_ms` 表示 ready 后等待资源。不要再把 `queue_ms` 单独解释为纯 resource wait；没有 runtime grant 的 pre-admission 失败/取消报告 timing 为 0。
+- 本轮只完成 fail-closed correctness 和 observability 修复，未运行新的真实 flowers2 大实验，不能据此宣称 Taskflow 加速；历史 C4/C5 结论不变。
 - 独立只读复核确认异构窗口等待环、默认入口兼容性、transient budget 误拒绝、worker native 超额、mapper 排队后输入变化、adaptive 的 PnP-only GPU 误申请、取消错误优先级及 keyframe 静态校验顺序问题均已关闭。窗口 floor 依赖当前 scheduler 的 ready 顺序，并可能减少异构输入的并行度。
 - 估算是分配规划而非 RSS/allocator 上限，数据相关候选余量不是已证明的最坏上界。本轮未运行大图、真实重建或新的 C5 对照；历史性能结果不能用作新执行池的加速证据。
 - 下一步：处理组合入口中 admission 外预加载的常驻模型／artifact 生命周期边界，或在明确 caller allowance 合同后保留现状；随后重新检查时间/RSS 预算，在新目录做真实质量与性能对照。暂不拆 DAG、提高默认预算或扩至960帧。
@@ -418,9 +422,9 @@ Median：scale-space sum **61.215890 → 19.047049 s (-68.89%)**；feature wall 
 
 建议先选 6～12 帧的小项目，避免单个真实重建过长导致实验成本过高。每个 workflow 使用相同输入规模和相同配置，再增加一组大小不均的 workload，观察大任务是否饿死小任务。
 
-### 需要补的调度观测
+### 调度观测（已完成）
 
-当前 BA 已有 `BaSchedulingReport.queue_ms`，但高层 `SfmTaskflow::run/sequence` 的阶段排队时间还没有完整暴露给调用层。需要增加非侵入式 stage report 或可选事件字段，至少包含：
+高层 `SfmTaskflow::run/sequence` 已通过 `SfmStageReport` 暴露：
 
 ```text
 stage_name
@@ -429,12 +433,14 @@ granted_threads
 requested_memory
 granted_memory
 queue_ms
+dependency_wait_ms
+resource_wait_ms
 service_ms
 total_ms
 cancelled_or_failed
 ```
 
-不要让观测 API 改变同步借用 callback 的线程归属，也不要在 Taskflow worker 内再次同步提交同一个 Runtime。
+runtime `TaskReport`/`Event::Started` 同样提供 `queue_time`、`dependency_wait_time` 和 `resource_wait_time`。这些字段不改变同步借用 callback 的线程归属，也不在 Taskflow worker 内同步提交同一个 Runtime。没有实际 grant 的 pre-admission 失败/取消不伪造 resource wait，timing 字段保持为 0。
 
 ### 排队分析的验收标准
 

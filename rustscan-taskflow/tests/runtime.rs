@@ -186,6 +186,41 @@ fn rejects_unsatisfiable_resources_before_any_work_runs() {
 }
 
 #[test]
+fn rejects_dependency_memory_deadlock_before_execution() {
+    let runtime = Runtime::new(config(1)).unwrap();
+    let mut graph = TaskGraph::new();
+    let mut producer_request = cpu(1);
+    producer_request.output_memory_bytes = 900;
+    let producer = graph
+        .task(
+            "producer",
+            vec![TaskVariant::cpu("cpu", producer_request, |_| Ok(42u64))],
+        )
+        .unwrap();
+    let producer_id = producer.id();
+    let input = producer.clone();
+    let mut consumer_request = cpu(1);
+    consumer_request.working_memory_bytes = 200;
+    let consumer = graph
+        .task(
+            "consumer",
+            vec![TaskVariant::cpu("cpu", consumer_request, move |ctx| {
+                let value = ctx.input(&input)?;
+                drop(value);
+                Ok(())
+            })],
+        )
+        .unwrap();
+    graph.depends_on(consumer.id(), producer_id).unwrap();
+
+    assert!(matches!(
+        runtime.submit(graph),
+        Err(Error::Unschedulable(name)) if name == "consumer"
+    ));
+    assert_eq!(runtime.snapshot().unwrap().pending_tasks, 0);
+}
+
+#[test]
 fn asynchronous_gpu_releases_cpu_but_not_gpu_or_memory() {
     let runtime = Runtime::new(config(1)).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -667,6 +702,64 @@ fn bounded_overtaking_prevents_large_cpu_task_starvation() {
     assert!(report(&large).succeeded());
     assert!(report(&small_run).succeeded());
     report(&hold_run);
+}
+
+#[test]
+fn reports_dependency_and_resource_wait_separately() {
+    let runtime = Runtime::new(config(1)).unwrap();
+    let (hold_started, hold_started_rx) = mpsc::channel();
+    let (release_hold, release_hold_rx) = mpsc::channel();
+    let mut hold = TaskGraph::new();
+    hold.task(
+        "hold",
+        vec![TaskVariant::cpu("cpu", cpu(1), move |_| {
+            hold_started.send(()).unwrap();
+            release_hold_rx.recv_timeout(TIMEOUT).unwrap();
+            Ok(())
+        })],
+    )
+    .unwrap();
+    let hold_run = runtime.submit(hold).unwrap();
+    hold_started_rx.recv_timeout(TIMEOUT).unwrap();
+
+    let mut graph = TaskGraph::new();
+    let producer = graph
+        .task(
+            "producer",
+            vec![TaskVariant::cpu("cpu", cpu(1), |_| {
+                std::thread::sleep(Duration::from_millis(25));
+                Ok(())
+            })],
+        )
+        .unwrap();
+    let consumer = graph
+        .task(
+            "consumer",
+            vec![TaskVariant::cpu("cpu", cpu(1), |_| Ok(()))],
+        )
+        .unwrap();
+    graph.depends_on(consumer.id(), producer.id()).unwrap();
+    let run = runtime.submit(graph).unwrap();
+
+    std::thread::sleep(Duration::from_millis(30));
+    release_hold.send(()).unwrap();
+    let result = report(&run);
+    report(&hold_run);
+
+    let producer_report = &result.tasks[producer.id().index()];
+    let consumer_report = &result.tasks[consumer.id().index()];
+    let producer_execution = producer_report.execution_time.unwrap();
+    assert!(
+        producer_report.resource_wait_time.unwrap() >= Duration::from_millis(15),
+        "producer resource wait was {:?}",
+        producer_report.resource_wait_time
+    );
+    assert_eq!(producer_report.dependency_wait_time, Some(Duration::ZERO));
+    assert!(consumer_report.dependency_wait_time.unwrap() >= producer_execution);
+    assert!(consumer_report.queue_time.unwrap() >= consumer_report.dependency_wait_time.unwrap());
+    assert!(
+        consumer_report.resource_wait_time.unwrap() < consumer_report.dependency_wait_time.unwrap()
+    );
 }
 
 #[test]

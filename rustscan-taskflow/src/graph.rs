@@ -148,13 +148,78 @@ impl TaskGraph {
 
     pub(crate) fn validate_resources(&self, config: &RuntimeConfig) -> Result<(), Error> {
         let ledger = Ledger::new(config.clone());
+        let mut max_outputs = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
-            if !node
-                .variants
-                .iter()
-                .any(|v| ledger.fits(&v.name, &v.resources).is_some())
-            {
+            let mut max_output = 0;
+            let mut feasible = false;
+            for variant in &node.variants {
+                if let Some(grant) = ledger.fits(&variant.name, &variant.resources) {
+                    feasible = true;
+                    max_output = max_output.max(grant.output_memory_bytes);
+                }
+            }
+            if !feasible {
                 return Err(Error::Unschedulable(node.name.clone()));
+            }
+            max_outputs.push(max_output);
+        }
+
+        // A dependency can keep every ancestor artifact alive until the consumer
+        // has acquired its working memory. Build a conservative topological
+        // liveness bound so an impossible graph is rejected instead of waiting
+        // forever after its producers have completed.
+        let mut counts: Vec<_> = self.nodes.iter().map(|node| node.deps.len()).collect();
+        let mut consumers = vec![Vec::new(); self.len()];
+        for (index, node) in self.nodes.iter().enumerate() {
+            for &dependency in &node.deps {
+                consumers[dependency].push(index);
+            }
+        }
+        let mut ready: VecDeque<_> = counts
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count == 0)
+            .map(|(index, _)| index)
+            .collect();
+        let mut order = Vec::with_capacity(self.len());
+        while let Some(index) = ready.pop_front() {
+            order.push(index);
+            for &consumer in &consumers[index] {
+                counts[consumer] -= 1;
+                if counts[consumer] == 0 {
+                    ready.push_back(consumer);
+                }
+            }
+        }
+        if order.len() != self.len() {
+            return Err(Error::Cycle);
+        }
+
+        let mut retained = vec![0u64; self.len()];
+        for index in order {
+            let retained_before = self.nodes[index]
+                .deps
+                .iter()
+                .try_fold(0u64, |total, &dependency| {
+                    total
+                        .checked_add(retained[dependency])
+                        .and_then(|total| total.checked_add(max_outputs[dependency]))
+                })
+                .ok_or_else(|| Error::Unschedulable(self.nodes[index].name.clone()))?;
+            retained[index] = retained_before;
+
+            let has_memory_feasible_variant = self.nodes[index].variants.iter().any(|variant| {
+                ledger
+                    .fits(&variant.name, &variant.resources)
+                    .is_some_and(|grant| {
+                        retained_before
+                            .checked_add(grant.working_memory_bytes)
+                            .and_then(|total| total.checked_add(grant.output_memory_bytes))
+                            .is_some_and(|total| total <= config.budget.memory_bytes)
+                    })
+            });
+            if !has_memory_feasible_variant {
+                return Err(Error::Unschedulable(self.nodes[index].name.clone()));
             }
         }
         Ok(())

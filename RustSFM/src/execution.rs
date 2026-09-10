@@ -23,10 +23,23 @@ pub struct SfmStageReport {
     pub granted_threads: usize,
     pub requested_memory: u64,
     pub granted_memory: u64,
+    /// Runtime admission timing. When `granted_threads == 0`, no Taskflow
+    /// `Started` event exists and all timing fields are zero.
     pub queue_ms: f64,
+    /// Time spent waiting for prerequisite stages after submission.
+    pub dependency_wait_ms: f64,
+    /// Time spent ready but waiting for resource admission.
+    pub resource_wait_ms: f64,
     pub service_ms: f64,
     pub total_ms: f64,
     pub cancelled_or_failed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdmissionTiming {
+    queue_ms: f64,
+    dependency_wait_ms: f64,
+    resource_wait_ms: f64,
 }
 
 pub(crate) type StageReportSink = Arc<Mutex<Vec<SfmStageReport>>>;
@@ -209,7 +222,6 @@ impl SfmTaskflow {
     ) -> Result<R> {
         let requested_threads = threads.max(1);
         let requested_memory = self.scratch_bytes;
-        let admission_start = Instant::now();
         if let Err(error) = control.checkpoint() {
             if let Some(reports) = reports {
                 record_stage_report(
@@ -220,9 +232,11 @@ impl SfmTaskflow {
                         granted_threads: 0,
                         requested_memory,
                         granted_memory: 0,
-                        queue_ms: admission_start.elapsed().as_secs_f64() * 1000.0,
+                        queue_ms: 0.0,
+                        dependency_wait_ms: 0.0,
+                        resource_wait_ms: 0.0,
                         service_ms: 0.0,
-                        total_ms: admission_start.elapsed().as_secs_f64() * 1000.0,
+                        total_ms: 0.0,
                         cancelled_or_failed: true,
                     },
                 );
@@ -261,6 +275,8 @@ impl SfmTaskflow {
                                 requested_memory,
                                 granted_memory: active.grant.working_memory_bytes,
                                 queue_ms: 0.0,
+                                dependency_wait_ms: 0.0,
+                                resource_wait_ms: 0.0,
                                 service_ms,
                                 total_ms: service_ms,
                                 cancelled_or_failed: result.is_err(),
@@ -281,6 +297,8 @@ impl SfmTaskflow {
                                 requested_memory,
                                 granted_memory: active.grant.working_memory_bytes,
                                 queue_ms: 0.0,
+                                dependency_wait_ms: 0.0,
+                                resource_wait_ms: 0.0,
                                 service_ms,
                                 total_ms: service_ms,
                                 cancelled_or_failed: true,
@@ -303,7 +321,7 @@ impl SfmTaskflow {
             let reported = reports.is_some();
             let report_recorded = std::cell::Cell::new(false);
             let run = || {
-                admit_outer(&self.runtime, name, request, control, |grant, queue_ms| {
+                admit_outer(&self.runtime, name, request, control, |grant, timing| {
                     let service_start = Instant::now();
                     let result = Self::scoped(&self.runtime, grant, control, work);
                     if let Some(reports) = reports {
@@ -316,9 +334,11 @@ impl SfmTaskflow {
                                 granted_threads: grant.cpu_threads,
                                 requested_memory,
                                 granted_memory: grant.working_memory_bytes,
-                                queue_ms,
+                                queue_ms: timing.queue_ms,
+                                dependency_wait_ms: timing.dependency_wait_ms,
+                                resource_wait_ms: timing.resource_wait_ms,
                                 service_ms,
-                                total_ms: queue_ms + service_ms,
+                                total_ms: timing.queue_ms + service_ms,
                                 cancelled_or_failed: result.is_err(),
                             },
                         );
@@ -340,9 +360,11 @@ impl SfmTaskflow {
                                     granted_threads: 0,
                                     requested_memory,
                                     granted_memory: 0,
-                                    queue_ms: admission_start.elapsed().as_secs_f64() * 1000.0,
+                                    queue_ms: 0.0,
+                                    dependency_wait_ms: 0.0,
+                                    resource_wait_ms: 0.0,
                                     service_ms: 0.0,
-                                    total_ms: admission_start.elapsed().as_secs_f64() * 1000.0,
+                                    total_ms: 0.0,
                                     cancelled_or_failed: true,
                                 },
                             );
@@ -362,9 +384,11 @@ impl SfmTaskflow {
                         granted_threads: 0,
                         requested_memory,
                         granted_memory: 0,
-                        queue_ms: admission_start.elapsed().as_secs_f64() * 1000.0,
+                        queue_ms: 0.0,
+                        dependency_wait_ms: 0.0,
+                        resource_wait_ms: 0.0,
                         service_ms: 0.0,
-                        total_ms: admission_start.elapsed().as_secs_f64() * 1000.0,
+                        total_ms: 0.0,
                         cancelled_or_failed: true,
                     },
                 );
@@ -447,33 +471,30 @@ impl SfmTaskflow {
                 (name, request)
             })
             .collect::<Vec<_>>();
-        admit_chain(
-            &self.runtime,
-            &requests,
-            control,
-            |index, grant, queue_ms| {
-                let service_start = Instant::now();
-                let result = Self::scoped(&self.runtime, grant, control, || work(index));
-                if let Some(reports) = reports {
-                    let service_ms = service_start.elapsed().as_secs_f64() * 1000.0;
-                    record_stage_report(
-                        reports,
-                        SfmStageReport {
-                            stage_name: stages[index].0.to_owned(),
-                            requested_threads: stages[index].2.max(1),
-                            granted_threads: grant.cpu_threads,
-                            requested_memory: self.scratch_bytes,
-                            granted_memory: grant.working_memory_bytes,
-                            queue_ms,
-                            service_ms,
-                            total_ms: queue_ms + service_ms,
-                            cancelled_or_failed: result.is_err(),
-                        },
-                    );
-                }
-                result
-            },
-        )
+        admit_chain(&self.runtime, &requests, control, |index, grant, timing| {
+            let service_start = Instant::now();
+            let result = Self::scoped(&self.runtime, grant, control, || work(index));
+            if let Some(reports) = reports {
+                let service_ms = service_start.elapsed().as_secs_f64() * 1000.0;
+                record_stage_report(
+                    reports,
+                    SfmStageReport {
+                        stage_name: stages[index].0.to_owned(),
+                        requested_threads: stages[index].2.max(1),
+                        granted_threads: grant.cpu_threads,
+                        requested_memory: self.scratch_bytes,
+                        granted_memory: grant.working_memory_bytes,
+                        queue_ms: timing.queue_ms,
+                        dependency_wait_ms: timing.dependency_wait_ms,
+                        resource_wait_ms: timing.resource_wait_ms,
+                        service_ms,
+                        total_ms: timing.queue_ms + service_ms,
+                        cancelled_or_failed: result.is_err(),
+                    },
+                );
+            }
+            result
+        })
     }
 }
 
@@ -590,8 +611,8 @@ pub(crate) fn admit<R>(
         };
         return work(&grant, 0.0);
     }
-    admit_outer(runtime, name, request, control, |grant, queue_ms| {
-        SfmTaskflow::scoped(runtime, grant, control, || work(grant, queue_ms))
+    admit_outer(runtime, name, request, control, |grant, timing| {
+        SfmTaskflow::scoped(runtime, grant, control, || work(grant, timing.queue_ms))
     })
 }
 
@@ -602,19 +623,14 @@ fn admit_outer<R>(
     name: &str,
     request: ResourceRequest,
     control: &SfmTaskControl,
-    work: impl FnOnce(&ExecutionGrant, f64) -> Result<R>,
+    work: impl FnOnce(&ExecutionGrant, AdmissionTiming) -> Result<R>,
 ) -> Result<R> {
     let mut work = Some(work);
     let mut result = None;
-    admit_chain(
-        runtime,
-        &[(name, request)],
-        control,
-        |_, grant, queue_ms| {
-            result = Some(work.take().unwrap()(grant, queue_ms)?);
-            Ok(())
-        },
-    )?;
+    admit_chain(runtime, &[(name, request)], control, |_, grant, timing| {
+        result = Some(work.take().unwrap()(grant, timing)?);
+        Ok(())
+    })?;
     Ok(result.expect("completed single-stage graph must have a result"))
 }
 
@@ -622,7 +638,7 @@ fn admit_chain(
     runtime: &Arc<Runtime>,
     stages: &[(&str, ResourceRequest)],
     control: &SfmTaskControl,
-    mut work: impl FnMut(usize, &ExecutionGrant, f64) -> Result<()>,
+    mut work: impl FnMut(usize, &ExecutionGrant, AdmissionTiming) -> Result<()>,
 ) -> Result<()> {
     control.checkpoint()?;
     if stages.is_empty() {
@@ -645,7 +661,16 @@ fn admit_chain(
                 move |ctx| {
                     ctx.check_cancelled()?;
                     grants
-                        .send((index, ctx.grant().clone()))
+                        .send((
+                            index,
+                            ctx.grant().clone(),
+                            AdmissionTiming {
+                                queue_ms: ctx.queue_time().as_secs_f64() * 1000.0,
+                                dependency_wait_ms: ctx.dependency_wait_time().as_secs_f64()
+                                    * 1000.0,
+                                resource_wait_ms: ctx.resource_wait_time().as_secs_f64() * 1000.0,
+                            },
+                        ))
                         .map_err(|_| TaskError::Cancelled)?;
                     finished
                         .lock()
@@ -665,9 +690,8 @@ fn admit_chain(
         run: runtime.submit(graph)?,
         finish: Some(finish),
     };
-    let mut stage_queue_start = Instant::now();
     for expected in 0..stages.len() {
-        let (index, grant) = loop {
+        let (index, grant, timing) = loop {
             control.checkpoint()?;
             match receive.recv_timeout(Duration::from_millis(5)) {
                 Ok(grant) => break grant,
@@ -680,15 +704,13 @@ fn admit_chain(
         };
         anyhow::ensure!(index == expected, "stage DAG executed out of order");
         control.checkpoint()?;
-        let queue_ms = stage_queue_start.elapsed().as_secs_f64() * 1000.0;
-        let result = work(index, &grant, queue_ms);
+        let result = work(index, &grant, timing);
         let status = result
             .as_ref()
             .map(|_| ())
             .map_err(|error| TaskError::Failed(format!("{error:#}")));
         let _ = active.finish.as_ref().unwrap().send(status);
         result?;
-        stage_queue_start = Instant::now();
     }
     let report = active.run.wait();
     anyhow::ensure!(report.succeeded(), "stage graph failed: {:?}", report.tasks);

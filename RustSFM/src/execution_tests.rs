@@ -317,6 +317,9 @@ fn stage_reports_capture_grant_and_service_time() -> Result<()> {
     assert_eq!(report.requested_memory, 128);
     assert_eq!(report.granted_memory, 128);
     assert!(report.queue_ms.is_finite() && report.queue_ms >= 0.0);
+    assert!(report.dependency_wait_ms.is_finite() && report.dependency_wait_ms >= 0.0);
+    assert!(report.resource_wait_ms.is_finite() && report.resource_wait_ms >= 0.0);
+    assert!((report.queue_ms - report.dependency_wait_ms - report.resource_wait_ms).abs() < 0.1);
     assert!(report.service_ms >= 5.0);
     assert!(report.total_ms >= report.service_ms);
     assert!(!report.cancelled_or_failed);
@@ -341,6 +344,7 @@ fn sequence_reports_capture_each_stage_in_order() -> Result<()> {
     assert_eq!(visited, [0, 1]);
 
     let reports = stage_reports(&reports);
+    assert_eq!(reports.len(), 2);
     assert_eq!(
         reports
             .iter()
@@ -348,12 +352,19 @@ fn sequence_reports_capture_each_stage_in_order() -> Result<()> {
             .collect::<Vec<_>>(),
         ["prepare", "register"]
     );
+    assert_eq!(reports[0].dependency_wait_ms, 0.0);
+    assert!(reports[1].dependency_wait_ms >= reports[0].service_ms);
     for (report, requested_threads) in reports.iter().zip([4, 2]) {
         assert_eq!(report.requested_threads, requested_threads);
         assert_eq!(report.granted_threads, 1);
         assert_eq!(report.requested_memory, 128);
         assert_eq!(report.granted_memory, 128);
         assert!(report.queue_ms.is_finite() && report.queue_ms >= 0.0);
+        assert!(report.dependency_wait_ms.is_finite() && report.dependency_wait_ms >= 0.0);
+        assert!(report.resource_wait_ms.is_finite() && report.resource_wait_ms >= 0.0);
+        assert!(
+            (report.queue_ms - report.dependency_wait_ms - report.resource_wait_ms).abs() < 0.1
+        );
         assert!(report.service_ms >= 2.0);
         assert!(report.total_ms >= report.service_ms);
         assert!(!report.cancelled_or_failed);
@@ -380,6 +391,11 @@ fn stage_reports_capture_pre_admission_cancel() -> Result<()> {
     assert_eq!(reports.len(), 1);
     assert!(reports[0].cancelled_or_failed);
     assert_eq!(reports[0].granted_threads, 0);
+    assert_eq!(reports[0].queue_ms, 0.0);
+    assert_eq!(reports[0].dependency_wait_ms, 0.0);
+    assert_eq!(reports[0].resource_wait_ms, 0.0);
+    assert_eq!(reports[0].service_ms, 0.0);
+    assert_eq!(reports[0].total_ms, 0.0);
     released(&executor);
     Ok(())
 }

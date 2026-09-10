@@ -6,6 +6,7 @@ use std::sync::{
     mpsc::Sender,
     Arc, OnceLock,
 };
+use std::time::Duration;
 
 use crate::runtime::Command;
 use crate::{DeviceId, ExecutionGrant, ResourceRequest};
@@ -148,6 +149,9 @@ pub struct TaskContext {
     pub(crate) grant: ExecutionGrant,
     pub(crate) dependencies: Vec<TaskId>,
     pub(crate) cancel: CancellationToken,
+    dependency_wait_time: Duration,
+    resource_wait_time: Duration,
+    queue_time: Duration,
     pool: OnceLock<Result<rayon::ThreadPool, String>>,
 }
 
@@ -156,17 +160,37 @@ impl TaskContext {
         grant: ExecutionGrant,
         dependencies: Vec<TaskId>,
         cancel: CancellationToken,
+        dependency_wait_time: Duration,
+        resource_wait_time: Duration,
+        queue_time: Duration,
     ) -> Self {
         Self {
             grant,
             dependencies,
             cancel,
+            dependency_wait_time,
+            resource_wait_time,
+            queue_time,
             pool: OnceLock::new(),
         }
     }
     pub fn grant(&self) -> &ExecutionGrant {
         &self.grant
     }
+    pub fn queue_time(&self) -> Duration {
+        self.queue_time
+    }
+
+    /// Time spent waiting for prerequisite tasks after workflow submission.
+    pub fn dependency_wait_time(&self) -> Duration {
+        self.dependency_wait_time
+    }
+
+    /// Time spent ready but waiting for resource admission.
+    pub fn resource_wait_time(&self) -> Duration {
+        self.resource_wait_time
+    }
+
     pub fn cancellation(&self) -> CancellationToken {
         self.cancel.clone()
     }
