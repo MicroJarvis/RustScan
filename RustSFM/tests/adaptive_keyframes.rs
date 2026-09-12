@@ -303,7 +303,6 @@ fn runtime_selection_acquires_finite_metrics_and_reports_selection_progress() {
     mapper.min_triangulated = 1;
     mapper.essential_iterations = 250;
     mapper.sift_extraction.use_gpu = false;
-    mapper.sift_matching.use_gpu = false;
     let selection = AdaptiveKeyframeSelectionConfig {
         retention_feature_coverage: 0.35,
         min_inliers: 4,
@@ -388,8 +387,6 @@ fn selection_features_are_reused_by_keyframe_reconstruction() {
     mapper.abs_pose_min_num_inliers = 16;
     mapper.ignore_two_view_tracks = false;
     mapper.sift_extraction.use_gpu = false;
-    mapper.sift_matching.use_gpu = false;
-    mapper.sift_matching.cpu_brute_force_matcher = true;
     mapper.matching_pair_strategy = MatchingPairStrategy::LocalWindow { window: 5 };
     preseed_projected_sift_database(&output.join("Cache/database.db"), &frames);
     let selection_config = AdaptiveKeyframeSelectionConfig {

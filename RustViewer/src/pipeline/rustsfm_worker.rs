@@ -257,7 +257,6 @@ fn mapper_config_for(request: &StageRequest) -> rustsfm::MapperConfig {
     mapper_config.max_features = 4096;
     mapper_config.matching_pair_strategy = rustsfm::MatchingPairStrategy::LocalWindow { window: 5 };
     mapper_config.sift_extraction.use_gpu = request.manifest.sfm_config.use_gpu_sift;
-    mapper_config.sift_matching.use_gpu = request.manifest.sfm_config.use_gpu_matching;
     mapper_config.use_gpu_pnp = request.manifest.pnp_config.use_gpu_pnp;
     mapper_config
 }
@@ -827,7 +826,6 @@ mod tests {
             mapper_config.sift_extraction.use_gpu,
             !cfg!(target_os = "macos")
         );
-        assert!(mapper_config.sift_matching.use_gpu);
         assert!(mapper_config.use_gpu_pnp);
         assert!(mapper_config.local_matching);
         assert!(mapper_config.single_camera);
@@ -845,14 +843,12 @@ mod tests {
     fn project_gpu_configuration_can_disable_each_rustsfm_gpu_path() {
         let (_temp, mut request) = fixture_request();
         request.manifest.sfm_config.use_gpu_sift = false;
-        request.manifest.sfm_config.use_gpu_matching = false;
         request.manifest.pnp_config.use_gpu_pnp = false;
 
         let mapper_config = super::mapper_config_for(&request);
         let registration_config = super::registration_config_for(&request);
 
         assert!(!mapper_config.sift_extraction.use_gpu);
-        assert!(!mapper_config.sift_matching.use_gpu);
         assert!(!mapper_config.use_gpu_pnp);
         assert!(!registration_config.use_gpu_pnp);
     }

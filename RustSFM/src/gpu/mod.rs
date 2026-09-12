@@ -723,7 +723,6 @@ mod tests {
         let left = [zero, full];
         let right = [zero, full, middle];
         let options = crate::sift::SiftMatchingOptions {
-            use_gpu: true,
             max_ratio: 0.8,
             max_distance: 0.7,
             cross_check: true,
@@ -790,7 +789,6 @@ mod tests {
         let left = [[0u8; 128], [255u8; 128]];
         let right = [[0u8; 128], [255u8; 128], [127u8; 128]];
         let options = crate::sift::SiftMatchingOptions {
-            use_gpu: true,
             cross_check: true,
             ..Default::default()
         };

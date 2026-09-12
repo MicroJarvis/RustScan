@@ -46,18 +46,33 @@
 |---|---|---|
 | R1 VLFeat 指数表并发初始化 | ✅ 修复并验证 | POSIX/Windows once，仅同步初始化；修改前 TSan 复现 expn_tab 写竞争，修改后 normal/count/TSan 各 10 个新进程×8线程×12次提取逐位一致，SIFT focused 18 tests 通过。Windows 分支未编译验证；见 `output/expn_once_20260908_01/REPORT.md` |
 | R2a admission 执行池与 worker 上下文 | ✅ 合成回归通过 | 每次 admission 独占惰性池，弱引用 TLS 覆盖各 worker，嵌套借用父额度；本池 worker 的 native bridge 至多 CPU1，fixed minimum>1 拒绝，coordinator 保留原额度。default/no-default execution 各23 tests通过；不保证 detached spawn 或任意外部线程传播 |
-| R2b 特征内存规划 | ✅ 组合入口接线并通过 focused gates | 显式绑定的标准 CPU default/selected DB、mapper image-only、sequence keyframe/remaining/adaptive 均按尺寸规划；per-image 窗口统一最大估算 floor 避免异构任务与顺序 commit 等待环。mapper 在 admission 后、首个 decode 前复核尺寸/encoded length；动态预算不足仍等待/可取消，超 ceiling/父 grant 拒绝。默认无绑定、custom/nonstandard 保留旧估算契约，无自动工作集保障。existing reconstruction/artifact 在 admission 外预加载仍是明确边界。默认 mapper 9/9、no-default 2/2；sequence memory/taskflow default 4/6/2、no-default 3/4；memory review 4/4。见各 `output/*memory*` 报告 |
+| R2b 特征内存规划 | ✅ 组合入口接线并通过 focused gates | 显式绑定的标准 CPU default/selected DB、mapper image-only、sequence keyframe/remaining/adaptive 均按尺寸规划；per-image 窗口统一最大估算 floor 避免异构任务与顺序 commit 等待环。mapper 在 admission 后、首个 decode 前复核尺寸/encoded length；动态预算不足仍等待/可取消，超 ceiling/父 grant 拒绝。默认无绑定、custom/nonstandard 保留旧估算契约，无自动工作集保障。默认 mapper 9/9、no-default 2/2；sequence memory/taskflow default 4/6/2、no-default 3/4；memory review 4/4。见各 `output/*memory*` 报告 |
 | R3 BA 失败状态闭环 | ✅ focused 回归通过 | outcome 区分未尝试/失败/提交及后处理；失败不推进成功 watermark，dirty 保留 final refinement 资格；未改变 solver、迭代预算或强制 full-budget final。global_ba_ 22 passed、6 ignored，schedule/caps筛选通过（有重叠）；见 `output/ba3_review_20260908T092053Z/REPORT.md` |
-| R4 Taskflow DAG artifact liveness 准入检查 | ✅ 完成并验证 | 提交前按依赖拓扑保守计算可能存活的前置 output lease，与 consumer working/output 共同检查；producer 900 + consumer working 200 在 1000 ceiling 下于 submit 阶段返回 `Unschedulable`，不进入执行；runtime focused 27 tests 通过。该检查可能拒绝依赖分支共享释放协议的极端图，仍不是精确全图内存证明 |
+| R4 Taskflow DAG artifact liveness 准入检查 | ✅ 完成并修复集成回归 | 提交前将节点直接依赖的 output lease 与当前 working/output 共同检查；producer 900 + direct consumer working 200 在 1000 ceiling 下返回 `Unschedulable`。更早祖先不重复累计，跨节点存活必须由中间 output 显式声明；新增三节点 release 回归并恢复 RustSFM ordered extraction window。runtime 28/28、feature window 4/4 通过；仍不是精确 RSS/allocator 上限 |
 | R5 queue timing decomposition | ✅ 完成并验证 | `queue_ms` 保留 workflow 创建到 task 开始的总等待，新增 `dependency_wait_ms` 与 `resource_wait_ms`；高层 stage/sequence report 和 runtime `TaskReport` 均接线，pre-admission 未获 grant 的失败/取消报告 timing 为 0；runtime 27、execution 23、BA 7 focused tests 通过。此修复只改善正确性与观测，不构成加速证据 |
-| R6 mapper DB cache 生命周期边界 | ✅ 完成并验证 | `prepare_mapper_features` 只在 admission 前解析路径和 SIFT 计划，不再预加载 `DatabaseCache`；已有 DB 在 reconstruction stage 获得 grant 后加载，等待期间 DB 消失则 fail closed。新增损坏 DB + queued cancellation 回归，mapper composition focused 9 tests 通过。sequence 的 initial reconstruction/model growth 仍遵循 caller allowance 合同 |
+| R6 mapper DB cache 生命周期边界 | ✅ 完成并验证 | `prepare_mapper_features` 只在 admission 前解析路径和 SIFT 计划，不再预加载 `DatabaseCache`；已有 DB 在 reconstruction stage 获得 grant 后加载，等待期间 DB 消失则 fail closed。新增损坏 DB + queued cancellation 回归，mapper composition focused 9 tests 通过。 |
+| R7 sequence initial reconstruction 生命周期 | ✅ 完成并验证（2026-09-12） | admission 前只校验固定 DB/sparse 路径并对全部可能 target 做保守的 missing-feature plan；完整 DB/sparse 校验、`Reconstruction` 单次加载和 partial-keyframe registration plan 构建均移入 stage grant。queued cancellation 严格在模型加载前返回 typed cancellation；等待期间 sparse 消失在恢复预算后 fail closed；sequence integration 69/69 通过。model growth 仍由 caller other-work floor 估算覆盖，grant 不是 RSS 上限；未据此宣称加速 |
+| R8 GPU-only matching 迁移门 | ✅ focused 与 CI 配置完成（2026-09-12） | 产品约束为 SIFT matching 仅使用 wgpu，不提供 CPU fallback。修复 `gpu-wgpu` 条件编译；旧 FIFO verifier 控制不再生成 trace；no-default 仅作 lib compile check，GPU integration 显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan 并串行执行 GPU 测试。matching 30/30、GPU integration 81 passed/1 ignored、默认 lib 760 passed/19 ignored；fixture reference 提交前仍须确认纳入 Git |
+
+| R8 GPU-only matching 测试/CI 迁移 | ✅ focused 门完成（2026-09-12） | 不保留 CPU matching fallback。`no-default-features` 改为最小编译门；matching/sequence/adaptive 集成门显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan。GPU session 测试按 feature gate 编译，旧 FIFO verifier 控制不再生成 trace 且不得改变 GPU 结果。no-default release check 通过；GPU matching 30/30、GPU integration 81 passed/1 ignored。完整默认 lib 门及真实 flowers2 尚待后续验证 |
 
 - 内存/执行最终集成门：default/no-default memory 18/15、feature_extraction 31/27、execution 23/23，task_control 10；新增组合入口 focused 门：mapper 9/2、sequence memory 4/3、sequence integration memory 6/4、taskflow sequence 2/0、memory review 4/4。测试集合有重叠，不累加为独立总数。见 `output/feature_memory_gate_20260908T142841Z/FINAL_AUDIT.md`、`output/composition_memory_mapper_20260909/REPORT.md`、`output/sequence_memory_gates_20260909T090715Z/REPORT.md` 与 `output/memory_review_20260909T091946Z/REPORT.md`。
 - runtime `queue_time`/高层 `queue_ms` 现在表示从 workflow 创建到 task/stage 开始的总等待；`dependency_wait_time`/`dependency_wait_ms` 表示依赖完成前等待，`resource_wait_time`/`resource_wait_ms` 表示 ready 后等待资源。不要再把 `queue_ms` 单独解释为纯 resource wait；没有 runtime grant 的 pre-admission 失败/取消报告 timing 为 0。
 - 本轮只完成 fail-closed correctness、observability 和 mapper cache lifecycle 修复，未运行新的真实 flowers2 大实验，不能据此宣称 Taskflow 加速；历史 C4/C5 结论不变。
 - 独立只读复核确认异构窗口等待环、默认入口兼容性、transient budget 误拒绝、worker native 超额、mapper 排队后输入变化、adaptive 的 PnP-only GPU 误申请、取消错误优先级及 keyframe 静态校验顺序问题均已关闭。窗口 floor 依赖当前 scheduler 的 ready 顺序，并可能减少异构输入的并行度。
 - 估算是分配规划而非 RSS/allocator 上限，数据相关候选余量不是已证明的最坏上界。本轮未运行大图、真实重建或新的 C5 对照；历史性能结果不能用作新执行池的加速证据。
-- 下一步：继续处理 sequence 入口中 admission 外加载的 `initial_reconstruction`、database/model growth 生命周期，明确 caller allowance 或移动可移动的加载边界；随后重新检查时间/RSS 预算，在新目录做真实质量与性能对照。暂不拆 DAG、提高默认预算或扩至960帧。
+- 下一步：以 [`output/b1_r7_baseline_flowers2_20260910/REPORT.md`](../output/b1_r7_baseline_flowers2_20260910/REPORT.md) 为 R7 后 48 帧参考基线。后续二选一单变量推进：独立 `post_bogus_cameras` 质量复现门，或仅在新测瓶颈证据下开下一性能候选。暂不拆 DAG、提高默认预算或扩至960帧。
+
+### B1：R7 后 flowers2 first48 对照基线（2026-09-10）
+
+**状态：已完成（新目录；非相对 2026-09-07 的加速宣称）。** 报告：[REPORT.md](../output/b1_r7_baseline_flowers2_20260910/REPORT.md)；可复算 [metrics.json](../output/b1_r7_baseline_flowers2_20260910/metrics.json)。
+
+- 输入：`test_data/flowers2/images` 前 48 帧 symlink；8192 features；matching/reconstruction `random_seed=1`；threads=4；三项 BLAS/OpenMP=1。
+- 准备一次：259,829 keypoints；461 matched/verified pairs；259,206 matches；DB SHA-256 `af18e5b2…ea2abd`；三份 frozen 副本重建后哈希不变。
+- **database-first ×3**：均为 48/48、427 pairs、17,144 points、1 model；median process real **9.73 s**、RSS **323,698,688**、`elapsed_ms` **9723.65**。stage：`queue_ms`/`resource_wait_ms` median ≈ **0.007**，`dependency_wait_ms` **0**，grant 4/512MiB，`cancelled_or_failed=false`。
+- **image-only ×3**（`--local-matching`）：均为 48/48、428 pairs、1 model；points 16079–16113（median **16082**）；median process real **70.64 s**、RSS **4,118,626,304**。queue 分解同为近零 bookkeeping。
+- 与文档中的 2026-09-07 数量级一致（dbfirst ~9.98 s / 17144 pts；image-only 单次 ~65.68 s / 16090 pts）；差异视为噪声，**不作 R7 收益**。本路径是 mapper `reconstruct`，未直接锻炼 sequence R7 reload。
+- 限制：单工作流无竞争，不能证明多项目饥饿/资源账本；summary 无旧 `timing_*` 分段字段；不与跨路径总耗时比优劣。
 
 ### B1：真实匹配输出回归门完成（2026-09-07）
 

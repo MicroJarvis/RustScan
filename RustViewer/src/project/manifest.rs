@@ -246,7 +246,6 @@ pub struct SfmConfigSnapshot {
     pub adaptive_keyframes: rustsfm::AdaptiveKeyframeSelectionConfig,
     pub use_all_images: bool,
     pub use_gpu_sift: bool,
-    pub use_gpu_matching: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -271,7 +270,6 @@ impl Default for SfmConfigSnapshot {
             adaptive_keyframes: rustsfm::AdaptiveKeyframeSelectionConfig::default(),
             use_all_images: true,
             use_gpu_sift: default_use_gpu_sift(),
-            use_gpu_matching: true,
         }
     }
 }

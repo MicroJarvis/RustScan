@@ -152,7 +152,6 @@ fn new_manifest_uses_the_declared_schema_and_config_defaults() {
             adaptive_keyframes: rustsfm::AdaptiveKeyframeSelectionConfig::default(),
             use_all_images: true,
             use_gpu_sift: true,
-            use_gpu_matching: true,
         }
     );
     assert_eq!(

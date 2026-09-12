@@ -87,8 +87,6 @@ struct ReconstructArgs {
     #[arg(long, default_value_t = false)]
     sift_force_covariant: bool,
     #[arg(long, default_value_t = false)]
-    sift_cpu_brute_force_matcher: bool,
-    #[arg(long, default_value_t = false)]
     local_matching: bool,
     #[arg(long, default_value = "3")]
     local_window: usize,
@@ -321,10 +319,6 @@ struct MatchFeaturesArgs {
     vocab_tree_num_images: usize,
     #[arg(long, default_value = "0.8")]
     match_ratio: f64,
-    #[arg(long, default_value_t = false)]
-    sift_cpu_brute_force_matcher: bool,
-    #[arg(long, default_value_t = false)]
-    use_gpu: bool,
     #[arg(long, default_value = "15")]
     min_num_matches: usize,
     #[arg(long, default_value = "4.0")]
@@ -355,8 +349,6 @@ struct BenchmarkMatchPairsArgs {
     pair_limit: Option<usize>,
     #[arg(long, default_value = "1")]
     repetitions: usize,
-    #[arg(long, default_value_t = false)]
-    use_gpu: bool,
     #[arg(long, default_value = "0")]
     random_seed: i32,
     #[arg(long)]
@@ -764,19 +756,40 @@ mod tests {
     }
 
     #[test]
-    fn native_match_features_parses_use_gpu() {
-        let cli = Cli::try_parse_from([
-            "rustsfm",
-            "match-features",
-            "--database",
-            "database.db",
-            "--use-gpu",
-        ])
-        .unwrap();
+    fn native_match_features_parses_without_use_gpu_toggle() {
+        let cli = Cli::try_parse_from(["rustsfm", "match-features", "--database", "database.db"])
+            .unwrap();
         let Commands::MatchFeatures(args) = cli.command else {
             panic!("wrong command")
         };
-        assert!(args.use_gpu);
+        assert_eq!(args.database, PathBuf::from("database.db"));
+    }
+
+    #[test]
+    fn colmap_matcher_accepts_sift_matching_use_gpu_one() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "exhaustive_matcher",
+            "--database_path",
+            "database.db",
+            "--SiftMatching.use_gpu",
+            "1",
+        ])
+        .unwrap();
+        let Commands::ExhaustiveMatcher(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.use_gpu, Some(1));
+    }
+
+    #[test]
+    fn require_sift_matching_gpu_rejects_cpu_request() {
+        assert!(support::require_sift_matching_gpu(Some(0))
+            .unwrap_err()
+            .to_string()
+            .contains("SIFT CPU matching was removed"));
+        assert!(support::require_sift_matching_gpu(None).is_ok());
+        assert!(support::require_sift_matching_gpu(Some(1)).is_ok());
     }
 
     #[test]
@@ -792,7 +805,6 @@ mod tests {
             "96",
             "--repetitions",
             "3",
-            "--use-gpu",
             "--output-json",
             "report.json",
         ])
@@ -803,7 +815,6 @@ mod tests {
         assert_eq!(args.window, 5);
         assert_eq!(args.pair_limit, Some(96));
         assert_eq!(args.repetitions, 3);
-        assert!(args.use_gpu);
         assert_eq!(args.output_json, Some(PathBuf::from("report.json")));
     }
 

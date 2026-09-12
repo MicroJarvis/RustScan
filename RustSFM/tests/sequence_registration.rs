@@ -83,14 +83,13 @@ fn overwrite_sparse_binary(
     write_colmap_sparse_binary(destination, &files)
 }
 
-fn remaining_stage_error_before_checkpoint(
+fn remaining_stage_error(
     frames: &[SequenceFrame],
     keyframes: &KeyframeReconstructionResult,
     mapper_config: &MapperConfig,
     output: &Path,
 ) -> anyhow::Error {
     let control = SfmTaskControl::new();
-    control.request_pause();
     let mut sink = |_| {};
     let mut task = SfmTaskContext::new(&control, &mut sink);
     register_remaining_sequence_frames(
@@ -326,8 +325,6 @@ fn synthetic_sequence_fixture(
         extract_colors: false,
         ..MapperConfig::default()
     };
-    mapper_config.sift_matching.cpu_brute_force_matcher = true;
-    mapper_config.sift_matching.use_gpu = false;
     Ok((temp, output, frames, keyframe_result, mapper_config))
 }
 
@@ -570,7 +567,7 @@ fn sequence_memory_cached_independent_entries_keep_floor_and_typed_pause() -> an
 }
 
 #[test]
-fn sequence_memory_resume_artifact_error_precedes_pause_and_admission() -> anyhow::Result<()> {
+fn sequence_memory_pause_precedes_heavy_resume_artifact_validation() -> anyhow::Result<()> {
     let (_temp, output, frames, mut keyframes, config) = synthetic_sequence_fixture(None)?;
     keyframes.registered_keyframes += 1;
     let control = SfmTaskControl::new();
@@ -588,13 +585,143 @@ fn sequence_memory_resume_artifact_error_precedes_pause_and_admission() -> anyho
         &mut task,
     )
     .unwrap_err();
-    assert!(
-        error.to_string().contains("registered keyframe count"),
+    assert_eq!(
+        error.downcast_ref::<rustsfm::SfmTaskStop>(),
+        Some(&rustsfm::SfmTaskStop::Paused),
         "{error:#}"
     );
-    assert!(error.downcast_ref::<rustsfm::SfmTaskStop>().is_none());
     assert!(task.stage_reports().is_empty());
     Ok(())
+}
+
+#[test]
+fn sequence_memory_queued_cancellation_precedes_sparse_model_load() -> anyhow::Result<()> {
+    use rustscan_taskflow::{Budget, Runtime, RuntimeConfig};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(1);
+    let runtime = Arc::new(Runtime::new(RuntimeConfig {
+        budget: Budget {
+            cpu_threads: 1,
+            memory_bytes: 512 * 1024 * 1024,
+            io_slots: 1,
+        },
+        ..Default::default()
+    })?);
+    let executor = rustsfm::SfmTaskflow::new(runtime.clone(), 128 * 1024 * 1024)?;
+    let mut paused = runtime.snapshot()?.budget;
+    paused.cpu_threads = 0;
+    runtime.set_budget(paused)?;
+
+    let control = SfmTaskControl::new();
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let worker = scope.spawn(|| {
+            let mut sink = |_| {};
+            let mut task = SfmTaskContext::new(&control, &mut sink).with_taskflow(executor);
+            register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.snapshot()?.pending_tasks == 0 {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "remaining registration did not reach admission queue"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        control.request_cancel();
+        let error = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("remaining registration worker panicked"))?
+            .expect_err("queued remaining registration must be cancelled");
+        assert_eq!(
+            error.downcast_ref::<rustsfm::SfmTaskStop>(),
+            Some(&rustsfm::SfmTaskStop::Cancelled),
+            "{error:#}"
+        );
+        let snapshot = runtime.snapshot()?;
+        assert_eq!(snapshot.pending_tasks, 0);
+        assert_eq!(snapshot.cpu_threads, 0);
+        assert_eq!(snapshot.memory_bytes, 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn sequence_memory_missing_sparse_model_after_queue_fails_closed() -> anyhow::Result<()> {
+    use rustscan_taskflow::{Budget, Runtime, RuntimeConfig};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(1);
+    let runtime = Arc::new(Runtime::new(RuntimeConfig {
+        budget: Budget {
+            cpu_threads: 1,
+            memory_bytes: 512 * 1024 * 1024,
+            io_slots: 1,
+        },
+        ..Default::default()
+    })?);
+    let executor = rustsfm::SfmTaskflow::new(runtime.clone(), 128 * 1024 * 1024)?;
+    let ceiling = runtime.snapshot()?.budget;
+    let mut paused = ceiling;
+    paused.cpu_threads = 0;
+    runtime.set_budget(paused)?;
+
+    let control = SfmTaskControl::new();
+    let sparse = keyframes.sparse_model.clone();
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let worker = scope.spawn(|| {
+            let mut sink = |_| {};
+            let mut task = SfmTaskContext::new(&control, &mut sink).with_taskflow(executor);
+            register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.snapshot()?.pending_tasks == 0 {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "remaining registration did not reach admission queue"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::remove_dir_all(&sparse)?;
+        runtime.set_budget(ceiling)?;
+        let error = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("remaining registration worker panicked"))?
+            .expect_err("missing queued sparse model must fail after admission");
+        assert!(
+            error.to_string().contains("missing keyframe sparse model"),
+            "{error:#}"
+        );
+        let snapshot = runtime.snapshot()?;
+        assert_eq!(snapshot.pending_tasks, 0);
+        assert_eq!(snapshot.cpu_threads, 0);
+        assert_eq!(snapshot.memory_bytes, 0);
+        Ok(())
+    })
 }
 
 #[test]
@@ -994,8 +1121,7 @@ fn remaining_stage_requires_the_fixed_keyframe_sparse_path() -> anyhow::Result<(
     write_colmap_sparse_binary(&relocated, &relocated_files)?;
     keyframes.sparse_model = relocated;
 
-    let error =
-        remaining_stage_error_before_checkpoint(&frames, &keyframes, &mapper_config, &output);
+    let error = remaining_stage_error(&frames, &keyframes, &mapper_config, &output);
 
     assert!(error
         .to_string()
@@ -1027,8 +1153,7 @@ fn remaining_stage_rejects_stale_binary_names_ids_and_extra_images() -> anyhow::
         }
         overwrite_sparse_binary(&keyframes.sparse_model, &reconstruction)?;
 
-        let error =
-            remaining_stage_error_before_checkpoint(&frames, &keyframes, &mapper_config, &output);
+        let error = remaining_stage_error(&frames, &keyframes, &mapper_config, &output);
 
         assert!(
             error
@@ -1050,8 +1175,7 @@ fn remaining_stage_rejects_mismatched_keyframe_database_camera() -> anyhow::Resu
     )?;
     drop(connection);
 
-    let error =
-        remaining_stage_error_before_checkpoint(&frames, &keyframes, &mapper_config, &output);
+    let error = remaining_stage_error(&frames, &keyframes, &mapper_config, &output);
 
     assert!(error
         .to_string()

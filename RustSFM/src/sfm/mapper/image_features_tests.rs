@@ -566,11 +566,13 @@ fn composition_memory_mapper_gpu_union_and_floor_survive_planned_admission() -> 
     let control = SfmTaskControl::new();
     let mut sink = |_| {};
     let mut task = SfmTaskContext::new(&control, &mut sink).with_taskflow(executor(1024, 128, 1)?);
-    for route in 0..3 {
+    // Default SIFT feature type implies GPU matching.
+    assert!(mapper_uses_gpu(&config(std::path::Path::new("unused"))));
+    for route in 0..2 {
         let mut cfg = config(std::path::Path::new("unused"));
+        cfg.feature_type = FeatureType::Orb;
         cfg.sift_extraction.use_gpu = route == 0;
-        cfg.sift_matching.use_gpu = route == 1;
-        cfg.use_gpu_pnp = route == 2;
+        cfg.use_gpu_pnp = route == 1;
         assert!(mapper_uses_gpu(&cfg));
         task.execute_with_memory_and_gpu(
             "reconstruction",
@@ -581,6 +583,8 @@ fn composition_memory_mapper_gpu_union_and_floor_survive_planned_admission() -> 
         )?;
         assert_eq!(task.feature_memory_limits()?.0, 128);
     }
-    assert!(!mapper_uses_gpu(&config(std::path::Path::new("unused"))));
+    let mut cpu_only = config(std::path::Path::new("unused"));
+    cpu_only.feature_type = FeatureType::Orb;
+    assert!(!mapper_uses_gpu(&cpu_only));
     Ok(())
 }

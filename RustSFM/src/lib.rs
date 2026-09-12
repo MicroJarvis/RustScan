@@ -49,8 +49,6 @@ mod feature_matching_db;
 pub mod retrieval;
 #[path = "feature/sift.rs"]
 pub mod sift;
-#[path = "feature/sift_index.rs"]
-mod sift_index;
 #[path = "feature/wide.rs"]
 pub mod wide;
 

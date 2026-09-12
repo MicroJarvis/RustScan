@@ -4,14 +4,20 @@ use rustsfm::feature_matching::MatchingPairStrategy;
 use rustsfm::sift::{SiftExtractionOptions, SiftMatchingOptions};
 use std::path::PathBuf;
 
-pub(super) fn sift_matching_from_args(
-    match_ratio: f64,
-    sift_cpu_brute_force_matcher: bool,
-) -> SiftMatchingOptions {
+pub(super) fn sift_matching_from_args(match_ratio: f64) -> SiftMatchingOptions {
     SiftMatchingOptions {
         max_ratio: match_ratio as f32,
-        cpu_brute_force_matcher: sift_cpu_brute_force_matcher,
         ..Default::default()
+    }
+}
+
+/// COLMAP `--SiftMatching.use_gpu`: omit/`1` keep GPU-only matching; `0` is rejected.
+pub(super) fn require_sift_matching_gpu(use_gpu: Option<i32>) -> Result<()> {
+    match super::project::colmap_optional_bool(use_gpu, "SiftMatching.use_gpu")? {
+        Some(false) => bail!(
+            "SIFT CPU matching was removed; SiftMatching.use_gpu=0 is unsupported (matching always uses GPU)"
+        ),
+        Some(true) | None => Ok(()),
     }
 }
 

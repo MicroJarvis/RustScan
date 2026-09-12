@@ -2,7 +2,7 @@ use super::feature_database::ensure_feature_extractor_database;
 use super::project::{colmap_bool, colmap_optional_bool, resolve_colmap_mapper_args};
 use super::support::{
     format_mask_overlap, matching_pair_strategy_from_name, parity_image_names, parse_sparse_format,
-    sift_extraction_from_args, sift_matching_from_args,
+    require_sift_matching_gpu, sift_extraction_from_args, sift_matching_from_args,
 };
 use super::*;
 use anyhow::{Context, Result};
@@ -60,7 +60,6 @@ fn run_reconstruct(args: ReconstructArgs) -> Result<()> {
         sift_matching: SiftMatchingOptions {
             guided_matching: args.guided_matching,
             max_guided_epipolar_error_px: args.guided_max_epipolar_error_px,
-            cpu_brute_force_matcher: args.sift_cpu_brute_force_matcher,
             max_ratio: args.match_ratio as f32,
             ..Default::default()
         },
@@ -162,10 +161,7 @@ fn run_match_features(args: MatchFeaturesArgs) -> Result<()> {
                 args.sequential_loop_detection_period,
                 args.vocab_tree_num_images,
             ),
-            sift_matching: SiftMatchingOptions {
-                use_gpu: args.use_gpu,
-                ..sift_matching_from_args(args.match_ratio, args.sift_cpu_brute_force_matcher)
-            },
+            sift_matching: sift_matching_from_args(args.match_ratio),
             min_num_matches: args.min_num_matches,
             min_inliers: args.min_num_matches,
             essential_threshold_px: args.essential_threshold_px,
@@ -199,7 +195,6 @@ fn run_benchmark_match_pairs(args: BenchmarkMatchPairsArgs) -> Result<()> {
     options.pair_strategy = MatchingPairStrategy::LocalWindow {
         window: args.window,
     };
-    options.sift_matching.use_gpu = args.use_gpu;
     options.random_seed = args.random_seed;
     options.task_pair_batch_size = 1;
     let report = if let Some(artifacts_dir) = args.artifacts_dir.as_deref() {
@@ -292,35 +287,14 @@ fn run_colmap_matcher(
     output_json: Option<PathBuf>,
     log_level: String,
 ) -> Result<()> {
-    let use_gpu = colmap_optional_bool(use_gpu, "SiftMatching.use_gpu")?;
+    env_logger::Builder::new().parse_filters(&log_level).init();
+    require_sift_matching_gpu(use_gpu)?;
     let guided_matching = colmap_bool(guided_matching, "SiftMatching.guided_matching")?;
-    let args = MatchFeaturesArgs {
-        database: database_path,
-        matching_strategy: "sequential".to_string(),
-        sequential_overlap: 10,
-        sequential_quadratic_overlap: true,
-        sequential_loop_detection: false,
-        sequential_loop_detection_period: 10,
-        vocab_tree_num_images: 100,
-        match_ratio: max_ratio,
-        sift_cpu_brute_force_matcher: false,
-        use_gpu: use_gpu.unwrap_or(false),
-        min_num_matches: min_num_inliers,
-        essential_threshold_px: max_error,
-        essential_iterations: max_num_trials,
-        clear_existing: true,
-        use_existing_matches: false,
-        existing_match_batch_size: 1000,
-        random_seed,
-        output_json,
-        log_level,
-    };
-    let mut options = MatchFeaturesOptions {
+    let options = MatchFeaturesOptions {
         pair_strategy: strategy,
         sift_matching: SiftMatchingOptions {
             guided_matching,
             max_ratio: max_ratio as f32,
-            use_gpu: args.use_gpu,
             ..Default::default()
         },
         min_num_matches: min_num_inliers,
@@ -328,10 +302,10 @@ fn run_colmap_matcher(
         essential_threshold_px: max_error,
         essential_iterations: max_num_trials,
         random_seed,
+        clear_existing: true,
         ..MatchFeaturesOptions::default()
     };
-    options.clear_existing = args.clear_existing;
-    let report = match_features_to_database(&args.database, &options)?;
+    let report = match_features_to_database(&database_path, &options)?;
     println!(
         "matcher: pairs={} matched={} verified={} total_matches={} seconds={:.3}",
         report.pair_count,
@@ -340,7 +314,7 @@ fn run_colmap_matcher(
         report.total_matches,
         report.matching_seconds
     );
-    if let Some(path) = args.output_json {
+    if let Some(path) = output_json {
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     }
     Ok(())
@@ -436,7 +410,6 @@ fn run_colmap_mapper(args: ColmapMapperArgs) -> Result<()> {
         sift_estimate_affine_shape: false,
         sift_domain_size_pooling: false,
         sift_force_covariant: false,
-        sift_cpu_brute_force_matcher: false,
         local_matching: false,
         local_window: 3,
         matching_strategy: "sequential".to_string(),

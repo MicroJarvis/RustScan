@@ -370,7 +370,7 @@ pub fn run_keyframe_reconstruction(
     task.execute_with_memory_and_gpu(
         "keyframe reconstruction and export",
         mapper_config.sift_extraction.use_gpu
-            || mapper_config.sift_matching.use_gpu
+            || matches!(mapper_config.feature_type, FeatureType::Sift)
             || mapper_config.use_gpu_pnp,
         planned
             .as_ref()
@@ -1011,9 +1011,10 @@ pub(super) fn validate_runner_inputs(
     Ok(keyframe_indices)
 }
 
-/// Resume artifacts (including the existing reconstruction) are loaded and
-/// validated before pause/memory admission. With a taskflow binding, the caller
-/// must size the stage-memory floor for live model/matching/BA/cache work;
+/// Resume artifact paths are validated before pause/memory admission. The sparse
+/// reconstruction and database contents are loaded and validated only after the
+/// stage grant. With a taskflow binding, the caller must size the stage-memory
+/// floor for live model/matching/BA/cache work (including model growth);
 /// supported per-target SIFT scratch is additive. Targets remain lazily extracted.
 pub fn register_remaining_sequence_frames(
     frames: &[SequenceFrame],
@@ -1075,33 +1076,28 @@ fn register_remaining_sequence_frames_planned(
             keyframe_result.database.display()
         );
     }
-    let initial_reconstruction = validate_keyframe_artifacts(
-        frames,
-        &keyframe_indices,
-        keyframe_result,
-        mapper_config,
-        output,
-    )?;
-    let initial_registered_names = registered_image_names(&initial_reconstruction);
-    let registered_keyframe_indices =
-        registered_keyframe_indices(frames, &keyframe_indices, &initial_registered_names)?;
-    let plan = SequenceRegistrationPlan::build_from_frames(
-        frames,
-        &registered_keyframe_indices,
-        config.narrow_neighbors_each_side,
-        config.wide_neighbors_each_side,
-    )?;
-    drop(initial_registered_names);
-    // Artifact/model loading deliberately precedes planning, pause and admission.
-    // The loaded reconstruction is outside admission; its residency and subsequent
-    // model growth are covered only by the caller's other-work allowance contract.
+    let expected_sparse_model = output.join("Cache").join("keyframe-sparse").join("0");
+    if keyframe_result.sparse_model != expected_sparse_model {
+        anyhow::bail!(
+            "keyframe sparse model must remain at {}",
+            expected_sparse_model.display()
+        );
+    }
+    if !keyframe_result.sparse_model.is_dir() {
+        anyhow::bail!(
+            "missing keyframe sparse model {}",
+            keyframe_result.sparse_model.display()
+        );
+    }
     let owned_plans;
     let target_plans = if let Some(plans) = preplanned {
         plans
     } else {
+        // Registration success is unknown until the admitted sparse model is
+        // loaded. Plan every possible target, but only missing feature rows.
         owned_plans = sequence_target_plans(
             frames,
-            plan.pending_frames(),
+            &(0..frames.len()).collect::<Vec<_>>(),
             &keyframe_result.database,
             mapper_config,
             task,
@@ -1116,13 +1112,28 @@ fn register_remaining_sequence_frames_planned(
     task.execute_with_memory_and_gpu(
         "remaining registration and final export",
         mapper_config.sift_extraction.use_gpu
-            || mapper_config.sift_matching.use_gpu
+            || matches!(mapper_config.feature_type, FeatureType::Sift)
             || config.use_gpu_pnp,
         request,
         mapper_config.threads.unwrap_or(4),
         |task| {
             task.checkpoint().map_err(anyhow::Error::new)?;
+            let initial_reconstruction = validate_keyframe_artifacts(
+                frames,
+                &keyframe_indices,
+                keyframe_result,
+                mapper_config,
+                output,
+            )?;
             let initial_registered_names = registered_image_names(&initial_reconstruction);
+            let registered_keyframe_indices =
+                registered_keyframe_indices(frames, &keyframe_indices, &initial_registered_names)?;
+            let plan = SequenceRegistrationPlan::build_from_frames(
+                frames,
+                &registered_keyframe_indices,
+                config.narrow_neighbors_each_side,
+                config.wide_neighbors_each_side,
+            )?;
 
             let sequence_input = output.join("Cache").join("sequence");
             std::fs::create_dir_all(&sequence_input)?;
@@ -1734,7 +1745,8 @@ pub fn run_sequence_registration(
 ) -> anyhow::Result<SequenceRegistrationResult> {
     validate_keyframe_reconstruction_config(mapper_config)?;
     task.inherit_ba_taskflow(mapper_config)?;
-    let gpu = mapper_config.sift_extraction.use_gpu || mapper_config.sift_matching.use_gpu;
+    let gpu = mapper_config.sift_extraction.use_gpu
+        || matches!(mapper_config.feature_type, FeatureType::Sift);
     let threads = mapper_config.threads.unwrap_or(4);
     let keyframe_indices = validate_runner_inputs(frames, keyframe_ids)?;
     config.validate().map_err(anyhow::Error::new)?;
@@ -2841,11 +2853,12 @@ mod task6_tests {
                 }
             })
             .collect::<Vec<_>>();
-        for (extract_gpu, match_gpu) in [(false, false), (true, false), (false, true)] {
+        // SIFT matching always uses GPU, so adaptive selection is GPU even when
+        // extraction/PnP flags are off. Nested GPU under a CPU parent must fail.
+        for extract_gpu in [false, true] {
             let mut config = MapperConfig::default();
             config.use_gpu_pnp = true;
             config.sift_extraction.use_gpu = extract_gpu;
-            config.sift_matching.use_gpu = match_gpu;
             config.max_features = 8;
             config.threads = Some(1);
             let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(Default::default())?);
@@ -2870,25 +2883,11 @@ mod task6_tests {
                     )
                 })
                 .unwrap_err();
-            if extract_gpu || match_gpu {
-                assert!(!began.get());
-                assert!(
-                    error.to_string().contains("nested inside a CPU-only stage"),
-                    "{error:#}"
-                );
-            } else {
-                assert!(began.get(), "PnP-only flag rejected selection: {error:#}");
-                assert_eq!(
-                    error.downcast_ref::<crate::SfmTaskStop>(),
-                    Some(&crate::SfmTaskStop::Paused)
-                );
-                assert!(
-                    task.stage_reports()
-                        .iter()
-                        .any(|r| r.stage_name == "adaptive keyframe selection"
-                            && r.granted_memory > 0)
-                );
-            }
+            assert!(!began.get());
+            assert!(
+                error.to_string().contains("nested inside a CPU-only stage"),
+                "{error:#}"
+            );
         }
         Ok(())
     }
@@ -2913,7 +2912,6 @@ mod task6_tests {
                         }];
                         let mut config = MapperConfig::default();
                         config.sift_extraction.use_gpu = false;
-                        config.sift_matching.use_gpu = false;
                         config.use_gpu_pnp = false;
                         let expected = if vocab {
                             config.matching_pair_strategy =

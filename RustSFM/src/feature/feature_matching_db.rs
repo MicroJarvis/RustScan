@@ -11,7 +11,7 @@ use crate::gpu::WgpuGeometryTiming;
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher, WgpuSiftMatcherTiming};
 use crate::mapper::pair_geometry_to_colmap_two_view_geometry;
-use crate::sift::{match_sift_with_options, SiftFeatures, SiftMatchingOptions};
+use crate::sift::{SiftFeatures, SiftMatchingOptions};
 use crate::task::{SfmTaskContext, SfmTaskEvent, SfmTaskEventKind, SfmTaskOperation, SfmTaskStage};
 use crate::two_view::{
     diagnose_calibrated_two_view_with_observations_rays_and_cameras,
@@ -21,7 +21,6 @@ use crate::two_view::{
 use crate::types::{CameraModel, ImageFrame, PairGeometry};
 use anyhow::{bail, Context, Result};
 use lowe_sift::Descriptor;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -253,12 +252,17 @@ impl Default for MatchFeaturesOptions {
     }
 }
 
-fn matching_backend_name(options: &SiftMatchingOptions) -> &'static str {
-    if options.use_gpu {
-        "wgpu_match_and_score"
-    } else {
-        "cpu_match_and_score"
+fn matching_backend_name(_options: &SiftMatchingOptions) -> &'static str {
+    "wgpu_match_and_score"
+}
+
+fn require_gpu_matching_feature() -> Result<()> {
+    #[cfg(not(feature = "gpu-wgpu"))]
+    {
+        bail!("SIFT matching requires RustSFM to be compiled with the gpu-wgpu feature");
     }
+    #[cfg(feature = "gpu-wgpu")]
+    Ok(())
 }
 
 pub fn match_features_to_database(
@@ -279,7 +283,7 @@ pub fn match_features_to_database_with_task(
     if crate::execution::active_threads().is_none() {
         return task.execute(
             "feature matching and verification",
-            options.sift_matching.use_gpu,
+            true,
             if colmap_fifo_verifier_enabled(options) {
                 colmap_fifo_verifier_threads()
             } else {
@@ -289,6 +293,7 @@ pub fn match_features_to_database_with_task(
         );
     }
     options.sift_matching.check()?;
+    require_gpu_matching_feature()?;
     task.checkpoint()?;
     let started = Instant::now();
     let prepare_started = Instant::now();
@@ -325,26 +330,21 @@ pub fn match_features_to_database_with_task(
 
     let backend_started = Instant::now();
     #[cfg(feature = "gpu-wgpu")]
-    let computed_backend = if !options.use_existing_matches && options.sift_matching.use_gpu {
+    let computed_backend = if !options.use_existing_matches {
         Some(ComputedGpuBackend::new()?)
     } else {
         None
     };
     #[cfg(feature = "gpu-wgpu")]
-    let existing_backend = if options.use_existing_matches && options.sift_matching.use_gpu {
+    let existing_backend = if options.use_existing_matches {
         Some(ExistingGpuBackend::new()?)
     } else {
         None
     };
-    #[cfg(not(feature = "gpu-wgpu"))]
-    if options.sift_matching.use_gpu {
-        bail!("RustSFM was built without gpu-wgpu support");
-    }
     timings.backend_initialization_seconds = backend_started.elapsed().as_secs_f64();
 
-    let fifo_enabled = options.use_existing_matches
-        && !options.sift_matching.use_gpu
-        && colmap_fifo_verifier_enabled(options);
+    // FIFO CPU verifier is unreachable: descriptor matching / scoring always use wgpu.
+    let fifo_enabled = false;
 
     let mut reports = Vec::new();
     let mut total_matches = 0usize;
@@ -397,7 +397,7 @@ pub fn match_features_to_database_with_task(
                     &cameras,
                     options,
                     #[cfg(feature = "gpu-wgpu")]
-                    existing_backend.as_ref(),
+                    existing_backend.as_ref().unwrap(),
                 )?
             } else {
                 let computed = computed_match_pair_reports_for_inputs(
@@ -406,7 +406,7 @@ pub fn match_features_to_database_with_task(
                     &cameras,
                     options,
                     #[cfg(feature = "gpu-wgpu")]
-                    computed_backend.as_ref(),
+                    computed_backend.as_ref().unwrap(),
                 )?;
                 timings.record_computed_batch(&computed);
                 computed.reports
@@ -474,28 +474,19 @@ pub fn match_features_to_database_with_task(
 }
 
 pub(crate) struct ExplicitPairMatchingSession {
-    use_gpu: bool,
     initialization_seconds: f64,
     #[cfg(feature = "gpu-wgpu")]
-    computed_backend: Option<ComputedGpuBackend>,
+    computed_backend: ComputedGpuBackend,
 }
 
 impl ExplicitPairMatchingSession {
     pub(crate) fn new(options: &MatchFeaturesOptions) -> Result<Self> {
         options.sift_matching.check()?;
+        require_gpu_matching_feature()?;
         let started = Instant::now();
         #[cfg(feature = "gpu-wgpu")]
-        let computed_backend = if options.sift_matching.use_gpu {
-            Some(ComputedGpuBackend::new()?)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "gpu-wgpu"))]
-        if options.sift_matching.use_gpu {
-            bail!("RustSFM was built without gpu-wgpu support");
-        }
+        let computed_backend = ComputedGpuBackend::new()?;
         Ok(Self {
-            use_gpu: options.sift_matching.use_gpu,
             initialization_seconds: started.elapsed().as_secs_f64(),
             #[cfg(feature = "gpu-wgpu")]
             computed_backend,
@@ -514,19 +505,14 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_task(
     task: &mut SfmTaskContext<'_>,
 ) -> Result<MatchFeaturesReport> {
     if crate::execution::active_threads().is_none() {
-        return task.execute(
-            "explicit pair matching",
-            options.sift_matching.use_gpu,
-            4,
-            |task| {
-                match_explicit_image_pairs_to_database_with_task(
-                    database_path,
-                    image_pairs,
-                    options,
-                    task,
-                )
-            },
-        );
+        return task.execute("explicit pair matching", true, 4, |task| {
+            match_explicit_image_pairs_to_database_with_task(
+                database_path,
+                image_pairs,
+                options,
+                task,
+            )
+        });
     }
     let session = ExplicitPairMatchingSession::new(options)?;
     let mut report = match_explicit_image_pairs_to_database_with_session(
@@ -550,11 +536,9 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
     task: &mut SfmTaskContext<'_>,
 ) -> Result<MatchFeaturesReport> {
     options.sift_matching.check()?;
+    require_gpu_matching_feature()?;
     if options.use_existing_matches {
         bail!("explicit image-pair matching requires computed matches");
-    }
-    if session.use_gpu != options.sift_matching.use_gpu {
-        bail!("explicit matching session backend does not match the requested options");
     }
     task.checkpoint()?;
     let started = Instant::now();
@@ -626,7 +610,7 @@ pub(crate) fn match_explicit_image_pairs_to_database_with_session(
             &cameras,
             options,
             #[cfg(feature = "gpu-wgpu")]
-            session.computed_backend.as_ref(),
+            &session.computed_backend,
         )?;
         timings.record_computed_batch(&computed);
         let pair_reports = computed.reports;
@@ -1135,11 +1119,11 @@ fn computed_match_pair_reports_for_inputs(
     frames: &[ImageFrame],
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
-    #[cfg(feature = "gpu-wgpu")] gpu_backend: Option<&ComputedGpuBackend>,
+    #[cfg(feature = "gpu-wgpu")] gpu_backend: &ComputedGpuBackend,
 ) -> Result<ComputedMatchPairBatch> {
     let pairs = batch.iter().map(|pair| pair.indices()).collect::<Vec<_>>();
     #[cfg(feature = "gpu-wgpu")]
-    if let Some(backend) = gpu_backend {
+    {
         let mut reports = Vec::with_capacity(pairs.len());
         let mut gpu_descriptor_match_seconds = 0.0;
         let mut gpu_geometry_seconds = 0.0;
@@ -1147,7 +1131,7 @@ fn computed_match_pair_reports_for_inputs(
         let mut gpu_matcher_timing = WgpuSiftMatcherTiming::default();
         for &(left, right) in &pairs {
             let descriptor_started = Instant::now();
-            let (matches, pair_timing) = backend.matcher.match_descriptors_profiled(
+            let (matches, pair_timing) = gpu_backend.matcher.match_descriptors_profiled(
                 &frames[left].sift.descriptors_u8,
                 &frames[right].sift.descriptors_u8,
                 &options.sift_matching,
@@ -1156,7 +1140,7 @@ fn computed_match_pair_reports_for_inputs(
             gpu_matcher_timing += pair_timing;
             let geometry_started = Instant::now();
             let (report, pair_geometry_timing) = estimate_existing_or_computed_pair_gpu_profiled(
-                &backend.scorer,
+                &gpu_backend.scorer,
                 left,
                 right,
                 matches,
@@ -1178,28 +1162,11 @@ fn computed_match_pair_reports_for_inputs(
             gpu_matcher_timing,
         });
     }
-    Ok(ComputedMatchPairBatch {
-        reports: crate::execution::parallel(|| {
-            pairs
-                .par_iter()
-                .filter_map(|&(left, right)| {
-                    let matches = match_sift_with_options(
-                        &frames[left].sift,
-                        &frames[right].sift,
-                        &options.sift_matching,
-                    );
-                    estimate_existing_or_computed_pair(
-                        left, right, matches, frames, cameras, options,
-                    )
-                })
-                .collect()
-        }),
-        gpu_descriptor_match_seconds: 0.0,
-        gpu_geometry_seconds: 0.0,
-        gpu_geometry_timing: WgpuGeometryTiming::default(),
-        #[cfg(feature = "gpu-wgpu")]
-        gpu_matcher_timing: WgpuSiftMatcherTiming::default(),
-    })
+    #[cfg(not(feature = "gpu-wgpu"))]
+    {
+        let _ = (batch, frames, cameras, options, pairs);
+        bail!("SIFT matching requires RustSFM to be compiled with the gpu-wgpu feature")
+    }
 }
 
 fn existing_match_pair_reports_for_inputs(
@@ -1207,10 +1174,10 @@ fn existing_match_pair_reports_for_inputs(
     frames: &[ImageFrame],
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
-    #[cfg(feature = "gpu-wgpu")] gpu_backend: Option<&ExistingGpuBackend>,
+    #[cfg(feature = "gpu-wgpu")] gpu_backend: &ExistingGpuBackend,
 ) -> Result<Vec<PairReportInput>> {
     #[cfg(feature = "gpu-wgpu")]
-    if let Some(backend) = gpu_backend {
+    {
         let mut reports = Vec::with_capacity(batch.len());
         for pair in batch {
             let MatchPairInput::Existing {
@@ -1222,7 +1189,7 @@ fn existing_match_pair_reports_for_inputs(
                 unreachable!()
             };
             if let Some(report) = estimate_existing_or_computed_pair_gpu(
-                &backend.scorer,
+                &gpu_backend.scorer,
                 *left,
                 *right,
                 matches.clone(),
@@ -1236,32 +1203,10 @@ fn existing_match_pair_reports_for_inputs(
         return Ok(reports);
     }
     #[cfg(not(feature = "gpu-wgpu"))]
-    if options.sift_matching.use_gpu {
-        bail!("RustSFM was built without gpu-wgpu support");
+    {
+        let _ = (batch, frames, cameras, options);
+        bail!("SIFT matching requires RustSFM to be compiled with the gpu-wgpu feature")
     }
-    Ok(crate::execution::parallel(|| {
-        batch
-            .par_iter()
-            .filter_map(|pair| {
-                let MatchPairInput::Existing {
-                    left,
-                    right,
-                    matches,
-                } = pair
-                else {
-                    unreachable!()
-                };
-                estimate_existing_or_computed_pair(
-                    *left,
-                    *right,
-                    matches.clone(),
-                    frames,
-                    cameras,
-                    options,
-                )
-            })
-            .collect()
-    }))
 }
 
 fn load_database_frames_and_cameras(
@@ -2864,6 +2809,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_explicit_matching_session_excludes_reused_initialization_time() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl};
@@ -2875,10 +2821,8 @@ mod tests {
         let mut options = controlled_computed_matching_options(1);
         options.clear_existing = false;
         let session = ExplicitPairMatchingSession {
-            use_gpu: false,
             initialization_seconds: 1.0,
-            #[cfg(feature = "gpu-wgpu")]
-            computed_backend: None,
+            computed_backend: ComputedGpuBackend::new()?,
         };
 
         let report = match_explicit_image_pairs_to_database_with_session(
@@ -2899,7 +2843,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_fifo_trace_is_independent_of_task_commit_batch_size() -> Result<()> {
+    fn gpu_only_matching_ignores_legacy_fifo_trace_control() -> Result<()> {
         let _env_guard = MATCHING_ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -2916,11 +2860,7 @@ mod tests {
         }
         let report = match_features_to_database(&db_path, &controlled_fifo_geometry_options(2))?;
         assert_fifo_timing_report(&report, input_pairs.len(), 2);
-        let trace = report.verifier_trace.as_ref().expect("live FIFO trace");
-        assert_eq!(trace.worker_count, 2);
-        assert_eq!(trace.events.len(), input_pairs.len());
-        assert!(trace.events.iter().all(|event| event.num_matches == 24));
-        assert!(trace.events.iter().any(|event| event.num_inliers >= 15));
+        assert!(report.verifier_trace.is_none());
         for &(left, right) in &input_pairs {
             assert!(
                 ColmapDatabase::open_read_only(&db_path)?.exists_two_view_geometry(left, right)?
@@ -2930,7 +2870,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_fifo_replay_is_independent_of_task_commit_batch_size() -> Result<()> {
+    fn gpu_only_matching_ignores_legacy_fifo_replay_control() -> Result<()> {
         let _env_guard = MATCHING_ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -2967,41 +2907,13 @@ mod tests {
             serde_json::to_value(&small.pairs)?,
             serde_json::to_value(&large.pairs)?
         );
-        assert_eq!(
-            serde_json::to_value(&small.verifier_trace)?,
-            serde_json::to_value(&large.verifier_trace)?
-        );
-        let trace = small.verifier_trace.as_ref().expect("replay trace");
-        assert_eq!(
-            trace
-                .events
-                .iter()
-                .map(|event| {
-                    (
-                        event.worker_id,
-                        event.dequeue_order,
-                        event.complete_order,
-                        event.left_index,
-                        event.right_index,
-                    )
-                })
-                .collect::<Vec<_>>(),
-            vec![
-                (1, 1, 0, 0, 2),
-                (1, 3, 1, 1, 2),
-                (1, 5, 2, 2, 3),
-                (0, 0, 3, 0, 1),
-                (0, 2, 4, 0, 3),
-                (0, 4, 5, 1, 3),
-            ]
-        );
+        assert!(small.verifier_trace.is_none());
+        assert!(large.verifier_trace.is_none());
         for &(left, right) in &input_pairs {
-            let small_db = ColmapDatabase::open_read_only(&small_db_path)?;
-            let large_db = ColmapDatabase::open_read_only(&large_db_path)?;
-            assert_eq!(
-                small_db.read_two_view_geometry(left, right)?,
-                large_db.read_two_view_geometry(left, right)?
-            );
+            assert!(ColmapDatabase::open_read_only(&small_db_path)?
+                .exists_two_view_geometry(left, right)?);
+            assert!(ColmapDatabase::open_read_only(&large_db_path)?
+                .exists_two_view_geometry(left, right)?);
         }
         Ok(())
     }
@@ -3243,10 +3155,7 @@ mod tests {
     fn controlled_computed_matching_options(task_pair_batch_size: usize) -> MatchFeaturesOptions {
         MatchFeaturesOptions {
             pair_strategy: MatchingPairStrategy::Exhaustive,
-            sift_matching: SiftMatchingOptions {
-                cpu_brute_force_matcher: true,
-                ..SiftMatchingOptions::default()
-            },
+            sift_matching: SiftMatchingOptions::default(),
             min_num_matches: 1,
             min_inliers: 8,
             random_seed: 0,
@@ -3494,10 +3403,7 @@ mod tests {
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn gpu_matching_routes_model_scoring() {
-        let options = SiftMatchingOptions {
-            use_gpu: true,
-            ..SiftMatchingOptions::default()
-        };
+        let options = SiftMatchingOptions::default();
         assert_eq!(matching_backend_name(&options), "wgpu_match_and_score");
     }
 
@@ -3576,7 +3482,6 @@ mod tests {
             &MatchFeaturesOptions {
                 pair_strategy: MatchingPairStrategy::Exhaustive,
                 sift_matching: SiftMatchingOptions {
-                    use_gpu: true,
                     max_num_matches: 128,
                     ..SiftMatchingOptions::default()
                 },
@@ -3601,7 +3506,6 @@ mod tests {
             &db_path,
             &MatchFeaturesOptions {
                 sift_matching: SiftMatchingOptions {
-                    use_gpu: true,
                     ..SiftMatchingOptions::default()
                 },
                 essential_threshold_px: 2.0,

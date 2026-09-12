@@ -570,7 +570,9 @@ pub fn run_reconstruction_with_task(
 }
 
 fn mapper_uses_gpu(config: &MapperConfig) -> bool {
-    config.sift_extraction.use_gpu || config.sift_matching.use_gpu || config.use_gpu_pnp
+    config.sift_extraction.use_gpu
+        || matches!(config.feature_type, FeatureType::Sift)
+        || config.use_gpu_pnp
 }
 
 struct PreparedMapperFeatures {
@@ -703,7 +705,9 @@ fn run_reconstruction_prepared(
             .unwrap_or_else(crate::SfmTaskflow::shared)?;
         return executor.run_with_reports(
             "reconstruction",
-            config.sift_extraction.use_gpu || config.sift_matching.use_gpu || config.use_gpu_pnp,
+            config.sift_extraction.use_gpu
+                || matches!(config.feature_type, FeatureType::Sift)
+                || config.use_gpu_pnp,
             config.threads.unwrap_or(4),
             &control,
             &reports,
@@ -1367,7 +1371,6 @@ struct PairTiming {
     matches: usize,
     inliers: usize,
     accepted_before_graph_filters: bool,
-    sift: crate::sift::SiftMatchingTiming,
 }
 
 fn build_pair_graph(
@@ -1381,6 +1384,16 @@ fn build_pair_graph(
     let profiling = std::env::var("RUSTSFM_PROFILE_PAIRS").is_ok_and(|value| value == "1");
     let candidate_start = profiling.then(Instant::now);
     let matcher = HammingMatcher::new(2).with_ratio_threshold(config.match_ratio);
+    #[cfg(feature = "gpu-wgpu")]
+    let sift_matcher = if config.feature_type == FeatureType::Sift {
+        Some(crate::gpu::WgpuSiftMatcher::try_new()?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu-wgpu"))]
+    if config.feature_type == FeatureType::Sift {
+        bail!("SIFT matching requires RustSFM to be compiled with the gpu-wgpu feature");
+    }
     let mut candidates = match config.matching_pair_strategy {
         MatchingPairStrategy::VocabTree { num_images } => {
             crate::feature_matching_db::vocab_tree_pairs_from_frames(
@@ -1395,47 +1408,81 @@ fn build_pair_graph(
         add_segment_bridge_candidates(frames.len(), &mut candidates);
     }
     let candidate_ms = candidate_start.map(|start| start.elapsed().as_secs_f64() * 1000.0);
-    let evaluate = |left: usize, right: usize, matcher: Option<&HammingMatcher>| {
-        let mut timing = profiling.then(|| PairTiming {
-            left,
-            right,
-            left_name: frames[left].name.clone(),
-            right_name: frames[right].name.clone(),
-            left_descriptors: if config.feature_type == FeatureType::Sift {
-                frames[left].sift.descriptors.len()
-            } else {
-                frames[left].descriptors.count
-            },
-            right_descriptors: if config.feature_type == FeatureType::Sift {
-                frames[right].sift.descriptors.len()
-            } else {
-                frames[right].descriptors.count
-            },
-            ..Default::default()
-        });
-        let start = profiling.then(Instant::now);
-        let pair = estimate_candidate_pair(
-            left,
-            right,
-            frames,
-            setup_camera_for_image(reference_camera_setup, left, camera),
-            setup_camera_for_image(reference_camera_setup, right, camera),
-            config,
-            matcher,
-            sift_matching,
-            timing.as_mut(),
-        );
-        if let (Some(timing), Some(start)) = (&mut timing, start) {
-            timing.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            timing.accepted_before_graph_filters = pair.is_some();
+    let evaluate =
+        |left: usize,
+         right: usize,
+         matcher: Option<&HammingMatcher>,
+         #[cfg(feature = "gpu-wgpu")] sift_matcher: Option<&crate::gpu::WgpuSiftMatcher>| {
+            let mut timing = profiling.then(|| PairTiming {
+                left,
+                right,
+                left_name: frames[left].name.clone(),
+                right_name: frames[right].name.clone(),
+                left_descriptors: if config.feature_type == FeatureType::Sift {
+                    frames[left].sift.descriptors.len()
+                } else {
+                    frames[left].descriptors.count
+                },
+                right_descriptors: if config.feature_type == FeatureType::Sift {
+                    frames[right].sift.descriptors.len()
+                } else {
+                    frames[right].descriptors.count
+                },
+                ..Default::default()
+            });
+            let start = profiling.then(Instant::now);
+            let pair = estimate_candidate_pair(
+                left,
+                right,
+                frames,
+                setup_camera_for_image(reference_camera_setup, left, camera),
+                setup_camera_for_image(reference_camera_setup, right, camera),
+                config,
+                matcher,
+                #[cfg(feature = "gpu-wgpu")]
+                sift_matcher,
+                sift_matching,
+                timing.as_mut(),
+            );
+            if let (Some(timing), Some(start)) = (&mut timing, start) {
+                timing.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                timing.accepted_before_graph_filters = pair.is_some();
+            }
+            (pair, timing)
+        };
+    // wgpu matching is not safely parallel across pairs; keep SIFT sequential.
+    let (mut pairs, mut profiles) = if config.feature_type == FeatureType::Sift {
+        let mut pair_results = Vec::new();
+        let mut profiles = Vec::new();
+        for &(left, right) in &candidates {
+            let (pair, timing) = evaluate(
+                left,
+                right,
+                Some(&matcher),
+                #[cfg(feature = "gpu-wgpu")]
+                sift_matcher.as_ref(),
+            );
+            if profiling {
+                profiles.push(timing);
+            }
+            if let Some(pair) = pair {
+                pair_results.push(pair);
+            }
         }
-        (pair, timing)
-    };
-    let (mut pairs, mut profiles) = if profiling {
+        (pair_results, profiles)
+    } else if profiling {
         let (pair_results, profiles): (Vec<_>, Vec<_>) = crate::execution::parallel(|| {
             candidates
                 .par_iter()
-                .map(|&(left, right)| evaluate(left, right, Some(&matcher)))
+                .map(|&(left, right)| {
+                    evaluate(
+                        left,
+                        right,
+                        Some(&matcher),
+                        #[cfg(feature = "gpu-wgpu")]
+                        None,
+                    )
+                })
                 .unzip()
         });
         (
@@ -1447,7 +1494,16 @@ fn build_pair_graph(
             crate::execution::parallel(|| {
                 candidates
                     .par_iter()
-                    .filter_map(|&(left, right)| evaluate(left, right, Some(&matcher)).0)
+                    .filter_map(|&(left, right)| {
+                        evaluate(
+                            left,
+                            right,
+                            Some(&matcher),
+                            #[cfg(feature = "gpu-wgpu")]
+                            None,
+                        )
+                        .0
+                    })
                     .collect::<Vec<_>>()
             }),
             Vec::new(),
@@ -1456,7 +1512,13 @@ fn build_pair_graph(
     if config.experimental_ring_closure || std::env::var_os("RUSTSFM_RING_CLOSURE").is_some() {
         let mut closure_pairs = Vec::new();
         for (left, right) in intra_segment_ring_candidates(frames.len(), 192) {
-            let (pair, timing) = evaluate(left, right, None);
+            let (pair, timing) = evaluate(
+                left,
+                right,
+                None,
+                #[cfg(feature = "gpu-wgpu")]
+                sift_matcher.as_ref(),
+            );
             if profiling {
                 profiles.push(timing);
             }
@@ -1816,6 +1878,7 @@ fn estimate_candidate_pair(
     right_camera: CameraModel,
     config: &MapperConfig,
     matcher: Option<&HammingMatcher>,
+    #[cfg(feature = "gpu-wgpu")] sift_matcher: Option<&crate::gpu::WgpuSiftMatcher>,
     sift_matching: &SiftMatchingOptions,
     mut timing: Option<&mut PairTiming>,
 ) -> Option<PairGeometry> {
@@ -1834,12 +1897,22 @@ fn estimate_candidate_pair(
                     0.85,
                 )
             } else {
-                crate::sift::match_sift_with_options_profiled(
-                    &frames[left].sift,
-                    &frames[right].sift,
-                    sift_matching,
-                    timing.as_mut().map(|t| &mut t.sift),
-                )
+                #[cfg(feature = "gpu-wgpu")]
+                {
+                    let matcher = sift_matcher?;
+                    matcher
+                        .match_descriptors(
+                            &frames[left].sift.descriptors_u8,
+                            &frames[right].sift.descriptors_u8,
+                            sift_matching,
+                        )
+                        .ok()?
+                }
+                #[cfg(not(feature = "gpu-wgpu"))]
+                {
+                    let _ = sift_matching;
+                    return None;
+                }
             }
         } else if is_ring_bridge_candidate(left, right) {
             let loose = HammingMatcher::new(2).with_ratio_threshold(0.92);
@@ -11530,7 +11603,17 @@ mod tests {
         let options = SiftMatchingOptions::default();
         let mut timing = PairTiming::default();
         assert!(estimate_candidate_pair(
-            0, 1, &frames, camera, camera, &config, None, &options, None
+            0,
+            1,
+            &frames,
+            camera,
+            camera,
+            &config,
+            None,
+            #[cfg(feature = "gpu-wgpu")]
+            None,
+            &options,
+            None
         )
         .is_none());
         assert!(estimate_candidate_pair(
@@ -11540,6 +11623,8 @@ mod tests {
             camera,
             camera,
             &config,
+            None,
+            #[cfg(feature = "gpu-wgpu")]
             None,
             &options,
             Some(&mut timing)

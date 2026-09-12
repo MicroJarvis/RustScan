@@ -280,7 +280,8 @@ pub fn run_adaptive_keyframe_selection(
     )?;
     task.execute_with_memory_and_gpu(
         "adaptive keyframe selection",
-        mapper_config.sift_extraction.use_gpu || mapper_config.sift_matching.use_gpu,
+        mapper_config.sift_extraction.use_gpu
+            || matches!(mapper_config.feature_type, FeatureType::Sift),
         planned
             .as_ref()
             .map_or(0, |plan| plan.memory.request_bytes()),

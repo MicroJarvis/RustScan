@@ -1,15 +1,11 @@
 use anyhow::{bail, Context, Result};
 use lowe_sift::Descriptor;
 use rustslam::{KeyPoint, Match};
-#[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
-use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::database::ColmapKeypoint;
-use crate::sift_index::{colmap_uint8_l2_distance2, SiftDescriptorIndex};
 #[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
-use lowe_sift::{BbfConfig, Feature, GrayImage, Sift, SiftConfig};
-use rayon::prelude::*;
+use lowe_sift::{Feature, GrayImage, Sift, SiftConfig};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Default)]
@@ -133,8 +129,6 @@ pub struct SiftMatchingOptions {
     pub max_num_matches: usize,
     pub guided_matching: bool,
     pub max_guided_epipolar_error_px: f32,
-    pub cpu_brute_force_matcher: bool,
-    pub use_gpu: bool,
 }
 
 impl Default for SiftMatchingOptions {
@@ -146,8 +140,6 @@ impl Default for SiftMatchingOptions {
             max_num_matches: 32768,
             guided_matching: false,
             max_guided_epipolar_error_px: 2.0,
-            cpu_brute_force_matcher: false,
-            use_gpu: false,
         }
     }
 }
@@ -554,29 +546,33 @@ fn descriptor_to_uint8_from_float(
     out
 }
 
-fn sift_features_u8(features: &SiftFeatures) -> Vec<[u8; lowe_sift::DESCRIPTOR_LEN]> {
-    if !features.descriptors_u8.is_empty() {
-        return features.descriptors_u8.clone();
-    }
-    features
-        .descriptors
-        .iter()
-        .map(descriptor_to_uint8)
-        .collect()
-}
-
 fn colmap_normalized_distance(l2_dist: f32) -> f32 {
     (l2_dist / COLMAP_SIFT_DESCRIPTOR_NORM).sqrt()
 }
 
-#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
-fn sift_pair_l2_distance2(left: &Descriptor, right: &Descriptor) -> f32 {
-    colmap_uint8_l2_distance2(&descriptor_to_uint8(left), &descriptor_to_uint8(right))
+#[inline]
+fn colmap_uint8_l2_distance2(
+    left: &[u8; lowe_sift::DESCRIPTOR_LEN],
+    right: &[u8; lowe_sift::DESCRIPTOR_LEN],
+) -> f32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(a, b)| {
+            let delta = i32::from(*a) - i32::from(*b);
+            (delta * delta) as u32
+        })
+        .sum::<u32>() as f32
 }
 
-#[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
 fn sift_pair_l2_distance2(left: &Descriptor, right: &Descriptor) -> f32 {
-    left.distance2(right)
+    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+    {
+        colmap_uint8_l2_distance2(&descriptor_to_uint8(left), &descriptor_to_uint8(right))
+    }
+    #[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
+    {
+        left.distance2(right)
+    }
 }
 
 fn sift_pair_distance(left: &Descriptor, right: &Descriptor) -> f32 {
@@ -605,278 +601,6 @@ pub(crate) struct SiftExtractionTiming {
     pub backend_descriptor_ms: f64,
     pub backend_output_assembly_ms: f64,
     pub result_conversion_ms: f64,
-}
-
-/// Nested wall-clock measurements, not CPU time. Available for the uint8 backend.
-#[derive(Default, serde::Serialize)]
-pub(crate) struct SiftMatchingTiming {
-    pub uint8_backend: bool,
-    pub prepare_ms: f64,
-    pub index_build_ms: f64,
-    pub search_ms: f64,
-}
-
-#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
-fn measure_matching<R>(elapsed: Option<&mut f64>, work: impl FnOnce() -> R) -> R {
-    let start = elapsed.as_ref().map(|_| std::time::Instant::now());
-    let result = work();
-    if let (Some(elapsed), Some(start)) = (elapsed, start) {
-        *elapsed += start.elapsed().as_secs_f64() * 1000.0;
-    }
-    result
-}
-
-#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
-fn match_sift_colmap_uint8(
-    left: &SiftFeatures,
-    right: &SiftFeatures,
-    options: &SiftMatchingOptions,
-    mut timing: Option<&mut SiftMatchingTiming>,
-) -> Vec<Match> {
-    if let Some(timing) = timing.as_mut() {
-        timing.uint8_backend = true;
-    }
-    let (left_u8, right_u8) = measure_matching(timing.as_mut().map(|t| &mut t.prepare_ms), || {
-        (sift_features_u8(left), sift_features_u8(right))
-    });
-    let forward = if options.cpu_brute_force_matcher {
-        measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
-            match_sift_colmap_one_way_brute(&left_u8, &right_u8, options)
-        })
-    } else {
-        let index = measure_matching(timing.as_mut().map(|t| &mut t.index_build_ms), || {
-            SiftDescriptorIndex::build(&right_u8)
-        });
-        measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
-            match_sift_colmap_one_way_indexed(&left_u8, &index, options)
-        })
-    };
-    if options.cross_check {
-        let reverse_pairs: HashSet<(u32, u32)> = if options.cpu_brute_force_matcher {
-            measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
-                match_sift_colmap_one_way_brute(&right_u8, &left_u8, options)
-            })
-        } else {
-            let index = measure_matching(timing.as_mut().map(|t| &mut t.index_build_ms), || {
-                SiftDescriptorIndex::build(&left_u8)
-            });
-            measure_matching(timing.as_mut().map(|t| &mut t.search_ms), || {
-                match_sift_colmap_one_way_indexed(&right_u8, &index, options)
-            })
-        }
-        .into_iter()
-        .collect();
-        let mut matches = Vec::new();
-        for (query_idx, train_idx) in forward {
-            if reverse_pairs.contains(&(train_idx, query_idx)) {
-                let distance = colmap_normalized_distance(colmap_uint8_l2_distance2(
-                    &left_u8[query_idx as usize],
-                    &right_u8[train_idx as usize],
-                ));
-                matches.push(Match {
-                    query_idx,
-                    train_idx,
-                    distance,
-                });
-            }
-        }
-        finalize_matches(matches, options)
-    } else {
-        let matches = forward
-            .into_iter()
-            .map(|(query_idx, train_idx)| {
-                let distance = colmap_normalized_distance(colmap_uint8_l2_distance2(
-                    &left_u8[query_idx as usize],
-                    &right_u8[train_idx as usize],
-                ));
-                Match {
-                    query_idx,
-                    train_idx,
-                    distance,
-                }
-            })
-            .collect();
-        finalize_matches(matches, options)
-    }
-}
-
-fn match_sift_colmap_one_way_brute(
-    left: &[[u8; lowe_sift::DESCRIPTOR_LEN]],
-    right: &[[u8; lowe_sift::DESCRIPTOR_LEN]],
-    options: &SiftMatchingOptions,
-) -> Vec<(u32, u32)> {
-    let max_l2_dist = COLMAP_SIFT_DESCRIPTOR_NORM * options.max_distance * options.max_distance;
-    crate::execution::parallel(|| {
-        left.par_iter()
-            .enumerate()
-            .filter_map(|(query_idx, left_desc)| {
-                let mut best_train = None::<usize>;
-                let mut best_l2 = f32::INFINITY;
-                let mut second_best_l2 = f32::INFINITY;
-                for (train_idx, right_desc) in right.iter().enumerate() {
-                    let l2_dist = colmap_uint8_l2_distance2(left_desc, right_desc);
-                    if l2_dist < best_l2 {
-                        second_best_l2 = best_l2;
-                        best_l2 = l2_dist;
-                        best_train = Some(train_idx);
-                    } else if l2_dist < second_best_l2 {
-                        second_best_l2 = l2_dist;
-                    }
-                }
-                let train_idx = best_train?;
-                if best_l2 > max_l2_dist {
-                    return None;
-                }
-                if best_l2.sqrt() >= options.max_ratio * second_best_l2.sqrt() {
-                    return None;
-                }
-                Some((query_idx as u32, train_idx as u32))
-            })
-            .collect()
-    })
-}
-
-fn match_sift_colmap_one_way_indexed(
-    left: &[[u8; lowe_sift::DESCRIPTOR_LEN]],
-    index: &SiftDescriptorIndex,
-    options: &SiftMatchingOptions,
-) -> Vec<(u32, u32)> {
-    let max_l2_dist = COLMAP_SIFT_DESCRIPTOR_NORM * options.max_distance * options.max_distance;
-    crate::execution::parallel(|| {
-        left.par_iter()
-            .enumerate()
-            .filter_map(|(query_idx, left_desc)| {
-                let neighbors = index.search_two_nearest(left_desc)?;
-                let (best_l2, best_index, second_best_l2) =
-                    if neighbors.best_l2 <= neighbors.second_best_l2 {
-                        (
-                            neighbors.best_l2,
-                            neighbors.best_index,
-                            neighbors.second_best_l2,
-                        )
-                    } else {
-                        (
-                            neighbors.second_best_l2,
-                            neighbors.second_best_index,
-                            neighbors.best_l2,
-                        )
-                    };
-                if best_l2 > max_l2_dist {
-                    return None;
-                }
-                if best_l2.sqrt() >= options.max_ratio * second_best_l2.sqrt() {
-                    return None;
-                }
-                Some((query_idx as u32, best_index))
-            })
-            .collect()
-    })
-}
-
-#[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
-fn match_sift_lowe_bbf(
-    left: &SiftFeatures,
-    right: &SiftFeatures,
-    options: &SiftMatchingOptions,
-) -> Vec<Match> {
-    let config = BbfConfig {
-        ratio_threshold: options.max_ratio,
-        max_candidates: 512,
-        leaf_size: 16,
-    };
-    let Ok(forward) =
-        lowe_sift::match_descriptors_bbf(&left.descriptors, &right.descriptors, config)
-    else {
-        return Vec::new();
-    };
-    let reverse_best = if options.cross_check {
-        let Ok(reverse) =
-            lowe_sift::match_descriptors_bbf(&right.descriptors, &left.descriptors, config)
-        else {
-            return Vec::new();
-        };
-        let mut reverse_best = HashMap::with_capacity(reverse.len());
-        for m in reverse {
-            if m.distance <= options.max_distance {
-                reverse_best.insert((m.query_index, m.train_index), m.distance);
-            }
-        }
-        Some(reverse_best)
-    } else {
-        None
-    };
-
-    let matches = forward
-        .into_iter()
-        .filter(|m| m.distance <= options.max_distance)
-        .filter(|m| {
-            reverse_best
-                .as_ref()
-                .map(|reverse| reverse.contains_key(&(m.train_index, m.query_index)))
-                .unwrap_or(true)
-        })
-        .map(|m| Match {
-            query_idx: m.query_index as u32,
-            train_idx: m.train_index as u32,
-            distance: m.distance,
-        })
-        .collect();
-    finalize_matches(matches, options)
-}
-
-fn finalize_matches(mut matches: Vec<Match>, options: &SiftMatchingOptions) -> Vec<Match> {
-    matches.sort_by(|a, b| {
-        a.distance
-            .partial_cmp(&b.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if options.max_num_matches > 0 && matches.len() > options.max_num_matches {
-        matches.truncate(options.max_num_matches);
-    }
-    matches
-}
-
-pub fn match_sift_mutual(
-    left: &SiftFeatures,
-    right: &SiftFeatures,
-    ratio_threshold: f32,
-) -> Vec<Match> {
-    let options = SiftMatchingOptions {
-        max_ratio: ratio_threshold,
-        ..Default::default()
-    };
-    match_sift_with_options(left, right, &options)
-}
-
-pub fn match_sift_with_options(
-    left: &SiftFeatures,
-    right: &SiftFeatures,
-    options: &SiftMatchingOptions,
-) -> Vec<Match> {
-    match_sift_with_options_profiled(left, right, options, None)
-}
-
-pub(crate) fn match_sift_with_options_profiled(
-    left: &SiftFeatures,
-    right: &SiftFeatures,
-    options: &SiftMatchingOptions,
-    timing: Option<&mut SiftMatchingTiming>,
-) -> Vec<Match> {
-    if options.check().is_err() {
-        return Vec::new();
-    }
-    if left.descriptors.is_empty() || right.descriptors.is_empty() {
-        return Vec::new();
-    }
-    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
-    {
-        return match_sift_colmap_uint8(left, right, options, timing);
-    }
-    #[cfg(any(not(feature = "vlfeat-sift"), feature = "lowe-sift-backend"))]
-    {
-        let _ = timing;
-        match_sift_lowe_bbf(left, right, options)
-    }
 }
 
 pub fn match_sift_guided_with_options(
@@ -1272,10 +996,6 @@ pub fn benchmark_sift_extraction(
     })
 }
 
-#[cfg(all(test, feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
-#[path = "sift_regression_tests.rs"]
-mod regression_tests;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1414,8 +1134,6 @@ mod tests {
                 max_num_matches: 32,
                 guided_matching: true,
                 max_guided_epipolar_error_px: 2.0,
-                cpu_brute_force_matcher: true,
-                use_gpu: false,
             },
         );
         assert_eq!(matches.len(), 1);
@@ -1633,272 +1351,5 @@ mod tests {
         assert!(timing.backend_input_conversion_ms > 0.0);
         assert!(timing.backend_output_assembly_ms > 0.0);
         Ok(())
-    }
-
-    #[test]
-    fn colmap_uint8_matching_applies_distance_and_ratio_thresholds() {
-        let mut left = [0u8; lowe_sift::DESCRIPTOR_LEN];
-        let mut near = [0u8; lowe_sift::DESCRIPTOR_LEN];
-        let mut far = [0u8; lowe_sift::DESCRIPTOR_LEN];
-        left.fill(255);
-        near.fill(255);
-        near[0] = 253;
-        far.fill(0);
-
-        let near_l2 = colmap_uint8_l2_distance2(&left, &near);
-        let far_l2 = colmap_uint8_l2_distance2(&left, &far);
-        assert!(near_l2 < far_l2);
-        assert!(colmap_normalized_distance(near_l2) < 0.7);
-        assert!(colmap_normalized_distance(far_l2) > 0.7);
-
-        let left_features = SiftFeatures {
-            keypoints: vec![KeyPoint::new(10.0, 10.0)],
-            descriptors: vec![Descriptor::new(left.map(|v| v as f32 / 512.0))],
-            colmap_keypoints: vec![],
-            descriptors_u8: vec![left],
-        };
-        let right_features = SiftFeatures {
-            keypoints: vec![KeyPoint::new(20.0, 20.0), KeyPoint::new(30.0, 30.0)],
-            descriptors: vec![
-                Descriptor::new(near.map(|v| v as f32 / 512.0)),
-                Descriptor::new(far.map(|v| v as f32 / 512.0)),
-            ],
-            colmap_keypoints: vec![],
-            descriptors_u8: vec![near, far],
-        };
-
-        let accepted = match_sift_with_options(
-            &left_features,
-            &right_features,
-            &SiftMatchingOptions {
-                max_ratio: 0.8,
-                max_distance: 0.7,
-                cross_check: false,
-                max_num_matches: 32768,
-                guided_matching: false,
-                max_guided_epipolar_error_px: 2.0,
-                cpu_brute_force_matcher: true,
-                use_gpu: false,
-            },
-        );
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].train_idx, 0);
-    }
-
-    #[test]
-    fn matching_profile_preserves_results_for_both_search_and_cross_check_modes() {
-        let descriptors_u8: Vec<[u8; 128]> = (0..8)
-            .map(|i| std::array::from_fn(|j| ((i * 37 + j * 17 + i * j * 3) % 251) as u8))
-            .collect();
-        let features = SiftFeatures {
-            descriptors: descriptors_u8
-                .iter()
-                .map(|d| Descriptor::new(d.map(|v| f32::from(v) / 512.0)))
-                .collect(),
-            descriptors_u8,
-            ..Default::default()
-        };
-        for brute in [false, true] {
-            for cross_check in [false, true] {
-                let options = SiftMatchingOptions {
-                    cpu_brute_force_matcher: brute,
-                    cross_check,
-                    ..Default::default()
-                };
-                let plain = match_sift_with_options(&features, &features, &options);
-                let mut timing = SiftMatchingTiming::default();
-                let profiled = match_sift_with_options_profiled(
-                    &features,
-                    &features,
-                    &options,
-                    Some(&mut timing),
-                );
-                assert!(!plain.is_empty());
-                let values = |matches: Vec<Match>| {
-                    matches
-                        .into_iter()
-                        .map(|m| (m.query_idx, m.train_idx, m.distance))
-                        .collect::<Vec<_>>()
-                };
-                assert_eq!(values(plain), values(profiled));
-                assert_eq!(
-                    timing.uint8_backend,
-                    cfg!(all(
-                        feature = "vlfeat-sift",
-                        not(feature = "lowe-sift-backend")
-                    ))
-                );
-                for value in [timing.prepare_ms, timing.index_build_ms, timing.search_ms] {
-                    assert!(value.is_finite() && value >= 0.0);
-                }
-                if brute {
-                    assert_eq!(timing.index_build_ms, 0.0);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn indexed_matching_agrees_with_brute_force_on_toy_descriptors() {
-        let mut left = [0u8; lowe_sift::DESCRIPTOR_LEN];
-        let mut near = [0u8; lowe_sift::DESCRIPTOR_LEN];
-        let mut far = [0u8; lowe_sift::DESCRIPTOR_LEN];
-        left.fill(255);
-        near.fill(255);
-        near[0] = 253;
-        far.fill(0);
-
-        let left_set = vec![left];
-        let right_set = vec![near, far];
-        let options = SiftMatchingOptions {
-            max_ratio: 0.8,
-            max_distance: 0.7,
-            cross_check: false,
-            max_num_matches: 32768,
-            guided_matching: false,
-            max_guided_epipolar_error_px: 2.0,
-            cpu_brute_force_matcher: false,
-            use_gpu: false,
-        };
-        let brute = match_sift_colmap_one_way_brute(&left_set, &right_set, &options);
-        let indexed = match_sift_colmap_one_way_indexed(
-            &left_set,
-            &SiftDescriptorIndex::build(&right_set),
-            &options,
-        );
-        assert_eq!(brute, indexed);
-    }
-
-    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
-    #[test]
-    fn uint8_matching_fixture_preserves_complete_output_semantics() {
-        fn descriptor(first: u8, fill: u8) -> [u8; lowe_sift::DESCRIPTOR_LEN] {
-            let mut value = [fill; lowe_sift::DESCRIPTOR_LEN];
-            value[0] = first;
-            value
-        }
-
-        fn features(rows: &[[u8; lowe_sift::DESCRIPTOR_LEN]]) -> SiftFeatures {
-            SiftFeatures {
-                descriptors: rows
-                    .iter()
-                    .map(|row| Descriptor::new(row.map(|value| f32::from(value) / 512.0)))
-                    .collect(),
-                descriptors_u8: rows.to_vec(),
-                ..Default::default()
-            }
-        }
-
-        fn fingerprint(label: &str, matches: &[Match], bytes: &mut Vec<u8>) {
-            bytes.extend_from_slice(&(label.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(label.as_bytes());
-            bytes.extend_from_slice(&(matches.len() as u32).to_le_bytes());
-            for m in matches {
-                bytes.extend_from_slice(&m.query_idx.to_le_bytes());
-                bytes.extend_from_slice(&m.train_idx.to_le_bytes());
-                bytes.extend_from_slice(&m.distance.to_bits().to_le_bytes());
-            }
-        }
-
-        let left_rows = [
-            descriptor(0, 0),
-            descriptor(10, 0),
-            descriptor(5, 0),
-            descriptor(0, 0),
-            descriptor(255, 255),
-            descriptor(20, 0),
-            descriptor(128, 128),
-        ];
-        let right_rows = [
-            descriptor(0, 0),
-            descriptor(10, 0),
-            descriptor(100, 0),
-            descriptor(255, 255),
-        ];
-        let left = features(&left_rows);
-        let right = features(&right_rows);
-        let base = SiftMatchingOptions {
-            max_ratio: 0.8,
-            max_distance: 0.7,
-            cross_check: false,
-            max_num_matches: 32768,
-            cpu_brute_force_matcher: false,
-            ..Default::default()
-        };
-        let mut fingerprint_bytes = Vec::new();
-        for (label, options) in [
-            ("forward", base.clone()),
-            (
-                "cross_check",
-                SiftMatchingOptions {
-                    cross_check: true,
-                    ..base.clone()
-                },
-            ),
-            (
-                "cross_check_max_two",
-                SiftMatchingOptions {
-                    cross_check: true,
-                    max_num_matches: 2,
-                    ..base.clone()
-                },
-            ),
-        ] {
-            let matches = match_sift_with_options(&left, &right, &options);
-            fingerprint(label, &matches, &mut fingerprint_bytes);
-        }
-
-        let hash = blake3::hash(&fingerprint_bytes).to_hex().to_string();
-        assert_eq!(
-            hash,
-            "3e9d58d11f4f059fbd8c068a03bccacd15cd87b84af93cc56480199715e102d7"
-        );
-    }
-
-    #[test]
-    fn sift_matching_applies_max_distance() {
-        let left = SiftFeatures {
-            keypoints: Vec::new(),
-            descriptors: vec![descriptor_with_first(0.0)],
-            colmap_keypoints: vec![],
-            descriptors_u8: vec![],
-        };
-        let right = SiftFeatures {
-            keypoints: Vec::new(),
-            descriptors: vec![descriptor_with_first(0.2), descriptor_with_first(1.0)],
-            colmap_keypoints: vec![],
-            descriptors_u8: vec![],
-        };
-        let accepted = match_sift_with_options(
-            &left,
-            &right,
-            &SiftMatchingOptions {
-                max_ratio: 0.8,
-                max_distance: 0.3,
-                cross_check: false,
-                max_num_matches: 32768,
-                guided_matching: false,
-                max_guided_epipolar_error_px: 2.0,
-                cpu_brute_force_matcher: true,
-                use_gpu: false,
-            },
-        );
-        let rejected = match_sift_with_options(
-            &left,
-            &right,
-            &SiftMatchingOptions {
-                max_ratio: 0.8,
-                max_distance: 0.1,
-                cross_check: false,
-                max_num_matches: 32768,
-                guided_matching: false,
-                max_guided_epipolar_error_px: 2.0,
-                cpu_brute_force_matcher: true,
-                use_gpu: false,
-            },
-        );
-
-        assert_eq!(accepted.len(), 1);
-        assert!(rejected.is_empty());
     }
 }
