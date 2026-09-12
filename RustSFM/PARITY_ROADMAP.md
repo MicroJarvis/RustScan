@@ -1,8 +1,8 @@
 # RustSFM COLMAP Parity Roadmap (non-GUI)
 
-**Updated:** 2026-08-31 (fixture provisioning, scheduled-BA triggers, and
-pose-prior alignment; dated numerical measurements below retain their
-original observation dates)
+**Updated:** 2026-09-10 (committed pinned flowers2 reference text + opt-in CI
+job; dated numerical measurements below retain their original observation
+dates)
 
 Target: 100% COLMAP behavior parity excluding Qt GUI and Python bindings.
 GPU: **wgpu** only (no CUDA/SiftGPU).
@@ -12,13 +12,16 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
 - [x] Stage-based `compare` (`features`, `matches`, `twoview`, `registration`, `tracks`, `ba`)
 - [x] Tests and adapters for the external `flowers2_colmap` sparse fixture
 - [x] CI execution for default and `--no-default-features` RustSFM suites
-- [ ] Versioned source and opt-in CI provisioning for `test_data/flowers2_colmap`;
-      the fixture is not distributed by Git or submodules and its tests are
-      ignored by default
-  - 2026-08-31: local provisioning is now pinned by
+- [x] Versioned source and opt-in CI provisioning for `test_data/flowers2_colmap`
+  - Runtime tree stays out of ordinary clones; tests remain `#[ignore]`d by
+    default.
+  - 2026-08-31: local provisioning pinned by
     `scripts/provision_flowers2_colmap_fixture.sh` (SHA-256-verified copy of
-    the 2026-06-30 archived COLMAP text export). The external hosted source and
-    opt-in CI fetch remain open.
+    the 2026-06-30 archived COLMAP text export).
+  - 2026-09-10: reference text committed under
+    `test_data/fixtures/flowers2_colmap_ref_text_20260630`; provision defaults
+    to that path; opt-in CI job `rustsfm-flowers2-parity-opt-in` runs on
+    `workflow_dispatch` or PR label `flowers2-parity`.
   - 2026-08-31 measured ignored suite: `19 passed; 0 failed` (after the
     scheduled-BA trigger and pose-prior alignment fixes recorded below).
 

@@ -1,6 +1,6 @@
 # RustScan Current Project Status
 
-**Updated:** 2026-08-31
+**Updated:** 2026-09-10
 **Branch:** `main`
 
 ## Overall
@@ -27,13 +27,13 @@
 
 ## Active Gaps
 
-- `flowers2_colmap` parity fixture 的来源、版本和 CI 获取方式尚未固化；默认测试不会再假设它存在。
+- `flowers2_colmap` 运行时树仍需 `./scripts/provision_flowers2_colmap_fixture.sh` 生成；参考文本已提交在 `test_data/fixtures/flowers2_colmap_ref_text_20260630`，opt-in CI job `rustsfm-flowers2-parity-opt-in`（`workflow_dispatch` 或 PR label `flowers2-parity`）可验收 ignored suite。默认 push/PR 仍不假设夹具存在。
 - RustSFM 的 COLMAP 数值 parity、RustGS 的 LiteGS parity/TUM PSNR，以及 RustViewer 的端到端真实媒体验证仍需要各自的专门验收。
 - RustSLAM 的 dependency-minimal library suite 在 2026-09-03 实测为 `245 passed; 0 failed`。此前 `tracker::vo::tests::test_initialize_keeps_relocalized_pose_in_global_frame` 的 fixture 仅有 10 个点，其中 7 个可三角化，误触发生产的 8 点退化保护；fixture 已扩展至 16 个空间分布点，生产门槛保持不变。
 - RustFF 的默认 library suite 在 2026-09-03 为 `2 passed; 0 failed`，`onnx-ort` feature 已迁移至 pinned ORT 2.0 RC API 并为 `3 passed; 0 failed`；Spann3R decoder ONNX execution 仍未实现，故该 feature 不是端到端推理后端。`onnx-candle` 仍仅暴露未接线依赖。
 
 ## Next Priorities
 
-1. 固化并可复现地提供 RustSFM `flowers2_colmap` parity fixture，作为独立 opt-in CI 验收。
-2. 维护 RustSFM default/minimal-feature 测试与 macOS GPU context 串行化的 CI 覆盖。
-3. 继续 RustGS parity/TUM 质量闭环，并在完成后更新其专项状态。
+1. 以 `output/b1_r7_baseline_flowers2_20260910` 为 R7 后 48 帧参考；下一步优先独立复现 `post_bogus_cameras` / BA 质量债（与吞吐实验分目录），或仅在新测瓶颈证据下开下一性能候选。
+2. 继续 RustGS parity/TUM 质量闭环，并在完成后更新其专项状态。
+3. 维护 RustSFM default/minimal-feature 测试与 macOS GPU context 串行化的 CI 覆盖；需要时触发 flowers2 opt-in job。

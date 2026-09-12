@@ -318,23 +318,29 @@ cargo test -p rustsfm --release --lib
 ```
 
 Existing clones can also run `./scripts/setup_rustsfm_deps.sh` to bootstrap
-RustSFM's native dependencies. The dependency-minimal build still compiles,
-but bundle adjustment is unavailable when the `ceres-ba` feature is disabled:
+RustSFM's native dependencies. The dependency-minimal library still compiles,
+but bundle adjustment is unavailable without `ceres-ba` and SIFT matching is
+unavailable without `gpu-wgpu`; this configuration is a compile gate, not a
+full pipeline test:
 
 ```bash
-cargo test -p rustsfm --release --lib --no-default-features
+cargo check -p rustsfm --release --lib --no-default-features
 ```
 
 The `real_colmap_sparse_*` parity tests require a compatible external
-`test_data/flowers2_colmap` 24-image sparse fixture. That fixture is not part
-of the repository or its submodules, so these tests are ignored by default.
-Provision it from the archived COLMAP text export with the pinned-provenance
-script (content is verified by SHA-256), then run the tests explicitly with:
+`test_data/flowers2_colmap` 24-image sparse fixture. That runtime tree is not
+part of the default checkout path used by ordinary tests, so these cases stay
+`#[ignore]`d. The pinned reference text lives under
+`test_data/fixtures/flowers2_colmap_ref_text_20260630` (SHA-256 verified).
+Provision it, then run the ignored suite explicitly:
 
 ```bash
 ./scripts/provision_flowers2_colmap_fixture.sh
 cargo test -p rustsfm --lib -- --ignored
 ```
+
+Opt-in CI: workflow_dispatch, or open a PR labeled `flowers2-parity` (job
+`rustsfm-flowers2-parity-opt-in`).
 Incremental registration is absolute-pose driven with COLMAP-style next-image
 ranking methods, registration trial bookkeeping, inlier-ratio checks, and
 pose-only reprojection refinement before accepting new images. Filtered or

@@ -7,10 +7,10 @@
 # `test_data/flowers2_colmap/sparse/text`. It is intentionally not
 # distributed through Git or submodules (see RustSFM/README.md).
 #
-# Provenance: generated 2026-06-30 and archived in the workspace `output/`
-# parity directories:
-#   output/flowers2_colmap_ref_text_20260630  (reference COLMAP text export)
-#   output/flowers2_colmap_txt_20260630       (identical archived copy)
+# Provenance: generated 2026-06-30 and archived as the committed fixture
+# `test_data/fixtures/flowers2_colmap_ref_text_20260630` (historical copies also
+# exist under `output/flowers2_colmap_ref_text_20260630` /
+# `output/flowers2_colmap_txt_20260630`).
 #
 # The fixture content is pinned by SHA-256 so a mismatched source is refused
 # instead of silently changing the parity reference.
@@ -18,12 +18,14 @@
 # Usage (from the workspace root):
 #   ./scripts/provision_flowers2_colmap_fixture.sh [SOURCE_DIR]
 #
-# SOURCE_DIR defaults to output/flowers2_colmap_ref_text_20260630 and must
-# contain the five text files whose digests match the pinned values below.
+# SOURCE_DIR defaults to the committed pinned fixture under
+# test_data/fixtures/flowers2_colmap_ref_text_20260630 (also archived historically
+# under output/flowers2_colmap_ref_text_20260630). The directory must contain the
+# five text files whose digests match the pinned values below.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SOURCE="${1:-output/flowers2_colmap_ref_text_20260630}"
+SOURCE="${1:-test_data/fixtures/flowers2_colmap_ref_text_20260630}"
 DEST="test_data/flowers2_colmap/sparse/text"
 
 case "$SOURCE" in

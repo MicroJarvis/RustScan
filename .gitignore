@@ -39,6 +39,9 @@ test_data/video/
 !test_data/fixtures/litegs/colmap-small/
 !test_data/fixtures/litegs/colmap-small/README.md
 !test_data/fixtures/litegs/colmap-small/parity-reference.json
+!test_data/fixtures/flowers2_colmap_ref_text_20260630/
+!test_data/fixtures/flowers2_colmap_ref_text_20260630/*.txt
+!test_data/fixtures/flowers2_colmap_ref_text_20260630/README.md
 
 # OpenMesh source (external dependency)
 Mirror/
