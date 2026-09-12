@@ -221,6 +221,44 @@ fn rejects_dependency_memory_deadlock_before_execution() {
 }
 
 #[test]
+fn accepts_chain_after_intermediate_consumer_releases_ancestor_output() {
+    let runtime = Runtime::new(config(1)).unwrap();
+    let mut graph = TaskGraph::new();
+    let mut producer_request = cpu(1);
+    producer_request.output_memory_bytes = 80;
+    let producer = graph
+        .task(
+            "producer",
+            vec![TaskVariant::cpu("cpu", producer_request, |_| Ok(42u64))],
+        )
+        .unwrap();
+    let producer_id = producer.id();
+    let bridge = graph
+        .task(
+            "bridge",
+            vec![TaskVariant::cpu("cpu", cpu(1), move |ctx| {
+                assert_eq!(*ctx.input(&producer)?, 42);
+                drop(producer);
+                Ok(())
+            })],
+        )
+        .unwrap();
+    graph.depends_on(bridge.id(), producer_id).unwrap();
+    let mut consumer_request = cpu(1);
+    consumer_request.working_memory_bytes = 30;
+    let consumer = graph
+        .task(
+            "consumer",
+            vec![TaskVariant::cpu("cpu", consumer_request, |_| Ok(()))],
+        )
+        .unwrap();
+    graph.depends_on(consumer.id(), bridge.id()).unwrap();
+
+    assert!(report(&runtime.submit(graph).unwrap()).succeeded());
+    assert_eq!(runtime.snapshot().unwrap().memory_bytes, 0);
+}
+
+#[test]
 fn asynchronous_gpu_releases_cpu_but_not_gpu_or_memory() {
     let runtime = Runtime::new(config(1)).unwrap();
     let (tx, rx) = mpsc::channel();

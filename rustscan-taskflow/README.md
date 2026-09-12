@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 内存额度是**调用方估算的协作式准入控制**，不是 allocator/显存硬隔离，不保证不会 OOM。申请应包含工作集和输出，输入由已有 artifact 的 lease 计费。对于内部共享指针、外部缓存等逃逸生命周期，调用方必须自行保证申报和存活期一致。
 
-输出直到最后一个 handle/reader 释放才归还额度，workflow 完成不等于输出释放。及时将输入 handle 移入消费者、释放不再需要的克隆。提交时会做保守的 DAG 内存存活检查：显式依赖上的前置输出按可能继续存活计入消费者的 working/output 请求；无法满足的图返回 `Error::Unschedulable`，而不是接受后永久等待。该检查可能拒绝依赖分支共享释放协议的图；此版本仍不做全图精确内存证明、磁盘溢写或自动分批。跨 workflow 的 output lease 仍按运行时 backpressure 处理，直到外部 handle/reader 释放。
+输出直到最后一个 handle/reader 释放才归还额度，workflow 完成不等于输出释放。及时将输入 handle 移入消费者、释放不再需要的克隆。提交时会做 DAG 内存存活检查：节点的直接依赖 output lease 与该节点的 working/output 请求必须能同时满足，否则返回 `Error::Unschedulable`，而不是接受后永久等待。更早祖先若需跨节点继续存活，必须由中间节点的声明 output 显式承载并计费；校验不会重复累计已消费的祖先 output。此版本仍不做全图精确内存证明、磁盘溢写或自动分批。跨 workflow 的 output lease 仍按运行时 backpressure 处理，直到外部 handle/reader 释放。
 
 ### CPU 并行
 

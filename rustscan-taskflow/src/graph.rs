@@ -164,10 +164,11 @@ impl TaskGraph {
             max_outputs.push(max_output);
         }
 
-        // A dependency can keep every ancestor artifact alive until the consumer
-        // has acquired its working memory. Build a conservative topological
-        // liveness bound so an impossible graph is rejected instead of waiting
-        // forever after its producers have completed.
+        // A node's direct input artifacts remain leased until it can acquire its
+        // own resources. Earlier ancestors do not remain implicit inputs: if an
+        // intermediate node carries data forward, that data must be represented
+        // by its declared output reservation. Counting transitive ancestors here
+        // would double-charge already-consumed outputs and reject valid pipelines.
         let mut counts: Vec<_> = self.nodes.iter().map(|node| node.deps.len()).collect();
         let mut consumers = vec![Vec::new(); self.len()];
         for (index, node) in self.nodes.iter().enumerate() {
@@ -195,18 +196,14 @@ impl TaskGraph {
             return Err(Error::Cycle);
         }
 
-        let mut retained = vec![0u64; self.len()];
         for index in order {
             let retained_before = self.nodes[index]
                 .deps
                 .iter()
                 .try_fold(0u64, |total, &dependency| {
-                    total
-                        .checked_add(retained[dependency])
-                        .and_then(|total| total.checked_add(max_outputs[dependency]))
+                    total.checked_add(max_outputs[dependency])
                 })
                 .ok_or_else(|| Error::Unschedulable(self.nodes[index].name.clone()))?;
-            retained[index] = retained_before;
 
             let has_memory_feasible_variant = self.nodes[index].variants.iter().any(|variant| {
                 ledger
