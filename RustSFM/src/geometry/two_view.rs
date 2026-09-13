@@ -1623,9 +1623,10 @@ fn estimate_essential_ransac_gpu_with_policy(
         active_indices,
         shared_stream,
     );
-    let run = run_gpu_ransac_batches(
+    let run = run_gpu_ransac_batches_with_five_point(
         &session,
         active_indices,
+        use_five_point.then_some((pts1, pts2)),
         GpuRansacRunConfig {
             family: "Essential",
             sample_size,
@@ -2439,6 +2440,53 @@ fn run_gpu_ransac_batches<S, G, R>(
     scorer: &impl GpuRansacScoring,
     active_indices: &[usize],
     config: GpuRansacRunConfig<'_>,
+    sample: S,
+    generate_models: G,
+    refine: R,
+) -> anyhow::Result<GpuRansacRunResult>
+where
+    S: FnMut(usize) -> Vec<usize>,
+    G: FnMut(&[usize]) -> Vec<Matrix3<f64>>,
+    R: FnMut(Matrix3<f64>, ModelSupport) -> (Matrix3<f64>, ModelSupport),
+{
+    run_gpu_ransac_batches_with_five_point(
+        scorer,
+        active_indices,
+        None,
+        config,
+        sample,
+        generate_models,
+        refine,
+    )
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn solve_five_point_trial_groups(
+    groups: &mut [GpuRansacTrialGroup],
+    pts1: &[Vector3<f64>],
+    pts2: &[Vector3<f64>],
+) {
+    let solve = |group: &mut GpuRansacTrialGroup| {
+        if group.sample.len() == 5 {
+            group.models = estimate_essential_five_point_indexed(pts1, pts2, &group.sample);
+        }
+    };
+    // parallel() alone does not prevent global Rayon use outside admission.
+    if groups.len() > 1 && crate::execution::active_threads().is_some_and(|threads| threads > 1) {
+        use rayon::prelude::*;
+        crate::execution::parallel(|| groups.par_iter_mut().for_each(solve));
+    } else {
+        groups.iter_mut().for_each(solve);
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_ransac_batches_with_five_point<S, G, R>(
+    scorer: &impl GpuRansacScoring,
+    active_indices: &[usize],
+    five_point_rays: Option<(&[Vector3<f64>], &[Vector3<f64>])>,
+    config: GpuRansacRunConfig<'_>,
     mut sample: S,
     mut generate_models: G,
     mut refine: R,
@@ -2448,6 +2496,9 @@ where
     G: FnMut(&[usize]) -> Vec<Matrix3<f64>>,
     R: FnMut(Matrix3<f64>, ModelSupport) -> (Matrix3<f64>, ModelSupport),
 {
+    // Defer only the stateless five-point solve, never a caller's FnMut generator.
+    let five_point_rays = five_point_rays
+        .filter(|_| crate::execution::active_threads().is_some_and(|threads| threads > 1));
     let mut timing = WgpuRansacStageTiming::default();
     let max_num_trials = config.options.max_num_trials.max(1);
     let mut dynamic_max_trials = max_num_trials;
@@ -2490,8 +2541,15 @@ where
             groups.push(GpuRansacTrialGroup::new(
                 trial,
                 sampled.clone(),
-                generate_models(&sampled),
+                if five_point_rays.is_some() {
+                    Vec::new()
+                } else {
+                    generate_models(&sampled)
+                },
             ));
+        }
+        if let Some((pts1, pts2)) = five_point_rays {
+            solve_five_point_trial_groups(&mut groups, pts1, pts2);
         }
         timing.candidate_generation_seconds += generation_started.elapsed().as_secs_f64();
         let candidates = gpu_ransac_candidates(&groups);
@@ -5267,6 +5325,181 @@ mod tests {
             max_num_trials: max_iterations as usize,
             ..ColmapRansacOptions::default()
         }
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn five_point_test_rays() -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>) {
+        let left = (0..23)
+            .map(|i| {
+                Vector3::new(
+                    (i as f64 * 1.7).sin(),
+                    (i as f64 * 0.8).cos(),
+                    2.0 + i as f64 * 0.1,
+                )
+                .normalize()
+            })
+            .collect();
+        let right = (0..23)
+            .map(|i| {
+                Vector3::new(
+                    (i as f64 * 1.7).sin() + 0.3,
+                    (i as f64 * 0.8).cos() - 0.1,
+                    2.0 + i as f64 * 0.1,
+                )
+                .normalize()
+            })
+            .collect();
+        (left, right)
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn five_point_trial_groups_preserve_bits_ordinals_and_exhaustion() -> anyhow::Result<()> {
+        let (left, right) = five_point_test_rays();
+        let active: Vec<_> = (0..left.len()).collect();
+        for batch_size in [1, 64, 512] {
+            let mut sampler = ColmapRandomSampler::new(1, &active);
+            let samples: Vec<_> = (0..batch_size).map(|_| sampler.sample(5)).collect();
+            let replay = || {
+                let mut groups: Vec<_> = samples
+                    .iter()
+                    .enumerate()
+                    .map(|(trial, sample)| {
+                        GpuRansacTrialGroup::new(trial, sample.clone(), Vec::new())
+                    })
+                    .collect();
+                groups.push(GpuRansacTrialGroup::new(batch_size, Vec::new(), Vec::new()));
+                solve_five_point_trial_groups(&mut groups, &left, &right);
+                groups
+                    .into_iter()
+                    .map(|group| {
+                        (
+                            group.trial,
+                            group.sample,
+                            group
+                                .models
+                                .into_iter()
+                                .map(|model| {
+                                    model
+                                        .as_slice()
+                                        .iter()
+                                        .map(|x| x.to_bits())
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(crate::execution::active_threads(), None);
+            let baseline = replay();
+            assert!(baseline.iter().any(|(_, _, models)| !models.is_empty()));
+            for threads in [1, 4] {
+                crate::execution::SfmTaskflow::shared()?.run(
+                    "five-point exact replay",
+                    false,
+                    threads,
+                    &crate::task::SfmTaskControl::new(),
+                    || {
+                        assert_eq!(crate::execution::active_threads(), Some(threads));
+                        assert_eq!(baseline, replay());
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn five_point_batch_runner_preserves_sampler_frontier_and_fnmut_path() -> anyhow::Result<()> {
+        let (left, right) = five_point_test_rays();
+        let active: Vec<_> = (0..left.len()).collect();
+        for shared_stream in [false, true] {
+            let replay = |parallel_five_point: bool| -> anyhow::Result<_> {
+                let options = test_ransac_options(64, 128, 0.999);
+                let previous_rng =
+                    COLMAP_SHARED_RANSAC_RNG.with(|rng| rng.replace(ColmapMt19937::new(1)));
+                let mut sampler = if shared_stream {
+                    TwoViewRansacSampler::Shared(ColmapSharedRandomSampler::new(&active))
+                } else {
+                    TwoViewRansacSampler::Owned(ColmapRandomSampler::new(1, &active))
+                };
+                let mut draws = Vec::new();
+                let mut generated = 0;
+                let mut refined = Vec::new();
+                let (scorer, _, _) = ScriptedGpuRansacScorer::new(23, 4096);
+                let result = run_gpu_ransac_batches_with_five_point(
+                    &scorer,
+                    &active,
+                    parallel_five_point.then_some((left.as_slice(), right.as_slice())),
+                    GpuRansacRunConfig {
+                        family: "Essential",
+                        sample_size: 5,
+                        dynamic_support_observations: active.len(),
+                        observation_count: active.len(),
+                        threshold: 0.01,
+                        kind: TwoViewModelKind::Sampson,
+                        options: &options,
+                        policy: gpu_ransac_batch_policy(shared_stream),
+                    },
+                    |trial| {
+                        let sample = sampler.sample(5);
+                        draws.push((trial, sample.clone()));
+                        sample
+                    },
+                    |sample| {
+                        generated += 1;
+                        estimate_essential_five_point_indexed(&left, &right, sample)
+                    },
+                    |model, support| {
+                        refined.push(
+                            model
+                                .as_slice()
+                                .iter()
+                                .map(|x| x.to_bits())
+                                .collect::<Vec<_>>(),
+                        );
+                        (model, support)
+                    },
+                );
+                let next_sample = sampler.sample(5);
+                COLMAP_SHARED_RANSAC_RNG.with(|rng| rng.replace(previous_rng));
+                let result = result?;
+                let best = result.best.map(|(model, support)| {
+                    (
+                        model
+                            .as_slice()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>(),
+                        support.inlier_mask,
+                        support.inliers,
+                        support.residual_sum.to_bits(),
+                    )
+                });
+                Ok(((draws, next_sample, refined, best), generated))
+            };
+            let (baseline, generated) = replay(false)?;
+            assert!(generated > 0);
+            assert_eq!(replay(true)?, (baseline.clone(), generated));
+            for threads in [1, 4] {
+                crate::execution::SfmTaskflow::shared()?.run(
+                    "five-point runner parity",
+                    false,
+                    threads,
+                    &crate::task::SfmTaskControl::new(),
+                    || {
+                        let (actual, actual_generated) = replay(true)?;
+                        assert_eq!(baseline, actual);
+                        assert_eq!(actual_generated, if threads > 1 { 0 } else { generated });
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
