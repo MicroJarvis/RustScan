@@ -1,5 +1,6 @@
 use super::{WgpuContext, WgpuModelScorerTiming};
 use anyhow::{bail, Context, Result};
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
@@ -79,12 +80,30 @@ pub struct WgpuModelScorer {
     mask_pipeline: wgpu::ComputePipeline,
 }
 
+/// Scratch buffers reused across every score and mask dispatch of one session.
+///
+/// The scoring shader bounds every access with `params.model_count` and
+/// `params.observation_count` instead of `arrayLength`, and readbacks copy only
+/// the requested element range, so buffers may be larger than one dispatch
+/// needs without changing results.
+struct SessionScratch {
+    models: wgpu::Buffer,
+    model_capacity: usize,
+    summaries: wgpu::Buffer,
+    summary_capacity: usize,
+    mask: wgpu::Buffer,
+    mask_capacity: usize,
+    params: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
 pub(crate) struct WgpuModelScoringSession<'a> {
     scorer: &'a WgpuModelScorer,
     points1: wgpu::Buffer,
     points2: wgpu::Buffer,
     observation_count: u32,
     observation_len: usize,
+    scratch: RefCell<Option<SessionScratch>>,
 }
 
 impl WgpuModelScorer {
@@ -246,6 +265,7 @@ impl WgpuModelScorer {
             points2: points2_buffer,
             observation_count,
             observation_len: points1.len(),
+            scratch: RefCell::new(None),
         })
     }
 
@@ -293,6 +313,13 @@ impl WgpuModelScorer {
 
     fn validate_storage_slice<T>(&self, label: &str, values: &[T]) -> Result<()> {
         self.validate_storage_elements::<T>(label, values.len())
+    }
+
+    fn storage_limit_bytes(&self) -> u64 {
+        let limits = self.context.device().limits();
+        limits
+            .max_buffer_size
+            .min(u64::from(limits.max_storage_buffer_binding_size))
     }
 
     fn validate_storage_elements<T>(&self, label: &str, count: usize) -> Result<()> {
@@ -358,37 +385,33 @@ impl WgpuModelScoringSession<'_> {
             pad1: 0.0,
             pad2: 0.0,
         };
-        let (bind_group, summaries, _mask) = self.create_bind_group(
-            models,
-            &params,
-            buffer_size::<GpuModelSupport>(models.len())?,
-            std::mem::size_of::<u32>() as u64,
-        );
-        let mut encoder =
-            self.scorer
-                .context
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("rustsfm model scorer support encoder"),
-                });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rustsfm model scorer support pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.scorer.score_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(model_count, 1, 1);
-        }
-        let command_buffer = encoder.finish();
-        let buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
-        let submit_started = Instant::now();
-        self.scorer.context.queue().submit(Some(command_buffer));
-        let submit_seconds = submit_started.elapsed().as_secs_f64();
-        let (supports, readback) = self
-            .scorer
-            .context
-            .read_buffer_profiled::<GpuModelSupport>(&summaries, models.len())?;
+        let mut buffer_prepare_seconds = 0.0;
+        let mut submit_seconds = 0.0;
+        let (supports, readback) =
+            self.with_session_scratch(models, &params, models.len(), 1, |scratch| {
+                let mut encoder = self.scorer.context.device().create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("rustsfm model scorer support encoder"),
+                    },
+                );
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("rustsfm model scorer support pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.scorer.score_pipeline);
+                    pass.set_bind_group(0, &scratch.bind_group, &[]);
+                    pass.dispatch_workgroups(model_count, 1, 1);
+                }
+                let command_buffer = encoder.finish();
+                buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
+                let submit_started = Instant::now();
+                self.scorer.context.queue().submit(Some(command_buffer));
+                submit_seconds = submit_started.elapsed().as_secs_f64();
+                self.scorer
+                    .context
+                    .read_buffer_profiled::<GpuModelSupport>(&scratch.summaries, models.len())
+            })??;
         Ok((
             supports,
             WgpuModelScorerTiming {
@@ -465,37 +488,33 @@ impl WgpuModelScoringSession<'_> {
             pad1: 0.0,
             pad2: 0.0,
         };
-        let (bind_group, _summaries, mask) = self.create_bind_group(
-            models,
-            &params,
-            std::mem::size_of::<GpuModelSupport>() as u64,
-            buffer_size::<u32>(mask_len)?,
-        );
-        let mut encoder =
-            self.scorer
-                .context
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("rustsfm model scorer mask encoder"),
-                });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rustsfm model scorer mask pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.scorer.mask_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups_per_model, model_count, 1);
-        }
-        let command_buffer = encoder.finish();
-        let buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
-        let submit_started = Instant::now();
-        self.scorer.context.queue().submit(Some(command_buffer));
-        let submit_seconds = submit_started.elapsed().as_secs_f64();
-        let (mask, readback) = self
-            .scorer
-            .context
-            .read_buffer_profiled::<u32>(&mask, mask_len)?;
+        let mut buffer_prepare_seconds = 0.0;
+        let mut submit_seconds = 0.0;
+        let (mask, readback) =
+            self.with_session_scratch(models, &params, 1, mask_len, |scratch| {
+                let mut encoder = self.scorer.context.device().create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("rustsfm model scorer mask encoder"),
+                    },
+                );
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("rustsfm model scorer mask pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.scorer.mask_pipeline);
+                    pass.set_bind_group(0, &scratch.bind_group, &[]);
+                    pass.dispatch_workgroups(workgroups_per_model, model_count, 1);
+                }
+                let command_buffer = encoder.finish();
+                buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
+                let submit_started = Instant::now();
+                self.scorer.context.queue().submit(Some(command_buffer));
+                submit_seconds = submit_started.elapsed().as_secs_f64();
+                self.scorer
+                    .context
+                    .read_buffer_profiled::<u32>(&scratch.mask, mask_len)
+            })??;
         let masks = mask
             .chunks_exact(self.observation_len)
             .map(|values| values.iter().map(|&value| value != 0).collect())
@@ -518,67 +537,173 @@ impl WgpuModelScoringSession<'_> {
         ))
     }
 
-    fn create_bind_group(
+    /// Uploads `models` and `params`, growing the reused scratch buffers only
+    /// when the requested element counts exceed the current capacities.
+    ///
+    /// Every dispatch fully writes the range it later reads back, so reusing a
+    /// buffer never exposes stale values from a previous dispatch.
+    fn with_session_scratch<R>(
         &self,
         models: &[[f32; 9]],
         params: &ScoringParams,
-        summary_size: u64,
-        mask_size: u64,
-    ) -> (wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer) {
+        summary_elements: usize,
+        mask_elements: usize,
+        body: impl FnOnce(&SessionScratch) -> R,
+    ) -> Result<R> {
+        let mut slot = self.scratch.borrow_mut();
+        self.grow_session_scratch(&mut slot, models.len(), summary_elements, mask_elements)?;
+        let scratch = slot
+            .as_ref()
+            .context("GPU model scorer scratch buffers are missing")?;
+        let queue = self.scorer.context.queue();
+        queue.write_buffer(&scratch.models, 0, bytemuck::cast_slice(models));
+        queue.write_buffer(&scratch.params, 0, bytemuck::bytes_of(params));
+        Ok(body(scratch))
+    }
+
+    fn grow_session_scratch(
+        &self,
+        slot: &mut Option<SessionScratch>,
+        model_elements: usize,
+        summary_elements: usize,
+        mask_elements: usize,
+    ) -> Result<()> {
+        let model_elements = model_elements.max(1);
+        let summary_elements = summary_elements.max(1);
+        let mask_elements = mask_elements.max(1);
         let device = self.scorer.context.device();
-        let model_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rustsfm model scorer models"),
-            contents: bytemuck::cast_slice(models),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let summaries = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rustsfm model scorer summaries"),
-            size: summary_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let mask = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rustsfm model scorer mask"),
-            size: mask_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rustsfm model scorer params"),
-            contents: bytemuck::bytes_of(params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rustsfm model scorer bind group"),
-            layout: &self.scorer.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: model_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.points1.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.points2.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: summaries.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: mask.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        (bind_group, summaries, mask)
+        let limit = self.scorer.storage_limit_bytes();
+
+        let Some(scratch) = slot.as_mut() else {
+            let models = create_scratch_buffer::<[f32; 9]>(
+                device,
+                "rustsfm model scorer models",
+                model_elements,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            )?;
+            let summaries = create_scratch_buffer::<GpuModelSupport>(
+                device,
+                "rustsfm model scorer summaries",
+                summary_elements,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )?;
+            let mask = create_scratch_buffer::<u32>(
+                device,
+                "rustsfm model scorer mask",
+                mask_elements,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )?;
+            let params = create_scratch_buffer::<ScoringParams>(
+                device,
+                "rustsfm model scorer params",
+                1,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            )?;
+            let bind_group = self.create_bind_group(&models, &summaries, &mask, &params);
+            *slot = Some(SessionScratch {
+                models,
+                model_capacity: model_elements,
+                summaries,
+                summary_capacity: summary_elements,
+                mask,
+                mask_capacity: mask_elements,
+                params,
+                bind_group,
+            });
+            return Ok(());
+        };
+
+        let mut rebind = false;
+        if scratch.model_capacity < model_elements {
+            let capacity =
+                grown_capacity::<[f32; 9]>(scratch.model_capacity, model_elements, limit);
+            scratch.models = create_scratch_buffer::<[f32; 9]>(
+                device,
+                "rustsfm model scorer models",
+                capacity,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            )?;
+            scratch.model_capacity = capacity;
+            rebind = true;
+        }
+        if scratch.summary_capacity < summary_elements {
+            let capacity = grown_capacity::<GpuModelSupport>(
+                scratch.summary_capacity,
+                summary_elements,
+                limit,
+            );
+            scratch.summaries = create_scratch_buffer::<GpuModelSupport>(
+                device,
+                "rustsfm model scorer summaries",
+                capacity,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )?;
+            scratch.summary_capacity = capacity;
+            rebind = true;
+        }
+        if scratch.mask_capacity < mask_elements {
+            let capacity = grown_capacity::<u32>(scratch.mask_capacity, mask_elements, limit);
+            scratch.mask = create_scratch_buffer::<u32>(
+                device,
+                "rustsfm model scorer mask",
+                capacity,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )?;
+            scratch.mask_capacity = capacity;
+            rebind = true;
+        }
+        if rebind {
+            let bind_group = self.create_bind_group(
+                &scratch.models,
+                &scratch.summaries,
+                &scratch.mask,
+                &scratch.params,
+            );
+            scratch.bind_group = bind_group;
+        }
+        Ok(())
+    }
+
+    fn create_bind_group(
+        &self,
+        models: &wgpu::Buffer,
+        summaries: &wgpu::Buffer,
+        mask: &wgpu::Buffer,
+        params: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.scorer
+            .context
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rustsfm model scorer bind group"),
+                layout: &self.scorer.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: models.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.points1.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.points2.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: summaries.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: mask.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: params.as_entire_binding(),
+                    },
+                ],
+            })
     }
 }
 
@@ -602,6 +727,34 @@ fn validate_threshold(threshold: f32) -> Result<()> {
 
 fn squared_threshold(threshold: f32) -> f32 {
     threshold.max(1.0e-12).powi(2)
+}
+
+/// Allocates a scratch buffer sized for `capacity` elements of `T`.
+fn create_scratch_buffer<T>(
+    device: &wgpu::Device,
+    label: &str,
+    capacity: usize,
+    usage: wgpu::BufferUsages,
+) -> Result<wgpu::Buffer> {
+    Ok(device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: buffer_size::<T>(capacity)?,
+        usage,
+        mapped_at_creation: false,
+    }))
+}
+
+/// Doubles a scratch capacity when the larger allocation still fits the device
+/// storage limit, otherwise allocates exactly what the dispatch needs.
+fn grown_capacity<T>(current: usize, needed: usize, limit_bytes: u64) -> usize {
+    let doubled = current.saturating_mul(2).max(needed);
+    if doubled == needed {
+        return needed;
+    }
+    match buffer_size::<T>(doubled) {
+        Ok(bytes) if bytes <= limit_bytes => doubled,
+        _ => needed,
+    }
 }
 
 fn buffer_size<T>(count: usize) -> Result<u64> {

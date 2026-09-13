@@ -851,6 +851,68 @@ mod tests {
         Ok(())
     }
 
+    /// The session reuses its model, summary and mask buffers across dispatches,
+    /// so shrinking batches must never observe values left by a larger one.
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_reused_buffers_match_isolated_sessions() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer buffer reuse test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let points1 = [
+            [0.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0],
+            [-3.0, 4.0, 1.0],
+            [5.0, -1.0, 1.0],
+            [2.0, 7.0, 1.0],
+        ];
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let scaled = [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0];
+        let translated = [1.0, 0.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let sheared = [1.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let batches: [&[[f32; 9]]; 5] = [
+            &[identity, scaled, translated, sheared],
+            &[identity],
+            &[translated, sheared],
+            &[scaled],
+            &[identity, scaled, translated, sheared],
+        ];
+
+        // Descending then ascending batch sizes exercise both reuse and growth.
+        let shared = scorer.prepare_homogeneous_session(&points1, &points1)?;
+        for models in batches {
+            let isolated = scorer.prepare_homogeneous_session(&points1, &points1)?;
+            for kind in [
+                TwoViewModelKind::HomographyForward,
+                TwoViewModelKind::Sampson,
+            ] {
+                let (shared_supports, _) =
+                    shared.score_two_view_models_profiled(models, 0.5, kind)?;
+                let (isolated_supports, _) =
+                    isolated.score_two_view_models_profiled(models, 0.5, kind)?;
+                assert_eq!(shared_supports, isolated_supports);
+
+                let (shared_masks, shared_timing) =
+                    shared.inlier_masks_profiled(models, 0.5, kind)?;
+                let (isolated_masks, _) = isolated.inlier_masks_profiled(models, 0.5, kind)?;
+                assert_eq!(shared_masks, isolated_masks);
+                assert_eq!(shared_masks.len(), models.len());
+                for mask in &shared_masks {
+                    assert_eq!(mask.len(), points1.len());
+                }
+                assert_eq!(shared_timing.mask_calls, 1);
+                assert_eq!(shared_timing.readback_calls, 1);
+                assert_eq!(
+                    shared_timing.readback_bytes,
+                    (models.len() * points1.len() * std::mem::size_of::<u32>()) as u64
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn wgpu_model_scorer_profiled_reports_support_and_mask_work() -> Result<()> {

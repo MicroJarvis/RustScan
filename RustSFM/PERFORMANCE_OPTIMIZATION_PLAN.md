@@ -56,6 +56,7 @@
 | R9 packed GPU SIFT distance | ✅ 交错验证完成，候选保留（2026-09-13） | CPU packing 为每个 descriptor 附加精确 `Σx²`，WGSL 使用 packed `dot4U8Packed` 计算 `‖q‖²+‖t‖²-2q·t`。flowers2 first48 baseline/candidate 各3轮，wall 中位数 63.80→41.64s（-34.7%），descriptor matching 39.82→17.04s（-57.2%），RSS 基本不变；6轮完整 pairs SHA-256 均为 `613a73f…97216`。focused、matching 30/30、完整 lib 760 passed/19 ignored。下一步只画像并优化 GPU geometry，不改 matching policy |
 | R10 geometry compute+copy 单提交 | ⛔ smoke 无收益，已回退（2026-09-13） | scorer 将 compute 与 readback copy command buffers 合为一次 queue submission；focused 3/3、pairs hash 不变，但 smoke wall 43.86s、geometry 25.80s，劣于相邻 packed-only 的约41.3/23.73s，E/F/H readback wait 几乎不变。源码已恢复，不做多轮、不重试 |
 | R11 bounded GPU geometry masks | ✅ 交错验证完成，候选保留（2026-09-13） | 每个64-trial decision window 按原 ordinal 即时预取最多4个当前 contender mask，CPU 仍逐候选重新比较/refine/update frontier。3×3 wall 中位数42.96→40.20s（-6.4%），geometry 25.63→22.87s（-10.8%），readback wait 15.31→13.19s；完整 pairs hash 一致。整窗口预取因严重过算已拒绝；batch failure 回到当前 candidate 的标量 GPU mask 并关闭本窗口 batching |
+| R12 geometry scorer session buffer 复用 | ⚠️ 目标指标改善但端到端不可证明（2026-09-13） | scorer session 复用 model/summary/mask/params buffer 与 bind group，按容量翻倍增长。逐位输出一致，focused 与完整 lib 763 passed/19 ignored 通过。scorer buffer_prepare 0.568→0.397s（-30%）、submit 0.152→0.091s（-40%），但 readback wait 13.13→13.20s 不变、wall 40.74→40.95s，收益被同步延迟完全掩盖。**本轮真正产出是瓶颈定位见 R12 小节，不作加速宣称** |
 
 | R8 GPU-only matching 测试/CI 迁移 | ✅ focused 门完成（2026-09-12） | 不保留 CPU matching fallback。`no-default-features` 改为最小编译门；matching/sequence/adaptive 集成门显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan。GPU session 测试按 feature gate 编译，旧 FIFO verifier 控制不再生成 trace 且不得改变 GPU 结果。no-default release check 通过；GPU matching 30/30、GPU integration 81 passed/1 ignored。完整默认 lib 门及真实 flowers2 尚待后续验证 |
 
@@ -99,6 +100,20 @@
 - geometry scorer readbacks 中位数12,025→10,352（-13.9%），readback bytes 51,838,616→63,637,340（+22.8%）；以有限额外GPU计算/传输换取更少同步点。RSS 中位数246,005,760→243,810,304 bytes，无增长信号，但不是一般输入的RSS上限证明。
 - 6轮均为461 matched/verified pairs、259,206 matches，规范化完整 pairs SHA-256 均为 `613a73f3838832d706f1574792d0ece141fb89ce0afcac91ca6fa3e4dbb97216`。
 - 错误与内存边界：转换、buffer size和dispatch limit在batch前验证；batch失败或返回数量异常时，丢弃预取结果并从当前candidate走原标量GPU mask，随后关闭本decision window batching，使错误按当前candidate路径暴露。每个已越过candidate的预取mask立即释放；新增失败注入对照确认最终best、sampling、refinement和mask消费与标量路径一致。这里的“标量”指单模型GPU dispatch/readback，不是CPU geometry fallback。
+
+### R12：geometry scorer session buffer 复用与同步延迟瓶颈定位（2026-09-13）
+
+**状态：代码保留（无回归），但不构成加速证据；本轮主要价值是证伪与瓶颈定位。** 实验目录：`output/gpu_only_profile_flowers2_20260913/geometry-scratch-reuse-smoke/`。
+
+- 单一候选：`WgpuModelScoringSession` 在 session 生命周期内复用 model/summary/mask/params buffer 与 bind group，容量不足时翻倍增长并受设备 storage 限制裁剪；未改 WGSL、candidate ordinal、summary 严格排序、local refinement、dynamic frontier、batch 上限或任何策略参数。
+- 复用安全性依据：scoring shader 用 `params.model_count`/`params.observation_count` 而非 `arrayLength` 约束全部访问，且每次 dispatch 完整写满随后读回的区间，readback 只拷贝请求的元素范围；因此超额分配的 buffer 既不越界也不会读到上一次 dispatch 的残留值。新增 `wgpu_model_scorer_reused_buffers_match_isolated_sessions`，用降序再升序的批量大小（4/1/2/1/4）交替 score 与 mask，对照每批独立 session，两种 residual kind 下 support、完整 mask 与 readback bytes 全部相同。
+- 门禁：`cargo fmt --all -- --check`、`git diff --check`、GPU scorer focused 7/7、RANSAC focused 41/41、完整默认 lib **763 passed / 19 ignored** 全部通过。
+- 质量：flowers2 first48 仍为 461 matched/verified pairs、259,206 matches。用新增 [pair_output_hash.py](tools/pair_output_hash.py) 对 `matches` 与 `two_view_geometries` 全部行（含原始 blob、float 按位）规范化后，R11 已提交 smoke 与本候选 smoke 的 digest 同为 `fbe4acf540b62c1866f3ccacc0d549b24c039ec1ef0a6ae192fb44a26d5c1a32`，即逐位一致。该脚本的规范化与历史 `613a73f…97216` 不是同一算法，两者不可互比。
+- 目标指标确实下降：scorer `buffer_prepare` 合计 `0.568 → 0.397s`（-30%），`submit` 合计 `0.152 → 0.091s`（-40%），每次 score/mask 的 4 次 buffer 创建加 1 次 bind group 创建被完全消除（约 10,352 次调用 × 5）。score/mask/readback 计数逐项不变。
+- 但端到端不可见：`readback wait` 13.132 → 13.199s、geometry 22.356 → 22.920s、wall 40.74 → 40.95s、RSS 248,676,352 → 244,547,584 bytes。分配开销只占 wall 约 1.4%，完全被同步等待掩盖，单轮差异在既有轮间噪声（约 ±1s）之内。因此**不跑 3×3 交错，不宣称加速**。
+- **瓶颈定位（本轮关键结论）**：per-readback 等待在三个 model family 间高度一致——essential `2.431s / 1896 = 1282µs`、fundamental `2.673s / 2100 = 1273µs`、homography `8.095s / 6356 = 1274µs`。三者传输量（20.9 / 16.6 / 26.1 MB）与每次计算量（平均每次 score 的模型数 2190 / 1231 / 476）差异巨大，per-call 延迟却只差 0.7%。这说明 geometry readback wait 由**每个同步点约 1.275ms 的固定往返延迟**主导，与字节数和 kernel 工作量基本无关：`10,352 × 1.275ms ≈ 13.2s`，占 geometry 的约 58%、wall 的约 32%。
+- 由此排除的方向：继续压缩 buffer 分配、staging 复用或纯传输量优化都不可能有实质收益（R10 合并 submission 的失败与此一致）。**唯一有效杠杆是减少同步点数量**，即减少 `score_calls + mask_calls`（当前 5,970 + 4,382 = 10,352），而不是让每次同步更便宜。
+- 限制：1.275ms 是本机 Metal/wgpu 后端在此工作负载下的观测值，不是设备无关常数，也未分离驱动唤醒、`map_async` 回调与 GPU 实际执行；不可外推到 960 帧或其他后端。
 
 ### B1：R7 后 flowers2 first48 对照基线（2026-09-10）
 
