@@ -872,6 +872,8 @@ mod tests {
         )?;
         let (mask, mask_timing) =
             session.inlier_mask_profiled(&identity, 0.1, TwoViewModelKind::HomographyForward)?;
+        let (batched_masks, batched_mask_timing) =
+            session.inlier_masks_profiled(&models, 0.1, TwoViewModelKind::HomographyForward)?;
         let (empty_supports, empty_timing) = session.score_two_view_models_profiled(
             &[],
             0.1,
@@ -882,6 +884,10 @@ mod tests {
         assert!(supports[0].residual_sum.abs() < 1.0e-6);
         assert_eq!(supports[1].inliers, 0);
         assert_eq!(mask, vec![true, true, true]);
+        assert_eq!(
+            batched_masks,
+            vec![vec![true, true, true], vec![false, false, false]]
+        );
         assert_eq!(score_timing.score_calls, 1);
         assert_eq!(score_timing.mask_calls, 0);
         assert_eq!(score_timing.models_scored, models.len());
@@ -890,6 +896,12 @@ mod tests {
         assert_eq!(mask_timing.mask_calls, 1);
         assert_eq!(mask_timing.models_scored, 0);
         assert_eq!(mask_timing.readback_calls, 1);
+        assert_eq!(batched_mask_timing.mask_calls, 1);
+        assert_eq!(batched_mask_timing.readback_calls, 1);
+        assert_eq!(
+            batched_mask_timing.readback_bytes,
+            mask_timing.readback_bytes * models.len() as u64
+        );
         assert!(score_timing.readback_bytes > 0);
         assert!(mask_timing.readback_bytes > 0);
         assert!(score_timing.readback_map_decode_seconds >= score_timing.readback_wait_seconds);

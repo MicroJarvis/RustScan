@@ -423,17 +423,40 @@ impl WgpuModelScoringSession<'_> {
         threshold: f32,
         kind: TwoViewModelKind,
     ) -> Result<(Vec<bool>, WgpuModelScorerTiming)> {
+        let (mut masks, timing) =
+            self.inlier_masks_profiled(std::slice::from_ref(model), threshold, kind)?;
+        Ok((masks.remove(0), timing))
+    }
+
+    pub(crate) fn inlier_masks_profiled(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> Result<(Vec<Vec<bool>>, WgpuModelScorerTiming)> {
         validate_threshold(threshold)?;
-        let workgroups = self.observation_count.div_ceil(64);
-        self.scorer.validate_dispatch_count(workgroups, "mask")?;
+        let model_count = u32::try_from(models.len()).context("GPU model count exceeds u32")?;
+        if models.is_empty() {
+            return Ok((Vec::new(), WgpuModelScorerTiming::default()));
+        }
+
+        let workgroups_per_model = self.observation_count.div_ceil(64);
         self.scorer
-            .validate_storage_slice("model", std::slice::from_ref(model))?;
+            .validate_dispatch_count(workgroups_per_model, "mask")?;
         self.scorer
-            .validate_storage_elements::<u32>("inlier mask", self.observation_len)?;
+            .validate_dispatch_count(model_count, "mask model")?;
+        let model_label = if models.len() == 1 { "model" } else { "models" };
+        self.scorer.validate_storage_slice(model_label, models)?;
+        let mask_len = models
+            .len()
+            .checked_mul(self.observation_len)
+            .context("GPU model scorer inlier mask element count overflow")?;
+        self.scorer
+            .validate_storage_elements::<u32>("inlier mask", mask_len)?;
 
         let buffer_prepare_started = Instant::now();
         let params = ScoringParams {
-            model_count: 1,
+            model_count,
             observation_count: self.observation_count,
             model_kind: kind.shader_value(),
             selected_model: 0,
@@ -443,10 +466,10 @@ impl WgpuModelScoringSession<'_> {
             pad2: 0.0,
         };
         let (bind_group, _summaries, mask) = self.create_bind_group(
-            std::slice::from_ref(model),
+            models,
             &params,
             std::mem::size_of::<GpuModelSupport>() as u64,
-            buffer_size::<u32>(self.observation_len)?,
+            buffer_size::<u32>(mask_len)?,
         );
         let mut encoder =
             self.scorer
@@ -462,7 +485,7 @@ impl WgpuModelScoringSession<'_> {
             });
             pass.set_pipeline(&self.scorer.mask_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(workgroups_per_model, model_count, 1);
         }
         let command_buffer = encoder.finish();
         let buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
@@ -472,9 +495,13 @@ impl WgpuModelScoringSession<'_> {
         let (mask, readback) = self
             .scorer
             .context
-            .read_buffer_profiled::<u32>(&mask, self.observation_len)?;
+            .read_buffer_profiled::<u32>(&mask, mask_len)?;
+        let masks = mask
+            .chunks_exact(self.observation_len)
+            .map(|values| values.iter().map(|&value| value != 0).collect())
+            .collect();
         Ok((
-            mask.into_iter().map(|value| value != 0).collect(),
+            masks,
             WgpuModelScorerTiming {
                 buffer_prepare_seconds,
                 submit_seconds,

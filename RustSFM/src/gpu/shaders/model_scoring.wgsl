@@ -193,9 +193,11 @@ fn score_models(
 @compute @workgroup_size(64)
 fn write_mask(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let observation_index = global_id.x;
-    if (observation_index >= params.observation_count) {
+    let model_index = global_id.y;
+    if (observation_index >= params.observation_count || model_index >= params.model_count) {
         return;
     }
-    let residual = model_residual(params.selected_model, observation_index);
-    mask[observation_index] = select(0u, 1u, is_inlier(residual));
+    let residual = model_residual(model_index, observation_index);
+    let output_offset = model_index * params.observation_count + observation_index;
+    mask[output_offset] = select(0u, 1u, is_inlier(residual));
 }

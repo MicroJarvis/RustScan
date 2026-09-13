@@ -55,6 +55,7 @@
 | R8 GPU-only matching 迁移门 | ✅ focused 与 CI 配置完成（2026-09-12） | 产品约束为 SIFT matching 仅使用 wgpu，不提供 CPU fallback。修复 `gpu-wgpu` 条件编译；旧 FIFO verifier 控制不再生成 trace；no-default 仅作 lib compile check，GPU integration 显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan 并串行执行 GPU 测试。matching 30/30、GPU integration 81 passed/1 ignored、默认 lib 760 passed/19 ignored；fixture reference 提交前仍须确认纳入 Git |
 | R9 packed GPU SIFT distance | ✅ 交错验证完成，候选保留（2026-09-13） | CPU packing 为每个 descriptor 附加精确 `Σx²`，WGSL 使用 packed `dot4U8Packed` 计算 `‖q‖²+‖t‖²-2q·t`。flowers2 first48 baseline/candidate 各3轮，wall 中位数 63.80→41.64s（-34.7%），descriptor matching 39.82→17.04s（-57.2%），RSS 基本不变；6轮完整 pairs SHA-256 均为 `613a73f…97216`。focused、matching 30/30、完整 lib 760 passed/19 ignored。下一步只画像并优化 GPU geometry，不改 matching policy |
 | R10 geometry compute+copy 单提交 | ⛔ smoke 无收益，已回退（2026-09-13） | scorer 将 compute 与 readback copy command buffers 合为一次 queue submission；focused 3/3、pairs hash 不变，但 smoke wall 43.86s、geometry 25.80s，劣于相邻 packed-only 的约41.3/23.73s，E/F/H readback wait 几乎不变。源码已恢复，不做多轮、不重试 |
+| R11 bounded GPU geometry masks | ✅ 交错验证完成，候选保留（2026-09-13） | 每个64-trial decision window 按原 ordinal 即时预取最多4个当前 contender mask，CPU 仍逐候选重新比较/refine/update frontier。3×3 wall 中位数42.96→40.20s（-6.4%），geometry 25.63→22.87s（-10.8%），readback wait 15.31→13.19s；完整 pairs hash 一致。整窗口预取因严重过算已拒绝；batch failure 回到当前 candidate 的标量 GPU mask 并关闭本窗口 batching |
 
 | R8 GPU-only matching 测试/CI 迁移 | ✅ focused 门完成（2026-09-12） | 不保留 CPU matching fallback。`no-default-features` 改为最小编译门；matching/sequence/adaptive 集成门显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan。GPU session 测试按 feature gate 编译，旧 FIFO verifier 控制不再生成 trace 且不得改变 GPU 结果。no-default release check 通过；GPU matching 30/30、GPU integration 81 passed/1 ignored。完整默认 lib 门及真实 flowers2 尚待后续验证 |
 
@@ -86,6 +87,18 @@
 - scorer support/mask/Sampson focused 3/3 通过；flowers2 smoke 仍为461 pairs、259,206 matches，完整 pairs SHA-256 仍为 `613a73f…97216`。
 - packed-only 相邻两轮 wall 41.64/41.05s、geometry 23.733/23.724s；候选 smoke wall 43.86s、geometry 25.801s。E/F/H readback wait 为2.768/3.184/9.368s，与 packed-only 的约2.757/3.178/9.352s 基本相同，没有机制级收益证据。
 - 按 smoke 停止条件回退 `gpu/context.rs` 与 `gpu/scorer.rs`，不运行多轮或完整门禁。后续不要重试单纯合并 submission；若继续 geometry，应先设计保持64-trial decision 顺序的 bounded batched-mask 实验，并单独证明内存上界和逐位输出。
+
+### R11：bounded GPU geometry masks（2026-09-13）
+
+**状态：候选保留，尚未提交。** 实验目录：`output/gpu_only_profile_flowers2_20260913/geometry-mask4-interleaved/`。
+
+- 首个整64-trial窗口预取候选被 smoke 拒绝：essential/fundamental/homography mask 计算膨胀到129,441/71,658/30,902，geometry 28.176s、wall 46.28s。该策略未保留。
+- 最终候选只在当前 candidate 确实需要 mask 时，从当前位置按 ordinal 选择最多4个相对当前 best 的 contender，一次二维 GPU dispatch/readback；CPU 仍按原顺序重新判断、构建 support、refine、更新 best 与 dynamic frontier。下一批只能在前一批最早4个 contender 已消费或失效后启动，因此 host 保留上界为4个 observation masks。
+- scalar synthetic scorer 保留原错误/顺序门；新增 batched synthetic scorer 对照，最终 model、support bits、完整 mask、sampling 和 refinement 顺序一致。真实 WGSL 回归验证两个可区分模型的一次2D dispatch、model-major mask 顺序、一次 readback。
+- flowers2 first48 使用同一 frozen DB。三轮 baseline wall 41.05/43.39/42.96s，三轮 candidate 40.73/40.16/40.20s，candidate 全部更快；中位数 wall `42.96 → 40.20s`（约-6.4%）、matching `42.814 → 39.998s`（约-6.6%）、geometry `25.628 → 22.872s`（约-10.8%）、geometry scorer readback wait `15.306 → 13.185s`（约-13.9%）。descriptor 约17.0s不变。
+- geometry scorer readbacks 中位数12,025→10,352（-13.9%），readback bytes 51,838,616→63,637,340（+22.8%）；以有限额外GPU计算/传输换取更少同步点。RSS 中位数246,005,760→243,810,304 bytes，无增长信号，但不是一般输入的RSS上限证明。
+- 6轮均为461 matched/verified pairs、259,206 matches，规范化完整 pairs SHA-256 均为 `613a73f3838832d706f1574792d0ece141fb89ce0afcac91ca6fa3e4dbb97216`。
+- 错误与内存边界：转换、buffer size和dispatch limit在batch前验证；batch失败或返回数量异常时，丢弃预取结果并从当前candidate走原标量GPU mask，随后关闭本decision window batching，使错误按当前candidate路径暴露。每个已越过candidate的预取mask立即释放；新增失败注入对照确认最终best、sampling、refinement和mask消费与标量路径一致。这里的“标量”指单模型GPU dispatch/readback，不是CPU geometry fallback。
 
 ### B1：R7 后 flowers2 first48 对照基线（2026-09-10）
 
