@@ -13,6 +13,8 @@ use std::ops::AddAssign;
 #[cfg(feature = "gpu-wgpu")]
 mod context;
 #[cfg(feature = "gpu-wgpu")]
+mod five_point_f32;
+#[cfg(feature = "gpu-wgpu")]
 mod matcher;
 #[cfg(feature = "gpu-wgpu")]
 mod pnp_focal;
@@ -38,6 +40,12 @@ pub(crate) use pnp_focal::{
 pub(crate) fn is_known_macos_agx_pipeline_failure(error: &anyhow::Error) -> bool {
     pnp_focal::is_known_macos_agx_pipeline_failure(error)
 }
+#[cfg(feature = "gpu-wgpu")]
+pub use five_point_f32::{
+    FivePointAlgebraResult, FivePointConstraintMatrix, FivePointModelSlot, FivePointNullspaceBasis,
+    FivePointNullspaceResult, FivePointSlotStatus, FivePointStatus, FivePointTrialResult,
+    WgpuFivePointF32,
+};
 #[cfg(feature = "gpu-wgpu")]
 pub use pnp_scorer::WgpuPnpModelScorer;
 #[cfg(all(feature = "gpu-wgpu", test))]

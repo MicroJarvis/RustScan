@@ -17,22 +17,22 @@ use std::{path::PathBuf, time::Instant};
 #[command(
     about = "CPU five-point fixed sampler PREFIX replay, not actual executed 960-trial RANSAC workload"
 )]
-struct Args {
+pub(crate) struct Args {
     #[arg(long, help = "Required existing COLMAP database; opened read-only")]
-    database: PathBuf,
+    pub(crate) database: PathBuf,
     #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..=12))]
-    pairs: u32,
+    pub(crate) pairs: u32,
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=512))]
-    trials: u32,
+    pub(crate) trials: u32,
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=512))]
-    batch_size: u32,
+    pub(crate) batch_size: u32,
 }
 
 #[derive(Clone)]
-struct Input {
-    indices: [usize; 5],
-    left: [Vector3<f64>; 5],
-    right: [Vector3<f64>; 5],
+pub(crate) struct Input {
+    pub(crate) indices: [usize; 5],
+    pub(crate) left: [Vector3<f64>; 5],
+    pub(crate) right: [Vector3<f64>; 5],
 }
 
 type Outputs = Vec<Vec<Matrix3<f64>>>;
@@ -86,7 +86,11 @@ fn replay(inputs: &[Input], pool: Option<&ThreadPool>) -> Outputs {
     replay_batches(inputs, pool, inputs.len().max(1))
 }
 
-fn replay_batches(inputs: &[Input], pool: Option<&ThreadPool>, batch_size: usize) -> Outputs {
+pub(crate) fn replay_batches(
+    inputs: &[Input],
+    pool: Option<&ThreadPool>,
+    batch_size: usize,
+) -> Outputs {
     let mut outputs = Vec::with_capacity(inputs.len());
     for batch in inputs.chunks(batch_size) {
         outputs.extend(match pool {
@@ -99,7 +103,7 @@ fn replay_batches(inputs: &[Input], pool: Option<&ThreadPool>, batch_size: usize
     outputs
 }
 
-fn output_bits(outputs: &Outputs) -> Bits {
+pub(crate) fn output_bits(outputs: &Outputs) -> Bits {
     outputs
         .iter()
         .map(|models| {
@@ -118,7 +122,7 @@ fn word(hash: &mut blake3::Hasher, value: u64) {
     hash.update(&value.to_le_bytes());
 }
 
-fn input_digest(inputs: &[Input]) -> String {
+pub(crate) fn input_digest(inputs: &[Input]) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"five-point-prefix-input-v1");
     word(&mut hash, inputs.len() as u64);
@@ -150,7 +154,20 @@ fn model_digest(bits: &[Vec<[u64; 9]>]) -> String {
     hash.finalize().to_hex().to_string()
 }
 
+pub(crate) struct PairObservations {
+    pub(crate) left: Vec<Vector3<f64>>,
+    pub(crate) right: Vec<Vector3<f64>>,
+}
+
 fn load(args: &Args) -> Result<(Vec<Input>, Vec<Value>, usize)> {
+    let (inputs, reports, eligible, _) = load_with_observations(args)?;
+    Ok((inputs, reports, eligible))
+}
+
+// Shared read-only loader/sampler for the independent GPU replay example.
+pub(crate) fn load_with_observations(
+    args: &Args,
+) -> Result<(Vec<Input>, Vec<Value>, usize, Vec<PairObservations>)> {
     ensure!(
         args.database.is_file(),
         "database unavailable: {}",
@@ -169,6 +186,7 @@ fn load(args: &Args) -> Result<(Vec<Input>, Vec<Value>, usize)> {
     );
     let mut inputs = Vec::new();
     let mut reports = Vec::new();
+    let mut observations = Vec::new();
     for rank in stratified_indices(pairs.len(), args.pairs as usize) {
         let pair_id = pairs[rank].0;
         let (id1, id2) = pair_id_to_image_pair(pair_id).map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -239,8 +257,9 @@ fn load(args: &Args) -> Result<(Vec<Input>, Vec<Value>, usize)> {
             "input_fingerprint": input_digest(&gathered)
         }));
         inputs.extend(gathered);
+        observations.push(PairObservations { left, right });
     }
-    Ok((inputs, reports, pairs.len()))
+    Ok((inputs, reports, pairs.len(), observations))
 }
 
 fn measure(
