@@ -1,6 +1,6 @@
 # RustSFM 性能优化计划
 
-更新时间：2026-09-10
+更新时间：2026-09-13
 
 本文档记录 RustSFM 后续性能工作的执行顺序、测量边界和验收标准。目标是先用数据定位瓶颈，再做一次只改变一个变量的优化；不把 Taskflow、匹配算法、BA 质量和 Viewer 延迟问题混在同一轮实验中。
 
@@ -53,6 +53,8 @@
 | R6 mapper DB cache 生命周期边界 | ✅ 完成并验证 | `prepare_mapper_features` 只在 admission 前解析路径和 SIFT 计划，不再预加载 `DatabaseCache`；已有 DB 在 reconstruction stage 获得 grant 后加载，等待期间 DB 消失则 fail closed。新增损坏 DB + queued cancellation 回归，mapper composition focused 9 tests 通过。 |
 | R7 sequence initial reconstruction 生命周期 | ✅ 完成并验证（2026-09-12） | admission 前只校验固定 DB/sparse 路径并对全部可能 target 做保守的 missing-feature plan；完整 DB/sparse 校验、`Reconstruction` 单次加载和 partial-keyframe registration plan 构建均移入 stage grant。queued cancellation 严格在模型加载前返回 typed cancellation；等待期间 sparse 消失在恢复预算后 fail closed；sequence integration 69/69 通过。model growth 仍由 caller other-work floor 估算覆盖，grant 不是 RSS 上限；未据此宣称加速 |
 | R8 GPU-only matching 迁移门 | ✅ focused 与 CI 配置完成（2026-09-12） | 产品约束为 SIFT matching 仅使用 wgpu，不提供 CPU fallback。修复 `gpu-wgpu` 条件编译；旧 FIFO verifier 控制不再生成 trace；no-default 仅作 lib compile check，GPU integration 显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan 并串行执行 GPU 测试。matching 30/30、GPU integration 81 passed/1 ignored、默认 lib 760 passed/19 ignored；fixture reference 提交前仍须确认纳入 Git |
+| R9 packed GPU SIFT distance | ✅ 交错验证完成，候选保留（2026-09-13） | CPU packing 为每个 descriptor 附加精确 `Σx²`，WGSL 使用 packed `dot4U8Packed` 计算 `‖q‖²+‖t‖²-2q·t`。flowers2 first48 baseline/candidate 各3轮，wall 中位数 63.80→41.64s（-34.7%），descriptor matching 39.82→17.04s（-57.2%），RSS 基本不变；6轮完整 pairs SHA-256 均为 `613a73f…97216`。focused、matching 30/30、完整 lib 760 passed/19 ignored。下一步只画像并优化 GPU geometry，不改 matching policy |
+| R10 geometry compute+copy 单提交 | ⛔ smoke 无收益，已回退（2026-09-13） | scorer 将 compute 与 readback copy command buffers 合为一次 queue submission；focused 3/3、pairs hash 不变，但 smoke wall 43.86s、geometry 25.80s，劣于相邻 packed-only 的约41.3/23.73s，E/F/H readback wait 几乎不变。源码已恢复，不做多轮、不重试 |
 
 | R8 GPU-only matching 测试/CI 迁移 | ✅ focused 门完成（2026-09-12） | 不保留 CPU matching fallback。`no-default-features` 改为最小编译门；matching/sequence/adaptive 集成门显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan。GPU session 测试按 feature gate 编译，旧 FIFO verifier 控制不再生成 trace 且不得改变 GPU 结果。no-default release check 通过；GPU matching 30/30、GPU integration 81 passed/1 ignored。完整默认 lib 门及真实 flowers2 尚待后续验证 |
 
@@ -61,7 +63,29 @@
 - 本轮只完成 fail-closed correctness、observability 和 mapper cache lifecycle 修复，未运行新的真实 flowers2 大实验，不能据此宣称 Taskflow 加速；历史 C4/C5 结论不变。
 - 独立只读复核确认异构窗口等待环、默认入口兼容性、transient budget 误拒绝、worker native 超额、mapper 排队后输入变化、adaptive 的 PnP-only GPU 误申请、取消错误优先级及 keyframe 静态校验顺序问题均已关闭。窗口 floor 依赖当前 scheduler 的 ready 顺序，并可能减少异构输入的并行度。
 - 估算是分配规划而非 RSS/allocator 上限，数据相关候选余量不是已证明的最坏上界。本轮未运行大图、真实重建或新的 C5 对照；历史性能结果不能用作新执行池的加速证据。
-- 下一步：以 [`output/b1_r7_baseline_flowers2_20260910/REPORT.md`](../output/b1_r7_baseline_flowers2_20260910/REPORT.md) 为 R7 后 48 帧参考基线。后续二选一单变量推进：独立 `post_bogus_cameras` 质量复现门，或仅在新测瓶颈证据下开下一性能候选。暂不拆 DAG、提高默认预算或扩至960帧。
+- 下一步：以 [`output/b1_r7_baseline_flowers2_20260910/REPORT.md`](../output/b1_r7_baseline_flowers2_20260910/REPORT.md) 为 R7 后 48 帧参考基线。R9 已按新测瓶颈证据完成；下一单变量方向是 GPU geometry 画像与候选筛选。暂不拆 DAG、提高默认预算或扩至960帧。
+
+### R9：packed GPU SIFT distance（2026-09-13）
+
+**状态：候选保留，尚未提交。** 实验目录：`output/gpu_only_profile_flowers2_20260913/`。
+
+- 输入固定为 `test_data/flowers2/images` 前48帧、8192 features、sequential matching、`random_seed=1`；每轮均从 SHA-256 `af18e5b2…ea2abd` 的 frozen DB 创建新副本，不复用已写数据库。
+- 单一实现变量：CPU 将每个128维 `u8` descriptor 打包为32个 little-endian `u32` 加一个 `Σx²` norm；WGSL 每个 word 只调用一次 `dot4U8Packed`，以 `norm(query) + norm(target) - 2 * dot(query,target)` 得到平方距离。最大值 `128 * 255² = 8,323,200 < 2²⁴`，转为 `f32` 精确；未改 ratio、distance、cross-check、pair policy、geometry 或 Taskflow。
+- 运行顺序包含初始 `baseline-1/candidate-1`，随后交错 `baseline-2 → candidate-2 → candidate-3 → baseline-3`。baseline wall 为 63.80/63.72/64.45s，candidate 为 54.42/41.64/41.05s；全部 candidate 均快于全部 baseline。
+- 三轮中位数：wall `63.80 → 41.64s`（约 -34.7%）；CLI matching `62.940 → 40.922s`（约 -35.0%）；GPU descriptor matching `39.820 → 17.042s`（约 -57.2%）；descriptor readback wait `38.919 → 16.497s`（约 -57.6%）。readback calls/bytes 保持 922 / 157,757,216，说明该 wait 含 kernel 完成等待，不能解释成纯复制收益。
+- GPU geometry 中位数 `22.895 → 23.733s`，接近但略高；`candidate-1` 的 32.354s 是本组明显高值，后两轮均约23.73s。不能据此宣称 geometry 改善；R9 收益来自 descriptor kernel。
+- RSS 中位数 `241,811,456 → 241,991,680 bytes`，约 +0.07%，没有有意义的工作集增加。descriptor storage 理论上由32增至33 words（+3.125%），但生命周期保持在单次匹配调用内。
+- 质量：6轮均为461 matched/verified pairs、259,206 matches；规范化完整 `pairs` SHA-256 均为 `613a73f3838832d706f1574792d0ece141fb89ce0afcac91ca6fa3e4dbb97216`，逐对象完全一致。
+- 门禁：`cargo fmt --all -- --check`、`git diff --check`、GPU matcher focused、`feature_matching_db::tests` 30/30、完整默认 lib 760 passed/19 ignored 全部通过；均为 release/offline、Cargo `-j1`、测试线程1并限制三项 native thread 环境。
+- **下一热点：GPU geometry。** 先拆分 essential/fundamental/homography 的 candidate generation、scorer score/mask、readback wait 与 CPU refinement；只选择一个有证据的最窄候选。不要仅凭 readback calls 多就直接合并，也不在同一轮改变 RANSAC/质量策略。
+
+### R10：geometry compute+copy 单提交候选关闭（2026-09-13）
+
+- 画像依据：packed-only 三轮中，homography scorer 中位数为4,037 score calls、3,321 mask calls、7,358 readbacks、约9.354s readback wait；fundamental 为2,500 readbacks/3.179s，essential 为2,167/2.758s。
+- 单一候选：保持现有 compute/copy command buffers 和同步 map/decode，只将两次 `queue.submit` 合并为一次有序 submission；不改 shader、RANSAC sampling/frontier、candidate ordinal、threshold、tie-breaking 或 CPU refinement。
+- scorer support/mask/Sampson focused 3/3 通过；flowers2 smoke 仍为461 pairs、259,206 matches，完整 pairs SHA-256 仍为 `613a73f…97216`。
+- packed-only 相邻两轮 wall 41.64/41.05s、geometry 23.733/23.724s；候选 smoke wall 43.86s、geometry 25.801s。E/F/H readback wait 为2.768/3.184/9.368s，与 packed-only 的约2.757/3.178/9.352s 基本相同，没有机制级收益证据。
+- 按 smoke 停止条件回退 `gpu/context.rs` 与 `gpu/scorer.rs`，不运行多轮或完整门禁。后续不要重试单纯合并 submission；若继续 geometry，应先设计保持64-trial decision 顺序的 bounded batched-mask 实验，并单独证明内存上界和逐位输出。
 
 ### B1：R7 后 flowers2 first48 对照基线（2026-09-10）
 

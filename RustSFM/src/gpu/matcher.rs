@@ -295,14 +295,19 @@ impl WgpuSiftMatcher {
 }
 
 fn pack_descriptors(descriptors: &[[u8; 128]]) -> Vec<u32> {
-    descriptors
-        .iter()
-        .flat_map(|descriptor| {
-            descriptor
-                .chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        })
-        .collect()
+    let mut values = Vec::with_capacity(descriptors.len().saturating_mul(33));
+    for descriptor in descriptors {
+        let mut norm = 0u32;
+        for bytes in descriptor.chunks_exact(4) {
+            values.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            norm += bytes
+                .iter()
+                .map(|&value| u32::from(value).pow(2))
+                .sum::<u32>();
+        }
+        values.push(norm);
+    }
+    values
 }
 
 fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

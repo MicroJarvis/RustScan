@@ -25,7 +25,8 @@ struct MatchCandidate {
 @group(0) @binding(2) var<storage, read_write> candidates: array<MatchCandidate>;
 @group(0) @binding(3) var<uniform> params: MatchParams;
 
-const DESCRIPTOR_WORDS: u32 = 32u;
+const DESCRIPTOR_PACKED_WORDS: u32 = 32u;
+const DESCRIPTOR_STRIDE: u32 = 33u;
 
 @compute @workgroup_size(64)
 fn match_main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -37,21 +38,21 @@ fn match_main(@builtin(global_invocation_id) id: vec3<u32>) {
     var second_index = 0xffffffffu;
     var best_distance = 3.402823466e+38;
     var second_distance = 3.402823466e+38;
-    let query_base = id.x * DESCRIPTOR_WORDS;
+    let query_base = id.x * DESCRIPTOR_STRIDE;
     for (var target_index = 0u; target_index < params.target_count; target_index = target_index + 1u) {
-        let target_base = target_index * DESCRIPTOR_WORDS;
-        var distance = 0.0;
-        for (var word_index = 0u; word_index < DESCRIPTOR_WORDS; word_index = word_index + 1u) {
-            let query_word = queries[query_base + word_index];
-            let target_word = targets[target_base + word_index];
-            for (var byte_index = 0u; byte_index < 4u; byte_index = byte_index + 1u) {
-                let shift = byte_index * 8u;
-                let query_value = (query_word >> shift) & 0xffu;
-                let target_value = (target_word >> shift) & 0xffu;
-                let delta = f32(query_value) - f32(target_value);
-                distance = distance + delta * delta;
-            }
+        let target_base = target_index * DESCRIPTOR_STRIDE;
+        var cross_term = 0u;
+        for (var word_index = 0u; word_index < DESCRIPTOR_PACKED_WORDS; word_index = word_index + 1u) {
+            cross_term = cross_term + dot4U8Packed(
+                queries[query_base + word_index],
+                targets[target_base + word_index],
+            );
         }
+        let query_norm = queries[query_base + DESCRIPTOR_PACKED_WORDS];
+        let target_norm = targets[target_base + DESCRIPTOR_PACKED_WORDS];
+        let distance_u32 = query_norm + target_norm - 2u * cross_term;
+        // 128 * 255^2 = 8,323,200 < 2^24, so conversion to f32 is exact.
+        let distance = f32(distance_u32);
         if (distance < best_distance || (distance == best_distance && target_index < best_index)) {
             second_distance = best_distance;
             second_index = best_index;
