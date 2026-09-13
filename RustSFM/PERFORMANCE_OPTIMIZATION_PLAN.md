@@ -115,6 +115,38 @@
 - 由此排除的方向：继续压缩 buffer 分配、staging 复用或纯传输量优化都不可能有实质收益（R10 合并 submission 的失败与此一致）。**唯一有效杠杆是减少同步点数量**，即减少 `score_calls + mask_calls`（当前 5,970 + 4,382 = 10,352），而不是让每次同步更便宜。
 - 限制：1.275ms 是本机 Metal/wgpu 后端在此工作负载下的观测值，不是设备无关常数，也未分离驱动唤醒、`map_async` 回调与 GPU 实际执行；不可外推到 960 帧或其他后端。
 
+### S1：flowers2 960 帧全流程结算（2026-09-13）
+
+**状态：已完成。** 报告：`output/flowers2_960_settlement_20260913/REPORT.md`；每阶段单轮，是占比普查而非验证过的 delta。
+
+| 阶段 | wall | RSS | 输出 |
+|---|---:|---:|---|
+| extract | 332.3s | 3.95GB | 960 images / 6,612,183 keypoints |
+| match | 2150.9s | 4.85GB | 14,045 pairs / 13,894 verified / 10,019,172 matches |
+| reconstruct | 599.0s | 9.33GB | 960/960 registered / 437,185 points / 1 model |
+| 合计 | 3082.2s (51.4 min) | | |
+
+- 阶段占比：match 69.8%、reconstruct 19.4%、extract 10.8%。
+- 瓶颈普查（占全流程）：geometry GPU 同步等待 684.6s/22.2%、descriptor readback 等待 639.6s/20.8%、**essential candidate generation（CPU 五点法）590.6s/19.2%**、CPU SIFT extract 332.3s/10.8%、global BA solve 330.8s/10.7%。前三项 62.2%，累计归类 93.5%。
+- **固定同步延迟结论在 44 倍规模下完全复现**：per-readback 等待 essential 1490µs、fundamental 1489µs、homography 1486µs，离散度 0.3%；同步点从 10,352 增到 460,025，per-call 成本只涨 17%。
+- **essential candidate generation 每 pair 超线性恶化**：12.2 → 42.0 ms/pair（3.4×），score calls/pair 1.74 → 5.92（3.4×），而 models/score call 不变（2190 → 2187）。因此不是 batching 问题，而是低 inlier-ratio pair 把动态 RANSAC 推向迭代上限。181.9M 个 essential 模型 / 590.6s = 3.25µs每模型，对比 fundamental 0.52µs、homography 0.64µs。
+- **matching 是严格串行的 CPU↔GPU 交替阻塞**：user/real = 0.38（18 核机器）；CPU 忙 687.5s（candidate gen）+ 阻塞等 GPU 1324.2s = pair_compute 的 93.8%。CPU 生成模型时 GPU 空闲，GPU 打分时 CPU 空闲。
+- reconstruct 内部：BA 占 404.7s（solve 346.7 / setup 27.4 / postprocess 30.6）；**27 次 global BA = 330.8s（平均 12.3s/次，占 BA 时间 81.7%）**，958 次 local BA 仅 73.9s（77ms/次）。
+- 限制：单轮无交错基线；1.49ms 为本机 Metal/wgpu 观测值；Taskflow 授予 512MiB 是准入预算，不约束 9.33GB RSS；extract 使用 CPU SIFT 以与 B1 可比。
+
+### R13：candidate generation 有界池并行候选关闭（2026-09-13）
+
+**状态：ⴛ smoke 严重退化，已完整回退。** 实验目录：`output/gpu_only_profile_flowers2_20260913/parallel-candgen-smoke/`。
+
+- 单一候选：在 `run_gpu_ransac_batches` 内将采样与模型求解分离——采样仍严格逐 trial 顶序，仅对无状态的最小解求解在 `execution::parallel` 有界池（matching admission = 4 threads）上用 indexed `par_iter` 并行，按 ordinal 收集。三个 family 的 `generate_models` 均只捕获不可变引用，确为纯函数，因此语义不变。
+- 质量确实不变：461 pairs、259,206 matches，规范化 pairs digest 仍为 `fbe4acf5…1a32`，**逐位一致**；RANSAC focused 42/42 通过。
+- 但端到端严重退化：matching `39.96 → 64.11s`、wall `40.95 → 118.70s`（+190%）、user CPU `10.22 → 31.93s`（+212%）。
+- 关键证据：**意图收益几乎不存在，而无关的 GPU 路径被毒化**。candidate generation 仅 `7.465 → 6.893s`（-0.57s）；而 descriptor matching 的 readback 调用数和字节数完全不变（922 次），其 readback wait 却 `16.326 → 33.500s`（+105%），geometry readback wait `13.199 → 16.197s`（+23%）。我未触碰这些代码路径。
+- 机制解释：rayon worker 在每次 install 后自旋再休眠，数千次 install 使 4 个 worker 持续热转，抢占了延迟敏感的 `device.poll(Wait)` 路径的 CPU，直接抬高 GPU 同步等待。user CPU 三倍与此一致。wall 减 matching 的缺口从 0.99s 涨到 54.59s，提示额外的线程 churn。
+- 48 帧 smoke 对此候选本身也不是有效代理：该规模下 candidate generation 仅 7.5s，而 960 帧为 687.5s。但自旋竞争机制与规模无关且在 960 帧下会更差，故不升级到 960 帧重试。
+- 保留产出：新增 `gpu_ransac_one_physical_batch_scores_every_trial_in_order`，固定“一个 physical batch 必须将全部 trial ordinal 按序无重复无缺口交给 scorer”这一契约，供任何后续改动参考。
+- **后续结论：不要在这个热路径上引入细粒度线程池 hand-off。** 若要同时吃掉 CPU 空等和 GPU 空等，必须是粗粒度的 pair 级流水线（pair N+1 的 CPU 生成与 pair N 的 GPU 打分重叠），且每个线程内部保持串行。
+
 ### B1：R7 后 flowers2 first48 对照基线（2026-09-10）
 
 **状态：已完成（新目录；非相对 2026-09-07 的加速宣称）。** 报告：[REPORT.md](../output/b1_r7_baseline_flowers2_20260910/REPORT.md)；可复算 [metrics.json](../output/b1_r7_baseline_flowers2_20260910/metrics.json)。

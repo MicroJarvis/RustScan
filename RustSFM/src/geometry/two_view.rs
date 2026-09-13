@@ -6260,6 +6260,51 @@ mod tests {
         Ok(())
     }
 
+    /// A full physical batch must hand the scorer every trial ordinal exactly
+    /// once, in order, with no gaps or duplicates. This pins the contract that
+    /// any future change to how a batch generates candidate models has to keep.
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_one_physical_batch_scores_every_trial_in_order() -> anyhow::Result<()> {
+        let trials = 128usize;
+        let (scorer, score_calls, _mask_calls, score_log, _mask_log) =
+            ScriptedGpuRansacScorer::new_with_logs(4096, 128);
+        let trial_limit: u32 = trials.try_into().expect("trial count must fit u32");
+        let options = test_ransac_options(trial_limit, trial_limit, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let sampled_trials = Rc::new(RefCell::new(Vec::new()));
+        let sampled_trials_for_closure = sampled_trials.clone();
+        run_gpu_ransac_batches(
+            &scorer,
+            &active_indices,
+            GpuRansacRunConfig {
+                family: "scripted-single-batch",
+                sample_size: 1,
+                dynamic_support_observations: active_indices.len(),
+                observation_count: active_indices.len(),
+                threshold: 1.0,
+                kind: TwoViewModelKind::Sampson,
+                options: &options,
+                policy: GpuRansacBatchPolicy {
+                    score_trials: GPU_RANSAC_SCORE_BATCH_TRIALS,
+                    decision_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+                },
+            },
+            move |trial| {
+                sampled_trials_for_closure.borrow_mut().push(trial);
+                vec![trial]
+            },
+            |sample| vec![Matrix3::from_diagonal_element(sample[0] as f64)],
+            |model, support| (model, support),
+        )?;
+
+        let expected = (0..trials).collect::<Vec<_>>();
+        assert_eq!(*sampled_trials.borrow(), expected);
+        assert_eq!(score_calls.get(), 1);
+        assert_eq!(*score_log.borrow(), vec![expected]);
+        Ok(())
+    }
+
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn gpu_ransac_frontier_runner_consumes_one_valid_trial() -> anyhow::Result<()> {
