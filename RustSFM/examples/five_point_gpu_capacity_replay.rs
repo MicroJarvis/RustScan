@@ -17,7 +17,7 @@ use std::{path::PathBuf, time::Instant};
 struct Args {
     #[arg(long)]
     database: PathBuf,
-    #[arg(long,default_value_t=12,value_parser=clap::value_parser!(u32).range(1..=12))]
+    #[arg(long,default_value_t=12,value_parser=clap::value_parser!(u32).range(1..))]
     pairs: u32,
     #[arg(long,default_value_t=512,value_parser=clap::value_parser!(u32).range(1..=512))]
     trials: u32,
@@ -25,6 +25,9 @@ struct Args {
     rounds: u32,
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Read the actual adapter limits and original 12-pair provenance without solving.
+    #[arg(long)]
+    inspect_only: bool,
 }
 
 const BATCH_SIZES: [usize; 7] = [64, 128, 256, 512, 1024, 2048, 6144];
@@ -67,6 +70,16 @@ fn gpu_bits(results: &[FivePointTrialResult]) -> Vec<Vec<u32>> {
                 r.unconverged as u32,
                 r.root_iterations as u32,
                 r.upstream_status as u32,
+                r.algebra_status as u32,
+                r.polynomial_failed as u32,
+                r.degree as u32,
+                r.complex_filtered as u32,
+                r.duplicate_roots as u32,
+                r.recovery_rejected as u32,
+                r.duplicate_models as u32,
+                r.dropped_leading as u32,
+                r.rank as u32,
+                r.jacobi_sweeps as u32,
             ];
             for slot in &r.slots {
                 words.extend([
@@ -74,6 +87,11 @@ fn gpu_bits(results: &[FivePointTrialResult]) -> Vec<Vec<u32>> {
                     slot.status as u32,
                     slot.root[0].to_bits(),
                     slot.root[1].to_bits(),
+                    slot.root_backward_error.to_bits(),
+                    slot.null_residual.to_bits(),
+                    slot.constraint_residual.to_bits(),
+                    slot.essential_residual.to_bits(),
+                    slot.essential.is_some() as u32,
                 ]);
                 if let Some(e) = slot.essential {
                     words.extend(e.map(f32::to_bits));
@@ -287,8 +305,101 @@ fn compare(
         "trials":records})
 }
 
+// Mirrors the complete solve's buffers, including its readback staging allocation.
+const BUFFER_BYTES: [(&str, u64); 8] = [
+    ("left_rays", 80),
+    ("right_rays", 80),
+    ("constraints", 180),
+    ("diagnostics", 160),
+    ("basis", 144),
+    ("algebra", 1408),
+    ("output", 704),
+    ("readback", 704),
+];
+const STAGES: [(&str, u32); 9] = [
+    ("constraints", 1),
+    ("basis", 1),
+    ("pack", 1),
+    ("elimination", 200),
+    ("algebra", 1),
+    ("polynomial", 11),
+    ("validate_polynomial", 1),
+    ("roots", 1),
+    ("recover", 1),
+];
+fn legal_trials(dimension: u32, binding: u64, buffer: u64) -> u64 {
+    if dimension < 200 {
+        return 0;
+    }
+    u64::from(dimension)
+        .min(u64::from(binding) / 1408)
+        .min(buffer / 1408)
+}
+fn unique_images(pairs: &[Value]) -> Vec<u64> {
+    pairs
+        .iter()
+        .flat_map(|p| p["image_ids"].as_array().unwrap())
+        .map(|id| id.as_u64().unwrap())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+fn signature(bits: &[Vec<u32>]) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"gpu-replay-bits-v1");
+    for trial in bits {
+        hash.update(&(trial.len() as u64).to_le_bytes());
+        for word in trial {
+            hash.update(&word.to_le_bytes());
+        }
+    }
+    hash.finalize().to_hex().to_string()
+}
 fn main() -> Result<()> {
     let args = Args::parse();
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))?;
+    let limits = adapter.limits();
+    let adapter_info = adapter.get_info();
+    let legal = legal_trials(
+        limits.max_compute_workgroups_per_dimension,
+        limits.max_storage_buffer_binding_size,
+        limits.max_buffer_size,
+    );
+    let capacity = json!({"adapter":format!("{adapter_info:?}"), "all_adapter_limits":format!("{limits:?}"),
+        "device_limits_contract":"WgpuContext requests required_limits: adapter.limits(); same default instance and HighPerformance selection; device name/backend checked",
+        "max_compute_workgroups_per_dimension":limits.max_compute_workgroups_per_dimension,
+        "max_storage_buffer_binding_size":limits.max_storage_buffer_binding_size,
+        "max_buffer_size":limits.max_buffer_size,"legal_complete_solve_trials":legal,
+        "stages":STAGES.map(|(name,y)| json!({"name":name,"dispatch":["N", &y.to_string(), "1"],"workgroup_size":[1,1,1]})),
+        "buffers":BUFFER_BYTES.map(|(name,stride)| json!({"name":name,"bytes_per_trial":stride,"trial_limit":if name=="readback" {limits.max_buffer_size/stride} else {limits.max_buffer_size.min(u64::from(limits.max_storage_buffer_binding_size))/stride}})),
+        "gpu_bytes_per_trial_with_readback":BUFFER_BYTES.iter().map(|(_,n)| n).sum::<u64>(),
+        "memory_budget_bytes":512u64*1024*1024});
+    eprintln!("capacity={capacity}");
+    let (original_inputs, original_pairs, _, _) = cpu::load_with_observations(&cpu::Args {
+        database: args.database.clone(),
+        pairs: 12,
+        trials: 512,
+        batch_size: 512,
+    })?;
+    let original = json!({"input_fingerprint":cpu::input_digest(&original_inputs),"pairs":original_pairs,"unique_image_ids":unique_images(&original_pairs),"unique_images":unique_images(&original_pairs).len()});
+    if args.inspect_only {
+        let report = json!({"capacity":capacity,"original_12_pairs":original});
+        if let Some(path) = args.output {
+            std::fs::write(path, serde_json::to_vec(&report)?)?;
+        }
+        eprintln!(
+            "original 12 pairs unique images={}",
+            original["unique_images"]
+        );
+        return Ok(());
+    }
+    drop(original_inputs);
     let load_start = Instant::now();
     let (inputs, pairs, eligible, observations) = cpu::load_with_observations(&cpu::Args {
         database: args.database.clone(),
@@ -309,13 +420,37 @@ fn main() -> Result<()> {
     let init_start = Instant::now();
     let context = WgpuContext::try_new()?;
     let device = format!("{:?}", context.capabilities());
+    ensure!(
+        context.capabilities().device_name == adapter_info.name
+            && context.backend() == adapter_info.backend,
+        "adapter probe differs from solver"
+    );
     let gpu = WgpuFivePointF32::from_context(context)?;
     let initialization = init_start.elapsed().as_secs_f64();
     eprintln!("GPU initialization={initialization}s, {device}");
     let pool = ThreadPoolBuilder::new().num_threads(4).build()?;
     let mut reports = Vec::new();
     let mut baseline_gpu: Option<Vec<Vec<u32>>> = None;
-    for batch in BATCH_SIZES {
+    let budget_trials = (512u64 * 1024 * 1024) / BUFFER_BYTES.iter().map(|(_, n)| n).sum::<u64>();
+    let cap = legal.min(budget_trials) as usize;
+    ensure!(
+        inputs.len() >= 32768,
+        "large sweep requires at least 64 real pairs x 512 trials"
+    );
+    let mut batches: Vec<_> = [8192, 16384, 32768, 49152, 65536, 131072]
+        .into_iter()
+        .filter(|&n| n <= cap && n <= inputs.len())
+        .collect();
+    if inputs.len() <= cap {
+        batches.push(inputs.len());
+    }
+    batches.sort_unstable();
+    batches.dedup();
+    ensure!(
+        batches.contains(&32768),
+        "device cannot support requested batch 32768"
+    );
+    for batch in batches {
         let t = Instant::now();
         let baseline = cpu::replay_batches(&inputs, None, batch);
         let serial_warmup = t.elapsed().as_secs_f64();
@@ -369,19 +504,42 @@ fn main() -> Result<()> {
             }
             rounds.push(json!({"round":round,"order":order,"measurements":measurements}));
         }
+        // Eight evenly spaced trials from every selected pair; masks still use all
+        // valid observations for those pairs. Full-workset bits/counts below are not sampled.
+        let sample_count = 8usize.min(args.trials as usize);
+        let indices: Vec<_> = (0..pairs.len())
+            .flat_map(|pair| {
+                (0..sample_count).map(move |j| {
+                    pair * args.trials as usize + j * args.trials as usize / sample_count
+                })
+            })
+            .collect();
+        let sample_inputs: Vec<_> = indices.iter().map(|&i| inputs[i].clone()).collect();
+        let sample_cpu: Vec<_> = indices.iter().map(|&i| baseline[i].clone()).collect();
+        let sample_gpu: Vec<_> = indices
+            .iter()
+            .enumerate()
+            .map(|(trial, &i)| {
+                let mut r = gpu_baseline[i].clone();
+                r.trial = trial;
+                r
+            })
+            .collect();
         let mut comparison = compare(
-            &inputs,
-            &baseline,
-            &gpu_baseline,
+            &sample_inputs,
+            &sample_cpu,
+            &sample_gpu,
             &observations,
-            args.trials as usize,
+            sample_count,
         );
+        comparison["sampling"] = json!({"trials":indices.len(),"per_pair":sample_count,"local_trial_indices":(0..sample_count).map(|j| j * args.trials as usize/sample_count).collect::<Vec<_>>(),"masks":"all valid observations of each selected pair"});
+        comparison["full_workset"] = json!({"trials":inputs.len(),"cpu_models":baseline.iter().map(Vec::len).sum::<usize>(),"gpu_models":gpu_baseline.iter().map(|r|r.model_count).sum::<usize>(),"gpu_empty":gpu_baseline.iter().filter(|r|r.model_count==0).count(),"model_count_mismatch":baseline.iter().zip(&gpu_baseline).filter(|(c,g)|c.len()!=g.model_count).count()});
         eprintln!("batch {batch} comparison: {}", comparison["summary"]);
         // Keep aggregate quality, not the large per-trial diagnostic payload.
         comparison.as_object_mut().unwrap().remove("trials");
-        reports.push(json!({"batch":batch,"gpu_solve_calls_per_replay":solve_calls(inputs.len(), batch),"gpu_solve_calls_including_warmup":solve_calls(inputs.len(), batch) * (args.rounds as usize + 1),"warmup_seconds":{"serial":serial_warmup,"threads4":parallel_warmup,"gpu":gpu_warmup},"gpu_exact_across_batches":batch_exact,"rounds":rounds,"comparison":comparison}));
+        reports.push(json!({"batch":batch,"gpu_signature":signature(&gbits),"gpu_buffer_bytes_with_readback":batch as u64 * BUFFER_BYTES.iter().map(|(_,n)| n).sum::<u64>(),"gpu_solve_calls_per_replay":solve_calls(inputs.len(), batch),"gpu_solve_calls_including_warmup":solve_calls(inputs.len(), batch) * (args.rounds as usize + 1),"warmup_seconds":{"serial":serial_warmup,"threads4":parallel_warmup,"gpu":gpu_warmup},"gpu_exact_across_batches":batch_exact,"rounds":rounds,"comparison":comparison}));
     }
-    let report = json!({"benchmark":"five_point_full_gpu_fixed_sampler_PREFIX","database":args.database,"device":device,"gpu_initialization_seconds":initialization,
+    let report = json!({"capacity":capacity,"original_12_pairs":original,"pair_count":pairs.len(),"unique_images":unique_images(&pairs).len(),"unique_image_ids":unique_images(&pairs),"total_trials":inputs.len(),"benchmark":"five_point_full_gpu_large_fixed_sampler_PREFIX","database":args.database,"device":device,"gpu_initialization_seconds":initialization,
         "scope":"Independent candidate generation only. NOT full RANSAC, NOT the 960-image pipeline. No CPU runtime fallback in GPU path.",
         "timing_contract":"Pre-gathered f64 rays. CPU solver + ordered collection; GPU includes f64-to-f32 conversion, allocations, uploads, all kernels, waits, readback and decode. Initialization, DB I/O, sampler, warmup, comparisons, masks, JSON and destruction after timing excluded. One warmup per path per batch; at least three interleaved rounds. No speedup inferred without candidate-quality differences.",
         "profiling_contract":"Host wall-clock total per replay only; GPU solve calls counted from chunks. No per-stage or kernel timestamp timing.",
@@ -389,10 +547,13 @@ fn main() -> Result<()> {
         "mask_contract":"CPU f64 diagnostic masks for both model sets, all valid raw pair observations (not verified inliers), normalized image coordinates z=1, squared Sampson <= 1e-6; nearest-model pairs in both directions. Not a production pixel threshold.",
         "loading_seconds":loading,"eligible_pairs":eligible,"pairs":pairs,"seed_per_pair":1,"trials_per_pair":args.trials,"input_fingerprint":cpu::input_digest(&inputs),"batches":reports});
     if let Some(path) = args.output {
-        serde_json::to_writer(
-            std::io::BufWriter::new(std::fs::File::create(path)?),
-            &report,
-        )?;
+        let bytes = serde_json::to_vec(&report)?;
+        ensure!(
+            bytes.len() < 100_000,
+            "summary exceeds 100KB: {}",
+            bytes.len()
+        );
+        std::fs::write(path, bytes)?;
     } else {
         serde_json::to_writer(std::io::stdout().lock(), &report)?;
         println!();
@@ -403,6 +564,35 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_respects_both_dispatch_axes_and_largest_buffer() {
+        assert_eq!(legal_trials(199, u64::MAX, u64::MAX), 0);
+        assert_eq!(legal_trials(200, u64::MAX, u64::MAX), 200);
+        assert_eq!(legal_trials(100000, 1408 * 40000, u64::MAX), 40000);
+        assert_eq!(legal_trials(100000, u64::MAX, 1408 * 30000), 30000);
+        assert_eq!(legal_trials(65535, u64::MAX, u64::MAX), 65535);
+        assert_eq!(BUFFER_BYTES.iter().map(|(_, n)| n).sum::<u64>(), 3460);
+        assert_eq!(
+            unique_images(&[json!({"image_ids":[1,2]}), json!({"image_ids":[2,3]})]),
+            vec![1, 2, 3]
+        );
+        for batch in [8192, 16384, 32768, 49152] {
+            let indices: Vec<_> = (0..49152).collect();
+            let actual: Vec<_> = indices
+                .chunks(batch)
+                .enumerate()
+                .flat_map(|(c, v)| (0..v.len()).map(move |i| c * batch + i))
+                .collect();
+            assert_eq!(actual, indices);
+            assert_eq!(
+                solve_calls(49152, batch),
+                [6, 3, 2, 1][[8192, 16384, 32768, 49152]
+                    .iter()
+                    .position(|&b| b == batch)
+                    .unwrap()]
+            );
+        }
+    }
     #[test]
     fn batch_sweep_covers_full_prefix_and_call_counts() {
         assert_eq!(BATCH_SIZES, [64, 128, 256, 512, 1024, 2048, 6144]);

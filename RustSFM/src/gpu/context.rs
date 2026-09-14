@@ -33,10 +33,22 @@ impl WgpuContext {
     }
 
     pub fn try_new_optional() -> Result<Option<Arc<Self>>> {
-        pollster::block_on(Self::new_async())
+        pollster::block_on(Self::new_async(false))
     }
 
-    async fn new_async() -> Result<Option<Arc<Self>>> {
+    /// Experimental diagnostics only. Requests pass-boundary timestamps when supported;
+    /// otherwise returns a normal device so callers can report host-only measurements.
+    pub fn try_new_experimental_timestamps() -> Result<Arc<Self>> {
+        pollster::block_on(Self::new_async(true))?.context(no_compatible_adapter_message())
+    }
+
+    pub fn timestamp_queries_enabled(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+    }
+
+    async fn new_async(timestamps: bool) -> Result<Option<Arc<Self>>> {
         #[cfg(test)]
         let test_gpu_context_lease = test_gpu_context_lease();
         #[cfg(feature = "gpu-vulkan")]
@@ -65,7 +77,11 @@ impl WgpuContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("rustsfm-wgpu-sift"),
-                required_features: wgpu::Features::empty(),
+                required_features: if timestamps {
+                    adapter.features() & wgpu::Features::TIMESTAMP_QUERY
+                } else {
+                    wgpu::Features::empty()
+                },
                 required_limits: adapter.limits(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,

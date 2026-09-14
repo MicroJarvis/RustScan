@@ -26,8 +26,11 @@ fn evaluate(c:array<f32,11>,degree:u32,z:vec2<f32>)->array<vec2<f32>,3> {
   return array<vec2<f32>,3>(p,dp,vec2<f32>(bound,0.0));
 }
 
-@compute @workgroup_size(1)
-fn roots(@builtin(workgroup_id) id:vec3<u32>) {
+@compute @workgroup_size(32)
+fn roots(@builtin(global_invocation_id) id:vec3<u32>) {
+  // Exact per-trial bindings; guard the final partial workgroup before any access.
+  let count=min(arrayLength(&results)/176u,arrayLength(&algebra_full)/352u);
+  if(id.x>=count) { return; }
   let ob=id.x*176u; let ab=id.x*352u;
   results[ob+13u]=algebra_full[ab+350u];
   if(algebra_full[ab+350u]!=0.0) { results[ob]=algebra_full[ab+350u]; return; }

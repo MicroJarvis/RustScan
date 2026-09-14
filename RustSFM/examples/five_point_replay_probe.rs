@@ -20,7 +20,7 @@ use std::{path::PathBuf, time::Instant};
 pub(crate) struct Args {
     #[arg(long, help = "Required existing COLMAP database; opened read-only")]
     pub(crate) database: PathBuf,
-    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..=12))]
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) pairs: u32,
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=512))]
     pub(crate) trials: u32,
@@ -352,18 +352,16 @@ mod tests {
     #[test]
     fn cli_requires_database_and_bounds_work() {
         assert!(Args::try_parse_from(["probe"]).is_err());
-        for (flag, value) in [
-            ("--pairs", "0"),
-            ("--pairs", "13"),
-            ("--trials", "0"),
-            ("--trials", "513"),
-        ] {
+        for (flag, value) in [("--pairs", "0"), ("--trials", "0"), ("--trials", "513")] {
             assert!(
                 Args::try_parse_from(["probe", "--database", "unused.db", flag, value]).is_err()
             );
         }
         let args = Args::try_parse_from(["probe", "--database", "unused.db"]).unwrap();
         assert_eq!((args.pairs, args.trials), (12, 512));
+        let expanded =
+            Args::try_parse_from(["probe", "--database", "unused.db", "--pairs", "128"]).unwrap();
+        assert_eq!((expanded.pairs, expanded.trials), (128, 512));
     }
 
     #[test]
@@ -371,6 +369,9 @@ mod tests {
         let indices = stratified_indices(1200, 12);
         assert_eq!(indices, (0..12).map(|i| 50 + i * 100).collect::<Vec<_>>());
         assert_eq!(stratified_indices(12, 12), (0..12).collect::<Vec<_>>());
+        let expanded = stratified_indices(1200, 128);
+        assert_eq!(expanded.len(), 128);
+        assert!(expanded.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

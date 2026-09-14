@@ -81,7 +81,10 @@ struct Kernel {
 
 #[path = "five_point_f32_complete.rs"]
 mod complete;
-pub use complete::{FivePointModelSlot, FivePointSlotStatus, FivePointTrialResult};
+pub use complete::{
+    FivePointModelSlot, FivePointProfile, FivePointSlotStatus, FivePointTrialResult,
+    FIVE_POINT_PASS_NAMES,
+};
 
 /// Independent GPU-only batched five-point solver and diagnostic stages.
 pub struct WgpuFivePointF32 {

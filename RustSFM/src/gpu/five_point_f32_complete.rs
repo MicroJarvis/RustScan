@@ -1,4 +1,35 @@
 use super::*;
+use std::time::Instant;
+
+pub const FIVE_POINT_PASS_NAMES: [&str; 9] = [
+    "constraints",
+    "basis",
+    "pack",
+    "elimination",
+    "algebra",
+    "polynomial",
+    "validate_polynomial",
+    "roots",
+    "recover",
+];
+
+/// Host intervals are disjoint wall times; GPU intervals overlap host wait.
+/// None means timestamp queries were unavailable/disabled, not zero GPU time.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FivePointProfile {
+    pub gpu_pass_seconds: Option<[Option<f64>; 9]>,
+    /// Raw evidence retained even when equal boundary ticks make a duration unusable.
+    pub timestamp_ticks: Option<[u64; 18]>,
+    pub timestamp_period_ns: Option<f32>,
+    pub prepare_seconds: f64,
+    pub encode_seconds: f64,
+    pub submit_seconds: f64,
+    pub wait_seconds: f64,
+    pub readback_seconds: f64,
+    pub decode_seconds: f64,
+    pub timestamp_readback_seconds: f64,
+    pub total_seconds: f64,
+}
 
 const STRIDE: usize = 176;
 const PACK: &str = "
@@ -84,6 +115,28 @@ impl WgpuFivePointF32 {
         rays1: &[[f32; 3]],
         rays2: &[[f32; 3]],
     ) -> Result<Vec<FivePointTrialResult>> {
+        self.solve_essential_inner(rays1, rays2, None)
+    }
+
+    /// Same nine dispatches and buffers as the unprofiled experiment. All queries
+    /// resolve after the last pass; no intermediate stage readback or host solving.
+    pub fn solve_essential_profiled(
+        &self,
+        rays1: &[[f32; 3]],
+        rays2: &[[f32; 3]],
+    ) -> Result<(Vec<FivePointTrialResult>, FivePointProfile)> {
+        let mut profile = FivePointProfile::default();
+        let results = self.solve_essential_inner(rays1, rays2, Some(&mut profile))?;
+        Ok((results, profile))
+    }
+
+    fn solve_essential_inner(
+        &self,
+        rays1: &[[f32; 3]],
+        rays2: &[[f32; 3]],
+        profile: Option<&mut FivePointProfile>,
+    ) -> Result<Vec<FivePointTrialResult>> {
+        let started = Instant::now();
         ensure!(
             rays1.len() == rays2.len() && rays1.len() % 5 == 0,
             "equal five-ray batches required"
@@ -122,24 +175,57 @@ impl WgpuFivePointF32 {
         let basis = self.complete_buffer(count, 36)?;
         let algebra = self.complete_buffer(count, 352)?;
         let out = self.complete_buffer(count, STRIDE)?;
+        let queries = (profile.is_some() && self.context.timestamp_queries_enabled()).then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("experimental five-point pass timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 18,
+            })
+        });
+        let resolved = queries.as_ref().map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("five-point resolved timestamps"),
+                size: 18 * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        });
+        let prepare_seconds = started.elapsed().as_secs_f64();
+        let encode_started = Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("complete GPU five-point"),
         });
-        self.complete_pass(
+        let mut stage = 0;
+        let mut dispatch = |encoder: &mut wgpu::CommandEncoder,
+                            kernel: &Kernel,
+                            buffers: &[&wgpu::Buffer],
+                            count,
+                            rows| {
+            self.complete_pass_timed(
+                encoder,
+                kernel,
+                buffers,
+                count,
+                rows,
+                queries.as_ref().map(|q| (q, stage)),
+            );
+            stage += 1;
+        };
+        dispatch(
             &mut encoder,
             &self.constraints,
             &[&left, &right, &constraints],
             count,
             1,
         );
-        self.complete_pass(
+        dispatch(
             &mut encoder,
             &self.basis,
             &[&constraints, &diagnostics],
             count,
             1,
         );
-        self.complete_pass(
+        dispatch(
             &mut encoder,
             &self.complete.pack,
             &[&diagnostics, &basis],
@@ -147,19 +233,86 @@ impl WgpuFivePointF32 {
             1,
         );
         for (kernel, rows) in [
-            (&self.elimination, 200),
+            (&self.elimination, 200u32.div_ceil(32)),
             (&self.algebra, 1),
             (&self.polynomial, 11),
             (&self.validate_polynomial, 1),
         ] {
-            self.complete_pass(&mut encoder, kernel, &[&basis, &algebra], count, rows);
+            dispatch(&mut encoder, kernel, &[&basis, &algebra], count, rows);
         }
         let buffers = [&constraints, &diagnostics, &algebra, &basis, &out];
-        self.complete_pass(&mut encoder, &self.complete.roots, &buffers, count, 1);
-        self.complete_pass(&mut encoder, &self.complete.recover, &buffers, count, 1);
-        self.context
-            .wait_for(self.context.queue().submit(Some(encoder.finish())))?;
-        decode(&self.context.read_buffer::<f32>(&out, count * STRIDE)?)
+        dispatch(
+            &mut encoder,
+            &self.complete.roots,
+            &buffers,
+            count.div_ceil(32),
+            1,
+        );
+        dispatch(&mut encoder, &self.complete.recover, &buffers, count, 1);
+        let commands = encoder.finish();
+        let encode_seconds = encode_started.elapsed().as_secs_f64();
+        let submit_started = Instant::now();
+        let submission = self.context.queue().submit(Some(commands));
+        let submit_seconds = submit_started.elapsed().as_secs_f64();
+        let wait_started = Instant::now();
+        self.context.wait_for(submission)?;
+        let wait_seconds = wait_started.elapsed().as_secs_f64();
+        let readback_started = Instant::now();
+        let values = self.context.read_buffer::<f32>(&out, count * STRIDE)?;
+        let readback_seconds = readback_started.elapsed().as_secs_f64();
+        let decode_started = Instant::now();
+        let results = decode(&values)?;
+        let decode_seconds = decode_started.elapsed().as_secs_f64();
+        if let Some(profile) = profile {
+            let query_started = Instant::now();
+            let mut timestamp_ticks = None;
+            let mut timestamp_period_ns = None;
+            let gpu_pass_seconds = if let (Some(q), Some(buffer)) = (&queries, &resolved) {
+                // Resolve only after completion of the entire compute submission.
+                // Same-submission Metal resolves have returned zero last-pass
+                // samples in this experiment. This is one final resolve, not
+                // per-stage synchronization or a change to the compute passes.
+                let mut resolve_encoder = device.create_command_encoder(&Default::default());
+                resolve_encoder.resolve_query_set(q, 0..18, buffer, 0);
+                self.context
+                    .wait_for(self.context.queue().submit(Some(resolve_encoder.finish())))?;
+                let ticks: [u64; 18] = self
+                    .context
+                    .read_buffer::<u64>(buffer, 18)?
+                    .try_into()
+                    .unwrap();
+                let period_ns = self.context.queue().get_timestamp_period();
+                let period = period_ns as f64 * 1e-9;
+                timestamp_ticks = Some(ticks);
+                timestamp_period_ns = Some(period_ns);
+                ensure!(
+                    ticks.chunks_exact(2).all(|p| p[1] >= p[0]),
+                    "nonmonotonic GPU timestamps"
+                );
+                Some(std::array::from_fn(|i| {
+                    // Equal samples have been observed on Metal for a nonempty
+                    // recovery dispatch. Do not present them as zero-cost work.
+                    (ticks[2 * i + 1] > ticks[2 * i])
+                        .then(|| (ticks[2 * i + 1] - ticks[2 * i]) as f64 * period)
+                }))
+            } else {
+                None
+            };
+            *profile = FivePointProfile {
+                gpu_pass_seconds,
+                timestamp_ticks,
+                timestamp_period_ns,
+                prepare_seconds,
+                encode_seconds,
+                submit_seconds,
+                wait_seconds,
+                readback_seconds,
+                decode_seconds,
+                timestamp_readback_seconds: query_started.elapsed().as_secs_f64(),
+                total_seconds: started.elapsed().as_secs_f64(),
+            };
+        }
+        Ok(results)
     }
 
     /// Diagnostic GPU root-only API (descending coefficients); no CPU root solver.
@@ -199,7 +352,7 @@ impl WgpuFivePointF32 {
             &mut encoder,
             &self.complete.roots,
             &[&dummy, &dummy, &algebra, &dummy, &out],
-            count,
+            count.div_ceil(32),
             1,
         );
         self.context
@@ -256,6 +409,19 @@ impl WgpuFivePointF32 {
         count: usize,
         rows: u32,
     ) {
+        self.complete_pass_timed(encoder, kernel, buffers, count, rows, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_pass_timed(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        kernel: &Kernel,
+        buffers: &[&wgpu::Buffer],
+        count: usize,
+        rows: u32,
+        timestamp: Option<(&wgpu::QuerySet, u32)>,
+    ) {
         let entries: Vec<_> = buffers
             .iter()
             .enumerate()
@@ -274,7 +440,13 @@ impl WgpuFivePointF32 {
             });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("five-point full stage"),
-            timestamp_writes: None,
+            timestamp_writes: timestamp.map(|(query_set, stage)| {
+                wgpu::ComputePassTimestampWrites {
+                    query_set,
+                    beginning_of_pass_write_index: Some(stage * 2),
+                    end_of_pass_write_index: Some(stage * 2 + 1),
+                }
+            }),
         });
         pass.set_pipeline(&kernel.pipeline);
         pass.set_bind_group(0, &group, &[]);

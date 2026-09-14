@@ -13,10 +13,11 @@
 // Source SHA256: 2b61a94a6f0fb709d34b988afa7429d261ee69b8a750fe4de543afc11730247e
 // e: column-major 9x4; a: column-major 10x20; b: column-major 13x3.
 // coeffs[0..11]: descending z^10 through z^0, unnormalized.
-// Dispatch: elimination (samples, 200, 1); polynomial (samples, 11, 1).
+// Dispatch: elimination (samples, ceil(200/32), 1), global row id; polynomial (samples, 11, 1).
 
-@compute @workgroup_size(1)
-fn elimination(@builtin(workgroup_id) id: vec3<u32>) {
+@compute @workgroup_size(1,32,1)
+fn elimination(@builtin(global_invocation_id) id: vec3<u32>) {
+  if(id.y>=200u) { return; }
   var e: array<f32,36>;
   for(var i=0u;i<36u;i++) { e[i]=bases[id.x*36u+i]; }
   var e2: array<f32, 36>; var e3: array<f32, 36>;
