@@ -189,7 +189,7 @@ impl WgpuFivePointF32 {
         );
         let values = self.dispatch(
             &[
-                (&self.elimination, 200),
+                (&self.elimination, 200u32.div_ceil(32)),
                 (&self.algebra, 1),
                 (&self.polynomial, 11),
                 (&self.validate_polynomial, 1),
