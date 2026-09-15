@@ -32,9 +32,9 @@ use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf};
 
 const INPUT: &str = "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5";
-const MODEL_SIGNATURE_Q4: &str = "26e825cf97002be4f7fc36b77ce4fed682445af37746504253444e0103c5e716";
-const DIAGNOSTIC_SIGNATURE_Q4: &str =
-    "d9e911ac6b6e2be18f7e3b8b8615417efba6257f955ce2bbf21f943a1c7f358a";
+const MODEL_SIGNATURE_Q5b: &str = "fb5be154bb0fa742ab1b83e5c9e62269722678cab463bfbe3827457b7424e8f0";
+const DIAGNOSTIC_SIGNATURE_Q5b: &str =
+    "1412c6d5d2af9bb9ed23c8d55238af22deb2b259cfa16fa43a99fb21486b9a1a";
 const CPU_SIGNATURE: &str = "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a";
 const MAX_ERROR_PX: f64 = 4.0;
 const TRIALS_PER_PAIR: usize = 512;
@@ -273,11 +273,11 @@ fn main() -> Result<()> {
     // Gate 1: full GPU replay carries the Q4 signatures.
     let gpu_results = shared::gpu_replay(&gpu, &inputs, inputs.len())?;
     ensure!(
-        shared::model_signature(&gpu_results) == MODEL_SIGNATURE_Q4,
+        shared::model_signature(&gpu_results) == MODEL_SIGNATURE_Q5b,
         "model signature drifted"
     );
     ensure!(
-        shared::signature(&shared::gpu_bits(&gpu_results)) == DIAGNOSTIC_SIGNATURE_Q4,
+        shared::signature(&shared::gpu_bits(&gpu_results)) == DIAGNOSTIC_SIGNATURE_Q5b,
         "diagnostic signature drifted"
     );
 
@@ -525,8 +525,8 @@ fn main() -> Result<()> {
         "device": device,
         "input_digest": INPUT,
         "signatures": {
-            "model_q4": MODEL_SIGNATURE_Q4,
-            "diagnostic_q4": DIAGNOSTIC_SIGNATURE_Q4,
+            "model_q5b": MODEL_SIGNATURE_Q5b,
+            "diagnostic_q5b": DIAGNOSTIC_SIGNATURE_Q5b,
             "cpu_f64": CPU_SIGNATURE,
             "all_verified": true,
         },

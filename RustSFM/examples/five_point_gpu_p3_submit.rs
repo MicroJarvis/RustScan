@@ -16,9 +16,9 @@ use serde_json::json;
 use std::{path::PathBuf, time::Instant};
 
 const INPUT: &str = "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5";
-const MODEL_SIGNATURE_Q4: &str = "26e825cf97002be4f7fc36b77ce4fed682445af37746504253444e0103c5e716";
-const DIAGNOSTIC_SIGNATURE_Q4: &str =
-    "d9e911ac6b6e2be18f7e3b8b8615417efba6257f955ce2bbf21f943a1c7f358a";
+const MODEL_SIGNATURE_Q5b: &str = "fb5be154bb0fa742ab1b83e5c9e62269722678cab463bfbe3827457b7424e8f0";
+const DIAGNOSTIC_SIGNATURE_Q5b: &str =
+    "1412c6d5d2af9bb9ed23c8d55238af22deb2b259cfa16fa43a99fb21486b9a1a";
 /// P2 steady median for 127×512 (seconds), from p2-session-final-20260914.json.
 const P2_STEADY_MEDIAN: f64 = 1.774772709;
 const BATCH: usize = 512;
@@ -59,11 +59,11 @@ fn main() -> Result<()> {
 
     let oneshot = shared::gpu_replay(&gpu, &inputs, inputs.len())?;
     ensure!(
-        shared::model_signature(&oneshot) == MODEL_SIGNATURE_Q4,
+        shared::model_signature(&oneshot) == MODEL_SIGNATURE_Q5b,
         "one-shot model signature drifted"
     );
     ensure!(
-        shared::signature(&shared::gpu_bits(&oneshot)) == DIAGNOSTIC_SIGNATURE_Q4,
+        shared::signature(&shared::gpu_bits(&oneshot)) == DIAGNOSTIC_SIGNATURE_Q5b,
         "one-shot diagnostic signature drifted"
     );
 
@@ -89,11 +89,11 @@ fn main() -> Result<()> {
         session_results.extend(part);
     }
     ensure!(
-        shared::model_signature(&session_results) == MODEL_SIGNATURE_Q4,
+        shared::model_signature(&session_results) == MODEL_SIGNATURE_Q5b,
         "session model signature mismatch"
     );
     ensure!(
-        shared::signature(&shared::gpu_bits(&session_results)) == DIAGNOSTIC_SIGNATURE_Q4,
+        shared::signature(&shared::gpu_bits(&session_results)) == DIAGNOSTIC_SIGNATURE_Q5b,
         "session diagnostic signature mismatch"
     );
     ensure!(
@@ -147,8 +147,8 @@ fn main() -> Result<()> {
         "candidate": "merge compute+copy into one submit/wait per solve",
         "device": device,
         "input_digest": INPUT,
-        "model_signature_q4": MODEL_SIGNATURE_Q4,
-        "diagnostic_signature_q4": DIAGNOSTIC_SIGNATURE_Q4,
+        "model_signature_q5b": MODEL_SIGNATURE_Q5b,
+        "diagnostic_signature_q5b": DIAGNOSTIC_SIGNATURE_Q5b,
         "signature_ok": true,
         "sync": {
             "calls_per_pass": CALLS,

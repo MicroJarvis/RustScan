@@ -119,23 +119,9 @@ fn roots(@builtin(global_invocation_id) id:vec3<u32>) {
   }
 }
 
-// FMA Gram G = B^T B (column-major mat3x3). G[i,j] = sum_r B[r,i]*B[r,j]
-// = sum_r b[i][r]*b[j][r]; stored as g[j][i].
-fn gram3_fma(b:mat3x3<f32>)->mat3x3<f32> {
-  var g=mat3x3<f32>(vec3<f32>(0.0),vec3<f32>(0.0),vec3<f32>(0.0));
-  for(var j=0u;j<3u;j++) {
-    for(var i=0u;i<3u;i++) {
-      g[j][i]=fma(b[i][0],b[j][0],fma(b[i][1],b[j][1],b[i][2]*b[j][2]));
-    }
-  }
-  return g;
-}
-
 // Small symmetric Jacobi SVD via B^T B, scaled first. Returns vector and residual.
-// Q5b: FMA Gram + pick min ||Bv|| eigenvector + 2 damped inverse-iteration steps.
-// Accept thresholds (nv.w / |z| / E residuals) are unchanged.
 fn null3(b:mat3x3<f32>)->vec4<f32> {
-  var s=gram3_fma(b); var v=mat3x3<f32>(vec3<f32>(1,0,0),vec3<f32>(0,1,0),vec3<f32>(0,0,1));
+  var s=transpose(b)*b; var v=mat3x3<f32>(vec3<f32>(1,0,0),vec3<f32>(0,1,0),vec3<f32>(0,0,1));
   var converged=false;
   for(var sweep=0u;sweep<24u;sweep++) {
     for(var p=0u;p<2u;p++) { for(var q=p+1u;q<3u;q++) {
@@ -152,26 +138,8 @@ fn null3(b:mat3x3<f32>)->vec4<f32> {
     if(max(abs(s[1][0]),max(abs(s[2][0]),abs(s[2][1])))<2e-7) { converged=true; break; }
   }
   if(!converged) { return vec4<f32>(0,0,0,-1); }
-  // Prefer the eigenvector with the smallest true residual ||B v||, not only the
-  // Jacobi eigenvalue estimate (can mis-order under incomplete diagonalization).
-  var best=0u; var best_res=length(b*normalize(v[0]));
-  for(var i=1u;i<3u;i++) {
-    let xi=normalize(v[i]); let ri=length(b*xi);
-    if(ri<best_res) { best=i; best_res=ri; }
-  }
-  var x=normalize(v[best]);
-  // Damped inverse iteration in the Jacobi eigenframe amplifies the null direction.
-  let trace_abs=abs(s[0][0])+abs(s[1][1])+abs(s[2][2]);
-  let eps=max(1e-12,1e-8*trace_abs);
-  for(var it=0u;it<2u;it++) {
-    let c0=dot(v[0],x)/(s[0][0]+eps);
-    let c1=dot(v[1],x)/(s[1][1]+eps);
-    let c2=dot(v[2],x)/(s[2][2]+eps);
-    let y=v[0]*c0+v[1]*c1+v[2]*c2;
-    let n=length(y);
-    if(!(n>0.0) || !finite_r(n) || !finite_r(y.x) || !finite_r(y.y) || !finite_r(y.z)) { break; }
-    x=y/n;
-  }
+  var smallest=0u; for(var i=1u;i<3u;i++) { if(s[i][i]<s[smallest][smallest]) { smallest=i; } }
+  let x=normalize(v[smallest]);
   let norm=sqrt(dot(b[0],b[0])+dot(b[1],b[1])+dot(b[2],b[2]));
   if(!(norm>1e-12)) { return vec4<f32>(0,0,0,-1); }
   return vec4<f32>(x,length(b*x)/norm);

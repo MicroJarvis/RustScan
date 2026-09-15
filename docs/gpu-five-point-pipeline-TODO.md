@@ -1,6 +1,6 @@
 # GPU f32 五点法 Pipeline 优化 TODO
 
-更新日期：2026-09-15（第十次更新）  
+更新日期：2026-09-15（第十一次更新）  
 开发分支：`gpu-five-point-f32`  
 工作区：`/Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32`  
 源码基线 commit：`4748208` / docs `ac15d4b`（Q1–Q4 + P1–P3 检查点；其上叠测量 harness 小修）
@@ -42,7 +42,8 @@
 | **Q5 前置测量** | **已完成** | B 误差 loss/no-loss p90 ≈30×；建议 Q5a LU/B |
 | **Q5a LU 迭代精化** | **已完成，回退** | B p90 4.45e-4→4.74e-4（变差）；签名保持 Q4 |
 | **Q5a-B elim/back-sub FMA** | **已完成，回退** | B p90 4.45e-4→4.36e-4（~2%，不实质）；签名保持 Q4 |
-| 难度感知 roots / P4 / P5 | 之后 | 见各节；质量线建议改 Q5b 或混精 |
+| **Q5b recovery null3** | **已完成，保留** | RF 18,063→17,475；模型 +949；签名→Q5b |
+| 难度感知 roots / P4 / P5 | 之后 | 见各节；质量线建议混精 LU/B 或 P4 |
 
 ## 固定输入与签名
 
@@ -52,15 +53,17 @@ DB: /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/mat
 Input digest:              af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5
 Model signature (Q1):      030f43068d9e8f78961142915162f20bef4ecb909d49d247a4f766a2ab5412df
 Model signature (Q2):      472124c8f1a9c6299d659e2f835dc11c682ff8a593757f0b145f73454f51d6ea   (历史)
-Model signature (Q4):      26e825cf97002be4f7fc36b77ce4fed682445af37746504253444e0103c5e716   (现行)
+Model signature (Q4):      26e825cf97002be4f7fc36b77ce4fed682445af37746504253444e0103c5e716   (历史)
+Model signature (Q5b):     fb5be154bb0fa742ab1b83e5c9e62269722678cab463bfbe3827457b7424e8f0   (现行)
 Diagnostic signature v1:   1f6f3f8d88a17e4e1c42abfc85aad44a66c4b864091805594e086ca80bf9b339   (历史，Q1 前)
 Diagnostic signature v2:   3cd8091d6033f2fdb0b598c27483e67c4dd3ee1af1232ff4f1f5ee1da86117cb   (Q1 后)
 Diagnostic signature Q2:   3d04bb3edaef183049e07d6c3841e296f963da3b279bcbd99d878e1dc090c050   (历史)
-Diagnostic signature Q4:   d9e911ac6b6e2be18f7e3b8b8615417efba6257f955ce2bbf21f943a1c7f358a   (现行)
+Diagnostic signature Q4:   d9e911ac6b6e2be18f7e3b8b8615417efba6257f955ce2bbf21f943a1c7f358a   (历史)
+Diagnostic signature Q5b:  1412c6d5d2af9bb9ed23c8d55238af22deb2b259cfa16fa43a99fb21486b9a1a   (现行)
 CPU f64 signature:         9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a
 ```
 
-资源/布局实验校验 **diagnostic** 签名（现行 **Q4**）。诊断-only 改动另校验 **model** 签名须不变。数值算法实验允许 diagnostic 与 model 都变，但须重新确立质量接受条件。P2/P3 资源复用必须保持现行质量签名。
+资源/布局实验校验 **diagnostic** 签名（现行 **Q5b**）。诊断-only 改动另校验 **model** 签名须不变。数值算法实验允许 diagnostic 与 model 都变，但须重新确立质量接受条件。P2/P3 资源复用必须保持现行质量签名。
 
 所有 harness 启动时先校验 digest；漂移即失败，不产出可比数字。
 
@@ -90,7 +93,8 @@ CPU f64 signature:         9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b
 ## 当前事实：质量
 
 - **Q2 后全量计数（历史）**：CPU 288,264；GPU 243,967；空结果 2,942；CPU 有解/GPU 空 2,899；`RankDeficient` 621。
-- **Q4 后全量计数（现行）**：CPU 288,264；GPU **248,884**（+4,917）；空结果 **2,172**；CPU 有解/GPU 空 **2,127**；`RankDeficient` 仍 621。同 basis 下游缺口 41,404→36,487。
+- **Q4 后全量计数（历史）**：CPU 288,264；GPU **248,884**（+4,917）；空结果 **2,172**；CPU 有解/GPU 空 **2,127**；`RankDeficient` 仍 621。同 basis 下游缺口 41,404→36,487。
+- **Q5b 后全量计数（现行）**：CPU 288,264；GPU **249,833**（+949 vs Q4）；CPU 有解/GPU 空 **1,883**；Matched RecoveryFailed 18,063→**17,475**（tol 1e-3）。
 - **Q2 闸门**：对缩放后的 A 做 AAᵀ（5×5）Jacobi 得 σ，接受条件 `σ₅/σ₁ > 1e-5`；基仍由 AᵀA 特征向量给出。禁止只下调旧的 `1e-6·trace(AᵀA)` 常数；改的是作用对象（σ 而非 σ²）与估计路径（AAᵀ 而非 AᵀA 噪声底）。
 - **救援带 `[1e-5,1e-2)`**：40,448 / 40,832 保留（99.1%）；其中出模型的样本 Sampson 相对 pair 最优 p50=0.592、均值 0.589。`[1e-4,1e-2)` 几乎全保留；`[1e-5,1e-4)` 仅 57.5%。
 - **真退化残留**：f64 `σ₅/σ₁ ≤ 1e-7` 仍有 88/197 被保留并出模型——f32 Gram 高估近零 σ₅；再拧常数无效（1e-6 与 1e-5 只差 2 trial）。CPU 也无秩检验。更严拒绝留给后续 QR/SVD，不作为本轮回滚理由。
@@ -100,6 +104,7 @@ CPU f64 signature:         9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b
 - **Q4 系数精度（保留）**：同一 B 上多项式系数 FMA 补偿；固定丢解 cohort p90 0.084→0.001（84×）；MissingNoSlot 37,345→10,094；质量 trial 5,701 优 / 4,200 劣 / 55,123 平。剩余误差主要在 LU/B（same-basis 总误差 p90≈1.2e-4 vs same-B 4.4e-8）。根匹配后 RecoveryFailed/NotDone 上升为重新归类，非 recovery 变差证据。详见 [Q4 报告](gpu-five-point-q4-coefficients-verified-20260915.md)。
 - **Q5 前置（2026-09-15）**：`B_gpu_vs_f64_same_basis` 丢解/无丢解 p90 ≈ **30×**；InvalidEssential 11,907 / NullVectorFailure 9,530 slots。Q5a / Q5a-B 均已回退；详见 [Q5](gpu-five-point-q5-premeasure-20260915.md) / [Q5a](gpu-five-point-q5a-lu-refinement-reverted-20260915.md) / [Q5a-B](gpu-five-point-q5a-b-fma-elim-reverted-20260915.md)。
 - **Q5a-B（2026-09-15，回退）**：消去/回代 FMA；固定 loss B p90 4.447e-4→4.361e-4（~2%）；模型 −2；质量近似持平略负。
+- **Q5b recovery（2026-09-15，保留）**：离线 good-B matched RF **6,759**（勿停）；`null3` FMA Gram + min‖Bv‖ + 逆迭代；RF −588；模型 +949；质量 net +569；签名→Q5b。详见 [Q5b 报告](gpu-five-point-q5b-recovery-retained-20260915.md)。
 
 ## 历史报告（相对本文件）
 
@@ -120,8 +125,9 @@ CPU f64 signature:         9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b
 - [Q5 前置测量（纯离线）](gpu-five-point-q5-premeasure-20260915.md)
 - [Q5a LU 迭代精化（回退）](gpu-five-point-q5a-lu-refinement-reverted-20260915.md)
 - [Q5a-B elim/back-sub FMA（回退）](gpu-five-point-q5a-b-fma-elim-reverted-20260915.md)
+- [Q5b recovery null3（保留）](gpu-five-point-q5b-recovery-retained-20260915.md)
 
-测量 harness：`five_point_gpu_p1_host.rs`、`five_point_gpu_roots_attribution.rs`、`five_point_gpu_lost_solutions.rs`、`five_point_gpu_q1_diagnostics.rs`、`five_point_gpu_q2_nullspace.rs`、`five_point_gpu_p2_session.rs`、`five_point_gpu_p3_submit.rs`、`five_point_gpu_p3_double.rs`、`five_point_gpu_recovery_attribution.rs`、`five_point_gpu_q4_coefficients.rs`；汇总脚本 `summarize_five_point_q4.py`、`summarize_five_point_q5_premeasure.py`；原始结果在 `experiments/`。
+测量 harness：`five_point_gpu_p1_host.rs`、`five_point_gpu_roots_attribution.rs`、`five_point_gpu_lost_solutions.rs`、`five_point_gpu_q1_diagnostics.rs`、`five_point_gpu_q2_nullspace.rs`、`five_point_gpu_p2_session.rs`、`five_point_gpu_p3_submit.rs`、`five_point_gpu_p3_double.rs`、`five_point_gpu_recovery_attribution.rs`、`five_point_gpu_q4_coefficients.rs`、`five_point_gpu_q5b_recovery_measure.rs`；汇总脚本 `summarize_five_point_q4.py`、`summarize_five_point_q5_premeasure.py`；原始结果在 `experiments/`。
 
 P1 轮的保留产物（baseline/candidate 二进制、`baseline-uncommitted.diff`、`P1.2-buffer-field-inventory.md`）在 `output/five-point-p1host-20260914-ThcNbcf6/`。下文提到这两个文件均指该目录。
 
@@ -216,8 +222,8 @@ P1 轮的保留产物（baseline/candidate 二进制、`baseline-uncommitted.dif
 - [x] 性能：batch 512 中位 1.492→1.573 s（+5.5%）；65,024 ~1×。
 
 **下一轮：** 勿再试纯 f32 同路径 LU 修补。优先二选一（仍单变量）：
-(1) **Q5b recovery**（B 视为暂时卡住）；(2) 设备混精 / f64 残差若 API 可行。
-P4 可在现行 Q4 质量门下单独开性能轮。
+(1) ~~**Q5b recovery**~~（已保留）；(2) 设备混精 / f64 残差若 API 可行。
+P4 可在现行 **Q5b** 质量门下单独开性能轮。
 
 ### Q5a-B — elim/back-sub FMA【已完成，回退】
 
@@ -227,6 +233,18 @@ P4 可在现行 Q4 质量门下单独开性能轮。
 - [x] **回退**：固定 loss cohort B p90 **4.447e-4 → 4.361e-4**（~2%，不实质）；
       模型 −2；质量 3751/3755/57518；签名保持 Q4。
 - [x] 产物：`experiments/q5a-b-fma-tol1e3-20260915.*`。
+
+### Q5b — recovery 3×3 null3【已完成，保留】
+
+报告：[Q5b recovery 保留](gpu-five-point-q5b-recovery-retained-20260915.md)。
+
+- [x] 离线：matched RF 按 NullVector/InvalidEssential × good-B/bad-B 交叉表；
+      good-B RF **6,759** → 继续实施（勿停）。
+- [x] 唯一变量：`null3` FMA Gram + min‖Bv‖ 选向量 + 2 步阻尼逆迭代；
+      不放宽 accept 阈值；不动 algebra/roots/闸门。
+- [x] 验收：RF 18,063→17,475（−588）；模型 +949；Sampson net +569；
+      签名→Q5b；focused tests 11/11。
+- [x] 活跃 harness 质量门切 Q5b。
 
 ### Q5 前置测量【完成】
 
@@ -327,8 +345,9 @@ P4 可在现行 Q4 质量门下单独开性能轮。
 | Q5 前置 | 离线测量 | B 误差 vs loss ~30× | **建议 Q5a LU/B** |
 | Q5a 迭代精化 | 实施+验证 | 一步 LU 残差修正 | **回退**；B p90 变差；见 Q5a 报告 |
 | Q5a-B FMA elim | 实施+验证 | 消去/回代 FMA | **回退**；B p90 ~2% 不足；见 Q5a-B 报告 |
+| Q5b recovery | 离线+实施 | null3 FMA/选向量/逆迭代 | **保留**；RF −588；签名→Q5b |
 
 ## 下一轮明确范围与停止条件
 
-**Q5a 与 Q5a-B 均已回退。** 下一轮勿重复纯 f32 LU 修补；选 **Q5b recovery**
-或混精残差，或在 Q4 门下开 **P4**。仍单变量；签名保持 Q4 直至 retain。
+**Q5b 已保留；Q5a/Q5a-B 均已回退。** 下一轮勿重复纯 f32 LU 修补或再拧
+recovery 阈值；选 **混精残差（LU/B）** 或在 **Q5b** 门下开 **P4**。仍单变量。
