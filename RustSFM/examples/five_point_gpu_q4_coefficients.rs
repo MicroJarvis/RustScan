@@ -390,10 +390,15 @@ fn main() -> Result<()> {
         }
     }
     ensure!(bases.len() == inputs.len());
-    // Consistency: staged basis availability must match full-pipeline upstream status.
+    // Consistency: staged basis availability must match full-pipeline nullspace
+    // success. Roots copies non-success algebra status into results[ob]
+    // (upstream), so SingularElimination/NonFinite there still imply a basis.
     for (i, r) in gpu_results.iter().enumerate() {
+        let full_had_basis = r.upstream_status == FivePointStatus::Success
+            || (r.algebra_status != FivePointStatus::Success
+                && r.upstream_status == r.algebra_status);
         ensure!(
-            bases[i].is_some() == (r.upstream_status == FivePointStatus::Success),
+            bases[i].is_some() == full_had_basis,
             "staged/full nullspace disagreement at trial {i}"
         );
     }

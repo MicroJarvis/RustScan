@@ -1,0 +1,298 @@
+warning: unused import: `run_reconstruction_with_task`
+ --> RustSFM/src/sfm/mapper/image_features_tests.rs:2:47
+  |
+2 |     mapper_uses_gpu, prepare_mapper_features, run_reconstruction_with_task, MapperConfig,
+  |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::feature_extraction::retained_memory_plan`
+ --> RustSFM/src/sfm/mapper/image_features_tests.rs:5:5
+  |
+5 | use crate::feature_extraction::retained_memory_plan;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `five_point_f32::Kernel` is more private than the item `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed`
+   --> RustSFM/src/gpu/five_point_f32_complete.rs:506:5
+    |
+506 | /     pub(crate) fn complete_pass_timed(
+507 | |         &self,
+508 | |         encoder: &mut wgpu::CommandEncoder,
+509 | |         kernel: &Kernel,
+...   |
+514 | |         timestamp: Option<(&wgpu::QuerySet, u32)>,
+515 | |     ) {
+    | |_____^ method `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed` is reachable at visibility `pub(crate)`
+    |
+note: but type `five_point_f32::Kernel` is only usable at visibility `pub(self)`
+   --> RustSFM/src/gpu/five_point_f32.rs:85:1
+    |
+ 85 | struct Kernel {
+    | ^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: function `real_gpu_stage_drains_caller_owned_context_on_error` is never used
+   --> RustSFM/src/execution_tests.rs:404:4
+    |
+404 | fn real_gpu_stage_drains_caller_owned_context_on_error() -> Result<()> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `sequence` is never used
+   --> RustSFM/src/task.rs:280:19
+    |
+163 | impl<'a> SfmTaskContext<'a> {
+    | --------------------------- method in this implementation
+...
+280 |     pub(crate) fn sequence(
+    |                   ^^^^^^^^
+
+warning: function `load_grayscale_image_for_frame` is never used
+    --> RustSFM/src/feature/feature_matching_db.rs:2265:8
+     |
+2265 | pub fn load_grayscale_image_for_frame(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `COLMAP_SIFT_DESCRIPTOR_NORM` is never used
+   --> RustSFM/src/feature/sift.rs:533:7
+    |
+533 | const COLMAP_SIFT_DESCRIPTOR_NORM: f32 = 512.0 * 512.0;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `colmap_normalized_distance` is never used
+   --> RustSFM/src/feature/sift.rs:549:4
+    |
+549 | fn colmap_normalized_distance(l2_dist: f32) -> f32 {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `colmap_uint8_l2_distance2` is never used
+   --> RustSFM/src/feature/sift.rs:554:4
+    |
+554 | fn colmap_uint8_l2_distance2(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `rgb_to_sift_gray` is never used
+   --> RustSFM/src/feature/sift.rs:883:4
+    |
+883 | fn rgb_to_sift_gray(rgb: &[u8], width: u32, height: u32) -> Result<GrayImage> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu` is never used
+   --> RustSFM/src/geometry/two_view.rs:340:15
+    |
+340 | pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `sample` is never read
+    --> RustSFM/src/geometry/two_view.rs:2239:5
+     |
+2235 | struct GpuRansacCandidate<'a> {
+     |        ------------------ field in this struct
+...
+2239 |     sample: &'a [usize],
+     |     ^^^^^^
+     |
+     = note: `GpuRansacCandidate` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `compare_pose_scores` is never used
+    --> RustSFM/src/geometry/two_view.rs:5118:4
+     |
+5118 | fn compare_pose_scores(a: &PoseCandidateScore, b: &PoseCandidateScore) -> std::cmp::Ordering {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `small_images` is never used
+  --> RustSFM/src/sfm/mapper/image_features_tests.rs:37:4
+   |
+37 | fn small_images(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
+   |    ^^^^^^^^^^^^
+
+warning: function `float_bits` is never used
+  --> RustSFM/src/sfm/mapper/image_features_tests.rs:52:4
+   |
+52 | fn float_bits(values: &[f32]) -> Vec<u32> {
+   |    ^^^^^^^^^^
+
+warning: function `keypoint_bits` is never used
+  --> RustSFM/src/sfm/mapper/image_features_tests.rs:56:4
+   |
+56 | fn keypoint_bits(points: &[rustslam::KeyPoint]) -> Vec<([u32; 5], i32)> {
+   |    ^^^^^^^^^^^^^
+
+warning: function `assert_frame_bits` is never used
+  --> RustSFM/src/sfm/mapper/image_features_tests.rs:74:4
+   |
+74 | fn assert_frame_bits(a: &ImageFrame, b: &ImageFrame) {
+   |    ^^^^^^^^^^^^^^^^^
+
+warning: function `crc32` is never used
+   --> RustSFM/src/sfm/mapper/image_features_tests.rs:490:4
+    |
+490 | fn crc32(bytes: &[u8]) -> u32 {
+    |    ^^^^^
+
+warning: `rustsfm` (lib test) generated 18 warnings (run `cargo fix --lib -p rustsfm --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.17s
+     Running unittests src/lib.rs (target/release/deps/rustsfm-38f75c26e1d5e005)
+
+running 11 tests
+test five_point::tests::five_point_nullspace_contains_true_essential ... ok
+test five_point::tests::five_point_overdetermined_nullspace_contains_true_essential ... ok
+test five_point::tests::five_point_recovers_synthetic_essential ... ok
+test five_point::tests::five_point_root_filter_uses_colmap_imaginary_threshold ... ok
+test gpu::five_point_f32::tests::decode_builds_fixed_slots_without_losing_state_or_order ... ok
+test gpu::five_point_f32::tests::five_point_f32_actual_gpu_stages ... five-point GPU: GpuSiftCapabilities { backend: Wgpu, device_name: "Apple M5 Max" }
+compiling five-point pipeline main
+compiled five-point pipeline main in 333.125µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 599.458µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 7.407708ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 747.084µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 482.166µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 494.375µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 65.75µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 304.833µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 438.792µs
+sample 0: [A, solve, B, coeff] relative errors=[5.167559762068577e-8, 1.3753602691368499e-5, 1.3700331450484549e-5, 1.3835031071229867e-5], pivot=0.0012304889
+sample 0: isolated polynomial relative error=0.00000002155826736959784
+sample 1: [A, solve, B, coeff] relative errors=[5.8717855084441e-8, 1.1669991539800893e-6, 1.02819223371089e-6, 1.6154819828072178e-6], pivot=0.09858661
+sample 1: isolated polynomial relative error=0.000000012585329643261108
+sample 2: [A, solve, B, coeff] relative errors=[1.0081871978186468e-7, 1.3228435556523953e-6, 1.6301747321425204e-6, 1.6941485158051526e-6], pivot=0.02491742
+sample 2: isolated polynomial relative error=0.000000034584637444574317
+sample 3: [A, solve, B, coeff] relative errors=[8.496772101783082e-8, 1.9385652151410887e-6, 2.014367330721107e-6, 3.2547599094639986e-6], pivot=0.033723284
+sample 3: isolated polynomial relative error=0.00000004849124996520011
+sample 4: [A, solve, B, coeff] relative errors=[6.75541273334331e-8, 2.9352651121173055e-7, 3.34861787937967e-7, 1.1587685260298854e-6], pivot=0.04535522
+sample 4: isolated polynomial relative error=0.000000024984731293128902
+sample 5: [A, solve, B, coeff] relative errors=[7.842025488734166e-8, 3.0447208845001943e-6, 7.860627830654497e-6, 2.0711990505874568e-5], pivot=0.011425897
+sample 5: isolated polynomial relative error=0.000000014322193144651922
+sample 6: [A, solve, B, coeff] relative errors=[8.929428106608456e-8, 3.515973907644992e-5, 3.556155649227665e-5, 6.687643553012744e-5], pivot=0.005158419
+sample 6: isolated polynomial relative error=0.000000020698304876671003
+sample 7: [A, solve, B, coeff] relative errors=[1.3146031754869566e-7, 1.911442544507617e-6, 9.83302349949742e-7, 1.0154700565495205e-6], pivot=0.043739878
+sample 7: isolated polynomial relative error=0.000000010897268309207545
+sample 8: [A, solve, B, coeff] relative errors=[1.0472955827606922e-7, 4.339912230318398e-7, 1.8203961890980627e-7, 1.8336941003369165e-7], pivot=0.24122883
+sample 8: isolated polynomial relative error=0.000000016099613634311873
+sample 9: [A, solve, B, coeff] relative errors=[7.0660430426004e-8, 5.953068358710659e-6, 5.76021621399299e-6, 6.020093167314156e-6], pivot=0.071256064
+sample 9: isolated polynomial relative error=0.00000002568345949709997
+sample 10: [A, solve, B, coeff] relative errors=[9.236823756489958e-8, 5.767476428218504e-7, 9.709088576996178e-7, 4.777140874019295e-7], pivot=0.29039708
+sample 10: isolated polynomial relative error=0.000000013310387864502356
+sample 11: [A, solve, B, coeff] relative errors=[9.261621071696108e-8, 2.643081587334162e-6, 2.3800192946459304e-6, 2.9038938252693016e-6], pivot=0.038621392
+sample 11: isolated polynomial relative error=0.000000024499400278935204
+sample 12: [A, solve, B, coeff] relative errors=[7.139950820132146e-8, 1.9983379068095662e-7, 2.1230155120963984e-7, 4.3110476626035857e-7], pivot=0.22787799
+sample 12: isolated polynomial relative error=0.00000002400470138846318
+sample 13: [A, solve, B, coeff] relative errors=[9.612455420878587e-8, 1.4187049160127458e-6, 1.274767277049721e-6, 2.1369080060275157e-6], pivot=0.03238522
+sample 13: isolated polynomial relative error=0.000000023498801536424887
+sample 14: [A, solve, B, coeff] relative errors=[9.527886449066496e-8, 6.84035237068372e-7, 6.789641634905677e-7, 6.64548039319319e-7], pivot=0.0736133
+sample 14: isolated polynomial relative error=0.0000000397383387380696
+sample 15: [A, solve, B, coeff] relative errors=[4.805976719075266e-8, 4.382977349906007e-7, 4.840368970576681e-7, 7.240140842629853e-7], pivot=0.20316532
+sample 15: isolated polynomial relative error=0.000000016874798970113087
+root fixture 0: degree=10, iterations=12, unconverged=0, complex=0, duplicate=0, failed=false, slots=[(RealRoot, [2.1000004, 0.0]), (RealRoot, [1.1000001, 0.0]), (RealRoot, [0.19999999, 0.0]), (RealRoot, [-0.49999997, 0.0]), (RealRoot, [-1.4999999, 0.0]), (RealRoot, [-2.0000002, 0.0]), (RealRoot, [-1.0000001, 0.0]), (RealRoot, [-0.10000001, 0.0]), (RealRoot, [0.6, 0.0]), (RealRoot, [1.5999998, 0.0])]
+root fixture 1: degree=2, iterations=4, unconverged=2, complex=0, duplicate=0, failed=false, slots=[(RealAxisRejected, [0.0, 0.0]), (RealAxisRejected, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0])]
+root fixture 2: degree=2, iterations=17, unconverged=0, complex=0, duplicate=1, failed=false, slots=[(RealRoot, [1.0, 0.0]), (DuplicateRoot, [0.9999998, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0])]
+root fixture 3: degree=0, iterations=0, unconverged=0, complex=0, duplicate=0, failed=true, slots=[(Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0])]
+root fixture 4: degree=10, iterations=384, unconverged=10, complex=0, duplicate=0, failed=false, slots=[(RootNotDone, [1.4234242, 0.16921662]), (RootNotDone, [1.1829845, 0.36605152]), (RootNotDone, [0.9308863, 0.352539]), (RootNotDone, [0.76653624, 0.23770183]), (RootNotDone, [0.7035451, 0.07740101]), (RootNotDone, [0.7038107, -0.0786355]), (RootNotDone, [0.7755091, -0.22936508]), (RootNotDone, [0.9277516, -0.36526662]), (RootNotDone, [1.1891402, -0.3749844]), (RootNotDone, [1.4199393, -0.16783275])]
+full trial 0: CPU=6, GPU=6, iterations=19, unconverged=4, complex=0, duplicate=0, rejected=0, best=0.00008256433993537136
+full trial 1: CPU=4, GPU=4, iterations=24, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.000010320455319531117
+full trial 2: CPU=6, GPU=4, iterations=35, unconverged=0, complex=4, duplicate=0, rejected=2, best=0.00008441324194914154
+full trial 3: CPU=2, GPU=1, iterations=19, unconverged=8, complex=0, duplicate=0, rejected=1, best=0.012715014372735374
+full trial 4: CPU=4, GPU=4, iterations=12, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.000001718462166380617
+full trial 5: CPU=4, GPU=3, iterations=13, unconverged=6, complex=0, duplicate=0, rejected=1, best=0.000005216140763272856
+full trial 6: CPU=4, GPU=4, iterations=17, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.00000780737035645703
+full trial 7: CPU=6, GPU=3, iterations=384, unconverged=7, complex=0, duplicate=0, rejected=0, best=0.000007742893478452292
+full trial 8: CPU=4, GPU=4, iterations=16, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.00000020090351539412742
+full trial 9: CPU=2, GPU=2, iterations=19, unconverged=6, complex=2, duplicate=0, rejected=0, best=0.000037070760551987954
+full trial 10: CPU=2, GPU=2, iterations=20, unconverged=8, complex=0, duplicate=0, rejected=0, best=0.000008355902390351203
+full trial 11: CPU=6, GPU=6, iterations=14, unconverged=4, complex=0, duplicate=0, rejected=0, best=0.000003266236670024616
+full trial 12: CPU=6, GPU=6, iterations=31, unconverged=0, complex=4, duplicate=0, rejected=0, best=0.00000020069167344405762
+full trial 13: CPU=4, GPU=4, iterations=18, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.0000007029004427531512
+full trial 14: CPU=4, GPU=4, iterations=22, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.000000740177389736406
+full trial 15: CPU=4, GPU=3, iterations=49, unconverged=4, complex=2, duplicate=0, rejected=1, best=0.0000005749828256958513
+worst normalized A*N=0.0000007608281104430883; worst [A, solve, B, coeff]=[1.3146031754869566e-7, 3.515973907644992e-5, 3.556155649227665e-5, 6.687643553012744e-5]; pivoted samples=13
+ok
+test gpu::five_point_f32::tests::five_point_session_reuses_buffers_without_stale_state ... compiling five-point pipeline main
+compiled five-point pipeline main in 229.292µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 324.75µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.412042ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 408.709µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 296.083µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 276.084µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 48.125µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 272.125µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 281.667µs
+ok
+test gpu::five_point_f32::tests::q4::five_point_q4_arithmetic_probe ... compiling five-point pipeline main
+compiled five-point pipeline main in 190.5µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 305.833µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.143917ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 382.75µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 282.25µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 266.542µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 50.333µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 265.167µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 282.375µs
+compiling five-point pipeline probe
+compiled five-point pipeline probe in 45.875µs
+Q4 arithmetic probe actual=[1.0, -1.4210855e-14, 100000000.0, 1.0, 0.0] expected=[1.0, -1.4210855e-14, 100000000.0, 1.0]
+ok
+test gpu::five_point_f32::tests::q4::five_point_q4_same_b_compensation_survives_gpu_compiler ... Q4 actual device: GpuSiftCapabilities { backend: Wgpu, device_name: "Apple M5 Max" }
+compiling five-point pipeline main
+compiled five-point pipeline main in 219.208µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 321.166µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.061ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 373.334µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 282.792µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 262.916µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 45.542µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 331.167µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 320.375µs
+compiling five-point pipeline q4_load
+compiled five-point pipeline q4_load in 632.542µs
+Q4 trial 181 scale_case=0 baseline=6.369077422382238e-2 candidate=3.132646012617449e-8
+Q4 trial 296 scale_case=0 baseline=3.765730987303341e-2 candidate=3.077965246867539e-8
+Q4 trial 540 scale_case=0 baseline=1.4540116825261908e-2 candidate=1.36086619588586e-8
+Q4 trial 561 scale_case=0 baseline=1.1198130263479326e-2 candidate=2.591881914178675e-8
+Q4 trial 731 scale_case=0 baseline=2.6521666873445697e-2 candidate=1.7660942073224668e-8
+Q4 trial 807 scale_case=0 baseline=1.419662055549509e-2 candidate=3.9817040672509694e-8
+Q4 trial 1007 scale_case=0 baseline=3.0189733372913544e-2 candidate=8.20568292536653e-9
+Q4 trial 1350 scale_case=0 baseline=6.644897394912129e-2 candidate=3.1845850058056946e-8
+Q4 trial 1576 scale_case=0 baseline=7.574261456415542e-2 candidate=2.843034605791279e-8
+Q4 trial 1585 scale_case=0 baseline=9.81067490847984e-2 candidate=1.7173410804797677e-8
+Q4 trial 1605 scale_case=0 baseline=2.7879316734664927e-2 candidate=1.7776649866615523e-8
+Q4 trial 1618 scale_case=0 baseline=5.186747077884064e-2 candidate=3.449167560796135e-8
+Q4 verified 72 same-B/sign/power-of-two cases twice
+ok
+test two_view::tests::five_point_batch_runner_preserves_sampler_frontier_and_fnmut_path ... ok
+test two_view::tests::five_point_trial_groups_preserve_bits_ordinals_and_exhaustion ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 725 filtered out; finished in 0.83s
+
