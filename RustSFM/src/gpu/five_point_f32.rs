@@ -19,6 +19,13 @@ struct Ray {
     _pad: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FivePointParams {
+    count: u32,
+    _pad: [u32; 3],
+}
+
 /// Row-major 5×9 epipolar constraints (each essential matrix is flattened row-major).
 pub type FivePointConstraintMatrix = [f32; 45];
 /// Column-major 9×4 basis: four consecutive nine-element right-nullspace vectors.
@@ -54,8 +61,9 @@ pub struct FivePointNullspaceResult {
     pub basis: Option<FivePointNullspaceBasis>,
     pub status: FivePointStatus,
     pub sweeps: u32,
-    pub relative_off_diagonal: f32,
-    /// Numerical rank of AᵀA, eigenvalue threshold 1e-6 times trace.
+    /// σ₅/σ₁ from Jacobi on the 5×5 AAᵀ (singular values), not from AᵀA.
+    pub min_diagonal_ratio: f32,
+    /// 5 on success; on RankDeficient, #{ σ_i > 1e-5 · σ₁ } over the five AAᵀ values.
     pub rank: u32,
 }
 
@@ -86,6 +94,10 @@ pub use complete::{
     FIVE_POINT_PASS_NAMES,
 };
 
+#[path = "five_point_f32_session.rs"]
+mod session;
+pub use session::FivePointSession;
+
 /// Independent GPU-only batched five-point solver and diagnostic stages.
 pub struct WgpuFivePointF32 {
     context: Arc<WgpuContext>,
@@ -106,13 +118,13 @@ impl WgpuFivePointF32 {
     pub fn from_context(context: Arc<WgpuContext>) -> Result<Self> {
         let geometry_module = shader_module(context.device(), SHADER)?;
         let algebra_module = shader_module(context.device(), ALGEBRA)?;
-        let constraints = kernel(context.device(), &geometry_module, "main", 2)?;
-        let basis = kernel(context.device(), &geometry_module, "nullspace", 1)?;
-        let elimination = kernel(context.device(), &algebra_module, "elimination", 1)?;
-        let algebra = kernel(context.device(), &algebra_module, "algebra", 1)?;
-        let polynomial = kernel(context.device(), &algebra_module, "polynomial", 1)?;
+        let constraints = kernel(context.device(), &geometry_module, "main", 2, false)?;
+        let basis = kernel(context.device(), &geometry_module, "nullspace", 1, true)?;
+        let elimination = kernel(context.device(), &algebra_module, "elimination", 1, false)?;
+        let algebra = kernel(context.device(), &algebra_module, "algebra", 1, true)?;
+        let polynomial = kernel(context.device(), &algebra_module, "polynomial", 1, false)?;
         let validate_polynomial =
-            kernel(context.device(), &algebra_module, "validate_polynomial", 1)?;
+            kernel(context.device(), &algebra_module, "validate_polynomial", 1, false)?;
         let complete = complete::CompleteKernels::new(context.device())?;
         Ok(Self {
             complete,
@@ -126,7 +138,7 @@ impl WgpuFivePointF32 {
         })
     }
 
-    /// Rejects nonfinite inputs; dispatches Jacobi with explicit convergence/rank status.
+    /// Rejects nonfinite inputs; dispatches QR with explicit rank status.
     pub fn compute_nullspace_diagnostics(
         &self,
         matrices: &[FivePointConstraintMatrix],
@@ -154,7 +166,7 @@ impl WgpuFivePointF32 {
                     basis,
                     status,
                     sweeps: v[37] as u32,
-                    relative_off_diagonal: v[38],
+                    min_diagonal_ratio: v[38],
                     rank: v[39] as u32,
                 })
             })
@@ -291,32 +303,54 @@ impl WgpuFivePointF32 {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let entries: Vec<_> = buffers
-            .iter()
-            .chain(std::iter::once(&out))
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("five-point bind group"),
-            layout: &kernels[0].0.layout,
-            entries: &entries,
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("five-point params"),
+            contents: bytemuck::bytes_of(&FivePointParams {
+                count: batches as u32,
+                _pad: [0; 3],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("five-point encoder"),
         });
         // Separate passes give storage dependencies between expansion, solve and polynomial.
         for &(kernel, rows) in kernels {
+            let needs_params =
+                std::ptr::eq(kernel, &self.basis) || std::ptr::eq(kernel, &self.algebra);
+            let mut entries: Vec<_> = buffers
+                .iter()
+                .chain(std::iter::once(&out))
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect();
+            if needs_params {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: entries.len() as u32,
+                    resource: params.as_entire_binding(),
+                });
+            }
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("five-point bind group"),
+                layout: &kernel.layout,
+                entries: &entries,
+            });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("five-point pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(batches as u32, rows, 1);
+            let groups = if std::ptr::eq(kernel, &self.basis) || std::ptr::eq(kernel, &self.algebra)
+            {
+                batches.div_ceil(32)
+            } else {
+                batches
+            };
+            pass.dispatch_workgroups(groups as u32, rows, 1);
         }
         self.context
             .wait_for(self.context.queue().submit(Some(encoder.finish())))?;
@@ -343,6 +377,7 @@ fn kernel(
     module: &wgpu::ShaderModule,
     entry: &str,
     inputs: u32,
+    with_params: bool,
 ) -> Result<Kernel> {
     #[cfg(test)]
     let started = std::time::Instant::now();
@@ -351,7 +386,7 @@ fn kernel(
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
-    let entries: Vec<_> = (0..=inputs)
+    let mut entries: Vec<_> = (0..=inputs)
         .map(|binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -365,6 +400,18 @@ fn kernel(
             count: None,
         })
         .collect();
+    if with_params {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: inputs + 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+    }
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(entry),
         entries: &entries,

@@ -4,11 +4,16 @@
 // rank, Jacobi sweeps, algebra status, max constraint residual, root failure.
 // Slot: status, root re/im, backward error, E[9] row-major, B null residual,
 // A*E residual, essential cubic residual. Status definitions are in Rust.
+// Slot status 3 = real-axis residual gate, 7 = Aberth done[] not set, 8 = polish
+// residual; the header unconverged counter still sums all three.
+// P2: roots bounds with params.count; recover still uses host dispatch count.
+struct FivePointParams { count: u32, _pad0: u32, _pad1: u32, _pad2: u32 }
 @group(0) @binding(0) var<storage, read> constraints_full: array<f32>;
 @group(0) @binding(1) var<storage, read> diagnostics: array<f32>;
 @group(0) @binding(2) var<storage, read> algebra_full: array<f32>;
 @group(0) @binding(3) var<storage, read> basis_full: array<f32>;
 @group(0) @binding(4) var<storage, read_write> results: array<f32>;
+@group(0) @binding(5) var<uniform> params: FivePointParams;
 
 fn finite_r(x:f32)->bool { return x==x && abs(x)<=3.402823e38; }
 fn finite_v(x:vec2<f32>)->bool { return finite_r(x.x) && finite_r(x.y); }
@@ -29,8 +34,7 @@ fn evaluate(c:array<f32,11>,degree:u32,z:vec2<f32>)->array<vec2<f32>,3> {
 @compute @workgroup_size(32)
 fn roots(@builtin(global_invocation_id) id:vec3<u32>) {
   // Exact per-trial bindings; guard the final partial workgroup before any access.
-  let count=min(arrayLength(&results)/176u,arrayLength(&algebra_full)/352u);
-  if(id.x>=count) { return; }
+  if(id.x>=params.count) { return; }
   let ob=id.x*176u; let ab=id.x*352u;
   results[ob+13u]=algebra_full[ab+350u];
   if(algebra_full[ab+350u]!=0.0) { results[ob]=algebra_full[ab+350u]; return; }
@@ -85,7 +89,8 @@ fn roots(@builtin(global_invocation_id) id:vec3<u32>) {
     if(!finite_v(final_eval[0]) || !finite_r(final_eval[2].x) || length(final_eval[0])>2e-5*max(final_eval[2].x,1e-30)) { results[sb]=3.0; results[ob+4u]+=1.0; continue; }
     results[sb+1u]=root.x; results[sb+2u]=root.y; results[sb+3u]=backward;
     results[ob+10u]=max(results[ob+10u],backward);
-    if(!done[i]) { results[sb]=3.0; results[ob+4u]+=1.0; continue; }
+    // Distinct from the real-axis residual gate above and the polish gate below.
+    if(!done[i]) { results[sb]=7.0; results[ob+4u]+=1.0; continue; }
     // f32 relative realness, deliberately not the CPU's absolute 1e-10 test.
     if(abs(root.y)>2e-4*(1.0+abs(root.x))) { results[sb]=2.0; results[ob+5u]+=1.0; continue; }
     // Real Newton polish, still in scaled coordinates; bounded and guarded.
@@ -102,7 +107,7 @@ fn roots(@builtin(global_invocation_id) id:vec3<u32>) {
       real=candidate;
     }
     let polished=evaluate(c,degree,vec2<f32>(real,0.0));
-    if(abs(polished[0].x)>2e-5*max(polished[2].x,1e-30)) { results[sb]=3.0; results[ob+4u]+=1.0; continue; }
+    if(abs(polished[0].x)>2e-5*max(polished[2].x,1e-30)) { results[sb]=8.0; results[ob+4u]+=1.0; continue; }
     root=vec2<f32>(real*radius,0.0); results[sb+1u]=root.x; results[sb+2u]=0.0;
     // Close-root clusters are unresolved in f32, not certified multiplicities.
     var duplicate=false;

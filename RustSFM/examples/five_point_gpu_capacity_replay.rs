@@ -1,7 +1,7 @@
 //! Independent fixed-prefix comparison, not RANSAC and not a 960-image pipeline.
 #[allow(dead_code)]
 #[path = "five_point_replay_probe.rs"]
-mod cpu;
+pub(crate) mod cpu;
 
 use anyhow::{ensure, Result};
 use clap::Parser;
@@ -36,7 +36,7 @@ fn solve_calls(trials: usize, batch: usize) -> usize {
     trials.div_ceil(batch)
 }
 
-fn gpu_replay(
+pub(crate) fn gpu_replay(
     gpu: &WgpuFivePointF32,
     inputs: &[cpu::Input],
     batch: usize,
@@ -60,7 +60,7 @@ fn gpu_replay(
     Ok(all)
 }
 
-fn gpu_bits(results: &[FivePointTrialResult]) -> Vec<Vec<u32>> {
+pub(crate) fn gpu_bits(results: &[FivePointTrialResult]) -> Vec<Vec<u32>> {
     results
         .iter()
         .map(|r| {
@@ -100,6 +100,37 @@ fn gpu_bits(results: &[FivePointTrialResult]) -> Vec<Vec<u32>> {
             words
         })
         .collect()
+}
+
+/// Candidate models only: trial index, model count, and Accepted essential
+/// coefficients in slot order. Status codes and other diagnostics are excluded
+/// so a diagnostic-only change can be proven not to alter candidates.
+pub(crate) fn model_bits(results: &[FivePointTrialResult]) -> Vec<Vec<u32>> {
+    results
+        .iter()
+        .map(|r| {
+            let mut words = vec![r.trial as u32, r.model_count as u32];
+            for slot in &r.slots {
+                if let Some(e) = slot.essential {
+                    words.push(slot.slot as u32);
+                    words.extend(e.map(f32::to_bits));
+                }
+            }
+            words
+        })
+        .collect()
+}
+
+pub(crate) fn model_signature(results: &[FivePointTrialResult]) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"gpu-replay-models-v1");
+    for trial in &model_bits(results) {
+        hash.update(&(trial.len() as u64).to_le_bytes());
+        for word in trial {
+            hash.update(&word.to_le_bytes());
+        }
+    }
+    hash.finalize().to_hex().to_string()
 }
 
 fn summary(values: &[f64]) -> Value {
@@ -335,7 +366,7 @@ fn legal_trials(dimension: u32, binding: u64, buffer: u64) -> u64 {
         .min(u64::from(binding) / 1408)
         .min(buffer / 1408)
 }
-fn unique_images(pairs: &[Value]) -> Vec<u64> {
+pub(crate) fn unique_images(pairs: &[Value]) -> Vec<u64> {
     pairs
         .iter()
         .flat_map(|p| p["image_ids"].as_array().unwrap())
@@ -344,7 +375,7 @@ fn unique_images(pairs: &[Value]) -> Vec<u64> {
         .into_iter()
         .collect()
 }
-fn signature(bits: &[Vec<u32>]) -> String {
+pub(crate) fn signature(bits: &[Vec<u32>]) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"gpu-replay-bits-v1");
     for trial in bits {

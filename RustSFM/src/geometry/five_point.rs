@@ -12,7 +12,33 @@ pub fn estimate_five_point_essential(
     let Some(basis) = five_point_nullspace(rays1, rays2) else {
         return Vec::new();
     };
-    let basis_data = basis_as_colmap_data(&basis);
+    essential_reference_from_basis(&basis)
+        .models
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// Offline f64 reference decomposition of the post-nullspace pipeline stages.
+///
+/// `coefficients` is `None` when the 10x10 elimination solve fails (the
+/// production path then returns no models). Diagnostic use only: this exposes
+/// the same arithmetic as `estimate_five_point_essential` so harnesses can
+/// feed a GPU-derived basis and compare polynomial coefficients, roots, and
+/// models stage by stage. It is not a runtime fallback.
+pub struct FivePointBasisReference {
+    pub coefficients: Option<[f64; 11]>,
+    pub roots: Vec<polynomial::Complex64>,
+    /// `(real root z, essential matrix)` pairs, in root order; roots whose
+    /// recovery fails (small `x[2]`, tiny norm, nonfinite) produce no entry.
+    pub models: Vec<(f64, Matrix3<f64>)>,
+}
+
+/// Run the f64 elimination → determinant polynomial → roots → recovery chain
+/// on the supplied basis, exactly as `estimate_five_point_essential` does
+/// after its own nullspace step.
+pub fn essential_reference_from_basis(basis: &EssentialBasis) -> FivePointBasisReference {
+    let basis_data = basis_as_colmap_data(basis);
     let a_data = five_point_generated::build_elimination_matrix(&basis_data);
     let a = DMatrix::<f64>::from_column_slice(10, 20, &a_data);
     let left = a.view((0, 0), (10, 10)).into_owned();
@@ -20,7 +46,11 @@ pub fn estimate_five_point_essential(
     let Some(aa) =
         colmap_eigen::partial_piv_lu_solve_10x10(&left, &right).or_else(|| left.lu().solve(&right))
     else {
-        return Vec::new();
+        return FivePointBasisReference {
+            coefficients: None,
+            roots: Vec::new(),
+            models: Vec::new(),
+        };
     };
 
     let b_data = build_determinant_matrix_data(&aa);
@@ -28,7 +58,7 @@ pub fn estimate_five_point_essential(
     let roots = polynomial::complex_roots_companion_matrix(&coeffs);
 
     let mut models = Vec::new();
-    for root in roots {
+    for root in roots.iter().copied() {
         if root.im.abs() > 1.0e-10 {
             continue;
         }
@@ -83,10 +113,14 @@ pub fn estimate_five_point_essential(
         }
         let e = vec9_to_matrix(e_vec / norm);
         if e.iter().all(|v| v.is_finite()) {
-            models.push(e);
+            models.push((z1, e));
         }
     }
-    models
+    FivePointBasisReference {
+        coefficients: Some(coeffs),
+        roots,
+        models,
+    }
 }
 
 pub fn five_point_nullspace(

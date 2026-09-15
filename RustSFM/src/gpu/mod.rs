@@ -43,8 +43,8 @@ pub(crate) fn is_known_macos_agx_pipeline_failure(error: &anyhow::Error) -> bool
 #[cfg(feature = "gpu-wgpu")]
 pub use five_point_f32::{
     FivePointAlgebraResult, FivePointConstraintMatrix, FivePointModelSlot, FivePointNullspaceBasis,
-    FivePointNullspaceResult, FivePointProfile, FivePointSlotStatus, FivePointStatus,
-    FivePointTrialResult, WgpuFivePointF32, FIVE_POINT_PASS_NAMES,
+    FivePointNullspaceResult, FivePointProfile, FivePointSession, FivePointSlotStatus,
+    FivePointStatus, FivePointTrialResult, WgpuFivePointF32, FIVE_POINT_PASS_NAMES,
 };
 #[cfg(feature = "gpu-wgpu")]
 pub use pnp_scorer::WgpuPnpModelScorer;

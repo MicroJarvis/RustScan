@@ -1,12 +1,17 @@
 // Appended after five_point_generated.wgsl. One invocation per sample.
+// P2: algebra bounds with params.count; other entry points in this module
+// still rely on the host dispatching exactly `count` workgroups.
+struct FivePointParams { count: u32, _pad0: u32, _pad1: u32, _pad2: u32 }
 @group(0) @binding(0) var<storage, read> bases: array<f32>;
 // Record: a[200], solve[100], b[39], coeffs[11], status, minimum relative pivot.
 @group(0) @binding(1) var<storage, read_write> algebra_output: array<f32>;
+@group(0) @binding(2) var<uniform> params: FivePointParams;
 
 fn finite(x: f32) -> bool { return x == x && abs(x) <= 3.402823e38; }
 
-@compute @workgroup_size(1)
-fn algebra(@builtin(workgroup_id) id: vec3<u32>) {
+@compute @workgroup_size(32)
+fn algebra(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= params.count) { return; }
   let ob = id.x * 352u;
   var a: array<f32,200>;
   for(var i=0u;i<200u;i++) { a[i]=algebra_output[ob+i]; }

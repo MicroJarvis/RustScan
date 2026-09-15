@@ -28,6 +28,16 @@ class GeneratorTests(unittest.TestCase):
         with self.assertRaises((AssertionError, ValueError)):
             generator.polynomial_table(source.replace("    coeffs\n}", "    unknown();\n    coeffs\n}", 1))
 
+    def test_compensated_polynomial_only(self):
+        text = generator.polynomial_table(generator.SOURCE.read_text())
+        self.assertIn("let pair_error=fma(first,second,-pair);", text)
+        self.assertIn("fma(pair,third,-product)+pair_error*third", text)
+        self.assertIn("correction+=sum_error+product_error;", text)
+        self.assertIn("sum_error=fma(-1.0,next,value)+product;", text)
+        self.assertIn("sum_error=fma(-1.0,next,product)+value;", text)
+        self.assertIn("=value+correction;", text)
+        self.assertNotIn("f64", text)
+
     def test_term_order_sign_and_packing(self):
         # Minimal full function: 11 outputs to exercise the same strict parser.
         source = "pub(crate) fn determinant_coeffs(b: &[f64; 39]) -> [f64; 11] {\n"

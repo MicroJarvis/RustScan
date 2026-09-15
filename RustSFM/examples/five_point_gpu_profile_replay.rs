@@ -221,11 +221,7 @@ fn attribution(
             .collect();
         ensure!(r.model_count == g.len(), "model count mismatch");
         ensure!(
-            r.unconverged
-                == r.slots
-                    .iter()
-                    .filter(|s| s.status == Slot::NotConverged)
-                    .count(),
+            r.unconverged == r.slots.iter().filter(|s| s.status.is_unconverged()).count(),
             "root counter mismatch"
         );
         ensure!(
@@ -290,7 +286,7 @@ fn attribution(
         "sum_reported_degree":degree_sum,"trials_entering_root_iterations":root_trials,
         "representative_first_trial_by_group":representatives,"distance_thresholds":DISTANCES,
         "association":"bidirectional nearest unit Frobenius sign-invariant distance; not bijective; missing includes empty target sets; diagnostic thresholds only",
-        "warning":"Marginals overlap: never sum them. NotConverged includes real-axis residual/polish rejection, not only iteration failure. Associations are not causal attribution."}),
+        "warning":"Marginals overlap: never sum them. Unconverged slots are now RealAxisRejected / RootNotDone / PolishRejected; associations are not causal attribution."}),
         ids,
     ))
 }

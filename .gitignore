@@ -57,3 +57,9 @@ openspec/
 /RustGS/output/
 /RustSFM/output/
 /.ua/
+
+# GPU five-point local sidecars (regenerable; keep summary JSON only)
+experiments/**/*.bits.json
+experiments/**/*.stages.bin
+experiments/**/*.trials.json
+experiments/q4-baseline-20260915/

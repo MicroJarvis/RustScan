@@ -31,7 +31,7 @@ pub struct FivePointProfile {
     pub total_seconds: f64,
 }
 
-const STRIDE: usize = 176;
+pub(super) const STRIDE: usize = 176;
 const PACK: &str = "
 @group(0) @binding(0) var<storage,read> diagnostics:array<f32>;
 @group(0) @binding(1) var<storage,read_write> bases:array<f32>;
@@ -46,12 +46,45 @@ pub enum FivePointSlotStatus {
     Unused,
     Accepted,
     Complex,
-    NotConverged,
+    /// Real-axis residual gate: evaluates at Re(z) alone before the dedicated
+    /// complex filter. Formerly collapsed into `NotConverged` (shader 3.0).
+    RealAxisRejected,
+    /// Aberth `done[i]` was still false after the loop (shader 7.0).
+    RootNotDone,
+    /// Real Newton polish residual exceeded the bound (shader 8.0).
+    PolishRejected,
     DuplicateRoot,
     NullVectorFailure,
     InvalidEssential,
     DuplicateModel,
     RealRoot,
+}
+
+impl FivePointSlotStatus {
+    fn decode(value: f32) -> Result<Self> {
+        Ok(match value {
+            0.0 => Self::Unused,
+            1.0 => Self::Accepted,
+            2.0 => Self::Complex,
+            3.0 => Self::RealAxisRejected,
+            4.0 => Self::DuplicateRoot,
+            5.0 => Self::NullVectorFailure,
+            6.0 => Self::InvalidEssential,
+            7.0 => Self::RootNotDone,
+            8.0 => Self::PolishRejected,
+            9.0 => Self::DuplicateModel,
+            10.0 => Self::RealRoot,
+            x => anyhow::bail!("invalid GPU slot status {x}"),
+        })
+    }
+
+    /// The three former `NotConverged` paths; header `unconverged` sums these.
+    pub fn is_unconverged(self) -> bool {
+        matches!(
+            self,
+            Self::RealAxisRejected | Self::RootNotDone | Self::PolishRejected
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +110,12 @@ pub struct FivePointTrialResult {
     pub model_count: usize,
     pub degree: usize,
     pub root_iterations: usize,
+    /// Header total: RealAxisRejected + RootNotDone + PolishRejected.
     pub unconverged: usize,
+    /// Slot-status split of `unconverged`; sums to `unconverged` when decode is consistent.
+    pub real_axis_rejected: usize,
+    pub root_not_done: usize,
+    pub polish_rejected: usize,
     pub complex_filtered: usize,
     pub duplicate_roots: usize,
     pub recovery_rejected: usize,
@@ -88,10 +126,10 @@ pub struct FivePointTrialResult {
     pub slots: [FivePointModelSlot; 10],
 }
 
-pub(super) struct CompleteKernels {
-    pack: Kernel,
-    roots: Kernel,
-    recover: Kernel,
+pub(crate) struct CompleteKernels {
+    pub(crate) pack: Kernel,
+    pub(crate) roots: Kernel,
+    pub(crate) recover: Kernel,
 }
 
 impl CompleteKernels {
@@ -99,9 +137,9 @@ impl CompleteKernels {
         let packing = shader_module(device, PACK)?;
         let recovery = shader_module(device, include_str!("shaders/five_point_recovery.wgsl"))?;
         Ok(Self {
-            pack: kernel(device, &packing, "pack", 1)?,
-            roots: kernel(device, &recovery, "roots", 4)?,
-            recover: kernel(device, &recovery, "recover", 4)?,
+            pack: kernel(device, &packing, "pack", 1, false)?,
+            roots: kernel(device, &recovery, "roots", 4, true)?,
+            recover: kernel(device, &recovery, "recover", 4, false)?,
         })
     }
 }
@@ -175,6 +213,14 @@ impl WgpuFivePointF32 {
         let basis = self.complete_buffer(count, 36)?;
         let algebra = self.complete_buffer(count, 352)?;
         let out = self.complete_buffer(count, STRIDE)?;
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("five-point full params"),
+            contents: bytemuck::bytes_of(&FivePointParams {
+                count: count as u32,
+                _pad: [0; 3],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         let queries = (profile.is_some() && self.context.timestamp_queries_enabled()).then(|| {
             device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("experimental five-point pass timestamps"),
@@ -199,13 +245,15 @@ impl WgpuFivePointF32 {
         let mut dispatch = |encoder: &mut wgpu::CommandEncoder,
                             kernel: &Kernel,
                             buffers: &[&wgpu::Buffer],
-                            count,
-                            rows| {
+                            groups,
+                            rows,
+                            with_params: bool| {
             self.complete_pass_timed(
                 encoder,
                 kernel,
                 buffers,
-                count,
+                if with_params { Some(&params) } else { None },
+                groups,
                 rows,
                 queries.as_ref().map(|q| (q, stage)),
             );
@@ -217,13 +265,15 @@ impl WgpuFivePointF32 {
             &[&left, &right, &constraints],
             count,
             1,
+            false,
         );
         dispatch(
             &mut encoder,
             &self.basis,
             &[&constraints, &diagnostics],
-            count,
+            count.div_ceil(32),
             1,
+            true,
         );
         dispatch(
             &mut encoder,
@@ -231,6 +281,7 @@ impl WgpuFivePointF32 {
             &[&diagnostics, &basis],
             count,
             1,
+            false,
         );
         for (kernel, rows) in [
             (&self.elimination, 200u32.div_ceil(32)),
@@ -238,7 +289,19 @@ impl WgpuFivePointF32 {
             (&self.polynomial, 11),
             (&self.validate_polynomial, 1),
         ] {
-            dispatch(&mut encoder, kernel, &[&basis, &algebra], count, rows);
+            let groups = if std::ptr::eq(kernel, &self.algebra) {
+                count.div_ceil(32)
+            } else {
+                count
+            };
+            dispatch(
+                &mut encoder,
+                kernel,
+                &[&basis, &algebra],
+                groups,
+                rows,
+                std::ptr::eq(kernel, &self.algebra),
+            );
         }
         let buffers = [&constraints, &diagnostics, &algebra, &basis, &out];
         dispatch(
@@ -247,8 +310,16 @@ impl WgpuFivePointF32 {
             &buffers,
             count.div_ceil(32),
             1,
+            true,
         );
-        dispatch(&mut encoder, &self.complete.recover, &buffers, count, 1);
+        dispatch(
+            &mut encoder,
+            &self.complete.recover,
+            &buffers,
+            count,
+            1,
+            false,
+        );
         let commands = encoder.finish();
         let encode_seconds = encode_started.elapsed().as_secs_f64();
         let submit_started = Instant::now();
@@ -344,6 +415,17 @@ impl WgpuFivePointF32 {
             });
         let dummy = self.complete_buffer(count, 45)?;
         let out = self.complete_buffer(count, STRIDE)?;
+        let params = self
+            .context
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("five-point diagnostic root params"),
+                contents: bytemuck::bytes_of(&FivePointParams {
+                    count: count as u32,
+                    _pad: [0; 3],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let mut encoder = self
             .context
             .device()
@@ -352,6 +434,7 @@ impl WgpuFivePointF32 {
             &mut encoder,
             &self.complete.roots,
             &[&dummy, &dummy, &algebra, &dummy, &out],
+            Some(&params),
             count.div_ceil(32),
             1,
         );
@@ -360,7 +443,7 @@ impl WgpuFivePointF32 {
         decode(&self.context.read_buffer::<f32>(&out, count * STRIDE)?)
     }
 
-    fn complete_size(&self, count: usize, stride: usize) -> Result<u64> {
+    pub(crate) fn complete_size(&self, count: usize, stride: usize) -> Result<u64> {
         ensure!(
             count
                 <= self
@@ -376,7 +459,7 @@ impl WgpuFivePointF32 {
             .context("five-point size overflow")?;
         self.complete_size_bytes(bytes)
     }
-    fn complete_size_bytes(&self, bytes: usize) -> Result<u64> {
+    pub(crate) fn complete_size_bytes(&self, bytes: usize) -> Result<u64> {
         let limits = self.context.device().limits();
         let bytes = u64::try_from(bytes).context("five-point size does not fit u64")?;
         ensure!(
@@ -389,16 +472,23 @@ impl WgpuFivePointF32 {
         );
         Ok(bytes)
     }
-    fn complete_buffer(&self, count: usize, stride: usize) -> Result<wgpu::Buffer> {
+    /// Zero start state is still required: `basis`, `diagnostics` and `algebra`
+    /// keep initial zeros on their failure paths, and `out` accumulates model
+    /// counts and maxima in place. New buffers rely on wgpu's zeroed allocation;
+    /// session reuse must clear active ranges (P1.2 inventory). `COPY_DST` is
+    /// kept so session clears and host uploads can target the same buffers.
+    pub(crate) fn complete_buffer(&self, count: usize, stride: usize) -> Result<wgpu::Buffer> {
         let size = self.complete_size(count, stride)?;
-        let zeroes = vec![0u8; usize::try_from(size).context("five-point zero buffer too large")?];
         Ok(self
             .context
             .device()
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            .create_buffer(&wgpu::BufferDescriptor {
                 label: Some("five-point zero-initialized intermediate"),
-                contents: &zeroes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             }))
     }
     fn complete_pass(
@@ -406,23 +496,24 @@ impl WgpuFivePointF32 {
         encoder: &mut wgpu::CommandEncoder,
         kernel: &Kernel,
         buffers: &[&wgpu::Buffer],
+        params: Option<&wgpu::Buffer>,
         count: usize,
         rows: u32,
     ) {
-        self.complete_pass_timed(encoder, kernel, buffers, count, rows, None);
+        self.complete_pass_timed(encoder, kernel, buffers, params, count, rows, None);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn complete_pass_timed(
+    pub(crate) fn complete_pass_timed(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         kernel: &Kernel,
         buffers: &[&wgpu::Buffer],
+        params: Option<&wgpu::Buffer>,
         count: usize,
         rows: u32,
         timestamp: Option<(&wgpu::QuerySet, u32)>,
     ) {
-        let entries: Vec<_> = buffers
+        let mut entries: Vec<_> = buffers
             .iter()
             .enumerate()
             .map(|(i, b)| wgpu::BindGroupEntry {
@@ -430,6 +521,12 @@ impl WgpuFivePointF32 {
                 resource: b.as_entire_binding(),
             })
             .collect();
+        if let Some(params) = params {
+            entries.push(wgpu::BindGroupEntry {
+                binding: entries.len() as u32,
+                resource: params.as_entire_binding(),
+            });
+        }
         let group = self
             .context
             .device()
@@ -454,27 +551,54 @@ impl WgpuFivePointF32 {
     }
 }
 
-fn decode(values: &[f32]) -> Result<Vec<FivePointTrialResult>> {
+pub(crate) fn decode(values: &[f32]) -> Result<Vec<FivePointTrialResult>> {
     values
         .chunks_exact(STRIDE)
         .enumerate()
         .map(|(trial, v)| {
-            let slots: Result<Vec<_>> = (0..10)
-                .map(|slot| {
+            // Statuses are validated first, in slot order, so the fixed-length
+            // slot array below is built in place without a temporary Vec.
+            let upstream_status = FivePointStatus::decode(v[0])?;
+            let algebra_status = FivePointStatus::decode(v[13])?;
+            let mut statuses = [FivePointSlotStatus::Unused; 10];
+            for (slot, status) in statuses.iter_mut().enumerate() {
+                *status = FivePointSlotStatus::decode(v[16 + slot * 16])?;
+            }
+            let real_axis_rejected = statuses
+                .iter()
+                .filter(|&&s| s == FivePointSlotStatus::RealAxisRejected)
+                .count();
+            let root_not_done = statuses
+                .iter()
+                .filter(|&&s| s == FivePointSlotStatus::RootNotDone)
+                .count();
+            let polish_rejected = statuses
+                .iter()
+                .filter(|&&s| s == FivePointSlotStatus::PolishRejected)
+                .count();
+            Ok(FivePointTrialResult {
+                trial,
+                upstream_status,
+                algebra_status,
+                polynomial_failed: v[15] != 0.0,
+                model_count: v[1] as usize,
+                degree: v[2] as usize,
+                root_iterations: v[3] as usize,
+                unconverged: v[4] as usize,
+                real_axis_rejected,
+                root_not_done,
+                polish_rejected,
+                complex_filtered: v[5] as usize,
+                duplicate_roots: v[6] as usize,
+                recovery_rejected: v[7] as usize,
+                duplicate_models: v[8] as usize,
+                dropped_leading: v[9] as usize,
+                rank: v[11] as usize,
+                jacobi_sweeps: v[12] as usize,
+                slots: std::array::from_fn(|slot| {
                     let s = &v[16 + slot * 16..32 + slot * 16];
-                    let status = match s[0] {
-                        0.0 => FivePointSlotStatus::Unused,
-                        1.0 => FivePointSlotStatus::Accepted,
-                        2.0 => FivePointSlotStatus::Complex,
-                        3.0 => FivePointSlotStatus::NotConverged,
-                        4.0 => FivePointSlotStatus::DuplicateRoot,
-                        5.0 => FivePointSlotStatus::NullVectorFailure,
-                        6.0 => FivePointSlotStatus::InvalidEssential,
-                        9.0 => FivePointSlotStatus::DuplicateModel,
-                        10.0 => FivePointSlotStatus::RealRoot,
-                        x => anyhow::bail!("invalid GPU slot status {x}"),
-                    };
-                    Ok(FivePointModelSlot {
+                    let status = statuses[slot];
+                    FivePointModelSlot {
                         slot,
                         status,
                         root: [s[1], s[2]],
@@ -487,26 +611,8 @@ fn decode(values: &[f32]) -> Result<Vec<FivePointTrialResult>> {
                         null_residual: s[13],
                         constraint_residual: s[14],
                         essential_residual: s[15],
-                    })
-                })
-                .collect();
-            Ok(FivePointTrialResult {
-                trial,
-                upstream_status: FivePointStatus::decode(v[0])?,
-                algebra_status: FivePointStatus::decode(v[13])?,
-                polynomial_failed: v[15] != 0.0,
-                model_count: v[1] as usize,
-                degree: v[2] as usize,
-                root_iterations: v[3] as usize,
-                unconverged: v[4] as usize,
-                complex_filtered: v[5] as usize,
-                duplicate_roots: v[6] as usize,
-                recovery_rejected: v[7] as usize,
-                duplicate_models: v[8] as usize,
-                dropped_leading: v[9] as usize,
-                rank: v[11] as usize,
-                jacobi_sweeps: v[12] as usize,
-                slots: slots?.try_into().unwrap(),
+                    }
+                }),
             })
         })
         .collect()

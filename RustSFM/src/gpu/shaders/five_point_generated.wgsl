@@ -275,18 +275,29 @@ fn polynomial(@builtin(workgroup_id) id: vec3<u32>) {
   let ob=id.x*352u;
   if(algebra_output[ob+350u]!=0.0) { return; }
   var value=0.0;
+  var correction=0.0;
   let start=polynomial_offsets[id.y];
   let end=polynomial_offsets[id.y+1u];
   for(var i=start;i<end;i++) {
     let word=polynomial_terms[i];
     var first=algebra_output[ob+300u+(word&63u)];
     if((word&524288u)!=0u) { first=-first; }
-    let product=(first*algebra_output[ob+300u+((word>>6u)&63u)])
-        *algebra_output[ob+300u+((word>>12u)&63u)];
-    if(i==start) { value=product; }
-    else if((word&262144u)!=0u) { value-=product; }
-    else { value+=product; }
+    let second=algebra_output[ob+300u+((word>>6u)&63u)];
+    let third=algebra_output[ob+300u+((word>>12u)&63u)];
+    if((word&262144u)!=0u) { first=-first; }
+    let pair=first*second;
+    let pair_error=fma(first,second,-pair);
+    let product=pair*third;
+    let product_error=fma(pair,third,-product)+pair_error*third;
+    let next=value+product;
+    var sum_error=0.0;
+    // Explicit fma subtraction prevents the measured Metal reassociation of
+    // (value-next)+product to zero. This is device-tested, not a WGSL guarantee.
+    if(abs(value)>=abs(product)) { sum_error=fma(-1.0,next,value)+product; }
+    else { sum_error=fma(-1.0,next,product)+value; }
+    correction+=sum_error+product_error;
+    value=next;
   }
-  algebra_output[ob+339u+id.y]=value;
+  algebra_output[ob+339u+id.y]=value+correction;
 }
 
