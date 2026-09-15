@@ -1,0 +1,91 @@
+{
+  "acceptance": {
+    "criterion": "accept iff σ5/σ1 > 1e-6 from Jacobi on AAᵀ (5×5); basis still from AᵀA",
+    "rescue_band": "[1e-5, 1e-2)",
+    "rescue_band_rejected": 383,
+    "rescue_band_retained": 40449,
+    "rescued_with_models_quality": {
+      "mean": 0.5892235599416077,
+      "n": 38602,
+      "p50": 0.592156862745098
+    },
+    "true_degenerate_retained": 90
+  },
+  "counts": {
+    "cpu_has_gpu_empty": 2895,
+    "cpu_models": 288264,
+    "gpu_empty_trials": 2938,
+    "gpu_models": 243979,
+    "trials": 65024,
+    "upstream_status": {
+      "RankDeficient": 617,
+      "Success": 64407
+    }
+  },
+  "cpu_signature": "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a",
+  "device": "GpuSiftCapabilities { backend: Wgpu, device_name: \"Apple M5 Max\" }",
+  "diagnostic_signature_q2": "ff5ba80baddba192242c1febdb2efb72f48b2aa090df9a4e786417a0902c4cc2",
+  "diagnostic_signature_v2_q1": "3cd8091d6033f2fdb0b598c27483e67c4dd3ee1af1232ff4f1f5ee1da86117cb",
+  "input_digest": "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5",
+  "model_signature_q1": "030f43068d9e8f78961142915162f20bef4ecb909d49d247a4f766a2ab5412df",
+  "model_signature_q2": "66521d824ad1c28e07a79b375d0f2ffa08d9eb1a8d9bbbe3a924c8d6b1dfae79",
+  "round": "Q2-nullspace",
+  "sigma5_over_sigma1_buckets": {
+    "<=0": {
+      "rank_deficient": 125,
+      "retain_rate": 0.4186046511627907,
+      "retained": 90,
+      "total": 215,
+      "with_models": 90
+    },
+    "<=1e-7": {
+      "rank_deficient": 107,
+      "retain_rate": 0.45685279187817257,
+      "retained": 90,
+      "total": 197,
+      "with_models": 90
+    },
+    ">=1e-1": {
+      "rank_deficient": 0,
+      "retain_rate": 1.0,
+      "retained": 16,
+      "total": 16,
+      "with_models": 16
+    },
+    "[1e-2,1e-1)": {
+      "rank_deficient": 0,
+      "retain_rate": 1.0,
+      "retained": 23761,
+      "total": 23761,
+      "with_models": 23287
+    },
+    "[1e-3,1e-2)": {
+      "rank_deficient": 0,
+      "retain_rate": 1.0,
+      "retained": 31404,
+      "total": 31404,
+      "with_models": 29849
+    },
+    "[1e-4,1e-3)": {
+      "rank_deficient": 132,
+      "retain_rate": 0.9850644942294636,
+      "retained": 8706,
+      "total": 8838,
+      "with_models": 8416
+    },
+    "[1e-5,1e-4)": {
+      "rank_deficient": 251,
+      "retain_rate": 0.5745762711864407,
+      "retained": 339,
+      "total": 590,
+      "with_models": 337
+    },
+    "[1e-6,1e-5)": {
+      "rank_deficient": 2,
+      "retain_rate": 0.3333333333333333,
+      "retained": 1,
+      "total": 3,
+      "with_models": 1
+    }
+  }
+}

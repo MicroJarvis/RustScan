@@ -1,0 +1,41 @@
+{
+  "candidate": "bounded double-buffer (2 slots) on merge submit/wait",
+  "decision": "retain_candidate_b",
+  "device": "GpuSiftCapabilities { backend: Wgpu, device_name: \"Apple M5 Max\" }",
+  "diagnostic_signature_q4": "d9e911ac6b6e2be18f7e3b8b8615417efba6257f955ce2bbf21f943a1c7f358a",
+  "input_digest": "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5",
+  "model_signature_q4": "26e825cf97002be4f7fc36b77ce4fed682445af37746504253444e0103c5e716",
+  "retain": true,
+  "round": "P3-double-buffer",
+  "signature_ok": true,
+  "sync": {
+    "calls_per_pass": 127,
+    "max_inflight": 2,
+    "submits_per_pass": 127,
+    "waits_per_pass": 127
+  },
+  "timing_seconds": {
+    "batch": 512,
+    "double_buffer_median": 0.674092459,
+    "double_buffer_samples": [
+      0.672410625,
+      0.686309417,
+      0.683373709,
+      0.674092459,
+      0.670520292
+    ],
+    "measure": 5,
+    "merge_same_run_median": 1.305865541,
+    "merge_same_run_samples": [
+      1.302200125,
+      1.30087925,
+      1.305865541,
+      1.312116125,
+      1.3147389170000001
+    ],
+    "p3a_steady_median_baseline": 1.344265917,
+    "relative_vs_merge_same_run": 0.48379642632747893,
+    "relative_vs_p3a": 0.49854232672626775,
+    "warmup": 2
+  }
+}

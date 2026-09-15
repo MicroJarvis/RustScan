@@ -1,0 +1,111 @@
+{
+  "B_gpu_vs_f64_same_basis": {
+    "all": {
+      "n": 64403,
+      "nonfinite": 621,
+      "p50": 1.9644550108172585e-06,
+      "p90": 6.278384636211201e-05,
+      "p99": 0.002311510645520798
+    },
+    "loss_buckets": {
+      "<1e-6": 2335,
+      ">=1e-1": 31,
+      "[1e-2,1e-1)": 171,
+      "[1e-3,1e-2)": 881,
+      "[1e-4,1e-3)": 3030,
+      "[1e-5,1e-4)": 5597,
+      "[1e-6,1e-5)": 5926
+    },
+    "loss_trials": {
+      "n": 17971,
+      "nonfinite": 0,
+      "p50": 1.3354267468007713e-05,
+      "p90": 0.0004447434942482329,
+      "p99": 0.01098707301036001
+    },
+    "no_loss_buckets": {
+      "<1e-6": 20396,
+      "[1e-2,1e-1)": 5,
+      "[1e-3,1e-2)": 79,
+      "[1e-4,1e-3)": 799,
+      "[1e-5,1e-4)": 5410,
+      "[1e-6,1e-5)": 19743,
+      "nonfinite": 621
+    },
+    "no_loss_trials": {
+      "n": 46432,
+      "nonfinite": 621,
+      "p50": 1.255691345996162e-06,
+      "p90": 1.4936871013940632e-05,
+      "p99": 0.0001913528621712989
+    },
+    "p90_loss_over_noloss": 29.774876802052603,
+    "trials_with_recovery_fail_slot": {
+      "n": 11848,
+      "nonfinite": 0,
+      "p50": 2.2048233929768744e-05,
+      "p90": 0.000670725838759066,
+      "p99": 0.016294886420630077
+    },
+    "trials_without_recovery_fail_slot": {
+      "n": 52555,
+      "nonfinite": 621,
+      "p50": 1.4055881091880145e-06,
+      "p90": 2.1060771072848534e-05,
+      "p99": 0.0004231588866350356
+    }
+  },
+  "context_polynomial_errors": {
+    "polynomial_gpu_vs_f64_same_B": {
+      "n": 64403,
+      "nonfinite": 621,
+      "p50": 2.7733685743880885e-08,
+      "p90": 4.399031006641962e-08,
+      "p99": 2.26749030462761e-06
+    },
+    "polynomial_total": {
+      "n": 64403,
+      "nonfinite": 621,
+      "p50": 2.9686868989799758e-06,
+      "p90": 0.00012172198575010434,
+      "p99": 0.009472289679139812
+    }
+  },
+  "inputs": {
+    "bits": "experiments/q4-verified-tol1e3-20260915.bits.json",
+    "n_trials": 65024,
+    "trials": "experiments/q4-verified-tol1e3-20260915.trials.json"
+  },
+  "kind": "offline-only",
+  "q4_report_root_classes": {
+    "ComplexMisclassified": 4,
+    "Covered": 246235,
+    "Duplicate": 610,
+    "GateRealAxis": 6,
+    "MissingNoSlot": 10094,
+    "NotDone": 10359,
+    "RecoveryFailed": 18063
+  },
+  "rationale": "B_same_basis p90 loss/no-loss ratio 29.8x; same pattern as Q3 coefficient discriminator \u2192 fix upstream LU/B first",
+  "recommendation": "Q5a_LU_B_precision",
+  "recovery_subtype": {
+    "InvalidEssential_slots": 11907,
+    "NullVectorFailure_slots": 9530,
+    "trials_with_InvalidEssential": 8826,
+    "trials_with_NullVectorFailure": 6290,
+    "trials_with_either": 11848
+  },
+  "round": "Q5-premeasure",
+  "slot_status_counts": {
+    "Accepted": 248884,
+    "Complex": 25702,
+    "DuplicateModel": 1,
+    "DuplicateRoot": 647,
+    "InvalidEssential": 11907,
+    "NullVectorFailure": 9530,
+    "PolishRejected": 4,
+    "RealAxisRejected": 319332,
+    "RootNotDone": 28017,
+    "Unused": 6216
+  }
+}

@@ -1,0 +1,124 @@
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/sources/ceres-solver-sys/src/lib.rs.cc:1:
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/crate/ceres-solver-sys/src/lib.h:8:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/ceres.h:40:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/autodiff_manifold.h:37:
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:278:35: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   278 |   bool PlusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                   ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:284:50: warning: unused parameter 'x' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   284 |   bool RightMultiplyByPlusJacobian(const double* x,
+warning: ceres-solver-sys@0.5.3:       |                                                  ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:302:36: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   302 |   bool MinusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                    ^
+warning: ceres-solver-sys@0.5.3: 3 warnings generated.
+warning: ceres-solver-sys@0.5.3: In file included from src/lib.cpp:5:
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/crate/ceres-solver-sys/src/lib.h:8:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/ceres.h:40:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/autodiff_manifold.h:37:
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:278:35: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   278 |   bool PlusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                   ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:284:50: warning: unused parameter 'x' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   284 |   bool RightMultiplyByPlusJacobian(const double* x,
+warning: ceres-solver-sys@0.5.3:       |                                                  ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:302:36: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   302 |   bool MinusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                    ^
+warning: ceres-solver-sys@0.5.3: 3 warnings generated.
+   Compiling rustsfm v0.1.0 (/Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/RustSFM)
+warning: type `five_point_f32::Kernel` is more private than the item `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed`
+   --> RustSFM/src/gpu/five_point_f32_complete.rs:506:5
+    |
+506 | /     pub(crate) fn complete_pass_timed(
+507 | |         &self,
+508 | |         encoder: &mut wgpu::CommandEncoder,
+509 | |         kernel: &Kernel,
+...   |
+514 | |         timestamp: Option<(&wgpu::QuerySet, u32)>,
+515 | |     ) {
+    | |_____^ method `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed` is reachable at visibility `pub(crate)`
+    |
+note: but type `five_point_f32::Kernel` is only usable at visibility `pub(self)`
+   --> RustSFM/src/gpu/five_point_f32.rs:85:1
+    |
+ 85 | struct Kernel {
+    | ^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: function `real_gpu_stage_drains_caller_owned_context_on_error` is never used
+   --> RustSFM/src/execution_tests.rs:404:4
+    |
+404 | fn real_gpu_stage_drains_caller_owned_context_on_error() -> Result<()> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `sequence` is never used
+   --> RustSFM/src/task.rs:280:19
+    |
+163 | impl<'a> SfmTaskContext<'a> {
+    | --------------------------- method in this implementation
+...
+280 |     pub(crate) fn sequence(
+    |                   ^^^^^^^^
+
+warning: function `load_grayscale_image_for_frame` is never used
+    --> RustSFM/src/feature/feature_matching_db.rs:2265:8
+     |
+2265 | pub fn load_grayscale_image_for_frame(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu` is never used
+   --> RustSFM/src/geometry/two_view.rs:340:15
+    |
+340 | pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `sample` is never read
+    --> RustSFM/src/geometry/two_view.rs:2239:5
+     |
+2235 | struct GpuRansacCandidate<'a> {
+     |        ------------------ field in this struct
+...
+2239 |     sample: &'a [usize],
+     |     ^^^^^^
+     |
+     = note: `GpuRansacCandidate` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `compare_pose_scores` is never used
+    --> RustSFM/src/geometry/two_view.rs:5118:4
+     |
+5118 | fn compare_pose_scores(a: &PoseCandidateScore, b: &PoseCandidateScore) -> std::cmp::Orderi...
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: `rustsfm` (lib test) generated 7 warnings
+    Finished `release` profile [optimized] target(s) in 20.44s
+     Running unittests src/lib.rs (target/release/deps/rustsfm-30463529e7ab3978)
+
+running 1 test
+compiling five-point pipeline main
+compiled five-point pipeline main in 322.584µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 365.542µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.3755ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 418.5µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 295.875µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 273.375µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 52.792µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 294.25µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 284.875µs
+compiling five-point pipeline probe
+compiled five-point pipeline probe in 39.361792ms
+Q4 arithmetic probe actual=[1.0, -1.4210855e-14, 100000000.0, 1.0] expected=[1.0, -1.4210855e-14, 100000000.0, 1.0]
+test gpu::five_point_f32::tests::q4::five_point_q4_arithmetic_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 789 filtered out; finished in 0.19s
+

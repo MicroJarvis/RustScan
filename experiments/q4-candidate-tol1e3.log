@@ -1,0 +1,1 @@
+saved experiments/q4-candidate-tol1e3-20260915.json: {"cpu_has_gpu_empty":2127,"cpu_models":288264,"cpu_models_in_rank_deficient_trials":2476,"f64_ref_models_on_gpu_basis":285371,"gpu_models":248884,"rank_deficient_trials":621,"trials":65024}

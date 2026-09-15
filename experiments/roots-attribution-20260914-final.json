@@ -1,0 +1,264 @@
+{
+  "classification_contract": "Slot status NotConverged is emitted by three paths in five_point_recovery.wgsl: the final evaluation gate, the loop's own done[] flag, and the real Newton polish check. They are separated here without changing the shader, using two facts. First, the final evaluation gate rejects before the root and backward error are stored, so its slots still hold the zero-initialized buffer value, while the other two gates run after that store. Second, a trial whose loop stopped before the cap left through all_done, which requires done[i] for every root, so the done[] path cannot have fired for it. Note that the final evaluation gate evaluates the polynomial at the real part of the root alone, discarding the imaginary part, so a legitimately complex root fails it and is labelled NotConverged before ever reaching the dedicated realness test that would label it Complex. The at-cap bucket is defined by root_iterations == 384, which also captures the rare trial that converged exactly on the last iteration; that only makes the below-cap counts conservative.",
+  "cpu_signature": "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a",
+  "database": "/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db",
+  "device": "GpuSiftCapabilities { backend: Wgpu, device_name: \"Apple M5 Max\" }",
+  "divergence_contract": "The three runs differ only in the order of the input trials. Each run reverses the permutation, restores the positional trial index and requires the exact historical decoded bit signature, so any timing difference is scheduling, not arithmetic. The sorted order is an oracle built from a previous run's measured iteration counts; it bounds what any difficulty-aware grouping could recover and is not an implementable policy. Kernel intervals come from a timestamp-enabled context and overlap host wait; they are not additive with host phases.",
+  "divergence_model": {
+    "fraction_of_groups_capped": 0.9301181102362205,
+    "groups": 2032,
+    "groups_containing_a_capped_trial": 1890,
+    "simd32_ideal": 3217825,
+    "simd32_lockstep": 23667680,
+    "simd32_sorted": 3223872,
+    "simd32_sorted_speedup_bound": 7.341383280725785,
+    "simd32_waste_ratio": 7.355179352512955,
+    "widths": [
+      {
+        "ideal_lane_iterations": 3217825,
+        "lockstep_lane_iterations": 14161328,
+        "lockstep_over_ideal": 4.4009006083301605,
+        "lockstep_over_sorted": 4.399053670877268,
+        "sorted_lockstep_lane_iterations": 3219176,
+        "width": 8
+      },
+      {
+        "ideal_lane_iterations": 3217825,
+        "lockstep_lane_iterations": 19843056,
+        "lockstep_over_ideal": 6.166605082625686,
+        "lockstep_over_sorted": 6.161092730036663,
+        "sorted_lockstep_lane_iterations": 3220704,
+        "width": 16
+      },
+      {
+        "ideal_lane_iterations": 3217825,
+        "lockstep_lane_iterations": 23667680,
+        "lockstep_over_ideal": 7.355179352512955,
+        "lockstep_over_sorted": 7.341383280725785,
+        "sorted_lockstep_lane_iterations": 3223872,
+        "width": 32
+      },
+      {
+        "ideal_lane_iterations": 3217825,
+        "lockstep_lane_iterations": 24889920,
+        "lockstep_over_ideal": 7.735013557294135,
+        "lockstep_over_sorted": 7.7050560684708955,
+        "sorted_lockstep_lane_iterations": 3230336,
+        "width": 64
+      }
+    ]
+  },
+  "gpu_signature": "1f6f3f8d88a17e4e1c42abfc85aad44a66c4b864091805594e086ca80bf9b339",
+  "input_digest": "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5",
+  "iteration_cap": 384,
+  "iterations": {
+    "at_cap_trials": 5629,
+    "entered_loop_trials": 54988,
+    "histogram": {
+      "0 (never entered the loop)": 10036,
+      "1-9": 602,
+      "10-19": 30776,
+      "100-199": 382,
+      "20-29": 14241,
+      "200-383": 272,
+      "30-49": 2439,
+      "384 (cap)": 5629,
+      "50-99": 647
+    },
+    "max": 384,
+    "mean_over_entered": 58.51867680221139,
+    "p50": 17,
+    "p90": 74,
+    "p99": 384,
+    "p999": 384,
+    "total_lane_iterations": 3217825
+  },
+  "lost_solutions": {
+    "count": 11967,
+    "definition": "CPU f64 has at least one model and GPU has none",
+    "iteration_histogram": {
+      "0 (never entered the loop)": 10029,
+      "1-9": 59,
+      "10-19": 964,
+      "100-199": 5,
+      "20-29": 390,
+      "200-383": 6,
+      "30-49": 40,
+      "384 (cap)": 464,
+      "50-99": 10
+    },
+    "primary_category": {
+      "2_nullspace_rank_deficient": 10028,
+      "4_algebra_singular_elimination": 1,
+      "7_reached_roots_all_candidates_rejected": 1938
+    }
+  },
+  "orders": [
+    {
+      "nine_kernel_sum_ms": {
+        "median": 54.069958,
+        "samples": [
+          53.553208000000005,
+          53.897124000000005,
+          54.42204100000001,
+          54.069958,
+          54.377373999999996
+        ]
+      },
+      "order": "identity",
+      "per_trial_results_identical": true,
+      "recover_ms": {
+        "median": 6.280875,
+        "samples": [
+          6.228333,
+          6.746041,
+          6.625333,
+          6.197583000000001,
+          6.280875
+        ]
+      },
+      "roots_ms": {
+        "median": 33.74808300000001,
+        "samples": [
+          33.377708,
+          33.556292,
+          33.74808300000001,
+          33.906666,
+          34.417500000000004
+        ]
+      }
+    },
+    {
+      "nine_kernel_sum_ms": {
+        "median": 53.589209000000004,
+        "samples": [
+          53.585791,
+          53.653084000000014,
+          53.589209000000004,
+          53.256209999999996,
+          54.125916000000004
+        ]
+      },
+      "order": "shuffled_control",
+      "per_trial_results_identical": true,
+      "recover_ms": {
+        "median": 6.318584,
+        "samples": [
+          6.192584,
+          6.339042,
+          6.318584,
+          6.174042,
+          7.146833000000001
+        ]
+      },
+      "roots_ms": {
+        "median": 33.552083,
+        "samples": [
+          33.428667000000004,
+          33.70658400000001,
+          33.552083,
+          33.676125,
+          32.801958
+        ]
+      }
+    },
+    {
+      "nine_kernel_sum_ms": {
+        "median": 29.348459000000005,
+        "samples": [
+          29.810335000000002,
+          29.348459000000005,
+          29.039207000000005,
+          29.817415999999998,
+          29.176625
+        ]
+      },
+      "order": "sorted_by_iterations_desc",
+      "per_trial_results_identical": true,
+      "recover_ms": {
+        "median": 6.347584,
+        "samples": [
+          6.674292,
+          6.347584,
+          6.16675,
+          6.697375,
+          6.230042000000001
+        ]
+      },
+      "roots_ms": {
+        "median": 9.327792000000002,
+        "samples": [
+          9.320500000000001,
+          9.327792000000002,
+          9.382625,
+          9.335917,
+          9.324167000000001
+        ]
+      }
+    }
+  ],
+  "pairs": 127,
+  "pass_names": [
+    "constraints",
+    "basis",
+    "pack",
+    "elimination",
+    "algebra",
+    "polynomial",
+    "validate_polynomial",
+    "roots",
+    "recover"
+  ],
+  "q1_classification": {
+    "notconverged_split": {
+      "after_store_at_cap_polish_or_done_flag": 20786,
+      "after_store_below_cap_so_polish_only": 130,
+      "after_store_inside_realness_threshold": 9307,
+      "real_axis_final_eval_gate": 276906
+    },
+    "primary_category": {
+      "2_nullspace_rank_deficient": 10035,
+      "4_algebra_singular_elimination": 1,
+      "7_reached_roots_all_candidates_rejected": 1976,
+      "8_reached_roots_produced_models": 53012
+    },
+    "rejection_totals": {
+      "complex_filtered": 21468,
+      "degree_sum": 549479,
+      "dropped_leading_trials": 379,
+      "duplicate_models": 0,
+      "duplicate_roots": 398,
+      "models": 209600,
+      "polynomial_failed_trials": 0,
+      "recovery_rejected": 20191,
+      "unconverged_slots": 297822
+    },
+    "root_budget": {
+      "accepted": 209600,
+      "accepted_plus_complex_plus_real_axis_gate": 507974,
+      "complex_status": 21468,
+      "degree_sum": 549479,
+      "real_axis_gate": 276906
+    },
+    "slot_status_totals": {
+      "Accepted": 209600,
+      "Complex": 21468,
+      "DuplicateRoot": 398,
+      "InvalidEssential": 12458,
+      "NotConverged": 297822,
+      "NullVectorFailure": 7733,
+      "Unused": 100761
+    },
+    "trials_at_cap_still_producing_models": 5158,
+    "unconverged_slots_below_cap": 257532,
+    "unconverged_trials": 52672,
+    "unconverged_trials_at_cap": 5629,
+    "unconverged_trials_below_cap": 47043
+  },
+  "schema": "five-point-roots-attribution-v1",
+  "scope": "Independent GPU f32 candidate generation measurement only. No solver, shader or protected harness change. CPU f64 is an offline reference, not a runtime fallback. Quality is not equivalent and nothing here changes it.",
+  "simd_width": 32,
+  "source_commit": "3ab9c09",
+  "trials": 65024,
+  "unique_images": 231
+}

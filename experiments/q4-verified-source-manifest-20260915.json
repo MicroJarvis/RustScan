@@ -1,0 +1,39 @@
+{
+  "utc": "2026-09-15T05:39:34.106551+00:00",
+  "focused_command": [
+    "cargo",
+    "test",
+    "-p",
+    "rustsfm",
+    "--release",
+    "--lib",
+    "--no-default-features",
+    "--features",
+    "gpu-wgpu",
+    "five_point",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "focused_exit_code": 0,
+  "sha256": {
+    "scripts/generate_five_point_wgsl.py": "605faebffb94ce000a0b7571202c4fc8db9899f7a3b9d9c88322ed8d4551fc71",
+    "scripts/test_generate_five_point_wgsl.py": "97565699b4e1d57602f4bfac6a8a1d8bde29d54dfa8d8af45811eb7f79077c0b",
+    "scripts/summarize_five_point_q4.py": "d992d71ca648198775251e7f99aa3cd6472202fcfc52f5bcbd6f39cd96c286d6",
+    "RustSFM/examples/five_point_gpu_q4_coefficients.rs": "a391c7797c560a5107d8502149649d7b71c7aca0e1ec1ce7aa0a9bd682766598",
+    "RustSFM/src/geometry/five_point.rs": "1be6ca3a8c59882ece2bcad4788a666d967cdbb294c9cbf9aeda8aadbe93b214",
+    "RustSFM/src/geometry/five_point_generated.rs": "2b61a94a6f0fb709d34b988afa7429d261ee69b8a750fe4de543afc11730247e",
+    "target/release/examples/five_point_gpu_q4_coefficients": "bee0e3c4acf9bafd599864edad337f5c0fb63184e004410a80bdd6444cf92bb5",
+    "RustSFM/src/gpu/five_point_f32_session.rs": "b6f19bbddfdb339169f5b0f88858efe09b9a58588be9fb023be9716877d10f91",
+    "RustSFM/src/gpu/five_point_f32_tests.rs": "775b362b7b5d2157fdf53c2f05a38fd5895c908ed6db4f48c8e9be87e4b05ad0",
+    "RustSFM/src/gpu/five_point_f32.rs": "a89a48b14a55f81b1c94690a4a333340375948e5b28bb2c42585536c537185c5",
+    "RustSFM/src/gpu/five_point_q4_tests.rs": "87fc01825ce928319c8086712dd3af057e29c8a3d411c83968a64762b5acc56f",
+    "RustSFM/src/gpu/five_point_f32_complete.rs": "aaf72aa949f9582cc03dba7f88b1f373dd98ba334e13a6e3cd4937eb0413f158",
+    "RustSFM/src/gpu/shaders/five_point_recovery.wgsl": "ad46b1e8629d29e975e678133b0e51977409d5ce8e2968d22f5bc5a3145bbd06",
+    "RustSFM/src/gpu/shaders/five_point_algebra.wgsl": "1ff76a1badd6b24029b51b8e2e08c6296e3bed31ebca67815d0c763acc6c96d0",
+    "RustSFM/src/gpu/shaders/five_point_generated.wgsl": "3edc0ae8fef9d1fd1f7b8b9826452d177665dd7615d36b0f5606886638793338",
+    "RustSFM/src/gpu/shaders/five_point_f32.wgsl": "f66581f676e71e61493917cc8d53a2ebc7774ef8b5992df5c461dd07c04ae74f",
+    "RustSFM/examples/q4/polynomial-fixtures.json": "9c0ae9640e58c8a860d0163be1a5dbbc7f30538106c93f0e23c263e8910382d4",
+    "RustSFM/examples/q4/attribution.rs": "8c86555576b55fabc771365959be51a9d59b1752a6946789243dc8fe0c3cad27"
+  }
+}

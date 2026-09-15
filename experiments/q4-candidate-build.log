@@ -1,0 +1,264 @@
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/sources/ceres-solver-sys/src/lib.rs.cc:1:
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/crate/ceres-solver-sys/src/lib.h:8:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/ceres.h:40:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/autodiff_manifold.h:37:
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:278:35: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   278 |   bool PlusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                   ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:284:50: warning: unused parameter 'x' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   284 |   bool RightMultiplyByPlusJacobian(const double* x,
+warning: ceres-solver-sys@0.5.3:       |                                                  ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:302:36: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   302 |   bool MinusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                    ^
+warning: ceres-solver-sys@0.5.3: 3 warnings generated.
+warning: ceres-solver-sys@0.5.3: In file included from src/lib.cpp:5:
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/crate/ceres-solver-sys/src/lib.h:8:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/ceres.h:40:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/autodiff_manifold.h:37:
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:278:35: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   278 |   bool PlusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                   ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:284:50: warning: unused parameter 'x' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   284 |   bool RightMultiplyByPlusJacobian(const double* x,
+warning: ceres-solver-sys@0.5.3:       |                                                  ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:302:36: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   302 |   bool MinusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                    ^
+warning: ceres-solver-sys@0.5.3: 3 warnings generated.
+   Compiling rustsfm v0.1.0 (/Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/RustSFM)
+warning: type `five_point_f32::Kernel` is more private than the item `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed`
+   --> RustSFM/src/gpu/five_point_f32_complete.rs:506:5
+    |
+506 | /     pub(crate) fn complete_pass_timed(
+507 | |         &self,
+508 | |         encoder: &mut wgpu::CommandEncoder,
+509 | |         kernel: &Kernel,
+...   |
+514 | |         timestamp: Option<(&wgpu::QuerySet, u32)>,
+515 | |     ) {
+    | |_____^ method `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed` is reachable at visibility `pub(crate)`
+    |
+note: but type `five_point_f32::Kernel` is only usable at visibility `pub(self)`
+   --> RustSFM/src/gpu/five_point_f32.rs:85:1
+    |
+ 85 | struct Kernel {
+    | ^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: method `sequence` is never used
+   --> RustSFM/src/execution.rs:425:19
+    |
+137 | impl SfmTaskflow {
+    | ---------------- method in this implementation
+...
+425 |     pub(crate) fn sequence(
+    |                   ^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `sequence` is never used
+   --> RustSFM/src/task.rs:280:19
+    |
+163 | impl<'a> SfmTaskContext<'a> {
+    | --------------------------- method in this implementation
+...
+280 |     pub(crate) fn sequence(
+    |                   ^^^^^^^^
+
+warning: field `retained_bytes` is never read
+   --> RustSFM/src/feature/feature_memory.rs:172:5
+    |
+167 | pub(crate) struct FeatureMemoryPlan {
+    |                   ----------------- field in this struct
+...
+172 |     retained_bytes: u64,
+    |     ^^^^^^^^^^^^^^
+    |
+    = note: `FeatureMemoryPlan` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `retained_bytes` is never used
+   --> RustSFM/src/feature/feature_memory.rs:190:19
+    |
+177 | impl FeatureMemoryPlan {
+    | ---------------------- method in this implementation
+...
+190 |     pub(crate) fn retained_bytes(&self) -> u64 {
+    |                   ^^^^^^^^^^^^^^
+
+warning: function `load_grayscale_image_for_frame` is never used
+    --> RustSFM/src/feature/feature_matching_db.rs:2265:8
+     |
+2265 | pub fn load_grayscale_image_for_frame(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `normalize_descriptor` is never used
+   --> RustSFM/src/feature/sift.rs:796:4
+    |
+796 | fn normalize_descriptor(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `rustsfm_vlfeat_test_paired_allocation_failure` is never used
+   --> RustSFM/src/feature/sift.rs:520:16
+    |
+520 |         pub fn rustsfm_vlfeat_test_paired_allocation_failure(
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `estimate_pair_geometry_with_options_and_cameras_gpu` is never used
+   --> RustSFM/src/geometry/geometry.rs:208:15
+    |
+208 | pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu` is never used
+   --> RustSFM/src/geometry/two_view.rs:340:15
+    |
+340 | pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `sample` is never read
+    --> RustSFM/src/geometry/two_view.rs:2239:5
+     |
+2235 | struct GpuRansacCandidate<'a> {
+     |        ------------------ field in this struct
+...
+2239 |     sample: &'a [usize],
+     |     ^^^^^^
+     |
+     = note: `GpuRansacCandidate` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `compare_pose_scores` is never used
+    --> RustSFM/src/geometry/two_view.rs:5118:4
+     |
+5118 | fn compare_pose_scores(a: &PoseCandidateScore, b: &PoseCandidateScore) -> std::cmp::Orderi...
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `local_pair_candidates` is never used
+    --> RustSFM/src/sfm/mapper.rs:1550:4
+     |
+1550 | fn local_pair_candidates(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `incremental_pipeline_map` is never used
+    --> RustSFM/src/sfm/mapper.rs:2636:4
+     |
+2636 | fn incremental_pipeline_map(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `registration_score` is never used
+    --> RustSFM/src/sfm/mapper.rs:7077:4
+     |
+7077 | fn registration_score(choice: &RegistrationChoice, obs_manager: &ObservationManager) -> f32 {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_reconstruction` is never used
+   --> RustSFM/src/sfm/mapper/state.rs:192:19
+    |
+191 | impl InitialPairSelectionState {
+    | ------------------------------ associated function in this implementation
+192 |     pub(super) fn from_reconstruction(reconstruction: &Reconstruction) -> Self {
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: field `initial_inliers` is never read
+  --> RustSFM/src/gpu/pnp_focal.rs:69:16
+   |
+65 | pub(crate) struct GpuPnpFocalSolution {
+   |                   ------------------- field in this struct
+...
+69 |     pub(crate) initial_inliers: usize,
+   |                ^^^^^^^^^^^^^^^
+
+warning: fields `context` and `pipeline` are never read
+   --> RustSFM/src/gpu/pnp_focal.rs:220:5
+    |
+219 | pub(crate) struct WgpuPnPFocalCandidateGenerator {
+    |                   ------------------------------ fields in this struct
+220 |     context: Arc<WgpuContext>,
+    |     ^^^^^^^
+221 |     bind_group_layout: wgpu::BindGroupLayout,
+222 |     pipeline: wgpu::ComputePipeline,
+    |     ^^^^^^^^
+
+warning: methods `generate_p3p` and `generate_p3p_batch` are never used
+   --> RustSFM/src/gpu/pnp_focal.rs:307:19
+    |
+227 | impl WgpuPnPFocalCandidateGenerator {
+    | ----------------------------------- methods in this implementation
+...
+307 |     pub(crate) fn generate_p3p(
+    |                   ^^^^^^^^^^^^
+...
+442 |     pub(crate) fn generate_p3p_batch(
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: method `refine_once` is never used
+   --> RustSFM/src/gpu/pnp_focal.rs:961:8
+    |
+918 | impl WgpuPnPFocalRefiner {
+    | ------------------------ method in this implementation
+...
+961 |     fn refine_once(
+    |        ^^^^^^^^^^^
+
+warning: function `select_best_focal_support` is never used
+    --> RustSFM/src/gpu/pnp_focal.rs:1220:15
+     |
+1220 | pub(crate) fn select_best_focal_support(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `score`, `score_many`, `accept_for_test`, `score_generated_models_and_select`, and `inlier_mask` are never used
+    --> RustSFM/src/gpu/pnp_focal.rs:1754:19
+     |
+1548 | impl WgpuPnPFocalScorer {
+     | ----------------------- methods in this implementation
+...
+1754 |     pub(crate) fn score(
+     |                   ^^^^^
+...
+1762 |     pub(crate) fn score_many(
+     |                   ^^^^^^^^^^
+...
+2292 |     fn accept_for_test(
+     |        ^^^^^^^^^^^^^^^
+...
+2357 |     fn score_generated_models_and_select(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2568 |     pub(crate) fn inlier_mask(&self, candidate: GpuPnpFocalCandidate) -> Result<Vec<bool>> {
+     |                   ^^^^^^^^^^^
+
+warning: function `focal_candidate_to_model` is never used
+    --> RustSFM/src/gpu/pnp_focal.rs:2691:4
+     |
+2691 | fn focal_candidate_to_model(candidate: GpuPnpFocalCandidate) -> Result<GpuPnpFocalModel> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `normalize_gpu_descriptor` is never used
+   --> RustSFM/src/gpu/sift/mod.rs:345:15
+    |
+345 | pub(crate) fn normalize_gpu_descriptor(mut values: [f32; 128], root_sift: bool) -> [f32; 12...
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `detect_volume` is never used
+   --> RustSFM/src/gpu/sift/mod.rs:417:19
+    |
+372 | impl SiftDetector {
+    | ----------------- method in this implementation
+...
+417 |     pub(crate) fn detect_volume(
+    |                   ^^^^^^^^^^^^^
+
+warning: fields `first_octave` and `sigma_step` are never read
+  --> RustSFM/src/gpu/sift/plan.rs:33:16
+   |
+32 | pub(crate) struct SiftPlan {
+   |                   -------- fields in this struct
+33 |     pub(crate) first_octave: i32,
+   |                ^^^^^^^^^^^^
+34 |     pub(crate) sigma_step: f32,
+   |                ^^^^^^^^^^
+   |
+   = note: `SiftPlan` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `rustsfm` (lib) generated 26 warnings
+    Finished `release` profile [optimized] target(s) in 13.39s

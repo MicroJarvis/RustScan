@@ -1,0 +1,113 @@
+{
+  "coefficient_error_vs_same_basis_f64": {
+    "buckets": {
+      "<1e-6": 14639,
+      ">=1e-1": 2010,
+      "[1e-2,1e-1)": 1494,
+      "[1e-3,1e-2)": 2665,
+      "[1e-4,1e-3)": 5696,
+      "[1e-5,1e-4)": 12443,
+      "[1e-6,1e-5)": 25456
+    },
+    "n": 64403,
+    "p50": 4.198641741107103e-6,
+    "p90": 0.0008439411150683221,
+    "p99": 11.26786197489292,
+    "trials_with_downstream_loss": {
+      "n": 20906,
+      "p50": 0.00008622841888486333,
+      "p90": 0.08420889639276771
+    },
+    "trials_without_downstream_loss": {
+      "n": 43497,
+      "p50": 2.0640066037254003e-6,
+      "p90": 0.000029182347891947003
+    }
+  },
+  "counts": {
+    "cpu_has_gpu_empty": 2899,
+    "cpu_models": 288264,
+    "cpu_models_in_rank_deficient_trials": 2476,
+    "f64_ref_models_on_gpu_basis": 285371,
+    "gpu_models": 243967,
+    "rank_deficient_trials": 621,
+    "trials": 65024
+  },
+  "cpu_has_gpu_empty_breakdown": {
+    "gpu_basis_f64_ref_also_empty": 3,
+    "rank_deficient": 616,
+    "root_classes": {
+      "ComplexMisclassified": 2,
+      "Duplicate": 5,
+      "GateRealAxis": 5,
+      "MissingNoSlot": 7854,
+      "NotDone": 398,
+      "RecoveryFailed": 821
+    }
+  },
+  "device": "GpuSiftCapabilities { backend: Wgpu, device_name: \"Apple M5 Max\" }",
+  "input_digest": "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5",
+  "kind": "measurement-only",
+  "missed_model_quality": {
+    "ComplexMisclassified": {
+      "beats_trial_best": 7,
+      "n": 39,
+      "rel_to_pair_best_p50": 0.376502002670227,
+      "rel_to_pair_best_p90": 0.6403887688984882
+    },
+    "GateRealAxis": {
+      "beats_trial_best": 7,
+      "n": 21,
+      "rel_to_pair_best_p50": 0.43521790341578326,
+      "rel_to_pair_best_p90": 0.9959165154264973
+    },
+    "MissingNoSlot": {
+      "beats_trial_best": 15427,
+      "n": 37345,
+      "rel_to_pair_best_p50": 0.40239043824701193,
+      "rel_to_pair_best_p90": 0.9202024133904243
+    },
+    "NotDone": {
+      "beats_trial_best": 1851,
+      "n": 5458,
+      "rel_to_pair_best_p50": 0.27631578947368424,
+      "rel_to_pair_best_p90": 0.6911519198664441
+    },
+    "RecoveryFailed": {
+      "beats_trial_best": 2349,
+      "n": 9862,
+      "rel_to_pair_best_p50": 0.25287356321839083,
+      "rel_to_pair_best_p90": 0.6997011952191236
+    }
+  },
+  "model_gap_ledger": {
+    "basis_and_gate_component_cpu_minus_ref": 2893,
+    "cpu_minus_gpu": 44297,
+    "downstream_component_ref_minus_gpu": 41404,
+    "missed_reference_models": 52725,
+    "spurious_gpu_models_no_f64_root": 11749
+  },
+  "root_classes_of_f64_real_roots": {
+    "ComplexMisclassified": 39,
+    "Covered": 232218,
+    "Duplicate": 428,
+    "GateRealAxis": 21,
+    "MissingNoSlot": 37345,
+    "NotDone": 5458,
+    "RecoveryFailed": 9862
+  },
+  "root_match_distance": {
+    "max": 0.0009999921181343405,
+    "n": 248026,
+    "p50": 1.9937289153725548e-6,
+    "p99": 0.0007599675185762953,
+    "tolerance": 0.001
+  },
+  "round": "Q3-recovery-attribution",
+  "signatures": {
+    "all_verified": true,
+    "cpu_f64": "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a",
+    "diagnostic_q2": "3d04bb3edaef183049e07d6c3841e296f963da3b279bcbd99d878e1dc090c050",
+    "model_q2": "472124c8f1a9c6299d659e2f835dc11c682ff8a593757f0b145f73454f51d6ea"
+  }
+}
