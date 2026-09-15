@@ -43,7 +43,7 @@
 | **Q5a LU 迭代精化** | **已完成，回退** | B p90 4.45e-4→4.74e-4（变差）；签名保持 Q4 |
 | **Q5a-B elim/back-sub FMA** | **已完成，回退** | B p90 4.45e-4→4.36e-4（~2%，不实质）；签名保持 Q4 |
 | **Q5b recovery null3** | **已完成，保留** | RF 18,063→17,475；模型 +949；签名→Q5b |
-| 难度感知 roots / P4 / P5 | 之后 | 见各节；质量线建议混精 LU/B 或 P4 |
+| **实验线冻结** | **2026-09-15** | 见文末"冻结决定"；不做 df64/Q5c；P4/P5 不用 f32 solver |
 
 ## 固定输入与签名
 
@@ -347,7 +347,23 @@ P4 可在现行 **Q5b** 质量门下单独开性能轮。
 | Q5a-B FMA elim | 实施+验证 | 消去/回代 FMA | **回退**；B p90 ~2% 不足；见 Q5a-B 报告 |
 | Q5b recovery | 离线+实施 | null3 FMA/选向量/逆迭代 | **保留**；RF −588；签名→Q5b |
 
-## 下一轮明确范围与停止条件
+## 冻结决定（2026-09-15）
 
-**Q5b 已保留；Q5a/Q5a-B 均已回退。** 下一轮勿重复纯 f32 LU 修补或再拧
-recovery 阈值；选 **混精残差（LU/B）** 或在 **Q5b** 门下开 **P4**。仍单变量。
+**本实验线冻结在 Q5b。** 不再开精度轮（不做 Q5c / df64 / 混精 LU-B），也不用
+f32 solver 推进 P4/P5。依据：
+
+- 生产 RANSAC 的五点法在 CPU f64（`colmap_eigen` / `five_point.rs`），GPU 只打分；
+  `8b0b63b` 并行化后 essential 候选生成占 960 帧 matching 的 196 s / 1668 s ≈ 12%。
+- GPU f32 最好成绩为超大 batch 下 1.36× CPU8；按生产粒度（每 pair 512 trials 一次调用）
+  0.674 s/127 pairs ≈ 5.3 ms/pair，比 CPU8（≈1 ms/pair）慢约 5×。不做跨 pair 聚合
+  （P5）即为负收益；做了 P5 上限也只是 196 s × (1−1/1.36) ≈ 52 s（matching 3%）。
+- 剩余 f32 缺口（LU/B κ 敏感）影响 2.9% trial（CPU 有解/GPU 空 1,883 / 65,024），
+  pair 级最优模型 127 对中仅 2 对落后 >10% 且均为坏 pair；RANSAC 天然容忍。
+- Apple GPU / Metal 无 shader f64；df64 会把 kernel 放慢数倍，直接吃掉 1.36×。
+- 960 帧真正的大项是 geometry scorer 读回等待（586 s，46 万次同步 × ~1.3 ms）和
+  描述子匹配 kernel（643 s），与五点法精度无关。
+
+后续性能工作转到主 worktree：geometry 同步点削减 → pair 级 CPU/GPU 流水线 →
+reconstruct/BA 求解器核查 → 描述子 kernel。本分支及全部报告、harness、
+`experiments/` 原始结果保留为归档；若日后 P5 骨架用 CPU f64 建成并证明 GPU
+候选生成仍有价值，可在 Q5b 门下复活。
