@@ -45,7 +45,7 @@ pub(crate) use pnp_scorer::{GpuPnpImagePoint, GpuPnpModel, GpuPnpObjectPoint};
 #[cfg(feature = "gpu-wgpu")]
 pub(crate) use scorer::WgpuModelScoringSession;
 #[cfg(feature = "gpu-wgpu")]
-pub use scorer::{GpuModelSupport, TwoViewModelKind, WgpuModelScorer};
+pub use scorer::{GpuModelSupport, GpuPackedMasks, TwoViewModelKind, WgpuModelScorer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -853,6 +853,81 @@ mod tests {
 
     /// The session reuses its model, summary and mask buffers across dispatches,
     /// so shrinking batches must never observe values left by a larger one.
+    /// The fused score+mask dispatch must reproduce the separate kernels bit for
+    /// bit (summaries and masks) across observation counts that exercise the
+    /// 32-bit word boundaries and multiple 64-lane passes, with one readback.
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_scored_masks_match_separate_kernels() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU scored mask test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let models: Vec<[f32; 9]> = vec![
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.3, 0.0, 1.0, -0.2, 0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.02, 0.0, -0.01, 1.0, 0.0, 0.0, 0.0, 1.0],
+        ];
+        for observation_count in [1usize, 31, 32, 33, 63, 64, 65, 127, 128, 129, 713] {
+            let points1: Vec<[f32; 3]> = (0..observation_count)
+                .map(|i| {
+                    let t = i as f32 * 0.37;
+                    [t.sin() * 3.0, (t * 1.7).cos() * 2.0, 1.0]
+                })
+                .collect();
+            let points2: Vec<[f32; 3]> = points1
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let jitter = if i % 3 == 0 { 0.4 } else { 0.01 };
+                    [p[0] + jitter, p[1] - jitter * 0.5, 1.0]
+                })
+                .collect();
+            let session = scorer.prepare_homogeneous_session(&points1, &points2)?;
+            for kind in [
+                TwoViewModelKind::HomographyForward,
+                TwoViewModelKind::Sampson,
+            ] {
+                let (plain_supports, _) =
+                    session.score_two_view_models_profiled(&models, 0.25, kind)?;
+                let (plain_masks, _) = session.inlier_masks_profiled(&models, 0.25, kind)?;
+                let (fused_supports, fused_masks, timing) =
+                    session.score_two_view_models_with_masks_profiled(&models, 0.25, kind)?;
+                assert_eq!(
+                    fused_supports, plain_supports,
+                    "n={observation_count} {kind:?}"
+                );
+                assert_eq!(fused_masks.model_count(), models.len());
+                for (index, plain_mask) in plain_masks.iter().enumerate() {
+                    let fused_mask = fused_masks.mask(index).expect("mask");
+                    assert_eq!(
+                        &fused_mask, plain_mask,
+                        "n={observation_count} model {index}"
+                    );
+                    assert_eq!(
+                        fused_mask.iter().filter(|&&b| b).count() as u32,
+                        plain_supports[index].inliers
+                    );
+                }
+                assert_eq!(timing.score_calls, 1);
+                assert_eq!(timing.mask_calls, 0);
+                assert_eq!(timing.readback_calls, 1);
+                let words_per_model = observation_count.div_ceil(32);
+                assert_eq!(
+                    timing.readback_bytes,
+                    (models.len() * std::mem::size_of::<GpuModelSupport>()
+                        + models.len() * words_per_model * std::mem::size_of::<u32>())
+                        as u64
+                );
+            }
+            assert!(session.max_two_view_models_per_score_with_masks() >= models.len());
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn wgpu_model_scorer_reused_buffers_match_isolated_sessions() -> Result<()> {

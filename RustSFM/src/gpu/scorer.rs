@@ -73,10 +73,76 @@ impl GpuHomogeneousPoint {
     }
 }
 
+/// Packed inlier masks for every model of one fused score dispatch.
+///
+/// Word `w` of model `m` is `words[m * words_per_model + w]`; bit `b` of that
+/// word is observation `32 * w + b`. Produced by `score_models_with_masks`,
+/// whose per-observation inlier test is the same `is_inlier(model_residual())`
+/// the standalone mask kernel uses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuPackedMasks {
+    words: Vec<u32>,
+    words_per_model: usize,
+    observation_len: usize,
+}
+
+impl GpuPackedMasks {
+    pub(crate) fn from_words(
+        words: Vec<u32>,
+        model_count: usize,
+        observation_len: usize,
+    ) -> Result<Self> {
+        let words_per_model = packed_words_per_model(observation_len);
+        let expected = model_count
+            .checked_mul(words_per_model)
+            .context("GPU packed mask word count overflow")?;
+        if words.len() != expected {
+            bail!(
+                "GPU packed masks hold {} words, expected {} for {} models × {} words",
+                words.len(),
+                expected,
+                model_count,
+                words_per_model
+            );
+        }
+        Ok(Self {
+            words,
+            words_per_model,
+            observation_len,
+        })
+    }
+
+    pub fn model_count(&self) -> usize {
+        self.words
+            .len()
+            .checked_div(self.words_per_model)
+            .unwrap_or(0)
+    }
+
+    /// Unpacks the mask of one model into per-observation booleans.
+    pub fn mask(&self, model_index: usize) -> Option<Vec<bool>> {
+        if model_index >= self.model_count() {
+            return None;
+        }
+        let start = model_index * self.words_per_model;
+        let words = &self.words[start..start + self.words_per_model];
+        Some(
+            (0..self.observation_len)
+                .map(|observation| (words[observation / 32] >> (observation % 32)) & 1 != 0)
+                .collect(),
+        )
+    }
+}
+
+pub(crate) fn packed_words_per_model(observation_len: usize) -> usize {
+    observation_len.div_ceil(32)
+}
+
 pub struct WgpuModelScorer {
     context: Arc<WgpuContext>,
     bind_group_layout: wgpu::BindGroupLayout,
     score_pipeline: wgpu::ComputePipeline,
+    score_with_masks_pipeline: wgpu::ComputePipeline,
     mask_pipeline: wgpu::ComputePipeline,
 }
 
@@ -150,6 +216,15 @@ impl WgpuModelScorer {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let score_with_masks_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rustsfm model scorer support+mask pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("score_models_with_masks"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let mask_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("rustsfm model scorer mask pipeline"),
             layout: Some(&pipeline_layout),
@@ -162,6 +237,7 @@ impl WgpuModelScorer {
             context,
             bind_group_layout,
             score_pipeline,
+            score_with_masks_pipeline,
             mask_pipeline,
         })
     }
@@ -346,6 +422,117 @@ impl WgpuModelScoringSession<'_> {
             storage_bytes,
             storage_bytes,
         )
+    }
+
+    /// Largest model batch one fused score+mask dispatch can hold, also bounded
+    /// by the packed mask buffer (`ceil(observations / 32)` words per model).
+    pub(crate) fn max_two_view_models_per_score_with_masks(&self) -> usize {
+        let limits = self.scorer.context.device().limits();
+        let storage_bytes = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size);
+        let base = two_view_model_capacity(
+            limits.max_compute_workgroups_per_dimension,
+            storage_bytes,
+            storage_bytes,
+        );
+        base.min(packed_mask_model_capacity(
+            storage_bytes,
+            packed_words_per_model(self.observation_len),
+        ))
+    }
+
+    /// Scores `models` and returns every model's packed inlier mask from the
+    /// same dispatch and the same readback, so no additional device
+    /// synchronisation is needed to obtain masks later.
+    pub(crate) fn score_two_view_models_with_masks_profiled(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> Result<(Vec<GpuModelSupport>, GpuPackedMasks, WgpuModelScorerTiming)> {
+        validate_threshold(threshold)?;
+        let model_count = u32::try_from(models.len()).context("GPU model count exceeds u32")?;
+        if models.is_empty() {
+            return Ok((
+                Vec::new(),
+                GpuPackedMasks::from_words(Vec::new(), 0, self.observation_len)?,
+                WgpuModelScorerTiming::default(),
+            ));
+        }
+        self.scorer.validate_dispatch_count(model_count, "model")?;
+        self.scorer.validate_storage_slice("models", models)?;
+        self.scorer
+            .validate_storage_elements::<GpuModelSupport>("support summaries", models.len())?;
+        let words_per_model = packed_words_per_model(self.observation_len);
+        let mask_words = models
+            .len()
+            .checked_mul(words_per_model)
+            .context("GPU model scorer packed mask word count overflow")?;
+        self.scorer
+            .validate_storage_elements::<u32>("packed inlier masks", mask_words)?;
+
+        let buffer_prepare_started = Instant::now();
+        let params = ScoringParams {
+            model_count,
+            observation_count: self.observation_count,
+            model_kind: kind.shader_value(),
+            selected_model: 0,
+            max_residual: squared_threshold(threshold),
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        };
+        let mut buffer_prepare_seconds = 0.0;
+        let mut submit_seconds = 0.0;
+        let (supports, words, readback) =
+            self.with_session_scratch(models, &params, models.len(), mask_words, |scratch| {
+                let mut encoder = self.scorer.context.device().create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("rustsfm model scorer support+mask encoder"),
+                    },
+                );
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("rustsfm model scorer support+mask pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.scorer.score_with_masks_pipeline);
+                    pass.set_bind_group(0, &scratch.bind_group, &[]);
+                    pass.dispatch_workgroups(model_count, 1, 1);
+                }
+                let command_buffer = encoder.finish();
+                buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
+                let submit_started = Instant::now();
+                self.scorer.context.queue().submit(Some(command_buffer));
+                submit_seconds = submit_started.elapsed().as_secs_f64();
+                self.scorer
+                    .context
+                    .read_two_buffers_profiled::<GpuModelSupport, u32>(
+                        &scratch.summaries,
+                        models.len(),
+                        &scratch.mask,
+                        mask_words,
+                    )
+            })??;
+        let masks = GpuPackedMasks::from_words(words, models.len(), self.observation_len)?;
+        Ok((
+            supports,
+            masks,
+            WgpuModelScorerTiming {
+                buffer_prepare_seconds,
+                submit_seconds,
+                readback_total_seconds: readback.total_seconds,
+                readback_copy_submit_seconds: readback.copy_submit_seconds,
+                readback_wait_seconds: readback.wait_seconds,
+                readback_map_decode_seconds: readback.map_decode_seconds,
+                score_calls: 1,
+                mask_calls: 0,
+                models_scored: models.len(),
+                readback_calls: readback.calls,
+                readback_bytes: readback.bytes,
+            },
+        ))
     }
 
     pub(crate) fn score_two_view_models(
@@ -777,6 +964,12 @@ fn two_view_model_capacity(
         .min(usize::try_from(summaries).unwrap_or(usize::MAX))
 }
 
+/// Models whose packed masks fit one storage buffer of `mask_buffer_bytes`.
+fn packed_mask_model_capacity(mask_buffer_bytes: u64, words_per_model: usize) -> usize {
+    let bytes_per_model = (words_per_model.max(1) as u64) * std::mem::size_of::<u32>() as u64;
+    usize::try_from(mask_buffer_bytes / bytes_per_model).unwrap_or(usize::MAX)
+}
+
 fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -792,12 +985,52 @@ fn storage_layout_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutE
 
 #[cfg(test)]
 mod tests {
-    use super::two_view_model_capacity;
+    use super::{
+        packed_mask_model_capacity, packed_words_per_model, two_view_model_capacity, GpuPackedMasks,
+    };
 
     #[test]
     fn two_view_model_capacity_uses_the_tightest_device_limit() {
         assert_eq!(two_view_model_capacity(100, 36 * 80, 8 * 90), 80);
         assert_eq!(two_view_model_capacity(70, u64::MAX, u64::MAX), 70);
         assert_eq!(two_view_model_capacity(100, 35, u64::MAX), 0);
+    }
+
+    #[test]
+    fn packed_words_round_observations_up_to_whole_words() {
+        assert_eq!(packed_words_per_model(0), 0);
+        assert_eq!(packed_words_per_model(1), 1);
+        assert_eq!(packed_words_per_model(32), 1);
+        assert_eq!(packed_words_per_model(33), 2);
+        assert_eq!(packed_words_per_model(713), 23);
+    }
+
+    #[test]
+    fn packed_mask_capacity_bounds_models_by_mask_bytes() {
+        assert_eq!(packed_mask_model_capacity(4 * 23 * 10, 23), 10);
+        assert_eq!(packed_mask_model_capacity(4 * 23 * 10 + 3, 23), 10);
+        assert_eq!(packed_mask_model_capacity(100, 0), 25);
+    }
+
+    #[test]
+    fn packed_masks_unpack_bits_in_observation_order() {
+        // Two models over 35 observations: 2 words per model.
+        let words = vec![
+            0b1011u32,
+            0b101u32, // model 0: obs 0,1,3 and 32,34
+            u32::MAX,
+            0u32, // model 1: obs 0..32 set, 32..35 clear
+        ];
+        let masks = GpuPackedMasks::from_words(words, 2, 35).expect("layout");
+        assert_eq!(masks.model_count(), 2);
+        let m0 = masks.mask(0).expect("model 0");
+        assert_eq!(m0.len(), 35);
+        let set0: Vec<usize> = (0..35).filter(|&i| m0[i]).collect();
+        assert_eq!(set0, vec![0, 1, 3, 32, 34]);
+        let m1 = masks.mask(1).expect("model 1");
+        assert!(m1[..32].iter().all(|&b| b));
+        assert!(m1[32..].iter().all(|&b| !b));
+        assert!(masks.mask(2).is_none());
+        assert!(GpuPackedMasks::from_words(vec![0; 3], 2, 35).is_err());
     }
 }

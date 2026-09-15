@@ -190,6 +190,79 @@ fn score_models(
     }
 }
 
+var<workgroup> local_bits: array<u32, 64>;
+
+// Scores every model exactly like `score_models` (same per-lane observation
+// order, same reduction) and additionally writes a packed inlier bitmask per
+// model: word `w` of model `m` lives at `m * words_per_model + w` and bit `b`
+// of that word is observation `32 * w + b`. Bits at or beyond
+// `observation_count` are zero. Every word below `ceil(observation_count / 32)`
+// is written, so the mask buffer needs no clearing between dispatches.
+@compute @workgroup_size(64)
+fn score_models_with_masks(
+    @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let model_index = group_id.x;
+    let lane = local_id.x;
+    if (model_index >= params.model_count) {
+        return;
+    }
+    let words_per_model = (params.observation_count + 31u) / 32u;
+    let mask_base = model_index * words_per_model;
+
+    var inliers = 0u;
+    var residual_sum = 0.0;
+    var base = 0u;
+    loop {
+        if (base >= params.observation_count) {
+            break;
+        }
+        let observation_index = base + lane;
+        var bit = 0u;
+        if (observation_index < params.observation_count) {
+            let residual = model_residual(model_index, observation_index);
+            if (is_inlier(residual)) {
+                inliers += 1u;
+                residual_sum += residual;
+                bit = 1u;
+            }
+        }
+        local_bits[lane] = bit;
+        workgroupBarrier();
+        if ((lane == 0u || lane == 32u) && observation_index < params.observation_count) {
+            var word = 0u;
+            for (var i = 0u; i < 32u; i++) {
+                word |= local_bits[lane + i] << i;
+            }
+            mask[mask_base + observation_index / 32u] = word;
+        }
+        workgroupBarrier();
+        base += 64u;
+    }
+    local_inliers[lane] = inliers;
+    local_residual_sums[lane] = residual_sum;
+    workgroupBarrier();
+
+    var stride = 32u;
+    loop {
+        if (lane < stride) {
+            local_inliers[lane] += local_inliers[lane + stride];
+            local_residual_sums[lane] += local_residual_sums[lane + stride];
+        }
+        workgroupBarrier();
+        if (stride == 1u) {
+            break;
+        }
+        stride /= 2u;
+    }
+
+    if (lane == 0u) {
+        summaries[model_index].inliers = local_inliers[0];
+        summaries[model_index].residual_sum = local_residual_sums[0];
+    }
+}
+
 @compute @workgroup_size(64)
 fn write_mask(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let observation_index = global_id.x;

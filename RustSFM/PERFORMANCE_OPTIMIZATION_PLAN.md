@@ -56,6 +56,7 @@
 | R9 packed GPU SIFT distance | ✅ 交错验证完成，候选保留（2026-09-13） | CPU packing 为每个 descriptor 附加精确 `Σx²`，WGSL 使用 packed `dot4U8Packed` 计算 `‖q‖²+‖t‖²-2q·t`。flowers2 first48 baseline/candidate 各3轮，wall 中位数 63.80→41.64s（-34.7%），descriptor matching 39.82→17.04s（-57.2%），RSS 基本不变；6轮完整 pairs SHA-256 均为 `613a73f…97216`。focused、matching 30/30、完整 lib 760 passed/19 ignored。下一步只画像并优化 GPU geometry，不改 matching policy |
 | R10 geometry compute+copy 单提交 | ⛔ smoke 无收益，已回退（2026-09-13） | scorer 将 compute 与 readback copy command buffers 合为一次 queue submission；focused 3/3、pairs hash 不变，但 smoke wall 43.86s、geometry 25.80s，劣于相邻 packed-only 的约41.3/23.73s，E/F/H readback wait 几乎不变。源码已恢复，不做多轮、不重试 |
 | R11 bounded GPU geometry masks | ✅ 交错验证完成，候选保留（2026-09-13） | 每个64-trial decision window 按原 ordinal 即时预取最多4个当前 contender mask，CPU 仍逐候选重新比较/refine/update frontier。3×3 wall 中位数42.96→40.20s（-6.4%），geometry 25.63→22.87s（-10.8%），readback wait 15.31→13.19s；完整 pairs hash 一致。整窗口预取因严重过算已拒绝；batch failure 回到当前 candidate 的标量 GPU mask 并关闭本窗口 batching |
+| R14 geometry 融合 score+mask + 几何增长 batch | ✅ 交错验证完成，两项保留（2026-09-15） | first48 wall 43.42→26.06 s（−40%）、geometry 25.48→9.06 s（−64%）、同步点 10,352→2,789、mask_calls→0；12 轮 pairs digest 均 `fbe4acf5…1a32`；lib 774/19 ignored。见 R14 小节 |
 | R12 geometry scorer session buffer 复用 | ⚠️ 目标指标改善但端到端不可证明（2026-09-13） | scorer session 复用 model/summary/mask/params buffer 与 bind group，按容量翻倍增长。逐位输出一致，focused 与完整 lib 763 passed/19 ignored 通过。scorer buffer_prepare 0.568→0.397s（-30%）、submit 0.152→0.091s（-40%），但 readback wait 13.13→13.20s 不变、wall 40.74→40.95s，收益被同步延迟完全掩盖。**本轮真正产出是瓶颈定位见 R12 小节，不作加速宣称** |
 
 | R8 GPU-only matching 测试/CI 迁移 | ✅ focused 门完成（2026-09-12） | 不保留 CPU matching fallback。`no-default-features` 改为最小编译门；matching/sequence/adaptive 集成门显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan。GPU session 测试按 feature gate 编译，旧 FIFO verifier 控制不再生成 trace 且不得改变 GPU 结果。no-default release check 通过；GPU matching 30/30、GPU integration 81 passed/1 ignored。完整默认 lib 门及真实 flowers2 尚待后续验证 |
@@ -146,6 +147,20 @@
 - 48 帧 smoke 对此候选本身也不是有效代理：该规模下 candidate generation 仅 7.5s，而 960 帧为 687.5s。但自旋竞争机制与规模无关且在 960 帧下会更差，故不升级到 960 帧重试。
 - 保留产出：新增 `gpu_ransac_one_physical_batch_scores_every_trial_in_order`，固定“一个 physical batch 必须将全部 trial ordinal 按序无重复无缺口交给 scorer”这一契约，供任何后续改动参考。
 - **后续结论：不要在这个热路径上引入细粒度线程池 hand-off。** 若要同时吃掉 CPU 空等和 GPU 空等，必须是粗粒度的 pair 级流水线（pair N+1 的 CPU 生成与 pair N 的 GPU 打分重叠），且每个线程内部保持串行。
+
+### R14：GPU geometry 同步点削减——融合 score+mask 与几何增长 batch（2026-09-15）
+
+**状态：两项候选均保留。** 报告：`output/geometry_scored_masks_20260915/REPORT.md`；对照 `main` `400e0cb`（= `8b0b63b` 代码）。
+
+- 依据 R12/S1：geometry 读回等待由每同步点约 1.3–1.5 ms 固定延迟主导，唯一杠杆是减少 `score_calls + mask_calls`。
+- **R14a 融合 score+mask（单变量）**：新 WGSL 入口 `score_models_with_masks` 在打分 dispatch 内同时写出每个模型的 packed inlier bitmask（每 32 观测一个 u32），summary 与 mask 一次 readback（`read_two_buffers_profiled`）。per-lane 观测顺序与树形归约与 `score_models` 完全一致，summary 逐位不变；mask 位 = `is_inlier(model_residual())`，与 `write_mask` 同一谓词。决策循环优先取已到主机的 mask，独立 `mask_calls` → 0；批量/标量 mask 路径保留为 fallback。容量规划计入 mask buffer。
+- **R14b 几何增长物理 batch（单变量）**：`GpuRansacBatchPolicy` 增加 `max_score_trials`；物理 score batch 按 512→1024→2048→4096 增长，决策窗口保持 64，`dynamic_max_trials` 仍在 `gpu_ransac_batch_end` 处截断；shared COLMAP RNG stream 模式保持 64/64（不得越过决策前沿采样）。输出与固定 batch 逐位一致（已有 frontier 独立性测试 + 新增 grown-vs-fixed 测试）。
+- flowers2 first48 交错三轮中位数：wall **43.42 → 34.36 → 26.06 s**（−40.0%），geometry **25.48 → 16.95 → 9.06 s**（−64.4%），同步点 **10,352 → 5,970 → 2,789**（E/F/H 1896/2100/6356 → 559/607/1623），readback wait 15.62 → 9.06 → 4.25 s，候选生成 6.08 → 3.25 s，descriptor ≈17 s 不变，RSS 不变。每个 candidate 轮均快于每个 baseline 轮。
+- 质量：12 轮全部 461 pairs / 259,206 matches，`pair_output_hash.py` digest 均为 `fbe4acf5…1a32`（与 R11/R12 相同，逐位一致）。
+- cap 探测：8192/16384 同步点与 4096 完全相同（本数据集无 run 超过 7,680 trials），保留 4096（最小满收益 cap、最小投机浪费）。
+- 门禁：fmt/diff-check、clippy 警告集 ⊆ 基线（少 1）、GPU scorer + RANSAC focused 40/40、完整默认 lib **774 passed / 19 ignored**；新增真实 GPU 测试覆盖 1…713 观测数的字边界与多轮 64-lane pass。
+- 代价：readback 字节 E/F/H 每 run 20.9/16.6/26.1 → 97.5/61.9/108.3 MB，每同步延迟 1.3 → 1.5 ms；传输不是瓶颈，净收益为正。
+- **下一步**：960 帧复测确认（S1 中 essential 每 pair 超线性，增长 batch 应更有效）；然后 pair 级粗粒度 CPU/GPU 流水线（现 geometry 9 s 中 wait 4.25 s、候选生成 3.25 s 仍串行交替）。
 
 ### B1：R7 后 flowers2 first48 对照基线（2026-09-10）
 

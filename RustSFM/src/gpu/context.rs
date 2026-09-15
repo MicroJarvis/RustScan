@@ -131,15 +131,64 @@ impl WgpuContext {
         if element_count == 0 {
             return Ok((Vec::new(), WgpuReadbackTiming::default()));
         }
-        let total_started = Instant::now();
         let byte_len = element_count
             .checked_mul(std::mem::size_of::<T>())
             .context("wgpu readback byte count overflow")?;
-        let byte_len = u64::try_from(byte_len).context("wgpu readback does not fit u64")?;
+        let (mut regions, timing) = self.read_regions_profiled(&[(source, byte_len)])?;
+        let values = decode_pod_region::<T>(&regions.remove(0));
+        Ok((values, timing))
+    }
+
+    /// Reads the leading `element_count` elements of two buffers with one
+    /// staging buffer, one copy submission and one device wait.
+    pub(crate) fn read_two_buffers_profiled<A: Pod, B: Pod>(
+        &self,
+        first: &wgpu::Buffer,
+        first_count: usize,
+        second: &wgpu::Buffer,
+        second_count: usize,
+    ) -> Result<(Vec<A>, Vec<B>, WgpuReadbackTiming)> {
+        let first_bytes = first_count
+            .checked_mul(std::mem::size_of::<A>())
+            .context("wgpu readback byte count overflow")?;
+        let second_bytes = second_count
+            .checked_mul(std::mem::size_of::<B>())
+            .context("wgpu readback byte count overflow")?;
+        if first_bytes == 0 && second_bytes == 0 {
+            return Ok((Vec::new(), Vec::new(), WgpuReadbackTiming::default()));
+        }
+        let (regions, timing) =
+            self.read_regions_profiled(&[(first, first_bytes), (second, second_bytes)])?;
+        Ok((
+            decode_pod_region::<A>(&regions[0]),
+            decode_pod_region::<B>(&regions[1]),
+            timing,
+        ))
+    }
+
+    /// Copies the leading byte range of each source into one staging buffer
+    /// (each region aligned to `COPY_BUFFER_ALIGNMENT`), waits once, and returns
+    /// the raw bytes of each region in order.
+    fn read_regions_profiled(
+        &self,
+        sources: &[(&wgpu::Buffer, usize)],
+    ) -> Result<(Vec<Vec<u8>>, WgpuReadbackTiming)> {
+        let total_started = Instant::now();
+        let alignment = wgpu::COPY_BUFFER_ALIGNMENT;
+        let mut offsets = Vec::with_capacity(sources.len());
+        let mut total_len = 0u64;
+        for &(_, bytes) in sources {
+            let bytes = u64::try_from(bytes).context("wgpu readback does not fit u64")?;
+            offsets.push((total_len, bytes));
+            let padded = bytes.div_ceil(alignment) * alignment;
+            total_len = total_len
+                .checked_add(padded)
+                .context("wgpu readback staging size overflow")?;
+        }
         let copy_submit_started = Instant::now();
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rustsfm wgpu readback staging"),
-            size: byte_len,
+            size: total_len.max(alignment),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -148,7 +197,11 @@ impl WgpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("rustsfm wgpu readback encoder"),
             });
-        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, byte_len);
+        for (&(source, _), &(offset, bytes)) in sources.iter().zip(&offsets) {
+            if bytes > 0 {
+                encoder.copy_buffer_to_buffer(source, 0, &staging, offset, bytes);
+            }
+        }
         let submission = self.queue().submit(Some(encoder.finish()));
         let copy_submit_seconds = copy_submit_started.elapsed().as_secs_f64();
 
@@ -167,26 +220,36 @@ impl WgpuContext {
             .context("wgpu readback mapping failed")?;
 
         let mapped = slice.get_mapped_range();
-        let element_size = std::mem::size_of::<T>();
-        let values = mapped
-            .chunks_exact(element_size)
-            .map(bytemuck::pod_read_unaligned)
+        let regions = offsets
+            .iter()
+            .map(|&(offset, bytes)| {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                let end = usize::try_from(offset + bytes).unwrap_or(usize::MAX);
+                mapped[start..end].to_vec()
+            })
             .collect();
         drop(mapped);
         staging.unmap();
         let map_decode_seconds = map_decode_started.elapsed().as_secs_f64();
         Ok((
-            values,
+            regions,
             WgpuReadbackTiming {
                 total_seconds: total_started.elapsed().as_secs_f64(),
                 copy_submit_seconds,
                 wait_seconds,
                 map_decode_seconds,
                 calls: 1,
-                bytes: byte_len,
+                bytes: offsets.iter().map(|&(_, bytes)| bytes).sum(),
             },
         ))
     }
+}
+
+fn decode_pod_region<T: Pod>(bytes: &[u8]) -> Vec<T> {
+    bytes
+        .chunks_exact(std::mem::size_of::<T>())
+        .map(bytemuck::pod_read_unaligned)
+        .collect()
 }
 
 fn no_compatible_adapter_message() -> &'static str {

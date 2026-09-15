@@ -2171,26 +2171,58 @@ const GPU_RANSAC_SCORE_BATCH_TRIALS: usize = 512;
 #[cfg(feature = "gpu-wgpu")]
 const GPU_RANSAC_DECISION_BATCH_TRIALS: usize = 64;
 
+/// Upper bound for the geometrically grown physical score batch. A run that
+/// has already survived several batches is very likely to continue, so later
+/// batches trade a bounded amount of speculative candidate generation for
+/// proportionally fewer device synchronisations.
+#[cfg(feature = "gpu-wgpu")]
+const GPU_RANSAC_MAX_SCORE_BATCH_TRIALS: usize = 4096;
+
 #[cfg(feature = "gpu-wgpu")]
 const GPU_RANSAC_MASK_BATCH_MODELS: usize = 4;
 
 #[cfg(feature = "gpu-wgpu")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GpuRansacBatchPolicy {
+    /// Trials in the first physical score batch.
     score_trials: usize,
+    /// Trials per decision window; best/frontier updates happen at this grain.
     decision_trials: usize,
+    /// Cap for the physical batch after geometric growth (`score_trials` when
+    /// growth is disabled, e.g. for the shared COLMAP RNG stream).
+    max_score_trials: usize,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl GpuRansacBatchPolicy {
+    /// Physical batch size for the `batch_index`-th batch of one run: doubles
+    /// from `score_trials` up to `max_score_trials`.
+    fn score_trials_for_batch(&self, batch_index: usize) -> usize {
+        let base = self.score_trials.max(1);
+        let cap = self.max_score_trials.max(base);
+        if batch_index >= base.leading_zeros() as usize {
+            return cap;
+        }
+        (base << batch_index).min(cap)
+    }
 }
 
 #[cfg(feature = "gpu-wgpu")]
 fn gpu_ransac_batch_policy(shared_stream: bool) -> GpuRansacBatchPolicy {
-    let score_trials = if shared_stream {
-        GPU_RANSAC_DECISION_BATCH_TRIALS
+    if shared_stream {
+        // Sampling from the shared stream must never run ahead of the decision
+        // frontier, so the physical batch stays at the decision grain.
+        GpuRansacBatchPolicy {
+            score_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+            decision_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+            max_score_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+        }
     } else {
-        GPU_RANSAC_SCORE_BATCH_TRIALS
-    };
-    GpuRansacBatchPolicy {
-        score_trials,
-        decision_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+        GpuRansacBatchPolicy {
+            score_trials: GPU_RANSAC_SCORE_BATCH_TRIALS,
+            decision_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+            max_score_trials: GPU_RANSAC_MAX_SCORE_BATCH_TRIALS,
+        }
     }
 }
 
@@ -2294,6 +2326,26 @@ trait GpuRansacScoring {
     fn supports_batched_masks(&self) -> bool {
         false
     }
+    /// Whether `score_models_with_masks_profiled` is available: one dispatch
+    /// returns every model's summary and packed inlier mask in one readback.
+    fn supports_scored_masks(&self) -> bool {
+        false
+    }
+    fn max_models_per_score_with_masks(&self) -> usize {
+        self.max_models_per_score()
+    }
+    fn score_models_with_masks_profiled(
+        &self,
+        _models: &[[f32; 9]],
+        _threshold: f32,
+        _kind: TwoViewModelKind,
+    ) -> anyhow::Result<(
+        Vec<GpuModelSupport>,
+        crate::gpu::GpuPackedMasks,
+        crate::gpu::WgpuModelScorerTiming,
+    )> {
+        anyhow::bail!("GPU RANSAC scorer does not support scored masks")
+    }
     fn score_models_profiled(
         &self,
         models: &[[f32; 9]],
@@ -2324,6 +2376,27 @@ impl GpuRansacScoring for WgpuModelScoringSession<'_> {
 
     fn supports_batched_masks(&self) -> bool {
         true
+    }
+
+    fn supports_scored_masks(&self) -> bool {
+        true
+    }
+
+    fn max_models_per_score_with_masks(&self) -> usize {
+        self.max_two_view_models_per_score_with_masks()
+    }
+
+    fn score_models_with_masks_profiled(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+    ) -> anyhow::Result<(
+        Vec<GpuModelSupport>,
+        crate::gpu::GpuPackedMasks,
+        crate::gpu::WgpuModelScorerTiming,
+    )> {
+        self.score_two_view_models_with_masks_profiled(models, threshold, kind)
     }
 
     fn score_models_profiled(
@@ -2373,12 +2446,52 @@ struct GpuRansacRunResult {
     timing: WgpuRansacStageTiming,
 }
 
+/// Packed inlier masks captured during scoring, addressed by candidate index.
+///
+/// When the scorer supports scored masks, every scored candidate's mask is
+/// already on the host after the score readback and no further device
+/// synchronisation is needed to consume it.
 #[cfg(feature = "gpu-wgpu")]
+#[derive(Default)]
+struct GpuRansacScoredMasks {
+    slices: Vec<crate::gpu::GpuPackedMasks>,
+    /// `(slice index, model offset within slice)` per candidate.
+    per_candidate: Vec<Option<(usize, usize)>>,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl GpuRansacScoredMasks {
+    fn with_candidates(candidate_count: usize) -> Self {
+        Self {
+            slices: Vec::new(),
+            per_candidate: vec![None; candidate_count],
+        }
+    }
+
+    fn record(&mut self, masks: crate::gpu::GpuPackedMasks, candidate_start: usize) {
+        let slice_index = self.slices.len();
+        for offset in 0..masks.model_count() {
+            if let Some(slot) = self.per_candidate.get_mut(candidate_start + offset) {
+                *slot = Some((slice_index, offset));
+            }
+        }
+        self.slices.push(masks);
+    }
+
+    fn mask(&self, candidate_index: usize) -> Option<Vec<bool>> {
+        let (slice_index, offset) = (*self.per_candidate.get(candidate_index)?)?;
+        self.slices.get(slice_index)?.mask(offset)
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
 fn gpu_ransac_score_candidate_range(
     scorer: &impl GpuRansacScoring,
     candidates: &[GpuRansacCandidate<'_>],
     gpu_models: &[Option<[f32; 9]>],
     summaries: &mut [Option<GpuModelSupport>],
+    scored_masks: &mut GpuRansacScoredMasks,
     start: usize,
     end: usize,
     threshold: f32,
@@ -2400,7 +2513,13 @@ fn gpu_ransac_score_candidate_range(
         model_counts.push((trial, trial_end - cursor));
         cursor = trial_end;
     }
-    let slices = gpu_ransac_score_slices(&model_counts, scorer.max_models_per_score())
+    let mut use_scored_masks = scorer.supports_scored_masks();
+    let capacity = if use_scored_masks {
+        scorer.max_models_per_score_with_masks()
+    } else {
+        scorer.max_models_per_score()
+    };
+    let slices = gpu_ransac_score_slices(&model_counts, capacity)
         .with_context(|| format!("GPU {family} RANSAC score capacity planning failed"))?;
     for slice in slices {
         let absolute_start = start + slice.start;
@@ -2417,10 +2536,42 @@ fn gpu_ransac_score_candidate_range(
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (slice_summaries, scorer_timing) = scorer
-            .score_models_profiled(&models, threshold, kind)
-            .with_context(|| format!("GPU {family} RANSAC scoring failed"))?;
-        timing.scorer += scorer_timing;
+        let slice_summaries = if use_scored_masks {
+            match scorer.score_models_with_masks_profiled(&models, threshold, kind) {
+                Ok((slice_summaries, masks, scorer_timing))
+                    if slice_summaries.len() == models.len()
+                        && masks.model_count() == models.len() =>
+                {
+                    timing.scorer += scorer_timing;
+                    scored_masks.record(masks, absolute_start);
+                    Some(slice_summaries)
+                }
+                Ok((_, _, scorer_timing)) => {
+                    timing.scorer += scorer_timing;
+                    use_scored_masks = false;
+                    None
+                }
+                Err(error) => {
+                    log::debug!(
+                        "GPU {family} RANSAC scored masks unavailable; scoring without masks: {error}"
+                    );
+                    use_scored_masks = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let slice_summaries = match slice_summaries {
+            Some(slice_summaries) => slice_summaries,
+            None => {
+                let (slice_summaries, scorer_timing) = scorer
+                    .score_models_profiled(&models, threshold, kind)
+                    .with_context(|| format!("GPU {family} RANSAC scoring failed"))?;
+                timing.scorer += scorer_timing;
+                slice_summaries
+            }
+        };
         if slice_summaries.len() != models.len() {
             anyhow::bail!(
                 "GPU {family} RANSAC returned {} summaries for {} candidates",
@@ -2504,14 +2655,17 @@ where
     let mut dynamic_max_trials = max_num_trials;
     let mut iteration = 0usize;
     let mut best: Option<(Matrix3<f64>, ModelSupport)> = None;
+    let mut physical_batch_index = 0usize;
 
     while iteration < max_num_trials {
+        let score_trials = config.policy.score_trials_for_batch(physical_batch_index);
+        physical_batch_index += 1;
         let physical_end = gpu_ransac_batch_end(
             iteration,
             max_num_trials,
             dynamic_max_trials,
             config.options.min_num_trials,
-            config.policy.score_trials,
+            score_trials,
         );
         if iteration >= physical_end {
             break;
@@ -2521,7 +2675,7 @@ where
             config.family,
             iteration,
             physical_end,
-            config.policy.score_trials,
+            score_trials,
             config.policy.decision_trials,
             dynamic_max_trials
         );
@@ -2606,11 +2760,13 @@ where
             .take_while(|candidate| candidate.trial < deferred_window_start)
             .count();
         let mut summaries = vec![None; candidates.len()];
+        let mut scored_masks = GpuRansacScoredMasks::with_candidates(candidates.len());
         gpu_ransac_score_candidate_range(
             scorer,
             &candidates,
             &gpu_models,
             &mut summaries,
+            &mut scored_masks,
             0,
             scored_prefix_len,
             config.threshold,
@@ -2673,6 +2829,7 @@ where
                         &candidates,
                         &gpu_models,
                         &mut summaries,
+                        &mut scored_masks,
                         scored_prefix_len,
                         partial_end,
                         config.threshold,
@@ -2719,7 +2876,11 @@ where
                         best.as_ref().map(|(_, support)| support),
                     )
                 {
-                    let local_mask = if use_batched_masks {
+                    let local_mask = if let Some(mask) = scored_masks.mask(candidate_index) {
+                        // Mask already arrived with the score readback; no
+                        // additional device round trip.
+                        mask
+                    } else if use_batched_masks {
                         let mask_offset = candidate_index - window_candidate_start;
                         if prefetched_masks[mask_offset].is_none() {
                             let mut contender_indices = Vec::new();
@@ -5518,8 +5679,70 @@ mod tests {
             GpuRansacBatchPolicy {
                 score_trials: 512,
                 decision_trials: 64,
+                max_score_trials: 4096,
             }
         );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_physical_batch_grows_geometrically_to_the_cap() {
+        let policy = gpu_ransac_batch_policy(false);
+        let sizes: Vec<usize> = (0..6).map(|i| policy.score_trials_for_batch(i)).collect();
+        assert_eq!(sizes, vec![512, 1024, 2048, 4096, 4096, 4096]);
+        assert_eq!(policy.score_trials_for_batch(200), 4096);
+        let fixed = gpu_ransac_batch_policy(true);
+        assert!((0..5).all(|i| fixed.score_trials_for_batch(i) == 64));
+        let degenerate = GpuRansacBatchPolicy {
+            score_trials: 0,
+            decision_trials: 64,
+            max_score_trials: 0,
+        };
+        assert_eq!(degenerate.score_trials_for_batch(3), 1);
+    }
+
+    /// Growing the physical batch must not change which trials are sampled,
+    /// refined or selected; only the number of score dispatches may drop.
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_grown_batches_match_fixed_batch_outputs() -> anyhow::Result<()> {
+        let fixed = GpuRansacBatchPolicy {
+            score_trials: 16,
+            decision_trials: 16,
+            max_score_trials: 16,
+        };
+        let grown = GpuRansacBatchPolicy {
+            score_trials: 16,
+            decision_trials: 16,
+            max_score_trials: 1024,
+        };
+        let (reference, reference_scores, reference_masks, _, ref_mask_log, ref_samples, ref_refs) =
+            run_scripted_gpu_ransac(fixed, false, false)?;
+        let (
+            candidate,
+            candidate_scores,
+            candidate_masks,
+            _,
+            cand_mask_log,
+            cand_samples,
+            cand_refs,
+        ) = run_scripted_gpu_ransac(grown, false, false)?;
+        let (reference_model, reference_support) =
+            reference.best.as_ref().context("reference best missing")?;
+        let (candidate_model, candidate_support) =
+            candidate.best.as_ref().context("candidate best missing")?;
+        assert_eq!(candidate_model, reference_model);
+        assert_eq!(candidate_support.inliers, reference_support.inliers);
+        assert_eq!(candidate_support.inlier_mask, reference_support.inlier_mask);
+        assert_eq!(cand_refs, ref_refs);
+        assert_eq!(cand_mask_log, ref_mask_log);
+        assert_eq!(candidate_masks, reference_masks);
+        // Speculative sampling beyond the frontier is allowed for owned
+        // samplers; the consumed prefix must be the same.
+        assert!(cand_samples.len() >= ref_samples.len());
+        assert_eq!(&cand_samples[..ref_samples.len()], &ref_samples[..]);
+        assert!(candidate_scores < reference_scores);
+        Ok(())
     }
 
     #[cfg(feature = "gpu-wgpu")]
@@ -5530,6 +5753,7 @@ mod tests {
             GpuRansacBatchPolicy {
                 score_trials: 64,
                 decision_trials: 64,
+                max_score_trials: 64,
             }
         );
     }
@@ -5640,10 +5864,20 @@ mod tests {
         truncate_first_score: bool,
         batched_masks: bool,
         fail_batched_masks: bool,
+        scored_masks: bool,
+        fail_scored_masks: bool,
     }
 
     #[cfg(feature = "gpu-wgpu")]
     impl ScriptedGpuRansacScorer {
+        fn scripted_mask(&self, model: &[f32; 9]) -> Vec<bool> {
+            let count = self.support_for_trial(model[0] as usize) as usize;
+            let mut mask = vec![false; self.observations];
+            let inlier_count = count.min(mask.len());
+            mask[..inlier_count].fill(true);
+            mask
+        }
+
         fn new(max_models: usize, observations: usize) -> (Self, Rc<Cell<usize>>, Rc<Cell<usize>>) {
             let (scorer, score_calls, mask_calls, _, _) =
                 Self::new_with_logs(max_models, observations);
@@ -5698,6 +5932,8 @@ mod tests {
                     truncate_first_score: false,
                     batched_masks: false,
                     fail_batched_masks: false,
+                    scored_masks: false,
+                    fail_scored_masks: false,
                 },
                 score_calls,
                 mask_calls,
@@ -5722,6 +5958,41 @@ mod tests {
 
         fn supports_batched_masks(&self) -> bool {
             self.batched_masks
+        }
+
+        fn supports_scored_masks(&self) -> bool {
+            self.scored_masks
+        }
+
+        fn score_models_with_masks_profiled(
+            &self,
+            models: &[[f32; 9]],
+            threshold: f32,
+            kind: TwoViewModelKind,
+        ) -> anyhow::Result<(
+            Vec<GpuModelSupport>,
+            crate::gpu::GpuPackedMasks,
+            crate::gpu::WgpuModelScorerTiming,
+        )> {
+            if self.fail_scored_masks {
+                anyhow::bail!("scripted scored mask failure")
+            }
+            let (supports, timing) = self.score_models_profiled(models, threshold, kind)?;
+            let mut words = Vec::new();
+            for model in models {
+                let mask = self.scripted_mask(model);
+                for chunk in mask.chunks(32) {
+                    words.push(
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .fold(0u32, |word, (bit, &set)| word | (u32::from(set) << bit)),
+                    );
+                }
+            }
+            let masks =
+                crate::gpu::GpuPackedMasks::from_words(words, models.len(), self.observations)?;
+            Ok((supports, masks, timing))
         }
 
         fn score_models_profiled(
@@ -5766,12 +6037,8 @@ mod tests {
         ) -> anyhow::Result<(Vec<bool>, crate::gpu::WgpuModelScorerTiming)> {
             self.mask_calls.set(self.mask_calls.get() + 1);
             self.mask_log.borrow_mut().push(model[0] as usize);
-            let count = self.support_for_trial(model[0] as usize) as usize;
-            let mut mask = vec![false; self.observations];
-            let inlier_count = count.min(mask.len());
-            mask[..inlier_count].fill(true);
             Ok((
-                mask,
+                self.scripted_mask(model),
                 crate::gpu::WgpuModelScorerTiming {
                     mask_calls: 1,
                     ..Default::default()
@@ -5794,13 +6061,7 @@ mod tests {
                 .extend(models.iter().map(|model| model[0] as usize));
             let masks = models
                 .iter()
-                .map(|model| {
-                    let count = self.support_for_trial(model[0] as usize) as usize;
-                    let mut mask = vec![false; self.observations];
-                    let inlier_count = count.min(mask.len());
-                    mask[..inlier_count].fill(true);
-                    mask
-                })
+                .map(|model| self.scripted_mask(model))
                 .collect();
             Ok((
                 masks,
@@ -5810,6 +6071,15 @@ mod tests {
                 },
             ))
         }
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[derive(Clone, Copy, Default)]
+    struct ScriptedMaskMode {
+        batched_masks: bool,
+        fail_batched_masks: bool,
+        scored_masks: bool,
+        fail_scored_masks: bool,
     }
 
     #[cfg(feature = "gpu-wgpu")]
@@ -5826,10 +6096,35 @@ mod tests {
         Vec<usize>,
         Vec<usize>,
     )> {
+        run_scripted_gpu_ransac_with_mode(
+            policy,
+            ScriptedMaskMode {
+                batched_masks,
+                fail_batched_masks,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn run_scripted_gpu_ransac_with_mode(
+        policy: GpuRansacBatchPolicy,
+        mode: ScriptedMaskMode,
+    ) -> anyhow::Result<(
+        GpuRansacRunResult,
+        usize,
+        usize,
+        Vec<Vec<usize>>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<usize>,
+    )> {
         let (mut scorer, score_calls, mask_calls, score_log, mask_log) =
             ScriptedGpuRansacScorer::new_with_logs(1024, 128);
-        scorer.batched_masks = batched_masks;
-        scorer.fail_batched_masks = fail_batched_masks;
+        scorer.batched_masks = mode.batched_masks;
+        scorer.fail_batched_masks = mode.fail_batched_masks;
+        scorer.scored_masks = mode.scored_masks;
+        scorer.fail_scored_masks = mode.fail_scored_masks;
         let options = test_ransac_options(100, 128, 0.999);
         let active_indices = (0..128).collect::<Vec<_>>();
         let sampled_trials = Rc::new(RefCell::new(Vec::new()));
@@ -5884,6 +6179,7 @@ mod tests {
                 GpuRansacBatchPolicy {
                     score_trials: 64,
                     decision_trials: 64,
+                    max_score_trials: 64,
                 },
                 false,
                 false,
@@ -5893,6 +6189,7 @@ mod tests {
                 GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
                 false,
                 false,
@@ -5922,6 +6219,7 @@ mod tests {
         let policy = GpuRansacBatchPolicy {
             score_trials: 512,
             decision_trials: 64,
+            max_score_trials: 512,
         };
         let (scalar, _, _, _, scalar_masks, scalar_samples, scalar_refinements) =
             run_scripted_gpu_ransac(policy, false, false)?;
@@ -5948,10 +6246,96 @@ mod tests {
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
+    fn gpu_ransac_scored_masks_remove_mask_calls_and_preserve_outputs() -> anyhow::Result<()> {
+        let policy = GpuRansacBatchPolicy {
+            score_trials: 512,
+            decision_trials: 64,
+            max_score_trials: 512,
+        };
+        let (
+            scalar,
+            scalar_scores,
+            scalar_mask_calls,
+            _,
+            scalar_masks,
+            scalar_samples,
+            scalar_refs,
+        ) = run_scripted_gpu_ransac(policy, false, false)?;
+        let (
+            scored,
+            scored_scores,
+            scored_mask_calls,
+            _,
+            scored_masks,
+            scored_samples,
+            scored_refs,
+        ) = run_scripted_gpu_ransac_with_mode(
+            policy,
+            ScriptedMaskMode {
+                batched_masks: true,
+                scored_masks: true,
+                ..Default::default()
+            },
+        )?;
+
+        let (scalar_model, scalar_support) = scalar.best.as_ref().context("scalar best missing")?;
+        let (scored_model, scored_support) = scored.best.as_ref().context("scored best missing")?;
+        assert_eq!(scored_model, scalar_model);
+        assert_eq!(scored_support.inliers, scalar_support.inliers);
+        assert_eq!(
+            scored_support.residual_sum.to_bits(),
+            scalar_support.residual_sum.to_bits()
+        );
+        assert_eq!(scored_support.inlier_mask, scalar_support.inlier_mask);
+        assert_eq!(scored_samples, scalar_samples);
+        assert_eq!(scored_refs, scalar_refs);
+        assert_eq!(scored_scores, scalar_scores);
+        assert_eq!(scalar_masks, vec![0, 63, 100]);
+        assert!(scalar_mask_calls > 0);
+        assert_eq!(
+            scored_mask_calls, 0,
+            "scored masks must not issue mask dispatches"
+        );
+        assert!(scored_masks.is_empty());
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_scored_mask_failure_falls_back_to_scalar_masks() -> anyhow::Result<()> {
+        let policy = GpuRansacBatchPolicy {
+            score_trials: 512,
+            decision_trials: 64,
+            max_score_trials: 512,
+        };
+        let (scalar, _, _, _, scalar_masks, scalar_samples, scalar_refs) =
+            run_scripted_gpu_ransac(policy, false, false)?;
+        let (fallback, _, _, _, fallback_masks, fallback_samples, fallback_refs) =
+            run_scripted_gpu_ransac_with_mode(
+                policy,
+                ScriptedMaskMode {
+                    scored_masks: true,
+                    fail_scored_masks: true,
+                    ..Default::default()
+                },
+            )?;
+        assert_eq!(
+            fallback.best.as_ref().map(|(model, _)| model[(0, 0)]),
+            scalar.best.as_ref().map(|(model, _)| model[(0, 0)])
+        );
+        assert_eq!(fallback_samples, scalar_samples);
+        assert_eq!(fallback_refs, scalar_refs);
+        assert_eq!(fallback_masks, scalar_masks);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
     fn gpu_ransac_batched_mask_failure_preserves_scalar_error_order() -> anyhow::Result<()> {
         let policy = GpuRansacBatchPolicy {
             score_trials: 512,
             decision_trials: 64,
+            max_score_trials: 512,
         };
         let (scalar, _, _, _, scalar_masks, scalar_samples, scalar_refinements) =
             run_scripted_gpu_ransac(policy, false, false)?;
@@ -5975,6 +6359,7 @@ mod tests {
             GpuRansacBatchPolicy {
                 score_trials: 512,
                 decision_trials: 64,
+                max_score_trials: 512,
             },
             false,
             false,
@@ -6032,6 +6417,7 @@ mod tests {
         let reference_draws = run_scripted_shared_stream_draws(GpuRansacBatchPolicy {
             score_trials: 64,
             decision_trials: 64,
+            max_score_trials: 64,
         })?;
         assert_eq!(shared_draws, (0..101).collect::<Vec<_>>());
         assert_eq!(shared_draws, reference_draws);
@@ -6063,6 +6449,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
             },
             |trial| vec![trial],
@@ -6117,6 +6504,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
             },
             |trial| vec![trial],
@@ -6177,6 +6565,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
             },
             |trial| vec![trial],
@@ -6224,6 +6613,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 64,
                     decision_trials: 64,
+                    max_score_trials: 64,
                 },
             },
             move |trial| {
@@ -6285,6 +6675,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
             },
             move |trial| {
@@ -6334,6 +6725,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
             },
             |trial| vec![trial],
@@ -6387,6 +6779,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
             },
             |trial| vec![trial],
@@ -6430,6 +6823,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 512,
                     decision_trials: 64,
+                    max_score_trials: 512,
                 },
             },
             |trial| vec![trial],
@@ -6473,6 +6867,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 4,
                     decision_trials: 64,
+                    max_score_trials: 4,
                 },
             },
             move |trial| {
@@ -6521,6 +6916,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: GPU_RANSAC_SCORE_BATCH_TRIALS,
                     decision_trials: GPU_RANSAC_DECISION_BATCH_TRIALS,
+                    max_score_trials: GPU_RANSAC_SCORE_BATCH_TRIALS,
                 },
             },
             move |trial| {
@@ -6556,6 +6952,7 @@ mod tests {
                 policy: GpuRansacBatchPolicy {
                     score_trials: 1,
                     decision_trials: 1,
+                    max_score_trials: 1,
                 },
             },
             |trial| if trial == 0 { vec![0] } else { Vec::new() },
@@ -6657,10 +7054,12 @@ mod tests {
         let reference_policy = GpuRansacBatchPolicy {
             score_trials: 64,
             decision_trials: 64,
+            max_score_trials: 64,
         };
         let candidate_policy = GpuRansacBatchPolicy {
             score_trials: 512,
             decision_trials: 64,
+            max_score_trials: 512,
         };
         let fingerprint = |result: &Option<(Matrix3<f64>, ModelSupport, bool)>| {
             result.as_ref().map(|(model, support, success)| {
