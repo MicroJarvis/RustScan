@@ -1,6 +1,6 @@
 # RustScan Current Project Status
 
-**Updated:** 2026-09-10
+**Updated:** 2026-09-15
 **Branch:** `main`
 
 ## Overall
@@ -32,8 +32,25 @@
 - RustSLAM 的 dependency-minimal library suite 在 2026-09-03 实测为 `245 passed; 0 failed`。此前 `tracker::vo::tests::test_initialize_keeps_relocalized_pose_in_global_frame` 的 fixture 仅有 10 个点，其中 7 个可三角化，误触发生产的 8 点退化保护；fixture 已扩展至 16 个空间分布点，生产门槛保持不变。
 - RustFF 的默认 library suite 在 2026-09-03 为 `2 passed; 0 failed`，`onnx-ort` feature 已迁移至 pinned ORT 2.0 RC API 并为 `3 passed; 0 failed`；Spann3R decoder ONNX execution 仍未实现，故该 feature 不是端到端推理后端。`onnx-candle` 仍仅暴露未接线依赖。
 
+## flowers2 960 帧基线（2026-09-13 settlement / 2026-09-15 retest）
+
+| 阶段 | settlement | retest（`8b0b63b`） | 质量 |
+|---|---:|---:|---|
+| extract（CPU SIFT） | 332.3 s | — | 960 images / 6,612,183 keypoints |
+| match | 2146.9 s | **1668.4 s** | 14,045 pairs / 13,894 verified / 10,019,172 matches（逐项一致） |
+| reconstruct（frozen matching.db） | 598.9 s | 698.8 s（单轮，未判定是否回归） | 960/960 / 437,185→437,192 points / 1 model |
+
+retest matching 分账（`output/flowers2_960_retest_20260915/matching.json`）：描述子匹配 GPU 等待 643 s；geometry scorer 读回等待 E 165 / F 181 / H 240 = 586 s（46 万次同步 × ~1.3 ms 固定延迟，与字节数无关，R12/S1 已证）；essential 候选生成（CPU f64 五点法）196 s；F/H 候选生成 + CPU refinement 127 s。reconstruct 内 27 次 global BA ≈ 331 s。
+
+GPU f32 五点法实验（分支 `gpu-five-point-f32`，Q1–Q5b / P1–P3）已于 2026-09-15 冻结：生产五点法保持 CPU f64；Apple GPU 无 shader f64，df64 不值；按生产粒度 GPU 比 CPU8 慢约 5×，进生产前提是跨 pair 聚合流水线。见该分支 `docs/gpu-five-point-pipeline-TODO.md` 冻结决定。
+
 ## Next Priorities
 
-1. 以 `output/b1_r7_baseline_flowers2_20260910` 为 R7 后 48 帧参考；下一步优先独立复现 `post_bogus_cameras` / BA 质量债（与吞吐实验分目录），或仅在新测瓶颈证据下开下一性能候选。
-2. 继续 RustGS parity/TUM 质量闭环，并在完成后更新其专项状态。
-3. 维护 RustSFM default/minimal-feature 测试与 macOS GPU context 串行化的 CI 覆盖；需要时触发 flowers2 opt-in job。
+按顺序逐项执行，每项完成后 review 全方案再进入下一项；需要时重跑 960 帧全流程更新真实数字：
+
+1. **geometry scorer 同步点削减**（586 s）：设备端 argmax 去除独立 `mask_calls`、决策窗口扩大；单变量、逐位输出门（`tools/pair_output_hash.py`）、3×3 交错；48 帧 smoke 不够，按 96→192 升级验证（essential 每 pair 成本在 960 帧超线性）。
+2. **pair 级粗粒度 CPU 候选生成 / GPU 打分流水线**：pair N+1 的 CPU 生成与 pair N 的 GPU 打分重叠，线程内部串行；禁止细粒度 rayon hand-off（R13 已证毒化 `device.poll`）。
+3. **reconstruct**：核查 960 相机时 Ceres 线性求解器（48 帧为 Eigen DenseSchur；COLMAP >50 图切 SPARSE_SCHUR）；同 `matching.db` 三轮复现 599→699 s 是噪声还是回归。
+4. **`post_bogus_cameras` / BA 质量债**独立复现与修复（与性能实验分目录，不混轮）。
+5. **描述子匹配 GPU kernel**（643 s，算力瓶颈）：先做 kernel 级画像；或 pair 选择策略（需独立质量门）。
+6. 继续 RustGS parity/TUM 质量闭环；维护 RustSFM CI 覆盖，需要时触发 flowers2 opt-in job。
