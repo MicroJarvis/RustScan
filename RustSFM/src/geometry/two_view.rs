@@ -277,6 +277,7 @@ pub(crate) fn estimate_calibrated_two_view_gpu(
         options,
         TwoViewScoringBackend::Wgpu(scorer),
         None,
+        None,
     )
 }
 
@@ -331,6 +332,8 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras(
         options,
         TwoViewScoringBackend::Cpu(std::marker::PhantomData),
         None,
+        #[cfg(feature = "gpu-wgpu")]
+        None,
     )
     .expect("CPU two-view scoring backend is infallible")
 }
@@ -369,6 +372,26 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gp
     camera2: CameraModel,
     options: &TwoViewOptions,
 ) -> anyhow::Result<(Option<TwoViewEstimate>, WgpuGeometryTiming)> {
+    estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu_profiled_prefetch(
+        scorer, pts1, pts2, obs1_px, obs2_px, rays1, rays2, camera1, camera2, options, None,
+    )
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu_profiled_prefetch(
+    scorer: &WgpuModelScorer,
+    pts1: &[[f32; 2]],
+    pts2: &[[f32; 2]],
+    obs1_px: &[[f32; 2]],
+    obs2_px: &[[f32; 2]],
+    rays1: Option<&[[f64; 3]]>,
+    rays2: Option<&[[f64; 3]]>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+    options: &TwoViewOptions,
+    first_batches: Option<TwoViewFirstBatchPrefetch>,
+) -> anyhow::Result<(Option<TwoViewEstimate>, WgpuGeometryTiming)> {
     let mut timing = WgpuGeometryTiming::default();
     let estimate = estimate_calibrated_two_view_impl(
         pts1,
@@ -382,6 +405,7 @@ pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gp
         options,
         TwoViewScoringBackend::Wgpu(scorer),
         Some(&mut timing),
+        first_batches,
     )?;
     Ok((estimate, timing))
 }
@@ -399,6 +423,7 @@ fn estimate_calibrated_two_view_impl(
     options: &TwoViewOptions,
     scoring_backend: TwoViewScoringBackend<'_>,
     mut gpu_timing: Option<&mut WgpuGeometryTiming>,
+    #[cfg(feature = "gpu-wgpu")] mut first_batches: Option<TwoViewFirstBatchPrefetch>,
 ) -> anyhow::Result<Option<TwoViewEstimate>> {
     let n = pts1.len().min(pts2.len());
     if n < options.min_inliers.max(5) {
@@ -539,6 +564,9 @@ fn estimate_calibrated_two_view_impl(
             shared_stream,
             options.use_five_point,
             options.use_hartley_refinement,
+            first_batches
+                .as_mut()
+                .and_then(|prefetch| prefetch.essential.take()),
         )?,
     };
     if let Some(timing) = gpu_timing.as_deref_mut() {
@@ -576,6 +604,9 @@ fn estimate_calibrated_two_view_impl(
             sampler_seed,
             options.loransac_num_lo_steps,
             shared_stream,
+            first_batches
+                .as_mut()
+                .and_then(|prefetch| prefetch.fundamental.take()),
         )?,
     };
     if let Some(timing) = gpu_timing.as_deref_mut() {
@@ -613,6 +644,9 @@ fn estimate_calibrated_two_view_impl(
             sampler_seed,
             options.loransac_num_lo_steps,
             shared_stream,
+            first_batches
+                .as_mut()
+                .and_then(|prefetch| prefetch.homography.take()),
         )?,
     };
     if let Some(timing) = gpu_timing.as_deref_mut() {
@@ -1564,6 +1598,7 @@ fn estimate_essential_ransac_gpu(
     shared_stream: bool,
     use_five_point: bool,
     use_hartley_refinement: bool,
+    prefetched: Option<PregeneratedGpuRansacFirstBatch>,
 ) -> anyhow::Result<(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
@@ -1581,6 +1616,7 @@ fn estimate_essential_ransac_gpu(
         use_five_point,
         use_hartley_refinement,
         gpu_ransac_batch_policy(shared_stream),
+        prefetched,
     )
 }
 
@@ -1599,6 +1635,7 @@ fn estimate_essential_ransac_gpu_with_policy(
     use_five_point: bool,
     use_hartley_refinement: bool,
     policy: GpuRansacBatchPolicy,
+    prefetched: Option<PregeneratedGpuRansacFirstBatch>,
 ) -> anyhow::Result<(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
@@ -1615,14 +1652,20 @@ fn estimate_essential_ransac_gpu_with_policy(
         scorer.prepare_homogeneous_session(&gpu_points1, &gpu_points2)?;
     timing.session_prepare_seconds += session_prepare_started.elapsed().as_secs_f64();
     let threshold = gpu_ransac_threshold(ransac_options.max_error)?;
-    let mut sampler = make_two_view_ransac_sampler(
-        random_seed,
-        &ransac_options,
-        0x9e37_79b9_7f4a_7c15,
-        num_observations,
-        active_indices,
-        shared_stream,
-    );
+    let (mut sampler, prefetched_batch) = match prefetched {
+        Some(prefetch) => (prefetch.sampler, Some(prefetch.batch)),
+        None => (
+            make_two_view_ransac_sampler(
+                random_seed,
+                &ransac_options,
+                0x9e37_79b9_7f4a_7c15,
+                num_observations,
+                active_indices,
+                shared_stream,
+            ),
+            None,
+        ),
+    };
     let run = run_gpu_ransac_batches_with_five_point(
         &session,
         active_indices,
@@ -1660,6 +1703,7 @@ fn estimate_essential_ransac_gpu_with_policy(
                 use_hartley_refinement,
             )
         },
+        prefetched_batch,
     )?;
     timing += run.timing;
     let best = run.best;
@@ -2205,6 +2249,14 @@ impl GpuRansacBatchPolicy {
         }
         (base << batch_index).min(cap)
     }
+
+    /// Owned samplers already allow speculative sampling past the decision
+    /// frontier (grown physical batches). Prefetching the next physical batch
+    /// during a GPU wait is the same contract; the shared COLMAP stream keeps
+    /// physical == decision grain and must not sample ahead.
+    fn allows_speculative_prefetch(&self) -> bool {
+        self.max_score_trials > self.decision_trials
+    }
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -2346,6 +2398,29 @@ trait GpuRansacScoring {
     )> {
         anyhow::bail!("GPU RANSAC scorer does not support scored masks")
     }
+    /// Runs `overlap` while a scored-mask dispatch is in flight. The default
+    /// implementation runs `overlap` first so CPU-only scripted scorers keep
+    /// generating the next batch before the (instant) score returns.
+    fn score_models_with_masks_overlapping<F, T>(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+        overlap: F,
+    ) -> anyhow::Result<(
+        Vec<GpuModelSupport>,
+        crate::gpu::GpuPackedMasks,
+        crate::gpu::WgpuModelScorerTiming,
+        T,
+    )>
+    where
+        F: FnOnce() -> T,
+    {
+        let extra = overlap();
+        let (supports, masks, timing) =
+            self.score_models_with_masks_profiled(models, threshold, kind)?;
+        Ok((supports, masks, timing, extra))
+    }
     fn score_models_profiled(
         &self,
         models: &[[f32; 9]],
@@ -2397,6 +2472,24 @@ impl GpuRansacScoring for WgpuModelScoringSession<'_> {
         crate::gpu::WgpuModelScorerTiming,
     )> {
         self.score_two_view_models_with_masks_profiled(models, threshold, kind)
+    }
+
+    fn score_models_with_masks_overlapping<F, T>(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+        overlap: F,
+    ) -> anyhow::Result<(
+        Vec<GpuModelSupport>,
+        crate::gpu::GpuPackedMasks,
+        crate::gpu::WgpuModelScorerTiming,
+        T,
+    )>
+    where
+        F: FnOnce() -> T,
+    {
+        self.score_two_view_models_with_masks_overlapping(models, threshold, kind, overlap)
     }
 
     fn score_models_profiled(
@@ -2482,6 +2575,34 @@ impl GpuRansacScoredMasks {
         let (slice_index, offset) = (*self.per_candidate.get(candidate_index)?)?;
         self.slices.get(slice_index)?.mask(offset)
     }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+struct GpuRansacPhysicalBatch {
+    groups: Vec<GpuRansacTrialGroup>,
+    batch_start: usize,
+    physical_end: usize,
+    sampler_exhausted: bool,
+    generation_seconds: f64,
+    next_iteration: usize,
+    next_physical_batch_index: usize,
+}
+
+/// First physical batch plus the sampler that produced it, so a later RANSAC
+/// run can continue the same sequential draw stream.
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) struct PregeneratedGpuRansacFirstBatch {
+    batch: GpuRansacPhysicalBatch,
+    sampler: TwoViewRansacSampler,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[derive(Default)]
+pub(crate) struct TwoViewFirstBatchPrefetch {
+    essential: Option<PregeneratedGpuRansacFirstBatch>,
+    fundamental: Option<PregeneratedGpuRansacFirstBatch>,
+    homography: Option<PregeneratedGpuRansacFirstBatch>,
+    pub generation_seconds: f64,
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -2608,6 +2729,7 @@ where
         sample,
         generate_models,
         refine,
+        None,
     )
 }
 
@@ -2616,6 +2738,7 @@ fn solve_five_point_trial_groups(
     groups: &mut [GpuRansacTrialGroup],
     pts1: &[Vector3<f64>],
     pts2: &[Vector3<f64>],
+    allow_parallel: bool,
 ) {
     let solve = |group: &mut GpuRansacTrialGroup| {
         if group.sample.len() == 5 {
@@ -2623,12 +2746,308 @@ fn solve_five_point_trial_groups(
         }
     };
     // parallel() alone does not prevent global Rayon use outside admission.
-    if groups.len() > 1 && crate::execution::active_threads().is_some_and(|threads| threads > 1) {
+    // This must return before the caller waits on the GPU (R13): a live Rayon
+    // pool contends with device.poll(Wait). Overlap generation during a GPU
+    // wait must stay serial (`allow_parallel = false`).
+    if allow_parallel
+        && groups.len() > 1
+        && crate::execution::active_threads().is_some_and(|threads| threads > 1)
+    {
         use rayon::prelude::*;
         crate::execution::parallel(|| groups.par_iter_mut().for_each(solve));
     } else {
         groups.iter_mut().for_each(solve);
     }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn generate_gpu_ransac_physical_batch<S, G>(
+    iteration: &mut usize,
+    physical_batch_index: &mut usize,
+    max_num_trials: usize,
+    dynamic_max_trials: usize,
+    config: GpuRansacRunConfig<'_>,
+    five_point_rays: Option<(&[Vector3<f64>], &[Vector3<f64>])>,
+    allow_parallel_five_point: bool,
+    sample: &mut S,
+    generate_models: &mut G,
+) -> Option<GpuRansacPhysicalBatch>
+where
+    S: FnMut(usize) -> Vec<usize>,
+    G: FnMut(&[usize]) -> Vec<Matrix3<f64>>,
+{
+    let score_trials = config.policy.score_trials_for_batch(*physical_batch_index);
+    *physical_batch_index += 1;
+    let physical_end = gpu_ransac_batch_end(
+        *iteration,
+        max_num_trials,
+        dynamic_max_trials,
+        config.options.min_num_trials,
+        score_trials,
+    );
+    if *iteration >= physical_end {
+        *physical_batch_index -= 1;
+        return None;
+    }
+    log::trace!(
+        "GPU RANSAC physical batch family={} trials=[{}, {}) score_trials={} decision_trials={} dynamic_max_trials={}",
+        config.family,
+        *iteration,
+        physical_end,
+        score_trials,
+        config.policy.decision_trials,
+        dynamic_max_trials
+    );
+    let generation_started = Instant::now();
+    let batch_start = *iteration;
+    let mut groups = Vec::new();
+    let mut sampler_exhausted = false;
+    while *iteration < physical_end {
+        let trial = *iteration;
+        *iteration += 1;
+        let sampled = sample(trial);
+        if sampled.len() != config.sample_size {
+            groups.push(GpuRansacTrialGroup::new(trial, sampled, Vec::new()));
+            sampler_exhausted = true;
+            break;
+        }
+        groups.push(GpuRansacTrialGroup::new(
+            trial,
+            sampled.clone(),
+            if five_point_rays.is_some() {
+                Vec::new()
+            } else {
+                generate_models(&sampled)
+            },
+        ));
+    }
+    if let Some((pts1, pts2)) = five_point_rays {
+        solve_five_point_trial_groups(&mut groups, pts1, pts2, allow_parallel_five_point);
+    }
+    Some(GpuRansacPhysicalBatch {
+        groups,
+        batch_start,
+        physical_end,
+        sampler_exhausted,
+        generation_seconds: generation_started.elapsed().as_secs_f64(),
+        next_iteration: *iteration,
+        next_physical_batch_index: *physical_batch_index,
+    })
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn pregenerate_family_first_batch<G>(
+    active_indices: &[usize],
+    config: GpuRansacRunConfig<'_>,
+    random_seed: u64,
+    shared_stream: bool,
+    salt: u64,
+    num_active_samples: usize,
+    five_point_rays: Option<(&[Vector3<f64>], &[Vector3<f64>])>,
+    mut generate_models: G,
+) -> Option<PregeneratedGpuRansacFirstBatch>
+where
+    G: FnMut(&[usize]) -> Vec<Matrix3<f64>>,
+{
+    if shared_stream {
+        return None;
+    }
+    let mut sampler = make_two_view_ransac_sampler(
+        random_seed,
+        config.options,
+        salt,
+        num_active_samples,
+        active_indices,
+        shared_stream,
+    );
+    let mut iteration = 0usize;
+    let mut physical_batch_index = 0usize;
+    let max_num_trials = config.options.max_num_trials.max(1);
+    let batch = generate_gpu_ransac_physical_batch(
+        &mut iteration,
+        &mut physical_batch_index,
+        max_num_trials,
+        max_num_trials,
+        config,
+        five_point_rays,
+        false,
+        &mut |_| sampler.sample(config.sample_size),
+        &mut generate_models,
+    )?;
+    Some(PregeneratedGpuRansacFirstBatch { batch, sampler })
+}
+
+/// Serial first physical batches for E/F/H. Safe to run during a matcher GPU
+/// wait: does not submit GPU work or use Rayon. Shared COLMAP streams return
+/// empty so sampling stays sequential with the later RANSAC run.
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) fn pregenerate_two_view_first_batches_serial(
+    pts1: &[[f32; 2]],
+    pts2: &[[f32; 2]],
+    obs1_px: &[[f32; 2]],
+    obs2_px: &[[f32; 2]],
+    rays1: Option<&[[f64; 3]]>,
+    rays2: Option<&[[f64; 3]]>,
+    camera1: CameraModel,
+    camera2: CameraModel,
+    options: &TwoViewOptions,
+) -> TwoViewFirstBatchPrefetch {
+    let started = Instant::now();
+    let n = pts1.len().min(pts2.len());
+    let mut prefetch = TwoViewFirstBatchPrefetch::default();
+    if n < options.min_inliers.max(5) {
+        return prefetch;
+    }
+    let obs1_px = if obs1_px.len() >= n { obs1_px } else { pts1 };
+    let obs2_px = if obs2_px.len() >= n { obs2_px } else { pts2 };
+    let active_indices = active_match_indices(
+        obs1_px,
+        obs2_px,
+        n,
+        options.filter_stationary_matches,
+        options.stationary_matches_max_error_px,
+    );
+    if active_indices.len() < options.min_inliers.max(5)
+        || options.multiple_models
+        || options.force_h_use
+    {
+        return prefetch;
+    }
+    let cam_pts1 = pts1
+        .iter()
+        .take(n)
+        .map(|p| Vector3::new(p[0] as f64, p[1] as f64, 1.0))
+        .collect::<Vec<_>>();
+    let cam_pts2 = pts2
+        .iter()
+        .take(n)
+        .map(|p| Vector3::new(p[0] as f64, p[1] as f64, 1.0))
+        .collect::<Vec<_>>();
+    let ray_pts1 = rays1
+        .filter(|rays| rays.len() >= n)
+        .map(|rays| {
+            rays.iter()
+                .take(n)
+                .map(vector3_from_ray)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| observation_rays_from_pixels(obs1_px, &cam_pts1, camera1, n));
+    let ray_pts2 = rays2
+        .filter(|rays| rays.len() >= n)
+        .map(|rays| {
+            rays.iter()
+                .take(n)
+                .map(vector3_from_ray)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| observation_rays_from_pixels(obs2_px, &cam_pts2, camera2, n));
+    let img_pts1 = obs1_px
+        .iter()
+        .take(n)
+        .map(|p| Vector3::new(p[0] as f64, p[1] as f64, 1.0))
+        .collect::<Vec<_>>();
+    let img_pts2 = obs2_px
+        .iter()
+        .take(n)
+        .map(|p| Vector3::new(p[0] as f64, p[1] as f64, 1.0))
+        .collect::<Vec<_>>();
+    let sampler_seed = two_view_sampler_seed(options);
+    let shared_stream = colmap_shared_ransac_stream_enabled(options);
+    if shared_stream {
+        prefetch.generation_seconds = started.elapsed().as_secs_f64();
+        return prefetch;
+    }
+    let essential_sample_size = if options.use_five_point { 5 } else { 8 };
+    let policy = gpu_ransac_batch_policy(false);
+    if let Some(essential_options) =
+        two_view_ransac_options(options.ransac_threshold, options, essential_sample_size)
+    {
+        let config = GpuRansacRunConfig {
+            family: "Essential",
+            sample_size: essential_sample_size,
+            dynamic_support_observations: active_indices.len(),
+            observation_count: n,
+            threshold: 0.0,
+            kind: TwoViewModelKind::Sampson,
+            options: &essential_options,
+            policy,
+        };
+        prefetch.essential = pregenerate_family_first_batch(
+            &active_indices,
+            config,
+            sampler_seed,
+            false,
+            0x9e37_79b9_7f4a_7c15,
+            n,
+            options
+                .use_five_point
+                .then_some((ray_pts1.as_slice(), ray_pts2.as_slice())),
+            |sample| {
+                if options.use_five_point {
+                    estimate_essential_five_point_indexed(&ray_pts1, &ray_pts2, sample)
+                } else {
+                    estimate_essential_eight_point_indexed_lightweight(&ray_pts1, &ray_pts2, sample)
+                        .into_iter()
+                        .collect()
+                }
+            },
+        );
+    }
+    if let Some(fundamental_options) =
+        two_view_ransac_options(options.ransac_max_error_px, options, 7)
+    {
+        let config = GpuRansacRunConfig {
+            family: "Fundamental",
+            sample_size: 7,
+            dynamic_support_observations: active_indices.len(),
+            observation_count: n,
+            threshold: 0.0,
+            kind: TwoViewModelKind::Sampson,
+            options: &fundamental_options,
+            policy,
+        };
+        prefetch.fundamental = pregenerate_family_first_batch(
+            &active_indices,
+            config,
+            sampler_seed,
+            false,
+            0x517c_c1b7_2722_0a95,
+            active_indices.len(),
+            None,
+            |sample| estimate_fundamental_seven_point_indexed(&img_pts1, &img_pts2, sample),
+        );
+    }
+    if let Some(homography_options) =
+        two_view_ransac_options(options.ransac_max_error_px, options, 4)
+    {
+        let config = GpuRansacRunConfig {
+            family: "Homography",
+            sample_size: 4,
+            dynamic_support_observations: active_indices.len(),
+            observation_count: n,
+            threshold: 0.0,
+            kind: TwoViewModelKind::HomographyForward,
+            options: &homography_options,
+            policy,
+        };
+        prefetch.homography = pregenerate_family_first_batch(
+            &active_indices,
+            config,
+            sampler_seed,
+            false,
+            0x94d0_49bb_1331_11eb,
+            active_indices.len(),
+            None,
+            |sample| {
+                estimate_homography_dlt_indexed(&img_pts1, &img_pts2, sample)
+                    .into_iter()
+                    .collect()
+            },
+        );
+    }
+    prefetch.generation_seconds = started.elapsed().as_secs_f64();
+    prefetch
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -2641,6 +3060,7 @@ fn run_gpu_ransac_batches_with_five_point<S, G, R>(
     mut sample: S,
     mut generate_models: G,
     mut refine: R,
+    mut prefetched: Option<GpuRansacPhysicalBatch>,
 ) -> anyhow::Result<GpuRansacRunResult>
 where
     S: FnMut(usize) -> Vec<usize>,
@@ -2658,54 +3078,33 @@ where
     let mut physical_batch_index = 0usize;
 
     while iteration < max_num_trials {
-        let score_trials = config.policy.score_trials_for_batch(physical_batch_index);
-        physical_batch_index += 1;
-        let physical_end = gpu_ransac_batch_end(
-            iteration,
-            max_num_trials,
-            dynamic_max_trials,
-            config.options.min_num_trials,
-            score_trials,
-        );
-        if iteration >= physical_end {
+        let Some(batch) = prefetched.take().or_else(|| {
+            generate_gpu_ransac_physical_batch(
+                &mut iteration,
+                &mut physical_batch_index,
+                max_num_trials,
+                dynamic_max_trials,
+                config,
+                five_point_rays,
+                true,
+                &mut sample,
+                &mut generate_models,
+            )
+        }) else {
             break;
-        }
-        log::trace!(
-            "GPU RANSAC physical batch family={} trials=[{}, {}) score_trials={} decision_trials={} dynamic_max_trials={}",
-            config.family,
-            iteration,
+        };
+        iteration = batch.next_iteration;
+        physical_batch_index = batch.next_physical_batch_index;
+        timing.candidate_generation_seconds += batch.generation_seconds;
+        let GpuRansacPhysicalBatch {
+            groups,
+            batch_start,
             physical_end,
-            score_trials,
-            config.policy.decision_trials,
-            dynamic_max_trials
-        );
-        let generation_started = Instant::now();
-        let batch_start = iteration;
-        let mut groups = Vec::new();
-        let mut sampler_exhausted = false;
-        while iteration < physical_end {
-            let trial = iteration;
-            iteration += 1;
-            let sampled = sample(trial);
-            if sampled.len() != config.sample_size {
-                groups.push(GpuRansacTrialGroup::new(trial, sampled, Vec::new()));
-                sampler_exhausted = true;
-                break;
-            }
-            groups.push(GpuRansacTrialGroup::new(
-                trial,
-                sampled.clone(),
-                if five_point_rays.is_some() {
-                    Vec::new()
-                } else {
-                    generate_models(&sampled)
-                },
-            ));
-        }
-        if let Some((pts1, pts2)) = five_point_rays {
-            solve_five_point_trial_groups(&mut groups, pts1, pts2);
-        }
-        timing.candidate_generation_seconds += generation_started.elapsed().as_secs_f64();
+            sampler_exhausted,
+            generation_seconds: _,
+            next_iteration: _,
+            next_physical_batch_index: _,
+        } = batch;
         let candidates = gpu_ransac_candidates(&groups);
         let mut gpu_models = vec![None; candidates.len()];
         let mut deferred_error = None;
@@ -3282,6 +3681,7 @@ fn estimate_fundamental_ransac_gpu(
     random_seed: u64,
     lo_steps: usize,
     shared_stream: bool,
+    prefetched: Option<PregeneratedGpuRansacFirstBatch>,
 ) -> anyhow::Result<(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
@@ -3296,6 +3696,7 @@ fn estimate_fundamental_ransac_gpu(
         lo_steps,
         shared_stream,
         gpu_ransac_batch_policy(shared_stream),
+        prefetched,
     )
 }
 
@@ -3311,6 +3712,7 @@ fn estimate_fundamental_ransac_gpu_with_policy(
     lo_steps: usize,
     shared_stream: bool,
     policy: GpuRansacBatchPolicy,
+    prefetched: Option<PregeneratedGpuRansacFirstBatch>,
 ) -> anyhow::Result<(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
@@ -3326,17 +3728,24 @@ fn estimate_fundamental_ransac_gpu_with_policy(
         scorer.prepare_homogeneous_session(&gpu_points1, &gpu_points2)?;
     timing.session_prepare_seconds += session_prepare_started.elapsed().as_secs_f64();
     let threshold = gpu_ransac_threshold(ransac_options.max_error)?;
-    let mut sampler = make_two_view_ransac_sampler(
-        random_seed,
-        &ransac_options,
-        0x517c_c1b7_2722_0a95,
-        active_indices.len(),
-        active_indices,
-        shared_stream,
-    );
-    let run = run_gpu_ransac_batches(
+    let (mut sampler, prefetched_batch) = match prefetched {
+        Some(prefetch) => (prefetch.sampler, Some(prefetch.batch)),
+        None => (
+            make_two_view_ransac_sampler(
+                random_seed,
+                &ransac_options,
+                0x517c_c1b7_2722_0a95,
+                active_indices.len(),
+                active_indices,
+                shared_stream,
+            ),
+            None,
+        ),
+    };
+    let run = run_gpu_ransac_batches_with_five_point(
         &session,
         active_indices,
+        None,
         GpuRansacRunConfig {
             family: "Fundamental",
             sample_size: 7,
@@ -3360,6 +3769,7 @@ fn estimate_fundamental_ransac_gpu_with_policy(
                 COLMAP_LORANSAC_LOCAL_TRIALS,
             )
         },
+        prefetched_batch,
     )?;
     timing += run.timing;
     let best = run.best;
@@ -3879,6 +4289,7 @@ fn estimate_homography_ransac_gpu(
     random_seed: u64,
     lo_steps: usize,
     shared_stream: bool,
+    prefetched: Option<PregeneratedGpuRansacFirstBatch>,
 ) -> anyhow::Result<(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
@@ -3893,6 +4304,7 @@ fn estimate_homography_ransac_gpu(
         lo_steps,
         shared_stream,
         gpu_ransac_batch_policy(shared_stream),
+        prefetched,
     )
 }
 
@@ -3908,6 +4320,7 @@ fn estimate_homography_ransac_gpu_with_policy(
     lo_steps: usize,
     shared_stream: bool,
     policy: GpuRansacBatchPolicy,
+    prefetched: Option<PregeneratedGpuRansacFirstBatch>,
 ) -> anyhow::Result<(
     Option<(Matrix3<f64>, ModelSupport, bool)>,
     WgpuRansacStageTiming,
@@ -3922,17 +4335,24 @@ fn estimate_homography_ransac_gpu_with_policy(
     let session = scorer.prepare_homogeneous_session(&gpu_points1, &gpu_points2)?;
     timing.session_prepare_seconds += session_prepare_started.elapsed().as_secs_f64();
     let threshold = gpu_ransac_threshold(ransac_options.max_error)?;
-    let mut sampler = make_two_view_ransac_sampler(
-        random_seed,
-        &ransac_options,
-        0x94d0_49bb_1331_11eb,
-        active_indices.len(),
-        active_indices,
-        shared_stream,
-    );
-    let run = run_gpu_ransac_batches(
+    let (mut sampler, prefetched_batch) = match prefetched {
+        Some(prefetch) => (prefetch.sampler, Some(prefetch.batch)),
+        None => (
+            make_two_view_ransac_sampler(
+                random_seed,
+                &ransac_options,
+                0x94d0_49bb_1331_11eb,
+                active_indices.len(),
+                active_indices,
+                shared_stream,
+            ),
+            None,
+        ),
+    };
+    let run = run_gpu_ransac_batches_with_five_point(
         &session,
         active_indices,
+        None,
         GpuRansacRunConfig {
             family: "Homography",
             sample_size: 4,
@@ -3960,6 +4380,7 @@ fn estimate_homography_ransac_gpu_with_policy(
                 COLMAP_LORANSAC_LOCAL_TRIALS,
             )
         },
+        prefetched_batch,
     )?;
     timing += run.timing;
     let best = run.best;
@@ -4291,6 +4712,21 @@ fn estimate_essential_five_point_indexed(
 ) -> Vec<Matrix3<f64>> {
     if indices.len() < 5 {
         return Vec::new();
+    }
+    if indices.len() == 5 {
+        let mut rays1 = [Vector3::zeros(); 5];
+        let mut rays2 = [Vector3::zeros(); 5];
+        for (slot, &idx) in indices.iter().enumerate() {
+            let Some(x1) = pts1.get(idx) else {
+                return Vec::new();
+            };
+            let Some(x2) = pts2.get(idx) else {
+                return Vec::new();
+            };
+            rays1[slot] = *x1;
+            rays2[slot] = *x2;
+        }
+        return estimate_five_point_essential(&rays1, &rays2);
     }
     let mut rays1 = Vec::with_capacity(indices.len());
     let mut rays2 = Vec::with_capacity(indices.len());
@@ -5530,7 +5966,7 @@ mod tests {
                     })
                     .collect();
                 groups.push(GpuRansacTrialGroup::new(batch_size, Vec::new(), Vec::new()));
-                solve_five_point_trial_groups(&mut groups, &left, &right);
+                solve_five_point_trial_groups(&mut groups, &left, &right, true);
                 groups
                     .into_iter()
                     .map(|group| {
@@ -5624,6 +6060,7 @@ mod tests {
                         );
                         (model, support)
                     },
+                    None,
                 );
                 let next_sample = sampler.sample(5);
                 COLMAP_SHARED_RANSAC_RNG.with(|rng| rng.replace(previous_rng));
@@ -5742,6 +6179,114 @@ mod tests {
         assert!(cand_samples.len() >= ref_samples.len());
         assert_eq!(&cand_samples[..ref_samples.len()], &ref_samples[..]);
         assert!(candidate_scores < reference_scores);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_prefetch_keeps_consumed_sample_prefix() -> anyhow::Result<()> {
+        let no_prefetch = GpuRansacBatchPolicy {
+            score_trials: 16,
+            decision_trials: 16,
+            max_score_trials: 16,
+        };
+        let prefetch = GpuRansacBatchPolicy {
+            score_trials: 16,
+            decision_trials: 16,
+            max_score_trials: 1024,
+        };
+        assert!(!no_prefetch.allows_speculative_prefetch());
+        assert!(prefetch.allows_speculative_prefetch());
+        let (reference, _, _, _, _, ref_samples, ref_refs) =
+            run_scripted_gpu_ransac(no_prefetch, false, false)?;
+        let (candidate, _, _, _, _, cand_samples, cand_refs) =
+            run_scripted_gpu_ransac(prefetch, false, false)?;
+        let (reference_model, reference_support) =
+            reference.best.as_ref().context("reference best missing")?;
+        let (candidate_model, candidate_support) =
+            candidate.best.as_ref().context("candidate best missing")?;
+        assert_eq!(candidate_model, reference_model);
+        assert_eq!(candidate_support.inliers, reference_support.inliers);
+        assert_eq!(candidate_support.inlier_mask, reference_support.inlier_mask);
+        assert_eq!(cand_refs, ref_refs);
+        assert!(cand_samples.len() >= ref_samples.len());
+        assert_eq!(&cand_samples[..ref_samples.len()], &ref_samples[..]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_ransac_consumed_prefetched_first_batch_matches_inline() -> anyhow::Result<()> {
+        let policy = GpuRansacBatchPolicy {
+            score_trials: 16,
+            decision_trials: 16,
+            max_score_trials: 64,
+        };
+        let (reference, _, _, _, _, ref_samples, ref_refs) =
+            run_scripted_gpu_ransac(policy, false, false)?;
+        let options = test_ransac_options(100, 128, 0.999);
+        let active_indices = (0..128).collect::<Vec<_>>();
+        let sampled_trials = Rc::new(RefCell::new(Vec::new()));
+        let sampled_trials_for_closure = sampled_trials.clone();
+        let refined_trials = Rc::new(RefCell::new(Vec::new()));
+        let refined_trials_for_closure = refined_trials.clone();
+        let (scorer, _, _, _, _) = ScriptedGpuRansacScorer::new_with_logs(1024, 128);
+        let mut iteration = 0usize;
+        let mut physical_batch_index = 0usize;
+        let mut generate_models =
+            |sample: &[usize]| vec![Matrix3::from_diagonal_element(sample[0] as f64)];
+        let mut sample_fn = {
+            let sampled_trials_for_closure = sampled_trials_for_closure.clone();
+            move |trial: usize| {
+                sampled_trials_for_closure.borrow_mut().push(trial);
+                vec![trial]
+            }
+        };
+        let config = GpuRansacRunConfig {
+            family: "scripted",
+            sample_size: 1,
+            dynamic_support_observations: active_indices.len(),
+            observation_count: active_indices.len(),
+            threshold: 1.0,
+            kind: TwoViewModelKind::Sampson,
+            options: &options,
+            policy,
+        };
+        let prefetched = generate_gpu_ransac_physical_batch(
+            &mut iteration,
+            &mut physical_batch_index,
+            options.max_num_trials.max(1),
+            options.max_num_trials.max(1),
+            config,
+            None,
+            false,
+            &mut sample_fn,
+            &mut generate_models,
+        );
+        let result = run_gpu_ransac_batches_with_five_point(
+            &scorer,
+            &active_indices,
+            None,
+            config,
+            sample_fn,
+            generate_models,
+            move |model, support| {
+                refined_trials_for_closure
+                    .borrow_mut()
+                    .push(model[(0, 0)] as usize);
+                (model, support)
+            },
+            prefetched,
+        )?;
+        let (reference_model, reference_support) =
+            reference.best.as_ref().context("reference best missing")?;
+        let (candidate_model, candidate_support) =
+            result.best.as_ref().context("prefetched best missing")?;
+        assert_eq!(candidate_model, reference_model);
+        assert_eq!(candidate_support.inliers, reference_support.inliers);
+        assert_eq!(candidate_support.inlier_mask, reference_support.inlier_mask);
+        assert_eq!(*refined_trials.borrow(), ref_refs);
+        assert_eq!(*sampled_trials.borrow(), ref_samples);
         Ok(())
     }
 
@@ -6998,6 +7543,7 @@ mod tests {
             42,
             0,
             false,
+            None,
         )?;
         let first = first.expect("GPU Homography RANSAC estimate");
         let (second, _) = estimate_homography_ransac_gpu(
@@ -7009,6 +7555,7 @@ mod tests {
             42,
             0,
             false,
+            None,
         )?;
         let second = second.expect("repeated GPU Homography RANSAC estimate");
         assert!(first.1.inliers >= 20);
@@ -7086,6 +7633,7 @@ mod tests {
             false,
             true,
             reference_policy,
+            None,
         )?;
         let (essential_candidate, _) = estimate_essential_ransac_gpu_with_policy(
             &scorer,
@@ -7100,6 +7648,7 @@ mod tests {
             false,
             true,
             candidate_policy,
+            None,
         )?;
         assert_eq!(
             fingerprint(&essential_reference),
@@ -7116,6 +7665,7 @@ mod tests {
             0,
             false,
             reference_policy,
+            None,
         )?;
         let (fundamental_candidate, _) = estimate_fundamental_ransac_gpu_with_policy(
             &scorer,
@@ -7127,6 +7677,7 @@ mod tests {
             0,
             false,
             candidate_policy,
+            None,
         )?;
         assert_eq!(
             fingerprint(&fundamental_reference),
@@ -7152,6 +7703,7 @@ mod tests {
             0,
             false,
             reference_policy,
+            None,
         )?;
         let (homography_candidate, _) = estimate_homography_ransac_gpu_with_policy(
             &scorer,
@@ -7163,6 +7715,7 @@ mod tests {
             0,
             false,
             candidate_policy,
+            None,
         )?;
         assert_eq!(
             fingerprint(&homography_reference),

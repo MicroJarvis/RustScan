@@ -9,25 +9,53 @@ pub fn estimate_five_point_essential(
     rays1: &[Vector3<f64>],
     rays2: &[Vector3<f64>],
 ) -> Vec<Matrix3<f64>> {
+    let n = rays1.len().min(rays2.len());
+    if n == 5 {
+        return estimate_five_point_essential_minimal(rays1, rays2);
+    }
     let Some(basis) = five_point_nullspace(rays1, rays2) else {
         return Vec::new();
     };
-    let basis_data = basis_as_colmap_data(&basis);
-    let a_data = five_point_generated::build_elimination_matrix(&basis_data);
-    let a = DMatrix::<f64>::from_column_slice(10, 20, &a_data);
-    let left = a.view((0, 0), (10, 10)).into_owned();
-    let right = a.view((0, 10), (10, 10)).into_owned();
-    let Some(aa) =
-        colmap_eigen::partial_piv_lu_solve_10x10(&left, &right).or_else(|| left.lu().solve(&right))
-    else {
+    essential_models_from_basis(&basis)
+}
+
+fn estimate_five_point_essential_minimal(
+    rays1: &[Vector3<f64>],
+    rays2: &[Vector3<f64>],
+) -> Vec<Matrix3<f64>> {
+    let Some(basis) = five_point_minimal_nullspace_from_rays(rays1, rays2) else {
         return Vec::new();
     };
+    essential_models_from_basis(&basis)
+}
 
-    let b_data = build_determinant_matrix_data(&aa);
+fn essential_models_from_basis(basis: &EssentialBasis) -> Vec<Matrix3<f64>> {
+    let basis_data = basis_as_colmap_data(basis);
+    let a_data = five_point_generated::build_elimination_matrix(&basis_data);
+    let left = colmajor_10x20_block_row_major(&a_data, 0);
+    let right = colmajor_10x20_block_row_major(&a_data, 10);
+    let aa = if let Some(aa) = colmap_eigen::partial_piv_lu_solve_10x10_row_major(&left, &right) {
+        aa
+    } else {
+        let left_m = DMatrix::<f64>::from_row_slice(10, 10, &left);
+        let right_m = DMatrix::<f64>::from_row_slice(10, 10, &right);
+        let Some(solved) = left_m.lu().solve(&right_m) else {
+            return Vec::new();
+        };
+        let mut aa = [0.0f64; 100];
+        for row in 0..10 {
+            for col in 0..10 {
+                aa[row * 10 + col] = solved[(row, col)];
+            }
+        }
+        aa
+    };
+
+    let b_data = build_determinant_matrix_data_from_row_major(&aa);
     let coeffs = five_point_generated::determinant_coeffs(&b_data);
     let roots = polynomial::complex_roots_companion_matrix(&coeffs);
 
-    let mut models = Vec::new();
+    let mut models = Vec::with_capacity(10);
     for root in roots {
         if root.im.abs() > 1.0e-10 {
             continue;
@@ -97,8 +125,11 @@ pub fn five_point_nullspace(
         return None;
     }
     let n = rays1.len().min(rays2.len());
+    if n == 5 {
+        return five_point_minimal_nullspace_from_rays(rays1, rays2);
+    }
     let mut rows = Vec::with_capacity(n * 9);
-    for (x1, x2) in rays1.iter().zip(rays2.iter()) {
+    for (x1, x2) in rays1.iter().zip(rays2.iter()).take(n) {
         rows.extend_from_slice(&[
             x2.x * x1.x,
             x2.x * x1.y,
@@ -112,11 +143,42 @@ pub fn five_point_nullspace(
         ]);
     }
     let q = DMatrix::<f64>::from_row_slice(n, 9, &rows);
-    if n == 5 {
-        five_point_minimal_nullspace(&q)
-    } else {
-        five_point_svd_nullspace(&q)
+    five_point_svd_nullspace(&q)
+}
+
+fn five_point_minimal_nullspace_from_rays(
+    rays1: &[Vector3<f64>],
+    rays2: &[Vector3<f64>],
+) -> Option<EssentialBasis> {
+    if rays1.len().min(rays2.len()) < 5 {
+        return None;
     }
+    let mut q = [0.0f64; 45];
+    for i in 0..5 {
+        let x1 = rays1[i];
+        let x2 = rays2[i];
+        let row = i * 9;
+        q[row] = x2.x * x1.x;
+        q[row + 1] = x2.x * x1.y;
+        q[row + 2] = x2.x * x1.z;
+        q[row + 3] = x2.y * x1.x;
+        q[row + 4] = x2.y * x1.y;
+        q[row + 5] = x2.y * x1.z;
+        q[row + 6] = x2.z * x1.x;
+        q[row + 7] = x2.z * x1.y;
+        q[row + 8] = x2.z * x1.z;
+    }
+    if let Some(rows) = colmap_eigen::full_piv_right_nullspace_5x9(&q) {
+        let mut basis = EssentialBasis::zeros();
+        for basis_col in 0..4 {
+            for idx in 0..9 {
+                basis[(idx, basis_col)] = rows[basis_col][idx];
+            }
+        }
+        return Some(basis);
+    }
+    let q_m = DMatrix::<f64>::from_row_slice(5, 9, &q);
+    five_point_minimal_nullspace(&q_m)
 }
 
 fn five_point_minimal_nullspace(q: &DMatrix<f64>) -> Option<EssentialBasis> {
@@ -202,7 +264,18 @@ fn basis_as_colmap_data(basis: &EssentialBasis) -> [f64; 36] {
     data
 }
 
-fn build_determinant_matrix_data(aa: &DMatrix<f64>) -> [f64; 39] {
+fn colmajor_10x20_block_row_major(a: &[f64; 200], start_col: usize) -> [f64; 100] {
+    let mut out = [0.0f64; 100];
+    for row in 0..10 {
+        for col in 0..10 {
+            out[row * 10 + col] = a[(start_col + col) * 10 + row];
+        }
+    }
+    out
+}
+
+fn build_determinant_matrix_data_from_row_major(aa: &[f64; 100]) -> [f64; 39] {
+    let at = |row: usize, col: usize| aa[row * 10 + col];
     let mut b = [0.0f64; 39];
     for i in 0..3 {
         b_set(&mut b, 0, i, 0.0);
@@ -210,29 +283,29 @@ fn build_determinant_matrix_data(aa: &DMatrix<f64>) -> [f64; 39] {
         b_set(&mut b, 8, i, 0.0);
 
         for k in 0..3 {
-            let v = aa[(i * 2 + 4, k)];
+            let v = at(i * 2 + 4, k);
             b_set(&mut b, 1 + k, i, v);
         }
         for k in 0..3 {
-            let v = aa[(i * 2 + 4, 3 + k)];
+            let v = at(i * 2 + 4, 3 + k);
             b_set(&mut b, 5 + k, i, v);
         }
         for k in 0..4 {
-            let v = aa[(i * 2 + 4, 6 + k)];
+            let v = at(i * 2 + 4, 6 + k);
             b_set(&mut b, 9 + k, i, v);
         }
         for k in 0..3 {
-            let v = b_at(&b, k, i) - aa[(i * 2 + 5, k)];
+            let v = b_at(&b, k, i) - at(i * 2 + 5, k);
             b_set(&mut b, k, i, v);
         }
         for k in 0..3 {
             let row = 4 + k;
-            let v = b_at(&b, row, i) - aa[(i * 2 + 5, 3 + k)];
+            let v = b_at(&b, row, i) - at(i * 2 + 5, 3 + k);
             b_set(&mut b, row, i, v);
         }
         for k in 0..4 {
             let row = 8 + k;
-            let v = b_at(&b, row, i) - aa[(i * 2 + 5, 6 + k)];
+            let v = b_at(&b, row, i) - at(i * 2 + 5, 6 + k);
             b_set(&mut b, row, i, v);
         }
     }

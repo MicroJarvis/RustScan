@@ -1,8 +1,6 @@
 use crate::gpu::WgpuGeometryTiming;
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::WgpuModelScorer;
-#[cfg(feature = "gpu-wgpu")]
-use crate::two_view::estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu_profiled;
 use crate::two_view::{
     essential_to_fundamental, estimate_calibrated_two_view_with_observations_rays_and_cameras,
     squared_sampson_error, triangulate_world_point, TwoViewOptions,
@@ -199,6 +197,8 @@ pub fn estimate_pair_geometry_with_options_and_cameras(
         options,
         PairGeometryScoringBackend::Cpu(std::marker::PhantomData),
         None,
+        #[cfg(feature = "gpu-wgpu")]
+        None,
     )
     .expect("CPU pair-geometry scoring backend is infallible")
 }
@@ -255,6 +255,42 @@ pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
     min_triangulated: usize,
     options: PairEstimationOptions,
 ) -> Result<(Option<PairGeometry>, WgpuGeometryTiming)> {
+    estimate_pair_geometry_with_options_and_cameras_gpu_profiled_prefetch(
+        scorer,
+        left_idx,
+        right_idx,
+        left,
+        right,
+        matches,
+        left_camera,
+        right_camera,
+        essential_threshold,
+        essential_iterations,
+        min_inliers,
+        min_triangulated,
+        options,
+        None,
+    )
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu_profiled_prefetch(
+    scorer: &WgpuModelScorer,
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+    options: PairEstimationOptions,
+    first_batches: Option<crate::two_view::TwoViewFirstBatchPrefetch>,
+) -> Result<(Option<PairGeometry>, WgpuGeometryTiming)> {
     let mut timing = WgpuGeometryTiming::default();
     let geometry = estimate_pair_geometry_with_options_and_cameras_impl(
         left_idx,
@@ -271,8 +307,166 @@ pub(crate) fn estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
         options,
         PairGeometryScoringBackend::Wgpu(scorer),
         Some(&mut timing),
+        first_batches,
     )?;
     Ok((geometry, timing))
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pregenerate_pair_two_view_first_batches_serial(
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+    options: PairEstimationOptions,
+) -> crate::two_view::TwoViewFirstBatchPrefetch {
+    let Some((
+        norm_left,
+        norm_right,
+        obs_left_px,
+        obs_right_px,
+        ray_left,
+        ray_right,
+        two_view_options,
+    )) = pair_two_view_ransac_inputs(
+        left_idx,
+        right_idx,
+        left,
+        right,
+        matches,
+        left_camera,
+        right_camera,
+        essential_threshold,
+        essential_iterations,
+        min_inliers,
+        min_triangulated,
+        options,
+    )
+    else {
+        return crate::two_view::TwoViewFirstBatchPrefetch::default();
+    };
+    crate::two_view::pregenerate_two_view_first_batches_serial(
+        &norm_left,
+        &norm_right,
+        &obs_left_px,
+        &obs_right_px,
+        Some(&ray_left),
+        Some(&ray_right),
+        left_camera,
+        right_camera,
+        &two_view_options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pair_two_view_ransac_inputs(
+    left_idx: usize,
+    right_idx: usize,
+    left: &ImageFrame,
+    right: &ImageFrame,
+    matches: &[Match],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    essential_threshold: f32,
+    essential_iterations: u32,
+    min_inliers: usize,
+    min_triangulated: usize,
+    options: PairEstimationOptions,
+) -> Option<(
+    Vec<[f32; 2]>,
+    Vec<[f32; 2]>,
+    Vec<[f32; 2]>,
+    Vec<[f32; 2]>,
+    Vec<[f64; 3]>,
+    Vec<[f64; 3]>,
+    TwoViewOptions,
+)> {
+    if matches.len() < min_inliers.max(8) {
+        return None;
+    }
+    let pose_matches = select_pose_matches(matches, left, options.max_pose_matches);
+    let mut norm_left = Vec::with_capacity(pose_matches.len());
+    let mut norm_right = Vec::with_capacity(pose_matches.len());
+    let mut obs_left_px = Vec::with_capacity(pose_matches.len());
+    let mut obs_right_px = Vec::with_capacity(pose_matches.len());
+    let mut ray_left = Vec::with_capacity(pose_matches.len());
+    let mut ray_right = Vec::with_capacity(pose_matches.len());
+    let mut valid = 0usize;
+    for m in &pose_matches {
+        let li = m.query_idx as usize;
+        let ri = m.train_idx as usize;
+        if li >= left.keypoints.len() || ri >= right.keypoints.len() {
+            continue;
+        }
+        let lk = &left.keypoints[li];
+        let rk = &right.keypoints[ri];
+        let Some(left_xy) = left_camera.cam_from_img_f32(lk.x(), lk.y()) else {
+            continue;
+        };
+        let Some(right_xy) = right_camera.cam_from_img_f32(rk.x(), rk.y()) else {
+            continue;
+        };
+        let Some(left_ray) = left_camera.cam_ray_from_img(lk.x() as f64, lk.y() as f64) else {
+            continue;
+        };
+        let Some(right_ray) = right_camera.cam_ray_from_img(rk.x() as f64, rk.y() as f64) else {
+            continue;
+        };
+        norm_left.push(left_xy);
+        norm_right.push(right_xy);
+        obs_left_px.push([lk.x(), lk.y()]);
+        obs_right_px.push([rk.x(), rk.y()]);
+        ray_left.push(left_ray);
+        ray_right.push(right_ray);
+        valid += 1;
+    }
+    if valid < min_inliers.max(8) {
+        return None;
+    }
+    let normalized_threshold =
+        mean_cam_from_img_threshold(left_camera, right_camera, essential_threshold as f64);
+    Some((
+        norm_left,
+        norm_right,
+        obs_left_px,
+        obs_right_px,
+        ray_left,
+        ray_right,
+        TwoViewOptions {
+            ransac_max_error_px: essential_threshold as f64,
+            ransac_threshold: normalized_threshold,
+            ransac_min_inlier_ratio: 0.25,
+            ransac_min_iterations: 100,
+            ransac_max_iterations: essential_iterations,
+            ransac_random_seed: options.ransac_random_seed,
+            random_seed: ((left_idx as u64) << 32) ^ right_idx as u64 ^ 0x243f_6a88_85a3_08d3,
+            loransac_num_lo_steps: 0,
+            min_inliers,
+            min_inlier_ratio: 0.0,
+            min_triangulated,
+            min_e_f_inlier_ratio: 0.95,
+            max_h_inlier_ratio: 0.8,
+            force_h_use: false,
+            multiple_models: false,
+            multiple_ignore_watermark: true,
+            detect_watermark: true,
+            watermark_min_inlier_ratio: 0.7,
+            watermark_border_size: 0.1,
+            watermark_detection_max_error_px: 4.0,
+            filter_stationary_matches: false,
+            stationary_matches_max_error_px: 4.0,
+            use_hartley_refinement: options.use_hartley_refinement,
+            use_five_point: options.use_five_point,
+        },
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -291,6 +485,7 @@ fn estimate_pair_geometry_with_options_and_cameras_impl(
     options: PairEstimationOptions,
     scoring_backend: PairGeometryScoringBackend<'_>,
     _gpu_timing: Option<&mut WgpuGeometryTiming>,
+    #[cfg(feature = "gpu-wgpu")] first_batches: Option<crate::two_view::TwoViewFirstBatchPrefetch>,
 ) -> Result<Option<PairGeometry>> {
     if matches.len() < min_inliers.max(8) {
         return Ok(None);
@@ -379,7 +574,7 @@ fn estimate_pair_geometry_with_options_and_cameras_impl(
         #[cfg(feature = "gpu-wgpu")]
         PairGeometryScoringBackend::Wgpu(scorer) => {
             let (estimate, timing) =
-                estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu_profiled(
+                crate::two_view::estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu_profiled_prefetch(
                     scorer,
                     &norm_left,
                     &norm_right,
@@ -390,6 +585,7 @@ fn estimate_pair_geometry_with_options_and_cameras_impl(
                     left_camera,
                     right_camera,
                     &two_view_options,
+                    first_batches,
                 )?;
             if let Some(total) = _gpu_timing {
                 *total += timing;

@@ -1274,22 +1274,71 @@ fn bogus_registered_camera_indices(
     reconstruction: &Reconstruction,
     config: &MapperConfig,
 ) -> Vec<usize> {
-    let mut indices = BTreeSet::new();
+    bogus_registered_camera_audits(reconstruction, config)
+        .into_iter()
+        .map(|audit| audit.camera_idx)
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct BogusCameraAudit {
+    pub(super) camera_idx: usize,
+    pub(super) summary: String,
+}
+
+pub(super) fn bogus_registered_camera_audits(
+    reconstruction: &Reconstruction,
+    config: &MapperConfig,
+) -> Vec<BogusCameraAudit> {
+    let mut audits = BTreeMap::new();
     for (image, pose) in reconstruction.poses.iter().enumerate() {
         if pose.is_none() {
             continue;
         }
         let camera = reconstruction.camera_for_image(image);
-        if camera_has_bogus_params(camera, config) {
-            let camera_idx = reconstruction
-                .image_camera_indices
-                .get(image)
-                .copied()
-                .unwrap_or(0);
-            indices.insert(camera_idx);
+        if !camera_has_bogus_params(camera, config) {
+            continue;
         }
+        let camera_idx = reconstruction
+            .image_camera_indices
+            .get(image)
+            .copied()
+            .unwrap_or(0);
+        audits.entry(camera_idx).or_insert_with(|| {
+            let camera_id = reconstruction
+                .camera_ids
+                .get(camera_idx)
+                .copied()
+                .unwrap_or(camera_idx as u32 + 1);
+            let reasons = camera.bogus_param_reasons(
+                config.min_focal_length_ratio,
+                config.max_focal_length_ratio,
+                config.max_extra_param,
+            );
+            let extra = colmap_camera_model_extra_idxs(camera.model_id)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|&idx| camera.params.get(idx))
+                .map(|value| format!("{value:.4}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            BogusCameraAudit {
+                camera_idx,
+                summary: format!(
+                    "{camera_idx}:id={camera_id} {} {}x{} fx={:.3} fy={:.3} cx={:.3} cy={:.3} extra=[{extra}] reasons={}",
+                    camera.model_name(),
+                    camera.width,
+                    camera.height,
+                    camera.fx,
+                    camera.fy,
+                    camera.cx,
+                    camera.cy,
+                    reasons.join("+")
+                ),
+            }
+        });
     }
-    indices.into_iter().collect()
+    audits.into_values().collect()
 }
 
 fn apply_image_camera(reconstruction: &mut Reconstruction, image: usize, camera: CameraModel) {
@@ -1616,7 +1665,11 @@ pub fn database_pair_matches_for_frames(
     Ok(out)
 }
 
-#[allow(dead_code)]
+const STORED_POSE_METRIC_CAP: usize = 128;
+// Pairs that already have a database pose do not need a 10k-iteration
+// five-point search when the stored pose misses the keep gate.
+const STORED_POSE_FALLBACK_ITERATIONS: u32 = 256;
+
 fn estimate_database_pair_geometries(
     frames: &[ImageFrame],
     cache: &DatabaseCache,
@@ -1625,67 +1678,370 @@ fn estimate_database_pair_geometries(
     reference_camera_setup: Option<&ReferenceCameraSetup>,
     config: &MapperConfig,
 ) -> Result<Vec<PairGeometry>> {
-    let pair_matches = database_pair_matches_for_frames(frames, cache)?;
+    let pair_refs = database_pair_refs_for_frames(frames, cache)?;
+    let stored_accepted = std::sync::atomic::AtomicUsize::new(0);
+    let stored_rejected = std::sync::atomic::AtomicUsize::new(0);
+    let no_geometry = std::sync::atomic::AtomicUsize::new(0);
+    let fallback_estimated = std::sync::atomic::AtomicUsize::new(0);
+    let pairs_done = std::sync::atomic::AtomicUsize::new(0);
+    // CPU-time sums across Rayon workers. Wall time is timing_pairs_ms.
+    let lookup_ns = std::sync::atomic::AtomicU64::new(0);
+    let metric_ns = std::sync::atomic::AtomicU64::new(0);
+    let fallback_ns = std::sync::atomic::AtomicU64::new(0);
+    let reject_config = std::sync::atomic::AtomicUsize::new(0);
+    let reject_support = std::sync::atomic::AtomicUsize::new(0);
+    let reject_error = std::sync::atomic::AtomicUsize::new(0);
+    let rescued_full = std::sync::atomic::AtomicUsize::new(0);
     let pairs = crate::execution::parallel(|| {
-        pair_matches
+        pair_refs
             .par_iter()
-            .filter_map(|pair| {
-                let left_camera = setup_camera_for_image(reference_camera_setup, pair.left, camera);
+            .filter_map(|pair_ref| {
+                let left_camera =
+                    setup_camera_for_image(reference_camera_setup, pair_ref.left, camera);
                 let right_camera =
-                    setup_camera_for_image(reference_camera_setup, pair.right, camera);
-                let stored_pair = (!config.ignore_database_two_view_poses)
-                    .then(|| {
-                        database_pair_geometry_from_stored_pose(
-                            pair,
+                    setup_camera_for_image(reference_camera_setup, pair_ref.right, camera);
+                if !config.ignore_database_two_view_poses {
+                    // pair_ref already resolved database image ids. Do not rebuild
+                    // a name→id map per pair — that is O(images × pairs).
+                    let lookup_start = Instant::now();
+                    let stored_geometry = stored_geometry_for_image_ids(
+                        pair_ref.left_image_id,
+                        pair_ref.right_image_id,
+                        stored_geometries,
+                    );
+                    lookup_ns.fetch_add(
+                        lookup_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if stored_geometry.is_none() {
+                        no_geometry.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Some(geometry) = stored_geometry {
+                        let metric_start = Instant::now();
+                        let stored_pair = database_pair_geometry_from_stored_geometry(
+                            pair_ref.left,
+                            pair_ref.right,
+                            &geometry,
                             frames,
-                            cache,
-                            stored_geometries,
                             left_camera,
                             right_camera,
                             config,
-                        )
-                    })
-                    .flatten();
-                stored_pair
-                    .filter(|pair| keep_pair_for_mapping(pair, config))
-                    .or_else(|| {
-                        let stored_geometry = stored_database_geometry_for_pair(
-                            pair,
-                            frames,
-                            cache,
-                            stored_geometries,
+                            None,
+                            STORED_POSE_METRIC_CAP,
                         );
-                        let mut estimated = estimate_pair_geometry_with_options_and_cameras(
-                            pair.left,
-                            pair.right,
-                            &frames[pair.left],
-                            &frames[pair.right],
-                            &pair.matches,
+                        let mut accepted = stored_pair
+                            .as_ref()
+                            .is_some_and(|pair| keep_stored_database_pair(pair, config));
+                        // A 128-inlier prefix can fail the triangulation gate when
+                        // later densified inliers still support the stored pose.
+                        let stored_pair = if accepted {
+                            stored_pair
+                        } else if let Some(full_pair) = database_pair_geometry_from_stored_geometry(
+                            pair_ref.left,
+                            pair_ref.right,
+                            &geometry,
+                            frames,
                             left_camera,
                             right_camera,
-                            config.essential_threshold_px,
-                            config.essential_iterations,
-                            config.min_inliers,
-                            config.min_triangulated,
-                            PairEstimationOptions {
-                                ransac_random_seed: config.random_seed,
-                                ..PairEstimationOptions::default()
-                            },
-                        )?;
-                        if let Some(geometry) = stored_geometry {
-                            estimated.two_view_config = geometry.config;
-                            estimated.f_matrix = geometry.f_matrix.or(estimated.f_matrix);
-                            estimated.e_matrix = geometry.e_matrix.or(estimated.e_matrix);
-                            estimated.h_matrix = geometry.h_matrix.or(estimated.h_matrix);
-                            keep_pair_for_mapping(&estimated, config).then_some(estimated)
+                            config,
+                            None,
+                            usize::MAX,
+                        ) {
+                            if keep_stored_database_pair(&full_pair, config) {
+                                rescued_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                accepted = true;
+                                Some(full_pair)
+                            } else {
+                                if let Some(pair) = stored_pair.as_ref() {
+                                    note_stored_pair_reject(
+                                        pair,
+                                        config,
+                                        &reject_config,
+                                        &reject_support,
+                                        &reject_error,
+                                    );
+                                }
+                                stored_pair
+                            }
                         } else {
-                            keep_pair_for_mapping(&estimated, config).then_some(estimated)
+                            if let Some(pair) = stored_pair.as_ref() {
+                                note_stored_pair_reject(
+                                    pair,
+                                    config,
+                                    &reject_config,
+                                    &reject_support,
+                                    &reject_error,
+                                );
+                            }
+                            stored_pair
+                        };
+                        metric_ns.fetch_add(
+                            metric_start.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if accepted {
+                            if let Some(stored_pair) = stored_pair {
+                                stored_accepted.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                note_pair_geometry_path_progress(
+                                    &pairs_done,
+                                    &stored_accepted,
+                                    &stored_rejected,
+                                    &no_geometry,
+                                    &fallback_estimated,
+                                    &lookup_ns,
+                                    &metric_ns,
+                                    &fallback_ns,
+                                    &reject_config,
+                                    &reject_support,
+                                    &reject_error,
+                                    &rescued_full,
+                                );
+                                return Some(stored_pair);
+                            }
                         }
-                    })
+                        stored_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                fallback_estimated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let fallback_start = Instant::now();
+                let matches = cache
+                    .correspondence_graph
+                    .extract_matches_between_images(pair_ref.left_image_id, pair_ref.right_image_id)
+                    .ok()
+                    .map(|matches| {
+                        matches
+                            .into_iter()
+                            .map(Into::into)
+                            .collect::<Vec<_>>()
+                    });
+                let Some(matches) = matches else {
+                    fallback_ns.fetch_add(
+                        fallback_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    return None;
+                };
+                let pair = DatabasePairMatches {
+                    left: pair_ref.left,
+                    right: pair_ref.right,
+                    matches,
+                };
+                let stored_geometry = stored_geometry_for_image_ids(
+                    pair_ref.left_image_id,
+                    pair_ref.right_image_id,
+                    stored_geometries,
+                );
+                let essential_iterations = if stored_geometry.is_some() {
+                    config
+                        .essential_iterations
+                        .min(STORED_POSE_FALLBACK_ITERATIONS)
+                } else {
+                    config.essential_iterations
+                };
+                let mut estimated = estimate_pair_geometry_with_options_and_cameras(
+                    pair.left,
+                    pair.right,
+                    &frames[pair.left],
+                    &frames[pair.right],
+                    &pair.matches,
+                    left_camera,
+                    right_camera,
+                    config.essential_threshold_px,
+                    essential_iterations,
+                    config.min_inliers,
+                    config.min_triangulated,
+                    PairEstimationOptions {
+                        ransac_random_seed: config.random_seed,
+                        ..PairEstimationOptions::default()
+                    },
+                )?;
+                if let Some(geometry) = stored_geometry {
+                    estimated.two_view_config = geometry.config;
+                    estimated.f_matrix = geometry.f_matrix.or(estimated.f_matrix);
+                    estimated.e_matrix = geometry.e_matrix.or(estimated.e_matrix);
+                    estimated.h_matrix = geometry.h_matrix.or(estimated.h_matrix);
+                }
+                let kept = keep_pair_for_mapping(&estimated, config).then_some(estimated);
+                fallback_ns.fetch_add(
+                    fallback_start.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                note_pair_geometry_path_progress(
+                    &pairs_done,
+                    &stored_accepted,
+                    &stored_rejected,
+                    &no_geometry,
+                    &fallback_estimated,
+                    &lookup_ns,
+                    &metric_ns,
+                    &fallback_ns,
+                    &reject_config,
+                    &reject_support,
+                    &reject_error,
+                    &rescued_full,
+                );
+                kept
             })
             .collect::<Vec<_>>()
     });
+    write_pair_geometry_path_progress(
+        &stored_accepted,
+        &stored_rejected,
+        &no_geometry,
+        &fallback_estimated,
+        &lookup_ns,
+        &metric_ns,
+        &fallback_ns,
+        &reject_config,
+        &reject_support,
+        &reject_error,
+        &rescued_full,
+    );
     Ok(pairs)
+}
+
+fn note_stored_pair_reject(
+    pair: &PairGeometry,
+    config: &MapperConfig,
+    reject_config: &std::sync::atomic::AtomicUsize,
+    reject_support: &std::sync::atomic::AtomicUsize,
+    reject_error: &std::sync::atomic::AtomicUsize,
+) {
+    let bucket = if matches!(
+        pair.two_view_config,
+        crate::database::COLMAP_TWO_VIEW_UNDEFINED
+            | crate::database::COLMAP_TWO_VIEW_DEGENERATE
+            | crate::database::COLMAP_TWO_VIEW_WATERMARK
+            | crate::database::COLMAP_TWO_VIEW_MULTIPLE
+    ) {
+        reject_config
+    } else if !pair.mean_reprojection_error_px.is_finite()
+        || pair.inliers < config.min_inliers
+        || pair.triangulated < config.min_triangulated
+    {
+        reject_support
+    } else {
+        reject_error
+    };
+    bucket.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_pair_geometry_path_progress(
+    pairs_done: &std::sync::atomic::AtomicUsize,
+    stored_accepted: &std::sync::atomic::AtomicUsize,
+    stored_rejected: &std::sync::atomic::AtomicUsize,
+    no_geometry: &std::sync::atomic::AtomicUsize,
+    fallback_estimated: &std::sync::atomic::AtomicUsize,
+    lookup_ns: &std::sync::atomic::AtomicU64,
+    metric_ns: &std::sync::atomic::AtomicU64,
+    fallback_ns: &std::sync::atomic::AtomicU64,
+    reject_config: &std::sync::atomic::AtomicUsize,
+    reject_support: &std::sync::atomic::AtomicUsize,
+    reject_error: &std::sync::atomic::AtomicUsize,
+    rescued_full: &std::sync::atomic::AtomicUsize,
+) {
+    let done = pairs_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if done % 2000 == 0 {
+        write_pair_geometry_path_progress(
+            stored_accepted,
+            stored_rejected,
+            no_geometry,
+            fallback_estimated,
+            lookup_ns,
+            metric_ns,
+            fallback_ns,
+            reject_config,
+            reject_support,
+            reject_error,
+            rescued_full,
+        );
+    }
+}
+
+fn write_pair_geometry_path_progress(
+    stored_accepted: &std::sync::atomic::AtomicUsize,
+    stored_rejected: &std::sync::atomic::AtomicUsize,
+    no_geometry: &std::sync::atomic::AtomicUsize,
+    fallback_estimated: &std::sync::atomic::AtomicUsize,
+    lookup_ns: &std::sync::atomic::AtomicU64,
+    metric_ns: &std::sync::atomic::AtomicU64,
+    fallback_ns: &std::sync::atomic::AtomicU64,
+    reject_config: &std::sync::atomic::AtomicUsize,
+    reject_support: &std::sync::atomic::AtomicUsize,
+    reject_error: &std::sync::atomic::AtomicUsize,
+    rescued_full: &std::sync::atomic::AtomicUsize,
+) {
+    let line = format!(
+        "pair_geometry_path stored_accepted={} stored_rejected={} no_geometry={} fallback={} reject_config={} reject_support={} reject_error={} rescued_full={} lookup_cpu_ms={:.1} metric_cpu_ms={:.1} fallback_cpu_ms={:.1}",
+        stored_accepted.load(std::sync::atomic::Ordering::Relaxed),
+        stored_rejected.load(std::sync::atomic::Ordering::Relaxed),
+        no_geometry.load(std::sync::atomic::Ordering::Relaxed),
+        fallback_estimated.load(std::sync::atomic::Ordering::Relaxed),
+        reject_config.load(std::sync::atomic::Ordering::Relaxed),
+        reject_support.load(std::sync::atomic::Ordering::Relaxed),
+        reject_error.load(std::sync::atomic::Ordering::Relaxed),
+        rescued_full.load(std::sync::atomic::Ordering::Relaxed),
+        lookup_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        metric_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        fallback_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+    );
+    eprintln!("{line}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if let Ok(path) = std::env::var("RUSTSFM_PAIR_PATH_LOG") {
+        let _ = std::fs::write(path, line);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DatabasePairRef {
+    left: usize,
+    right: usize,
+    left_image_id: crate::correspondence_graph::ImageId,
+    right_image_id: crate::correspondence_graph::ImageId,
+}
+
+fn database_pair_refs_for_frames(
+    frames: &[ImageFrame],
+    cache: &DatabaseCache,
+) -> Result<Vec<DatabasePairRef>> {
+    let frame_by_name = frames
+        .iter()
+        .enumerate()
+        .map(|(idx, frame)| (frame.name.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut out = Vec::new();
+    for pair_id in cache.correspondence_graph.image_pairs() {
+        let (image_id1, image_id2) = crate::correspondence_graph::pair_id_to_image_pair(pair_id)
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        let Some(image1) = cache.images.get(&image_id1) else {
+            continue;
+        };
+        let Some(image2) = cache.images.get(&image_id2) else {
+            continue;
+        };
+        let Some(&frame1) = frame_by_name.get(image1.name.as_str()) else {
+            continue;
+        };
+        let Some(&frame2) = frame_by_name.get(image2.name.as_str()) else {
+            continue;
+        };
+        let (left, right, left_image_id, right_image_id) = if frame1 <= frame2 {
+            (frame1, frame2, image_id1, image_id2)
+        } else {
+            (frame2, frame1, image_id2, image_id1)
+        };
+        out.push(DatabasePairRef {
+            left,
+            right,
+            left_image_id,
+            right_image_id,
+        });
+    }
+    out.sort_by_key(|pair| (pair.left, pair.right));
+    Ok(out)
 }
 
 fn stored_two_view_pose(geometry: &ColmapTwoViewGeometry) -> Option<SE3> {
@@ -1841,13 +2197,11 @@ fn database_image_ids_for_pair(
     Some((left_image_id, right_image_id))
 }
 
-fn stored_database_geometry_for_pair(
-    pair: &DatabasePairMatches,
-    frames: &[ImageFrame],
-    cache: &DatabaseCache,
+fn stored_geometry_for_image_ids(
+    left_image_id: crate::correspondence_graph::ImageId,
+    right_image_id: crate::correspondence_graph::ImageId,
     stored_geometries: &HashMap<ImagePairId, ColmapTwoViewGeometry>,
 ) -> Option<ColmapTwoViewGeometry> {
-    let (left_image_id, right_image_id) = database_image_ids_for_pair(pair, frames, cache)?;
     let pair_id =
         crate::correspondence_graph::image_pair_to_pair_id(left_image_id, right_image_id).ok()?;
     let mut geometry = stored_geometries.get(&pair_id)?.clone();
@@ -1855,6 +2209,16 @@ fn stored_database_geometry_for_pair(
         geometry.invert();
     }
     is_usable_stored_database_geometry(&geometry).then_some(geometry)
+}
+
+fn stored_database_geometry_for_pair(
+    pair: &DatabasePairMatches,
+    frames: &[ImageFrame],
+    cache: &DatabaseCache,
+    stored_geometries: &HashMap<ImagePairId, ColmapTwoViewGeometry>,
+) -> Option<ColmapTwoViewGeometry> {
+    let (left_image_id, right_image_id) = database_image_ids_for_pair(pair, frames, cache)?;
+    stored_geometry_for_image_ids(left_image_id, right_image_id, stored_geometries)
 }
 
 fn is_usable_stored_database_geometry(geometry: &ColmapTwoViewGeometry) -> bool {
@@ -2049,12 +2413,76 @@ fn database_pair_geometry_from_stored_pose(
     config: &MapperConfig,
 ) -> Option<PairGeometry> {
     let geometry = stored_database_geometry_for_pair(pair, frames, cache, stored_geometries)?;
+    database_pair_geometry_from_stored_geometry(
+        pair.left,
+        pair.right,
+        &geometry,
+        frames,
+        left_camera,
+        right_camera,
+        config,
+        // Prefer inliers for the match list — full densified matches are only
+        // needed when re-estimating pose, and cloning them dominates pairs_ms.
+        None,
+        STORED_POSE_METRIC_CAP,
+    )
+}
+
+fn database_pair_geometry_from_stored_pose_ref(
+    pair_ref: &DatabasePairRef,
+    frames: &[ImageFrame],
+    cache: &DatabaseCache,
+    stored_geometries: &HashMap<ImagePairId, ColmapTwoViewGeometry>,
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    config: &MapperConfig,
+) -> Option<PairGeometry> {
+    let pair_id = crate::correspondence_graph::image_pair_to_pair_id(
+        pair_ref.left_image_id,
+        pair_ref.right_image_id,
+    )
+    .ok()?;
+    let mut geometry = stored_geometries.get(&pair_id)?.clone();
+    if crate::correspondence_graph::should_swap_image_pair(
+        pair_ref.left_image_id,
+        pair_ref.right_image_id,
+    ) {
+        geometry.invert();
+    }
+    if !is_usable_stored_database_geometry(&geometry) {
+        return None;
+    }
+    let _ = cache; // cache reserved for future image-id validation parity
+    database_pair_geometry_from_stored_geometry(
+        pair_ref.left,
+        pair_ref.right,
+        &geometry,
+        frames,
+        left_camera,
+        right_camera,
+        config,
+        None,
+        STORED_POSE_METRIC_CAP,
+    )
+}
+
+fn database_pair_geometry_from_stored_geometry(
+    left: usize,
+    right: usize,
+    geometry: &ColmapTwoViewGeometry,
+    frames: &[ImageFrame],
+    left_camera: CameraModel,
+    right_camera: CameraModel,
+    config: &MapperConfig,
+    full_matches: Option<Vec<rustslam::Match>>,
+    metric_cap: usize,
+) -> Option<PairGeometry> {
     let inlier_matches = geometry
         .inlier_matches
         .iter()
         .filter(|match_| {
-            (match_.point2d_idx1 as usize) < frames[pair.left].keypoints.len()
-                && (match_.point2d_idx2 as usize) < frames[pair.right].keypoints.len()
+            (match_.point2d_idx1 as usize) < frames[left].keypoints.len()
+                && (match_.point2d_idx2 as usize) < frames[right].keypoints.len()
         })
         .map(|match_| rustslam::Match {
             query_idx: match_.point2d_idx1,
@@ -2065,29 +2493,41 @@ fn database_pair_geometry_from_stored_pose(
     if inlier_matches.len() < config.min_inliers {
         return None;
     }
-    let pose = stored_two_view_pose(&geometry)?;
+    let pose = stored_two_view_pose(geometry)?;
+    // Gate on a prefix of the stored inliers. Densify writes best-first, so the
+    // prefix mean matches the ungided acceptance check and does not force a
+    // full RANSAC fallback just because extra guided inliers raise the mean.
+    let metric_len = inlier_matches.len().min(metric_cap);
     let metrics = stored_pose_pair_metrics(
-        &inlier_matches,
-        &frames[pair.left],
-        &frames[pair.right],
+        &inlier_matches[..metric_len],
+        &frames[left],
+        &frames[right],
         pose,
         left_camera,
         right_camera,
     );
+    let inliers = inlier_matches.len();
+    let triangulated = if metric_len == 0 {
+        0
+    } else {
+        // Scale the sample so the triangulated gate still sees the full set.
+        metrics.triangulated.saturating_mul(inliers) / metric_len
+    };
+    let matches = full_matches.unwrap_or_else(|| inlier_matches.clone());
     Some(PairGeometry {
-        left: pair.left,
-        right: pair.right,
+        left,
+        right,
         two_view_config: geometry.config,
         f_matrix: geometry.f_matrix,
         e_matrix: geometry.e_matrix,
         h_matrix: geometry.h_matrix,
         qvec: geometry.qvec,
         tvec: geometry.tvec,
-        matches: pair.matches.clone(),
-        inlier_matches: metrics.inlier_matches,
+        matches,
+        inlier_matches,
         relative_pose: pose,
-        inliers: metrics.inliers,
-        triangulated: metrics.triangulated,
+        inliers,
+        triangulated,
         mean_reprojection_error_px: metrics.mean_reprojection_error_px,
         rotation_deg: relative_rotation_deg(pose, SE3::identity()),
         median_triangulation_angle_deg: metrics.median_triangulation_angle_deg,
@@ -2097,6 +2537,30 @@ fn database_pair_geometry_from_stored_pose(
 
 fn limited_indices(indices: &[usize], limit: usize) -> &[usize] {
     &indices[..indices.len().min(limit)]
+}
+
+fn keep_stored_database_pair(pair: &PairGeometry, config: &MapperConfig) -> bool {
+    // CLI maps Mapper.filter_max_reproj_error (default 4px) onto
+    // max_reprojection_error_px. That gate is for registered observations, not
+    // for deciding whether a verified database pose can skip five-point.
+    // Re-estimating every pair above 4px is what made 960 pairs_ms ~110s.
+    const STORED_POSE_MAX_REPROJ_PX: f32 = 8.0;
+    if matches!(
+        pair.two_view_config,
+        crate::database::COLMAP_TWO_VIEW_UNDEFINED
+            | crate::database::COLMAP_TWO_VIEW_DEGENERATE
+            | crate::database::COLMAP_TWO_VIEW_WATERMARK
+            | crate::database::COLMAP_TWO_VIEW_MULTIPLE
+    ) {
+        return false;
+    }
+    pair.mean_reprojection_error_px.is_finite()
+        && pair.inliers >= config.min_inliers
+        && pair.triangulated >= config.min_triangulated
+        && pair.mean_reprojection_error_px
+            <= config
+                .max_reprojection_error_px
+                .max(STORED_POSE_MAX_REPROJ_PX)
 }
 
 fn keep_pair_for_mapping(pair: &PairGeometry, config: &MapperConfig) -> bool {
@@ -2881,6 +3345,23 @@ pub fn run_incremental_pipeline(
     }
 }
 
+fn clone_reconstruction_for_rollback(reconstruction: &mut Reconstruction) -> Reconstruction {
+    // Keypoints are fixed after image load. A full clone recopied them on every
+    // registration even though rollback never mutates them.
+    let keypoints = std::mem::take(&mut reconstruction.keypoints);
+    let snapshot = reconstruction.clone();
+    reconstruction.keypoints = keypoints;
+    snapshot
+}
+
+fn restore_reconstruction_after_rollback(
+    reconstruction: &mut Reconstruction,
+    mut snapshot: Reconstruction,
+) {
+    snapshot.keypoints = std::mem::take(&mut reconstruction.keypoints);
+    *reconstruction = snapshot;
+}
+
 fn triangulate_registration_unit(
     triangulator: &mut IncrementalTriangulator<'_>,
     tri_options: &IncrementalTriangulatorOptions,
@@ -3298,6 +3779,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
     let mut fallback_available = true;
     while reconstruction.poses.iter().any(|p| p.is_none()) {
         events.checkpoint()?;
+        let next_image_start = Instant::now();
         let NextRegistrationSelection {
             choice,
             failed_attempts,
@@ -3316,6 +3798,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             &mut telemetry,
             pnp_scorer,
         )?;
+        telemetry.next_image_ms += next_image_start.elapsed().as_secs_f64() * 1000.0;
         events.checkpoint()?;
         let normal_attempted_candidates = !failed_attempts.is_empty();
         for (failed_image, mode) in failed_attempts {
@@ -3378,7 +3861,9 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             };
             choice
         };
-        let registration_snapshot = reconstruction.clone();
+        let snapshot_start = Instant::now();
+        let registration_snapshot = clone_reconstruction_for_rollback(&mut reconstruction);
+        telemetry.snapshot_ms += snapshot_start.elapsed().as_secs_f64() * 1000.0;
         let registration_log = format!(
             "register {} source={} pnp_inliers={} inlier_ratio={:.3} visible_points={} visible_ratio={:.3} mean_error={:.3} pair_rot_error={:.3}",
             frames[choice.image].name,
@@ -3510,6 +3995,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             SfmTaskOperation::LocalBundleAdjustment,
             SfmTaskEventKind::Started,
         );
+        let local_ba_start = Instant::now();
         let local_ba_report = refine_local_bundle_after_registration(
             frames,
             pairs,
@@ -3521,6 +4007,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             &local_registration_stats,
             &mut triangulation_state,
         );
+        telemetry.local_ba_ms += local_ba_start.elapsed().as_secs_f64() * 1000.0;
         events.emit_operation(
             SfmTaskStage::BundleAdjustment,
             SfmTaskOperation::LocalBundleAdjustment,
@@ -3535,7 +4022,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             config,
         );
         if let Some(reason) = rollback_reason {
-            reconstruction = registration_snapshot;
+            restore_reconstruction_after_rollback(&mut reconstruction, registration_snapshot);
             triangulation_state.sync_after_reconstruction_rollback(frames, pairs, &reconstruction);
             let mode = registration_mode_for_choice(&choice);
             let support = registration_unit_support(
@@ -3563,6 +4050,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         );
         fallback_available = true;
         filtered_units.remove(&registration_unit_key(&reconstruction, choice.image));
+        let filter_frames_start = Instant::now();
         let filtered_frames = filter_registered_frames(
             frames,
             pairs,
@@ -3572,6 +4060,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             Some(&mut filtered_units),
             &mut triangulation_state,
         );
+        telemetry.filter_frames_ms += filter_frames_start.elapsed().as_secs_f64() * 1000.0;
         debug_log.push(registration_log);
         if structureless_track_report.total_observations() > 0 {
             debug_log.push(format!(
@@ -4098,6 +4587,10 @@ struct IncrementalRegistrationTelemetry {
     pose_solve_refine_ms: f64,
     observation_update_ms: f64,
     triangulation_ms: f64,
+    next_image_ms: f64,
+    snapshot_ms: f64,
+    filter_frames_ms: f64,
+    local_ba_ms: f64,
     gpu_pnp_focal_fallbacks: Vec<String>,
 }
 
@@ -4112,7 +4605,7 @@ impl IncrementalRegistrationTelemetry {
 
     fn format_log(&self) -> String {
         format!(
-            "incremental_registration candidate_units={} skipped_unchanged={} structure_based_attempts={} structureless_attempts={} structureless_estimates={} structureless_accepted={} structureless_solver_ms={:.2} fallback_epochs={} collect_observations_ms={:.2} pose_solve_refine_ms={:.2} observation_update_ms={:.2} triangulation_ms={:.2} gpu_pnp_focal_fallback={}",
+            "incremental_registration candidate_units={} skipped_unchanged={} structure_based_attempts={} structureless_attempts={} structureless_estimates={} structureless_accepted={} structureless_solver_ms={:.2} fallback_epochs={} collect_observations_ms={:.2} pose_solve_refine_ms={:.2} observation_update_ms={:.2} triangulation_ms={:.2} next_image_ms={:.2} snapshot_ms={:.2} filter_frames_ms={:.2} local_ba_ms={:.2} gpu_pnp_focal_fallback={}",
             self.candidate_units,
             self.skipped_unchanged,
             self.structure_based_attempts,
@@ -4125,6 +4618,10 @@ impl IncrementalRegistrationTelemetry {
             self.pose_solve_refine_ms,
             self.observation_update_ms,
             self.triangulation_ms,
+            self.next_image_ms,
+            self.snapshot_ms,
+            self.filter_frames_ms,
+            self.local_ba_ms,
             self.gpu_pnp_focal_fallbacks.join("; "),
         )
     }
@@ -5200,7 +5697,7 @@ fn refine_initial_global_bundle(
     };
     let changed = filtered as f32 / observations_before.max(1) as f32;
     debug_log.push(format!(
-        "global_ba reason=initial round=1 size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed=0 merged=0 filtered={} filtered_frames={} changed={:.6} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}",
+        "global_ba reason=initial round=1 size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed=0 merged=0 filtered={} filtered_frames={} changed={:.6} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}{}",
         global_ba_size_tag(reconstruction, config),
         gauge_images,
         report.observations,
@@ -5220,7 +5717,8 @@ fn refine_initial_global_bundle(
         report.setup_ms,
         report.solve_ms,
         report.postprocess_ms,
-        report.elapsed_ms
+        report.elapsed_ms,
+        format_camera_reset_suffix(&report)
     ));
     if let Some(transform) = normalization {
         debug_log.push(format!(
@@ -5294,12 +5792,20 @@ fn refine_global_bundle_with_postprocessing_using_solver(
         return GlobalBaOutcome::not_attempted();
     }
 
+    let skip_scheduled_retriangulate =
+        reason == "scheduled" && global_ba_size_tag(reconstruction, config) == "large";
     let (pre_completed, pre_merged, retriangulated) = {
         let mut triangulator =
             IncrementalTriangulator::new(frames, pairs, reconstruction, triangulation_state);
         let completed = triangulator.complete_all_tracks(tri_options);
         let merged = triangulator.merge_all_tracks(tri_options);
-        let retriangulated = triangulator.retriangulate(tri_options);
+        // Retriangulation before every scheduled BA is O(tracks) and dominates
+        // dense guided reconstructions; keep it for initial/final quality closure.
+        let retriangulated = if skip_scheduled_retriangulate {
+            0
+        } else {
+            triangulator.retriangulate(tri_options)
+        };
         (completed, merged, retriangulated)
     };
     if pre_completed > 0 || pre_merged > 0 || retriangulated > 0 {
@@ -5310,7 +5816,7 @@ fn refine_global_bundle_with_postprocessing_using_solver(
     }
 
     let mut outcome = GlobalBaOutcome::not_attempted();
-    for round in 0..global_ba_max_refinements_for_reason(config, reason) {
+    for round in 0..global_ba_max_refinements_for_reason(config, reason, reconstruction) {
         let observations_before = reconstruction_num_observations(reconstruction);
         if observations_before == 0 {
             break;
@@ -5460,7 +5966,7 @@ fn refine_global_bundle_with_postprocessing_using_solver(
         };
         let changed = (completed + merged + filtered) as f32 / observations_before.max(1) as f32;
         debug_log.push(format!(
-            "global_ba reason={reason} round={} size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed={} merged={} filtered={} filtered_frames={} changed={:.6} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}",
+            "global_ba reason={reason} round={} size={} gauge_images={:?} observations={} residuals={} cost={:.6}->{:.6} iterations={}/{} termination={:?} termination_reason={:?} completed={} merged={} filtered={} filtered_frames={} changed={:.6} solver={:?} preconditioner={:?} sparse_backend={:?} setup_ms={:.2} solve_ms={:.2} postprocess_ms={:.2} ba_elapsed_ms={:.2}{}",
             round + 1,
             global_ba_size_tag(reconstruction, config),
             gauge_images,
@@ -5483,7 +5989,8 @@ fn refine_global_bundle_with_postprocessing_using_solver(
             report.setup_ms,
             report.solve_ms,
             report.postprocess_ms,
-            report.elapsed_ms
+            report.elapsed_ms,
+            format_camera_reset_suffix(&report)
         ));
         if let Some(transform) = normalization {
             debug_log.push(format!(
@@ -5496,7 +6003,9 @@ fn refine_global_bundle_with_postprocessing_using_solver(
             ));
         }
         outcome.complete_postprocessing();
-        if changed <= config.global_ba_max_refinement_change {
+        if changed
+            <= global_ba_max_refinement_change_for_reason(config, reason, observations_before)
+        {
             break;
         }
     }
@@ -5558,14 +6067,55 @@ pub(crate) fn global_ba_enabled(config: &MapperConfig) -> bool {
 // Scheduled BA recurs on model-growth thresholds, so repeated full refinements
 // have diminishing value before the next trigger. Keep the full configured
 // budget for initial/final quality closure and cap only intermediate passes.
-fn global_ba_max_refinements_for_reason(config: &MapperConfig, reason: &str) -> usize {
+// On dense guided tracks, each scheduled round at size=large is tens of seconds;
+// a second round rarely moves >0.5% of observations, so cap large scheduled to 1.
+fn global_ba_max_refinements_for_reason(
+    config: &MapperConfig,
+    reason: &str,
+    reconstruction: &Reconstruction,
+) -> usize {
     const MAX_SCHEDULED_REFINEMENTS: usize = 2;
+    const MAX_LARGE_SCHEDULED_REFINEMENTS: usize = 1;
     if reason == "scheduled" {
-        config
-            .global_ba_max_refinements
-            .min(MAX_SCHEDULED_REFINEMENTS)
+        let observations = reconstruction_num_observations(reconstruction);
+        // Second scheduled rounds above ~50k observations repeat a 3–15s solve
+        // and change <0.3% of observations. One round is enough before the next
+        // growth trigger.
+        let cap = if observations >= 50_000 {
+            MAX_LARGE_SCHEDULED_REFINEMENTS
+        } else if global_ba_size_tag(reconstruction, config) == "large" {
+            MAX_LARGE_SCHEDULED_REFINEMENTS
+        } else {
+            MAX_SCHEDULED_REFINEMENTS
+        };
+        config.global_ba_max_refinements.min(cap)
     } else {
         config.global_ba_max_refinements
+    }
+}
+
+// Final SparseSchur rounds on dense 960-frame scenes are ~150s each. Ungided
+// flowers2 stops after one round near changed≈0.0012; guided densify needs a
+// slightly looser gate (~0.5%) so one final solve can close without 2–3×150s.
+fn global_ba_max_refinement_change_for_reason(
+    config: &MapperConfig,
+    reason: &str,
+    observations: usize,
+) -> f32 {
+    const FINAL_MAX_REFINEMENT_CHANGE: f32 = 0.01;
+    // Dense scheduled second rounds on flowers2 change <0.3% and cost 3–15s each.
+    const DENSE_SCHEDULED_MAX_REFINEMENT_CHANGE: f32 = 0.006;
+    const DENSE_SCHEDULED_OBSERVATIONS: usize = 200_000;
+    if reason == "final" {
+        config
+            .global_ba_max_refinement_change
+            .max(FINAL_MAX_REFINEMENT_CHANGE)
+    } else if reason == "scheduled" && observations >= DENSE_SCHEDULED_OBSERVATIONS {
+        config
+            .global_ba_max_refinement_change
+            .max(DENSE_SCHEDULED_MAX_REFINEMENT_CHANGE)
+    } else {
+        config.global_ba_max_refinement_change
     }
 }
 
@@ -5606,8 +6156,13 @@ fn global_ba_redundant_point_ids(
     reconstruction: &Reconstruction,
 ) -> Option<Vec<usize>> {
     const MIN_NUM_REG_FRAMES_FOR_FAST_BA: usize = 10;
-    if !config.global_ba_ignore_redundant_points3d
-        || registered_frame_count(reconstruction) < MIN_NUM_REG_FRAMES_FOR_FAST_BA
+    // Dense guided reconstructions grow past COLMAP's default points_freq with
+    // many spatially redundant tracks. Auto-ignore those in BA once the model is
+    // already "large" so SparseSchur stays tractable without dropping dense
+    // output points from the reconstruction itself.
+    let ignore_redundant = config.global_ba_ignore_redundant_points3d
+        || global_ba_size_tag(reconstruction, config) == "large";
+    if !ignore_redundant || registered_frame_count(reconstruction) < MIN_NUM_REG_FRAMES_FOR_FAST_BA
     {
         return None;
     }
@@ -6041,7 +6596,12 @@ fn filter_registered_frames(
         }
         let unit = registration_unit_key(reconstruction, image);
         if !seen_units.insert(unit)
-            || !registered_unit_should_be_filtered(reconstruction, image, config)
+            || !registered_unit_should_be_filtered(
+                reconstruction,
+                image,
+                config,
+                triangulation_state.observation_manager(),
+            )
             || (config.fix_existing_frames
                 && registration_stats.is_existing_registration_unit(reconstruction, image))
         {
@@ -6072,7 +6632,11 @@ fn registered_unit_should_be_filtered(
     reconstruction: &Reconstruction,
     image: usize,
     config: &MapperConfig,
+    observation_manager: &ObservationManager,
 ) -> bool {
+    // The old scan walked every feature slot of every registered image after
+    // each registration (960 × ~8k × 958). The manager already keeps a
+    // per-image 3D visibility count, and the gate is only "any observation".
     let mut num_point3d_observations = 0usize;
     for frame_image in reconstruction.image_indices_for_registration_unit(image) {
         if reconstruction
@@ -6087,16 +6651,7 @@ fn registered_unit_should_be_filtered(
         if camera_has_bogus_params(reconstruction.camera_for_image(frame_image), config) {
             return true;
         }
-        num_point3d_observations += reconstruction
-            .observations
-            .get(frame_image)
-            .map(|observations| {
-                observations
-                    .iter()
-                    .filter(|point_id| point_id.is_some())
-                    .count()
-            })
-            .unwrap_or(0);
+        num_point3d_observations += observation_manager.num_visible_points3d(frame_image);
     }
     num_point3d_observations < 1
 }
@@ -12805,6 +13360,10 @@ mod tests {
             pose_solve_refine_ms: 2.5,
             observation_update_ms: 3.75,
             triangulation_ms: 4.5,
+            next_image_ms: 0.0,
+            snapshot_ms: 0.0,
+            filter_frames_ms: 0.0,
+            local_ba_ms: 0.0,
             gpu_pnp_focal_fallbacks: Vec::new(),
         };
 
@@ -15239,12 +15798,84 @@ mod tests {
             },
         );
 
-        assert!(report.is_err());
+        let skip = report.expect_err("bogus cameras should skip commit");
+        assert_eq!(skip.to_string(), "pre_bogus_cameras=[0]");
         assert_eq!(reconstruction.cameras[0].fx, original_camera.fx);
         assert_eq!(
             reconstruction.poses[1].unwrap().translation(),
             [1.0, 0.0, 0.0]
         );
+    }
+
+    #[test]
+    fn bogus_camera_audit_reports_focal_ratio_in_post_bogus_skip() {
+        let frames = vec![minimal_frame(0, "a.jpg")];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.cameras[0].set_fx(2000.0);
+        reconstruction.cameras[0].set_fy(2000.0);
+        reconstruction.camera = reconstruction.cameras[0];
+        let audits = bogus_registered_camera_audits(&reconstruction, &MapperConfig::default());
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].camera_idx, 0);
+        assert!(
+            audits[0].summary.contains("PINHOLE") && audits[0].summary.contains("focal("),
+            "{}",
+            audits[0].summary
+        );
+        let skip = BundleAdjustmentSkipReason::PostBogusCameras {
+            indices: vec![0],
+            audit: audits[0].summary.clone(),
+        };
+        let skip_text = skip.to_string();
+        assert!(
+            skip_text.starts_with("post_bogus_cameras=[0] audit=["),
+            "{skip_text}"
+        );
+        assert!(skip_text.contains("focal("), "{skip_text}");
+    }
+
+    #[test]
+    fn restore_bogus_cameras_keeps_other_ba_state() {
+        let frames = vec![minimal_frame(0, "a.jpg"), minimal_frame(1, "b.jpg")];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.poses[0] = Some(SE3::identity());
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(1.0, 0.0, 0.0),
+        ));
+        reconstruction.points.push(Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation {
+                image: 0,
+                feature: 0,
+            }],
+        });
+        let healthy = reconstruction.cameras[0];
+        let base_cameras = reconstruction.cameras.clone();
+        reconstruction.cameras[0].set_fx(2000.0);
+        reconstruction.cameras[0].set_fy(2000.0);
+        reconstruction.camera = reconstruction.cameras[0];
+        reconstruction.poses[1] = Some(SE3::from_quat_translation(
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(2.0, 0.0, 0.0),
+        ));
+        reconstruction.points[0].xyz = [9.0, 9.0, 9.0];
+
+        restore_bogus_cameras_from_snapshot(&mut reconstruction, healthy, &base_cameras, &[0]);
+
+        assert_eq!(reconstruction.cameras[0].fx, healthy.fx);
+        assert!(!camera_has_bogus_params(
+            reconstruction.cameras[0],
+            &MapperConfig::default()
+        ));
+        assert_eq!(
+            reconstruction.poses[1].unwrap().translation(),
+            [2.0, 0.0, 0.0]
+        );
+        assert_eq!(reconstruction.points[0].xyz, [9.0, 9.0, 9.0]);
     }
 
     #[test]
@@ -17144,22 +17775,31 @@ mod tests {
     #[test]
     fn scheduled_global_ba_caps_refinements_while_initial_and_final_keep_config() {
         let mut config = MapperConfig::default();
+        let reconstruction = test_reconstruction(&structureless_frames(3));
         config.global_ba_max_refinements = 5;
         assert_eq!(
-            global_ba_max_refinements_for_reason(&config, "scheduled"),
+            global_ba_max_refinements_for_reason(&config, "scheduled", &reconstruction),
             2
         );
-        assert_eq!(global_ba_max_refinements_for_reason(&config, "initial"), 5);
-        assert_eq!(global_ba_max_refinements_for_reason(&config, "final"), 5);
+        assert_eq!(
+            global_ba_max_refinements_for_reason(&config, "initial", &reconstruction),
+            5
+        );
+        assert_eq!(
+            global_ba_max_refinements_for_reason(&config, "final", &reconstruction),
+            5
+        );
 
         config.global_ba_max_refinements = 1;
         assert_eq!(
-            global_ba_max_refinements_for_reason(&config, "scheduled"),
+            global_ba_max_refinements_for_reason(&config, "scheduled", &reconstruction),
             1
         );
-        assert_eq!(global_ba_max_refinements_for_reason(&config, "final"), 1);
+        assert_eq!(
+            global_ba_max_refinements_for_reason(&config, "final", &reconstruction),
+            1
+        );
 
-        let reconstruction = test_reconstruction(&structureless_frames(3));
         config.global_ba_iterations = 50;
         assert_eq!(
             global_ba_iterations_for_reason(&config, &reconstruction, "scheduled"),
@@ -17173,6 +17813,30 @@ mod tests {
         assert_eq!(
             global_ba_iterations_for_reason(&config, &reconstruction, "scheduled"),
             10
+        );
+    }
+
+    #[test]
+    fn final_global_ba_uses_looser_refinement_change_gate() {
+        let mut config = MapperConfig::default();
+        config.global_ba_max_refinement_change = 0.0005;
+        assert_eq!(
+            global_ba_max_refinement_change_for_reason(&config, "scheduled", 0),
+            0.0005
+        );
+        assert_eq!(
+            global_ba_max_refinement_change_for_reason(&config, "initial", 0),
+            0.0005
+        );
+        assert_eq!(
+            global_ba_max_refinement_change_for_reason(&config, "final", 0),
+            0.01
+        );
+
+        config.global_ba_max_refinement_change = 0.02;
+        assert_eq!(
+            global_ba_max_refinement_change_for_reason(&config, "final", 0),
+            0.02
         );
     }
 
@@ -17509,7 +18173,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_database_pair_geometries_rejects_under_supported_stored_wide_baseline() -> Result<()>
+    fn estimate_database_pair_geometries_keeps_stored_wide_baseline_under_eight_px() -> Result<()>
     {
         let dir = tempdir()?;
         let db_path = dir.path().join("database.db");
@@ -17596,11 +18260,29 @@ mod tests {
             },
         )?;
 
-        assert!(pairs.is_empty());
+        // Stored-pose reuse uses an 8px floor, not the 1.0/1.8 mapping filter.
+        // This fixture's stored pose is under that floor, so it is kept instead
+        // of falling through to five-point.
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].mean_reprojection_error_px <= 8.0);
         Ok(())
     }
 
     #[test]
+    fn stored_pose_keep_uses_eight_px_floor_not_observation_filter() {
+        let mut pair = test_pair(0, 20, 60, 50, 12.0, [1.0, 0.0, 0.0]);
+        pair.mean_reprojection_error_px = 5.0;
+        let config = MapperConfig {
+            max_reprojection_error_px: 4.0,
+            min_inliers: 15,
+            min_triangulated: 4,
+            ..MapperConfig::default()
+        };
+        assert!(keep_stored_database_pair(&pair, &config));
+        pair.mean_reprojection_error_px = 9.0;
+        assert!(!keep_stored_database_pair(&pair, &config));
+    }
+
     fn stored_database_pair_rejects_high_reprojection_error() {
         let mut pair = test_pair(0, 20, 60, 50, 12.0, [1.0, 0.0, 0.0]);
         pair.mean_reprojection_error_px = 2.0;

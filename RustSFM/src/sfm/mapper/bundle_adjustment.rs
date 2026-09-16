@@ -459,7 +459,8 @@ pub(super) enum BundleAdjustmentSkipReason {
     SolverReturnedNone,
     AdmissionFailed(String),
     UnusableSolution(crate::ba::BundleAdjustmentReport),
-    PostBogusCameras(Vec<usize>),
+    #[allow(dead_code)] // retained so skip-reason Display/tests still cover the historical log form
+    PostBogusCameras { indices: Vec<usize>, audit: String },
 }
 
 impl fmt::Display for BundleAdjustmentSkipReason {
@@ -473,8 +474,12 @@ impl fmt::Display for BundleAdjustmentSkipReason {
             Self::UnusableSolution(report) => {
                 write!(f, "unusable_solution {}", report.brief_report())
             }
-            Self::PostBogusCameras(indices) => {
-                write!(f, "post_bogus_cameras={indices:?}")
+            Self::PostBogusCameras { indices, audit } => {
+                if audit.is_empty() {
+                    write!(f, "post_bogus_cameras={indices:?}")
+                } else {
+                    write!(f, "post_bogus_cameras={indices:?} audit=[{audit}]")
+                }
             }
         }
     }
@@ -501,7 +506,7 @@ pub(super) fn refine_bundle_adjustment_checked(
 
     let report = crate::ba::try_refine_bundle_adjustment(frames, reconstruction, options)
         .map_err(|error| BundleAdjustmentSkipReason::AdmissionFailed(format!("{error:#}")))?;
-    let Some(report) = report else {
+    let Some(mut report) = report else {
         restore_ba_state(
             reconstruction,
             base_camera,
@@ -521,16 +526,24 @@ pub(super) fn refine_bundle_adjustment_checked(
         );
         return Err(BundleAdjustmentSkipReason::UnusableSolution(report));
     }
-    let post_bogus = bogus_registered_camera_indices(reconstruction, config);
+    let post_bogus = bogus_registered_camera_audits(reconstruction, config);
     if !post_bogus.is_empty() {
-        restore_ba_state(
+        restore_bogus_cameras_from_snapshot(
             reconstruction,
             base_camera,
             &base_cameras,
-            &base_poses,
-            &base_points,
+            &post_bogus
+                .iter()
+                .map(|audit| audit.camera_idx)
+                .collect::<Vec<_>>(),
         );
-        return Err(BundleAdjustmentSkipReason::PostBogusCameras(post_bogus));
+        report.camera_reset_audit = Some(
+            post_bogus
+                .iter()
+                .map(|audit| audit.summary.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
     }
     sync_registered_frame_poses_from_images(reconstruction);
     Ok(report)
@@ -589,11 +602,46 @@ pub(super) fn restore_ba_state(
     poses: &[Option<SE3>],
     points: &[[f32; 3]],
 ) {
-    reconstruction.camera = camera;
-    reconstruction.cameras.clone_from_slice(cameras);
+    restore_ba_cameras(reconstruction, camera, cameras);
     reconstruction.poses.clone_from_slice(poses);
     for (point, xyz) in reconstruction.points.iter_mut().zip(points.iter()) {
         point.xyz = *xyz;
+    }
+}
+
+pub(super) fn restore_bogus_cameras_from_snapshot(
+    reconstruction: &mut Reconstruction,
+    base_camera: CameraModel,
+    base_cameras: &[CameraModel],
+    bogus_indices: &[usize],
+) {
+    for &idx in bogus_indices {
+        if let (Some(slot), Some(base)) =
+            (reconstruction.cameras.get_mut(idx), base_cameras.get(idx))
+        {
+            *slot = *base;
+        }
+    }
+    reconstruction.camera = reconstruction
+        .cameras
+        .first()
+        .copied()
+        .unwrap_or(base_camera);
+}
+
+fn restore_ba_cameras(
+    reconstruction: &mut Reconstruction,
+    camera: CameraModel,
+    cameras: &[CameraModel],
+) {
+    reconstruction.camera = camera;
+    reconstruction.cameras.clone_from_slice(cameras);
+}
+
+pub(super) fn format_camera_reset_suffix(report: &crate::ba::BundleAdjustmentReport) -> String {
+    match report.camera_reset_audit.as_deref() {
+        Some(audit) if !audit.is_empty() => format!(" camera_reset=[{audit}]"),
+        _ => String::new(),
     }
 }
 

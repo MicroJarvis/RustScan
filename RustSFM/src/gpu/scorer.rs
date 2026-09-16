@@ -451,13 +451,39 @@ impl WgpuModelScoringSession<'_> {
         threshold: f32,
         kind: TwoViewModelKind,
     ) -> Result<(Vec<GpuModelSupport>, GpuPackedMasks, WgpuModelScorerTiming)> {
+        let (supports, masks, timing, ()) =
+            self.score_two_view_models_with_masks_overlapping(models, threshold, kind, || ())?;
+        Ok((supports, masks, timing))
+    }
+
+    /// Like `score_two_view_models_with_masks_profiled`, but runs `overlap`
+    /// after the GPU copy is in flight and before the device wait. `overlap`
+    /// must not touch this session's scratch or submit GPU work on the same
+    /// device.
+    pub(crate) fn score_two_view_models_with_masks_overlapping<F, T>(
+        &self,
+        models: &[[f32; 9]],
+        threshold: f32,
+        kind: TwoViewModelKind,
+        overlap: F,
+    ) -> Result<(
+        Vec<GpuModelSupport>,
+        GpuPackedMasks,
+        WgpuModelScorerTiming,
+        T,
+    )>
+    where
+        F: FnOnce() -> T,
+    {
         validate_threshold(threshold)?;
         let model_count = u32::try_from(models.len()).context("GPU model count exceeds u32")?;
         if models.is_empty() {
+            let extra = overlap();
             return Ok((
                 Vec::new(),
                 GpuPackedMasks::from_words(Vec::new(), 0, self.observation_len)?,
                 WgpuModelScorerTiming::default(),
+                extra,
             ));
         }
         self.scorer.validate_dispatch_count(model_count, "model")?;
@@ -485,7 +511,7 @@ impl WgpuModelScoringSession<'_> {
         };
         let mut buffer_prepare_seconds = 0.0;
         let mut submit_seconds = 0.0;
-        let (supports, words, readback) =
+        let (supports, words, readback, extra) =
             self.with_session_scratch(models, &params, models.len(), mask_words, |scratch| {
                 let mut encoder = self.scorer.context.device().create_command_encoder(
                     &wgpu::CommandEncoderDescriptor {
@@ -508,11 +534,12 @@ impl WgpuModelScoringSession<'_> {
                 submit_seconds = submit_started.elapsed().as_secs_f64();
                 self.scorer
                     .context
-                    .read_two_buffers_profiled::<GpuModelSupport, u32>(
+                    .read_two_buffers_profiled_overlapping::<GpuModelSupport, u32, _, T>(
                         &scratch.summaries,
                         models.len(),
                         &scratch.mask,
                         mask_words,
+                        overlap,
                     )
             })??;
         let masks = GpuPackedMasks::from_words(words, models.len(), self.observation_len)?;
@@ -532,6 +559,7 @@ impl WgpuModelScoringSession<'_> {
                 readback_calls: readback.calls,
                 readback_bytes: readback.bytes,
             },
+            extra,
         ))
     }
 

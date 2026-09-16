@@ -88,6 +88,10 @@ struct ReconstructArgs {
     sift_force_covariant: bool,
     #[arg(long, default_value_t = false)]
     local_matching: bool,
+    /// Image-only reconstruct assigns one camera per image unless this is 1.
+    /// Matches COLMAP `ImageReader.single_camera`; extract already defaults to 1.
+    #[arg(long = "ImageReader.single_camera", default_value = "0")]
+    single_camera: i32,
     #[arg(long, default_value = "3")]
     local_window: usize,
     #[arg(long, default_value = "sequential")]
@@ -333,6 +337,8 @@ struct MatchFeaturesArgs {
     existing_match_batch_size: usize,
     #[arg(long, default_value = "-1")]
     random_seed: i32,
+    #[arg(long = "SiftMatching.guided_matching", default_value = "0")]
+    guided_matching: i32,
     #[arg(long)]
     output_json: Option<PathBuf>,
     #[arg(long, default_value = "info")]
@@ -763,6 +769,24 @@ mod tests {
             panic!("wrong command")
         };
         assert_eq!(args.database, PathBuf::from("database.db"));
+        assert_eq!(args.guided_matching, 0);
+    }
+
+    #[test]
+    fn native_match_features_parses_guided_matching() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "match-features",
+            "--database",
+            "database.db",
+            "--SiftMatching.guided_matching",
+            "1",
+        ])
+        .unwrap();
+        let Commands::MatchFeatures(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.guided_matching, 1);
     }
 
     #[test]
@@ -896,6 +920,26 @@ mod tests {
 
         assert_eq!(args.global_ba_images_ratio, 1.5);
         assert_eq!(args.global_ba_points_ratio, 1.5);
+        assert_eq!(args.single_camera, 0);
+    }
+
+    #[test]
+    fn reconstruct_parses_image_reader_single_camera() {
+        let cli = Cli::try_parse_from([
+            "rustsfm",
+            "reconstruct",
+            "--input",
+            "in",
+            "--output",
+            "out",
+            "--ImageReader.single_camera",
+            "1",
+        ])
+        .expect("reconstruct ImageReader.single_camera");
+        let Commands::Reconstruct(args) = cli.command else {
+            panic!("reconstruct command")
+        };
+        assert_eq!(args.single_camera, 1);
     }
 
     #[test]

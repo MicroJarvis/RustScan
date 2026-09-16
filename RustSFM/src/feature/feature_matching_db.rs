@@ -4,8 +4,6 @@ use crate::database::{
     ColmapDatabase, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint, ColmapTwoViewGeometry,
 };
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
-#[cfg(feature = "gpu-wgpu")]
-use crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu_profiled;
 use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions};
 use crate::gpu::WgpuGeometryTiming;
 #[cfg(feature = "gpu-wgpu")]
@@ -1124,35 +1122,104 @@ fn computed_match_pair_reports_for_inputs(
     let pairs = batch.iter().map(|pair| pair.indices()).collect::<Vec<_>>();
     #[cfg(feature = "gpu-wgpu")]
     {
+        let pair_estimation_options = PairEstimationOptions {
+            max_pose_matches: 0,
+            refine_sampson: !options.use_existing_matches,
+            ransac_random_seed: options.random_seed,
+            expand_dense_inliers: !options.use_existing_matches,
+            ..PairEstimationOptions::default()
+        };
+        let pregenerate = |left: usize, right: usize, matches: &[rustslam::Match]| {
+            crate::geometry::pregenerate_pair_two_view_first_batches_serial(
+                left,
+                right,
+                &frames[left],
+                &frames[right],
+                matches,
+                cameras[left],
+                cameras[right],
+                options.essential_threshold_px,
+                options.essential_iterations,
+                options.min_inliers,
+                options.min_triangulated,
+                pair_estimation_options,
+            )
+        };
         let mut reports = Vec::with_capacity(pairs.len());
         let mut gpu_descriptor_match_seconds = 0.0;
         let mut gpu_geometry_seconds = 0.0;
         let mut gpu_geometry_timing = WgpuGeometryTiming::default();
         let mut gpu_matcher_timing = WgpuSiftMatcherTiming::default();
-        for &(left, right) in &pairs {
-            let descriptor_started = Instant::now();
-            let (matches, pair_timing) = gpu_backend.matcher.match_descriptors_profiled(
-                &frames[left].sift.descriptors_u8,
-                &frames[right].sift.descriptors_u8,
-                &options.sift_matching,
-            )?;
-            gpu_descriptor_match_seconds += descriptor_started.elapsed().as_secs_f64();
-            gpu_matcher_timing += pair_timing;
+        if pairs.is_empty() {
+            return Ok(ComputedMatchPairBatch {
+                reports,
+                gpu_descriptor_match_seconds,
+                gpu_geometry_seconds,
+                gpu_geometry_timing,
+                gpu_matcher_timing,
+            });
+        }
+        let &(first_left, first_right) = &pairs[0];
+        let descriptor_started = Instant::now();
+        let (mut current_matches, first_timing) = gpu_backend.matcher.match_descriptors_profiled(
+            &frames[first_left].sift.descriptors_u8,
+            &frames[first_right].sift.descriptors_u8,
+            &options.sift_matching,
+        )?;
+        gpu_descriptor_match_seconds += descriptor_started.elapsed().as_secs_f64();
+        gpu_matcher_timing += first_timing;
+        for (pair_index, &(left, right)) in pairs.iter().enumerate() {
+            let mut first_batches = None;
+            let mut prefetch_seconds = 0.0;
+            let next_matches = if let Some(&(next_left, next_right)) = pairs.get(pair_index + 1) {
+                let descriptor_started = Instant::now();
+                let (matches, pair_timing, ()) =
+                    gpu_backend.matcher.match_descriptors_overlapping(
+                        &frames[next_left].sift.descriptors_u8,
+                        &frames[next_right].sift.descriptors_u8,
+                        &options.sift_matching,
+                        || {
+                            if first_batches.is_some() {
+                                return;
+                            }
+                            let started = Instant::now();
+                            first_batches = Some(pregenerate(left, right, &current_matches));
+                            prefetch_seconds = started.elapsed().as_secs_f64();
+                        },
+                    )?;
+                let descriptor_wall = descriptor_started.elapsed().as_secs_f64();
+                gpu_descriptor_match_seconds += (descriptor_wall - prefetch_seconds).max(0.0);
+                gpu_geometry_seconds += prefetch_seconds;
+                gpu_matcher_timing += pair_timing;
+                Some(matches)
+            } else {
+                None
+            };
+            if first_batches.is_none() {
+                let started = Instant::now();
+                first_batches = Some(pregenerate(left, right, &current_matches));
+                let extra = started.elapsed().as_secs_f64();
+                gpu_geometry_seconds += extra;
+            }
             let geometry_started = Instant::now();
             let (report, pair_geometry_timing) = estimate_existing_or_computed_pair_gpu_profiled(
                 &gpu_backend.scorer,
                 left,
                 right,
-                matches,
+                std::mem::take(&mut current_matches),
                 frames,
                 cameras,
                 options,
+                first_batches,
             )?;
             gpu_geometry_timing += pair_geometry_timing;
             if let Some(report) = report {
                 reports.push(report);
             }
             gpu_geometry_seconds += geometry_started.elapsed().as_secs_f64();
+            if let Some(matches) = next_matches {
+                current_matches = matches;
+            }
         }
         return Ok(ComputedMatchPairBatch {
             reports,
@@ -2110,7 +2177,7 @@ fn estimate_existing_or_computed_pair_gpu(
     options: &MatchFeaturesOptions,
 ) -> Result<Option<PairReportInput>> {
     estimate_existing_or_computed_pair_gpu_profiled(
-        scorer, left, right, matches, frames, cameras, options,
+        scorer, left, right, matches, frames, cameras, options, None,
     )
     .map(|(report, _)| report)
 }
@@ -2124,6 +2191,7 @@ fn estimate_existing_or_computed_pair_gpu_profiled(
     frames: &[ImageFrame],
     cameras: &[CameraModel],
     options: &MatchFeaturesOptions,
+    first_batches: Option<crate::two_view::TwoViewFirstBatchPrefetch>,
 ) -> Result<(Option<PairReportInput>, WgpuGeometryTiming)> {
     let min_matches_for_estimation = if options.use_existing_matches {
         options.min_inliers
@@ -2140,28 +2208,179 @@ fn estimate_existing_or_computed_pair_gpu_profiled(
             WgpuGeometryTiming::default(),
         ));
     }
-    let (geometry, timing) = estimate_pair_geometry_with_options_and_cameras_gpu_profiled(
-        scorer,
-        left,
-        right,
-        &frames[left],
-        &frames[right],
-        &matches,
-        cameras[left],
-        cameras[right],
-        options.essential_threshold_px,
-        options.essential_iterations,
-        options.min_inliers,
-        options.min_triangulated,
-        PairEstimationOptions {
-            max_pose_matches: 0,
-            refine_sampson: !options.use_existing_matches,
-            ransac_random_seed: options.random_seed,
-            expand_dense_inliers: !options.use_existing_matches,
-            ..PairEstimationOptions::default()
-        },
-    )?;
+    let (geometry, mut timing) =
+        crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu_profiled_prefetch(
+            scorer,
+            left,
+            right,
+            &frames[left],
+            &frames[right],
+            &matches,
+            cameras[left],
+            cameras[right],
+            options.essential_threshold_px,
+            options.essential_iterations,
+            options.min_inliers,
+            options.min_triangulated,
+            PairEstimationOptions {
+                max_pose_matches: 0,
+                refine_sampson: !options.use_existing_matches,
+                ransac_random_seed: options.random_seed,
+                expand_dense_inliers: !options.use_existing_matches,
+                ..PairEstimationOptions::default()
+            },
+            first_batches,
+        )?;
+    let mut matches = matches;
+    let mut geometry = geometry;
+    if options.sift_matching.guided_matching {
+        if let Some(pair) = geometry.as_ref() {
+            if let Some(f_matrix) = pair.f_matrix {
+                let guided = crate::sift::match_sift_guided_with_options(
+                    &frames[left].sift,
+                    &frames[right].sift,
+                    &f_matrix,
+                    &options.sift_matching,
+                );
+                let min_guided = if options.use_existing_matches {
+                    options.min_inliers
+                } else {
+                    options.min_num_matches
+                };
+                if guided.len() >= min_guided {
+                    // Fast path: densify under the already-accepted F without a
+                    // second full GPU RANSAC. Re-estimate only when the densified
+                    // Sampson inlier count does not beat the current model.
+                    let fundamental = nalgebra::Matrix3::from_row_slice(&f_matrix);
+                    let threshold_sq = (options.essential_threshold_px as f64).powi(2);
+                    let mut densified_inliers = Vec::with_capacity(guided.len());
+                    for m in &guided {
+                        let li = m.query_idx as usize;
+                        let ri = m.train_idx as usize;
+                        if li >= frames[left].keypoints.len() || ri >= frames[right].keypoints.len()
+                        {
+                            continue;
+                        }
+                        let lk = &frames[left].keypoints[li];
+                        let rk = &frames[right].keypoints[ri];
+                        let x1 = nalgebra::Vector3::new(lk.x() as f64, lk.y() as f64, 1.0);
+                        let x2 = nalgebra::Vector3::new(rk.x() as f64, rk.y() as f64, 1.0);
+                        let residual =
+                            crate::two_view::squared_sampson_error(&x1, &x2, &fundamental);
+                        if residual.is_finite() && residual <= threshold_sq {
+                            densified_inliers.push(m.clone());
+                        }
+                    }
+                    if densified_inliers.len() >= pair.inliers {
+                        // Bound densify growth so reconstruct merge/filter/pair
+                        // load stay tractable while still lifting weak pairs.
+                        let (guided_kept, densified_inliers) =
+                            cap_guided_densify_matches(guided, densified_inliers, pair.inliers);
+                        let mut densified = pair.clone();
+                        densified.matches = guided_kept.clone();
+                        densified.inlier_matches = densified_inliers;
+                        densified.inliers = densified.inlier_matches.len();
+                        matches = guided_kept;
+                        geometry = Some(densified);
+                    } else {
+                        let (refined, guided_timing) =
+                            crate::geometry::estimate_pair_geometry_with_options_and_cameras_gpu_profiled_prefetch(
+                                scorer,
+                                left,
+                                right,
+                                &frames[left],
+                                &frames[right],
+                                &guided,
+                                cameras[left],
+                                cameras[right],
+                                options.essential_threshold_px,
+                                options.essential_iterations,
+                                options.min_inliers,
+                                options.min_triangulated,
+                                PairEstimationOptions {
+                                    max_pose_matches: 0,
+                                    refine_sampson: !options.use_existing_matches,
+                                    ransac_random_seed: options.random_seed,
+                                    expand_dense_inliers: !options.use_existing_matches,
+                                    ..PairEstimationOptions::default()
+                                },
+                                None,
+                            )?;
+                        timing += guided_timing;
+                        if let Some(refined) = refined {
+                            if refined.inliers >= pair.inliers {
+                                let (guided_kept, capped_inliers) = cap_guided_densify_matches(
+                                    guided,
+                                    refined.inlier_matches.clone(),
+                                    pair.inliers,
+                                );
+                                let mut capped = refined;
+                                capped.matches = guided_kept.clone();
+                                capped.inlier_matches = capped_inliers;
+                                capped.inliers = capped.inlier_matches.len();
+                                matches = guided_kept;
+                                geometry = Some(capped);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok((Some((left, right, matches, geometry)), timing))
+}
+
+/// Keep densify from exploding reconstruct cost: allow growth vs the ungided
+/// model, but clamp absolute inliers / matches per pair.
+fn cap_guided_densify_matches(
+    guided: Vec<rustslam::Match>,
+    densified_inliers: Vec<rustslam::Match>,
+    baseline_inliers: usize,
+) -> (Vec<rustslam::Match>, Vec<rustslam::Match>) {
+    const MIN_CAP: usize = 768;
+    const ABS_CAP: usize = 1280;
+    let inlier_cap = baseline_inliers
+        .saturating_mul(2)
+        .max(MIN_CAP)
+        .min(ABS_CAP);
+    // Keep match list close to inlier set — reconstruct loads every match.
+    let match_cap = inlier_cap;
+
+    let mut inliers = densified_inliers;
+    if inliers.len() > inlier_cap {
+        inliers.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.query_idx.cmp(&b.query_idx))
+                .then_with(|| a.train_idx.cmp(&b.train_idx))
+        });
+        inliers.truncate(inlier_cap);
+    }
+
+    let mut matches = guided;
+    if matches.len() > match_cap {
+        matches.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.query_idx.cmp(&b.query_idx))
+                .then_with(|| a.train_idx.cmp(&b.train_idx))
+        });
+        matches.truncate(match_cap);
+    }
+
+    // Ensure every kept inlier is also present in the match list.
+    let match_keys: std::collections::HashSet<(u32, u32)> = matches
+        .iter()
+        .map(|m| (m.query_idx, m.train_idx))
+        .collect();
+    for m in &inliers {
+        if !match_keys.contains(&(m.query_idx, m.train_idx)) {
+            matches.push(m.clone());
+        }
+    }
+    (matches, inliers)
 }
 
 /// Build vocabulary-tree candidate pairs from the in-memory frame descriptors.

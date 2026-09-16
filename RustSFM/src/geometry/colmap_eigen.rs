@@ -259,20 +259,60 @@ pub fn partial_piv_lu_solve_10x10(lhs: &DMatrix<f64>, rhs: &DMatrix<f64>) -> Opt
         return None;
     }
 
+    let lhs_row_major = row_major_10x10(lhs)?;
+    let rhs_row_major = row_major_10x10(rhs)?;
+    let output = partial_piv_lu_solve_10x10_row_major(&lhs_row_major, &rhs_row_major)?;
+    Some(DMatrix::from_row_slice(10, 10, &output))
+}
+
+pub fn partial_piv_lu_solve_10x10_row_major(
+    lhs: &[f64; 100],
+    rhs: &[f64; 100],
+) -> Option<[f64; 100]> {
+    if lhs.iter().chain(rhs.iter()).any(|value| !value.is_finite()) {
+        return None;
+    }
+
     #[cfg(colmap_eigen)]
     {
-        let lhs_row_major = row_major(lhs)?;
-        let rhs_row_major = row_major(rhs)?;
         let mut output = [0.0f64; 100];
         let ok = unsafe {
             ffi::rustsfm_eigen_partial_piv_lu_solve_10x10(
-                lhs_row_major.as_ptr(),
-                rhs_row_major.as_ptr(),
+                lhs.as_ptr(),
+                rhs.as_ptr(),
                 output.as_mut_ptr(),
             )
         };
         if ok != 0 && output.iter().all(|value| value.is_finite()) {
-            return Some(DMatrix::from_row_slice(10, 10, &output));
+            return Some(output);
+        }
+    }
+
+    None
+}
+
+pub fn full_piv_right_nullspace_5x9(row_major_5x9: &[f64; 45]) -> Option<[[f64; 9]; 4]> {
+    if row_major_5x9.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+
+    #[cfg(colmap_eigen)]
+    {
+        let mut output = [0.0f64; 36];
+        let ok = unsafe {
+            ffi::rustsfm_eigen_full_piv_right_nullspace_9(
+                row_major_5x9.as_ptr(),
+                5,
+                4,
+                output.as_mut_ptr(),
+            )
+        };
+        if ok != 0 && output.iter().all(|value| value.is_finite()) {
+            let mut rows = [[0.0f64; 9]; 4];
+            for basis_col in 0..4 {
+                rows[basis_col].copy_from_slice(&output[basis_col * 9..basis_col * 9 + 9]);
+            }
+            return Some(rows);
         }
     }
 
@@ -307,6 +347,19 @@ fn row_major_9(a: &DMatrix<f64>) -> Option<Vec<f64>> {
         return None;
     }
     row_major(a)
+}
+
+fn row_major_10x10(a: &DMatrix<f64>) -> Option<[f64; 100]> {
+    if a.shape() != (10, 10) || a.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut row_major = [0.0f64; 100];
+    for row in 0..10 {
+        for col in 0..10 {
+            row_major[row * 10 + col] = a[(row, col)];
+        }
+    }
+    Some(row_major)
 }
 
 #[cfg(colmap_eigen)]

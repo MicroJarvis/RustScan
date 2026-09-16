@@ -56,7 +56,8 @@
 | R9 packed GPU SIFT distance | ✅ 交错验证完成，候选保留（2026-09-13） | CPU packing 为每个 descriptor 附加精确 `Σx²`，WGSL 使用 packed `dot4U8Packed` 计算 `‖q‖²+‖t‖²-2q·t`。flowers2 first48 baseline/candidate 各3轮，wall 中位数 63.80→41.64s（-34.7%），descriptor matching 39.82→17.04s（-57.2%），RSS 基本不变；6轮完整 pairs SHA-256 均为 `613a73f…97216`。focused、matching 30/30、完整 lib 760 passed/19 ignored。下一步只画像并优化 GPU geometry，不改 matching policy |
 | R10 geometry compute+copy 单提交 | ⛔ smoke 无收益，已回退（2026-09-13） | scorer 将 compute 与 readback copy command buffers 合为一次 queue submission；focused 3/3、pairs hash 不变，但 smoke wall 43.86s、geometry 25.80s，劣于相邻 packed-only 的约41.3/23.73s，E/F/H readback wait 几乎不变。源码已恢复，不做多轮、不重试 |
 | R11 bounded GPU geometry masks | ✅ 交错验证完成，候选保留（2026-09-13） | 每个64-trial decision window 按原 ordinal 即时预取最多4个当前 contender mask，CPU 仍逐候选重新比较/refine/update frontier。3×3 wall 中位数42.96→40.20s（-6.4%），geometry 25.63→22.87s（-10.8%），readback wait 15.31→13.19s；完整 pairs hash 一致。整窗口预取因严重过算已拒绝；batch failure 回到当前 candidate 的标量 GPU mask 并关闭本窗口 batching |
-| R14 geometry 融合 score+mask + 几何增长 batch | ✅ 交错验证完成，两项保留（2026-09-15） | first48 wall 43.42→26.06 s（−40%）、geometry 25.48→9.06 s（−64%）、同步点 10,352→2,789、mask_calls→0；12 轮 pairs digest 均 `fbe4acf5…1a32`；lib 774/19 ignored。见 R14 小节 |
+| R16 pair-level descriptor/geometry overlap | ✅ first48+960 质量门通过（2026-09-16） | 960 matching 1108→1094 s，digest `a4e8e8ec…2295c9`。描述子 kernel wait 未变。见 `output/pair_pipeline_r16_20260916/REPORT.md` |
+| R17 tiled GPU SIFT matcher | ✅ first48+960 质量门通过（2026-09-16） | 960 matching 1668→722 s（−57%），desc 669→196 s，digest `a4e8e8ec…2295c9`。见 `output/pair_pipeline_r17_20260916/REPORT.md` |
 | R12 geometry scorer session buffer 复用 | ⚠️ 目标指标改善但端到端不可证明（2026-09-13） | scorer session 复用 model/summary/mask/params buffer 与 bind group，按容量翻倍增长。逐位输出一致，focused 与完整 lib 763 passed/19 ignored 通过。scorer buffer_prepare 0.568→0.397s（-30%）、submit 0.152→0.091s（-40%），但 readback wait 13.13→13.20s 不变、wall 40.74→40.95s，收益被同步延迟完全掩盖。**本轮真正产出是瓶颈定位见 R12 小节，不作加速宣称** |
 
 | R8 GPU-only matching 测试/CI 迁移 | ✅ focused 门完成（2026-09-12） | 不保留 CPU matching fallback。`no-default-features` 改为最小编译门；matching/sequence/adaptive 集成门显式启用 `gpu-wgpu,vlfeat-sift`，Linux CI 安装 Mesa Vulkan。GPU session 测试按 feature gate 编译，旧 FIFO verifier 控制不再生成 trace 且不得改变 GPU 结果。no-default release check 通过；GPU matching 30/30、GPU integration 81 passed/1 ignored。完整默认 lib 门及真实 flowers2 尚待后续验证 |
@@ -160,7 +161,34 @@
 - cap 探测：8192/16384 同步点与 4096 完全相同（本数据集无 run 超过 7,680 trials），保留 4096（最小满收益 cap、最小投机浪费）。
 - 门禁：fmt/diff-check、clippy 警告集 ⊆ 基线（少 1）、GPU scorer + RANSAC focused 40/40、完整默认 lib **774 passed / 19 ignored**；新增真实 GPU 测试覆盖 1…713 观测数的字边界与多轮 64-lane pass。
 - 代价：readback 字节 E/F/H 每 run 20.9/16.6/26.1 → 97.5/61.9/108.3 MB，每同步延迟 1.3 → 1.5 ms；传输不是瓶颈，净收益为正。
-- **下一步**：960 帧复测确认（S1 中 essential 每 pair 超线性，增长 batch 应更有效）；然后 pair 级粗粒度 CPU/GPU 流水线（现 geometry 9 s 中 wait 4.25 s、候选生成 3.25 s 仍串行交替）。
+- **Task 1 复盘（960 已确认）**：matching 1668→1108 s，geometry wait 586→167 s，pairs digest 与 settlement 逐位相同。设备端 argmax 不再需要；64-trial 决策窗口不可扩大。
+- **R15 预取已回退**：同一 RANSAC 内预取下一批会改 sequential sampler，first48 82/461 two-view 行变化。overlapping readback API 保留；后续 pair 级重叠不得共用飞行中的 sampler。
+- **R16 pair 级重叠（first48 质量门已过）**：pair N+1 描述子 GPU wait 期间串行生成 pair N 的 E/F/H 首个 physical batch（独立 sampler，wait 内不用 Rayon）。first48 digest 仍为 `fbe4acf5…1a32`；matching 24.97 s（R14b 中位数 25.70 s，单轮）。960 待测。
+
+### R22：guided densify u8+Rayon（2026-09-16）
+
+**状态：first48 门通过；960 guided match+recon 进行中。** 报告：`output/pair_pipeline_r22_20260916/REPORT.md`。
+
+- 单一变量：`match_sift_guided_with_options` 在 DB/GPU 路径使用已有 `descriptors_u8`，避免每次极线候选把 float 描述子重新量化；forward/reverse 用 indexed Rayon；u8 路径在平方 L2 空间做 ratio/distance；保留 R21 的 F 下快速 densify（无二次 GPU RANSAC）。
+- first48：matching **16.998 s**（ungided 15.545 / 旧 guided 49.148），matches **488246**（与旧 guided 相同），points **40194**（ungided 17143，约 2.34×），recon **28.9 s**。
+- 预估 960 matching ≈ 782 s（相对 main retest 1668 s 约 0.47×），质量靠 densify 拉开；recon 墙钟待 960 实测（更密 track 可能抬高 BA）。
+- R21 final BA early-exit（changed≤0.0015）在相同 R20 matching.db 上：584 s / 437212 points，相对 main 仍非大幅度双胜。
+
+### R23：dense BA policy（2026-09-16）
+
+**状态：完成；960 guided reconstruct 1007s/852k。** 报告：`output/pair_pipeline_r23_20260916/REPORT.md`。final gate 0.005、large scheduled 1 round、size=large 自动 ignore-redundant。global BA 760→175s；recon 仍高于 main。
+
+### R24：capped guided densify（2026-09-16）
+
+**状态：first48 门通过；960 进行中。** 报告：`output/pair_pipeline_r24_20260916/REPORT.md`。每对 densify 上限 1280；跳过 large scheduled prepare retriangulate；final gate 0.008。first48：16.0s / 405939 matches / 34535 points / recon 20.8s。
+
+### R29–R30：stored-pose reuse and registration filter（2026-09-16）
+
+**状态：matching 与点数已大幅超过 main；reconstruct wall 仍只略快于 settlement，目标未完成。**
+
+- 前几轮 960 `pairs_ms≈110s` 不是 lookup miss。新 binary 计数：`no_geometry=175`，`stored_accepted=10174`，`stored_rejected=3545`，拒绝原因全是 stored mean error > 8px，随后 10000-iter five-point。把这类 fallback 限到 256 iter 后 `timing_pairs_ms=6.1s`。
+- R29 960（R24 matching.db，seed 1，threads 4）：recon **562.1s** / 960/960 / **594264** points。相对 settlement 599s 为 0.94×，相对 retest 699s 为 0.80×，点数 1.36×。scheduled round-2 已消失；final 一轮。
+- R30 把每帧全量 observation 扫描改成 observation manager 的 `num_visible_points3d`：`filter_frames_ms=0.44s`。总时间只到 **556.8s** / 595677 points。incremental 分段：`local_ba_ms=210s`，`next_image_ms=42s`，`triangulation_ms=37s`，`snapshot_ms=9s`。`sparse_maintenance`：complete 31s、merge 37s、filter 51s、delete 10s，frontier 约 11.5M。下一刀应减 local BA 后的 complete/merge/filter，不能靠丢掉 guided 点数换速度。
 
 ### B1：R7 后 flowers2 first48 对照基线（2026-09-10）
 
@@ -597,14 +625,13 @@ runtime `TaskReport`/`Event::Started` 同样提供 `queue_time`、`dependency_wa
 
 ## 独立质量问题：Global BA 回退
 
-`post_bogus_cameras` 不属于当前性能优化的直接结果，但必须单独跟踪。后续单独建立质量任务：
+`post_bogus_cameras` 不属于当前性能优化的直接结果。2026-09-16 独立调查（`output/post_bogus_repro_20260916/REPORT.md`）：
 
-1. 固定同一输入和随机种子；
-2. 记录 BA 前后 camera 参数范围；
-3. 记录哪个 camera 首先变成 bogus；
-4. 检查 gauge、focal 参数、归一化和 local/global BA 状态；
-5. 比较直接 Ceres、Taskflow Ceres 和 Mapper BA；
-6. 在修复前不要用最终模型点数或 BA 成功率作为性能优化的唯一正确性指标。
+- 历史触发面是 **image-only `--local-matching` 每图一个 PINHOLE**（flowers 24，`neon_corrected_*.json`），不是 flowers2 960 的共享相机 DB 路径。960 recon 无 post_bogus 行。
+- Mapper 在 Ceres 成功后若任一注册相机 `HasBogusParams`，会回滚 **整次** BA（pose+point+camera）。COLMAP IncrementalMapper 的 global BA 不会这样整包丢弃。
+- PINHOLE 不精化 extra / principal（默认），预期失败模式是 **focal ratio** 离开 `[0.1, 10]`。skip 日志现带 `audit=[idx:model fx=… reasons=focal(…)]`。
+- `reconstruct --ImageReader.single_camera` 已接线（默认 0，保持历史每图相机）。当前二进制 24 帧 image-only 复现须等 GPU matching 空闲，再与 `--ImageReader.single_camera 1` 对照。
+- **已改提交语义（待 24 帧确认）：** post-BA bogus 只把那些 camera 恢复到 BA 前快照，**保留 pose/point**；成功行带 `camera_reset=[…]`。pre-BA bogus 仍整次跳过。unit test：`restore_bogus_cameras_keeps_other_ba_state`。
 
 性能实验可以暂时以 pair metadata、pair-quality、注册率和资源清理作为回归门；质量修复应有自己的数值验收。
 

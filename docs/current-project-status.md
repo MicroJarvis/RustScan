@@ -1,6 +1,6 @@
 # RustScan Current Project Status
 
-**Updated:** 2026-09-15
+**Updated:** 2026-09-16
 **Branch:** `main`
 
 ## Overall
@@ -48,9 +48,9 @@ GPU f32 五点法实验（分支 `gpu-five-point-f32`，Q1–Q5b / P1–P3）已
 
 按顺序逐项执行，每项完成后 review 全方案再进入下一项；需要时重跑 960 帧全流程更新真实数字：
 
-1. **geometry scorer 同步点削减**（586 s）：设备端 argmax 去除独立 `mask_calls`、决策窗口扩大；单变量、逐位输出门（`tools/pair_output_hash.py`）、3×3 交错；48 帧 smoke 不够，按 96→192 升级验证（essential 每 pair 成本在 960 帧超线性）。
-2. **pair 级粗粒度 CPU 候选生成 / GPU 打分流水线**：pair N+1 的 CPU 生成与 pair N 的 GPU 打分重叠，线程内部串行；禁止细粒度 rayon hand-off（R13 已证毒化 `device.poll`）。
-3. **reconstruct**：核查 960 相机时 Ceres 线性求解器（48 帧为 Eigen DenseSchur；COLMAP >50 图切 SPARSE_SCHUR）；同 `matching.db` 三轮复现 599→699 s 是噪声还是回归。
-4. **`post_bogus_cameras` / BA 质量债**独立复现与修复（与性能实验分目录，不混轮）。
-5. **描述子匹配 GPU kernel**（643 s，算力瓶颈）：先做 kernel 级画像；或 pair 选择策略（需独立质量门）。
+1. **geometry scorer 同步点削减（R14，960 已确认）**：matching **1668→1108 s**（−33.6%），geometry 998→455 s，scorer wait 586→167 s，`mask_calls=0`，pairs digest 与 settlement **逐位相同** `a4e8e8ec…2295c9`。不再做设备端 argmax、不扩大 64-trial 决策窗口。报告 `output/flowers2_960_r14_20260915/REPORT.md`。
+2. **CPU/GPU 重叠（R16 保留）**：matching 1108→1094 s。R18 去掉 overlap 后 first48 15.57→19.46 s（拒绝）。R19 把 next-pair first-batch 塞进 essential scorer wait 后 first48 15.57→18.73 s（拒绝）。见 `output/pair_pipeline_r18_20260916/REPORT.md`、`output/pair_pipeline_r19_20260916/REPORT.md`。
+3. **reconstruct（R17 matching.db 复测）**：606.3 s / 960/960 / 437,186 points。仍在 settlement 599–retest 699 带内，未大幅度超过主 worktree。27 次 global BA：DenseSchur×11 → SparseSchur×16，solve 316 s。无 post_bogus / camera_reset。
+4. **`post_bogus_cameras` / BA 质量债**：post-BA 只回滚 bogus camera、保留 pose/point。24 帧 image-only 当前二进制：24/24、4239 points、`camera_reset=`×23、final BA 已提交、无 skip。报告 `output/post_bogus_repro_20260916/REPORT.md`。
+5. **描述子匹配 GPU kernel（R17）+ 五点法去堆分配（R20）**：matching **1668→715 s**（−57%），digest 仍 `a4e8e8ec…2295c9`。R20 essential cand-gen 215→200 s。报告 `output/pair_pipeline_r17_20260916/REPORT.md`、`output/pair_pipeline_r20_20260916/REPORT.md`。
 6. 继续 RustGS parity/TUM 质量闭环；维护 RustSFM CI 覆盖，需要时触发 flowers2 opt-in job。

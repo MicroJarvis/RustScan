@@ -350,6 +350,8 @@ pub struct BundleAdjustmentReport {
     pub covariance: Option<BundleAdjustmentCovariance>,
     pub termination_type: BundleAdjustmentTerminationType,
     pub termination_reason: BundleAdjustmentTerminationReason,
+    /// Present when post-BA cameras were reset to the pre-BA snapshot and poses/points were kept.
+    pub camera_reset_audit: Option<String>,
 }
 
 impl BundleAdjustmentReport {

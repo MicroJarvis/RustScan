@@ -55,6 +55,7 @@ fn run_reconstruct(args: ReconstructArgs) -> Result<()> {
         match_ratio: args.match_ratio,
         max_hamming_distance: args.max_hamming_distance,
         local_matching: args.local_matching,
+        single_camera: colmap_bool(args.single_camera, "ImageReader.single_camera")?,
         local_window: args.local_window,
         matching_pair_strategy,
         sift_matching: SiftMatchingOptions {
@@ -149,6 +150,9 @@ fn run_match_features(args: MatchFeaturesArgs) -> Result<()> {
     env_logger::Builder::new()
         .parse_filters(&args.log_level)
         .init();
+    let guided_matching = colmap_bool(args.guided_matching, "SiftMatching.guided_matching")?;
+    let mut sift_matching = sift_matching_from_args(args.match_ratio);
+    sift_matching.guided_matching = guided_matching;
     let report = match_features_to_database(
         &args.database,
         &MatchFeaturesOptions {
@@ -161,7 +165,7 @@ fn run_match_features(args: MatchFeaturesArgs) -> Result<()> {
                 args.sequential_loop_detection_period,
                 args.vocab_tree_num_images,
             ),
-            sift_matching: sift_matching_from_args(args.match_ratio),
+            sift_matching,
             min_num_matches: args.min_num_matches,
             min_inliers: args.min_num_matches,
             essential_threshold_px: args.essential_threshold_px,
@@ -411,6 +415,7 @@ fn run_colmap_mapper(args: ColmapMapperArgs) -> Result<()> {
         sift_domain_size_pooling: false,
         sift_force_covariant: false,
         local_matching: false,
+        single_camera: 0,
         local_window: 3,
         matching_strategy: "sequential".to_string(),
         sequential_overlap: 10,

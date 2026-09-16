@@ -397,6 +397,84 @@ impl CameraModel {
             || self.has_bogus_extra_params(max_extra_param)
     }
 
+    /// Human-readable reasons matching [`Self::has_bogus_params`], for BA skip audits.
+    pub fn bogus_param_reasons(
+        &self,
+        min_focal_length_ratio: f64,
+        max_focal_length_ratio: f64,
+        max_extra_param: f64,
+    ) -> Vec<String> {
+        let mut reasons = Vec::new();
+        let max_dim = self.width.max(self.height).max(1) as f64;
+        match colmap_camera_model_focal_idxs(self.model_id) {
+            None => reasons.push("focal(unknown_model)".to_string()),
+            Some(focal_idxs) => {
+                let mut parts = Vec::new();
+                for &idx in focal_idxs {
+                    if idx >= self.num_params {
+                        parts.push(format!("idx{idx}=oob"));
+                        continue;
+                    }
+                    let value = self.params[idx];
+                    if !value.is_finite() {
+                        parts.push(format!("idx{idx}=nonfinite"));
+                        continue;
+                    }
+                    let ratio = value / max_dim;
+                    if ratio < min_focal_length_ratio || ratio > max_focal_length_ratio {
+                        parts.push(format!("idx{idx}_ratio={ratio:.4}"));
+                    }
+                }
+                if !parts.is_empty() {
+                    reasons.push(format!("focal({})", parts.join(",")));
+                }
+            }
+        }
+        match colmap_camera_model_principal_point_idxs(self.model_id) {
+            None => reasons.push("principal(unknown_model)".to_string()),
+            Some([idx_x, idx_y]) => {
+                if idx_x >= self.num_params || idx_y >= self.num_params {
+                    reasons.push("principal(oob)".to_string());
+                } else {
+                    let cx = self.params[idx_x];
+                    let cy = self.params[idx_y];
+                    if !cx.is_finite()
+                        || !cy.is_finite()
+                        || cx < 0.0
+                        || cx > self.width as f64
+                        || cy < 0.0
+                        || cy > self.height as f64
+                    {
+                        reasons.push(format!("principal(cx={cx:.3},cy={cy:.3})"));
+                    }
+                }
+            }
+        }
+        let max_extra_param = max_extra_param.abs();
+        match colmap_camera_model_extra_idxs(self.model_id) {
+            None => reasons.push("extra(unknown_model)".to_string()),
+            Some(idxs) => {
+                let mut parts = Vec::new();
+                for &idx in idxs {
+                    if idx >= self.num_params {
+                        parts.push(format!("idx{idx}=oob"));
+                        continue;
+                    }
+                    let value = self.params[idx];
+                    if !value.is_finite() {
+                        parts.push(format!("idx{idx}=nonfinite"));
+                    } else if value.abs() > max_extra_param {
+                        parts.push(format!("idx{idx}={value:.4}"));
+                    }
+                }
+                if !parts.is_empty() {
+                    reasons.push(format!("extra({})", parts.join(",")));
+                }
+            }
+        }
+        reasons
+    }
+
     pub fn has_bogus_focal_length(
         &self,
         min_focal_length_ratio: f64,
@@ -1417,6 +1495,13 @@ mod tests {
 
         camera.params[4] = 1.25;
         assert!(camera.has_bogus_extra_params(1.0));
+        let extra_reasons = camera.bogus_param_reasons(0.1, 10.0, 1.0);
+        assert_eq!(extra_reasons, vec!["extra(idx4=1.2500)".to_string()]);
+
+        camera.params[4] = 0.1;
+        camera.params[0] = 50.0;
+        let focal_reasons = camera.bogus_param_reasons(0.1, 10.0, 1.0);
+        assert_eq!(focal_reasons, vec!["focal(idx0_ratio=0.0500)".to_string()]);
     }
 
     #[test]

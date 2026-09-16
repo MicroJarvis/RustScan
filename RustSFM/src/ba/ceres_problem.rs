@@ -482,6 +482,7 @@ pub fn solve_bundle_adjustment_ceres(
         covariance,
         termination_type,
         termination_reason,
+        camera_reset_audit: None,
     })
 }
 

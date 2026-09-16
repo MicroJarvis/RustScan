@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use lowe_sift::Descriptor;
+use rayon::prelude::*;
 use rustslam::{KeyPoint, Match};
 use std::collections::HashSet;
 
@@ -617,61 +618,100 @@ pub fn match_sift_guided_with_options(
     }
     let f = nalgebra::Matrix3::from_row_slice(f_matrix);
     let max_epipolar_error = options.max_guided_epipolar_error_px.max(0.0);
+    let max_ratio = options.max_ratio;
+    let max_distance = options.max_distance;
+    // Prefer pre-quantized u8 descriptors from the DB/GPU path. The float path
+    // re-quantizes on every candidate compare and dominates guided wall time.
+    let use_u8 = left.descriptors_u8.len() == left.keypoints.len()
+        && right.descriptors_u8.len() == right.keypoints.len();
+    let max_l2 = if use_u8 {
+        (max_distance * max_distance) * COLMAP_SIFT_DESCRIPTOR_NORM
+    } else {
+        f32::INFINITY
+    };
+    let max_ratio_sq = max_ratio * max_ratio;
 
-    let mut forward = Vec::new();
-    for (left_idx, (left_kp, left_desc)) in left
-        .keypoints
-        .iter()
-        .zip(left.descriptors.iter())
-        .enumerate()
-    {
-        let x1 = nalgebra::Vector3::new(left_kp.x() as f64, left_kp.y() as f64, 1.0);
-        let line2 = f * x1;
-        let mut best = None::<(u32, f32, f32)>;
-        let mut second_best = f32::INFINITY;
-        for (right_idx, right_kp) in right.keypoints.iter().enumerate() {
-            let err = epipolar_line_distance_px(
-                (right_kp.x(), right_kp.y()),
-                (line2.x, line2.y, line2.z),
-            );
-            if err > max_epipolar_error {
-                continue;
-            }
-            let distance = sift_pair_distance(left_desc, &right.descriptors[right_idx]);
-            if distance > options.max_distance {
-                continue;
-            }
-            match best {
-                Some((_, best_distance, _)) if distance >= best_distance => {
-                    if distance < second_best {
-                        second_best = distance;
+    let forward: Vec<Match> = (0..left.keypoints.len())
+        .into_par_iter()
+        .map(|left_idx| {
+            let left_kp = &left.keypoints[left_idx];
+            let x1 = nalgebra::Vector3::new(left_kp.x() as f64, left_kp.y() as f64, 1.0);
+            let line2 = f * x1;
+            let mut best = None::<(u32, f32)>;
+            let mut second_best = f32::INFINITY;
+            for (right_idx, right_kp) in right.keypoints.iter().enumerate() {
+                let err = epipolar_line_distance_px(
+                    (right_kp.x(), right_kp.y()),
+                    (line2.x, line2.y, line2.z),
+                );
+                if err > max_epipolar_error {
+                    continue;
+                }
+                let distance = if use_u8 {
+                    let l2 = colmap_uint8_l2_distance2(
+                        &left.descriptors_u8[left_idx],
+                        &right.descriptors_u8[right_idx],
+                    );
+                    if l2 > max_l2 {
+                        continue;
                     }
+                    l2
+                } else {
+                    let distance = sift_pair_distance(
+                        &left.descriptors[left_idx],
+                        &right.descriptors[right_idx],
+                    );
+                    if distance > max_distance {
+                        continue;
+                    }
+                    distance
+                };
+                match best {
+                    Some((_, best_distance)) if distance >= best_distance => {
+                        if distance < second_best {
+                            second_best = distance;
+                        }
+                    }
+                    Some((_, best_distance)) => {
+                        second_best = best_distance;
+                        best = Some((right_idx as u32, distance));
+                    }
+                    None => best = Some((right_idx as u32, distance)),
                 }
-                Some((_, best_distance, _)) => {
-                    second_best = best_distance;
-                    best = Some((right_idx as u32, distance, err));
-                }
-                None => best = Some((right_idx as u32, distance, err)),
             }
-        }
-        let Some((train_idx, best_distance, _)) = best else {
-            continue;
-        };
-        if second_best.is_finite() && best_distance >= options.max_ratio * second_best {
-            continue;
-        }
-        forward.push(Match {
-            query_idx: left_idx as u32,
-            train_idx,
-            distance: best_distance,
-        });
-    }
+            let (train_idx, best_distance) = best?;
+            let reject = if use_u8 {
+                second_best.is_finite() && best_distance >= max_ratio_sq * second_best
+            } else {
+                second_best.is_finite() && best_distance >= max_ratio * second_best
+            };
+            if reject {
+                return None;
+            }
+            let reported = if use_u8 {
+                colmap_normalized_distance(best_distance)
+            } else {
+                best_distance
+            };
+            Some(Match {
+                query_idx: left_idx as u32,
+                train_idx,
+                distance: reported,
+            })
+        })
+        .collect::<Vec<Option<Match>>>()
+        .into_iter()
+        .flatten()
+        .collect();
 
     if !options.cross_check {
+        let mut forward = forward;
         forward.sort_by(|a, b| {
             a.distance
                 .partial_cmp(&b.distance)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.query_idx.cmp(&b.query_idx))
+                .then_with(|| a.train_idx.cmp(&b.train_idx))
         });
         if options.max_num_matches > 0 && forward.len() > options.max_num_matches {
             forward.truncate(options.max_num_matches);
@@ -679,65 +719,85 @@ pub fn match_sift_guided_with_options(
         return forward;
     }
 
-    let mut reverse = Vec::new();
     let f_t = f.transpose();
-    for (right_idx, (right_kp, right_desc)) in right
-        .keypoints
-        .iter()
-        .zip(right.descriptors.iter())
-        .enumerate()
-    {
-        let x2 = nalgebra::Vector3::new(right_kp.x() as f64, right_kp.y() as f64, 1.0);
-        let line1 = f_t * x2;
-        let mut best = None::<(u32, f32)>;
-        let mut second_best = f32::INFINITY;
-        for (left_idx, left_kp) in left.keypoints.iter().enumerate() {
-            let err =
-                epipolar_line_distance_px((left_kp.x(), left_kp.y()), (line1.x, line1.y, line1.z));
-            if err > max_epipolar_error {
-                continue;
-            }
-            let distance = sift_pair_distance(right_desc, &left.descriptors[left_idx]);
-            if distance > options.max_distance {
-                continue;
-            }
-            match best {
-                Some((_, best_distance)) if distance >= best_distance => {
-                    if distance < second_best {
-                        second_best = distance;
+    let reverse: HashSet<(u32, u32)> = (0..right.keypoints.len())
+        .into_par_iter()
+        .filter_map(|right_idx| {
+            let right_kp = &right.keypoints[right_idx];
+            let x2 = nalgebra::Vector3::new(right_kp.x() as f64, right_kp.y() as f64, 1.0);
+            let line1 = f_t * x2;
+            let mut best = None::<(u32, f32)>;
+            let mut second_best = f32::INFINITY;
+            for (left_idx, left_kp) in left.keypoints.iter().enumerate() {
+                let err = epipolar_line_distance_px(
+                    (left_kp.x(), left_kp.y()),
+                    (line1.x, line1.y, line1.z),
+                );
+                if err > max_epipolar_error {
+                    continue;
+                }
+                let distance = if use_u8 {
+                    let l2 = colmap_uint8_l2_distance2(
+                        &right.descriptors_u8[right_idx],
+                        &left.descriptors_u8[left_idx],
+                    );
+                    if l2 > max_l2 {
+                        continue;
                     }
+                    l2
+                } else {
+                    let distance = sift_pair_distance(
+                        &right.descriptors[right_idx],
+                        &left.descriptors[left_idx],
+                    );
+                    if distance > max_distance {
+                        continue;
+                    }
+                    distance
+                };
+                match best {
+                    Some((_, best_distance)) if distance >= best_distance => {
+                        if distance < second_best {
+                            second_best = distance;
+                        }
+                    }
+                    Some((_, best_distance)) => {
+                        second_best = best_distance;
+                        best = Some((left_idx as u32, distance));
+                    }
+                    None => best = Some((left_idx as u32, distance)),
                 }
-                Some((_, best_distance)) => {
-                    second_best = best_distance;
-                    best = Some((left_idx as u32, distance));
-                }
-                None => best = Some((left_idx as u32, distance)),
             }
-        }
-        let Some((query_idx, best_distance)) = best else {
-            continue;
-        };
-        if second_best.is_finite() && best_distance >= options.max_ratio * second_best {
-            continue;
-        }
-        reverse.push((query_idx, right_idx as u32));
-    }
+            let (query_idx, best_distance) = best?;
+            let reject = if use_u8 {
+                second_best.is_finite() && best_distance >= max_ratio_sq * second_best
+            } else {
+                second_best.is_finite() && best_distance >= max_ratio * second_best
+            };
+            if reject {
+                return None;
+            }
+            Some((query_idx, right_idx as u32))
+        })
+        .collect();
 
-    let reverse_set: HashSet<(u32, u32)> = reverse.into_iter().collect();
     let mut matches = forward
         .into_iter()
-        .filter(|m| reverse_set.contains(&(m.query_idx, m.train_idx)))
+        .filter(|m| reverse.contains(&(m.query_idx, m.train_idx)))
         .collect::<Vec<_>>();
     matches.sort_by(|a, b| {
         a.distance
             .partial_cmp(&b.distance)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.query_idx.cmp(&b.query_idx))
+            .then_with(|| a.train_idx.cmp(&b.train_idx))
     });
     if options.max_num_matches > 0 && matches.len() > options.max_num_matches {
         matches.truncate(options.max_num_matches);
     }
     matches
 }
+
 
 fn epipolar_line_distance_px(point: (f32, f32), line: (f64, f64, f64)) -> f32 {
     let (a, b, c) = line;

@@ -9,6 +9,11 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 
 const MATCHING_SHADER: &str = include_str!("shaders/sift_matching.wgsl");
+/// Workgroup size in `sift_matching.wgsl`. Dispatch and the target tile must match.
+const MATCHING_WORKGROUP_SIZE: u32 = 64;
+const MATCHING_DESCRIPTOR_STRIDE: usize = 33;
+const MATCHING_TILE_WORDS: usize = MATCHING_WORKGROUP_SIZE as usize * MATCHING_DESCRIPTOR_STRIDE;
+const _: () = assert!(MATCHING_TILE_WORDS == 2112);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -138,13 +143,29 @@ impl WgpuSiftMatcher {
         targets: &[[u8; 128]],
         options: &SiftMatchingOptions,
     ) -> Result<(Vec<Match>, WgpuSiftMatcherTiming)> {
+        self.match_descriptors_overlapping(queries, targets, options, || ())
+            .map(|(matches, timing, _)| (matches, timing))
+    }
+
+    /// Matches descriptors, running `overlap` during each one-way GPU wait.
+    /// `overlap` must not submit GPU work against this device.
+    pub fn match_descriptors_overlapping<F: FnMut()>(
+        &self,
+        queries: &[[u8; 128]],
+        targets: &[[u8; 128]],
+        options: &SiftMatchingOptions,
+        mut overlap: F,
+    ) -> Result<(Vec<Match>, WgpuSiftMatcherTiming, ())> {
         options.check()?;
         if queries.is_empty() || targets.is_empty() {
-            return Ok((Vec::new(), WgpuSiftMatcherTiming::default()));
+            overlap();
+            return Ok((Vec::new(), WgpuSiftMatcherTiming::default(), ()));
         }
-        let (forward, mut timing) = self.match_one_way(queries, targets, options)?;
+        let (forward, mut timing) =
+            self.match_one_way_overlapping(queries, targets, options, &mut overlap)?;
         let mut matches = if options.cross_check {
-            let (reverse, reverse_timing) = self.match_one_way(targets, queries, options)?;
+            let (reverse, reverse_timing) =
+                self.match_one_way_overlapping(targets, queries, options, &mut overlap)?;
             timing += reverse_timing;
             let postprocess_started = Instant::now();
             let reverse_pairs = reverse
@@ -171,14 +192,15 @@ impl WgpuSiftMatcher {
             matches.truncate(options.max_num_matches);
         }
         timing.cpu_postprocess_seconds += postprocess_started.elapsed().as_secs_f64();
-        Ok((matches, timing))
+        Ok((matches, timing, ()))
     }
 
-    fn match_one_way(
+    fn match_one_way_overlapping<F: FnMut()>(
         &self,
         queries: &[[u8; 128]],
         targets: &[[u8; 128]],
         options: &SiftMatchingOptions,
+        overlap: F,
     ) -> Result<(Vec<Match>, WgpuSiftMatcherTiming)> {
         let query_count =
             u32::try_from(queries.len()).context("GPU SIFT query count exceeds u32")?;
@@ -253,16 +275,20 @@ impl WgpuSiftMatcher {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(query_count.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(query_count.div_ceil(MATCHING_WORKGROUP_SIZE), 1, 1);
         }
         let command_buffer = encoder.finish();
         let buffer_prepare_seconds = buffer_prepare_started.elapsed().as_secs_f64();
         let submit_started = Instant::now();
         self.context.queue().submit(Some(command_buffer));
         let submit_seconds = submit_started.elapsed().as_secs_f64();
-        let (candidates, readback) = self
+        let (candidates, readback, ()) = self
             .context
-            .read_buffer_profiled::<MatchCandidate>(&output, queries.len())?;
+            .read_buffer_profiled_overlapping::<MatchCandidate, _, _>(
+                &output,
+                queries.len(),
+                overlap,
+            )?;
         let postprocess_started = Instant::now();
         let matches = candidates
             .into_iter()

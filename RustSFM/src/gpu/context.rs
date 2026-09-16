@@ -128,15 +128,36 @@ impl WgpuContext {
         source: &wgpu::Buffer,
         element_count: usize,
     ) -> Result<(Vec<T>, WgpuReadbackTiming)> {
+        let (values, timing, ()) =
+            self.read_buffer_profiled_overlapping(source, element_count, || ())?;
+        Ok((values, timing))
+    }
+
+    /// Reads one buffer, running `overlap` after the copy is submitted and
+    /// mapped so CPU work can hide the device wait. `overlap` must not submit
+    /// GPU work against this device or reuse matcher/scorer scratch.
+    pub(crate) fn read_buffer_profiled_overlapping<T, F, R>(
+        &self,
+        source: &wgpu::Buffer,
+        element_count: usize,
+        overlap: F,
+    ) -> Result<(Vec<T>, WgpuReadbackTiming, R)>
+    where
+        T: Pod,
+        F: FnOnce() -> R,
+    {
         if element_count == 0 {
-            return Ok((Vec::new(), WgpuReadbackTiming::default()));
+            let extra = overlap();
+            return Ok((Vec::new(), WgpuReadbackTiming::default(), extra));
         }
         let byte_len = element_count
             .checked_mul(std::mem::size_of::<T>())
             .context("wgpu readback byte count overflow")?;
-        let (mut regions, timing) = self.read_regions_profiled(&[(source, byte_len)])?;
+        let pending = self.start_read_regions(&[(source, byte_len)])?;
+        let extra = overlap();
+        let (mut regions, timing) = self.finish_read_regions(pending)?;
         let values = decode_pod_region::<T>(&regions.remove(0));
-        Ok((values, timing))
+        Ok((values, timing, extra))
     }
 
     /// Reads the leading `element_count` elements of two buffers with one
@@ -148,6 +169,32 @@ impl WgpuContext {
         second: &wgpu::Buffer,
         second_count: usize,
     ) -> Result<(Vec<A>, Vec<B>, WgpuReadbackTiming)> {
+        let (first, second, timing, ()) = self.read_two_buffers_profiled_overlapping(
+            first,
+            first_count,
+            second,
+            second_count,
+            || (),
+        )?;
+        Ok((first, second, timing))
+    }
+
+    /// Reads two buffers, running `overlap` after the copy is submitted and
+    /// mapped so CPU work can hide the device wait. `overlap` must not submit
+    /// GPU work against this device or reuse scorer scratch.
+    pub(crate) fn read_two_buffers_profiled_overlapping<A, B, F, T>(
+        &self,
+        first: &wgpu::Buffer,
+        first_count: usize,
+        second: &wgpu::Buffer,
+        second_count: usize,
+        overlap: F,
+    ) -> Result<(Vec<A>, Vec<B>, WgpuReadbackTiming, T)>
+    where
+        A: Pod,
+        B: Pod,
+        F: FnOnce() -> T,
+    {
         let first_bytes = first_count
             .checked_mul(std::mem::size_of::<A>())
             .context("wgpu readback byte count overflow")?;
@@ -155,14 +202,17 @@ impl WgpuContext {
             .checked_mul(std::mem::size_of::<B>())
             .context("wgpu readback byte count overflow")?;
         if first_bytes == 0 && second_bytes == 0 {
-            return Ok((Vec::new(), Vec::new(), WgpuReadbackTiming::default()));
+            let extra = overlap();
+            return Ok((Vec::new(), Vec::new(), WgpuReadbackTiming::default(), extra));
         }
-        let (regions, timing) =
-            self.read_regions_profiled(&[(first, first_bytes), (second, second_bytes)])?;
+        let pending = self.start_read_regions(&[(first, first_bytes), (second, second_bytes)])?;
+        let extra = overlap();
+        let (regions, timing) = self.finish_read_regions(pending)?;
         Ok((
             decode_pod_region::<A>(&regions[0]),
             decode_pod_region::<B>(&regions[1]),
             timing,
+            extra,
         ))
     }
 
@@ -173,6 +223,11 @@ impl WgpuContext {
         &self,
         sources: &[(&wgpu::Buffer, usize)],
     ) -> Result<(Vec<Vec<u8>>, WgpuReadbackTiming)> {
+        let pending = self.start_read_regions(sources)?;
+        self.finish_read_regions(pending)
+    }
+
+    fn start_read_regions(&self, sources: &[(&wgpu::Buffer, usize)]) -> Result<PendingReadback> {
         let total_started = Instant::now();
         let alignment = wgpu::COPY_BUFFER_ALIGNMENT;
         let mut offsets = Vec::with_capacity(sources.len());
@@ -211,16 +266,34 @@ impl WgpuContext {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        let wait_started = Instant::now();
-        self.wait_for(submission)?;
-        let wait_seconds = wait_started.elapsed().as_secs_f64();
-        receiver
+        Ok(PendingReadback {
+            staging,
+            offsets,
+            receiver,
+            submission,
+            wait_started: Instant::now(),
+            copy_submit_seconds,
+            total_started,
+            map_decode_started,
+        })
+    }
+
+    fn finish_read_regions(
+        &self,
+        pending: PendingReadback,
+    ) -> Result<(Vec<Vec<u8>>, WgpuReadbackTiming)> {
+        self.wait_for(pending.submission)?;
+        let wait_seconds = pending.wait_started.elapsed().as_secs_f64();
+        pending
+            .receiver
             .recv()
             .context("wgpu readback callback was dropped")?
             .context("wgpu readback mapping failed")?;
 
+        let slice = pending.staging.slice(..);
         let mapped = slice.get_mapped_range();
-        let regions = offsets
+        let regions = pending
+            .offsets
             .iter()
             .map(|&(offset, bytes)| {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX);
@@ -229,20 +302,31 @@ impl WgpuContext {
             })
             .collect();
         drop(mapped);
-        staging.unmap();
-        let map_decode_seconds = map_decode_started.elapsed().as_secs_f64();
+        pending.staging.unmap();
+        let map_decode_seconds = pending.map_decode_started.elapsed().as_secs_f64();
         Ok((
             regions,
             WgpuReadbackTiming {
-                total_seconds: total_started.elapsed().as_secs_f64(),
-                copy_submit_seconds,
+                total_seconds: pending.total_started.elapsed().as_secs_f64(),
+                copy_submit_seconds: pending.copy_submit_seconds,
                 wait_seconds,
                 map_decode_seconds,
                 calls: 1,
-                bytes: offsets.iter().map(|&(_, bytes)| bytes).sum(),
+                bytes: pending.offsets.iter().map(|&(_, bytes)| bytes).sum(),
             },
         ))
     }
+}
+
+struct PendingReadback {
+    staging: wgpu::Buffer,
+    offsets: Vec<(u64, u64)>,
+    receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    submission: wgpu::SubmissionIndex,
+    wait_started: Instant,
+    copy_submit_seconds: f64,
+    total_started: Instant,
+    map_decode_started: Instant,
 }
 
 fn decode_pod_region<T: Pod>(bytes: &[u8]) -> Vec<T> {
