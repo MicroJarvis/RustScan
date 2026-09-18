@@ -5,6 +5,9 @@ struct Params {
     collect_actual_visibility: u32,
 }
 
+const STATUS_FORWARD_OVERFLOW: u32 = 1u;
+const STATUS_NON_FINITE_LOSS: u32 = 2u;
+
 @group(0) @binding(0) var<storage, read> transforms_grad: array<f32>;
 @group(0) @binding(1) var<storage, read> screen_grad_stats: array<f32>;
 @group(0) @binding(2) var<storage, read> sh_grad: array<f32>;
@@ -19,7 +22,8 @@ struct Params {
 @group(0) @binding(11) var<storage, read_write> num_observations: array<f32>;
 @group(0) @binding(12) var<storage, read_write> visible_observations: array<f32>;
 @group(0) @binding(13) var<storage, read_write> actual_visible_observations: array<f32>;
-@group(0) @binding(14) var<storage, read> params: Params;
+@group(0) @binding(14) var<storage, read> status: array<u32>;
+@group(0) @binding(15) var<storage, read> params: Params;
 
 fn abs_finite(value: f32) -> f32 {
     let abs_value = abs(value);
@@ -33,6 +37,10 @@ fn abs_finite(value: f32) -> f32 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.num_splats) {
+        return;
+    }
+    let flags = status[0];
+    if ((flags & (STATUS_FORWARD_OVERFLOW | STATUS_NON_FINITE_LOSS)) != 0u) {
         return;
     }
 

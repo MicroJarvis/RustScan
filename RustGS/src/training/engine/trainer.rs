@@ -191,6 +191,10 @@ pub struct WgpuTrainer {
     intersection_capacity: usize,
     device_status: DeviceTrainingStatus<GsBackendBase>,
     optimization_samples: OptimizationTimingSamples,
+    /// When set (tests only), forces forward capacity below the planned size so
+    /// overflow sticky flags can be exercised through `train_step`.
+    #[cfg(test)]
+    intersection_capacity_override: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -398,6 +402,8 @@ impl WgpuTrainer {
             intersection_capacity: 0,
             device_status: DeviceTrainingStatus::new(&device, 0),
             optimization_samples: OptimizationTimingSamples::default(),
+            #[cfg(test)]
+            intersection_capacity_override: None,
         }
     }
 
@@ -777,7 +783,13 @@ impl WgpuTrainer {
             );
         }
         self.optimizer
-            .step_device_splats(splats, transforms_grad, sh_grad, opacity_grad);
+            .step_device_splats(
+                splats,
+                transforms_grad,
+                sh_grad,
+                opacity_grad,
+                self.device_status.buffer().clone(),
+            );
         let optimizer_elapsed = if profile_step {
             let started = Instant::now();
             let _ = splats
@@ -1083,6 +1095,11 @@ impl WgpuTrainer {
     }
 
     fn intersection_capacity_for(&mut self, splat_count: usize, img_size: (u32, u32)) -> usize {
+        #[cfg(test)]
+        if let Some(capacity) = self.intersection_capacity_override {
+            self.intersection_capacity = capacity.max(1);
+            return self.intersection_capacity;
+        }
         let tile_bounds = crate::training::forward::calc_tile_bounds(img_size);
         let hard = crate::training::forward::hard_intersection_capacity(
             splat_count,
@@ -1203,6 +1220,7 @@ impl WgpuTrainer {
             sh_grad.clone(),
             visible.clone().inner(),
             accum,
+            self.device_status.buffer().clone(),
             use_actual_visibility,
             collect_actual_visibility_diagnostics,
         );
@@ -1646,7 +1664,9 @@ fn training_epoch_count(iterations: usize, frame_count: usize) -> usize {
 mod tests {
     use super::*;
     use crate::training::engine::splats::host_splats_to_device;
-    use crate::training::{TensorCheckpoint, TrainingCheckpoint, TrainingIdentity};
+    use crate::training::{
+        TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity,
+    };
     use burn::module::Param;
 
     #[test]
@@ -1780,6 +1800,7 @@ mod tests {
             Tensor::ones([3, 10], &trainer.device).mul_scalar(0.1),
             Tensor::ones([3, 4, 3], &trainer.device).mul_scalar(-0.2),
             Tensor::ones([3], &trainer.device).mul_scalar(0.3),
+            trainer.device_status.buffer().clone(),
         );
     }
 
@@ -2094,6 +2115,7 @@ mod tests {
             Tensor::ones([3, 10], &trainer.device).mul_scalar(0.1),
             Tensor::ones([3, 4, 3], &trainer.device).mul_scalar(-0.2),
             Tensor::ones([3], &trainer.device).mul_scalar(0.3),
+            trainer.device_status.buffer().clone(),
         );
         let checkpoint = trainer
             .checkpoint(
@@ -2179,5 +2201,210 @@ mod tests {
             TrainingError::InvalidInput(message)
                 if message.contains("transforms") && message.contains("[N, 10]")
         ));
+    }
+
+    async fn snapshot_mutation_state(
+        trainer: &WgpuTrainer,
+        splats: &DeviceSplats<GsDiffBackend>,
+    ) -> (
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        crate::training::AdamCheckpoint,
+        TopologyCheckpoint,
+        TrainingStatusSnapshot,
+        Vec<usize>,
+        Vec<usize>,
+    ) {
+        let transforms = splats
+            .transforms
+            .val()
+            .into_data_async()
+            .await
+            .expect("transforms")
+            .into_vec::<f32>()
+            .expect("f32");
+        let sh = splats
+            .sh_coeffs
+            .val()
+            .into_data_async()
+            .await
+            .expect("sh")
+            .into_vec::<f32>()
+            .expect("f32");
+        let opacity = splats
+            .raw_opacities
+            .val()
+            .into_data_async()
+            .await
+            .expect("opacity")
+            .into_vec::<f32>()
+            .expect("f32");
+        let adam = trainer
+            .optimizer
+            .checkpoint()
+            .await
+            .expect("adam checkpoint");
+        let topology = TopologyAccumulatorSet {
+            grad_2d: trainer.grad_2d_accum.clone(),
+            screen_grad_2d: trainer.screen_grad_2d_accum.clone(),
+            abs_grad_2d: trainer.abs_grad_2d_accum.clone(),
+            abs_pixel_grad_2d: trainer.abs_pixel_grad_2d_accum.clone(),
+            pixel_coverage: trainer.pixel_coverage_accum.clone(),
+            camera_depth: trainer.camera_depth_accum.clone(),
+            grad_color: trainer.grad_color_accum.clone(),
+            num_observations: trainer.num_observations.clone(),
+            visible_observations: trainer.visible_observations.clone(),
+            actual_visible_observations: trainer.actual_visible_observations.clone(),
+        }
+        .checkpoint(
+            &trainer.splat_birth_iterations,
+            &trainer.splat_invisible_windows,
+        )
+        .await
+        .expect("topology checkpoint");
+        let status = trainer.device_status.read().await.expect("status read");
+        (
+            transforms,
+            sh,
+            opacity,
+            adam,
+            topology,
+            status,
+            trainer.splat_birth_iterations.clone(),
+            trainer.splat_invisible_windows.clone(),
+        )
+    }
+
+    fn fault_injection_camera() -> GaussianCamera {
+        use crate::{Intrinsics, SE3};
+        GaussianCamera::new(
+            Intrinsics::new(8.0, 8.0, 4.0, 4.0, 8, 8),
+            SE3::new(&[0.0, 0.0, 0.0, 1.0], &[0.0, 0.0, 0.0]),
+        )
+    }
+
+    fn fault_injection_target(device: &GsDevice, fill: f32) -> Tensor<GsDiffBackend, 3> {
+        Tensor::<GsDiffBackend, 3>::full([8, 8, 3], fill, device)
+    }
+
+    fn fault_injection_config() -> TrainingConfig {
+        let mut config = trainer_checkpoint_config();
+        config.iterations = 4;
+        config.litegs.topology.refine_every = 10_000;
+        config.litegs.topology.opacity_reset_interval = 10_000;
+        config
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn train_step_nan_injection_with_read_loss_false_mutates_nothing() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let camera = fault_injection_camera();
+
+        let healthy = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                1,
+                1,
+                true,
+                false,
+            )
+            .await
+            .expect("healthy step");
+        assert!(healthy.is_none());
+
+        let before = snapshot_mutation_state(&trainer, &splats).await;
+        assert_eq!(before.5.committed_optimizer_steps, 1);
+
+        let poisoned = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, f32::NAN),
+                (8, 8),
+                2,
+                1,
+                true,
+                false,
+            )
+            .await
+            .expect("gated nan step returns Ok when loss is not sampled");
+        assert!(poisoned.is_none());
+
+        let after = snapshot_mutation_state(&trainer, &splats).await;
+        assert_eq!(after.0, before.0, "transforms must not change");
+        assert_eq!(after.1, before.1, "sh must not change");
+        assert_eq!(after.2, before.2, "opacity must not change");
+        assert_eq!(after.3, before.3, "adam state must not change");
+        assert_eq!(after.4, before.4, "topology accumulators must not change");
+        assert_eq!(after.6, before.6, "birth iterations must not change");
+        assert_eq!(after.7, before.7, "invisible windows must not change");
+        assert_eq!(after.5.committed_optimizer_steps, before.5.committed_optimizer_steps);
+        assert!(after.5.has_non_finite_loss());
+        assert_eq!(after.5.first_invalid_iteration, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn train_step_overflow_injection_with_read_loss_false_mutates_nothing() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let camera = fault_injection_camera();
+
+        let healthy = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                1,
+                1,
+                true,
+                false,
+            )
+            .await
+            .expect("healthy step");
+        assert!(healthy.is_none());
+
+        let before = snapshot_mutation_state(&trainer, &splats).await;
+        trainer.intersection_capacity_override = Some(1);
+
+        let overflowed = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                2,
+                1,
+                true,
+                false,
+            )
+            .await
+            .expect("gated overflow step returns Ok when loss is not sampled");
+        assert!(overflowed.is_none());
+
+        let after = snapshot_mutation_state(&trainer, &splats).await;
+        assert_eq!(after.0, before.0, "transforms must not change");
+        assert_eq!(after.1, before.1, "sh must not change");
+        assert_eq!(after.2, before.2, "opacity must not change");
+        assert_eq!(after.3, before.3, "adam state must not change");
+        assert_eq!(after.4, before.4, "topology accumulators must not change");
+        assert_eq!(after.6, before.6);
+        assert_eq!(after.7, before.7);
+        assert_eq!(after.5.committed_optimizer_steps, before.5.committed_optimizer_steps);
+        assert!(after.5.has_forward_overflow());
+        assert_eq!(after.5.first_invalid_iteration, 2);
     }
 }

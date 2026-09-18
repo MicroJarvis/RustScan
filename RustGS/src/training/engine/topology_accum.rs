@@ -187,6 +187,7 @@ pub(crate) trait TopologyAccumBackend: Backend {
         num_observations: Self::FloatTensorPrimitive,
         visible_observations: Self::FloatTensorPrimitive,
         actual_visible_observations: Self::FloatTensorPrimitive,
+        status: Self::IntTensorPrimitive,
         use_actual_visibility: bool,
         collect_actual_visibility: bool,
     ) -> TopologyAccumulatorSet<Self>;
@@ -213,6 +214,7 @@ where
         num_observations: Self::FloatTensorPrimitive,
         visible_observations: Self::FloatTensorPrimitive,
         actual_visible_observations: Self::FloatTensorPrimitive,
+        status: Self::IntTensorPrimitive,
         use_actual_visibility: bool,
         collect_actual_visibility: bool,
     ) -> TopologyAccumulatorSet<Self> {
@@ -230,6 +232,7 @@ where
         let num_observations = into_contiguous(num_observations);
         let visible_observations = into_contiguous(visible_observations);
         let actual_visible_observations = into_contiguous(actual_visible_observations);
+        let status = into_contiguous(status);
 
         let num_splats = transforms_grad.shape()[0];
         if num_splats > 0 {
@@ -265,6 +268,7 @@ where
                     num_observations.handle.clone().binding(),
                     visible_observations.handle.clone().binding(),
                     actual_visible_observations.handle.clone().binding(),
+                    status.handle.binding(),
                     params_handle.binding(),
                 ]),
             );
@@ -298,6 +302,7 @@ pub(crate) fn accumulate_topology_stats<B: TopologyAccumBackend>(
     sh_grad: Tensor<B, 3>,
     visible: Tensor<B, 1>,
     accum: TopologyAccumulatorSet<B>,
+    status: Tensor<B, 1, Int>,
     use_actual_visibility: bool,
     collect_actual_visibility: bool,
 ) -> TopologyAccumulatorSet<B> {
@@ -316,6 +321,7 @@ pub(crate) fn accumulate_topology_stats<B: TopologyAccumBackend>(
         accum.num_observations.into_primitive().tensor(),
         accum.visible_observations.into_primitive().tensor(),
         accum.actual_visible_observations.into_primitive().tensor(),
+        status.into_primitive(),
         use_actual_visibility,
         collect_actual_visibility,
     )
@@ -441,5 +447,50 @@ mod tests {
         let mut invisible_mismatch = checkpoint_fixture();
         invisible_mismatch.splat_invisible_windows.pop();
         assert!(restore_error(&invisible_mismatch, &device).contains("splat_invisible_windows"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn topology_accumulate_gate_preserves_sentinel_accumulators() {
+        use crate::training::engine::{
+            DeviceTrainingStatus, TrainingStatusSnapshot, STATUS_NON_FINITE_LOSS,
+        };
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 3);
+        status.set_host_snapshot(TrainingStatusSnapshot {
+            flags: STATUS_NON_FINITE_LOSS,
+            first_invalid_iteration: 2,
+            requested_intersections: 0,
+            intersection_capacity: 0,
+            committed_optimizer_steps: 3,
+            mutation_gate: 1,
+        });
+
+        let sentinel = accumulator_fixture(&device);
+        let before = sentinel
+            .checkpoint(&[0, 1, 2], &[0, 1, 2])
+            .await
+            .expect("sentinel checkpoint");
+
+        let transforms_grad = Tensor::<GsBackendBase, 2>::ones([3, 10], &device);
+        let screen_grad_stats = Tensor::<GsBackendBase, 2>::ones([3, 7], &device);
+        let sh_grad = Tensor::<GsBackendBase, 3>::ones([3, 4, 3], &device);
+        let visible = Tensor::<GsBackendBase, 1>::ones([3], &device);
+
+        let updated = accumulate_topology_stats(
+            transforms_grad,
+            screen_grad_stats,
+            sh_grad,
+            visible,
+            sentinel,
+            status.buffer().clone(),
+            false,
+            true,
+        );
+        let after = updated
+            .checkpoint(&[0, 1, 2], &[0, 1, 2])
+            .await
+            .expect("gated checkpoint");
+        assert_eq!(after, before);
     }
 }

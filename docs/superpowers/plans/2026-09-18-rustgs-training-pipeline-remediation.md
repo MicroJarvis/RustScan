@@ -107,11 +107,11 @@ word 0 为 sticky flags；word 1 为首次异常 iteration（初始 `u32::MAX`�
 
 新增 `prepare_optimizer_step.wgsl`：读取 status flags，健康时将 word 5 设为 1 并把 word 4 加一；异常时设为 0 且不加 step。Adam 三组参数 kernel 都读取 word 5/4；gate=0 立即 return，不写 param/moment，gate=1 使用同一 committed step 做 bias correction。无 scaling 的路径也必须走 gated kernel。Topology accumulator 在每个写入前检查 flags。
 
-- [ ] 用非零 param/moment、step=7 写异常 gate 测试，验证参数、moment、step 全不变。
-- [ ] 用非零哨兵 accumulator 写 topology gate 测试。
-- [ ] 增加真实 `train_step` 故障注入：第 2 step、`read_loss=false` 注入 NaN，checkpoint 前后比较全部 state。
-- [ ] 增加小 capacity overflow 故障注入，断言同样不变。
-- [ ] 运行 GPU library、integration、checkpoint tests，提交 `fix(rustgs): gate optimizer and topology mutations on device`。
+- [x] 用非零 param/moment、step=7 写异常 gate 测试，验证参数、moment、step 全不变。
+- [x] 用非零哨兵 accumulator 写 topology gate 测试。
+- [x] 增加真实 `train_step` 故障注入：第 2 step、`read_loss=false` 注入 NaN，checkpoint 前后比较全部 state。
+- [x] 增加小 capacity overflow 故障注入，断言同样不变。
+- [x] 运行 GPU library、integration、checkpoint tests，提交 `fix(rustgs): gate optimizer and topology mutations on device`。
 
 ## Task 1.5：集中 host 安全点
 

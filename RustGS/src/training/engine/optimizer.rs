@@ -1,7 +1,6 @@
 use burn::module::Param;
 use burn::prelude::*;
-use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::TensorPrimitive;
+use burn::tensor::{backend::AutodiffBackend, Int, TensorPrimitive};
 use burn_cubecl::cubecl::{prelude::KernelId, server::KernelArguments, CubeCount};
 use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElement, IntElement};
 use burn_wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime};
@@ -23,15 +22,11 @@ pub(crate) struct AdamUpdateParams {
     len: u32,
     scale_len: u32,
     scale_inner_repeat: u32,
-    step: u32,
     beta1: f32,
     beta2: f32,
     lr: f32,
     eps: f32,
     weight_decay: f32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 }
 
 struct AdamUpdateRaw;
@@ -55,6 +50,35 @@ impl KernelSource for AdamUpdateKernel {
     }
 }
 
+const PREPARE_SHADER_SRC: &str = include_str!("../shaders/prepare_optimizer_step.wgsl");
+
+struct PrepareOptimizerRaw;
+impl PrepareOptimizerRaw {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(PREPARE_SHADER_SRC)
+    }
+}
+
+#[derive(Debug)]
+struct PrepareOptimizerKernel;
+impl KernelSource for PrepareOptimizerKernel {
+    fn source(&self) -> SourceTemplate {
+        PrepareOptimizerRaw.source()
+    }
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PrepareOptimizerParams {
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
 pub(crate) struct AdamUpdatePrimitiveOutput<B: Backend> {
     param: B::FloatTensorPrimitive,
     moment1: B::FloatTensorPrimitive,
@@ -62,12 +86,15 @@ pub(crate) struct AdamUpdatePrimitiveOutput<B: Backend> {
 }
 
 pub(crate) trait AdamUpdateBackend: Backend {
+    fn prepare_optimizer_step(status: Self::IntTensorPrimitive);
+
     fn adam_update_primitive(
         param: Self::FloatTensorPrimitive,
         grad: Self::FloatTensorPrimitive,
         moment1: Self::FloatTensorPrimitive,
         moment2: Self::FloatTensorPrimitive,
         scale: Self::FloatTensorPrimitive,
+        status: Self::IntTensorPrimitive,
         params: AdamUpdateParams,
     ) -> AdamUpdatePrimitiveOutput<Self>;
 }
@@ -78,12 +105,39 @@ where
     I: IntElement,
     BT: BoolElement,
 {
+    fn prepare_optimizer_step(status: Self::IntTensorPrimitive) {
+        let status = into_contiguous(status);
+        let params = PrepareOptimizerParams {
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let params_handle = status.client.create_from_slice(bytemuck::bytes_of(&params));
+        status.client.launch(
+            Box::new(SourceKernel::new(
+                PrepareOptimizerKernel,
+                CubeDim::new_1d(1),
+            )),
+            CubeCount::Static(1, 1, 1),
+            KernelArguments::new().with_buffers(vec![
+                status.handle.binding(),
+                params_handle.binding(),
+            ]),
+        );
+        status
+            .client
+            .flush()
+            .expect("flush prepare_optimizer_step");
+    }
+
     fn adam_update_primitive(
         param: Self::FloatTensorPrimitive,
         grad: Self::FloatTensorPrimitive,
         moment1: Self::FloatTensorPrimitive,
         moment2: Self::FloatTensorPrimitive,
         scale: Self::FloatTensorPrimitive,
+        status: Self::IntTensorPrimitive,
         params: AdamUpdateParams,
     ) -> AdamUpdatePrimitiveOutput<Self> {
         let param = into_contiguous(param);
@@ -91,6 +145,7 @@ where
         let moment1 = into_contiguous(moment1);
         let moment2 = into_contiguous(moment2);
         let scale = into_contiguous(scale);
+        let status = into_contiguous(status);
 
         if params.len > 0 {
             let params_handle = param.client.create_from_slice(bytemuck::bytes_of(&params));
@@ -106,6 +161,7 @@ where
                     moment1.handle.clone().binding(),
                     moment2.handle.clone().binding(),
                     scale.handle.binding(),
+                    status.handle.binding(),
                     params_handle.binding(),
                 ]),
             );
@@ -561,6 +617,21 @@ impl<B: Backend> AdamScaled<B> {
     }
 }
 
+fn committed_optimizer_steps_from_status<B: Backend>(status: &Tensor<B, 1, Int>) -> usize {
+    // Device word 4 is authoritative after prepare. Syncing host Adam counters
+    // here keeps blocked gates from advancing step without a separate host flag
+    // mirror. Task 1.5 folds broader status readback accounting into safety points.
+    let data = status.clone().into_data();
+    let values = data
+        .to_vec::<i32>()
+        .expect("training status buffer must decode as i32 words");
+    debug_assert!(
+        values.len() >= 5,
+        "training status buffer too short for committed step word"
+    );
+    values[4].max(0) as usize
+}
+
 impl<B: AdamUpdateBackend> AdamScaled<B> {
     pub fn step_device_splats<AD>(
         &mut self,
@@ -568,15 +639,23 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
         transforms_grad: Tensor<B, 2>,
         sh_grad: Tensor<B, 3>,
         opacity_grad: Tensor<B, 1>,
+        status: Tensor<B, 1, Int>,
     ) where
         AD: AutodiffBackend<InnerBackend = B>,
     {
+        B::prepare_optimizer_step(status.clone().into_primitive());
+        let next_step = committed_optimizer_steps_from_status(&status);
+        self.transforms.step = next_step;
+        self.sh_coeffs.step = next_step;
+        self.raw_opacities.step = next_step;
+
         let new_transforms = Self::step_tensor(
             &self.config,
             splats.transforms.val().inner(),
             transforms_grad,
             &mut self.transforms,
             1,
+            status.clone(),
         );
         let new_sh = Self::step_tensor(
             &self.config,
@@ -584,6 +663,7 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
             sh_grad,
             &mut self.sh_coeffs,
             3,
+            status.clone(),
         );
         let new_opacity = Self::step_tensor(
             &self.config,
@@ -591,6 +671,7 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
             opacity_grad,
             &mut self.raw_opacities,
             1,
+            status,
         );
 
         splats.transforms = Param::initialized(
@@ -613,30 +694,31 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
         grad: Tensor<B, D>,
         state: &mut AdamState<B, D>,
         scale_inner_repeat: usize,
+        status: Tensor<B, 1, Int>,
     ) -> Tensor<B, D> {
-        let Some(scale) = state.scaling.clone() else {
-            return Self::step_tensor_burn(config, param, grad, state);
+        let device = param.device();
+        let (scale, scale_inner_repeat) = match state.scaling.clone() {
+            Some(scale) => {
+                let flat_len = scale.dims().iter().product::<usize>().max(1);
+                (scale.reshape([flat_len]), scale_inner_repeat.max(1))
+            }
+            None => (Tensor::<B, 1>::ones([1], &device), 1usize),
         };
 
         let len = param.dims().iter().product::<usize>();
-        let scale_len = scale.dims().iter().product::<usize>().max(1);
+        let scale_len = scale.dims()[0].max(1);
         let moment1 = state.moment1.take().unwrap_or_else(|| param.zeros_like());
         let moment2 = state.moment2.take().unwrap_or_else(|| param.zeros_like());
 
-        state.step = state.step.saturating_add(1);
         let params = AdamUpdateParams {
             len: len as u32,
             scale_len: scale_len as u32,
-            scale_inner_repeat: scale_inner_repeat.max(1) as u32,
-            step: state.step as u32,
+            scale_inner_repeat: scale_inner_repeat as u32,
             beta1: config.betas.0 as f32,
             beta2: config.betas.1 as f32,
             lr: config.lr as f32,
             eps: config.eps as f32,
             weight_decay: config.weight_decay as f32,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
         };
         let output = B::adam_update_primitive(
             param.into_primitive().tensor(),
@@ -644,6 +726,7 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
             moment1.into_primitive().tensor(),
             moment2.into_primitive().tensor(),
             scale.into_primitive().tensor(),
+            status.into_primitive(),
             params,
         );
         state.moment1 = Some(Tensor::from_primitive(TensorPrimitive::Float(
@@ -659,7 +742,10 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::training::engine::{GsBackendBase, GsDiffBackend};
+    use crate::training::engine::{
+        DeviceTrainingStatus, GsBackendBase, GsDiffBackend, TrainingStatusSnapshot,
+        STATUS_NON_FINITE_LOSS,
+    };
 
     fn test_splats(device: &<GsBackendBase as Backend>::Device) -> DeviceSplats<GsDiffBackend> {
         let transforms = Tensor::<GsDiffBackend, 2>::from_data(
@@ -763,6 +849,7 @@ mod tests {
     fn optimizer_step(
         optimizer: &mut AdamScaled<GsBackendBase>,
         splats: &mut DeviceSplats<GsDiffBackend>,
+        status: &DeviceTrainingStatus<GsBackendBase>,
         device: &<GsBackendBase as Backend>::Device,
     ) {
         optimizer.step_device_splats(
@@ -770,6 +857,7 @@ mod tests {
             Tensor::ones([2, 10], device).mul_scalar(0.1),
             Tensor::ones([2, 4, 3], device).mul_scalar(-0.2),
             Tensor::ones([2], device).mul_scalar(0.3),
+            status.buffer().clone(),
         );
     }
 
@@ -786,13 +874,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn adam_mutation_gate_blocks_param_moment_and_step() {
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut splats = test_splats(&device);
+        let mut optimizer = optimizer_with_scaling(&device);
+        let mut status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+
+        // Build non-zero moments and step=7 on a healthy status buffer.
+        for _ in 0..7 {
+            optimizer_step(&mut optimizer, &mut splats, &status, &device);
+        }
+        assert_eq!(optimizer.transforms.step, 7);
+        assert_eq!(
+            status.read().await.expect("status read").committed_optimizer_steps,
+            7
+        );
+
+        let before_ckpt = optimizer.checkpoint().await.expect("before checkpoint");
+        let before_splats = copy_splats(&splats, &device).await;
+        assert!(before_ckpt.transforms.moment1.is_some());
+        assert!(before_ckpt.transforms.moment2.is_some());
+
+        status.set_host_snapshot(TrainingStatusSnapshot {
+            flags: STATUS_NON_FINITE_LOSS,
+            first_invalid_iteration: 2,
+            requested_intersections: 0,
+            intersection_capacity: 0,
+            committed_optimizer_steps: 7,
+            mutation_gate: 1,
+        });
+
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
+
+        let after_status = status.read().await.expect("status after blocked step");
+        assert_eq!(after_status.committed_optimizer_steps, 7);
+        assert_eq!(after_status.mutation_gate, 0);
+        assert_eq!(optimizer.transforms.step, 7);
+        assert_eq!(optimizer.sh_coeffs.step, 7);
+        assert_eq!(optimizer.raw_opacities.step, 7);
+
+        let after_ckpt = optimizer.checkpoint().await.expect("after checkpoint");
+        assert_eq!(after_ckpt, before_ckpt);
+        assert_tensor_close(splats.transforms.val(), before_splats.transforms.val()).await;
+        assert_tensor_close(splats.sh_coeffs.val(), before_splats.sh_coeffs.val()).await;
+        assert_tensor_close(
+            splats.raw_opacities.val(),
+            before_splats.raw_opacities.val(),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn optimizer_checkpoint_roundtrips_state_and_preserves_next_step() {
         let device = <GsBackendBase as Backend>::Device::default();
         let mut splats = test_splats(&device);
         let mut optimizer = optimizer_with_scaling(&device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
 
-        optimizer_step(&mut optimizer, &mut splats, &device);
-        optimizer_step(&mut optimizer, &mut splats, &device);
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
         let checkpoint = optimizer.checkpoint().await.expect("export checkpoint");
         let mut resumed_splats = copy_splats(&splats, &device).await;
 
@@ -836,8 +976,9 @@ mod tests {
             checkpoint
         );
 
-        optimizer_step(&mut optimizer, &mut splats, &device);
-        optimizer_step(&mut restored, &mut resumed_splats, &device);
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
+        let restored_status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 2);
+        optimizer_step(&mut restored, &mut resumed_splats, &restored_status, &device);
         assert_tensor_close(splats.transforms.val(), resumed_splats.transforms.val()).await;
         assert_tensor_close(splats.sh_coeffs.val(), resumed_splats.sh_coeffs.val()).await;
         assert_tensor_close(
@@ -852,7 +993,8 @@ mod tests {
         let device = <GsBackendBase as Backend>::Device::default();
         let mut splats = test_splats(&device);
         let mut optimizer = optimizer_with_scaling(&device);
-        optimizer_step(&mut optimizer, &mut splats, &device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
         let checkpoint = optimizer.checkpoint().await.expect("export checkpoint");
 
         let mut missing_pair = checkpoint.clone();
@@ -894,7 +1036,8 @@ mod tests {
         let device = <GsBackendBase as Backend>::Device::default();
         let mut splats = test_splats(&device);
         let mut optimizer = optimizer_with_scaling(&device);
-        optimizer_step(&mut optimizer, &mut splats, &device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
         let mut checkpoint = optimizer.checkpoint().await.expect("export checkpoint");
 
         checkpoint.transforms.step = 3;
@@ -923,7 +1066,8 @@ mod tests {
         let device = <GsBackendBase as Backend>::Device::default();
         let mut splats = test_splats(&device);
         let mut optimizer = optimizer_with_scaling(&device);
-        optimizer_step(&mut optimizer, &mut splats, &device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
         let mut checkpoint = optimizer.checkpoint().await.expect("export checkpoint");
         let unsafe_step = MAX_TRAINING_ITERATIONS + 1;
         checkpoint.transforms.step = unsafe_step;
@@ -945,7 +1089,8 @@ mod tests {
         let device = <GsBackendBase as Backend>::Device::default();
         let mut splats = test_splats(&device);
         let mut optimizer = optimizer_with_scaling(&device);
-        optimizer_step(&mut optimizer, &mut splats, &device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        optimizer_step(&mut optimizer, &mut splats, &status, &device);
         let mut checkpoint = optimizer.checkpoint().await.expect("export checkpoint");
 
         checkpoint.transforms.step = 3;
@@ -1029,12 +1174,14 @@ mod tests {
         splats.raw_opacities = Param::from_tensor(raw_opacities);
 
         let mut optimizer = optimizer_with_scaling(&device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
         for _ in 0..7 {
             optimizer.step_device_splats(
                 &mut splats,
                 Tensor::ones([3, 10], &device).mul_scalar(0.1),
                 Tensor::ones([3, 4, 3], &device).mul_scalar(-0.2),
                 Tensor::ones([3], &device).mul_scalar(0.3),
+                status.buffer().clone(),
             );
         }
         let before = optimizer
@@ -1124,12 +1271,14 @@ mod tests {
         splats.raw_opacities = Param::from_tensor(raw_opacities);
 
         let mut optimizer = optimizer_with_scaling(&device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
         for _ in 0..7 {
             optimizer.step_device_splats(
                 &mut splats,
                 Tensor::ones([3, 10], &device).mul_scalar(0.1),
                 Tensor::ones([3, 4, 3], &device).mul_scalar(-0.2),
                 Tensor::ones([3], &device).mul_scalar(0.3),
+                status.buffer().clone(),
             );
         }
         optimizer.remap_origins(&[Some(1), None, Some(0)], 4, 3, &device);
@@ -1182,17 +1331,21 @@ mod tests {
         restored.set_sh_scaling(Tensor::ones([1, 4, 1], &device).mul_scalar(0.5));
         restored.set_opacity_scaling(Tensor::from_floats([0.25], &device));
 
+        let post_status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 7);
         live.step_device_splats(
             &mut splats,
             Tensor::ones([3, 10], &device).mul_scalar(0.05),
             Tensor::ones([3, 4, 3], &device).mul_scalar(-0.05),
             Tensor::ones([3], &device).mul_scalar(0.05),
+            post_status.buffer().clone(),
         );
+        let restored_status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 7);
         restored.step_device_splats(
             &mut restored_splats,
             Tensor::ones([3, 10], &device).mul_scalar(0.05),
             Tensor::ones([3, 4, 3], &device).mul_scalar(-0.05),
             Tensor::ones([3], &device).mul_scalar(0.05),
+            restored_status.buffer().clone(),
         );
 
         let live_ckpt = live.checkpoint().await.expect("live after step");
