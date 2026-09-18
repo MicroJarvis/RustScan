@@ -159,9 +159,9 @@ v2 要求长度等于 splat count、值 finite 且非负；v1 用旧累计 visib
 
 在 `RustGS/tests/checkpoint_resume.rs` 增加 topology interval=4、iteration 2 checkpoint 的双路径测试：A 直训到 8，B 从 checkpoint 训到 8。比较 topology event fingerprint（iteration、disposition、origins、增密/剪枝数、两个 visibility delta、invisible windows）、HostSplats、三组 Adam state、committed step 和 accumulator，浮点误差 `1e-6`。
 
-- [ ] 先让旧 baseline reset 使测试失败，再实现后使其通过。
-- [ ] 覆盖 checkpoint 不在 topology 边界和 checkpoint 不在 loss cadence 两种位置。
-- [ ] 提交 `test(rustgs): prove mid-window topology resume parity`。
+- [x] 先让旧 baseline reset 使测试失败，再实现后使其通过。
+- [x] 覆盖 checkpoint 不在 topology 边界和 checkpoint 不在 loss cadence 两种位置。
+- [x] 提交 `test(rustgs): prove mid-window topology resume parity`。
 
 ## Task 2.3：Densify/prune/opacity reset 后 Adam continuity
 

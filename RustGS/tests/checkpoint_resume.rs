@@ -1902,3 +1902,265 @@ fn resumed_training_matches_uninterrupted_training_state() {
             <= 1e-5
     );
 }
+
+fn assert_tensor_checkpoint_close(label: &str, left: &TensorCheckpoint, right: &TensorCheckpoint) {
+    assert_eq!(left.shape, right.shape, "{label} shape");
+    assert_eq!(left.values.len(), right.values.len(), "{label} length");
+    for (index, (&a, &b)) in left.values.iter().zip(&right.values).enumerate() {
+        assert!(
+            (a - b).abs() <= 1e-5,
+            "{label}[{index}] differs: {a} vs {b}"
+        );
+    }
+}
+
+fn assert_topology_checkpoints_close(left: &TopologyCheckpoint, right: &TopologyCheckpoint) {
+    assert_tensor_checkpoint_close("grad_2d", &left.grad_2d, &right.grad_2d);
+    assert_tensor_checkpoint_close(
+        "screen_grad_2d",
+        &left.screen_grad_2d,
+        &right.screen_grad_2d,
+    );
+    assert_tensor_checkpoint_close("abs_grad_2d", &left.abs_grad_2d, &right.abs_grad_2d);
+    assert_tensor_checkpoint_close(
+        "abs_pixel_grad_2d",
+        &left.abs_pixel_grad_2d,
+        &right.abs_pixel_grad_2d,
+    );
+    assert_tensor_checkpoint_close(
+        "pixel_coverage",
+        &left.pixel_coverage,
+        &right.pixel_coverage,
+    );
+    assert_tensor_checkpoint_close("camera_depth", &left.camera_depth, &right.camera_depth);
+    assert_tensor_checkpoint_close("grad_color", &left.grad_color, &right.grad_color);
+    assert_tensor_checkpoint_close(
+        "num_observations",
+        &left.num_observations,
+        &right.num_observations,
+    );
+    assert_tensor_checkpoint_close(
+        "visible_observations",
+        &left.visible_observations,
+        &right.visible_observations,
+    );
+    assert_tensor_checkpoint_close(
+        "actual_visible_observations",
+        &left.actual_visible_observations,
+        &right.actual_visible_observations,
+    );
+    assert_eq!(left.splat_birth_iterations, right.splat_birth_iterations);
+    assert_eq!(left.splat_invisible_windows, right.splat_invisible_windows);
+    assert_eq!(
+        left.visibility_window_baseline,
+        right.visibility_window_baseline
+    );
+    assert_eq!(
+        left.actual_visibility_window_baseline,
+        right.actual_visibility_window_baseline
+    );
+}
+
+fn assert_adam_checkpoints_close(left: &AdamCheckpoint, right: &AdamCheckpoint) {
+    for (label, a, b) in [
+        ("transforms", &left.transforms, &right.transforms),
+        ("sh_coeffs", &left.sh_coeffs, &right.sh_coeffs),
+        ("raw_opacities", &left.raw_opacities, &right.raw_opacities),
+    ] {
+        assert_eq!(a.step, b.step, "{label} step");
+        match (&a.moment1, &b.moment1) {
+            (Some(am), Some(bm)) => {
+                assert_tensor_checkpoint_close(&format!("{label}.moment1"), am, bm)
+            }
+            (None, None) => {}
+            _ => panic!("{label}.moment1 presence mismatch"),
+        }
+        match (&a.moment2, &b.moment2) {
+            (Some(am), Some(bm)) => {
+                assert_tensor_checkpoint_close(&format!("{label}.moment2"), am, bm)
+            }
+            (None, None) => {}
+            _ => panic!("{label}.moment2 presence mismatch"),
+        }
+    }
+}
+
+#[test]
+fn mid_window_topology_resume_matches_uninterrupted_at_iteration_eight() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = continuity_training_dataset(&temp);
+    let mut config = tiny_training_config(8);
+    config.data.frame_shuffle_seed = 0x71c0_1067;
+    config.litegs.topology.refine_every = 4;
+    config.litegs.topology.opacity_reset_interval = 10_000;
+    config.litegs.topology.target_primitives = 64;
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"mid-window-topology", &config)
+            .unwrap();
+
+    let uninterrupted_final = Rc::new(RefCell::new(None));
+    let sink_uninterrupted = Rc::clone(&uninterrupted_final);
+    let uninterrupted = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity.clone())
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(8) })
+            .with_checkpoint_sink(move |ready| {
+                assert_eq!(ready.iteration, 8);
+                *sink_uninterrupted.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .unwrap();
+    assert_eq!(uninterrupted.report.completed_iterations, 8);
+    let uninterrupted_ckpt = uninterrupted_final
+        .borrow()
+        .clone()
+        .expect("uninterrupted final checkpoint");
+
+    let mid_checkpoint = Rc::new(RefCell::new(None));
+    let sink_mid = Rc::clone(&mid_checkpoint);
+    let control = TrainingControl::default();
+    let pause_control = control.clone();
+    let paused = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_control(control)
+            .with_identity(identity.clone())
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(2) })
+            .with_checkpoint_sink(move |ready| {
+                if ready.iteration == 2 {
+                    assert_eq!(ready.reason, TrainingCheckpointReason::Periodic);
+                    // Mid densify window (refine_every=4) and outside loss cadence (20).
+                    *sink_mid.borrow_mut() = Some(ready.checkpoint.clone());
+                    pause_control.request_pause();
+                }
+                Ok(())
+            }),
+    )
+    .unwrap();
+    assert_eq!(paused.report.disposition, TrainingRunDisposition::Paused);
+    assert_eq!(paused.report.completed_iterations, 2);
+    let resume_from = mid_checkpoint
+        .borrow()
+        .clone()
+        .expect("mid-window checkpoint at iteration 2");
+    assert_eq!(resume_from.completed_iterations, 2);
+    assert_eq!(
+        resume_from.topology.visibility_window_baseline.len(),
+        resume_from.splats.len()
+    );
+
+    let resumed_final = Rc::new(RefCell::new(None));
+    let sink_resumed = Rc::clone(&resumed_final);
+    let resumed = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity)
+            .with_resume_checkpoint(resume_from)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(8) })
+            .with_checkpoint_sink(move |ready| {
+                assert_eq!(ready.iteration, 8);
+                *sink_resumed.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .unwrap();
+    assert_eq!(resumed.report.completed_iterations, 8);
+    let resumed_ckpt = resumed_final
+        .borrow()
+        .clone()
+        .expect("resumed final checkpoint");
+
+    assert_eq!(
+        resumed_ckpt.completed_iterations,
+        uninterrupted_ckpt.completed_iterations
+    );
+    assert_eq!(
+        resumed_ckpt.optimizer.transforms.step,
+        uninterrupted_ckpt.optimizer.transforms.step
+    );
+    assert_topology_checkpoints_close(&resumed_ckpt.topology, &uninterrupted_ckpt.topology);
+    assert_adam_checkpoints_close(&resumed_ckpt.optimizer, &uninterrupted_ckpt.optimizer);
+
+    let expected = uninterrupted_ckpt.splats.as_view();
+    let actual = resumed_ckpt.splats.as_view();
+    for (name, expected, actual) in [
+        ("positions", expected.positions, actual.positions),
+        ("log_scales", expected.log_scales, actual.log_scales),
+        ("rotations", expected.rotations, actual.rotations),
+        (
+            "opacity_logits",
+            expected.opacity_logits,
+            actual.opacity_logits,
+        ),
+        ("sh_coeffs", expected.sh_coeffs, actual.sh_coeffs),
+    ] {
+        assert_eq!(actual.len(), expected.len(), "{name} length");
+        for (index, (&a, &b)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-5,
+                "{name}[{index}] differs: resumed={a}, uninterrupted={b}"
+            );
+        }
+    }
+
+    let left_samples = &uninterrupted
+        .report
+        .telemetry
+        .as_ref()
+        .unwrap()
+        .topology
+        .topology_step_samples;
+    let right_samples = &resumed
+        .report
+        .telemetry
+        .as_ref()
+        .unwrap()
+        .topology
+        .topology_step_samples;
+    assert_eq!(left_samples.len(), right_samples.len());
+    for (left, right) in left_samples.iter().zip(right_samples) {
+        assert_eq!(left.iteration, right.iteration);
+        assert_eq!(left.gaussian_count, right.gaussian_count);
+        assert_eq!(left.clone_candidates, right.clone_candidates);
+        assert_eq!(left.split_candidates, right.split_candidates);
+        assert_eq!(left.prune_candidates, right.prune_candidates);
+        assert_eq!(left.growth_candidates, right.growth_candidates);
+    }
+    assert_eq!(
+        uninterrupted
+            .report
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .topology
+            .densify_added,
+        resumed
+            .report
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .topology
+            .densify_added
+    );
+    assert_eq!(
+        uninterrupted
+            .report
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .topology
+            .prune_removed,
+        resumed
+            .report
+            .telemetry
+            .as_ref()
+            .unwrap()
+            .topology
+            .prune_removed
+    );
+}
