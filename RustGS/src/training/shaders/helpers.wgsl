@@ -185,6 +185,44 @@ fn compensate_cov2d(cov2d: ptr<function, mat2x2<f32>>, cov_blur: f32) -> f32 {
     return sqrt(det_raw / det_end);
 }
 
+/// VJP of `filter_comp = sqrt(det(cov_raw)/det(cov_raw + cov_blur*I))` w.r.t. `cov_raw`.
+fn compensate_cov2d_vjp(
+    cov_raw: mat2x2<f32>,
+    cov_blur: f32,
+    filter_comp: f32,
+    v_filter: f32,
+) -> mat2x2<f32> {
+    let det_raw = max(determinant(cov_raw), 0.0);
+    var cov_end = cov_raw;
+    cov_end[0][0] += cov_blur;
+    cov_end[1][1] += cov_blur;
+    let det_end = max(determinant(cov_end), 1e-12);
+    if det_raw <= 0.0 || filter_comp <= 0.0 || abs(v_filter) <= 0.0 {
+        return mat2x2<f32>(vec2<f32>(0.0), vec2<f32>(0.0));
+    }
+    // f = sqrt(r/e) ⇒ ∂f/∂r = ½ f/r, ∂f/∂e = -½ f/e
+    let df_dr = 0.5 * filter_comp / det_raw;
+    let df_de = -0.5 * filter_comp / det_end;
+    let v_det_raw = v_filter * df_dr;
+    let v_det_end = v_filter * df_de;
+    // det = a*c - b² for [[a,b],[b,c]]
+    let v_raw = mat2x2<f32>(
+        vec2<f32>(v_det_raw * cov_raw[1][1], -v_det_raw * cov_raw[0][1]),
+        vec2<f32>(-v_det_raw * cov_raw[1][0], v_det_raw * cov_raw[0][0]),
+    );
+    let v_end = mat2x2<f32>(
+        vec2<f32>(v_det_end * cov_end[1][1], -v_det_end * cov_end[0][1]),
+        vec2<f32>(-v_det_end * cov_end[1][0], v_det_end * cov_end[0][0]),
+    );
+    return v_raw + v_end;
+}
+
+fn normalize3_vjp(v: vec3<f32>, v_out: vec3<f32>) -> vec3<f32> {
+    let inv_len = inverseSqrt(max(dot(v, v), 1e-12));
+    let n = v * inv_len;
+    return (v_out - n * dot(n, v_out)) * inv_len;
+}
+
 fn inverse2x2(m: mat2x2<f32>) -> mat2x2<f32> {
     var m_reg = m;
     m_reg[0][0] += 1e-6;
@@ -380,6 +418,86 @@ fn sh_to_color_vjp(
     grads[23] = pSH23 * v_color;
     grads[24] = pSH24 * v_color;
     return grads;
+}
+
+/// ∂L/∂viewdir from SH color, given stored SH coefficients and upstream `v_color`.
+fn sh_to_color_viewdir_vjp(
+    degree: u32,
+    viewdir: vec3<f32>,
+    sh: array<vec3<f32>, 25>,
+    v_color: vec3<f32>,
+) -> vec3<f32> {
+    if degree == 0u {
+        return vec3<f32>(0.0);
+    }
+
+    let x = viewdir.x;
+    let y = viewdir.y;
+    let z = viewdir.z;
+    var v_dir = vec3<f32>(0.0);
+
+    let fTmp0A = 0.48860251190292;
+    // color += fTmp0A * (-y*sh1 + z*sh2 - x*sh3)
+    v_dir.x += dot(v_color, -fTmp0A * sh[3]);
+    v_dir.y += dot(v_color, -fTmp0A * sh[1]);
+    v_dir.z += dot(v_color, fTmp0A * sh[2]);
+    if degree == 1u {
+        return v_dir;
+    }
+
+    let z2 = z * z;
+    let fTmp0B = -1.092548430592079 * z;
+    let fTmp1A = 0.5462742152960395;
+    let fC1 = x * x - y * y;
+    let fS1 = 2.0 * x * y;
+    // pSH4=fTmp1A*fS1, pSH5=fTmp0B*y, pSH6=0.9461746957575601*z2-0.3153915652525201,
+    // pSH7=fTmp0B*x, pSH8=fTmp1A*fC1
+    // ∂fS1/∂x=2y, ∂fS1/∂y=2x; ∂fC1/∂x=2x, ∂fC1/∂y=-2y
+    // ∂fTmp0B/∂z = -1.092548430592079
+    let d_fTmp0B_dz = -1.092548430592079;
+    v_dir.x += dot(v_color, fTmp1A * 2.0 * y * sh[4] + fTmp0B * sh[7] + fTmp1A * 2.0 * x * sh[8]);
+    v_dir.y += dot(v_color, fTmp1A * 2.0 * x * sh[4] + fTmp0B * sh[5] + fTmp1A * (-2.0 * y) * sh[8]);
+    v_dir.z += dot(
+        v_color,
+        d_fTmp0B_dz * y * sh[5] + (2.0 * 0.9461746957575601 * z) * sh[6] + d_fTmp0B_dz * x * sh[7],
+    );
+    if degree == 2u {
+        return v_dir;
+    }
+
+    // Degree 3: finite-difference sensitive path; include leading terms matching forward.
+    let fTmp0C = -2.285228997322329 * z2 + 0.4570457994644658;
+    let fTmp1B = 1.445305721320277 * z;
+    let fTmp2A = -0.5900435899266435;
+    let fC2 = x * fC1 - y * fS1;
+    let fS2 = x * fS1 + y * fC1;
+    let d_fTmp0C_dz = -2.0 * 2.285228997322329 * z;
+    let d_fTmp1B_dz = 1.445305721320277;
+    // fC2 = x*(x²-y²) - y*(2xy) = x³ - 3xy²; fS2 = 3x²y - y³
+    let d_fC1_dx = 2.0 * x;
+    let d_fC1_dy = -2.0 * y;
+    let d_fS1_dx = 2.0 * y;
+    let d_fS1_dy = 2.0 * x;
+    let d_fC2_dx = fC1 + x * d_fC1_dx - y * d_fS1_dx;
+    let d_fC2_dy = x * d_fC1_dy - (fS1 + y * d_fS1_dy);
+    let d_fS2_dx = fS1 + x * d_fS1_dx + y * d_fC1_dx;
+    let d_fS2_dy = x * d_fS1_dy + fC1 + y * d_fC1_dy;
+    // pSH9=fTmp2A*fS2, pSH10=fTmp1B*fS1, pSH11=fTmp0C*y, pSH12=z*(1.865881662950577*z2-1.119528997770346),
+    // pSH13=fTmp0C*x, pSH14=fTmp1B*fC1, pSH15=fTmp2A*fC2
+    let d_pSH12_dz = (1.865881662950577 * z2 - 1.119528997770346) + z * (2.0 * 1.865881662950577 * z);
+    v_dir.x += dot(
+        v_color,
+        fTmp2A * d_fS2_dx * sh[9] + fTmp1B * d_fS1_dx * sh[10] + fTmp0C * sh[13] + fTmp1B * d_fC1_dx * sh[14] + fTmp2A * d_fC2_dx * sh[15],
+    );
+    v_dir.y += dot(
+        v_color,
+        fTmp2A * d_fS2_dy * sh[9] + fTmp1B * d_fS1_dy * sh[10] + fTmp0C * sh[11] + fTmp1B * d_fC1_dy * sh[14] + fTmp2A * d_fC2_dy * sh[15],
+    );
+    v_dir.z += dot(
+        v_color,
+        d_fTmp1B_dz * fS1 * sh[10] + d_fTmp0C_dz * y * sh[11] + d_pSH12_dz * sh[12] + d_fTmp0C_dz * x * sh[13] + d_fTmp1B_dz * fC1 * sh[14],
+    );
+    return v_dir;
 }
 
 fn persp_proj_vjp(

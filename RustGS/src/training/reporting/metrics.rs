@@ -1,11 +1,64 @@
 use serde::{Deserialize, Serialize};
 
+use crate::TrainingError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ForwardCapacityTelemetry {
     pub logical_visible: u32,
     pub logical_intersections: u32,
     pub capacity: u32,
     pub overflowed: bool,
+}
+
+/// Cross-step sticky overflow record. Sampling cadence must not drop earlier
+/// capacity failures, and mutation is blocked while this stays set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StickyForwardOverflow {
+    pub overflowed: bool,
+    pub first_iteration: u32,
+    pub logical_intersections: u32,
+    pub capacity: u32,
+}
+
+impl StickyForwardOverflow {
+    pub fn to_error(self) -> TrainingError {
+        TrainingError::ForwardCapacityExceeded {
+            logical_intersections: self.logical_intersections,
+            capacity: self.capacity,
+            first_iteration: self.first_iteration,
+        }
+    }
+}
+
+/// Exact-full (`requested == capacity`) is valid; only a strict excess fails.
+pub fn step_intersection_overflowed(requested: u32, capacity: u32) -> bool {
+    requested > capacity
+}
+
+/// Merge a step overflow into sticky state. The first anomaly wins.
+pub fn accumulate_sticky_forward_overflow(
+    sticky: StickyForwardOverflow,
+    step_overflowed: bool,
+    iteration: u32,
+    logical_intersections: u32,
+    capacity: u32,
+) -> StickyForwardOverflow {
+    if !step_overflowed {
+        return sticky;
+    }
+    if sticky.overflowed {
+        return sticky;
+    }
+    StickyForwardOverflow {
+        overflowed: true,
+        first_iteration: iteration.max(1),
+        logical_intersections,
+        capacity,
+    }
+}
+
+pub fn allows_state_mutation(sticky: StickyForwardOverflow) -> bool {
+    !sticky.overflowed
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -128,7 +181,7 @@ pub struct ParityLossCurveSample {
 
 #[cfg(test)]
 mod tests {
-    use super::ForwardCapacityTelemetry;
+    use super::*;
     use crate::TrainingError;
 
     #[test]
@@ -143,8 +196,95 @@ mod tests {
         let err = TrainingError::ForwardCapacityExceeded {
             logical_intersections: telemetry.logical_intersections,
             capacity: telemetry.capacity,
+            first_iteration: 1,
         };
         assert!(err.to_string().contains("9000"));
         assert!(err.to_string().contains("8000"));
+        assert!(err.to_string().contains("first_iteration=1"));
+    }
+
+    #[test]
+    fn exact_full_capacity_is_not_overflow() {
+        assert!(!step_intersection_overflowed(1_024, 1_024));
+        assert!(step_intersection_overflowed(1_025, 1_024));
+    }
+
+    #[test]
+    fn sticky_keeps_first_anomaly_across_later_healthy_steps() {
+        let mut sticky = StickyForwardOverflow::default();
+        sticky = accumulate_sticky_forward_overflow(sticky, false, 1, 100, 1_000);
+        assert!(allows_state_mutation(sticky));
+
+        sticky = accumulate_sticky_forward_overflow(sticky, true, 2, 9_000, 8_000);
+        assert!(!allows_state_mutation(sticky));
+        assert_eq!(sticky.first_iteration, 2);
+        assert_eq!(sticky.logical_intersections, 9_000);
+        assert_eq!(sticky.capacity, 8_000);
+
+        sticky = accumulate_sticky_forward_overflow(sticky, false, 20, 100, 8_000);
+        assert!(!allows_state_mutation(sticky));
+        assert_eq!(sticky.first_iteration, 2);
+        assert_eq!(sticky.logical_intersections, 9_000);
+
+        let err = sticky.to_error();
+        assert!(matches!(
+            err,
+            TrainingError::ForwardCapacityExceeded {
+                logical_intersections: 9_000,
+                capacity: 8_000,
+                first_iteration: 2,
+            }
+        ));
+        let message = err.to_string();
+        assert!(message.contains("9000"));
+        assert!(message.contains("8000"));
+        assert!(message.contains("first_iteration=2"));
+    }
+
+    #[test]
+    fn consecutive_overflows_preserve_first_iteration() {
+        let mut sticky = StickyForwardOverflow::default();
+        sticky = accumulate_sticky_forward_overflow(sticky, true, 3, 5_000, 4_000);
+        sticky = accumulate_sticky_forward_overflow(sticky, true, 4, 6_000, 4_000);
+        assert_eq!(sticky.first_iteration, 3);
+        assert_eq!(sticky.logical_intersections, 5_000);
+        assert_eq!(sticky.capacity, 4_000);
+    }
+
+    #[test]
+    fn policy_blocks_mutation_on_overflow_step_before_later_sample() {
+        let mut sticky = StickyForwardOverflow::default();
+        let mut mutations = 0usize;
+        let mut failed_at = None;
+        for iteration in 1u32..=20 {
+            let overflowed = iteration == 2;
+            let requested = if overflowed { 9_000 } else { 100 };
+            sticky =
+                accumulate_sticky_forward_overflow(sticky, overflowed, iteration, requested, 8_000);
+            if !allows_state_mutation(sticky) {
+                failed_at = Some(iteration);
+                break;
+            }
+            mutations += 1;
+        }
+        assert_eq!(failed_at, Some(2));
+        assert_eq!(mutations, 1);
+        assert_eq!(sticky.first_iteration, 2);
+    }
+
+    #[test]
+    fn buggy_sample_only_current_frame_policy_misses_nonsample_overflow() {
+        let mut saw_error = false;
+        let mut mutations = 0usize;
+        for iteration in 1u32..=20 {
+            let overflowed = iteration == 2;
+            let sample = iteration == 20;
+            mutations += 1;
+            if sample && overflowed {
+                saw_error = true;
+            }
+        }
+        assert_eq!(mutations, 20);
+        assert!(!saw_error);
     }
 }

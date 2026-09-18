@@ -27,8 +27,6 @@ impl CountPolicy {
     }
 }
 
-pub(crate) use crate::training::reporting::metrics::ForwardCapacityTelemetry;
-
 pub(crate) fn hard_intersection_capacity(total_splats: usize, num_tiles: u32) -> usize {
     total_splats
         .saturating_mul(u32::from(num_tiles.max(1)) as usize)
@@ -122,10 +120,7 @@ where
         };
         let params_handle = client.create_from_slice(bytemuck::bytes_of(&params));
         client.launch(
-            Box::new(SourceKernel::new(
-                WriteDispatchKernel,
-                CubeDim::new_1d(1),
-            )),
+            Box::new(SourceKernel::new(WriteDispatchKernel, CubeDim::new_1d(1))),
             CubeCount::Static(1, 1, 1),
             KernelArguments::new().with_buffers(vec![
                 num_visible.handle.binding(),
@@ -188,8 +183,9 @@ pub(crate) fn host_dispatch_tensor<B: Backend>(
 mod tests {
     use super::{
         hard_intersection_capacity, planned_intersection_capacity, CountPolicy,
-        ForwardCapacityTelemetry, MAX_BOUNDED_INTERSECTIONS,
+        MAX_BOUNDED_INTERSECTIONS,
     };
+    use crate::training::reporting::metrics::ForwardCapacityTelemetry;
     use crate::TrainingError;
 
     #[test]
@@ -230,15 +226,18 @@ mod tests {
         let err = TrainingError::ForwardCapacityExceeded {
             logical_intersections: telemetry.logical_intersections,
             capacity: telemetry.capacity,
+            first_iteration: 2,
         };
         let message = err.to_string();
         assert!(message.contains("9000"));
         assert!(message.contains("8000"));
+        assert!(message.contains("first_iteration=2"));
         assert!(matches!(
             err,
             TrainingError::ForwardCapacityExceeded {
                 logical_intersections: 9_000,
-                capacity: 8_000
+                capacity: 8_000,
+                first_iteration: 2,
             }
         ));
     }

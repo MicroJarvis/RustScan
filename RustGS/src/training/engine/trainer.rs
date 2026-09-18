@@ -12,11 +12,25 @@ use crate::core::GaussianCamera;
 use crate::core::HostSplats;
 use crate::training::backward;
 use crate::training::data::frame_loader::PrefetchFrameLoader;
-use crate::training::reporting::metrics::{ParityLossCurveSample, ParityTopologyMetrics};
+use crate::training::gpu_primitives::device_radix::{
+    radix_sort_dispatch_count, radix_sort_workspace_bytes,
+};
+use crate::training::gpu_primitives::prefix_sum::{
+    prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
+};
+use crate::training::reporting::metrics::{
+    accumulate_sticky_forward_overflow, allows_state_mutation, step_intersection_overflowed,
+    ParityLossCurveSample, ParityTopologyMetrics, StickyForwardOverflow,
+};
+use crate::training::reporting::optimization_report::{
+    duration_millis, percentile_f64, percentile_usize,
+};
 use crate::training::reporting::telemetry::{LiteGsOptimizerLrs, LiteGsTrainingTelemetry};
-use crate::training::topology::TopologyMutationPlan;
-use crate::training::topology::{apply_mutations, plan_mutations, snapshot_for_topology};
-use crate::training::topology::{apply_topology_metrics_delta, should_apply_topology_step};
+use crate::training::topology::{
+    apply_mutations, apply_topology_metrics_delta, plan_mutations, should_apply_topology_step,
+    snapshot_for_topology, visibility_window_baseline_from_cumulative, visibility_window_delta,
+    TopologyMutationPlan,
+};
 use crate::training::{
     LiteGsPruneMode, TrainingCheckpoint, TrainingCheckpointReady, TrainingCheckpointReason,
     TrainingConfig, TrainingIdentity, TrainingRunDisposition, TRAINING_CHECKPOINT_VERSION,
@@ -165,6 +179,10 @@ pub struct WgpuTrainer {
     actual_visible_observations: Tensor<GsBackendBase, 1>,
     splat_birth_iterations: Vec<usize>,
     splat_invisible_windows: Vec<usize>,
+    /// Cumulative visible_observations at the previous topology step. Window
+    /// visibility for prune / invisible-window advancement is the delta.
+    visibility_window_baseline: Vec<f32>,
+    actual_visibility_window_baseline: Vec<f32>,
     ssim_config: SsimConfig,
     ssim_kernel: Tensor<GsDiffBackend, 1>,
     telemetry: LiteGsTrainingTelemetry,
@@ -172,6 +190,79 @@ pub struct WgpuTrainer {
     optimizer_lr_state: Option<OptimizerLrState>,
     intersection_capacity: usize,
     non_finite_loss_steps: Option<Tensor<GsBackendBase, 1, Int>>,
+    sticky_forward_overflow: StickyForwardOverflow,
+    optimization_samples: OptimizationTimingSamples,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OptimizationTimingSamples {
+    loop_ms: Vec<f64>,
+    loss_readbacks: usize,
+    count_readbacks: usize,
+    sort_dispatches: Vec<usize>,
+    scan_dispatches: Vec<usize>,
+    sort_workspace_bytes: Option<usize>,
+    scan_workspace_bytes: Option<usize>,
+    topology_snapshot_ms: Vec<f64>,
+    topology_plan_ms: Vec<f64>,
+    topology_apply_ms: Vec<f64>,
+    topology_snapshot_readback_bytes: Option<usize>,
+}
+
+impl OptimizationTimingSamples {
+    fn record_loop_step(
+        &mut self,
+        loop_duration: Duration,
+        loss_readback: bool,
+        splat_count: usize,
+        intersection_capacity: usize,
+    ) {
+        self.loop_ms.push(duration_millis(loop_duration));
+        if loss_readback {
+            self.loss_readbacks = self.loss_readbacks.saturating_add(1);
+        }
+        let sort_len = splat_count;
+        let scan_len = splat_count;
+        self.sort_dispatches
+            .push(radix_sort_dispatch_count(sort_len));
+        self.scan_dispatches
+            .push(prefix_sum_dispatch_count(scan_len));
+        let sort_bytes = radix_sort_workspace_bytes(intersection_capacity.max(sort_len));
+        let scan_bytes = prefix_sum_workspace_bytes(scan_len);
+        self.sort_workspace_bytes = Some(self.sort_workspace_bytes.unwrap_or(0).max(sort_bytes));
+        self.scan_workspace_bytes = Some(self.scan_workspace_bytes.unwrap_or(0).max(scan_bytes));
+    }
+
+    fn record_count_readbacks(&mut self, count: usize) {
+        self.count_readbacks = self.count_readbacks.saturating_add(count);
+    }
+
+    fn flush_into(&self, telemetry: &mut LiteGsTrainingTelemetry) {
+        let mut loop_sorted = self.loop_ms.clone();
+        loop_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        telemetry.loop_duration_p50_ms = percentile_f64(&loop_sorted, 50.0);
+        telemetry.loop_duration_p95_ms = percentile_f64(&loop_sorted, 95.0);
+        telemetry.loop_timing_kind = Some("cpu_submit_instant".into());
+        telemetry.loss_readback_count = Some(self.loss_readbacks);
+        telemetry.count_readback_count = Some(self.count_readbacks);
+        telemetry.radix_dispatch_count_p50 = percentile_usize(&self.sort_dispatches, 50.0);
+        telemetry.radix_dispatch_count_p95 = percentile_usize(&self.sort_dispatches, 95.0);
+        telemetry.scan_dispatch_count_p50 = percentile_usize(&self.scan_dispatches, 50.0);
+        telemetry.scan_dispatch_count_p95 = percentile_usize(&self.scan_dispatches, 95.0);
+        telemetry.sort_workspace_bytes = self.sort_workspace_bytes;
+        telemetry.scan_workspace_bytes = self.scan_workspace_bytes;
+
+        let mut snapshot_sorted = self.topology_snapshot_ms.clone();
+        snapshot_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut plan_sorted = self.topology_plan_ms.clone();
+        plan_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut apply_sorted = self.topology_apply_ms.clone();
+        apply_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        telemetry.topology_snapshot_ms_p50 = percentile_f64(&snapshot_sorted, 50.0);
+        telemetry.topology_plan_ms_p50 = percentile_f64(&plan_sorted, 50.0);
+        telemetry.topology_apply_ms_p50 = percentile_f64(&apply_sorted, 50.0);
+        telemetry.topology_snapshot_readback_bytes = self.topology_snapshot_readback_bytes;
+    }
 }
 
 #[derive(Clone)]
@@ -290,6 +381,8 @@ impl WgpuTrainer {
             actual_visible_observations: Tensor::zeros([initial_splats], &device),
             splat_birth_iterations: vec![0; initial_splats],
             splat_invisible_windows: vec![0; initial_splats],
+            visibility_window_baseline: vec![0.0; initial_splats],
+            actual_visibility_window_baseline: vec![0.0; initial_splats],
             ssim_config,
             ssim_kernel,
             telemetry,
@@ -297,6 +390,8 @@ impl WgpuTrainer {
             optimizer_lr_state: None,
             intersection_capacity: 0,
             non_finite_loss_steps: None,
+            sticky_forward_overflow: StickyForwardOverflow::default(),
+            optimization_samples: OptimizationTimingSamples::default(),
         }
     }
 
@@ -308,6 +403,9 @@ impl WgpuTrainer {
         completed_iterations: usize,
         latest_loss: Option<f32>,
     ) -> Result<TrainingCheckpoint, TrainingError> {
+        if !allows_state_mutation(self.sticky_forward_overflow) {
+            return Err(self.sticky_forward_overflow.to_error());
+        }
         let host_splats = try_device_splats_to_host(splats).await?;
         let active_sh_degree =
             self.active_sh_degree_at(completed_iterations, splats.sh_degree) as usize;
@@ -372,6 +470,14 @@ impl WgpuTrainer {
         trainer.actual_visible_observations = topology.actual_visible_observations;
         trainer.splat_birth_iterations = checkpoint.topology.splat_birth_iterations.clone();
         trainer.splat_invisible_windows = checkpoint.topology.splat_invisible_windows.clone();
+        // Resume mid densify-window: start a fresh visibility window from the
+        // restored cumulative counts so invisible clocks keep advancing.
+        trainer.visibility_window_baseline = visibility_window_baseline_from_cumulative(
+            &checkpoint.topology.visible_observations.values,
+        );
+        trainer.actual_visibility_window_baseline = visibility_window_baseline_from_cumulative(
+            &checkpoint.topology.actual_visible_observations.values,
+        );
         trainer.telemetry.active_sh_degree = Some(checkpoint.active_sh_degree);
 
         Ok((trainer, splats))
@@ -530,6 +636,17 @@ impl WgpuTrainer {
             self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32)),
         )
         .await;
+        self.note_sticky_forward_overflow(
+            &rendered.requested_intersections,
+            &rendered.intersection_overflow,
+            rendered.intersection_capacity,
+            iteration,
+        )
+        .await?;
+        // Fail before loss/backward/optimizer so a truncated forward cannot
+        // update Adam moments, parameters, or topology statistics.
+        self.ensure_forward_capacity_before_update(read_loss)
+            .await?;
         let forward_elapsed = if profile_step {
             let started = Instant::now();
             let _ = rendered
@@ -557,6 +674,7 @@ impl WgpuTrainer {
             dynamic_mask.map(|mask| mask.0).unwrap_or(0.0) as f64,
             dynamic_mask.map(|mask| mask.1).unwrap_or(0.0) as f64,
             dynamic_mask.map(|mask| mask.2).unwrap_or(1.0) as f64,
+            self.config.loss.loss_dynamic_mask_gradient,
             &self.ssim_config,
             self.ssim_kernel.clone(),
         );
@@ -635,6 +753,9 @@ impl WgpuTrainer {
             iteration.saturating_sub(1),
             splats.sh_coeffs.val().dims()[1],
         );
+        // Defense in depth: sticky must still be clear immediately before mutation.
+        self.ensure_forward_capacity_before_update(read_loss)
+            .await?;
         if collect_topology_stats {
             self.accumulate_gradients(
                 &transforms_grad,
@@ -742,6 +863,8 @@ impl WgpuTrainer {
             return Ok(None);
         }
 
+        // Sample current-frame capacity telemetry on loss cadence only. Sticky
+        // overflow was already consumed before state updates above.
         let capacity_telemetry = self
             .sample_forward_capacity(
                 &rendered.logical_visible,
@@ -750,19 +873,15 @@ impl WgpuTrainer {
                 rendered.intersection_capacity,
             )
             .await?;
-        if capacity_telemetry.overflowed {
-            return Err(TrainingError::ForwardCapacityExceeded {
-                logical_intersections: capacity_telemetry.logical_intersections,
-                capacity: capacity_telemetry.capacity,
-            });
-        }
+        debug_assert!(
+            !capacity_telemetry.overflowed || self.sticky_forward_overflow.overflowed,
+            "current-frame overflow must already be sticky before loss sampling"
+        );
         let loss_value = loss_for_read
             .expect("loss retained for scalar readback")
             .into_scalar_async()
             .await
-            .map_err(|err| {
-                TrainingError::TrainingFailed(format!("failed to read loss: {err}"))
-            })?;
+            .map_err(|err| TrainingError::TrainingFailed(format!("failed to read loss: {err}")))?;
         if self.non_finite_loss_seen().await? || !loss_value.is_finite() {
             return Err(TrainingError::TrainingFailed(format!(
                 "non-finite loss {loss_value} at iteration {iteration}"
@@ -866,15 +985,16 @@ impl WgpuTrainer {
                 )
                 .await?;
             let loop_duration = step_started_at.elapsed();
+            self.optimization_samples.record_loop_step(
+                loop_duration,
+                read_loss,
+                splats.num_splats(),
+                self.intersection_capacity,
+            );
             if let Some(loss) = loss {
                 last_sampled_loss = loss;
             }
-            record_completed_step(
-                &mut report,
-                iteration_idx,
-                splats.num_splats(),
-                loss,
-            );
+            record_completed_step(&mut report, iteration_idx, splats.num_splats(), loss);
             if let Some(loss) = loss {
                 self.record_loss_sample(
                     iteration_idx,
@@ -937,6 +1057,7 @@ impl WgpuTrainer {
         }
 
         report.training_loop_elapsed = training_loop_started_at.elapsed();
+        self.ensure_forward_capacity_before_update(true).await?;
         self.finish_report(&mut report);
         Ok(report)
     }
@@ -962,6 +1083,66 @@ impl WgpuTrainer {
             Some(accumulated) => accumulated + bad,
             None => bad,
         });
+    }
+
+    async fn note_sticky_forward_overflow(
+        &mut self,
+        requested: &Tensor<GsDiffBackend, 1, Int>,
+        overflow: &Tensor<GsDiffBackend, 1, Int>,
+        capacity: usize,
+        iteration: usize,
+    ) -> Result<(), TrainingError> {
+        // Once sticky, keep the first anomaly and avoid further count readback.
+        if self.sticky_forward_overflow.overflowed {
+            return Ok(());
+        }
+        let overflow_value = overflow
+            .clone()
+            .inner()
+            .into_scalar_async()
+            .await
+            .map_err(|err| {
+                TrainingError::TrainingFailed(format!(
+                    "failed to read intersection overflow: {err}"
+                ))
+            })?;
+        let requested_value = if overflow_value != 0 {
+            requested
+                .clone()
+                .inner()
+                .into_scalar_async()
+                .await
+                .map_err(|err| {
+                    TrainingError::TrainingFailed(format!(
+                        "failed to read requested intersections: {err}"
+                    ))
+                })?
+        } else {
+            0
+        };
+        let requested_u32 = requested_value.max(0) as u32;
+        let capacity_u32 = capacity as u32;
+        let step_overflowed =
+            overflow_value != 0 || step_intersection_overflowed(requested_u32, capacity_u32);
+        self.sticky_forward_overflow = accumulate_sticky_forward_overflow(
+            self.sticky_forward_overflow,
+            step_overflowed,
+            iteration as u32,
+            requested_u32,
+            capacity_u32,
+        );
+        Ok(())
+    }
+
+    async fn ensure_forward_capacity_before_update(
+        &self,
+        read_loss: bool,
+    ) -> Result<(), TrainingError> {
+        let _ = read_loss;
+        if allows_state_mutation(self.sticky_forward_overflow) {
+            return Ok(());
+        }
+        Err(self.sticky_forward_overflow.to_error())
     }
 
     async fn non_finite_loss_seen(&self) -> Result<bool, TrainingError> {
@@ -1005,7 +1186,9 @@ impl WgpuTrainer {
             .into_scalar_async()
             .await
             .map_err(|err| {
-                TrainingError::TrainingFailed(format!("failed to read intersection overflow: {err}"))
+                TrainingError::TrainingFailed(format!(
+                    "failed to read intersection overflow: {err}"
+                ))
             })?;
         let telemetry = crate::training::reporting::metrics::ForwardCapacityTelemetry {
             logical_visible: visible_value.max(0) as u32,
@@ -1014,6 +1197,7 @@ impl WgpuTrainer {
             overflowed: overflow_value != 0 || (requested_value as usize) > capacity,
         };
         self.telemetry.forward_capacity = Some(telemetry);
+        self.optimization_samples.record_count_readbacks(3);
         Ok(telemetry)
     }
 
@@ -1146,6 +1330,7 @@ impl WgpuTrainer {
         iteration: usize,
         frame_count: usize,
     ) {
+        let snapshot_started = Instant::now();
         let mut snapshot = snapshot_for_topology(
             splats,
             &self.grad_2d_accum,
@@ -1161,9 +1346,38 @@ impl WgpuTrainer {
                 .then_some(&self.actual_visible_observations),
         )
         .await;
+        let accumulator_fields = if self.collects_actual_visibility_diagnostics() {
+            10
+        } else {
+            9
+        };
+        self.optimization_samples
+            .topology_snapshot_ms
+            .push(duration_millis(snapshot_started.elapsed()));
+        let snapshot_readback_bytes = snapshot
+            .splats
+            .len()
+            .saturating_mul(accumulator_fields * std::mem::size_of::<f32>());
+        self.optimization_samples.topology_snapshot_readback_bytes = Some(
+            self.optimization_samples
+                .topology_snapshot_readback_bytes
+                .unwrap_or(0)
+                .max(snapshot_readback_bytes),
+        );
+        // Densify keeps cumulative visible_observations. Prune / invisible windows
+        // use the delta since the previous topology step so SkipNoEligibleCandidates
+        // can retain densify accumulators without freezing invisibility clocks.
+        snapshot.window_visible_observations = visibility_window_delta(
+            &snapshot.visible_observations,
+            &self.visibility_window_baseline,
+        );
+        snapshot.window_actual_visible_observations = visibility_window_delta(
+            &snapshot.actual_visible_observations,
+            &self.actual_visibility_window_baseline,
+        );
         self.update_topology_visibility_state(
             snapshot.splats.len(),
-            &snapshot.visible_observations,
+            &snapshot.window_visible_observations,
             iteration,
         );
         snapshot.splat_ages = self.splat_ages_at(iteration, snapshot.splats.len());
@@ -1173,7 +1387,11 @@ impl WgpuTrainer {
             .copied()
             .take(snapshot.splats.len())
             .collect();
+        let plan_started = Instant::now();
         let plan = plan_mutations(&snapshot, &self.config, iteration, frame_count);
+        self.optimization_samples
+            .topology_plan_ms
+            .push(duration_millis(plan_started.elapsed()));
         if let Some(sample) = plan.telemetry_sample.clone() {
             log::info!(
                 "Topology diagnostics | iter={} | epoch={:?} | splats={} | growth={} | clone={} | split={} | prune={} | large_low_grad={}/{} ({:.3}) | low_vis={} | near_low_vis={} | high_opacity_low_vis={} | vis_prune_dry_run={}",
@@ -1197,6 +1415,7 @@ impl WgpuTrainer {
         apply_topology_metrics_delta(&mut self.telemetry.topology, plan.aftermath.metrics_delta);
         self.telemetry.topology.scheduled_steps =
             self.telemetry.topology.scheduled_steps.saturating_add(1);
+        let apply_started = Instant::now();
         if plan.mutates_splats() {
             apply_mutations(splats, &snapshot.splats, &plan, &self.device);
             self.remap_topology_visibility_state(&plan, iteration);
@@ -1220,6 +1439,11 @@ impl WgpuTrainer {
                 "Topology step {} retained accumulators: no eligible candidates",
                 iteration
             );
+            // Advance the visibility window even when densify accumulators stay.
+            self.visibility_window_baseline =
+                visibility_window_baseline_from_cumulative(&snapshot.visible_observations);
+            self.actual_visibility_window_baseline =
+                visibility_window_baseline_from_cumulative(&snapshot.actual_visible_observations);
         } else {
             self.telemetry.topology.accumulator_resets =
                 self.telemetry.topology.accumulator_resets.saturating_add(1);
@@ -1229,6 +1453,9 @@ impl WgpuTrainer {
                 iteration,
             );
         }
+        self.optimization_samples
+            .topology_apply_ms
+            .push(duration_millis(apply_started.elapsed()));
     }
 
     fn reset_accumulators(&mut self, num_splats: usize, sh_coeffs: usize, iteration: usize) {
@@ -1242,6 +1469,8 @@ impl WgpuTrainer {
         self.num_observations = Tensor::zeros([num_splats], &self.device);
         self.visible_observations = Tensor::zeros([num_splats], &self.device);
         self.actual_visible_observations = Tensor::zeros([num_splats], &self.device);
+        self.visibility_window_baseline = vec![0.0; num_splats];
+        self.actual_visibility_window_baseline = vec![0.0; num_splats];
 
         self.update_optimizer_lrs(iteration.saturating_sub(1), sh_coeffs);
     }
@@ -1279,6 +1508,19 @@ impl WgpuTrainer {
         } else {
             self.splat_invisible_windows.truncate(num_splats);
         }
+
+        if self.visibility_window_baseline.len() < num_splats {
+            self.visibility_window_baseline.resize(num_splats, 0.0);
+        } else {
+            self.visibility_window_baseline.truncate(num_splats);
+        }
+
+        if self.actual_visibility_window_baseline.len() < num_splats {
+            self.actual_visibility_window_baseline
+                .resize(num_splats, 0.0);
+        } else {
+            self.actual_visibility_window_baseline.truncate(num_splats);
+        }
     }
 
     fn splat_ages_at(&self, iteration: usize, num_splats: usize) -> Vec<usize> {
@@ -1297,6 +1539,8 @@ impl WgpuTrainer {
     fn remap_topology_visibility_state(&mut self, plan: &TopologyMutationPlan, iteration: usize) {
         let previous_birth_iterations = self.splat_birth_iterations.clone();
         let previous_invisible_windows = self.splat_invisible_windows.clone();
+        let previous_visibility_baseline = self.visibility_window_baseline.clone();
+        let previous_actual_baseline = self.actual_visibility_window_baseline.clone();
         let origins = plan.origins();
         self.splat_birth_iterations = origins
             .iter()
@@ -1312,6 +1556,22 @@ impl WgpuTrainer {
                 origin
                     .and_then(|idx| previous_invisible_windows.get(idx).copied())
                     .unwrap_or(0)
+            })
+            .collect();
+        self.visibility_window_baseline = origins
+            .iter()
+            .map(|origin| {
+                origin
+                    .and_then(|idx| previous_visibility_baseline.get(idx).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        self.actual_visibility_window_baseline = origins
+            .iter()
+            .map(|origin| {
+                origin
+                    .and_then(|idx| previous_actual_baseline.get(idx).copied())
+                    .unwrap_or(0.0)
             })
             .collect();
     }
@@ -1345,6 +1605,7 @@ impl WgpuTrainer {
         self.telemetry.final_loss = report.final_loss;
         self.telemetry.final_step_loss = report.final_step_loss;
         self.telemetry.topology.final_gaussians = Some(report.final_gaussian_count);
+        self.optimization_samples.flush_into(&mut self.telemetry);
         report.telemetry = self.telemetry.clone();
     }
 }
@@ -1423,13 +1684,76 @@ mod tests {
 
     #[test]
     fn loss_scalar_readback_is_not_every_step() {
-        assert!(should_read_loss(1, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
-        assert!(!should_read_loss(2, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
-        assert!(should_read_loss(20, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
-        assert!(should_read_loss(19, 3_000, LOSS_SCALAR_READBACK_INTERVAL, true, false));
-        assert!(should_read_loss(19, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, true));
-        assert!(should_read_loss(3_000, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
-        assert!(!should_read_loss(2_999, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
+        assert!(should_read_loss(
+            1,
+            3_000,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            false,
+            false
+        ));
+        assert!(!should_read_loss(
+            2,
+            3_000,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            false,
+            false
+        ));
+        assert!(should_read_loss(
+            20,
+            3_000,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            false,
+            false
+        ));
+        assert!(should_read_loss(
+            19,
+            3_000,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            true,
+            false
+        ));
+        assert!(should_read_loss(
+            19,
+            3_000,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            false,
+            true
+        ));
+        assert!(should_read_loss(
+            3_000,
+            3_000,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            false,
+            false
+        ));
+        assert!(!should_read_loss(
+            2_999,
+            3_000,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn sticky_overflow_blocks_mutation_and_checkpoint_identity() {
+        let sticky = accumulate_sticky_forward_overflow(
+            StickyForwardOverflow::default(),
+            true,
+            2,
+            9_000,
+            8_000,
+        );
+        assert!(!allows_state_mutation(sticky));
+        let err = sticky.to_error();
+        assert!(matches!(
+            err,
+            TrainingError::ForwardCapacityExceeded {
+                first_iteration: 2,
+                logical_intersections: 9_000,
+                capacity: 8_000,
+            }
+        ));
     }
 
     const CHECKPOINT_ITERATIONS: usize = 8;
@@ -1622,6 +1946,39 @@ mod tests {
             Some(TrainingCheckpointReason::Pause)
         );
         assert_eq!(disposition, Some(TrainingRunDisposition::Paused));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sticky_overflow_rejects_successful_checkpoint_export() {
+        let device = GsDevice::default();
+        let config = trainer_checkpoint_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
+        trainer.sticky_forward_overflow = accumulate_sticky_forward_overflow(
+            StickyForwardOverflow::default(),
+            true,
+            2,
+            9_000,
+            8_000,
+        );
+        let err = trainer
+            .checkpoint(
+                &splats,
+                trainer_checkpoint_identity(),
+                CHECKPOINT_ITERATIONS,
+                Some(0.125),
+            )
+            .await
+            .expect_err("sticky overflow must reject checkpoint export");
+        assert!(matches!(
+            err,
+            TrainingError::ForwardCapacityExceeded {
+                first_iteration: 2,
+                logical_intersections: 9_000,
+                capacity: 8_000,
+            }
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

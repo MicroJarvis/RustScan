@@ -48,6 +48,7 @@ pub(crate) trait ProjectBwdBackend: Backend {
         v_splats: Self::FloatTensorPrimitive,
         screen_grad_splats: Self::FloatTensorPrimitive,
         logical_visible: Self::IntTensorPrimitive,
+        sh_coeffs: Self::FloatTensorPrimitive,
         uniforms: ProjectUniforms,
         dispatch: CubeCount,
     ) -> ProjectBwdPrimitiveOutput<Self>;
@@ -71,6 +72,7 @@ where
         v_splats: Self::FloatTensorPrimitive,
         screen_grad_splats: Self::FloatTensorPrimitive,
         logical_visible: Self::IntTensorPrimitive,
+        sh_coeffs: Self::FloatTensorPrimitive,
         uniforms: ProjectUniforms,
         dispatch: CubeCount,
     ) -> ProjectBwdPrimitiveOutput<Self> {
@@ -82,6 +84,7 @@ where
         let v_splats = v_splats;
         let screen_grad_splats = screen_grad_splats;
         let logical_visible = into_contiguous(logical_visible);
+        let sh_coeffs = into_contiguous(sh_coeffs);
         let device = params.device.clone();
         let client = params.client.clone();
 
@@ -120,6 +123,7 @@ where
                         .handle
                         .binding(),
                     logical_visible.handle.binding(),
+                    sh_coeffs.handle.binding(),
                 ]),
             );
         }
@@ -171,6 +175,7 @@ pub(crate) fn project_bwd<B: ProjectBwdBackend>(
         v_splats.into_primitive().tensor(),
         screen_grad_splats.into_primitive().tensor(),
         logical_visible.into_primitive(),
+        splats.sh_coeffs.val().into_primitive().tensor(),
         uniforms,
         dispatch,
     );

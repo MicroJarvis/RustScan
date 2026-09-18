@@ -4,12 +4,11 @@
 //!   rustgs train --input <colmap_dir> --output <scene.ply>
 //!   rustgs render --input <scene.splat|scene.ply> --camera <pose.json> --output <image.png>
 
-use anyhow::bail;
-#[cfg(feature = "gpu")]
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{CommandFactory, FromArgMatches};
 #[cfg(feature = "gpu")]
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::path::PathBuf;
 
 #[path = "rustgs/train_command.rs"]
@@ -377,6 +376,10 @@ struct TrainArgs {
     #[arg(long)]
     loss_dynamic_mask_start_epoch: Option<usize>,
 
+    /// Dynamic-mask gradient mode: stop_gradient (default) or coupled (diagnostic)
+    #[arg(long, default_value = "stop_gradient")]
+    loss_dynamic_mask_gradient: String,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -420,6 +423,10 @@ struct TrainArgs {
     /// Print the post-training evaluation summary as JSON
     #[arg(long, default_value_t = false)]
     eval_json: bool,
+
+    /// Write a comparable OptimizationReport JSON (defaults beside --output when --eval-json)
+    #[arg(long)]
+    optimization_report: Option<PathBuf>,
 
     /// Directory for post-training target/render/diff crop exports
     #[arg(long)]
@@ -506,6 +513,21 @@ struct PruneSceneArgs {
     log_level: String,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+struct CompareOptimizationReportsArgs {
+    /// Baseline OptimizationReport JSON
+    #[arg(long)]
+    baseline: PathBuf,
+
+    /// Candidate OptimizationReport JSON
+    #[arg(long)]
+    candidate: PathBuf,
+
+    /// Print compare result as JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
 #[derive(Debug, clap::Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -517,6 +539,9 @@ enum Commands {
 
     /// Remove low-quality splats from an existing scene .splat or PLY
     PruneScene(PruneSceneArgs),
+
+    /// Compare two OptimizationReport JSON files for experiment compatibility
+    CompareOptimizationReports(CompareOptimizationReportsArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -528,6 +553,9 @@ fn main() -> anyhow::Result<()> {
         Commands::Train(args) => train_command::run_train_command(args, sources)?,
         Commands::Render(args) => run_render_command(args)?,
         Commands::PruneScene(args) => run_prune_scene_command(args)?,
+        Commands::CompareOptimizationReports(args) => {
+            run_compare_optimization_reports_command(args)?
+        }
     }
 
     Ok(())
@@ -1122,6 +1150,71 @@ fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
 #[cfg(not(feature = "gpu"))]
 fn run_prune_scene_command(_args: PruneSceneArgs) -> anyhow::Result<()> {
     bail!("prune-scene requires the gpu feature");
+}
+
+fn run_compare_optimization_reports_command(
+    args: CompareOptimizationReportsArgs,
+) -> anyhow::Result<()> {
+    let baseline = rustgs::load_optimization_report(&args.baseline).with_context(|| {
+        format!(
+            "failed to load baseline optimization report {}",
+            args.baseline.display()
+        )
+    })?;
+    let candidate = rustgs::load_optimization_report(&args.candidate).with_context(|| {
+        format!(
+            "failed to load candidate optimization report {}",
+            args.candidate.display()
+        )
+    })?;
+    let result = rustgs::compare_optimization_reports(&baseline, &candidate);
+    if args.json {
+        #[derive(Serialize)]
+        struct CompareJson<'a> {
+            decision: &'a str,
+            reasons: Vec<&'a str>,
+            deltas: &'a [rustgs::OptimizationMetricDelta],
+        }
+        let (decision, reasons) = match &result.decision {
+            rustgs::OptimizationCompareDecision::Compatible => ("compatible", Vec::new()),
+            rustgs::OptimizationCompareDecision::Rejected { reasons } => {
+                ("rejected", reasons.iter().map(String::as_str).collect())
+            }
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CompareJson {
+                decision,
+                reasons,
+                deltas: &result.deltas,
+            })?
+        );
+    } else {
+        match &result.decision {
+            rustgs::OptimizationCompareDecision::Compatible => {
+                println!("compatible");
+            }
+            rustgs::OptimizationCompareDecision::Rejected { reasons } => {
+                println!("rejected");
+                for reason in reasons {
+                    println!("- {reason}");
+                }
+            }
+        }
+        for delta in &result.deltas {
+            println!(
+                "{}: baseline={:?} candidate={:?} delta={:?}",
+                delta.name, delta.baseline, delta.candidate, delta.delta
+            );
+        }
+    }
+    if matches!(
+        result.decision,
+        rustgs::OptimizationCompareDecision::Rejected { .. }
+    ) {
+        bail!("optimization reports are not comparable");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "gpu")]

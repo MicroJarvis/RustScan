@@ -213,6 +213,15 @@ pub(crate) fn radix_sort_dispatch_count(len: usize) -> usize {
     RADIX_PASSES * (3 + scan) + 2
 }
 
+/// Peak scratch for keys + values + histogram at the given capacity.
+pub(crate) fn radix_sort_workspace_bytes(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let hist_len = RADIX_BINS * capacity.div_ceil(WORKGROUP_SIZE as usize);
+    (capacity * 2 + hist_len) * std::mem::size_of::<u32>()
+}
+
 pub(crate) fn bitonic_dispatch_count(len: usize) -> usize {
     if len <= 1 {
         return 0;

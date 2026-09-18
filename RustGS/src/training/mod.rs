@@ -63,12 +63,21 @@ pub use events::{
     TrainingSnapshotReady,
 };
 pub use reporting::metrics::{
+    accumulate_sticky_forward_overflow, allows_state_mutation, step_intersection_overflowed,
     ForwardCapacityTelemetry, ParityFloatDistribution, ParityLossCurveSample, ParityLossTerms,
-    ParityTopologyMetrics, ParityTopologyStepSample,
+    ParityTopologyMetrics, ParityTopologyStepSample, StickyForwardOverflow,
+};
+pub use reporting::optimization_report::{
+    build_optimization_report, compare_optimization_reports, current_peak_rss_bytes,
+    default_optimization_report_path, duration_millis, load_optimization_report, percentile_f64,
+    percentile_usize, write_optimization_report, OptimizationCommand, OptimizationCompareDecision,
+    OptimizationCompareResult, OptimizationEnvironment, OptimizationEvalFrame,
+    OptimizationEvaluationMetrics, OptimizationMemoryMetrics, OptimizationMetricDelta,
+    OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics,
 };
 
 pub use config::{
-    LiteGsCameraConfig, LiteGsConfig, LiteGsFeatureConfig, LiteGsGrowthConfig,
+    DynamicMaskGradient, LiteGsCameraConfig, LiteGsConfig, LiteGsFeatureConfig, LiteGsGrowthConfig,
     LiteGsOpacityResetMode, LiteGsPruneMode, LiteGsPruningConfig, LiteGsRefineConfig,
     LiteGsRenderingConfig, LiteGsSplitScoreMode, LiteGsTileSize, LiteGsTopologyConfig,
     LiteGsTrainingProfile, TrainingBackend, TrainingConfig, TrainingDataConfig,

@@ -10,6 +10,8 @@
 
 **Spec:** `docs/RustGS-TODO-训练效果与效率优化-2026-09-17.md`
 
+> **2026-09-18 状态更新：** 本文保留为历史技术方案参考，旧任务编号、实现假设及未验证接口不再直接代表当前待办。执行范围、优先级和新增审核修复以 [当前 TODO](../../RustGS-TODO-训练效果与效率优化-2026-09-17.md) 为准；不要重复实现已落地的 pipeline，也不要将本文全部方法实验视为已授权的必做实现。
+
 ## Global Constraints
 
 - Do not treat existing P0-01, P0-02, P1-01, P1-02, P1-03, P1-05, or P1-06 code as accepted: each requires the quality and performance gates below.

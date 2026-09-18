@@ -32,6 +32,16 @@ pub struct LiteGsTrainingTelemetry {
     pub scan_dispatch_count_p95: Option<usize>,
     pub sort_workspace_bytes: Option<usize>,
     pub scan_workspace_bytes: Option<usize>,
+    /// CPU submit-side loop duration percentiles (`Instant`); not GPU completion.
+    pub loop_duration_p50_ms: Option<f64>,
+    pub loop_duration_p95_ms: Option<f64>,
+    pub loop_timing_kind: Option<String>,
+    pub loss_readback_count: Option<usize>,
+    pub count_readback_count: Option<usize>,
+    pub topology_snapshot_ms_p50: Option<f64>,
+    pub topology_plan_ms_p50: Option<f64>,
+    pub topology_apply_ms_p50: Option<f64>,
+    pub topology_snapshot_readback_bytes: Option<usize>,
 }
 
 static LAST_TRAINING_TELEMETRY: OnceLock<Mutex<Option<LiteGsTrainingTelemetry>>> = OnceLock::new();

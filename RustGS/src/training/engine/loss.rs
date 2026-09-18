@@ -1,3 +1,4 @@
+use crate::training::config::DynamicMaskGradient;
 use burn::prelude::*;
 use burn::tensor::{
     module::conv2d,
@@ -81,6 +82,7 @@ pub fn combined_loss_with_kernel<B: Backend>(
     dynamic_mask_threshold_low: f64,
     dynamic_mask_threshold_high: f64,
     dynamic_mask_min_weight: f64,
+    dynamic_mask_gradient: DynamicMaskGradient,
     ssim_config: &SsimConfig,
     ssim_kernel: Tensor<B, 1>,
 ) -> Tensor<B, 1> {
@@ -93,6 +95,7 @@ pub fn combined_loss_with_kernel<B: Backend>(
         dynamic_mask_threshold_low as f32,
         dynamic_mask_threshold_high as f32,
         dynamic_mask_min_weight as f32,
+        dynamic_mask_gradient,
     );
     let gradient = if gradient_weight > 0.0 {
         gradient_difference_loss(pred.clone(), target.clone())
@@ -117,6 +120,7 @@ fn reconstruction_residual_loss<B: Backend>(
     dynamic_mask_threshold_low: f32,
     dynamic_mask_threshold_high: f32,
     dynamic_mask_min_weight: f32,
+    dynamic_mask_gradient: DynamicMaskGradient,
 ) -> Tensor<B, 1> {
     let abs_residual = (pred - target).abs();
     let loss = if robust_delta.is_finite() && robust_delta > 0.0 {
@@ -156,6 +160,12 @@ fn reconstruction_residual_loss<B: Backend>(
             dynamic_mask_threshold_high,
             dynamic_mask_min_weight,
         );
+        // Detach once at mask construction so both numerator and denominator see
+        // the same stop-gradient weights (R08). Coupled mode keeps the old graph.
+        let weight = match dynamic_mask_gradient {
+            DynamicMaskGradient::StopGradient => weight.detach(),
+            DynamicMaskGradient::Coupled => weight,
+        };
         ((loss * weight.clone()).mean() / weight.mean().clamp_min(1e-6_f32)).reshape([1])
     } else {
         loss.mean().reshape([1])
@@ -240,4 +250,91 @@ fn separable_blur<B: Backend>(tensor: Tensor<B, 4>, kernel: Tensor<B, 1>) -> Ten
         None,
         ConvOptions::new([1, 1], [0, 0], [1, 1], channels),
     )
+}
+
+/// Host-only dynamic-mask math used by R08 gradient diagnostics.
+pub mod dynamic_mask_host {
+    pub fn mask_weight(residual: f32, low: f32, high: f32, min_weight: f32) -> f32 {
+        let denom = (high - low).max(1e-6);
+        ((high - residual) / denom).clamp(min_weight.clamp(0.0, 1.0), 1.0)
+    }
+
+    pub fn weighted_mean_loss(residuals: &[f32], weights: &[f32]) -> f32 {
+        debug_assert_eq!(residuals.len(), weights.len());
+        let num: f32 = residuals
+            .iter()
+            .zip(weights.iter())
+            .map(|(residual, weight)| residual * weight)
+            .sum();
+        let den: f32 = weights.iter().sum::<f32>().max(1e-6);
+        num / den
+    }
+
+    pub fn coupled_loss(residuals: &[f32], low: f32, high: f32, min_weight: f32) -> f32 {
+        let weights: Vec<f32> = residuals
+            .iter()
+            .copied()
+            .map(|residual| mask_weight(residual, low, high, min_weight))
+            .collect();
+        weighted_mean_loss(residuals, &weights)
+    }
+
+    pub fn detached_loss(residuals: &[f32], fixed_weights: &[f32]) -> f32 {
+        weighted_mean_loss(residuals, fixed_weights)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dynamic_mask_host::{coupled_loss, detached_loss, mask_weight};
+
+    #[test]
+    fn coupled_dynamic_mask_can_reward_larger_residuals() {
+        // Many static pixels plus one transitional pixel: raising the dynamic
+        // residual lowers its weight enough that the normalized mean falls.
+        let low = 0.05;
+        let high = 0.20;
+        let min_w = 0.1;
+        let mut residuals = vec![0.01; 12];
+        residuals.push(0.15);
+        let base = coupled_loss(&residuals, low, high, min_w);
+        *residuals.last_mut().unwrap() = 0.19;
+        let increased = coupled_loss(&residuals, low, high, min_w);
+        assert!(
+            increased < base,
+            "expected coupled mask to reward larger residual: base={base} increased={increased}"
+        );
+    }
+
+    #[test]
+    fn detached_dynamic_mask_keeps_non_negative_residual_derivative() {
+        let low = 0.05;
+        let high = 0.20;
+        let min_w = 0.1;
+        let residuals = vec![0.02, 0.08, 0.25];
+        let fixed: Vec<f32> = residuals
+            .iter()
+            .copied()
+            .map(|residual| mask_weight(residual, low, high, min_w))
+            .collect();
+        let eps = 1e-3;
+        for idx in 0..residuals.len() {
+            let mut plus = residuals.clone();
+            let mut minus = residuals.clone();
+            plus[idx] += eps;
+            minus[idx] = (minus[idx] - eps).max(0.0);
+            let d = (detached_loss(&plus, &fixed) - detached_loss(&minus, &fixed))
+                / (plus[idx] - minus[idx]);
+            assert!(
+                d >= -1e-5,
+                "detached mask derivative must not reward larger residual at {idx}: d={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_weight_plateaus_outside_transition() {
+        assert!((mask_weight(0.0, 0.05, 0.2, 0.1) - 1.0).abs() < 1e-6);
+        assert!((mask_weight(0.3, 0.05, 0.2, 0.1) - 0.1).abs() < 1e-6);
+    }
 }

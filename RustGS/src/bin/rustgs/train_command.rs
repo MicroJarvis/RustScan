@@ -326,8 +326,8 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
     rustgs::save_splats(&args.output, &splats, &metadata)?;
     log::info!("Saved scene to {:?}", args.output);
 
-    let evaluation_summary =
-        maybe_evaluate_trained_splats(&args, &splats, &metadata, training_telemetry)?;
+    let evaluation = maybe_evaluate_trained_splats(&args, &splats, &metadata, training_telemetry)?;
+    let evaluation_summary = evaluation.as_ref().map(|result| &result.summary);
 
     if let Err(err) = maybe_write_litegs_parity_report(
         &args.input,
@@ -339,9 +339,19 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
         training_telemetry,
         training_report.training_loop_elapsed,
         training_report.elapsed,
-        evaluation_summary.as_ref(),
+        evaluation_summary,
     ) {
         log::warn!("failed to persist LiteGS parity report: {err}");
+    }
+
+    if let Err(err) = maybe_write_optimization_report(
+        &args,
+        &dataset,
+        &config,
+        &training_report,
+        evaluation.as_ref(),
+    ) {
+        log::warn!("failed to persist optimization report: {err}");
     }
 
     Ok(())
@@ -539,6 +549,7 @@ pub(super) struct TrainConfigOverrides {
     loss_dynamic_mask_min_weight: Option<f32>,
     #[serde(default, deserialize_with = "deserialize_nullable_override")]
     loss_dynamic_mask_start_epoch: Option<Option<usize>>,
+    loss_dynamic_mask_gradient: Option<String>,
     log_level: Option<String>,
     eval_after_train: Option<bool>,
     eval_render_scale: Option<f32>,
@@ -553,6 +564,8 @@ pub(super) struct TrainConfigOverrides {
     eval_worst_frames: Option<usize>,
     eval_device: Option<String>,
     eval_json: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    optimization_report: Option<Option<PathBuf>>,
     #[serde(default, deserialize_with = "deserialize_nullable_override")]
     eval_crop_output_dir: Option<Option<PathBuf>>,
     #[serde(default, deserialize_with = "deserialize_nullable_override")]
@@ -1014,6 +1027,12 @@ impl TrainConfigOverrides {
         );
         apply_override(
             sources,
+            "loss_dynamic_mask_gradient",
+            &mut args.loss_dynamic_mask_gradient,
+            self.loss_dynamic_mask_gradient.clone(),
+        );
+        apply_override(
+            sources,
             "log_level",
             &mut args.log_level,
             self.log_level.clone(),
@@ -1073,6 +1092,12 @@ impl TrainConfigOverrides {
             self.eval_device.clone(),
         );
         apply_override(sources, "eval_json", &mut args.eval_json, self.eval_json);
+        apply_override(
+            sources,
+            "optimization_report",
+            &mut args.optimization_report,
+            self.optimization_report.clone(),
+        );
         apply_override(
             sources,
             "eval_crop_output_dir",
@@ -1695,7 +1720,7 @@ fn maybe_evaluate_trained_splats(
     splats: &rustgs::HostSplats,
     metadata: &rustgs::SplatMetadata,
     training_telemetry: Option<&rustgs::LiteGsTrainingTelemetry>,
-) -> anyhow::Result<Option<rustgs::SplatEvaluationSummary>> {
+) -> anyhow::Result<Option<rustgs::SplatEvaluationResult>> {
     if !args.eval_after_train {
         return Ok(None);
     }
@@ -1745,7 +1770,7 @@ fn maybe_evaluate_trained_splats(
     evaluation.summary.crop_outputs =
         export_evaluation_crops(args, &dataset, splats, &device, &evaluation.summary)?;
     log_splat_evaluation_summary(&evaluation.summary, args.eval_json)?;
-    Ok(Some(evaluation.summary))
+    Ok(Some(evaluation))
 }
 
 #[cfg(feature = "gpu")]
@@ -1852,6 +1877,10 @@ pub(super) fn build_training_config(args: &TrainArgs) -> anyhow::Result<rustgs::
             loss_dynamic_mask_threshold_high: args.loss_dynamic_mask_threshold_high,
             loss_dynamic_mask_min_weight: args.loss_dynamic_mask_min_weight,
             loss_dynamic_mask_start_epoch: args.loss_dynamic_mask_start_epoch,
+            loss_dynamic_mask_gradient: args
+                .loss_dynamic_mask_gradient
+                .parse::<rustgs::DynamicMaskGradient>()
+                .map_err(anyhow::Error::msg)?,
         },
         litegs: rustgs::LiteGsConfig {
             rendering: rustgs::LiteGsRenderingConfig {
@@ -1939,7 +1968,7 @@ fn litegs_profile_overrides(args: &TrainArgs) -> (rustgs::LiteGsSplitScoreMode, 
 
 fn log_litegs_training_config(config: &rustgs::TrainingConfig) {
     log::info!(
-        "LiteGS profile config | profile={} | sh_degree={} | init(point_scale={:.3}, point_opacity={:.3}, vksplat_scale={}, random_rot={}, rotation_seed={}) | tile_size={} | sparse_grad={} | reg_weight={:.4} | enable_transmittance={} | enable_depth={} | learnable_viewproj={} | lr_pose={:.6} | densify_from={} | densify_until={:?} | topology_freeze_after_epoch={:?} | growth_freeze_after_epoch={:?} | refine_every={} | densification_interval={} | growth_grad_threshold={:.6} | split_score={} | split_grad_threshold={:.6} | depth_scale_gamma={:.3} | growth_select_fraction={:.3} | growth_stop_iter={} | opacity_decay={:.6} | scale_decay={:.6} | opacity_reset_interval={} | opacity_reset_mode={} | prune_mode={} | prune_opacity_threshold={:.6} | prune_visibility_dry_run={} | prune_visibility_threshold={:.3} | prune_high_opacity_threshold={:.3} | prune_until_epoch={:?} | target_primitives={} | lr_decay_iterations={:?} | lr_position_scene_scale={} | lr_final(scale={:.6}, rot={:.6}, opacity={:.6}, color={:.6}, color_rest={:.6}) | raster_cov_blur={:.3} | raster_cov_blur_final={:?} | raster_cov_blur_final_after_epoch={:?} | loss_weights(l1={:.3}, ssim={:.3}, gradient={:.3}, robust_delta={:.3}, outlier_threshold={:.3}, outlier_weight={:.3}, dynamic_mask_low={:.3}, dynamic_mask_high={:.3}, dynamic_mask_min_weight={:.3}, dynamic_mask_start_epoch={:?})",
+        "LiteGS profile config | profile={} | sh_degree={} | init(point_scale={:.3}, point_opacity={:.3}, vksplat_scale={}, random_rot={}, rotation_seed={}) | tile_size={} | sparse_grad={} | reg_weight={:.4} | enable_transmittance={} | enable_depth={} | learnable_viewproj={} | lr_pose={:.6} | densify_from={} | densify_until={:?} | topology_freeze_after_epoch={:?} | growth_freeze_after_epoch={:?} | refine_every={} | densification_interval={} | growth_grad_threshold={:.6} | split_score={} | split_grad_threshold={:.6} | depth_scale_gamma={:.3} | growth_select_fraction={:.3} | growth_stop_iter={} | opacity_decay={:.6} | scale_decay={:.6} | opacity_reset_interval={} | opacity_reset_mode={} | prune_mode={} | prune_opacity_threshold={:.6} | prune_visibility_dry_run={} | prune_visibility_threshold={:.3} | prune_high_opacity_threshold={:.3} | prune_until_epoch={:?} | target_primitives={} | lr_decay_iterations={:?} | lr_position_scene_scale={} | lr_final(scale={:.6}, rot={:.6}, opacity={:.6}, color={:.6}, color_rest={:.6}) | raster_cov_blur={:.3} | raster_cov_blur_final={:?} | raster_cov_blur_final_after_epoch={:?} | loss_weights(l1={:.3}, ssim={:.3}, gradient={:.3}, robust_delta={:.3}, outlier_threshold={:.3}, outlier_weight={:.3}, dynamic_mask_low={:.3}, dynamic_mask_high={:.3}, dynamic_mask_min_weight={:.3}, dynamic_mask_start_epoch={:?}, dynamic_mask_gradient={})",
         config.litegs.features.training_profile,
         config.litegs.rendering.sh_degree,
         config.initialization.point_scale_factor,
@@ -2002,6 +2031,7 @@ fn log_litegs_training_config(config: &rustgs::TrainingConfig) {
         config.loss.loss_dynamic_mask_threshold_high,
         config.loss.loss_dynamic_mask_min_weight,
         config.loss.loss_dynamic_mask_start_epoch,
+        config.loss.loss_dynamic_mask_gradient,
     );
 }
 
@@ -2023,6 +2053,178 @@ fn ensure_sparse_initialization_points(
         source,
         source_hint
     );
+}
+
+#[cfg(feature = "gpu")]
+fn resolve_optimization_report_path(args: &TrainArgs) -> Option<PathBuf> {
+    if let Some(path) = args.optimization_report.clone() {
+        return Some(path);
+    }
+    if args.eval_json {
+        return Some(rustgs::default_optimization_report_path(&args.output));
+    }
+    None
+}
+
+#[cfg(feature = "gpu")]
+fn optimization_evaluation_metrics(
+    evaluation: &rustgs::SplatEvaluationResult,
+) -> rustgs::OptimizationEvaluationMetrics {
+    let summary = &evaluation.summary;
+    rustgs::OptimizationEvaluationMetrics {
+        frame_count: Some(summary.frame_count),
+        render_width: Some(summary.render_width),
+        render_height: Some(summary.render_height),
+        psnr_mean_db: Some(summary.psnr_mean_db),
+        psnr_median_db: Some(summary.psnr_median_db),
+        psnr_min_db: Some(summary.psnr_min_db),
+        psnr_max_db: Some(summary.psnr_max_db),
+        worst_frame_ids: summary
+            .worst_frames
+            .iter()
+            .map(|frame| frame.frame_id as u32)
+            .collect(),
+        frames: evaluation
+            .frame_metrics
+            .iter()
+            .map(|frame| rustgs::OptimizationEvalFrame {
+                frame_id: frame.frame_id as u32,
+                psnr_db: frame.psnr_db,
+                sharpness_grad_ratio: Some(frame.sharpness_grad_ratio),
+                sharpness_lap_ratio: Some(frame.sharpness_lap_ratio),
+            })
+            .collect(),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn maybe_write_optimization_report(
+    args: &TrainArgs,
+    dataset: &rustscan_types::TrainingDataset,
+    config: &rustgs::TrainingConfig,
+    training_report: &rustgs::TrainingRunReport,
+    evaluation: Option<&rustgs::SplatEvaluationResult>,
+) -> anyhow::Result<()> {
+    let Some(report_path) = resolve_optimization_report_path(args) else {
+        return Ok(());
+    };
+
+    let dataset_fingerprint = rustgs::fingerprint_colmap_sparse_model(&args.input)
+        .ok()
+        .map(|digest| {
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+    let eval_frame_ids = evaluation
+        .map(|result| {
+            result
+                .frame_metrics
+                .iter()
+                .map(|frame| frame.frame_id as u32)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let eval_resolution =
+        evaluation.map(|result| [result.summary.render_width, result.summary.render_height]);
+    let telemetry = training_report.telemetry.as_ref();
+    let completed_iterations = training_report.completed_iterations;
+    let training_loop_seconds = training_report.training_loop_elapsed.as_secs_f64();
+    let steps_per_second = if training_loop_seconds > 0.0 && completed_iterations > 0 {
+        Some(completed_iterations as f64 / training_loop_seconds)
+    } else {
+        None
+    };
+    let estimated_buffer_bytes = telemetry.and_then(|telemetry| {
+        match (
+            telemetry.sort_workspace_bytes,
+            telemetry.scan_workspace_bytes,
+        ) {
+            (Some(sort), Some(scan)) => Some((sort as u64).saturating_add(scan as u64)),
+            (Some(sort), None) => Some(sort as u64),
+            (None, Some(scan)) => Some(scan as u64),
+            (None, None) => None,
+        }
+    });
+
+    let report = rustgs::build_optimization_report(
+        rustgs::OptimizationEnvironment {
+            binary_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            git_revision: option_env!("VERGEN_GIT_SHA").map(str::to_string),
+            adapter_name: None,
+            backend: Some("wgpu".to_string()),
+            driver: None,
+            timestamp_query_available: Some(false),
+        },
+        rustgs::OptimizationCommand {
+            argv: std::env::args().collect(),
+            dataset_fingerprint,
+            frame_shuffle_seed: Some(config.data.frame_shuffle_seed),
+            render_scale: Some(config.raster.render_scale),
+            eval_render_scale: args.eval_after_train.then_some(args.eval_render_scale),
+            eval_frame_ids,
+            eval_resolution,
+            iterations: Some(config.iterations),
+            max_frames: Some(dataset.poses.len()),
+        },
+        rustgs::OptimizationTrainMetrics {
+            wall_clock_seconds: Some(training_report.elapsed.as_secs_f64()),
+            training_loop_seconds: Some(training_loop_seconds),
+            completed_iterations: Some(completed_iterations),
+            steps_per_second,
+            loop_duration_p50_ms: telemetry.and_then(|t| t.loop_duration_p50_ms),
+            loop_duration_p95_ms: telemetry.and_then(|t| t.loop_duration_p95_ms),
+            loop_timing_kind: telemetry
+                .and_then(|t| t.loop_timing_kind.clone())
+                .or_else(|| Some("cpu_submit_instant".into())),
+            gpu_completion_seconds: None,
+            loss_readback_count: telemetry.and_then(|t| t.loss_readback_count),
+            count_readback_count: telemetry.and_then(|t| t.count_readback_count),
+            sort_dispatch_count_p50: telemetry.and_then(|t| t.radix_dispatch_count_p50),
+            sort_dispatch_count_p95: telemetry.and_then(|t| t.radix_dispatch_count_p95),
+            scan_dispatch_count_p50: telemetry.and_then(|t| t.scan_dispatch_count_p50),
+            scan_dispatch_count_p95: telemetry.and_then(|t| t.scan_dispatch_count_p95),
+            sort_workspace_bytes: telemetry.and_then(|t| t.sort_workspace_bytes),
+            scan_workspace_bytes: telemetry.and_then(|t| t.scan_workspace_bytes),
+            initial_gaussians: telemetry.and_then(|t| t.topology.initialization_gaussians),
+            final_gaussians: Some(training_report.gaussian_count),
+            final_loss: training_report.final_loss,
+            forward_capacity: telemetry.and_then(|t| t.forward_capacity),
+        },
+        rustgs::OptimizationTopologyMetrics {
+            scheduled_steps: telemetry.map(|t| t.topology.scheduled_steps),
+            mutations: telemetry.map(|t| {
+                t.topology
+                    .densify_events
+                    .saturating_add(t.topology.prune_events)
+            }),
+            skipped_no_eligible_candidates: telemetry
+                .map(|t| t.topology.skipped_no_eligible_candidates),
+            accumulator_resets: telemetry.map(|t| t.topology.accumulator_resets),
+            snapshot_ms_p50: telemetry.and_then(|t| t.topology_snapshot_ms_p50),
+            plan_ms_p50: telemetry.and_then(|t| t.topology_plan_ms_p50),
+            apply_ms_p50: telemetry.and_then(|t| t.topology_apply_ms_p50),
+            snapshot_readback_bytes: telemetry.and_then(|t| t.topology_snapshot_readback_bytes),
+            densify_added: telemetry.map(|t| t.topology.densify_added),
+            prune_removed: telemetry.map(|t| t.topology.prune_removed),
+        },
+        rustgs::OptimizationMemoryMetrics {
+            peak_rss_bytes: rustgs::current_peak_rss_bytes(),
+            peak_device_bytes: None,
+            estimated_buffer_bytes,
+        },
+        evaluation.map(optimization_evaluation_metrics),
+    );
+
+    rustgs::write_optimization_report(&report_path, &report).with_context(|| {
+        format!(
+            "failed to write optimization report {}",
+            report_path.display()
+        )
+    })?;
+    log::info!("Saved optimization report to {:?}", report_path);
+    Ok(())
 }
 
 #[cfg(feature = "gpu")]

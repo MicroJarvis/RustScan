@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-
 use burn::tensor::{DType, Shape, TensorMetadata};
 use burn_cubecl::cubecl::{prelude::KernelId, server::KernelArguments, CubeCount};
 use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElement, IntElement};
@@ -73,21 +71,30 @@ pub(crate) fn prefix_sum_dispatch_count(len: usize) -> usize {
     }
 }
 
+/// Transient output + recursive block-sum buffers for an inclusive scan of `len`.
+pub(crate) fn prefix_sum_workspace_bytes(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let mut total = 0usize;
+    let mut remaining = len;
+    while remaining > 1 {
+        let blocks = remaining.div_ceil(WORKGROUP_SIZE as usize);
+        total = total.saturating_add(remaining.saturating_add(blocks.max(1)));
+        if blocks <= 1 {
+            break;
+        }
+        remaining = blocks;
+    }
+    total.saturating_mul(std::mem::size_of::<u32>())
+}
+
 pub(crate) fn hillis_steele_dispatch_count(len: usize) -> usize {
     if len <= 1 {
         return 0;
     }
     // Copy plus one kernel per doubling offset.
     1 + usize::BITS.saturating_sub(len.saturating_sub(1).leading_zeros()) as usize
-}
-
-struct ScanScratch {
-    output: CubeTensor<WgpuRuntime>,
-    block_sums: CubeTensor<WgpuRuntime>,
-}
-
-thread_local! {
-    static SCAN_SCRATCH: RefCell<Vec<ScanScratch>> = const { RefCell::new(Vec::new()) };
 }
 
 fn empty_tensor(like: &CubeTensor<WgpuRuntime>, len: usize) -> CubeTensor<WgpuRuntime> {
@@ -100,34 +107,6 @@ fn empty_tensor(like: &CubeTensor<WgpuRuntime>, len: usize) -> CubeTensor<WgpuRu
             .empty(shape.num_elements() * core::mem::size_of::<u32>()),
         like.dtype(),
     )
-}
-
-fn scratch_output(
-    like: &CubeTensor<WgpuRuntime>,
-    len: usize,
-    blocks: usize,
-) -> (CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>) {
-    SCAN_SCRATCH.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if let Some(scratch) = slot.iter().find(|scratch| {
-            scratch.output.shape()[0] == len
-                && scratch.block_sums.shape()[0] == blocks.max(1)
-                && scratch.output.device == like.device
-                && scratch.output.dtype() == like.dtype()
-        }) {
-            return (scratch.output.clone(), scratch.block_sums.clone());
-        }
-        if slot.len() >= 8 {
-            slot.remove(0);
-        }
-        let scratch = ScanScratch {
-            output: empty_tensor(like, len),
-            block_sums: empty_tensor(like, blocks.max(1)),
-        };
-        let pair = (scratch.output.clone(), scratch.block_sums.clone());
-        slot.push(scratch);
-        pair
-    })
 }
 
 impl<F, I, BT> PrefixSumBackend for CubeBackend<WgpuRuntime, F, I, BT>
@@ -158,7 +137,11 @@ fn inclusive_scan(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<WgpuRunti
 
     let client = input.client.clone();
     let blocks = len.div_ceil(WORKGROUP_SIZE as usize);
-    let (output, block_sums) = scratch_output(&input, len, blocks);
+    // Fresh output and block-sum buffers every call (R02):
+    // - returned outputs must outlive later same-length scans
+    // - recursive block scans must not overwrite a parent frame's totals
+    let output = empty_tensor(&input, len);
+    let block_sums = empty_tensor(&input, blocks.max(1));
     let params = ScanParams {
         len: len as u32,
         _pad0: 0,
@@ -216,6 +199,124 @@ mod tests {
         assert_eq!(prefix_sum_dispatch_count(0), 0);
         assert_eq!(prefix_sum_dispatch_count(1), 0);
         assert_eq!(prefix_sum_dispatch_count(256), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consecutive_same_length_scans_keep_independent_results() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+        use super::PrefixSumBackend;
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let first_values = vec![1_i32, 2, 3];
+        let second_values = vec![10_i32, 20, 30];
+        let first_input = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(first_values.clone(), [3]),
+            &device,
+        );
+        let second_input = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(second_values.clone(), [3]),
+            &device,
+        );
+
+        let first_scanned = GsBackendBase::prefix_sum_u32_primitive(first_input.into_primitive())
+            .expect("first scan");
+        let second_scanned =
+            GsBackendBase::prefix_sum_u32_primitive(second_input.into_primitive())
+                .expect("second scan");
+
+        // Read the first result AFTER the second scan has been submitted. The
+        // historical bug overwrote the shared scratch so [1,3,6] became [10,30,60].
+        let first_actual = Tensor::<GsBackendBase, 1, Int>::from_primitive(first_scanned)
+            .into_data_async()
+            .await
+            .expect("first readback")
+            .into_vec::<i32>()
+            .expect("first data");
+        let second_actual = Tensor::<GsBackendBase, 1, Int>::from_primitive(second_scanned)
+            .into_data_async()
+            .await
+            .expect("second readback")
+            .into_vec::<i32>()
+            .expect("second data");
+
+        assert_eq!(first_actual, vec![1, 3, 6]);
+        assert_eq!(second_actual, vec![10, 30, 60]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_results_survive_length_changes_and_reuse() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+        use super::PrefixSumBackend;
+
+        fn cpu_scan(values: &[i32]) -> Vec<i32> {
+            let mut acc = 0u32;
+            values
+                .iter()
+                .map(|value| {
+                    acc = acc.wrapping_add(*value as u32);
+                    acc as i32
+                })
+                .collect()
+        }
+
+        async fn scan_vec(device: &<GsBackendBase as Backend>::Device, values: &[i32]) -> Vec<i32> {
+            let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(values.to_vec(), [values.len()]),
+                device,
+            );
+            let scanned = GsBackendBase::prefix_sum_u32_primitive(input.into_primitive())
+                .expect("scan");
+            Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
+                .into_data_async()
+                .await
+                .expect("readback")
+                .into_vec::<i32>()
+                .expect("data")
+        }
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let short = vec![1_i32, 2, 3];
+        let long: Vec<i32> = (0..257).map(|index| (index % 5) as i32 + 1).collect();
+        let short_again = vec![4_i32, 5, 6];
+
+        let held_short = {
+            let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(short.clone(), [3]),
+                &device,
+            );
+            GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("short scan")
+        };
+        let held_long = {
+            let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(long.clone(), [long.len()]),
+                &device,
+            );
+            GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("long scan")
+        };
+        // Different length, then same length again while prior results are live.
+        let _ = scan_vec(&device, &[9, 8, 7, 6]).await;
+        let third = scan_vec(&device, &short_again).await;
+
+        let short_actual = Tensor::<GsBackendBase, 1, Int>::from_primitive(held_short)
+            .into_data_async()
+            .await
+            .expect("short readback")
+            .into_vec::<i32>()
+            .expect("short data");
+        let long_actual = Tensor::<GsBackendBase, 1, Int>::from_primitive(held_long)
+            .into_data_async()
+            .await
+            .expect("long readback")
+            .into_vec::<i32>()
+            .expect("long data");
+
+        assert_eq!(short_actual, cpu_scan(&short));
+        assert_eq!(long_actual, cpu_scan(&long));
+        assert_eq!(third, cpu_scan(&short_again));
     }
 
     #[tokio::test(flavor = "current_thread")]

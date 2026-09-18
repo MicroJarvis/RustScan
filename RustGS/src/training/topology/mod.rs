@@ -161,7 +161,9 @@ pub(crate) fn plan_topology_from_host_snapshot(
     grad_color_accum: &[f32],
     num_observations: &[f32],
     visible_observations: &[f32],
+    window_visible_observations: &[f32],
     actual_visible_observations: &[f32],
+    window_actual_visible_observations: &[f32],
     splat_ages: &[usize],
     invisible_windows: &[usize],
     iteration: usize,
@@ -188,11 +190,21 @@ pub(crate) fn plan_topology_from_host_snapshot(
         grad_color_accum,
         num_observations,
         visible_observations,
+        window_visible_observations,
         actual_visible_observations,
+        window_actual_visible_observations,
         splat_ages,
         invisible_windows,
     );
-    let analysis = analyze_topology_candidates(&policy, &metrics, &stats, schedule.densify);
+    let opacity_prune_enabled = match policy.litegs.pruning.prune_mode {
+        // Threshold opacity cleanup follows the prune schedule, including prune-only steps.
+        LiteGsPruneMode::Threshold => schedule.prune,
+        // Weight / VisibilityWeight keep densify-gated opacity cleanup; prune-only
+        // steps still evaluate history-invisible / visibility-ratio rules.
+        LiteGsPruneMode::Weight | LiteGsPruneMode::VisibilityWeight => schedule.densify,
+    };
+    let analysis =
+        analyze_topology_candidates(&policy, &metrics, &stats, opacity_prune_enabled);
 
     let requested_additions = litegs_requested_additions(
         &analysis.infos,
@@ -1050,12 +1062,13 @@ fn litegs_should_prune_candidate(
     let history_invisible_prune = old_enough
         && info.visible_count == 0
         && info.consecutive_invisible_epochs >= policy.litegs.pruning.prune_invisible_epochs;
-    // Threshold: opacity or a long invisible window, both using real visibility.
-    // Weight: the same, so default densify+prune steps can still drop Gaussians
-    // that never rasterize. Visibility does not replace the opacity rule.
-    // VisibilityWeight: Weight plus a low actual-visibility-ratio rule.
+    // Keep prune-mode branches separate so Threshold / Weight / VisibilityWeight
+    // schedule conditions cannot silently rewrite each other.
     let contribution_prune = match policy.litegs.pruning.prune_mode {
-        LiteGsPruneMode::Threshold | LiteGsPruneMode::Weight => {
+        LiteGsPruneMode::Threshold => {
+            (opacity_prune_enabled && opacity_prune) || history_invisible_prune
+        }
+        LiteGsPruneMode::Weight => {
             (opacity_prune_enabled && opacity_prune) || history_invisible_prune
         }
         LiteGsPruneMode::VisibilityWeight => {
@@ -1091,7 +1104,9 @@ fn build_host_snapshot_stats(
     _grad_color_accum: &[f32],
     num_observations: &[f32],
     visible_observations: &[f32],
+    window_visible_observations: &[f32],
     actual_visible_observations: &[f32],
+    window_actual_visible_observations: &[f32],
     splat_ages: &[usize],
     invisible_windows: &[usize],
 ) -> Vec<MetalGaussianStats> {
@@ -1108,15 +1123,26 @@ fn build_host_snapshot_stats(
                 .copied()
                 .unwrap_or_default()
                 .max(0.0);
-            let visible_count = visible_observations.round().min(usize::MAX as f32) as usize;
+            let window_visible_observations = window_visible_observations
+                .get(idx)
+                .copied()
+                .unwrap_or_default()
+                .max(0.0);
+            let visible_count = window_visible_observations.round().min(usize::MAX as f32) as usize;
             let visible_denom = visible_observations.max(1.0);
             let actual_visible_observations = actual_visible_observations
                 .get(idx)
                 .copied()
                 .unwrap_or_default()
                 .max(0.0);
-            let actual_visible_count =
-                actual_visible_observations.round().min(usize::MAX as f32) as usize;
+            let window_actual_visible_observations = window_actual_visible_observations
+                .get(idx)
+                .copied()
+                .unwrap_or_default()
+                .max(0.0);
+            let actual_visible_count = window_actual_visible_observations
+                .round()
+                .min(usize::MAX as f32) as usize;
             let actual_visibility_ratio = if observations > 0.0 {
                 (actual_visible_observations / observations).clamp(0.0, 1.0)
             } else {
@@ -1157,9 +1183,72 @@ fn build_host_snapshot_stats(
         .collect()
 }
 
+/// Counts observed since the previous topology visibility baseline.
+pub(crate) fn visibility_window_delta(cumulative: &[f32], baseline: &[f32]) -> Vec<f32> {
+    cumulative
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let current = if value.is_finite() { (*value).max(0.0) } else { 0.0 };
+            let base = baseline
+                .get(idx)
+                .copied()
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0)
+                .max(0.0);
+            (current - base).max(0.0)
+        })
+        .collect()
+}
+
+pub(crate) fn visibility_window_baseline_from_cumulative(cumulative: &[f32]) -> Vec<f32> {
+    cumulative
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                (*value).max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn visibility_window_delta_ignores_retained_cumulative_history() {
+        let cumulative = vec![5.0, 0.0, 3.0];
+        let baseline = vec![5.0, 0.0, 1.0];
+        assert_eq!(
+            visibility_window_delta(&cumulative, &baseline),
+            vec![0.0, 0.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn retained_accumulators_still_advance_invisible_windows() {
+        // Early window saw visibility (cumulative=4). Later windows add nothing.
+        // Without a baseline delta, visible_count stayed >0 and invisible clocks froze.
+        let mut invisible = vec![0usize];
+        let mut baseline = vec![0.0];
+        let thresholds = 3usize;
+        for step in 0..5 {
+            let cumulative = if step == 0 { vec![4.0] } else { vec![4.0] };
+            let window = visibility_window_delta(&cumulative, &baseline);
+            let visible = window[0] > 0.0;
+            if visible {
+                invisible[0] = 0;
+            } else {
+                invisible[0] = invisible[0].saturating_add(1);
+            }
+            baseline = visibility_window_baseline_from_cumulative(&cumulative);
+        }
+        assert_eq!(invisible[0], 4);
+        assert!(invisible[0] >= thresholds);
+    }
 
     #[test]
     fn topology_growth_is_capped_by_target_primitive_budget() {
@@ -1214,6 +1303,8 @@ mod budget_tests {
         let plan = plan_topology_from_host_snapshot(
             &config,
             &splats,
+            &stats,
+            &stats,
             &stats,
             &stats,
             &stats,
@@ -1307,6 +1398,68 @@ mod budget_tests {
         ));
         assert!(!litegs_should_prune_candidate(
             &policy, &split_source, position, scale, center, 10.0, true, true
+        ));
+    }
+
+    #[test]
+    fn threshold_prune_only_step_removes_low_opacity_keeps_visible_high_opacity() {
+        let mut config = TrainingConfig::default();
+        config.litegs.pruning.prune_mode = LiteGsPruneMode::Threshold;
+        config.litegs.pruning.prune_min_age = 1;
+        config.litegs.pruning.prune_opacity_threshold = 0.05;
+        let policy = TopologyPolicy::from_training_config(&config, 1.0);
+        let scale = [0.01, 0.01, 0.01];
+        let center = [0.0, 0.0, 0.0];
+        let position = [0.0, 0.0, 0.0];
+        let low_opacity = prune_info(0.01, 8, 0);
+        let high_visible = prune_info(0.9, 12, 0);
+        // densify=false, prune=true → opacity_prune_enabled must be true for Threshold.
+        assert!(litegs_should_prune_candidate(
+            &policy, &low_opacity, position, scale, center, 10.0, true, true
+        ));
+        assert!(!litegs_should_prune_candidate(
+            &policy, &high_visible, position, scale, center, 10.0, true, true
+        ));
+        // Age protection: too young must not prune on opacity alone.
+        let mut young = low_opacity.clone();
+        young.age = 0;
+        assert!(!litegs_should_prune_candidate(
+            &policy, &young, position, scale, center, 10.0, true, true
+        ));
+    }
+
+    #[test]
+    fn weight_opacity_cleanup_stays_densify_gated_on_prune_only_steps() {
+        let mut config = TrainingConfig::default();
+        config.litegs.pruning.prune_mode = LiteGsPruneMode::Weight;
+        config.litegs.pruning.prune_min_age = 1;
+        config.litegs.pruning.prune_opacity_threshold = 0.05;
+        let policy = TopologyPolicy::from_training_config(&config, 1.0);
+        let scale = [0.01, 0.01, 0.01];
+        let center = [0.0, 0.0, 0.0];
+        let position = [0.0, 0.0, 0.0];
+        let low_opacity_visible = prune_info(0.01, 8, 0);
+        // prune-only: opacity_prune_enabled=false for Weight → no opacity prune.
+        assert!(!litegs_should_prune_candidate(
+            &policy,
+            &low_opacity_visible,
+            position,
+            scale,
+            center,
+            10.0,
+            true,
+            false,
+        ));
+        // densify+prune: opacity cleanup enabled.
+        assert!(litegs_should_prune_candidate(
+            &policy,
+            &low_opacity_visible,
+            position,
+            scale,
+            center,
+            10.0,
+            true,
+            true,
         ));
     }
 

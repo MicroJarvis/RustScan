@@ -9,6 +9,7 @@
 @group(0) @binding(6) var<storage, read> screen_grad_splats: array<f32>;
 @group(0) @binding(7) var<storage, read_write> screen_grad_stats: array<f32>;
 @group(0) @binding(8) var<storage, read> logical_visible: array<u32>;
+@group(0) @binding(9) var<storage, read> sh_coeffs: array<f32>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -72,6 +73,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let num_active_coeffs = helpers::num_sh_coeffs(uniforms.sh_degree);
     let num_storage_coeffs = helpers::num_sh_coeffs(uniforms.storage_sh_degree);
     let sh_base = global_gid * num_storage_coeffs * 3u;
+    var sh_values = array<vec3<f32>, 25>();
+    for (var coeff_idx = 0u; coeff_idx < num_storage_coeffs; coeff_idx++) {
+        let src = sh_base + coeff_idx * 3u;
+        sh_values[coeff_idx] = vec3<f32>(sh_coeffs[src], sh_coeffs[src + 1u], sh_coeffs[src + 2u]);
+    }
     for (var coeff_idx = 0u; coeff_idx < num_active_coeffs; coeff_idx++) {
         let grad = sh_grads[coeff_idx];
         let dst = sh_base + coeff_idx * 3u;
@@ -79,6 +85,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         v_sh_coeffs[dst + 1u] = grad.y;
         v_sh_coeffs[dst + 2u] = grad.z;
     }
+    let v_viewdir = helpers::sh_to_color_viewdir_vjp(
+        uniforms.sh_degree,
+        viewdir,
+        sh_values,
+        v_color,
+    );
 
     let rotation = mat3x3<f32>(
         uniforms.viewmat[0].xyz,
@@ -101,6 +113,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         uniforms.pixel_center,
     );
     var cov2d = j * cov_cam * transpose(j);
+    let cov2d_raw = cov2d;
     let filter_comp = helpers::compensate_cov2d(&cov2d, uniforms.cov_blur);
 
     let opac = helpers::sigmoid(params[t_base + 10u]);
@@ -116,8 +129,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec2<f32>(v_conic.x, 0.5 * v_conic.y),
         vec2<f32>(0.5 * v_conic.y, v_conic.z),
     );
-    let v_cov2d = helpers::inverse2x2_vjp(cov2d_inv, v_cov2d_inv);
-    let v_mean_c = helpers::persp_proj_vjp(
+    var v_cov2d = helpers::inverse2x2_vjp(cov2d_inv, v_cov2d_inv);
+    // Opacity uses filter_comp(cov_raw); fold that VJP into cov_raw before the cov chain.
+    let v_filter = v_color_a * opac;
+    v_cov2d = v_cov2d + helpers::compensate_cov2d_vjp(
+        cov2d_raw,
+        uniforms.cov_blur,
+        filter_comp,
+        v_filter,
+    );
+    var v_mean_c = helpers::persp_proj_vjp(
         j,
         mean_c,
         cov_cam,
@@ -138,7 +159,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v_log_scale = v_scale * scale;
     let v_quat = helpers::normalize_vjp(quat_unorm) *
         helpers::quat_to_mat3_vjp(quat, v_m * scale_mat);
-    let v_mean = transpose(rotation) * v_mean_c;
+    var v_mean = transpose(rotation) * v_mean_c;
+    v_mean = v_mean + helpers::normalize3_vjp(viewdir_delta, v_viewdir);
 
     v_params[p_base] = v_mean.x;
     v_params[p_base + 1u] = v_mean.y;

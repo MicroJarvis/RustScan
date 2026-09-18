@@ -1,6 +1,7 @@
 //! Backward rendering pipeline
 
 pub mod autodiff;
+pub mod gradient_check;
 pub mod project_bwd;
 pub mod rasterize_bwd;
 

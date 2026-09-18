@@ -59,14 +59,20 @@ pub use crate::core::{GaussianCamera, HostSplats, SplatView};
 
 // Re-export training types
 pub use crate::training::{
-    compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
-    load_training_checkpoint, parity_fixture_id_for_input_path,
+    build_optimization_report, compare_loss_curve_samples, compare_optimization_reports,
+    current_peak_rss_bytes, default_litegs_parity_fixtures, default_optimization_report_path,
+    default_parity_report_path, duration_millis, load_optimization_report,
+    load_training_checkpoint, parity_fixture_id_for_input_path, percentile_f64, percentile_usize,
     resolve_litegs_parity_fixture_input_path, resolve_litegs_parity_reference_report_path,
-    save_training_checkpoint, AdamCheckpoint, AdamParameterCheckpoint, EvaluationDevice,
-    EvaluationFrameMetric, FinalTrainingMetrics, LiteGsCameraConfig, LiteGsConfig,
-    LiteGsFeatureConfig, LiteGsGrowthConfig, LiteGsOpacityResetMode, LiteGsPruneMode,
-    LiteGsPruningConfig, LiteGsRefineConfig, LiteGsRenderingConfig, LiteGsSplitScoreMode,
-    LiteGsTileSize, LiteGsTopologyConfig, LiteGsTrainingProfile, ParityCheckOutcome,
+    save_training_checkpoint, write_optimization_report, AdamCheckpoint, AdamParameterCheckpoint,
+    DynamicMaskGradient, EvaluationDevice, EvaluationFrameMetric, FinalTrainingMetrics,
+    LiteGsCameraConfig, LiteGsConfig, LiteGsFeatureConfig, LiteGsGrowthConfig,
+    LiteGsOpacityResetMode, LiteGsPruneMode, LiteGsPruningConfig, LiteGsRefineConfig,
+    LiteGsRenderingConfig, LiteGsSplitScoreMode, LiteGsTileSize, LiteGsTopologyConfig,
+    LiteGsTrainingProfile, OptimizationCommand, OptimizationCompareDecision,
+    OptimizationCompareResult, OptimizationEnvironment, OptimizationEvalFrame,
+    OptimizationEvaluationMetrics, OptimizationMemoryMetrics, OptimizationMetricDelta,
+    OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics, ParityCheckOutcome,
     ParityCheckStatus, ParityFixtureKind, ParityFixtureSpec, ParityFloatDistribution,
     ParityGateEvaluation, ParityGateStatus, ParityHarnessReport, ParityLossCurveSample,
     ParityLossTerms, ParityMetricSnapshot, ParityReferenceComparison, ParityThresholds,
@@ -191,10 +197,11 @@ pub enum TrainingError {
     TrainingFailed(String),
 
     #[error(
-        "forward intersection capacity exceeded: logical_intersections={logical_intersections}, capacity={capacity}"
+        "forward intersection capacity exceeded: logical_intersections={logical_intersections}, capacity={capacity}, first_iteration={first_iteration}"
     )]
     ForwardCapacityExceeded {
         logical_intersections: u32,
         capacity: u32,
+        first_iteration: u32,
     },
 }

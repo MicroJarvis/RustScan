@@ -18,6 +18,11 @@ pub(crate) struct TopologySnapshot {
     pub num_observations: Vec<f32>,
     pub visible_observations: Vec<f32>,
     pub actual_visible_observations: Vec<f32>,
+    /// Visibility counts since the previous topology step. Used for prune
+    /// `visible_count` / invisible-window advancement while densify still uses
+    /// the cumulative `visible_observations` accumulator.
+    pub window_visible_observations: Vec<f32>,
+    pub window_actual_visible_observations: Vec<f32>,
     pub splat_ages: Vec<usize>,
     pub invisible_windows: Vec<usize>,
 }
@@ -98,7 +103,7 @@ pub(crate) async fn snapshot_for_topology<S: Backend, A: Backend>(
             }
         })
         .collect();
-    let visible_observations = data[8]
+    let visible_observations: Vec<f32> = data[8]
         .clone()
         .into_vec::<f32>()
         .expect("topology visible_observations: expected f32 scalar tensor")
@@ -111,7 +116,7 @@ pub(crate) async fn snapshot_for_topology<S: Backend, A: Backend>(
             }
         })
         .collect();
-    let actual_visible_observations = if actual_visible_observations.is_some() {
+    let actual_visible_observations: Vec<f32> = if actual_visible_observations.is_some() {
         data[9]
             .clone()
             .into_vec::<f32>()
@@ -141,6 +146,8 @@ pub(crate) async fn snapshot_for_topology<S: Backend, A: Backend>(
         camera_depth_accum,
         grad_color_accum,
         num_observations,
+        window_visible_observations: visible_observations.clone(),
+        window_actual_visible_observations: actual_visible_observations.clone(),
         visible_observations,
         actual_visible_observations,
     }
@@ -164,7 +171,9 @@ pub(crate) fn plan_mutations(
         &snapshot.grad_color_accum,
         &snapshot.num_observations,
         &snapshot.visible_observations,
+        &snapshot.window_visible_observations,
         &snapshot.actual_visible_observations,
+        &snapshot.window_actual_visible_observations,
         &snapshot.splat_ages,
         &snapshot.invisible_windows,
         iteration,

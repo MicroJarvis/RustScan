@@ -1,6 +1,6 @@
 # RustScan Current Project Status
 
-**Updated:** 2026-09-16
+**Updated:** 2026-09-18
 **Branch:** `main`
 
 ## Overall
@@ -9,21 +9,22 @@
 
 ## Verified Snapshot
 
-本轮 RustSFM 硬化后的本地验证结果是：
+2026-09-17 macOS arm64 / rustc 1.97.0 本地实测。`--no-default-features` 只保证编译和非 GPU codec 测试；需要 adapter 的测试必须显式启用 `gpu-wgpu,vlfeat-sift`。较早的 784 通过记录见 `output/p0_baseline_20260917/REPORT.md`，不能覆盖随后的初始化改动。下列数字是 R1/R2 修复后的复验，任务 4 仍未验收。2026-09-17 的 seed 0 / 1 线程对照见 `docs/RustSFM-TODO-技术方案-2026-09-17.md` 第 12.6 节：首个 accepted pair 与 COLMAP 3.13.0 都是 `frame_0002.jpg -> frame_0018.jpg`，注册顺序和模型切分未对齐。
 
-- `cargo test -p rustsfm --lib`: `713 passed; 0 failed; 19 ignored`
-- `cargo test -p rustsfm --lib --no-default-features`: `586 passed; 0 failed; 19 ignored`
-- `cargo test -p rustsfm --test sequence_registration --no-default-features`: `62 passed; 0 failed`
-- `cargo test -p rustsfm --lib -- --ignored`（本地 provision 夹具后）: `19 passed; 0 failed`
+- `cargo test -p rustsfm --lib --features gpu-wgpu,vlfeat-sift -- --test-threads=1`: `792 passed; 0 failed; 19 ignored`（测试耗时 64.23 s）
+- `cargo test -p rustsfm --test sequence_registration --features gpu-wgpu,vlfeat-sift -- --test-threads=1`: `72 passed; 0 failed; 0 ignored`（58.41 s）
+- `cargo test -p rustsfm --lib --features gpu-wgpu,vlfeat-sift -- --ignored --test-threads=1`（已有 `test_data/flowers2_colmap`）: `19 passed; 0 failed`（4.55 s）
+- `cargo test -p rustsfm --lib --no-default-features -- --test-threads=8`: `603 passed; 0 failed; 19 ignored`
+- `cargo test -p rustsfm --test sequence_registration --no-default-features -- --test-threads=8`: `55 passed; 0 failed`
 
-被忽略的 `real_colmap_sparse_*` 测试需要工作区外部的 `test_data/flowers2_colmap` 夹具；该夹具不在 Git 或 submodule 中，必须显式用 `--ignored` 执行。2026-08-31 通过 `scripts/provision_flowers2_colmap_fixture.sh`（SHA-256 固定内容）重新 provision 后实测为 `19 passed; 0 failed`。此前两个失败项（scheduled global BA 不触发、先验位置 BA 未对齐）已按 COLMAP `CheckRunGlobalRefinement`/`PosePriorBundleAdjuster` 语义修复（见 PARITY_ROADMAP 的 BA orchestration 修复记录）。
+被忽略的 `real_colmap_sparse_*` 测试需要工作区外部的 `test_data/flowers2_colmap` 夹具；该夹具不在 Git 或 submodule 中，必须显式用 `--ignored` 执行。2026-09-17 用 `scripts/provision_flowers2_colmap_fixture.sh` 重新 provision 后，SHA-256 与脚本钉死值一致，ignored suite 为 `19 passed; 0 failed`。这 19 个测试加载的 COLMAP 参考模型是 24/24 注册、1 个模型、6449 点、34234 观测、平均重投影误差 0.638769 px；这不是一次新的 RustSFM 全量重建。2026-08-31 的 scheduled-BA / pose-prior 修复记录仍见 PARITY_ROADMAP。
 
 ## Current Progress
 
 - RustSFM 是 workspace 的主动维护 crate，提供 COLMAP-style 特征、匹配、两视图验证、增量 mapper、序列注册和文本导出。
 - RustSFM 硬化已合并：keyframe mapper 输入固定为私有快照，共享输出被序列化，GPU PnP-focal 管线失败或不支持的路由（generalized rig/structureless）会返回既有 CPU fallback 并记录遥测，BA 重投影残差对负深度连续求值（`img_from_cam_unchecked`，COLMAP 语义，2026-09-02），scheduled BA 只限制中间精化为最多两轮/每轮 15 次迭代而保留 initial/final 完整质量预算（60 图固定 seed 基准快 43%，点数 +6.1%、观测 +1.2%、平均误差下降），macOS GPU context 测试也已串行化。
 - RustViewer 维护导入媒体、运行 RustSFM、消费 COLMAP 产物并衔接 RustGS 训练的桌面工作流；macOS 新项目默认使用并行 CPU VLFeat SIFT（60 图实测 23.3s / 638,895 特征，对比当前 wgpu SIFT 59.6s / 424,554 特征），既有 manifest 保留用户已保存的 GPU 选择。顺序匹配保留 GPU cross-check：60 图实测 130.2s（CPU 264.5s）；禁用 cross-check 虽降到 89.1s，但 mapper 注册从 60/60 降到 56/60。
-- RustGS 的公开训练路径仍收口到 splat-first API；其细节和质量路线见架构文档及 RustGS 专项文档。
+- RustGS 的公开训练路径仍收口到 splat-first API；R01～R12（mask detach、voxel init、Home/flowers2 验收、瓶颈排名、Abs 对照）证据见 `docs/reviews/2026-09-18-rustgs-training-review-and-home-evidence.md`。残留仅 TUM 全视图阶梯（TODO `R09b`）。
 
 ## Active Gaps
 
@@ -53,4 +54,4 @@ GPU f32 五点法实验（分支 `gpu-five-point-f32`，Q1–Q5b / P1–P3）已
 3. **reconstruct（R17 matching.db 复测）**：606.3 s / 960/960 / 437,186 points。仍在 settlement 599–retest 699 带内，未大幅度超过主 worktree。27 次 global BA：DenseSchur×11 → SparseSchur×16，solve 316 s。无 post_bogus / camera_reset。
 4. **`post_bogus_cameras` / BA 质量债**：post-BA 只回滚 bogus camera、保留 pose/point。24 帧 image-only 当前二进制：24/24、4239 points、`camera_reset=`×23、final BA 已提交、无 skip。报告 `output/post_bogus_repro_20260916/REPORT.md`。
 5. **描述子匹配 GPU kernel（R17）+ 五点法去堆分配（R20）**：matching **1668→715 s**（−57%），digest 仍 `a4e8e8ec…2295c9`。R20 essential cand-gen 215→200 s。报告 `output/pair_pipeline_r17_20260916/REPORT.md`、`output/pair_pipeline_r20_20260916/REPORT.md`。
-6. 继续 RustGS parity/TUM 质量闭环；维护 RustSFM CI 覆盖，需要时触发 flowers2 opt-in job。
+6. 补齐 RustGS TUM 全视图阶梯（`R09b`）；维护 RustSFM CI 覆盖，需要时触发 flowers2 opt-in job。

@@ -17,9 +17,7 @@ pub mod rasterize;
 pub mod sorting;
 pub mod tile_mapping;
 
-pub(crate) use dispatch::{
-    hard_intersection_capacity, planned_intersection_capacity, CountPolicy,
-};
+pub(crate) use dispatch::{hard_intersection_capacity, planned_intersection_capacity, CountPolicy};
 pub(crate) use project_visible::project_visible;
 pub(crate) use projection::project_forward;
 pub(crate) use rasterize::rasterize;
@@ -247,10 +245,7 @@ where
                 logical_intersections: dispatch::host_count_tensor(counts.intersections, device),
                 requested_intersections: dispatch::host_count_tensor(counts.intersections, device),
                 visible_dispatch: dispatch::host_dispatch_tensor(counts.visible, device),
-                intersection_dispatch: dispatch::host_dispatch_tensor(
-                    counts.intersections,
-                    device,
-                ),
+                intersection_dispatch: dispatch::host_dispatch_tensor(counts.intersections, device),
                 overflow: dispatch::host_count_tensor(0, device),
                 capacity: counts.intersections.max(1),
                 visible: counts.visible,
@@ -261,12 +256,10 @@ where
         CountPolicy::Bounded {
             intersection_capacity,
         } => {
-            debug_assert!(
-                !CountPolicy::Bounded {
-                    intersection_capacity
-                }
-                .allows_count_readback()
-            );
+            debug_assert!(!CountPolicy::Bounded {
+                intersection_capacity
+            }
+            .allows_count_readback());
             let prepared = B::write_forward_dispatch(
                 num_visible_buf.into_primitive(),
                 num_intersections_buf.into_primitive(),
@@ -402,20 +395,14 @@ where
             0,
         )
         .expect("counted tile sort");
-        (
-            Tensor::from_primitive(keys),
-            Tensor::from_primitive(values),
-        )
+        (Tensor::from_primitive(keys), Tensor::from_primitive(values))
     } else if bounds.intersections > 1 && num_tiles > 1 {
         let (keys, values) = B::radix_sort_by_key_u32_primitive(
             tile_out.tile_id_from_isect.into_primitive(),
             tile_out.compact_gid_from_isect.into_primitive(),
         )
         .expect("tile sort");
-        (
-            Tensor::from_primitive(keys),
-            Tensor::from_primitive(values),
-        )
+        (Tensor::from_primitive(keys), Tensor::from_primitive(values))
     } else {
         (tile_out.tile_id_from_isect, tile_out.compact_gid_from_isect)
     };

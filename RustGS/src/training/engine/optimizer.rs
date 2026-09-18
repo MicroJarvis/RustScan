@@ -503,9 +503,7 @@ impl<B: Backend> AdamScaled<B> {
             burn::tensor::TensorData::new(mask_values, [origins.len(), row_width]),
             device,
         );
-        flat.gather(0, indices)
-            .mul(mask)
-            .reshape(out_dims)
+        flat.gather(0, indices).mul(mask).reshape(out_dims)
     }
 
     pub fn set_transform_scaling(&mut self, scaling: Tensor<B, 2>) {
@@ -1032,22 +1030,192 @@ mod tests {
 
         let mut optimizer = optimizer_with_scaling(&device);
         for _ in 0..7 {
-            optimizer_step(&mut optimizer, &mut splats, &device);
+            optimizer.step_device_splats(
+                &mut splats,
+                Tensor::ones([3, 10], &device).mul_scalar(0.1),
+                Tensor::ones([3, 4, 3], &device).mul_scalar(-0.2),
+                Tensor::ones([3], &device).mul_scalar(0.3),
+            );
         }
-        let before = optimizer.checkpoint().await.expect("checkpoint before remap");
+        let before = optimizer
+            .checkpoint()
+            .await
+            .expect("checkpoint before remap");
         assert_eq!(before.transforms.step, 7);
+        assert_eq!(before.sh_coeffs.step, 7);
+        assert_eq!(before.raw_opacities.step, 7);
 
         optimizer.remap_origins(&[Some(1), None, Some(0)], 4, 3, &device);
-        let after = optimizer.checkpoint().await.expect("checkpoint after remap");
+        let after = optimizer
+            .checkpoint()
+            .await
+            .expect("checkpoint after remap");
         assert_eq!(after.transforms.step, 7);
         assert_eq!(after.sh_coeffs.step, 7);
         assert_eq!(after.raw_opacities.step, 7);
 
-        let before_moments = before.transforms.moment1.expect("original moment");
-        let moments = after.transforms.moment1.expect("remapped moment");
-        assert_eq!(moments.shape, vec![3, 10]);
-        assert_eq!(&moments.values[..10], &before_moments.values[10..20]);
-        assert!(moments.values[10..20].iter().all(|value| *value == 0.0));
-        assert_eq!(&moments.values[20..30], &before_moments.values[..10]);
+        fn assert_remapped_rows(
+            before: &crate::training::AdamParameterCheckpoint,
+            after: &crate::training::AdamParameterCheckpoint,
+            row_width: usize,
+        ) {
+            for (label, before_moment, after_moment) in [
+                (
+                    "moment1",
+                    before.moment1.as_ref().expect("before moment1"),
+                    after.moment1.as_ref().expect("after moment1"),
+                ),
+                (
+                    "moment2",
+                    before.moment2.as_ref().expect("before moment2"),
+                    after.moment2.as_ref().expect("after moment2"),
+                ),
+            ] {
+                assert_eq!(
+                    after_moment.values.len(),
+                    3 * row_width,
+                    "{label} remapped length"
+                );
+                assert_eq!(
+                    &after_moment.values[..row_width],
+                    &before_moment.values[row_width..2 * row_width],
+                    "{label} row0 <- old row1"
+                );
+                assert!(
+                    after_moment.values[row_width..2 * row_width]
+                        .iter()
+                        .all(|value| *value == 0.0),
+                    "{label} new row must be zero"
+                );
+                assert_eq!(
+                    &after_moment.values[2 * row_width..],
+                    &before_moment.values[..row_width],
+                    "{label} row2 <- old row0"
+                );
+            }
+        }
+
+        assert_remapped_rows(&before.transforms, &after.transforms, 10);
+        assert_remapped_rows(&before.sh_coeffs, &after.sh_coeffs, 12);
+        assert_remapped_rows(&before.raw_opacities, &after.raw_opacities, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn optimizer_remap_checkpoint_restore_preserves_next_step_update() {
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut splats = test_splats(&device);
+        let transforms = Tensor::<GsDiffBackend, 2>::from_data(
+            TensorData::new(
+                (0..30).map(|value| value as f32 * 0.01).collect(),
+                Shape::new([3, 10]),
+            ),
+            &device,
+        );
+        let sh_coeffs = Tensor::<GsDiffBackend, 3>::from_data(
+            TensorData::new(
+                (0..36).map(|value| value as f32 * 0.005).collect(),
+                Shape::new([3, 4, 3]),
+            ),
+            &device,
+        );
+        let raw_opacities = Tensor::<GsDiffBackend, 1>::from_floats([0.1, -0.2, 0.3], &device);
+        splats.transforms = Param::from_tensor(transforms);
+        splats.sh_coeffs = Param::from_tensor(sh_coeffs);
+        splats.raw_opacities = Param::from_tensor(raw_opacities);
+
+        let mut optimizer = optimizer_with_scaling(&device);
+        for _ in 0..7 {
+            optimizer.step_device_splats(
+                &mut splats,
+                Tensor::ones([3, 10], &device).mul_scalar(0.1),
+                Tensor::ones([3, 4, 3], &device).mul_scalar(-0.2),
+                Tensor::ones([3], &device).mul_scalar(0.3),
+            );
+        }
+        optimizer.remap_origins(&[Some(1), None, Some(0)], 4, 3, &device);
+
+        // Resize live parameters to the remapped topology before checkpointing.
+        let transforms = Tensor::<GsDiffBackend, 2>::from_data(
+            TensorData::new(
+                (0..30).map(|value| value as f32 * 0.02).collect(),
+                Shape::new([3, 10]),
+            ),
+            &device,
+        );
+        let sh_coeffs = Tensor::<GsDiffBackend, 3>::from_data(
+            TensorData::new(
+                (0..36).map(|value| value as f32 * 0.01).collect(),
+                Shape::new([3, 4, 3]),
+            ),
+            &device,
+        );
+        let raw_opacities = Tensor::<GsDiffBackend, 1>::from_floats([0.4, -0.1, 0.2], &device);
+        splats.transforms = Param::from_tensor(transforms);
+        splats.sh_coeffs = Param::from_tensor(sh_coeffs);
+        splats.raw_opacities = Param::from_tensor(raw_opacities);
+
+        let checkpoint = optimizer
+            .checkpoint()
+            .await
+            .expect("checkpoint after remap");
+        assert_eq!(checkpoint.transforms.step, 7);
+
+        let mut live = AdamScaled::new(AdamScaledConfig {
+            lr: 0.01,
+            ..AdamScaledConfig::default()
+        });
+        live.restore(&checkpoint, &splats, &device)
+            .expect("restore remapped optimizer");
+        live.set_transform_scaling(Tensor::ones([1, 10], &device));
+        live.set_sh_scaling(Tensor::ones([1, 4, 1], &device).mul_scalar(0.5));
+        live.set_opacity_scaling(Tensor::from_floats([0.25], &device));
+
+        let mut restored_splats = copy_splats(&splats, &device).await;
+        let mut restored = AdamScaled::new(AdamScaledConfig {
+            lr: 0.01,
+            ..AdamScaledConfig::default()
+        });
+        restored
+            .restore(&checkpoint, &restored_splats, &device)
+            .expect("restore twin");
+        restored.set_transform_scaling(Tensor::ones([1, 10], &device));
+        restored.set_sh_scaling(Tensor::ones([1, 4, 1], &device).mul_scalar(0.5));
+        restored.set_opacity_scaling(Tensor::from_floats([0.25], &device));
+
+        live.step_device_splats(
+            &mut splats,
+            Tensor::ones([3, 10], &device).mul_scalar(0.05),
+            Tensor::ones([3, 4, 3], &device).mul_scalar(-0.05),
+            Tensor::ones([3], &device).mul_scalar(0.05),
+        );
+        restored.step_device_splats(
+            &mut restored_splats,
+            Tensor::ones([3, 10], &device).mul_scalar(0.05),
+            Tensor::ones([3, 4, 3], &device).mul_scalar(-0.05),
+            Tensor::ones([3], &device).mul_scalar(0.05),
+        );
+
+        let live_ckpt = live.checkpoint().await.expect("live after step");
+        let restored_ckpt = restored.checkpoint().await.expect("restored after step");
+        assert_eq!(live_ckpt.transforms.step, 8);
+        assert_eq!(restored_ckpt.transforms.step, 8);
+        assert_eq!(live_ckpt.sh_coeffs.step, 8);
+        assert_eq!(restored_ckpt.raw_opacities.step, 8);
+        assert_tensor_close(splats.transforms.val(), restored_splats.transforms.val()).await;
+        assert_tensor_close(splats.sh_coeffs.val(), restored_splats.sh_coeffs.val()).await;
+        assert_tensor_close(
+            splats.raw_opacities.val(),
+            restored_splats.raw_opacities.val(),
+        )
+        .await;
+        // New row (index 1) moments must leave the zero-init path after one step.
+        let m1 = live_ckpt
+            .transforms
+            .moment1
+            .expect("transforms moment1 after step");
+        assert!(
+            m1.values[10..20].iter().any(|value| *value != 0.0),
+            "new-row moment1 must update on the post-restore step"
+        );
     }
 }

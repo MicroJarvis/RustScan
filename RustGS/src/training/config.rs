@@ -606,6 +606,39 @@ fn default_lr_color_rest() -> f32 {
     0.0025 / 20.0
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicMaskGradient {
+    /// Detach mask weights before the weighted reduction (default after R08).
+    #[default]
+    StopGradient,
+    /// Keep coupled weight gradients (diagnostic / ablation only).
+    Coupled,
+}
+
+impl FromStr for DynamicMaskGradient {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stop_gradient" | "stop-gradient" | "detach" => Ok(Self::StopGradient),
+            "coupled" => Ok(Self::Coupled),
+            other => Err(format!(
+                "unknown dynamic mask gradient mode '{other}' (expected stop_gradient|coupled)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for DynamicMaskGradient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StopGradient => write!(f, "stop_gradient"),
+            Self::Coupled => write!(f, "coupled"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TrainingLossConfig {
     /// L1 image reconstruction loss weight.
@@ -631,6 +664,9 @@ pub struct TrainingLossConfig {
     pub loss_dynamic_mask_min_weight: f32,
     /// Epoch when dynamic/occlusion masking starts. Defaults to topology freeze epoch.
     pub loss_dynamic_mask_start_epoch: Option<usize>,
+    /// Whether dynamic-mask weights enter the autodiff graph.
+    #[serde(default)]
+    pub loss_dynamic_mask_gradient: DynamicMaskGradient,
 }
 
 impl Default for TrainingLossConfig {
@@ -646,6 +682,7 @@ impl Default for TrainingLossConfig {
             loss_dynamic_mask_threshold_high: 0.0,
             loss_dynamic_mask_min_weight: 1.0,
             loss_dynamic_mask_start_epoch: None,
+            loss_dynamic_mask_gradient: DynamicMaskGradient::StopGradient,
         }
     }
 }
@@ -726,6 +763,16 @@ pub struct TrainingInitializationConfig {
     pub randomize_rotations: bool,
     /// Seed used when randomizing sparse-point rotations.
     pub rotation_seed: u64,
+    /// Deterministic seed reserved for stratified init sampling variants.
+    #[serde(default = "default_init_sampling_seed")]
+    pub init_sampling_seed: u64,
+    /// Voxel cell size for truncated sparse-point sampling. `0` auto-sizes from extents.
+    #[serde(default)]
+    pub init_voxel_cell_size: f32,
+}
+
+fn default_init_sampling_seed() -> u64 {
+    0
 }
 
 impl Default for TrainingInitializationConfig {
@@ -741,6 +788,8 @@ impl Default for TrainingInitializationConfig {
             vksplat_scale_estimator: false,
             randomize_rotations: false,
             rotation_seed: 42,
+            init_sampling_seed: 0,
+            init_voxel_cell_size: 0.0,
         }
     }
 }

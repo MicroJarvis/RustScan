@@ -1,6 +1,6 @@
 # RustScan Documentation Index
 
-**Updated:** 2026-09-17
+**Updated:** 2026-09-18
 
 此索引先列出当前作为执行、验证或状态依据的文档；带日期的设计、计划和实验记录仅在其仍有审计价值时保留，不替代当前入口。
 
@@ -31,7 +31,9 @@
 |---|---|
 | [../RustGS/README.md](../RustGS/README.md) | build、test、CLI 与 artifact contract |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前 wgpu training module layout、public surface 和 ownership boundary |
-| [RustGS-TODO-训练效果与效率优化-2026-09-17.md](RustGS-TODO-训练效果与效率优化-2026-09-17.md) | RustGS 训练质量、GPU 吞吐和拓扑优化的执行清单与验收门槛 |
+| [RustGS-TODO-训练效果与效率优化-2026-09-17.md](RustGS-TODO-训练效果与效率优化-2026-09-17.md) | 残留 R09b（TUM 阶梯）；R01～R12 其余项已落地 |
+
+审核与 Home/flowers2 证据见 [2026-09-18 审核记录](reviews/2026-09-18-rustgs-training-review-and-home-evidence.md)；缺 TUM 全视图前不把默认配置当作全场景已验收。
 
 The dated RustGS TUM benchmark and dataset-research records remain outside the
 maintained entry set. Read them only as historical evidence and verify every
