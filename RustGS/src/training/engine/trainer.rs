@@ -19,8 +19,7 @@ use crate::training::gpu_primitives::prefix_sum::{
     prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
 };
 use crate::training::reporting::metrics::{
-    accumulate_sticky_forward_overflow, allows_state_mutation, step_intersection_overflowed,
-    ParityLossCurveSample, ParityTopologyMetrics, StickyForwardOverflow,
+    step_intersection_overflowed, ParityLossCurveSample, ParityTopologyMetrics,
 };
 use crate::training::reporting::optimization_report::{
     duration_millis, percentile_f64, percentile_usize,
@@ -38,6 +37,7 @@ use crate::training::{
 use crate::TrainingError;
 
 use super::backend::{GsBackendBase, GsDevice, GsDiffBackend};
+use super::device_status::{DeviceTrainingStatus, TrainingStatusSnapshot};
 use super::loss::{combined_loss_with_kernel, gaussian_kernel_1d, SsimConfig};
 use super::optimizer::{AdamScaled, AdamScaledConfig};
 use super::splats::{
@@ -189,8 +189,7 @@ pub struct WgpuTrainer {
     position_lr_scene_scale: f32,
     optimizer_lr_state: Option<OptimizerLrState>,
     intersection_capacity: usize,
-    non_finite_loss_steps: Option<Tensor<GsBackendBase, 1, Int>>,
-    sticky_forward_overflow: StickyForwardOverflow,
+    device_status: DeviceTrainingStatus<GsBackendBase>,
     optimization_samples: OptimizationTimingSamples,
 }
 
@@ -389,8 +388,7 @@ impl WgpuTrainer {
             position_lr_scene_scale,
             optimizer_lr_state: None,
             intersection_capacity: 0,
-            non_finite_loss_steps: None,
-            sticky_forward_overflow: StickyForwardOverflow::default(),
+            device_status: DeviceTrainingStatus::new(&device, 0),
             optimization_samples: OptimizationTimingSamples::default(),
         }
     }
@@ -403,8 +401,8 @@ impl WgpuTrainer {
         completed_iterations: usize,
         latest_loss: Option<f32>,
     ) -> Result<TrainingCheckpoint, TrainingError> {
-        if !allows_state_mutation(self.sticky_forward_overflow) {
-            return Err(self.sticky_forward_overflow.to_error());
+        if let Some(err) = self.device_status.host_snapshot().to_error() {
+            return Err(err);
         }
         let host_splats = try_device_splats_to_host(splats).await?;
         let active_sh_degree =
@@ -456,6 +454,8 @@ impl WgpuTrainer {
         trainer
             .optimizer
             .restore(&checkpoint.optimizer, &splats, &device)?;
+        trainer.device_status =
+            DeviceTrainingStatus::new(&device, checkpoint.optimizer.transforms.step as u32);
         let topology =
             TopologyAccumulatorSet::from_checkpoint(&checkpoint.topology, splat_count, &device)?;
         trainer.grad_2d_accum = topology.grad_2d;
@@ -874,7 +874,8 @@ impl WgpuTrainer {
             )
             .await?;
         debug_assert!(
-            !capacity_telemetry.overflowed || self.sticky_forward_overflow.overflowed,
+            !capacity_telemetry.overflowed
+                || self.device_status.host_snapshot().has_forward_overflow(),
             "current-frame overflow must already be sticky before loss sampling"
         );
         let loss_value = loss_for_read
@@ -882,10 +883,15 @@ impl WgpuTrainer {
             .into_scalar_async()
             .await
             .map_err(|err| TrainingError::TrainingFailed(format!("failed to read loss: {err}")))?;
-        if self.non_finite_loss_seen().await? || !loss_value.is_finite() {
-            return Err(TrainingError::TrainingFailed(format!(
-                "non-finite loss {loss_value} at iteration {iteration}"
-            )));
+        if self.device_status.non_finite_loss_seen().await? || !loss_value.is_finite() {
+            let first = if self.device_status.host_snapshot().has_non_finite_loss() {
+                self.device_status.host_snapshot().first_invalid_iteration
+            } else {
+                (iteration as u32).max(1)
+            };
+            return Err(TrainingError::NonFiniteLoss {
+                first_iteration: first,
+            });
         }
         Ok(Some(validate_loss_value(loss_value, iteration)?))
     }
@@ -1079,10 +1085,7 @@ impl WgpuTrainer {
 
     fn note_non_finite_loss(&mut self, loss: &Tensor<GsDiffBackend, 1>) {
         let bad = loss.clone().inner().is_finite().bool_not().int();
-        self.non_finite_loss_steps = Some(match self.non_finite_loss_steps.clone() {
-            Some(accumulated) => accumulated + bad,
-            None => bad,
-        });
+        self.device_status.note_non_finite_loss_device(bad);
     }
 
     async fn note_sticky_forward_overflow(
@@ -1093,7 +1096,7 @@ impl WgpuTrainer {
         iteration: usize,
     ) -> Result<(), TrainingError> {
         // Once sticky, keep the first anomaly and avoid further count readback.
-        if self.sticky_forward_overflow.overflowed {
+        if self.device_status.host_snapshot().has_forward_overflow() {
             return Ok(());
         }
         let overflow_value = overflow
@@ -1124,8 +1127,7 @@ impl WgpuTrainer {
         let capacity_u32 = capacity as u32;
         let step_overflowed =
             overflow_value != 0 || step_intersection_overflowed(requested_u32, capacity_u32);
-        self.sticky_forward_overflow = accumulate_sticky_forward_overflow(
-            self.sticky_forward_overflow,
+        self.device_status.note_forward_overflow_host(
             step_overflowed,
             iteration as u32,
             requested_u32,
@@ -1139,20 +1141,10 @@ impl WgpuTrainer {
         read_loss: bool,
     ) -> Result<(), TrainingError> {
         let _ = read_loss;
-        if allows_state_mutation(self.sticky_forward_overflow) {
-            return Ok(());
+        if let Some(err) = self.device_status.host_snapshot().to_error() {
+            return Err(err);
         }
-        Err(self.sticky_forward_overflow.to_error())
-    }
-
-    async fn non_finite_loss_seen(&self) -> Result<bool, TrainingError> {
-        let Some(flag) = self.non_finite_loss_steps.clone() else {
-            return Ok(false);
-        };
-        let value = flag.into_scalar_async().await.map_err(|err| {
-            TrainingError::TrainingFailed(format!("failed to read loss finite flag: {err}"))
-        })?;
-        Ok(value != 0)
+        Ok(())
     }
 
     async fn sample_forward_capacity(
@@ -1737,15 +1729,15 @@ mod tests {
 
     #[test]
     fn sticky_overflow_blocks_mutation_and_checkpoint_identity() {
-        let sticky = accumulate_sticky_forward_overflow(
-            StickyForwardOverflow::default(),
+        let snapshot = super::super::device_status::note_forward_overflow(
+            TrainingStatusSnapshot::default(),
             true,
             2,
             9_000,
             8_000,
         );
-        assert!(!allows_state_mutation(sticky));
-        let err = sticky.to_error();
+        assert!(!snapshot.is_healthy());
+        let err = snapshot.to_error().expect("overflow must produce an error");
         assert!(matches!(
             err,
             TrainingError::ForwardCapacityExceeded {
@@ -1955,12 +1947,14 @@ mod tests {
         let host_splats = trainer_checkpoint_host_splats();
         let splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
         let mut trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
-        trainer.sticky_forward_overflow = accumulate_sticky_forward_overflow(
-            StickyForwardOverflow::default(),
-            true,
-            2,
-            9_000,
-            8_000,
+        trainer.device_status.set_host_snapshot(
+            super::super::device_status::note_forward_overflow(
+                TrainingStatusSnapshot::default(),
+                true,
+                2,
+                9_000,
+                8_000,
+            ),
         );
         let err = trainer
             .checkpoint(

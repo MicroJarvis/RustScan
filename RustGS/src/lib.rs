@@ -204,4 +204,7 @@ pub enum TrainingError {
         capacity: u32,
         first_iteration: u32,
     },
+
+    #[error("non-finite loss at first_iteration={first_iteration}")]
+    NonFiniteLoss { first_iteration: u32 },
 }
