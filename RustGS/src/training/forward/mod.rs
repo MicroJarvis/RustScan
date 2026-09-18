@@ -200,6 +200,7 @@ where
         device,
         cov_blur,
         CountPolicy::Exact,
+        None,
     )
     .await
 }
@@ -213,6 +214,7 @@ pub(crate) async fn render_forward_with_active_sh<B>(
     device: &B::Device,
     cov_blur: f32,
     count_policy: CountPolicy,
+    training_status: Option<(u32, Tensor<B, 1, Int>)>,
 ) -> RenderOutput<B>
 where
     B: projection::ProjectionBackend
@@ -260,10 +262,20 @@ where
                 intersection_capacity
             }
             .allows_count_readback());
+            let (iteration, status) = match training_status {
+                Some((iteration, status)) => (iteration, status),
+                None => {
+                    // Evaluation / one-off bounded paths use an isolated dummy status.
+                    let dummy = crate::training::engine::DeviceTrainingStatus::<B>::new(device, 0);
+                    (0, dummy.buffer().clone())
+                }
+            };
             let prepared = B::write_forward_dispatch(
                 num_visible_buf.into_primitive(),
                 num_intersections_buf.into_primitive(),
                 intersection_capacity,
+                iteration,
+                status.into_primitive(),
             );
             ResolvedForwardBounds {
                 logical_visible: prepared.logical_visible,

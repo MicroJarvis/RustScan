@@ -198,6 +198,10 @@ struct OptimizationTimingSamples {
     loop_ms: Vec<f64>,
     loss_readbacks: usize,
     count_readbacks: usize,
+    status_readbacks: usize,
+    capacity_telemetry_readbacks: usize,
+    loss_value_readbacks: usize,
+    checkpoint_tensor_readbacks: usize,
     sort_dispatches: Vec<usize>,
     scan_dispatches: Vec<usize>,
     sort_workspace_bytes: Option<usize>,
@@ -244,6 +248,10 @@ impl OptimizationTimingSamples {
         telemetry.loop_timing_kind = Some("cpu_submit_instant".into());
         telemetry.loss_readback_count = Some(self.loss_readbacks);
         telemetry.count_readback_count = Some(self.count_readbacks);
+        telemetry.status_readbacks = Some(self.status_readbacks);
+        telemetry.capacity_telemetry_readbacks = Some(self.capacity_telemetry_readbacks);
+        telemetry.loss_value_readbacks = Some(self.loss_value_readbacks);
+        telemetry.checkpoint_tensor_readbacks = Some(self.checkpoint_tensor_readbacks);
         telemetry.radix_dispatch_count_p50 = percentile_usize(&self.sort_dispatches, 50.0);
         telemetry.radix_dispatch_count_p95 = percentile_usize(&self.sort_dispatches, 95.0);
         telemetry.scan_dispatch_count_p50 = percentile_usize(&self.scan_dispatches, 50.0);
@@ -634,15 +642,12 @@ impl WgpuTrainer {
             background,
             self.raster_cov_blur_at(iteration, frame_count),
             self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32)),
+            Some((iteration as u32, self.device_status.buffer().clone())),
         )
         .await;
-        self.note_sticky_forward_overflow(
-            &rendered.requested_intersections,
-            &rendered.intersection_overflow,
-            rendered.intersection_capacity,
-            iteration,
-        )
-        .await?;
+        // Overflow sticky bits are written on-device by write_dispatch (no per-step
+        // host readback). Host mirror catches up at safety-point reads; device
+        // mutation gates land in Task 1.4.
         // Fail before loss/backward/optimizer so a truncated forward cannot
         // update Adam moments, parameters, or topology statistics.
         self.ensure_forward_capacity_before_update(read_loss)
@@ -876,13 +881,17 @@ impl WgpuTrainer {
         debug_assert!(
             !capacity_telemetry.overflowed
                 || self.device_status.host_snapshot().has_forward_overflow(),
-            "current-frame overflow must already be sticky before loss sampling"
+            "loss-cadence status sync must observe sticky overflow before reporting"
         );
         let loss_value = loss_for_read
             .expect("loss retained for scalar readback")
             .into_scalar_async()
             .await
             .map_err(|err| TrainingError::TrainingFailed(format!("failed to read loss: {err}")))?;
+        self.optimization_samples.loss_value_readbacks = self
+            .optimization_samples
+            .loss_value_readbacks
+            .saturating_add(1);
         if self.device_status.non_finite_loss_seen().await? || !loss_value.is_finite() {
             let first = if self.device_status.host_snapshot().has_non_finite_loss() {
                 self.device_status.host_snapshot().first_invalid_iteration
@@ -1088,54 +1097,6 @@ impl WgpuTrainer {
         self.device_status.note_non_finite_loss_device(bad);
     }
 
-    async fn note_sticky_forward_overflow(
-        &mut self,
-        requested: &Tensor<GsDiffBackend, 1, Int>,
-        overflow: &Tensor<GsDiffBackend, 1, Int>,
-        capacity: usize,
-        iteration: usize,
-    ) -> Result<(), TrainingError> {
-        // Once sticky, keep the first anomaly and avoid further count readback.
-        if self.device_status.host_snapshot().has_forward_overflow() {
-            return Ok(());
-        }
-        let overflow_value = overflow
-            .clone()
-            .inner()
-            .into_scalar_async()
-            .await
-            .map_err(|err| {
-                TrainingError::TrainingFailed(format!(
-                    "failed to read intersection overflow: {err}"
-                ))
-            })?;
-        let requested_value = if overflow_value != 0 {
-            requested
-                .clone()
-                .inner()
-                .into_scalar_async()
-                .await
-                .map_err(|err| {
-                    TrainingError::TrainingFailed(format!(
-                        "failed to read requested intersections: {err}"
-                    ))
-                })?
-        } else {
-            0
-        };
-        let requested_u32 = requested_value.max(0) as u32;
-        let capacity_u32 = capacity as u32;
-        let step_overflowed =
-            overflow_value != 0 || step_intersection_overflowed(requested_u32, capacity_u32);
-        self.device_status.note_forward_overflow_host(
-            step_overflowed,
-            iteration as u32,
-            requested_u32,
-            capacity_u32,
-        );
-        Ok(())
-    }
-
     async fn ensure_forward_capacity_before_update(
         &self,
         read_loss: bool,
@@ -1154,6 +1115,14 @@ impl WgpuTrainer {
         overflow: &Tensor<GsDiffBackend, 1, Int>,
         capacity: usize,
     ) -> Result<crate::training::reporting::metrics::ForwardCapacityTelemetry, TrainingError> {
+        // Loss cadence is a safety point: pull sticky status without relying on
+        // per-step overflow scalar readback.
+        let status = self.device_status.read().await?;
+        self.device_status.adopt_device_snapshot(status);
+        self.optimization_samples.status_readbacks =
+            self.optimization_samples.status_readbacks.saturating_add(1);
+        let status = self.device_status.host_snapshot();
+
         let visible_value = logical_visible
             .clone()
             .inner()
@@ -1186,10 +1155,16 @@ impl WgpuTrainer {
             logical_visible: visible_value.max(0) as u32,
             logical_intersections: requested_value.max(0) as u32,
             capacity: capacity as u32,
-            overflowed: overflow_value != 0 || (requested_value as usize) > capacity,
+            overflowed: overflow_value != 0
+                || step_intersection_overflowed(requested_value.max(0) as u32, capacity as u32)
+                || status.has_forward_overflow(),
         };
         self.telemetry.forward_capacity = Some(telemetry);
         self.optimization_samples.record_count_readbacks(3);
+        self.optimization_samples.capacity_telemetry_readbacks = self
+            .optimization_samples
+            .capacity_telemetry_readbacks
+            .saturating_add(3);
         Ok(telemetry)
     }
 

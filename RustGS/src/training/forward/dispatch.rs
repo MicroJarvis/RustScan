@@ -77,8 +77,8 @@ impl KernelSource for WriteDispatchKernel {
 struct WriteDispatchParams {
     intersection_capacity: u32,
     workgroup_size: u32,
+    iteration: u32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 pub(crate) trait WriteDispatchBackend: Backend {
@@ -86,6 +86,8 @@ pub(crate) trait WriteDispatchBackend: Backend {
         num_visible: Self::IntTensorPrimitive,
         num_intersections: Self::IntTensorPrimitive,
         intersection_capacity: usize,
+        iteration: u32,
+        status: Self::IntTensorPrimitive,
     ) -> ForwardDispatch<Self>;
 
     fn indirect_dispatch(dispatch: &Tensor<Self, 1, Int>) -> CubeCount;
@@ -101,9 +103,12 @@ where
         num_visible: Self::IntTensorPrimitive,
         num_intersections: Self::IntTensorPrimitive,
         intersection_capacity: usize,
+        iteration: u32,
+        status: Self::IntTensorPrimitive,
     ) -> ForwardDispatch<Self> {
         let num_visible = into_contiguous(num_visible);
         let num_intersections = into_contiguous(num_intersections);
+        let status = into_contiguous(status);
         let device = num_visible.device.clone();
         let client = num_visible.client.clone();
         let logical_visible = Tensor::<Self, 1, Int>::zeros([1], &device);
@@ -115,8 +120,8 @@ where
         let params = WriteDispatchParams {
             intersection_capacity: intersection_capacity as u32,
             workgroup_size: DISPATCH_WORKGROUP,
+            iteration,
             _pad0: 0,
-            _pad1: 0,
         };
         let params_handle = client.create_from_slice(bytemuck::bytes_of(&params));
         client.launch(
@@ -143,6 +148,7 @@ where
                     .into_primitive()
                     .handle
                     .binding(),
+                status.handle.binding(),
                 params_handle.binding(),
             ]),
         );
@@ -183,10 +189,15 @@ pub(crate) fn host_dispatch_tensor<B: Backend>(
 mod tests {
     use super::{
         hard_intersection_capacity, planned_intersection_capacity, CountPolicy,
-        MAX_BOUNDED_INTERSECTIONS,
+        WriteDispatchBackend, MAX_BOUNDED_INTERSECTIONS,
+    };
+    use crate::training::engine::{
+        DeviceTrainingStatus, GsBackendBase, GsDevice, STATUS_FORWARD_OVERFLOW,
     };
     use crate::training::reporting::metrics::ForwardCapacityTelemetry;
     use crate::TrainingError;
+    use burn::prelude::*;
+    use burn::tensor::Int;
 
     #[test]
     fn planned_capacity_uses_the_hard_bound_under_the_budget() {
@@ -240,5 +251,59 @@ mod tests {
                 first_iteration: 2,
             }
         ));
+    }
+
+    async fn run_dispatch_status(
+        requested: u32,
+        capacity: u32,
+        iteration: u32,
+        status: &DeviceTrainingStatus<GsBackendBase>,
+    ) {
+        let device = GsDevice::default();
+        let num_visible = Tensor::<GsBackendBase, 1, Int>::from_ints([1], &device);
+        let num_intersections =
+            Tensor::<GsBackendBase, 1, Int>::from_ints([requested as i32], &device);
+        let _ = GsBackendBase::write_forward_dispatch(
+            num_visible.into_primitive(),
+            num_intersections.into_primitive(),
+            capacity as usize,
+            iteration,
+            status.buffer().clone().into_primitive(),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_full_capacity_does_not_set_sticky_overflow() {
+        let device = GsDevice::default();
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        run_dispatch_status(1_024, 1_024, 3, &status).await;
+        let snap = status.read().await.expect("read status");
+        assert!(!snap.has_forward_overflow(), "{snap:?}");
+        assert_eq!(snap.flags & STATUS_FORWARD_OVERFLOW, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_plus_one_sets_sticky_overflow_once() {
+        let device = GsDevice::default();
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        run_dispatch_status(1_025, 1_024, 2, &status).await;
+        let snap = status.read().await.expect("read status");
+        assert!(snap.has_forward_overflow());
+        assert_eq!(snap.first_invalid_iteration, 2);
+        assert_eq!(snap.requested_intersections, 1_025);
+        assert_eq!(snap.intersection_capacity, 1_024);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consecutive_overflow_keeps_first_iteration_and_request() {
+        let device = GsDevice::default();
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        run_dispatch_status(5_000, 4_000, 3, &status).await;
+        run_dispatch_status(6_000, 4_000, 4, &status).await;
+        let snap = status.read().await.expect("read status");
+        assert!(snap.has_forward_overflow());
+        assert_eq!(snap.first_invalid_iteration, 3);
+        assert_eq!(snap.requested_intersections, 5_000);
+        assert_eq!(snap.intersection_capacity, 4_000);
     }
 }

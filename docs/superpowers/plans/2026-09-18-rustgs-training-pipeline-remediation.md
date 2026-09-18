@@ -84,11 +84,11 @@ word 0 为 sticky flags；word 1 为首次异常 iteration（初始 `u32::MAX`�
 
 把 `WriteDispatchBackend::write_forward_dispatch` 增加 `iteration` 和 status buffer 参数。shader 仍将 logical intersections clamp 到 capacity，但在 `requested > capacity` 时 `atomicOr(flags, STATUS_FORWARD_OVERFLOW)`、`atomicMin(first_iteration, iteration)`，并只在首次异常写 requested/capacity。
 
-- [ ] 覆盖 `requested == capacity`、`capacity + 1`、连续 overflow 三个边界测试。
-- [ ] training forward 传入共享 status；evaluation exact path 使用独立 dummy status。
-- [ ] 删除 `note_sticky_forward_overflow()` 中每 step 的 `into_scalar_async()`。
-- [ ] telemetry 分开记录 `status_readbacks`、`capacity_telemetry_readbacks`、`loss_value_readbacks`、`checkpoint_tensor_readbacks`。
-- [ ] 运行 forward/GPU integration tests，提交 `perf(rustgs): keep overflow detection on device`。
+- [x] 覆盖 `requested == capacity`、`capacity + 1`、连续 overflow 三个边界测试。
+- [x] training forward 传入共享 status；evaluation exact path 使用独立 dummy status。
+- [x] 删除 `note_sticky_forward_overflow()` 中每 step 的 `into_scalar_async()`。
+- [x] telemetry 分开记录 `status_readbacks`、`capacity_telemetry_readbacks`、`loss_value_readbacks`、`checkpoint_tensor_readbacks`。
+- [x] 运行 forward/GPU integration tests，提交 `perf(rustgs): keep overflow detection on device`。
 
 ## Task 1.3：Non-finite loss 在 GPU 上先标记
 

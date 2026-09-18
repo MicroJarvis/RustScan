@@ -11,7 +11,7 @@ use burn::backend::{
 };
 use burn::module::Param;
 use burn::prelude::*;
-use burn::tensor::{backend::AutodiffBackend as BurnAutodiffBackend, Tensor, TensorPrimitive};
+use burn::tensor::{backend::AutodiffBackend as BurnAutodiffBackend, Int, Tensor, TensorPrimitive};
 
 use crate::core::GaussianCamera;
 use crate::training::backward::{
@@ -164,6 +164,7 @@ async fn render_splats_impl<B, C>(
     background: [f32; 3],
     cov_blur: f32,
     intersection_capacity: usize,
+    training_status: Option<(u32, Tensor<B, 1, Int>)>,
 ) -> RenderSplatsOutput<Autodiff<B, C>>
 where
     B: RenderBackend,
@@ -208,6 +209,7 @@ where
         CountPolicy::Bounded {
             intersection_capacity,
         },
+        training_status,
     )
     .await;
     let visible = Tensor::<AD<B, C>, 1>::from_inner(fwd_out.visible.clone());
@@ -278,6 +280,7 @@ pub(crate) async fn render_splats_with_visibility_active_sh(
     background: [f32; 3],
     cov_blur: f32,
     intersection_capacity: usize,
+    training_status: Option<(u32, Tensor<GsBackendBase, 1, Int>)>,
 ) -> RenderSplatsOutput<GsDiffBackend> {
     render_splats_impl::<GsBackendBase, NoCheckpointing>(
         splats,
@@ -287,6 +290,7 @@ pub(crate) async fn render_splats_with_visibility_active_sh(
         background,
         cov_blur,
         intersection_capacity,
+        training_status,
     )
     .await
 }

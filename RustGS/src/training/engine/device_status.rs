@@ -161,7 +161,6 @@ impl<B: Backend> DeviceTrainingStatus<B> {
         self.host
     }
 
-    #[allow(dead_code)]
     pub(crate) fn buffer(&self) -> &Tensor<B, 1, Int> {
         &self.buffer
     }
@@ -171,6 +170,11 @@ impl<B: Backend> DeviceTrainingStatus<B> {
         self.sync_host_to_device();
     }
 
+    pub(crate) fn adopt_device_snapshot(&mut self, snapshot: TrainingStatusSnapshot) {
+        self.host = snapshot;
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn note_forward_overflow_host(
         &mut self,
         step_overflowed: bool,
@@ -213,7 +217,6 @@ impl<B: Backend> DeviceTrainingStatus<B> {
         self.buffer = Tensor::<B, 1, Int>::from_ints(ints.as_slice(), &device);
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn read(&self) -> Result<TrainingStatusSnapshot, TrainingError> {
         let data = self.buffer.clone().into_data_async().await.map_err(|err| {
             TrainingError::TrainingFailed(format!("failed to read training status: {err}"))
