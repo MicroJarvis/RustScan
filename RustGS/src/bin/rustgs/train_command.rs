@@ -206,9 +206,16 @@ pub(super) fn training_options(
     let mut options = rustgs::TrainingOptions::default().with_identity(identity);
 
     if let Some(resume_path) = &args.resume {
-        let checkpoint = rustgs::load_training_checkpoint(resume_path).with_context(|| {
-            format!("failed to load resume checkpoint {}", resume_path.display())
-        })?;
+        let (checkpoint, migration) = rustgs::load_training_checkpoint_with_migration(resume_path)
+            .with_context(|| {
+                format!("failed to load resume checkpoint {}", resume_path.display())
+            })?;
+        if migration == rustgs::CheckpointMigration::V1BaselineReset {
+            log::warn!(
+                "Migrated v1 training checkpoint {}: visibility window baselines were reconstructed from cumulative observations (V1BaselineReset)",
+                resume_path.display()
+            );
+        }
         options = options.with_resume_checkpoint(checkpoint);
     }
 

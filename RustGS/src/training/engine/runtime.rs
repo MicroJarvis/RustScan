@@ -631,6 +631,8 @@ mod tests {
                 actual_visible_observations: topology_tensor,
                 splat_birth_iterations: Vec::new(),
                 splat_invisible_windows: Vec::new(),
+                visibility_window_baseline: Vec::new(),
+                actual_visibility_window_baseline: Vec::new(),
             },
             frame_shuffle_seed: 17,
             active_sh_degree: 0,

@@ -64,6 +64,8 @@ impl<B: Backend> TopologyAccumulatorSet<B> {
         &self,
         splat_birth_iterations: &[usize],
         splat_invisible_windows: &[usize],
+        visibility_window_baseline: &[f32],
+        actual_visibility_window_baseline: &[f32],
     ) -> Result<TopologyCheckpoint, TrainingError> {
         let checkpoint = TopologyCheckpoint {
             grad_2d: tensor_checkpoint(&self.grad_2d).await?,
@@ -79,6 +81,8 @@ impl<B: Backend> TopologyAccumulatorSet<B> {
                 .await?,
             splat_birth_iterations: splat_birth_iterations.to_vec(),
             splat_invisible_windows: splat_invisible_windows.to_vec(),
+            visibility_window_baseline: visibility_window_baseline.to_vec(),
+            actual_visibility_window_baseline: actual_visibility_window_baseline.to_vec(),
         };
         validate_topology_checkpoint(&checkpoint, self.grad_2d.dims()[0])?;
         Ok(checkpoint)
@@ -154,6 +158,42 @@ fn validate_topology_checkpoint(
         checkpoint.splat_invisible_windows.len(),
         splat_count,
     )?;
+    validate_topology_baseline(
+        "topology.visibility_window_baseline",
+        &checkpoint.visibility_window_baseline,
+        splat_count,
+    )?;
+    validate_topology_baseline(
+        "topology.actual_visibility_window_baseline",
+        &checkpoint.actual_visibility_window_baseline,
+        splat_count,
+    )?;
+    Ok(())
+}
+
+fn validate_topology_baseline(
+    name: &str,
+    values: &[f32],
+    splat_count: usize,
+) -> Result<(), TrainingError> {
+    if values.len() != splat_count {
+        return Err(TrainingError::InvalidInput(format!(
+            "{name} length {} does not match splat count {splat_count}",
+            values.len()
+        )));
+    }
+    for (index, value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(TrainingError::InvalidInput(format!(
+                "{name}[{index}] must be finite"
+            )));
+        }
+        if *value < 0.0 {
+            return Err(TrainingError::InvalidInput(format!(
+                "{name}[{index}] must be non-negative"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -373,6 +413,8 @@ mod tests {
             actual_visible_observations: checkpoint_tensor(90.0),
             splat_birth_iterations: vec![0, 1, 2],
             splat_invisible_windows: vec![0, 1, 2],
+            visibility_window_baseline: vec![0.0, 0.0, 0.0],
+            actual_visibility_window_baseline: vec![0.0, 0.0, 0.0],
         }
     }
 
@@ -393,7 +435,7 @@ mod tests {
         let mut wrong_count = accumulator_fixture(&device);
         wrong_count.screen_grad_2d = Tensor::zeros([2], &device);
         let error = wrong_count
-            .checkpoint(&[0, 1, 2], &[0, 1, 2])
+            .checkpoint(&[0, 1, 2], &[0, 1, 2], &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0])
             .await
             .expect_err("non-uniform tensor counts must be rejected")
             .to_string();
@@ -402,7 +444,7 @@ mod tests {
         let mut non_finite = accumulator_fixture(&device);
         non_finite.grad_color = Tensor::from_floats([1.0, f32::NAN, 3.0], &device);
         let error = non_finite
-            .checkpoint(&[0, 1, 2], &[0, 1, 2])
+            .checkpoint(&[0, 1, 2], &[0, 1, 2], &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0])
             .await
             .expect_err("non-finite tensor values must be rejected")
             .to_string();
@@ -410,13 +452,13 @@ mod tests {
 
         let accumulators = accumulator_fixture(&device);
         let error = accumulators
-            .checkpoint(&[0, 1], &[0, 1, 2])
+            .checkpoint(&[0, 1], &[0, 1, 2], &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0])
             .await
             .expect_err("birth vector mismatch must be rejected")
             .to_string();
         assert!(error.contains("splat_birth_iterations"));
         let error = accumulators
-            .checkpoint(&[0, 1, 2], &[0, 1])
+            .checkpoint(&[0, 1, 2], &[0, 1], &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0])
             .await
             .expect_err("invisible vector mismatch must be rejected")
             .to_string();
@@ -468,7 +510,7 @@ mod tests {
 
         let sentinel = accumulator_fixture(&device);
         let before = sentinel
-            .checkpoint(&[0, 1, 2], &[0, 1, 2])
+            .checkpoint(&[0, 1, 2], &[0, 1, 2], &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0])
             .await
             .expect("sentinel checkpoint");
 
@@ -488,7 +530,7 @@ mod tests {
             true,
         );
         let after = updated
-            .checkpoint(&[0, 1, 2], &[0, 1, 2])
+            .checkpoint(&[0, 1, 2], &[0, 1, 2], &[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0])
             .await
             .expect("gated checkpoint");
         assert_eq!(after, before);

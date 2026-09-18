@@ -25,12 +25,13 @@ pub(crate) mod forward;
 use crate::{TrainingDataset, TrainingError};
 
 pub use checkpoint::{
-    load_training_checkpoint, save_training_checkpoint, AdamCheckpoint, AdamParameterCheckpoint,
-    TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity,
-    MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
-    MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
-    MAX_TRAINING_IDENTITY_BYTES, TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC,
-    TRAINING_CHECKPOINT_VERSION,
+    load_training_checkpoint, load_training_checkpoint_with_migration, save_training_checkpoint,
+    AdamCheckpoint, AdamParameterCheckpoint, CheckpointMigration, TensorCheckpoint,
+    TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity, MAX_TRAINING_CHECKPOINT_BYTES,
+    MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
+    MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES,
+    TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
+    TRAINING_CHECKPOINT_VERSION_V1,
 };
 pub use evaluation::MIN_RENDER_SCALE;
 pub use evaluation::{

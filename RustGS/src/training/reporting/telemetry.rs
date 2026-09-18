@@ -52,6 +52,7 @@ pub struct LiteGsTrainingTelemetry {
     pub topology_plan_ms_p50: Option<f64>,
     pub topology_apply_ms_p50: Option<f64>,
     pub topology_snapshot_readback_bytes: Option<usize>,
+    pub checkpoint_migration: Option<String>,
 }
 
 static LAST_TRAINING_TELEMETRY: OnceLock<Mutex<Option<LiteGsTrainingTelemetry>>> = OnceLock::new();

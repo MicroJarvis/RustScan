@@ -14,7 +14,8 @@ use crate::{HostSplats, TrainingConfig, TrainingDataset, TrainingError};
 
 use super::config::MAX_TRAINING_ITERATIONS;
 
-pub const TRAINING_CHECKPOINT_VERSION: u32 = 1;
+pub const TRAINING_CHECKPOINT_VERSION: u32 = 2;
+pub const TRAINING_CHECKPOINT_VERSION_V1: u32 = 1;
 pub const TRAINING_CHECKPOINT_MAGIC: [u8; 8] = *b"RGSCPBIN";
 pub const TRAINING_CHECKPOINT_FORMAT_VERSION: u32 = 1;
 pub const MAX_TRAINING_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -329,6 +330,12 @@ pub struct AdamParameterCheckpoint {
     pub step: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointMigration {
+    None,
+    V1BaselineReset,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdamCheckpoint {
     pub transforms: AdamParameterCheckpoint,
@@ -350,6 +357,37 @@ pub struct TopologyCheckpoint {
     pub actual_visible_observations: TensorCheckpoint,
     pub splat_birth_iterations: Vec<usize>,
     pub splat_invisible_windows: Vec<usize>,
+    pub visibility_window_baseline: Vec<f32>,
+    pub actual_visibility_window_baseline: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TopologyCheckpointV1 {
+    grad_2d: TensorCheckpoint,
+    screen_grad_2d: TensorCheckpoint,
+    abs_grad_2d: TensorCheckpoint,
+    abs_pixel_grad_2d: TensorCheckpoint,
+    pixel_coverage: TensorCheckpoint,
+    camera_depth: TensorCheckpoint,
+    grad_color: TensorCheckpoint,
+    num_observations: TensorCheckpoint,
+    visible_observations: TensorCheckpoint,
+    actual_visible_observations: TensorCheckpoint,
+    splat_birth_iterations: Vec<usize>,
+    splat_invisible_windows: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TrainingCheckpointV1 {
+    version: u32,
+    identity: TrainingIdentity,
+    completed_iterations: usize,
+    latest_loss: Option<f32>,
+    splats: HostSplats,
+    optimizer: AdamCheckpoint,
+    topology: TopologyCheckpointV1,
+    frame_shuffle_seed: u64,
+    active_sh_degree: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -494,6 +532,16 @@ impl TrainingCheckpoint {
             self.topology.splat_invisible_windows.len(),
             splat_count,
         )?;
+        validate_visibility_baseline(
+            "topology.visibility_window_baseline",
+            &self.topology.visibility_window_baseline,
+            splat_count,
+        )?;
+        validate_visibility_baseline(
+            "topology.actual_visibility_window_baseline",
+            &self.topology.actual_visibility_window_baseline,
+            splat_count,
+        )?;
         if self
             .topology
             .splat_birth_iterations
@@ -518,6 +566,86 @@ impl TrainingCheckpoint {
     }
 }
 
+fn validate_visibility_baseline(
+    label: &str,
+    values: &[f32],
+    splat_count: usize,
+) -> Result<(), TrainingError> {
+    if values.len() != splat_count {
+        return Err(invalid_checkpoint(format!(
+            "{label} length {} does not match splat count {splat_count}",
+            values.len()
+        )));
+    }
+    for (index, value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(invalid_checkpoint(format!(
+                "{label}[{index}] must be finite"
+            )));
+        }
+        if *value < 0.0 {
+            return Err(invalid_checkpoint(format!(
+                "{label}[{index}] must be non-negative"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_topology_v1(topology: TopologyCheckpointV1) -> TopologyCheckpoint {
+    let visibility_window_baseline =
+        visibility_window_baseline_from_cumulative_values(&topology.visible_observations.values);
+    let actual_visibility_window_baseline = visibility_window_baseline_from_cumulative_values(
+        &topology.actual_visible_observations.values,
+    );
+    TopologyCheckpoint {
+        grad_2d: topology.grad_2d,
+        screen_grad_2d: topology.screen_grad_2d,
+        abs_grad_2d: topology.abs_grad_2d,
+        abs_pixel_grad_2d: topology.abs_pixel_grad_2d,
+        pixel_coverage: topology.pixel_coverage,
+        camera_depth: topology.camera_depth,
+        grad_color: topology.grad_color,
+        num_observations: topology.num_observations,
+        visible_observations: topology.visible_observations,
+        actual_visible_observations: topology.actual_visible_observations,
+        splat_birth_iterations: topology.splat_birth_iterations,
+        splat_invisible_windows: topology.splat_invisible_windows,
+        visibility_window_baseline,
+        actual_visibility_window_baseline,
+    }
+}
+
+fn visibility_window_baseline_from_cumulative_values(cumulative: &[f32]) -> Vec<f32> {
+    cumulative
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                (*value).max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+fn migrate_checkpoint_v1(v1: TrainingCheckpointV1) -> (TrainingCheckpoint, CheckpointMigration) {
+    (
+        TrainingCheckpoint {
+            version: TRAINING_CHECKPOINT_VERSION,
+            identity: v1.identity,
+            completed_iterations: v1.completed_iterations,
+            latest_loss: v1.latest_loss,
+            splats: v1.splats,
+            optimizer: v1.optimizer,
+            topology: migrate_topology_v1(v1.topology),
+            frame_shuffle_seed: v1.frame_shuffle_seed,
+            active_sh_degree: v1.active_sh_degree,
+        },
+        CheckpointMigration::V1BaselineReset,
+    )
+}
+
 pub fn save_training_checkpoint(
     path: &Path,
     checkpoint: &TrainingCheckpoint,
@@ -531,6 +659,12 @@ pub fn save_training_checkpoint(
 }
 
 pub fn load_training_checkpoint(path: &Path) -> Result<TrainingCheckpoint, TrainingError> {
+    Ok(load_training_checkpoint_with_migration(path)?.0)
+}
+
+pub fn load_training_checkpoint_with_migration(
+    path: &Path,
+) -> Result<(TrainingCheckpoint, CheckpointMigration), TrainingError> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
     if file_len > MAX_TRAINING_CHECKPOINT_BYTES {
@@ -561,17 +695,42 @@ pub fn load_training_checkpoint(path: &Path) -> Result<TrainingCheckpoint, Train
         )));
     }
 
-    let checkpoint: TrainingCheckpoint = checkpoint_bincode_options()
-        .deserialize_from(&mut reader)
-        .map_err(|error| decode_checkpoint_error(*error))?;
-    let mut trailing = [0u8; 1];
-    if reader.read(&mut trailing)? != 0 {
-        return Err(TrainingError::InvalidInput(
-            "decode checkpoint: trailing bytes are not allowed".to_string(),
-        ));
-    }
+    let mut payload = Vec::new();
+    reader.read_to_end(&mut payload)?;
+    let (checkpoint, migration) = decode_training_checkpoint_payload(&payload)?;
     checkpoint.validate()?;
-    Ok(checkpoint)
+    Ok((checkpoint, migration))
+}
+
+fn decode_training_checkpoint_payload(
+    payload: &[u8],
+) -> Result<(TrainingCheckpoint, CheckpointMigration), TrainingError> {
+    if let Ok(checkpoint) = checkpoint_bincode_options().deserialize::<TrainingCheckpoint>(payload)
+    {
+        if checkpoint.version == TRAINING_CHECKPOINT_VERSION {
+            return Ok((checkpoint, CheckpointMigration::None));
+        }
+        if checkpoint.version == TRAINING_CHECKPOINT_VERSION_V1 {
+            return Err(invalid_checkpoint(
+                "checkpoint version 1 payload was decoded as v2 layout; file is corrupt",
+            ));
+        }
+        return Err(invalid_checkpoint(format!(
+            "checkpoint version {} is unsupported; expected {TRAINING_CHECKPOINT_VERSION} (or migrate from {TRAINING_CHECKPOINT_VERSION_V1})",
+            checkpoint.version
+        )));
+    }
+
+    let v1: TrainingCheckpointV1 = checkpoint_bincode_options()
+        .deserialize(payload)
+        .map_err(|error| decode_checkpoint_error(*error))?;
+    if v1.version != TRAINING_CHECKPOINT_VERSION_V1 {
+        return Err(invalid_checkpoint(format!(
+            "checkpoint version {} is unsupported; expected {TRAINING_CHECKPOINT_VERSION_V1} for v1 layout",
+            v1.version
+        )));
+    }
+    Ok(migrate_checkpoint_v1(v1))
 }
 
 fn validate_identity_field(name: &str, value: &str) -> Result<(), TrainingError> {
@@ -788,6 +947,15 @@ fn decode_checkpoint_error(error: bincode::ErrorKind) -> TrainingError {
         bincode::ErrorKind::Io(error) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
             TrainingError::Io(error)
         }
-        error => TrainingError::InvalidInput(format!("decode checkpoint: {error}")),
+        error => {
+            let message = error.to_string();
+            if message.contains("bytes remaining") || message.contains("trailing") {
+                TrainingError::InvalidInput(
+                    "decode checkpoint: trailing bytes are not allowed".to_string(),
+                )
+            } else {
+                TrainingError::InvalidInput(format!("decode checkpoint: {message}"))
+            }
+        }
     }
 }

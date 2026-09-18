@@ -7,15 +7,16 @@ use std::sync::{Arc, Barrier};
 
 use bincode::Options;
 use rustgs::{
-    load_training_checkpoint, save_training_checkpoint, train_splats, AdamCheckpoint,
-    AdamParameterCheckpoint, HostSplats, Intrinsics, ScenePose, TensorCheckpoint,
-    TopologyCheckpoint, TrainingCheckpoint, TrainingCheckpointPolicy, TrainingCheckpointReason,
-    TrainingConfig, TrainingControl, TrainingDataset, TrainingError, TrainingEvent,
-    TrainingEventCadence, TrainingIdentity, TrainingOptions, TrainingRunDisposition,
-    MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
-    MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
-    MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3, TRAINING_CHECKPOINT_FORMAT_VERSION,
-    TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
+    load_training_checkpoint, load_training_checkpoint_with_migration, save_training_checkpoint,
+    train_splats, AdamCheckpoint, AdamParameterCheckpoint, CheckpointMigration, HostSplats,
+    Intrinsics, ScenePose, TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint,
+    TrainingCheckpointPolicy, TrainingCheckpointReason, TrainingConfig, TrainingControl,
+    TrainingDataset, TrainingError, TrainingEvent, TrainingEventCadence, TrainingIdentity,
+    TrainingOptions, TrainingRunDisposition, MAX_TRAINING_CHECKPOINT_BYTES,
+    MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
+    MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3,
+    TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
+    TRAINING_CHECKPOINT_VERSION_V1,
 };
 use serde::Serialize;
 
@@ -109,6 +110,8 @@ fn checkpoint_fixture(completed_iterations: usize) -> TrainingCheckpoint {
             actual_visible_observations: topology_tensor,
             splat_birth_iterations: vec![0],
             splat_invisible_windows: vec![1],
+            visibility_window_baseline: vec![0.0],
+            actual_visibility_window_baseline: vec![0.0],
         },
         frame_shuffle_seed: 7,
         active_sh_degree: 0,
@@ -427,6 +430,118 @@ fn checkpoint_load_rejects_wrong_version() {
         load_training_checkpoint(&path).unwrap_err(),
         "checkpoint version",
     );
+}
+
+#[test]
+fn checkpoint_v2_roundtrip_preserves_visibility_baselines() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v2-baselines.rgscp");
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.topology.visibility_window_baseline = vec![4.0];
+    checkpoint.topology.actual_visibility_window_baseline = vec![5.0];
+    save_training_checkpoint(&path, &checkpoint).unwrap();
+    let loaded = load_training_checkpoint(&path).unwrap();
+    assert_eq!(loaded.version, TRAINING_CHECKPOINT_VERSION);
+    assert_eq!(loaded.topology.visibility_window_baseline, vec![4.0]);
+    assert_eq!(loaded.topology.actual_visibility_window_baseline, vec![5.0]);
+}
+
+#[test]
+fn checkpoint_v2_rejects_baseline_length_and_nan() {
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.topology.visibility_window_baseline = vec![1.0, 2.0];
+    assert_invalid_input_contains(
+        checkpoint.validate().unwrap_err(),
+        "visibility_window_baseline length",
+    );
+
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.topology.actual_visibility_window_baseline = vec![f32::NAN];
+    assert_invalid_input_contains(
+        checkpoint.validate().unwrap_err(),
+        "actual_visibility_window_baseline[0] must be finite",
+    );
+
+    let mut checkpoint = checkpoint_fixture(10);
+    checkpoint.topology.visibility_window_baseline = vec![-1.0];
+    assert_invalid_input_contains(
+        checkpoint.validate().unwrap_err(),
+        "visibility_window_baseline[0] must be non-negative",
+    );
+}
+
+#[derive(Serialize)]
+struct TopologyCheckpointV1Wire {
+    grad_2d: TensorCheckpoint,
+    screen_grad_2d: TensorCheckpoint,
+    abs_grad_2d: TensorCheckpoint,
+    abs_pixel_grad_2d: TensorCheckpoint,
+    pixel_coverage: TensorCheckpoint,
+    camera_depth: TensorCheckpoint,
+    grad_color: TensorCheckpoint,
+    num_observations: TensorCheckpoint,
+    visible_observations: TensorCheckpoint,
+    actual_visible_observations: TensorCheckpoint,
+    splat_birth_iterations: Vec<usize>,
+    splat_invisible_windows: Vec<usize>,
+}
+
+#[derive(Serialize)]
+struct TrainingCheckpointV1Wire {
+    version: u32,
+    identity: TrainingIdentity,
+    completed_iterations: usize,
+    latest_loss: Option<f32>,
+    splats: HostSplats,
+    optimizer: AdamCheckpoint,
+    topology: TopologyCheckpointV1Wire,
+    frame_shuffle_seed: u64,
+    active_sh_degree: usize,
+}
+
+#[test]
+fn checkpoint_v1_fixture_migrates_baselines_from_cumulative() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v1-migrate.rgscp");
+    let v2 = checkpoint_fixture(10);
+    let v1 = TrainingCheckpointV1Wire {
+        version: TRAINING_CHECKPOINT_VERSION_V1,
+        identity: v2.identity.clone(),
+        completed_iterations: v2.completed_iterations,
+        latest_loss: v2.latest_loss,
+        splats: v2.splats.clone(),
+        optimizer: v2.optimizer.clone(),
+        topology: TopologyCheckpointV1Wire {
+            grad_2d: v2.topology.grad_2d.clone(),
+            screen_grad_2d: v2.topology.screen_grad_2d.clone(),
+            abs_grad_2d: v2.topology.abs_grad_2d.clone(),
+            abs_pixel_grad_2d: v2.topology.abs_pixel_grad_2d.clone(),
+            pixel_coverage: v2.topology.pixel_coverage.clone(),
+            camera_depth: v2.topology.camera_depth.clone(),
+            grad_color: v2.topology.grad_color.clone(),
+            num_observations: v2.topology.num_observations.clone(),
+            visible_observations: TensorCheckpoint {
+                shape: vec![1],
+                values: vec![7.0],
+            },
+            actual_visible_observations: TensorCheckpoint {
+                shape: vec![1],
+                values: vec![9.0],
+            },
+            splat_birth_iterations: v2.topology.splat_birth_iterations.clone(),
+            splat_invisible_windows: v2.topology.splat_invisible_windows.clone(),
+        },
+        frame_shuffle_seed: v2.frame_shuffle_seed,
+        active_sh_degree: v2.active_sh_degree,
+    };
+    fs::write(&path, encode_unchecked(&v1)).unwrap();
+
+    let (loaded, migration) = load_training_checkpoint_with_migration(&path).unwrap();
+    assert_eq!(migration, CheckpointMigration::V1BaselineReset);
+    assert_eq!(loaded.version, TRAINING_CHECKPOINT_VERSION);
+    assert_eq!(loaded.topology.visibility_window_baseline, vec![7.0]);
+    assert_eq!(loaded.topology.actual_visibility_window_baseline, vec![9.0]);
+    assert_eq!(loaded.topology.visible_observations.values, vec![7.0]);
 }
 
 #[test]

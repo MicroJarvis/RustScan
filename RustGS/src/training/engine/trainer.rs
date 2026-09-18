@@ -502,7 +502,12 @@ impl WgpuTrainer {
             visible_observations: self.visible_observations.clone(),
             actual_visible_observations: self.actual_visible_observations.clone(),
         }
-        .checkpoint(&self.splat_birth_iterations, &self.splat_invisible_windows)
+        .checkpoint(
+            &self.splat_birth_iterations,
+            &self.splat_invisible_windows,
+            &self.visibility_window_baseline,
+            &self.actual_visibility_window_baseline,
+        )
         .await?;
         let checkpoint = TrainingCheckpoint {
             version: TRAINING_CHECKPOINT_VERSION,
@@ -553,14 +558,12 @@ impl WgpuTrainer {
         trainer.actual_visible_observations = topology.actual_visible_observations;
         trainer.splat_birth_iterations = checkpoint.topology.splat_birth_iterations.clone();
         trainer.splat_invisible_windows = checkpoint.topology.splat_invisible_windows.clone();
-        // Resume mid densify-window: start a fresh visibility window from the
-        // restored cumulative counts so invisible clocks keep advancing.
-        trainer.visibility_window_baseline = visibility_window_baseline_from_cumulative(
-            &checkpoint.topology.visible_observations.values,
-        );
-        trainer.actual_visibility_window_baseline = visibility_window_baseline_from_cumulative(
-            &checkpoint.topology.actual_visible_observations.values,
-        );
+        // v2 checkpoints own the mid-window baselines; do not rebuild from cumulative.
+        trainer.visibility_window_baseline = checkpoint.topology.visibility_window_baseline.clone();
+        trainer.actual_visibility_window_baseline = checkpoint
+            .topology
+            .actual_visibility_window_baseline
+            .clone();
         trainer.telemetry.active_sh_degree = Some(checkpoint.active_sh_degree);
 
         Ok((trainer, splats))
@@ -1889,6 +1892,8 @@ mod tests {
         trainer.actual_visible_observations = tensor([91.0, 92.0, 93.0]);
         trainer.splat_birth_iterations = vec![0, 4, 8];
         trainer.splat_invisible_windows = vec![1, 2, 3];
+        trainer.visibility_window_baseline = vec![10.0, 20.0, 30.0];
+        trainer.actual_visibility_window_baseline = vec![11.0, 21.0, 31.0];
     }
 
     fn step_trainer_optimizer(trainer: &mut WgpuTrainer, splats: &mut DeviceSplats<GsDiffBackend>) {
@@ -2098,11 +2103,27 @@ mod tests {
         );
         assert_eq!(checkpoint.topology.splat_birth_iterations, [0, 4, 8]);
         assert_eq!(checkpoint.topology.splat_invisible_windows, [1, 2, 3]);
+        assert_eq!(
+            checkpoint.topology.visibility_window_baseline,
+            [10.0, 20.0, 30.0]
+        );
+        assert_eq!(
+            checkpoint.topology.actual_visibility_window_baseline,
+            [11.0, 21.0, 31.0]
+        );
 
         let (mut restored, restored_splats) =
             WgpuTrainer::from_checkpoint(config, device, 2.5, &checkpoint)
                 .await
                 .expect("restore trainer checkpoint");
+        assert_eq!(
+            restored.visibility_window_baseline,
+            checkpoint.topology.visibility_window_baseline
+        );
+        assert_eq!(
+            restored.actual_visibility_window_baseline,
+            checkpoint.topology.actual_visibility_window_baseline
+        );
         assert_eq!(
             device_splats_to_host(&restored_splats).await,
             checkpoint.splats
@@ -2362,6 +2383,8 @@ mod tests {
         .checkpoint(
             &trainer.splat_birth_iterations,
             &trainer.splat_invisible_windows,
+            &trainer.visibility_window_baseline,
+            &trainer.actual_visibility_window_baseline,
         )
         .await
         .expect("topology checkpoint");

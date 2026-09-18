@@ -151,9 +151,9 @@ pub actual_visibility_window_baseline: Vec<f32>;
 
 v2 要求长度等于 splat count、值 finite 且非负；v1 用旧累计 visibility 构造 baseline，并返回 `CheckpointMigration::V1BaselineReset`，日志和 report 必须记录迁移；不能用 `serde(default)` 静默接受损坏的空数组。
 
-- [ ] 增加 v2 round-trip、长度/NaN 校验和固定 v1 JSON fixture。
-- [ ] restore 直接使用 checkpoint baseline，禁止再由累计 tensor 覆盖。
-- [ ] 运行 checkpoint tests，提交 `fix(rustgs): preserve topology visibility windows in checkpoints`。
+- [x] 增加 v2 round-trip、长度/NaN 校验和固定 v1 JSON fixture。
+- [x] restore 直接使用 checkpoint baseline，禁止再由累计 tensor 覆盖。
+- [x] 运行 checkpoint tests，提交 `fix(rustgs): preserve topology visibility windows in checkpoints`。
 
 ## Task 2.2：Topology window 中途 resume parity
 
