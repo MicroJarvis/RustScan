@@ -1506,7 +1506,7 @@ impl WgpuTrainer {
             apply_mutations(splats, &snapshot.splats, &plan, &self.device);
             self.remap_topology_visibility_state(&plan, iteration);
         }
-        if plan.aftermath.requires_adam_rebuild || plan.aftermath.apply_opacity_reset {
+        if plan.aftermath.requires_adam_rebuild {
             let sh_dims = splats.sh_coeffs.val().dims();
             self.optimizer.remap_origins(
                 &plan.origins(),
@@ -1514,6 +1514,9 @@ impl WgpuTrainer {
                 sh_dims.get(2).copied().unwrap_or(3),
                 &self.device,
             );
+        }
+        if plan.aftermath.apply_opacity_reset {
+            self.optimizer.clear_opacity_moments();
         }
         if plan.should_retain_accumulators() {
             self.telemetry.topology.skipped_no_eligible_candidates = self

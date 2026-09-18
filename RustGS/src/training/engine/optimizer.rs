@@ -500,6 +500,17 @@ impl<B: Backend> AdamScaled<B> {
         Self::remap_state(&mut self.raw_opacities, origins, &[], device);
     }
 
+    /// Opacity reset changes logits but must not rewind Adam step or wipe
+    /// transform/SH moments. Only the opacity moment buffers are zeroed.
+    pub fn clear_opacity_moments(&mut self) {
+        if let Some(moment1) = self.raw_opacities.moment1.as_ref() {
+            self.raw_opacities.moment1 = Some(moment1.zeros_like());
+        }
+        if let Some(moment2) = self.raw_opacities.moment2.as_ref() {
+            self.raw_opacities.moment2 = Some(moment2.zeros_like());
+        }
+    }
+
     fn remap_state<const D: usize>(
         state: &mut AdamState<B, D>,
         origins: &[Option<usize>],
@@ -1371,5 +1382,89 @@ mod tests {
             m1.values[10..20].iter().any(|value| *value != 0.0),
             "new-row moment1 must update on the post-restore step"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn opacity_reset_clears_only_opacity_moments_and_keeps_step() {
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut splats = test_splats(&device);
+        let mut optimizer = optimizer_with_scaling(&device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        for _ in 0..5 {
+            optimizer_step(&mut optimizer, &mut splats, &status, &device);
+        }
+        let before = optimizer.checkpoint().await.expect("before opacity reset");
+        assert_eq!(before.transforms.step, 5);
+        assert!(before.transforms.moment1.is_some());
+        assert!(before.raw_opacities.moment1.is_some());
+
+        optimizer.clear_opacity_moments();
+        let after = optimizer.checkpoint().await.expect("after opacity reset");
+        assert_eq!(after.transforms.step, 5);
+        assert_eq!(after.sh_coeffs.step, 5);
+        assert_eq!(after.raw_opacities.step, 5);
+        assert_eq!(after.transforms.moment1, before.transforms.moment1);
+        assert_eq!(after.transforms.moment2, before.transforms.moment2);
+        assert_eq!(after.sh_coeffs.moment1, before.sh_coeffs.moment1);
+        assert_eq!(after.sh_coeffs.moment2, before.sh_coeffs.moment2);
+        let opacity_m1 = after.raw_opacities.moment1.expect("opacity moment1");
+        let opacity_m2 = after.raw_opacities.moment2.expect("opacity moment2");
+        assert!(opacity_m1.values.iter().all(|value| *value == 0.0));
+        assert!(opacity_m2.values.iter().all(|value| *value == 0.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remap_mixed_prune_and_densify_keeps_survivor_moments_and_zeros_new_rows() {
+        let device = <GsBackendBase as Backend>::Device::default();
+        // Start with 5 rows so a non-contiguous prune + densify is expressible.
+        let transforms = Tensor::<GsDiffBackend, 2>::from_data(
+            TensorData::new(
+                (0..50).map(|value| value as f32 * 0.01).collect(),
+                Shape::new([5, 10]),
+            ),
+            &device,
+        );
+        let sh_coeffs = Tensor::<GsDiffBackend, 3>::from_data(
+            TensorData::new(
+                (0..60).map(|value| value as f32 * 0.005).collect(),
+                Shape::new([5, 4, 3]),
+            ),
+            &device,
+        );
+        let raw_opacities =
+            Tensor::<GsDiffBackend, 1>::from_floats([0.1, -0.2, 0.3, -0.4, 0.5], &device);
+        let mut splats = DeviceSplats {
+            transforms: Param::from_tensor(transforms),
+            sh_coeffs: Param::from_tensor(sh_coeffs),
+            raw_opacities: Param::from_tensor(raw_opacities),
+            sh_degree: 1,
+        };
+        let mut optimizer = optimizer_with_scaling(&device);
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        for _ in 0..4 {
+            optimizer.step_device_splats(
+                &mut splats,
+                Tensor::ones([5, 10], &device).mul_scalar(0.1),
+                Tensor::ones([5, 4, 3], &device).mul_scalar(-0.2),
+                Tensor::ones([5], &device).mul_scalar(0.3),
+                status.buffer().clone(),
+            );
+        }
+        let before = optimizer.checkpoint().await.expect("before remap");
+        // Keep rows 4 and 1, insert two densified rows, drop 0/2/3.
+        let origins = [Some(4), None, Some(1), None];
+        optimizer.remap_origins(&origins, 4, 3, &device);
+        let after = optimizer.checkpoint().await.expect("after remap");
+        assert_eq!(after.transforms.step, 4);
+        assert_eq!(after.sh_coeffs.step, 4);
+        assert_eq!(after.raw_opacities.step, 4);
+
+        let before_m1 = before.transforms.moment1.expect("before moment1");
+        let after_m1 = after.transforms.moment1.expect("after moment1");
+        assert_eq!(after_m1.shape, [4, 10]);
+        assert_eq!(&after_m1.values[0..10], &before_m1.values[40..50]);
+        assert!(after_m1.values[10..20].iter().all(|value| *value == 0.0));
+        assert_eq!(&after_m1.values[20..30], &before_m1.values[10..20]);
+        assert!(after_m1.values[30..40].iter().all(|value| *value == 0.0));
     }
 }

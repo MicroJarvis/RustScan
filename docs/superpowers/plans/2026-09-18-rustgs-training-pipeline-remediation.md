@@ -169,6 +169,9 @@ v2 要求长度等于 splat count、值 finite 且非负；v1 用旧累计 visib
 
 用可识别 row 值覆盖：非连续大量 prune、多个 `None` densify、混合 origins、opacity reset、全部候选 prune 的保护逻辑。survivor 的 param/moment/age/baseline 必须同源；new row moment 为 0；opacity reset 时只清对应 opacity moment，transform/SH moment 保留；step 不回退。增加 apply→checkpoint→restore→next-step parity，提交 `fix(rustgs): preserve optimizer continuity across topology changes`。
 
+- [x] opacity reset 只清 opacity moment；混合 prune/densify remap 保留 survivor、新行为零；step 不回退。
+- [x] 提交 `fix(rustgs): preserve optimizer continuity across topology changes`。
+
 **阶段 2 验收：** v2 严格验证、v1 显式迁移；mid-window resume 与 uninterrupted 事件相同；大规模 mutation 后所有 tensor/vector shape 和来源一致。
 
 ---
