@@ -127,10 +127,10 @@ async fn ensure_device_status_healthy(&mut self, reason: StatusReadbackReason)
 
 普通 step 不读；loss cadence、topology snapshot 前、checkpoint、pause/cancel、training end 才读。删除分散的 status readback，并在 report 写出各 reason 计数。
 
-- [ ] 覆盖 checkpoint 不在 loss cadence 的测试。
-- [ ] 100-step 正常训练断言 readback 数量等于安全点数量而不是 step 数。
-- [ ] 阶段门禁：`cargo fmt --package rustgs --check`、CPU/GPU library、integration ignored、checkpoint_resume、`git diff --check`。
-- [ ] 提交 `fix(rustgs): validate device status at training safety points`。
+- [x] 覆盖 checkpoint 不在 loss cadence 的测试。
+- [x] 100-step 正常训练断言 readback 数量等于安全点数量而不是 step 数。
+- [x] 阶段门禁：`cargo fmt --package rustgs --check`、CPU/GPU library、integration ignored、checkpoint_resume、`git diff --check`。
+- [x] 提交 `fix(rustgs): validate device status at training safety points`。
 
 **阶段 1 验收：** 正常 step 零 status/overflow/finite readback；异常 step 零参数、moment、step、topology mutation；首次异常信息准确；checkpoint 和成功结束都不能越过异常。
 

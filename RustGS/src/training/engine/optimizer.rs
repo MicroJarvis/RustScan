@@ -120,15 +120,10 @@ where
                 CubeDim::new_1d(1),
             )),
             CubeCount::Static(1, 1, 1),
-            KernelArguments::new().with_buffers(vec![
-                status.handle.binding(),
-                params_handle.binding(),
-            ]),
+            KernelArguments::new()
+                .with_buffers(vec![status.handle.binding(), params_handle.binding()]),
         );
-        status
-            .client
-            .flush()
-            .expect("flush prepare_optimizer_step");
+        status.client.flush().expect("flush prepare_optimizer_step");
     }
 
     fn adam_update_primitive(
@@ -617,22 +612,15 @@ impl<B: Backend> AdamScaled<B> {
     }
 }
 
-fn committed_optimizer_steps_from_status<B: Backend>(status: &Tensor<B, 1, Int>) -> usize {
-    // Device word 4 is authoritative after prepare. Syncing host Adam counters
-    // here keeps blocked gates from advancing step without a separate host flag
-    // mirror. Task 1.5 folds broader status readback accounting into safety points.
-    let data = status.clone().into_data();
-    let values = data
-        .to_vec::<i32>()
-        .expect("training status buffer must decode as i32 words");
-    debug_assert!(
-        values.len() >= 5,
-        "training status buffer too short for committed step word"
-    );
-    values[4].max(0) as usize
-}
-
 impl<B: AdamUpdateBackend> AdamScaled<B> {
+    /// Align host Adam step counters with device-committed steps (status word 4).
+    /// Called from training safety-point status reads; normal steps stay readback-free.
+    pub fn sync_committed_steps(&mut self, committed: usize) {
+        self.transforms.step = committed;
+        self.sh_coeffs.step = committed;
+        self.raw_opacities.step = committed;
+    }
+
     pub fn step_device_splats<AD>(
         &mut self,
         splats: &mut DeviceSplats<AD>,
@@ -644,7 +632,9 @@ impl<B: AdamUpdateBackend> AdamScaled<B> {
         AD: AutodiffBackend<InnerBackend = B>,
     {
         B::prepare_optimizer_step(status.clone().into_primitive());
-        let next_step = committed_optimizer_steps_from_status(&status);
+        // Optimistic host advance. Device word 4 is authoritative for bias
+        // correction and for blocked gates; safety-point reads resync host.
+        let next_step = self.transforms.step.saturating_add(1);
         self.transforms.step = next_step;
         self.sh_coeffs.step = next_step;
         self.raw_opacities.step = next_step;
@@ -886,7 +876,11 @@ mod tests {
         }
         assert_eq!(optimizer.transforms.step, 7);
         assert_eq!(
-            status.read().await.expect("status read").committed_optimizer_steps,
+            status
+                .read()
+                .await
+                .expect("status read")
+                .committed_optimizer_steps,
             7
         );
 
@@ -909,6 +903,8 @@ mod tests {
         let after_status = status.read().await.expect("status after blocked step");
         assert_eq!(after_status.committed_optimizer_steps, 7);
         assert_eq!(after_status.mutation_gate, 0);
+        // Host may optimistically advance; device word 4 is authoritative.
+        optimizer.sync_committed_steps(after_status.committed_optimizer_steps as usize);
         assert_eq!(optimizer.transforms.step, 7);
         assert_eq!(optimizer.sh_coeffs.step, 7);
         assert_eq!(optimizer.raw_opacities.step, 7);
@@ -978,7 +974,12 @@ mod tests {
 
         optimizer_step(&mut optimizer, &mut splats, &status, &device);
         let restored_status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 2);
-        optimizer_step(&mut restored, &mut resumed_splats, &restored_status, &device);
+        optimizer_step(
+            &mut restored,
+            &mut resumed_splats,
+            &restored_status,
+            &device,
+        );
         assert_tensor_close(splats.transforms.val(), resumed_splats.transforms.val()).await;
         assert_tensor_close(splats.sh_coeffs.val(), resumed_splats.sh_coeffs.val()).await;
         assert_tensor_close(

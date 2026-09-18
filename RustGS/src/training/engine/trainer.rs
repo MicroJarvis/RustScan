@@ -45,6 +45,16 @@ use super::splats::{
 };
 use super::topology_accum::{accumulate_topology_stats, TopologyAccumulatorSet};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusReadbackReason {
+    LossCadence,
+    TopologyBoundary,
+    Checkpoint,
+    Pause,
+    Cancel,
+    TrainingEnd,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WgpuTrainingReport {
     pub final_loss: Option<f32>,
@@ -203,6 +213,12 @@ struct OptimizationTimingSamples {
     loss_readbacks: usize,
     count_readbacks: usize,
     status_readbacks: usize,
+    status_readbacks_loss_cadence: usize,
+    status_readbacks_topology: usize,
+    status_readbacks_checkpoint: usize,
+    status_readbacks_pause: usize,
+    status_readbacks_cancel: usize,
+    status_readbacks_training_end: usize,
     capacity_telemetry_readbacks: usize,
     loss_value_readbacks: usize,
     checkpoint_tensor_readbacks: usize,
@@ -244,6 +260,33 @@ impl OptimizationTimingSamples {
         self.count_readbacks = self.count_readbacks.saturating_add(count);
     }
 
+    fn record_status_readback(&mut self, reason: StatusReadbackReason) {
+        self.status_readbacks = self.status_readbacks.saturating_add(1);
+        match reason {
+            StatusReadbackReason::LossCadence => {
+                self.status_readbacks_loss_cadence =
+                    self.status_readbacks_loss_cadence.saturating_add(1);
+            }
+            StatusReadbackReason::TopologyBoundary => {
+                self.status_readbacks_topology = self.status_readbacks_topology.saturating_add(1);
+            }
+            StatusReadbackReason::Checkpoint => {
+                self.status_readbacks_checkpoint =
+                    self.status_readbacks_checkpoint.saturating_add(1);
+            }
+            StatusReadbackReason::Pause => {
+                self.status_readbacks_pause = self.status_readbacks_pause.saturating_add(1);
+            }
+            StatusReadbackReason::Cancel => {
+                self.status_readbacks_cancel = self.status_readbacks_cancel.saturating_add(1);
+            }
+            StatusReadbackReason::TrainingEnd => {
+                self.status_readbacks_training_end =
+                    self.status_readbacks_training_end.saturating_add(1);
+            }
+        }
+    }
+
     fn flush_into(&self, telemetry: &mut LiteGsTrainingTelemetry) {
         let mut loop_sorted = self.loop_ms.clone();
         loop_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -253,6 +296,12 @@ impl OptimizationTimingSamples {
         telemetry.loss_readback_count = Some(self.loss_readbacks);
         telemetry.count_readback_count = Some(self.count_readbacks);
         telemetry.status_readbacks = Some(self.status_readbacks);
+        telemetry.status_readbacks_loss_cadence = Some(self.status_readbacks_loss_cadence);
+        telemetry.status_readbacks_topology = Some(self.status_readbacks_topology);
+        telemetry.status_readbacks_checkpoint = Some(self.status_readbacks_checkpoint);
+        telemetry.status_readbacks_pause = Some(self.status_readbacks_pause);
+        telemetry.status_readbacks_cancel = Some(self.status_readbacks_cancel);
+        telemetry.status_readbacks_training_end = Some(self.status_readbacks_training_end);
         telemetry.capacity_telemetry_readbacks = Some(self.capacity_telemetry_readbacks);
         telemetry.loss_value_readbacks = Some(self.loss_value_readbacks);
         telemetry.checkpoint_tensor_readbacks = Some(self.checkpoint_tensor_readbacks);
@@ -409,16 +458,36 @@ impl WgpuTrainer {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn checkpoint(
-        &self,
+        &mut self,
         splats: &DeviceSplats<GsDiffBackend>,
         identity: TrainingIdentity,
         completed_iterations: usize,
         latest_loss: Option<f32>,
     ) -> Result<TrainingCheckpoint, TrainingError> {
-        if let Some(err) = self.device_status.host_snapshot().to_error() {
-            return Err(err);
-        }
+        self.checkpoint_with_status_reason(
+            splats,
+            identity,
+            completed_iterations,
+            latest_loss,
+            StatusReadbackReason::Checkpoint,
+        )
+        .await
+    }
+
+    async fn checkpoint_with_status_reason(
+        &mut self,
+        splats: &DeviceSplats<GsDiffBackend>,
+        identity: TrainingIdentity,
+        completed_iterations: usize,
+        latest_loss: Option<f32>,
+        status_reason: StatusReadbackReason,
+    ) -> Result<TrainingCheckpoint, TrainingError> {
+        self.ensure_device_status_healthy(status_reason).await?;
         let host_splats = try_device_splats_to_host(splats).await?;
+        self.optimization_samples.checkpoint_tensor_readbacks = self
+            .optimization_samples
+            .checkpoint_tensor_readbacks
+            .saturating_add(1);
         let active_sh_degree =
             self.active_sh_degree_at(completed_iterations, splats.sh_degree) as usize;
         let topology = TopologyAccumulatorSet {
@@ -782,14 +851,13 @@ impl WgpuTrainer {
                 self.collects_actual_visibility_diagnostics(),
             );
         }
-        self.optimizer
-            .step_device_splats(
-                splats,
-                transforms_grad,
-                sh_grad,
-                opacity_grad,
-                self.device_status.buffer().clone(),
-            );
+        self.optimizer.step_device_splats(
+            splats,
+            transforms_grad,
+            sh_grad,
+            opacity_grad,
+            self.device_status.buffer().clone(),
+        );
         let optimizer_elapsed = if profile_step {
             let started = Instant::now();
             let _ = splats
@@ -877,6 +945,8 @@ impl WgpuTrainer {
         }
 
         if self.should_apply_topology(iteration, frame_count) {
+            self.ensure_device_status_healthy(StatusReadbackReason::TopologyBoundary)
+                .await?;
             self.apply_topology_mutations(splats, iteration, frame_count)
                 .await;
         }
@@ -1071,7 +1141,13 @@ impl WgpuTrainer {
                     )
                 })?;
                 let checkpoint = self
-                    .checkpoint(splats, identity, iteration_idx, Some(last_sampled_loss))
+                    .checkpoint_with_status_reason(
+                        splats,
+                        identity,
+                        iteration_idx,
+                        Some(last_sampled_loss),
+                        Self::checkpoint_status_reason(reason),
+                    )
                     .await?;
                 if let Some(disposition) = complete_checkpoint_boundary(
                     observer,
@@ -1089,7 +1165,8 @@ impl WgpuTrainer {
         }
 
         report.training_loop_elapsed = training_loop_started_at.elapsed();
-        self.ensure_forward_capacity_before_update(true).await?;
+        self.ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
+            .await?;
         self.finish_report(&mut report);
         Ok(report)
     }
@@ -1125,6 +1202,29 @@ impl WgpuTrainer {
         Ok(())
     }
 
+    async fn ensure_device_status_healthy(
+        &mut self,
+        reason: StatusReadbackReason,
+    ) -> Result<TrainingStatusSnapshot, TrainingError> {
+        let status = self.device_status.read().await?;
+        self.device_status.adopt_device_snapshot(status);
+        self.optimization_samples.record_status_readback(reason);
+        self.optimizer
+            .sync_committed_steps(status.committed_optimizer_steps as usize);
+        if let Some(err) = status.to_error() {
+            return Err(err);
+        }
+        Ok(status)
+    }
+
+    fn checkpoint_status_reason(reason: TrainingCheckpointReason) -> StatusReadbackReason {
+        match reason {
+            TrainingCheckpointReason::Periodic => StatusReadbackReason::Checkpoint,
+            TrainingCheckpointReason::Pause => StatusReadbackReason::Pause,
+            TrainingCheckpointReason::Shutdown => StatusReadbackReason::Cancel,
+        }
+    }
+
     async fn sample_forward_capacity(
         &mut self,
         logical_visible: &Tensor<GsDiffBackend, 1, Int>,
@@ -1134,11 +1234,9 @@ impl WgpuTrainer {
     ) -> Result<crate::training::reporting::metrics::ForwardCapacityTelemetry, TrainingError> {
         // Loss cadence is a safety point: pull sticky status without relying on
         // per-step overflow scalar readback.
-        let status = self.device_status.read().await?;
-        self.device_status.adopt_device_snapshot(status);
-        self.optimization_samples.status_readbacks =
-            self.optimization_samples.status_readbacks.saturating_add(1);
-        let status = self.device_status.host_snapshot();
+        let status = self
+            .ensure_device_status_healthy(StatusReadbackReason::LossCadence)
+            .await?;
 
         let visible_value = logical_visible
             .clone()
@@ -2001,7 +2099,7 @@ mod tests {
         assert_eq!(checkpoint.topology.splat_birth_iterations, [0, 4, 8]);
         assert_eq!(checkpoint.topology.splat_invisible_windows, [1, 2, 3]);
 
-        let (restored, restored_splats) =
+        let (mut restored, restored_splats) =
             WgpuTrainer::from_checkpoint(config, device, 2.5, &checkpoint)
                 .await
                 .expect("restore trainer checkpoint");
@@ -2078,7 +2176,7 @@ mod tests {
         assert!(checkpoint.optimizer.transforms.moment1.is_none());
         assert!(checkpoint.optimizer.transforms.scaling.is_some());
 
-        let (restored, restored_splats) =
+        let (mut restored, restored_splats) =
             WgpuTrainer::from_checkpoint(config, device, 2.5, &checkpoint)
                 .await
                 .expect("restore reset trainer checkpoint");
@@ -2164,7 +2262,7 @@ mod tests {
         let config = trainer_checkpoint_config();
         let host_splats = trainer_checkpoint_host_splats();
         let splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
-        let trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
+        let mut trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
 
         for (completed_iterations, expected_degree) in [(0, 0), (1000, 0), (1001, 1)] {
             let checkpoint = trainer
@@ -2190,7 +2288,7 @@ mod tests {
         let host_splats = trainer_checkpoint_host_splats();
         let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
         splats.transforms = Param::from_tensor(Tensor::zeros([3, 9], &device));
-        let trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
+        let mut trainer = WgpuTrainer::new(config, device, 3, 4, 2.5);
 
         let error = trainer
             .checkpoint(&splats, trainer_checkpoint_identity(), 0, None)
@@ -2204,7 +2302,7 @@ mod tests {
     }
 
     async fn snapshot_mutation_state(
-        trainer: &WgpuTrainer,
+        trainer: &mut WgpuTrainer,
         splats: &DeviceSplats<GsDiffBackend>,
     ) -> (
         Vec<f32>,
@@ -2216,6 +2314,10 @@ mod tests {
         Vec<usize>,
         Vec<usize>,
     ) {
+        let status = trainer.device_status.read().await.expect("status read");
+        trainer
+            .optimizer
+            .sync_committed_steps(status.committed_optimizer_steps as usize);
         let transforms = splats
             .transforms
             .val()
@@ -2263,7 +2365,6 @@ mod tests {
         )
         .await
         .expect("topology checkpoint");
-        let status = trainer.device_status.read().await.expect("status read");
         (
             transforms,
             sh,
@@ -2321,7 +2422,7 @@ mod tests {
             .expect("healthy step");
         assert!(healthy.is_none());
 
-        let before = snapshot_mutation_state(&trainer, &splats).await;
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(before.5.committed_optimizer_steps, 1);
 
         let poisoned = trainer
@@ -2339,7 +2440,7 @@ mod tests {
             .expect("gated nan step returns Ok when loss is not sampled");
         assert!(poisoned.is_none());
 
-        let after = snapshot_mutation_state(&trainer, &splats).await;
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(after.0, before.0, "transforms must not change");
         assert_eq!(after.1, before.1, "sh must not change");
         assert_eq!(after.2, before.2, "opacity must not change");
@@ -2347,7 +2448,10 @@ mod tests {
         assert_eq!(after.4, before.4, "topology accumulators must not change");
         assert_eq!(after.6, before.6, "birth iterations must not change");
         assert_eq!(after.7, before.7, "invisible windows must not change");
-        assert_eq!(after.5.committed_optimizer_steps, before.5.committed_optimizer_steps);
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
         assert!(after.5.has_non_finite_loss());
         assert_eq!(after.5.first_invalid_iteration, 2);
     }
@@ -2377,7 +2481,7 @@ mod tests {
             .expect("healthy step");
         assert!(healthy.is_none());
 
-        let before = snapshot_mutation_state(&trainer, &splats).await;
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
         trainer.intersection_capacity_override = Some(1);
 
         let overflowed = trainer
@@ -2395,7 +2499,7 @@ mod tests {
             .expect("gated overflow step returns Ok when loss is not sampled");
         assert!(overflowed.is_none());
 
-        let after = snapshot_mutation_state(&trainer, &splats).await;
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(after.0, before.0, "transforms must not change");
         assert_eq!(after.1, before.1, "sh must not change");
         assert_eq!(after.2, before.2, "opacity must not change");
@@ -2403,8 +2507,115 @@ mod tests {
         assert_eq!(after.4, before.4, "topology accumulators must not change");
         assert_eq!(after.6, before.6);
         assert_eq!(after.7, before.7);
-        assert_eq!(after.5.committed_optimizer_steps, before.5.committed_optimizer_steps);
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
         assert!(after.5.has_forward_overflow());
         assert_eq!(after.5.first_invalid_iteration, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkpoint_outside_loss_cadence_still_reads_device_status() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+
+        for iteration in 1..=3 {
+            let read_loss =
+                should_read_loss(iteration, 100, LOSS_SCALAR_READBACK_INTERVAL, false, false);
+            trainer
+                .train_step(
+                    &mut splats,
+                    &camera,
+                    fault_injection_target(&device, 0.4),
+                    (8, 8),
+                    iteration,
+                    1,
+                    false,
+                    read_loss,
+                )
+                .await
+                .expect("healthy train step");
+        }
+        assert!(!should_read_loss(
+            3,
+            100,
+            LOSS_SCALAR_READBACK_INTERVAL,
+            false,
+            false
+        ));
+        assert_eq!(
+            trainer.optimization_samples.status_readbacks_loss_cadence,
+            1
+        );
+        assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 0);
+
+        trainer
+            .checkpoint(&splats, trainer_checkpoint_identity(), 3, None)
+            .await
+            .expect("checkpoint outside loss cadence");
+        assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 1);
+        assert_eq!(trainer.optimization_samples.status_readbacks, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hundred_step_status_readbacks_match_safety_points_not_steps() {
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 100;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+
+        let mut expected_loss_cadence = 0usize;
+        for iteration in 1..=100 {
+            let read_loss =
+                should_read_loss(iteration, 100, LOSS_SCALAR_READBACK_INTERVAL, false, false);
+            if read_loss {
+                expected_loss_cadence += 1;
+            }
+            trainer
+                .train_step(
+                    &mut splats,
+                    &camera,
+                    fault_injection_target(&device, 0.4),
+                    (8, 8),
+                    iteration,
+                    1,
+                    false,
+                    read_loss,
+                )
+                .await
+                .expect("healthy hundred-step training");
+        }
+        trainer
+            .ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
+            .await
+            .expect("training end status");
+
+        assert_eq!(
+            trainer.optimization_samples.status_readbacks_loss_cadence,
+            expected_loss_cadence
+        );
+        assert_eq!(trainer.optimization_samples.status_readbacks_topology, 0);
+        assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 0);
+        assert_eq!(
+            trainer.optimization_samples.status_readbacks_training_end,
+            1
+        );
+        assert_eq!(
+            trainer.optimization_samples.status_readbacks,
+            expected_loss_cadence + 1
+        );
+        assert!(
+            trainer.optimization_samples.status_readbacks < 100,
+            "status readbacks must not scale with every step"
+        );
+        assert_eq!(expected_loss_cadence, 6);
     }
 }
