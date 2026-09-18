@@ -140,8 +140,6 @@ pub(crate) fn note_non_finite_loss(
 pub(crate) struct DeviceTrainingStatus<B: Backend> {
     buffer: Tensor<B, 1, Int>,
     host: TrainingStatusSnapshot,
-    /// Device-side sticky until Task 1.3 marks `STATUS_NON_FINITE_LOSS` from a GPU kernel.
-    non_finite_steps: Option<Tensor<B, 1, Int>>,
 }
 
 impl<B: Backend> DeviceTrainingStatus<B> {
@@ -153,7 +151,6 @@ impl<B: Backend> DeviceTrainingStatus<B> {
         Self {
             buffer: Tensor::<B, 1, Int>::from_ints(ints.as_slice(), device),
             host,
-            non_finite_steps: None,
         }
     }
 
@@ -192,24 +189,6 @@ impl<B: Backend> DeviceTrainingStatus<B> {
         self.sync_host_to_device();
     }
 
-    pub(crate) fn note_non_finite_loss_device(&mut self, bad: Tensor<B, 1, Int>) {
-        self.non_finite_steps = Some(match self.non_finite_steps.clone() {
-            Some(accumulated) => accumulated + bad,
-            None => bad,
-        });
-    }
-
-    pub(crate) async fn non_finite_loss_seen(&self) -> Result<bool, TrainingError> {
-        let Some(flag) = self.non_finite_steps.clone() else {
-            return Ok(self.host.has_non_finite_loss());
-        };
-        let value = flag.into_scalar_async().await.map_err(|err| {
-            TrainingError::TrainingFailed(format!("failed to read loss finite flag: {err}"))
-        })?;
-        let value_i32 = burn::tensor::cast::ToElement::to_i32(&value);
-        Ok(value_i32 != 0 || self.host.has_non_finite_loss())
-    }
-
     fn sync_host_to_device(&mut self) {
         let device = self.buffer.device();
         let words = encode_training_status(self.host);
@@ -234,11 +213,7 @@ impl<B: Backend> DeviceTrainingStatus<B> {
         for (idx, value) in values.into_iter().enumerate() {
             words[idx] = value as u32;
         }
-        let mut snapshot = decode_training_status(&words);
-        if self.non_finite_loss_seen().await? {
-            snapshot = note_non_finite_loss(snapshot, snapshot.first_invalid_iteration.max(1));
-        }
-        Ok(snapshot)
+        Ok(decode_training_status(&words))
     }
 }
 

@@ -96,10 +96,10 @@ word 0 为 sticky flags；word 1 为首次异常 iteration（初始 `u32::MAX`�
 
 增加 `LossStatusBackend::mark_non_finite_loss(loss, status, iteration)`。命令顺序必须是 `loss → mark status → backward → mutation gate → topology/Adam`。finite、NaN、+Inf、-Inf 都要覆盖；采样 loss scalar readback 仍保留用于报错数值，但不再承担安全职责。
 
-- [ ] 写四个 GPU fixture 并确认旧实现无法提前阻断。
-- [ ] 实现 kernel/backend trait 和首次 iteration 记录。
-- [ ] 删除 `non_finite_loss_steps` 的累加路径。
-- [ ] 运行 loss/trainer tests，提交 `fix(rustgs): mark non-finite loss before state mutation`。
+- [x] 写四个 GPU fixture 并确认旧实现无法提前阻断。
+- [x] 实现 kernel/backend trait 和首次 iteration 记录。
+- [x] 删除 `non_finite_loss_steps` 的累加路径。
+- [x] 运行 loss/trainer tests，提交 `fix(rustgs): mark non-finite loss before state mutation`。
 
 ## Task 1.4：Topology 与 Adam 消费同一个 mutation gate
 

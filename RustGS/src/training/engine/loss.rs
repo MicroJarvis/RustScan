@@ -284,9 +284,93 @@ pub mod dynamic_mask_host {
     }
 }
 
+use burn::tensor::Int;
+use burn_cubecl::cubecl::{prelude::KernelId, server::KernelArguments, CubeCount};
+use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElement, IntElement};
+use burn_wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime};
+use bytemuck::{Pod, Zeroable};
+
+const MARK_NON_FINITE_SHADER: &str = include_str!("../shaders/mark_non_finite_loss.wgsl");
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MarkNonFiniteParams {
+    iteration: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct MarkNonFiniteRaw;
+impl MarkNonFiniteRaw {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(MARK_NON_FINITE_SHADER)
+    }
+}
+
+#[derive(Debug)]
+struct MarkNonFiniteKernel;
+impl KernelSource for MarkNonFiniteKernel {
+    fn source(&self) -> SourceTemplate {
+        MarkNonFiniteRaw.source()
+    }
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+pub(crate) trait LossStatusBackend: Backend {
+    fn mark_non_finite_loss(
+        loss: Self::FloatTensorPrimitive,
+        status: Self::IntTensorPrimitive,
+        iteration: u32,
+    );
+}
+
+impl<F, I, BT> LossStatusBackend for CubeBackend<WgpuRuntime, F, I, BT>
+where
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    fn mark_non_finite_loss(
+        loss: Self::FloatTensorPrimitive,
+        status: Self::IntTensorPrimitive,
+        iteration: u32,
+    ) {
+        let loss = into_contiguous(loss);
+        let status = into_contiguous(status);
+        let params = MarkNonFiniteParams {
+            iteration,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let params_handle = loss.client.create_from_slice(bytemuck::bytes_of(&params));
+        loss.client.launch(
+            Box::new(SourceKernel::new(MarkNonFiniteKernel, CubeDim::new_1d(1))),
+            CubeCount::Static(1, 1, 1),
+            KernelArguments::new().with_buffers(vec![
+                loss.handle.binding(),
+                status.handle.binding(),
+                params_handle.binding(),
+            ]),
+        );
+        loss.client
+            .flush()
+            .expect("flush mark_non_finite_loss before status readback");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::dynamic_mask_host::{coupled_loss, detached_loss, mask_weight};
+    use super::LossStatusBackend;
+    use crate::training::engine::{
+        DeviceTrainingStatus, GsBackendBase, GsDevice, STATUS_NON_FINITE_LOSS,
+    };
+    use burn::prelude::*;
+    use burn::tensor::Int;
 
     #[test]
     fn coupled_dynamic_mask_can_reward_larger_residuals() {
@@ -336,5 +420,48 @@ mod tests {
     fn mask_weight_plateaus_outside_transition() {
         assert!((mask_weight(0.0, 0.05, 0.2, 0.1) - 1.0).abs() < 1e-6);
         assert!((mask_weight(0.3, 0.05, 0.2, 0.1) - 0.1).abs() < 1e-6);
+    }
+
+    async fn mark_and_read(
+        value: f32,
+        iteration: u32,
+    ) -> crate::training::engine::TrainingStatusSnapshot {
+        let device = GsDevice::default();
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        let loss = Tensor::<GsBackendBase, 1>::from_floats([value], &device);
+        GsBackendBase::mark_non_finite_loss(
+            loss.into_primitive().tensor(),
+            status.buffer().clone().into_primitive(),
+            iteration,
+        );
+        status.read().await.expect("status read")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finite_loss_does_not_set_non_finite_flag() {
+        let snap = mark_and_read(0.125, 4).await;
+        assert!(!snap.has_non_finite_loss(), "{snap:?}");
+        assert_eq!(snap.flags & STATUS_NON_FINITE_LOSS, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nan_loss_sets_sticky_non_finite_flag() {
+        let snap = mark_and_read(f32::NAN, 5).await;
+        assert!(snap.has_non_finite_loss());
+        assert_eq!(snap.first_invalid_iteration, 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pos_inf_loss_sets_sticky_non_finite_flag() {
+        let snap = mark_and_read(f32::INFINITY, 6).await;
+        assert!(snap.has_non_finite_loss());
+        assert_eq!(snap.first_invalid_iteration, 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn neg_inf_loss_sets_sticky_non_finite_flag() {
+        let snap = mark_and_read(f32::NEG_INFINITY, 7).await;
+        assert!(snap.has_non_finite_loss());
+        assert_eq!(snap.first_invalid_iteration, 7);
     }
 }

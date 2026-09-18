@@ -38,7 +38,7 @@ use crate::TrainingError;
 
 use super::backend::{GsBackendBase, GsDevice, GsDiffBackend};
 use super::device_status::{DeviceTrainingStatus, TrainingStatusSnapshot};
-use super::loss::{combined_loss_with_kernel, gaussian_kernel_1d, SsimConfig};
+use super::loss::{combined_loss_with_kernel, gaussian_kernel_1d, LossStatusBackend, SsimConfig};
 use super::optimizer::{AdamScaled, AdamScaledConfig};
 use super::splats::{
     device_splats_to_host, host_splats_to_device, try_device_splats_to_host, DeviceSplats,
@@ -683,7 +683,12 @@ impl WgpuTrainer {
             &self.ssim_config,
             self.ssim_kernel.clone(),
         );
-        self.note_non_finite_loss(&loss);
+        // Mark sticky non-finite on device before backward / mutation.
+        GsBackendBase::mark_non_finite_loss(
+            loss.clone().inner().into_primitive().tensor(),
+            self.device_status.buffer().clone().into_primitive(),
+            iteration as u32,
+        );
         let loss_for_read = read_loss.then(|| loss.clone());
         let mut grads = loss.backward();
 
@@ -892,7 +897,7 @@ impl WgpuTrainer {
             .optimization_samples
             .loss_value_readbacks
             .saturating_add(1);
-        if self.device_status.non_finite_loss_seen().await? || !loss_value.is_finite() {
+        if self.device_status.host_snapshot().has_non_finite_loss() || !loss_value.is_finite() {
             let first = if self.device_status.host_snapshot().has_non_finite_loss() {
                 self.device_status.host_snapshot().first_invalid_iteration
             } else {
@@ -1090,11 +1095,6 @@ impl WgpuTrainer {
         let capacity = self.intersection_capacity.max(planned).min(hard);
         self.intersection_capacity = capacity;
         capacity
-    }
-
-    fn note_non_finite_loss(&mut self, loss: &Tensor<GsDiffBackend, 1>) {
-        let bad = loss.clone().inner().is_finite().bool_not().int();
-        self.device_status.note_non_finite_loss_device(bad);
     }
 
     async fn ensure_forward_capacity_before_update(
