@@ -39,8 +39,10 @@ pub(crate) trait ProjectVisibleBackend: Backend {
         sh_coeffs: Self::FloatTensorPrimitive,
         raw_opacities: Self::FloatTensorPrimitive,
         global_from_compact_gid: Self::IntTensorPrimitive,
+        logical_visible: Self::IntTensorPrimitive,
         uniforms: ProjectUniforms,
-        num_visible: usize,
+        allocation: usize,
+        dispatch: CubeCount,
     ) -> Self::FloatTensorPrimitive;
 }
 
@@ -55,26 +57,29 @@ where
         sh_coeffs: Self::FloatTensorPrimitive,
         raw_opacities: Self::FloatTensorPrimitive,
         global_from_compact_gid: Self::IntTensorPrimitive,
+        logical_visible: Self::IntTensorPrimitive,
         uniforms: ProjectUniforms,
-        num_visible: usize,
+        allocation: usize,
+        dispatch: CubeCount,
     ) -> Self::FloatTensorPrimitive {
         let transforms = into_contiguous(transforms);
         let sh_coeffs = into_contiguous(sh_coeffs);
         let raw_opacities = into_contiguous(raw_opacities);
         let global_from_compact_gid = into_contiguous(global_from_compact_gid);
+        let logical_visible = into_contiguous(logical_visible);
         let device = transforms.device.clone();
         let client = transforms.client.clone();
 
-        let projected = Tensor::<Self, 2>::zeros([num_visible, 10], &device);
+        let projected = Tensor::<Self, 2>::zeros([allocation, 10], &device);
 
-        if num_visible > 0 {
+        if allocation > 0 && !dispatch.is_empty() {
             let uniforms_handle = client.create_from_slice(bytemuck::bytes_of(&uniforms));
             client.launch(
                 Box::new(SourceKernel::new(
                     ProjectVisibleKernel,
                     CubeDim::new_1d(WORKGROUP_SIZE),
                 )),
-                CubeCount::Static((num_visible as u32).div_ceil(WORKGROUP_SIZE), 1, 1),
+                dispatch,
                 KernelArguments::new().with_buffers(vec![
                     transforms.handle.binding(),
                     sh_coeffs.handle.binding(),
@@ -82,6 +87,7 @@ where
                     global_from_compact_gid.handle.binding(),
                     projected.clone().into_primitive().tensor().handle.binding(),
                     uniforms_handle.binding(),
+                    logical_visible.handle.binding(),
                 ]),
             );
         }
@@ -91,11 +97,14 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn project_visible<B: ProjectVisibleBackend>(
     splats: &DeviceSplats<B>,
     active_sh_degree: u32,
     global_from_compact_gid: &Tensor<B, 1, Int>,
-    num_visible: usize,
+    logical_visible: &Tensor<B, 1, Int>,
+    allocation: usize,
+    dispatch: CubeCount,
     camera: &GaussianCamera,
     img_size: (u32, u32),
     _device: &B::Device,
@@ -109,7 +118,7 @@ pub(crate) fn project_visible<B: ProjectVisibleBackend>(
         active_sh_degree,
         splats.sh_degree,
         splats.num_splats() as u32,
-        num_visible as u32,
+        allocation as u32,
         cov_blur,
     );
 
@@ -118,7 +127,9 @@ pub(crate) fn project_visible<B: ProjectVisibleBackend>(
         splats.sh_coeffs.val().into_primitive().tensor(),
         splats.raw_opacities.val().into_primitive().tensor(),
         global_from_compact_gid.clone().into_primitive(),
+        logical_visible.clone().into_primitive(),
         uniforms,
-        num_visible,
+        allocation,
+        dispatch,
     )))
 }

@@ -83,6 +83,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (params.use_actual_visibility != 0u) {
         visible_observations[idx] += visible_value;
     } else {
+        // Only diagnostic paths that opt out of prune-mode visibility should
+        // count every splat as observed. Default Weight/Threshold do not.
         visible_observations[idx] += 1.0;
     }
 }

@@ -1,4 +1,6 @@
-use super::metrics::{ParityLossCurveSample, ParityLossTerms, ParityTopologyMetrics};
+use super::metrics::{
+    ForwardCapacityTelemetry, ParityLossCurveSample, ParityLossTerms, ParityTopologyMetrics,
+};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -23,6 +25,13 @@ pub struct LiteGsTrainingTelemetry {
     pub depth_grad_scale: Option<f32>,
     pub rotation_frozen: bool,
     pub learning_rates: LiteGsOptimizerLrs,
+    pub forward_capacity: Option<ForwardCapacityTelemetry>,
+    pub radix_dispatch_count_p50: Option<usize>,
+    pub radix_dispatch_count_p95: Option<usize>,
+    pub scan_dispatch_count_p50: Option<usize>,
+    pub scan_dispatch_count_p95: Option<usize>,
+    pub sort_workspace_bytes: Option<usize>,
+    pub scan_workspace_bytes: Option<usize>,
 }
 
 static LAST_TRAINING_TELEMETRY: OnceLock<Mutex<Option<LiteGsTrainingTelemetry>>> = OnceLock::new();

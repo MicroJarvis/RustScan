@@ -10,16 +10,21 @@ use crate::core::GaussianCamera;
 use crate::training::engine::DeviceSplats;
 use crate::training::gpu_primitives::{prefix_sum::PrefixSumBackend, radix_sort::RadixSortBackend};
 
+pub mod dispatch;
 pub mod project_visible;
 pub mod projection;
 pub mod rasterize;
 pub mod sorting;
 pub mod tile_mapping;
 
+pub(crate) use dispatch::{
+    hard_intersection_capacity, planned_intersection_capacity, CountPolicy,
+};
 pub(crate) use project_visible::project_visible;
 pub(crate) use projection::project_forward;
 pub(crate) use rasterize::rasterize;
 pub(crate) use sorting::sort_by_depth;
+pub(crate) use sorting::sort_by_depth_counted;
 pub(crate) use tile_mapping::{get_tile_offsets, tile_mapping};
 
 pub(crate) const TILE_WIDTH: u32 = 16;
@@ -162,6 +167,11 @@ pub(crate) struct RenderOutput<B: Backend> {
     pub global_from_compact_gid: Tensor<B, 1, Int>,
     pub compact_gid_from_isect: Tensor<B, 1, Int>,
     pub tile_offsets: Tensor<B, 1, Int>,
+    pub logical_visible: Tensor<B, 1, Int>,
+    pub visible_dispatch: Tensor<B, 1, Int>,
+    pub intersection_overflow: Tensor<B, 1, Int>,
+    pub requested_intersections: Tensor<B, 1, Int>,
+    pub intersection_capacity: usize,
     pub num_visible: usize,
 }
 
@@ -180,7 +190,8 @@ where
         + tile_mapping::TileMappingBackend
         + rasterize::RasterizeBackend
         + PrefixSumBackend
-        + RadixSortBackend,
+        + RadixSortBackend
+        + dispatch::WriteDispatchBackend,
 {
     render_forward_with_active_sh(
         splats,
@@ -190,6 +201,7 @@ where
         background,
         device,
         cov_blur,
+        CountPolicy::Exact,
     )
     .await
 }
@@ -202,6 +214,7 @@ pub(crate) async fn render_forward_with_active_sh<B>(
     background: [f32; 3],
     device: &B::Device,
     cov_blur: f32,
+    count_policy: CountPolicy,
 ) -> RenderOutput<B>
 where
     B: projection::ProjectionBackend
@@ -210,7 +223,8 @@ where
         + tile_mapping::TileMappingBackend
         + rasterize::RasterizeBackend
         + PrefixSumBackend
-        + RadixSortBackend,
+        + RadixSortBackend
+        + dispatch::WriteDispatchBackend,
 {
     let active_sh_degree = active_sh_degree.min(splats.sh_degree);
     let proj_out = project_forward(splats, active_sh_degree, camera, img_size, device, cov_blur);
@@ -221,13 +235,59 @@ where
         num_visible_buf,
         num_intersections_buf,
     } = proj_out;
-    // This is the remaining CPU/GPU sync in the canonical forward path. The counts
-    // choose dynamic buffer sizes for sorting, tile mapping, and rasterization.
-    let counts = sync_projection_counts_from_gpu(num_visible_buf, num_intersections_buf).await;
     let tile_bounds = calc_tile_bounds(img_size);
     let num_tiles = tile_bounds.0 * tile_bounds.1;
+    let bounds = match count_policy {
+        CountPolicy::Exact => {
+            // Eval and viewport still read the exact counts. Training must not.
+            let counts =
+                sync_projection_counts_from_gpu(num_visible_buf, num_intersections_buf).await;
+            ResolvedForwardBounds {
+                logical_visible: dispatch::host_count_tensor(counts.visible, device),
+                logical_intersections: dispatch::host_count_tensor(counts.intersections, device),
+                requested_intersections: dispatch::host_count_tensor(counts.intersections, device),
+                visible_dispatch: dispatch::host_dispatch_tensor(counts.visible, device),
+                intersection_dispatch: dispatch::host_dispatch_tensor(
+                    counts.intersections,
+                    device,
+                ),
+                overflow: dispatch::host_count_tensor(0, device),
+                capacity: counts.intersections.max(1),
+                visible: counts.visible,
+                intersections: counts.intersections,
+                device_counted: false,
+            }
+        }
+        CountPolicy::Bounded {
+            intersection_capacity,
+        } => {
+            debug_assert!(
+                !CountPolicy::Bounded {
+                    intersection_capacity
+                }
+                .allows_count_readback()
+            );
+            let prepared = B::write_forward_dispatch(
+                num_visible_buf.into_primitive(),
+                num_intersections_buf.into_primitive(),
+                intersection_capacity,
+            );
+            ResolvedForwardBounds {
+                logical_visible: prepared.logical_visible,
+                logical_intersections: prepared.logical_intersections,
+                requested_intersections: prepared.requested_intersections,
+                visible_dispatch: prepared.visible_dispatch,
+                intersection_dispatch: prepared.intersection_dispatch,
+                overflow: prepared.overflow,
+                capacity: prepared.capacity,
+                visible: splats.num_splats(),
+                intersections: intersection_capacity,
+                device_counted: true,
+            }
+        }
+    };
 
-    if counts.visible == 0 {
+    if !bounds.device_counted && bounds.visible == 0 {
         let empty_indices = Tensor::<B, 1, Int>::zeros([0], device);
         let projected_splats = Tensor::<B, 2>::zeros([0, 10], device);
         let tile_offsets = Tensor::<B, 1, Int>::zeros([2 * num_tiles as usize], device);
@@ -251,27 +311,47 @@ where
             global_from_compact_gid: empty_indices.clone(),
             compact_gid_from_isect: empty_indices,
             tile_offsets,
-            num_visible: counts.visible,
+            logical_visible: bounds.logical_visible,
+            visible_dispatch: bounds.visible_dispatch,
+            intersection_overflow: bounds.overflow,
+            requested_intersections: bounds.requested_intersections.clone(),
+            intersection_capacity: bounds.capacity,
+            num_visible: 0,
         };
     }
 
-    let global_from_compact_gid =
-        sort_by_depth(depths, global_from_presort_gid, counts.visible, device);
+    let global_from_compact_gid = if bounds.device_counted {
+        sort_by_depth_counted(
+            depths,
+            global_from_presort_gid,
+            &bounds.logical_visible,
+            &bounds.visible_dispatch,
+            splats.num_splats() as i32,
+        )
+    } else {
+        sort_by_depth(depths, global_from_presort_gid, bounds.visible, device)
+    };
 
     let compact_intersect_counts = intersect_counts.gather(0, global_from_compact_gid.clone());
-
+    let projected_allocation = if bounds.device_counted {
+        splats.num_splats()
+    } else {
+        bounds.visible
+    };
     let projected_splats = project_visible(
         splats,
         active_sh_degree,
         &global_from_compact_gid,
-        counts.visible,
+        &bounds.logical_visible,
+        projected_allocation,
+        bounds.visible_cube_count(),
         camera,
         img_size,
         device,
         cov_blur,
     );
 
-    if counts.intersections == 0 {
+    if !bounds.device_counted && bounds.intersections == 0 {
         let compact_gid_from_isect = Tensor::<B, 1, Int>::zeros([0], device);
         let tile_offsets = Tensor::<B, 1, Int>::zeros([2 * num_tiles as usize], device);
         let raster_out = rasterize(
@@ -294,28 +374,63 @@ where
             global_from_compact_gid,
             compact_gid_from_isect,
             tile_offsets,
-            num_visible: counts.visible,
+            logical_visible: bounds.logical_visible,
+            visible_dispatch: bounds.visible_dispatch,
+            intersection_overflow: bounds.overflow,
+            requested_intersections: bounds.requested_intersections.clone(),
+            intersection_capacity: bounds.capacity,
+            num_visible: bounds.visible,
         };
     }
 
     let tile_out = tile_mapping(
         &projected_splats,
         compact_intersect_counts,
-        counts.intersections,
+        &bounds.logical_visible,
+        bounds.intersections,
         num_tiles,
         tile_bounds,
+        bounds.visible_cube_count(),
         device,
     );
+    let (tile_id_from_isect, compact_gid_from_isect) = if bounds.device_counted {
+        let (keys, values) = B::radix_sort_counted_primitive(
+            tile_out.tile_id_from_isect.into_primitive(),
+            tile_out.compact_gid_from_isect.into_primitive(),
+            bounds.logical_intersections.clone().into_primitive(),
+            bounds.intersection_dispatch.clone().into_primitive(),
+            0,
+        )
+        .expect("counted tile sort");
+        (
+            Tensor::from_primitive(keys),
+            Tensor::from_primitive(values),
+        )
+    } else if bounds.intersections > 1 && num_tiles > 1 {
+        let (keys, values) = B::radix_sort_by_key_u32_primitive(
+            tile_out.tile_id_from_isect.into_primitive(),
+            tile_out.compact_gid_from_isect.into_primitive(),
+        )
+        .expect("tile sort");
+        (
+            Tensor::from_primitive(keys),
+            Tensor::from_primitive(values),
+        )
+    } else {
+        (tile_out.tile_id_from_isect, tile_out.compact_gid_from_isect)
+    };
 
     let tile_offsets = get_tile_offsets(
-        tile_out.tile_id_from_isect.clone(),
-        counts.intersections,
+        tile_id_from_isect,
+        &bounds.logical_intersections,
+        bounds.intersections,
         tile_bounds,
+        bounds.intersection_cube_count(),
         device,
     );
 
     let raster_out = rasterize(
-        &tile_out.compact_gid_from_isect,
+        &compact_gid_from_isect,
         &tile_offsets,
         &projected_splats,
         &global_from_compact_gid,
@@ -332,8 +447,48 @@ where
         visible: raster_out.visible,
         projected_splats,
         global_from_compact_gid,
-        compact_gid_from_isect: tile_out.compact_gid_from_isect,
+        compact_gid_from_isect,
         tile_offsets,
-        num_visible: counts.visible,
+        logical_visible: bounds.logical_visible,
+        visible_dispatch: bounds.visible_dispatch,
+        intersection_overflow: bounds.overflow,
+        requested_intersections: bounds.requested_intersections,
+        intersection_capacity: bounds.capacity,
+        num_visible: if bounds.device_counted {
+            projected_allocation
+        } else {
+            bounds.visible
+        },
+    }
+}
+
+struct ResolvedForwardBounds<B: Backend> {
+    logical_visible: Tensor<B, 1, Int>,
+    logical_intersections: Tensor<B, 1, Int>,
+    requested_intersections: Tensor<B, 1, Int>,
+    visible_dispatch: Tensor<B, 1, Int>,
+    intersection_dispatch: Tensor<B, 1, Int>,
+    overflow: Tensor<B, 1, Int>,
+    capacity: usize,
+    visible: usize,
+    intersections: usize,
+    device_counted: bool,
+}
+
+impl<B: dispatch::WriteDispatchBackend> ResolvedForwardBounds<B> {
+    fn visible_cube_count(&self) -> burn_cubecl::cubecl::CubeCount {
+        if self.device_counted {
+            B::indirect_dispatch(&self.visible_dispatch)
+        } else {
+            dispatch::static_dispatch(self.visible)
+        }
+    }
+
+    fn intersection_cube_count(&self) -> burn_cubecl::cubecl::CubeCount {
+        if self.device_counted {
+            B::indirect_dispatch(&self.intersection_dispatch)
+        } else {
+            dispatch::static_dispatch(self.intersections)
+        }
     }
 }

@@ -47,7 +47,9 @@ pub(crate) trait ProjectBwdBackend: Backend {
         global_from_compact_gid: Self::IntTensorPrimitive,
         v_splats: Self::FloatTensorPrimitive,
         screen_grad_splats: Self::FloatTensorPrimitive,
+        logical_visible: Self::IntTensorPrimitive,
         uniforms: ProjectUniforms,
+        dispatch: CubeCount,
     ) -> ProjectBwdPrimitiveOutput<Self>;
 }
 
@@ -68,7 +70,9 @@ where
         global_from_compact_gid: Self::IntTensorPrimitive,
         v_splats: Self::FloatTensorPrimitive,
         screen_grad_splats: Self::FloatTensorPrimitive,
+        logical_visible: Self::IntTensorPrimitive,
         uniforms: ProjectUniforms,
+        dispatch: CubeCount,
     ) -> ProjectBwdPrimitiveOutput<Self> {
         let params = into_contiguous(params);
         let global_from_compact_gid = into_contiguous(global_from_compact_gid);
@@ -77,6 +81,7 @@ where
         // drop out-of-band writes from the rasterize backward kernel.
         let v_splats = v_splats;
         let screen_grad_splats = screen_grad_splats;
+        let logical_visible = into_contiguous(logical_visible);
         let device = params.device.clone();
         let client = params.client.clone();
 
@@ -87,14 +92,14 @@ where
         let v_sh_coeffs = Tensor::<Self, 3>::zeros([num_splats, num_coeffs, 3], &device);
         let screen_grad_stats = Tensor::<Self, 2>::zeros([num_splats, 7], &device);
 
-        if uniforms.num_visible > 0 {
+        if !dispatch.is_empty() {
             let uniforms_handle = client.create_from_slice(bytemuck::bytes_of(&uniforms));
             client.launch(
                 Box::new(SourceKernel::new(
                     ProjectBwdKernel,
                     CubeDim::new_1d(WORKGROUP_SIZE),
                 )),
-                CubeCount::Static(uniforms.num_visible.div_ceil(WORKGROUP_SIZE), 1, 1),
+                dispatch,
                 KernelArguments::new().with_buffers(vec![
                     params.handle.binding(),
                     global_from_compact_gid.handle.binding(),
@@ -114,6 +119,7 @@ where
                         .tensor()
                         .handle
                         .binding(),
+                    logical_visible.handle.binding(),
                 ]),
             );
         }
@@ -131,8 +137,10 @@ pub(crate) fn project_bwd<B: ProjectBwdBackend>(
     splats: &DeviceSplats<B>,
     active_sh_degree: u32,
     global_from_compact_gid: Tensor<B, 1, Int>,
+    logical_visible: Tensor<B, 1, Int>,
     v_splats: Tensor<B, 2>,
     screen_grad_splats: Tensor<B, 2>,
+    dispatch: CubeCount,
     camera: &GaussianCamera,
     img_size: (u32, u32),
     num_visible: usize,
@@ -162,7 +170,9 @@ pub(crate) fn project_bwd<B: ProjectBwdBackend>(
         global_from_compact_gid.into_primitive(),
         v_splats.into_primitive().tensor(),
         screen_grad_splats.into_primitive().tensor(),
+        logical_visible.into_primitive(),
         uniforms,
+        dispatch,
     );
     let v_params = Tensor::from_primitive(TensorPrimitive::Float(bwd.v_params));
     let num_splats = splats.num_splats();

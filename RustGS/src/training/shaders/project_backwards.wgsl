@@ -8,11 +8,12 @@
 @group(0) @binding(5) var<storage, read> uniforms: helpers::ProjectUniforms;
 @group(0) @binding(6) var<storage, read> screen_grad_splats: array<f32>;
 @group(0) @binding(7) var<storage, read_write> screen_grad_stats: array<f32>;
+@group(0) @binding(8) var<storage, read> logical_visible: array<u32>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let compact_gid = gid.x;
-    if compact_gid >= uniforms.num_visible {
+    if compact_gid >= logical_visible[0] {
         return;
     }
 

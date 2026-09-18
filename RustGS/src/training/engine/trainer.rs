@@ -48,6 +48,8 @@ pub(crate) struct TrainingIterationMetrics {
     pub iteration: usize,
     pub loss: f32,
     pub gaussian_count: usize,
+    pub loop_duration: Duration,
+    pub loss_readback: bool,
 }
 
 fn validate_loss_value(loss: f32, iteration: usize) -> Result<f32, TrainingError> {
@@ -60,16 +62,35 @@ fn validate_loss_value(loss: f32, iteration: usize) -> Result<f32, TrainingError
     }
 }
 
+pub(crate) const LOSS_SCALAR_READBACK_INTERVAL: usize = 20;
+
+pub(crate) fn should_read_loss(
+    iteration: usize,
+    total_iterations: usize,
+    cadence: usize,
+    checkpoint_due: bool,
+    paused: bool,
+) -> bool {
+    let cadence = cadence.max(1);
+    checkpoint_due
+        || paused
+        || iteration == 1
+        || iteration >= total_iterations.max(1)
+        || iteration.is_multiple_of(cadence)
+}
+
 fn record_completed_step(
     report: &mut WgpuTrainingReport,
     iteration: usize,
     gaussian_count: usize,
-    loss: f32,
+    loss: Option<f32>,
 ) {
     report.completed_iterations = iteration;
     report.final_gaussian_count = gaussian_count;
-    report.final_loss = Some(loss);
-    report.final_step_loss = Some(loss);
+    if let Some(loss) = loss {
+        report.final_loss = Some(loss);
+        report.final_step_loss = Some(loss);
+    }
 }
 
 pub(crate) trait TrainingLoopObserver {
@@ -149,6 +170,8 @@ pub struct WgpuTrainer {
     telemetry: LiteGsTrainingTelemetry,
     position_lr_scene_scale: f32,
     optimizer_lr_state: Option<OptimizerLrState>,
+    intersection_capacity: usize,
+    non_finite_loss_steps: Option<Tensor<GsBackendBase, 1, Int>>,
 }
 
 #[derive(Clone)]
@@ -272,6 +295,8 @@ impl WgpuTrainer {
             telemetry,
             position_lr_scene_scale,
             optimizer_lr_state: None,
+            intersection_capacity: 0,
+            non_finite_loss_steps: None,
         }
     }
 
@@ -484,7 +509,8 @@ impl WgpuTrainer {
         iteration: usize,
         frame_count: usize,
         collect_topology_stats: bool,
-    ) -> Result<f32, TrainingError> {
+        read_loss: bool,
+    ) -> Result<Option<f32>, TrainingError> {
         let profile_step = log::log_enabled!(log::Level::Debug)
             && (iteration <= 3 || iteration.is_multiple_of(100));
         let step_started_at = Instant::now();
@@ -501,6 +527,7 @@ impl WgpuTrainer {
             (width as u32, height as u32),
             background,
             self.raster_cov_blur_at(iteration, frame_count),
+            self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32)),
         )
         .await;
         let forward_elapsed = if profile_step {
@@ -533,13 +560,8 @@ impl WgpuTrainer {
             &self.ssim_config,
             self.ssim_kernel.clone(),
         );
-        let loss_sync_started_at = Instant::now();
-        let loss_value =
-            loss.clone().into_scalar_async().await.map_err(|err| {
-                TrainingError::TrainingFailed(format!("failed to read loss: {err}"))
-            })?;
-        let loss_value = validate_loss_value(loss_value, iteration)?;
-        let loss_elapsed = loss_sync_started_at.elapsed();
+        self.note_non_finite_loss(&loss);
+        let loss_for_read = read_loss.then(|| loss.clone());
         let mut grads = loss.backward();
 
         let transforms_grad = splats
@@ -647,7 +669,7 @@ impl WgpuTrainer {
                 iteration,
                 target_ready_elapsed.as_secs_f64() * 1000.0,
                 forward_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
-                loss_elapsed.as_secs_f64() * 1000.0,
+                0.0,
                 backward_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
                 optimizer_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
                 step_started_at.elapsed().as_secs_f64() * 1000.0,
@@ -716,7 +738,37 @@ impl WgpuTrainer {
                 .await;
         }
 
-        Ok(loss_value)
+        if !read_loss {
+            return Ok(None);
+        }
+
+        let capacity_telemetry = self
+            .sample_forward_capacity(
+                &rendered.logical_visible,
+                &rendered.requested_intersections,
+                &rendered.intersection_overflow,
+                rendered.intersection_capacity,
+            )
+            .await?;
+        if capacity_telemetry.overflowed {
+            return Err(TrainingError::ForwardCapacityExceeded {
+                logical_intersections: capacity_telemetry.logical_intersections,
+                capacity: capacity_telemetry.capacity,
+            });
+        }
+        let loss_value = loss_for_read
+            .expect("loss retained for scalar readback")
+            .into_scalar_async()
+            .await
+            .map_err(|err| {
+                TrainingError::TrainingFailed(format!("failed to read loss: {err}"))
+            })?;
+        if self.non_finite_loss_seen().await? || !loss_value.is_finite() {
+            return Err(TrainingError::TrainingFailed(format!(
+                "non-finite loss {loss_value} at iteration {iteration}"
+            )));
+        }
+        Ok(Some(validate_loss_value(loss_value, iteration)?))
     }
 
     pub(crate) async fn train_with_frame_loader(
@@ -751,6 +803,7 @@ impl WgpuTrainer {
         let mut target_tensor_lru = VecDeque::<usize>::new();
         let target_tensor_cache_capacity = self.config.data.frame_cache_capacity.max(1);
         let training_loop_started_at = Instant::now();
+        let mut last_sampled_loss = 0.0;
 
         for zero_based in start_iteration..num_iterations {
             if observer.should_cancel() {
@@ -787,10 +840,19 @@ impl WgpuTrainer {
             };
 
             let iteration_idx = zero_based + 1;
+            let step_started_at = Instant::now();
             let emit_progress = observer.should_emit_progress(iteration_idx);
             let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
             let should_log_step = iteration_idx.is_multiple_of(100)
                 || (start_iteration > 0 && zero_based == start_iteration);
+            let checkpoint_due = observer.checkpoint_reason(iteration_idx).is_some();
+            let read_loss = should_read_loss(
+                iteration_idx,
+                num_iterations,
+                LOSS_SCALAR_READBACK_INTERVAL,
+                checkpoint_due,
+                observer.should_pause(),
+            ) || should_log_step;
             let loss = self
                 .train_step(
                     splats,
@@ -800,19 +862,33 @@ impl WgpuTrainer {
                     iteration_idx,
                     cameras.len(),
                     collect_topology_stats,
+                    read_loss,
                 )
                 .await?;
-            record_completed_step(&mut report, iteration_idx, splats.num_splats(), loss);
-            self.record_loss_sample(
+            let loop_duration = step_started_at.elapsed();
+            if let Some(loss) = loss {
+                last_sampled_loss = loss;
+            }
+            record_completed_step(
+                &mut report,
                 iteration_idx,
-                frame_idx,
+                splats.num_splats(),
                 loss,
-                should_log_step || iteration_idx == num_iterations,
             );
+            if let Some(loss) = loss {
+                self.record_loss_sample(
+                    iteration_idx,
+                    frame_idx,
+                    loss,
+                    should_log_step || iteration_idx == num_iterations,
+                );
+            }
             let metrics = TrainingIterationMetrics {
                 iteration: iteration_idx,
-                loss,
+                loss: last_sampled_loss,
                 gaussian_count: splats.num_splats(),
+                loop_duration,
+                loss_readback: read_loss,
             };
             if emit_progress {
                 observer.on_iteration(metrics);
@@ -825,7 +901,7 @@ impl WgpuTrainer {
                 log::info!(
                     "WGPU training step {} | loss={:.6} | splats={}",
                     iteration_idx,
-                    loss,
+                    last_sampled_loss,
                     splats.num_splats()
                 );
             }
@@ -843,7 +919,7 @@ impl WgpuTrainer {
                     )
                 })?;
                 let checkpoint = self
-                    .checkpoint(splats, identity, iteration_idx, Some(loss))
+                    .checkpoint(splats, identity, iteration_idx, Some(last_sampled_loss))
                     .await?;
                 if let Some(disposition) = complete_checkpoint_boundary(
                     observer,
@@ -863,6 +939,82 @@ impl WgpuTrainer {
         report.training_loop_elapsed = training_loop_started_at.elapsed();
         self.finish_report(&mut report);
         Ok(report)
+    }
+
+    fn intersection_capacity_for(&mut self, splat_count: usize, img_size: (u32, u32)) -> usize {
+        let tile_bounds = crate::training::forward::calc_tile_bounds(img_size);
+        let hard = crate::training::forward::hard_intersection_capacity(
+            splat_count,
+            tile_bounds.0 * tile_bounds.1,
+        );
+        let planned = crate::training::forward::planned_intersection_capacity(
+            splat_count,
+            tile_bounds.0 * tile_bounds.1,
+        );
+        let capacity = self.intersection_capacity.max(planned).min(hard);
+        self.intersection_capacity = capacity;
+        capacity
+    }
+
+    fn note_non_finite_loss(&mut self, loss: &Tensor<GsDiffBackend, 1>) {
+        let bad = loss.clone().inner().is_finite().bool_not().int();
+        self.non_finite_loss_steps = Some(match self.non_finite_loss_steps.clone() {
+            Some(accumulated) => accumulated + bad,
+            None => bad,
+        });
+    }
+
+    async fn non_finite_loss_seen(&self) -> Result<bool, TrainingError> {
+        let Some(flag) = self.non_finite_loss_steps.clone() else {
+            return Ok(false);
+        };
+        let value = flag.into_scalar_async().await.map_err(|err| {
+            TrainingError::TrainingFailed(format!("failed to read loss finite flag: {err}"))
+        })?;
+        Ok(value != 0)
+    }
+
+    async fn sample_forward_capacity(
+        &mut self,
+        logical_visible: &Tensor<GsDiffBackend, 1, Int>,
+        requested: &Tensor<GsDiffBackend, 1, Int>,
+        overflow: &Tensor<GsDiffBackend, 1, Int>,
+        capacity: usize,
+    ) -> Result<crate::training::reporting::metrics::ForwardCapacityTelemetry, TrainingError> {
+        let visible_value = logical_visible
+            .clone()
+            .inner()
+            .into_scalar_async()
+            .await
+            .map_err(|err| {
+                TrainingError::TrainingFailed(format!("failed to read logical visible: {err}"))
+            })?;
+        let requested_value = requested
+            .clone()
+            .inner()
+            .into_scalar_async()
+            .await
+            .map_err(|err| {
+                TrainingError::TrainingFailed(format!(
+                    "failed to read requested intersections: {err}"
+                ))
+            })?;
+        let overflow_value = overflow
+            .clone()
+            .inner()
+            .into_scalar_async()
+            .await
+            .map_err(|err| {
+                TrainingError::TrainingFailed(format!("failed to read intersection overflow: {err}"))
+            })?;
+        let telemetry = crate::training::reporting::metrics::ForwardCapacityTelemetry {
+            logical_visible: visible_value.max(0) as u32,
+            logical_intersections: requested_value.max(0) as u32,
+            capacity: capacity as u32,
+            overflowed: overflow_value != 0 || (requested_value as usize) > capacity,
+        };
+        self.telemetry.forward_capacity = Some(telemetry);
+        Ok(telemetry)
     }
 
     fn should_apply_topology(&self, iteration: usize, frame_count: usize) -> bool {
@@ -917,9 +1069,14 @@ impl WgpuTrainer {
     }
 
     fn uses_visibility_pruning(&self) -> bool {
+        // Weight used to force visible_observations += 1, so history-invisible
+        // pruning could never see a zero count. All prune modes now accumulate
+        // the rasterizer visibility bit.
         matches!(
             self.config.litegs.pruning.prune_mode,
             LiteGsPruneMode::Threshold
+                | LiteGsPruneMode::Weight
+                | LiteGsPruneMode::VisibilityWeight
         )
     }
 
@@ -1038,18 +1195,40 @@ impl WgpuTrainer {
             self.telemetry.topology.topology_step_samples.push(sample);
         }
         apply_topology_metrics_delta(&mut self.telemetry.topology, plan.aftermath.metrics_delta);
+        self.telemetry.topology.scheduled_steps =
+            self.telemetry.topology.scheduled_steps.saturating_add(1);
         if plan.mutates_splats() {
             apply_mutations(splats, &snapshot.splats, &plan, &self.device);
             self.remap_topology_visibility_state(&plan, iteration);
         }
         if plan.aftermath.requires_adam_rebuild || plan.aftermath.apply_opacity_reset {
-            self.optimizer.reset();
+            let sh_dims = splats.sh_coeffs.val().dims();
+            self.optimizer.remap_origins(
+                &plan.origins(),
+                sh_dims[1],
+                sh_dims.get(2).copied().unwrap_or(3),
+                &self.device,
+            );
         }
-        self.reset_accumulators(
-            splats.num_splats(),
-            splats.sh_coeffs.val().dims()[1],
-            iteration,
-        );
+        if plan.should_retain_accumulators() {
+            self.telemetry.topology.skipped_no_eligible_candidates = self
+                .telemetry
+                .topology
+                .skipped_no_eligible_candidates
+                .saturating_add(1);
+            log::info!(
+                "Topology step {} retained accumulators: no eligible candidates",
+                iteration
+            );
+        } else {
+            self.telemetry.topology.accumulator_resets =
+                self.telemetry.topology.accumulator_resets.saturating_add(1);
+            self.reset_accumulators(
+                splats.num_splats(),
+                splats.sh_coeffs.val().dims()[1],
+                iteration,
+            );
+        }
     }
 
     fn reset_accumulators(&mut self, num_splats: usize, sh_coeffs: usize, iteration: usize) {
@@ -1242,6 +1421,17 @@ mod tests {
     use crate::training::{TensorCheckpoint, TrainingCheckpoint, TrainingIdentity};
     use burn::module::Param;
 
+    #[test]
+    fn loss_scalar_readback_is_not_every_step() {
+        assert!(should_read_loss(1, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
+        assert!(!should_read_loss(2, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
+        assert!(should_read_loss(20, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
+        assert!(should_read_loss(19, 3_000, LOSS_SCALAR_READBACK_INTERVAL, true, false));
+        assert!(should_read_loss(19, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, true));
+        assert!(should_read_loss(3_000, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
+        assert!(!should_read_loss(2_999, 3_000, LOSS_SCALAR_READBACK_INTERVAL, false, false));
+    }
+
     const CHECKPOINT_ITERATIONS: usize = 8;
 
     fn trainer_checkpoint_config() -> TrainingConfig {
@@ -1379,8 +1569,8 @@ mod tests {
     #[test]
     fn completed_step_always_replaces_reported_final_loss() {
         let mut report = WgpuTrainingReport::default();
-        record_completed_step(&mut report, 1, 10, 0.5);
-        record_completed_step(&mut report, 2, 11, 0.25);
+        record_completed_step(&mut report, 1, 10, Some(0.5));
+        record_completed_step(&mut report, 2, 11, Some(0.25));
         assert_eq!(report.final_loss, Some(0.25));
         assert_eq!(report.final_step_loss, Some(0.25));
         assert_eq!(report.completed_iterations, 2);

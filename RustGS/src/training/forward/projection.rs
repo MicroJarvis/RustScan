@@ -66,9 +66,10 @@ where
         let client = transforms.client.clone();
         let total_splats = transforms.shape()[0];
 
-        let global_from_presort_gid = Tensor::<Self, 1, Int>::zeros([total_splats], &device);
-        let depths = Tensor::<Self, 1>::zeros([total_splats], &device);
-        let intersect_counts = Tensor::<Self, 1, Int>::zeros([total_splats], &device);
+        let global_from_presort_gid =
+            Tensor::<Self, 1, Int>::full([total_splats], total_splats as i32, &device);
+        let depths = Tensor::<Self, 1>::full([total_splats], f32::INFINITY, &device);
+        let intersect_counts = Tensor::<Self, 1, Int>::zeros([total_splats + 1], &device);
         let num_visible_buf = Tensor::<Self, 1, Int>::zeros([1], &device);
         let num_intersections_buf = Tensor::<Self, 1, Int>::zeros([1], &device);
 

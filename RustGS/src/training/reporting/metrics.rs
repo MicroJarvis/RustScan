@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ForwardCapacityTelemetry {
+    pub logical_visible: u32,
+    pub logical_intersections: u32,
+    pub capacity: u32,
+    pub overflowed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ParityLossTerms {
     pub l1: Option<f32>,
@@ -96,6 +104,15 @@ pub struct ParityTopologyMetrics {
     pub topology_step_samples: Vec<ParityTopologyStepSample>,
     pub export_outputs: usize,
     pub checkpoint_roundtrips: usize,
+    /// Scheduled topology steps, including steps that retained accumulators.
+    #[serde(default)]
+    pub scheduled_steps: usize,
+    /// Scheduled steps with no eligible candidates and no opacity reset.
+    #[serde(default)]
+    pub skipped_no_eligible_candidates: usize,
+    /// Steps that cleared topology accumulators and started a new window.
+    #[serde(default)]
+    pub accumulator_resets: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -107,4 +124,27 @@ pub struct ParityLossCurveSample {
     pub depth: Option<f32>,
     pub total: Option<f32>,
     pub depth_valid_pixels: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ForwardCapacityTelemetry;
+    use crate::TrainingError;
+
+    #[test]
+    fn overflow_telemetry_maps_to_forward_capacity_exceeded() {
+        let telemetry = ForwardCapacityTelemetry {
+            logical_visible: 128,
+            logical_intersections: 9_000,
+            capacity: 8_000,
+            overflowed: true,
+        };
+        assert!(telemetry.overflowed);
+        let err = TrainingError::ForwardCapacityExceeded {
+            logical_intersections: telemetry.logical_intersections,
+            capacity: telemetry.capacity,
+        };
+        assert!(err.to_string().contains("9000"));
+        assert!(err.to_string().contains("8000"));
+    }
 }

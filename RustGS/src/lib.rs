@@ -189,4 +189,12 @@ pub enum TrainingError {
 
     #[error("Training failed: {0}")]
     TrainingFailed(String),
+
+    #[error(
+        "forward intersection capacity exceeded: logical_intersections={logical_intersections}, capacity={capacity}"
+    )]
+    ForwardCapacityExceeded {
+        logical_intersections: u32,
+        capacity: u32,
+    },
 }

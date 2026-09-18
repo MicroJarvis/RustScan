@@ -59,3 +59,27 @@ where
 
     Tensor::from_primitive(sorted)
 }
+
+pub(crate) fn sort_by_depth_counted<B>(
+    depths: Tensor<B, 1>,
+    global_from_presort_gid: Tensor<B, 1, Int>,
+    logical_visible: &Tensor<B, 1, Int>,
+    dispatch: &Tensor<B, 1, Int>,
+    value_fill: i32,
+) -> Tensor<B, 1, Int>
+where
+    B: SortingBackend + RadixSortBackend,
+{
+    let depth_bits = Tensor::<B, 1, Int>::from_primitive(B::reinterpret_f32_as_u32_primitive(
+        depths.into_primitive().tensor(),
+    ));
+    let (_, sorted) = B::radix_sort_counted_primitive(
+        depth_bits.into_primitive(),
+        global_from_presort_gid.into_primitive(),
+        logical_visible.clone().into_primitive(),
+        dispatch.clone().into_primitive(),
+        value_fill,
+    )
+    .expect("counted depth sort");
+    Tensor::from_primitive(sorted)
+}

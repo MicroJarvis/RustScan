@@ -21,6 +21,7 @@ use crate::training::backward::{
 use crate::training::engine::{DeviceSplats, GsBackendBase, GsDiffBackend};
 use crate::training::forward::{
     self, calc_tile_bounds, project_visible, projection, rasterize, sorting, tile_mapping,
+    CountPolicy,
 };
 use crate::training::gpu_primitives::{prefix_sum::PrefixSumBackend, radix_sort::RadixSortBackend};
 
@@ -35,6 +36,7 @@ trait RenderBackend:
     + ProjectBwdBackend
     + PrefixSumBackend
     + RadixSortBackend
+    + forward::dispatch::WriteDispatchBackend
 {
 }
 
@@ -49,6 +51,7 @@ impl<T> RenderBackend for T where
         + ProjectBwdBackend
         + PrefixSumBackend
         + RadixSortBackend
+        + forward::dispatch::WriteDispatchBackend
 {
 }
 
@@ -68,6 +71,8 @@ pub(crate) struct RenderCheckpoint<B: Backend> {
     pub global_from_compact_gid: Tensor<B, 1, Int>,
     pub compact_gid_from_isect: Tensor<B, 1, Int>,
     pub tile_offsets: Tensor<B, 1, Int>,
+    pub logical_visible: Tensor<B, 1, Int>,
+    pub visible_dispatch: Tensor<B, 1, Int>,
     pub num_visible: usize,
 }
 
@@ -75,6 +80,10 @@ pub(crate) struct RenderSplatsOutput<B: Backend> {
     pub image: Tensor<B, 3>,
     pub visible: Tensor<B, 1>,
     pub screen_grad_stats: Tensor<B, 2>,
+    pub logical_visible: Tensor<B, 1, Int>,
+    pub intersection_overflow: Tensor<B, 1, Int>,
+    pub requested_intersections: Tensor<B, 1, Int>,
+    pub intersection_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -119,8 +128,12 @@ impl<B: RenderBackend> Backward<B, 4> for RenderBackward {
             &splats,
             state.active_sh_degree,
             state.global_from_compact_gid,
+            state.logical_visible,
             raster_bwd.v_splats,
             raster_bwd.screen_grad_splats,
+            <B as crate::training::forward::dispatch::WriteDispatchBackend>::indirect_dispatch(
+                &state.visible_dispatch,
+            ),
             &state.camera,
             state.img_size,
             state.num_visible,
@@ -150,6 +163,7 @@ async fn render_splats_impl<B, C>(
     img_size: (u32, u32),
     background: [f32; 3],
     cov_blur: f32,
+    intersection_capacity: usize,
 ) -> RenderSplatsOutput<Autodiff<B, C>>
 where
     B: RenderBackend,
@@ -191,6 +205,9 @@ where
         background,
         &device,
         cov_blur,
+        CountPolicy::Bounded {
+            intersection_capacity,
+        },
     )
     .await;
     let visible = Tensor::<AD<B, C>, 1>::from_inner(fwd_out.visible.clone());
@@ -224,6 +241,8 @@ where
                 global_from_compact_gid: fwd_out.global_from_compact_gid,
                 compact_gid_from_isect: fwd_out.compact_gid_from_isect,
                 tile_offsets: fwd_out.tile_offsets,
+                logical_visible: fwd_out.logical_visible.clone(),
+                visible_dispatch: fwd_out.visible_dispatch,
                 num_visible: fwd_out.num_visible,
             };
 
@@ -240,6 +259,14 @@ where
         image,
         visible,
         screen_grad_stats,
+        logical_visible: Tensor::<AD<B, C>, 1, Int>::from_inner(fwd_out.logical_visible),
+        intersection_overflow: Tensor::<AD<B, C>, 1, Int>::from_inner(
+            fwd_out.intersection_overflow,
+        ),
+        requested_intersections: Tensor::<AD<B, C>, 1, Int>::from_inner(
+            fwd_out.requested_intersections,
+        ),
+        intersection_capacity: fwd_out.intersection_capacity,
     }
 }
 
@@ -250,6 +277,7 @@ pub(crate) async fn render_splats_with_visibility_active_sh(
     img_size: (u32, u32),
     background: [f32; 3],
     cov_blur: f32,
+    intersection_capacity: usize,
 ) -> RenderSplatsOutput<GsDiffBackend> {
     render_splats_impl::<GsBackendBase, NoCheckpointing>(
         splats,
@@ -258,6 +286,7 @@ pub(crate) async fn render_splats_with_visibility_active_sh(
         img_size,
         background,
         cov_blur,
+        intersection_capacity,
     )
     .await
 }

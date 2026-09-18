@@ -63,8 +63,8 @@ pub use events::{
     TrainingSnapshotReady,
 };
 pub use reporting::metrics::{
-    ParityFloatDistribution, ParityLossCurveSample, ParityLossTerms, ParityTopologyMetrics,
-    ParityTopologyStepSample,
+    ForwardCapacityTelemetry, ParityFloatDistribution, ParityLossCurveSample, ParityLossTerms,
+    ParityTopologyMetrics, ParityTopologyStepSample,
 };
 
 pub use config::{

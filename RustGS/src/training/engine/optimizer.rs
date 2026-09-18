@@ -430,6 +430,84 @@ impl<B: Backend> AdamScaled<B> {
         state.step = 0;
     }
 
+    /// Keep surviving rows' moments and Adam step. New rows start at zero.
+    /// A full reset happens only when a moment's inner layout no longer matches.
+    pub fn remap_origins(
+        &mut self,
+        origins: &[Option<usize>],
+        sh_coeffs: usize,
+        sh_channels: usize,
+        device: &B::Device,
+    ) {
+        Self::remap_state(&mut self.transforms, origins, &[10], device);
+        Self::remap_state(
+            &mut self.sh_coeffs,
+            origins,
+            &[sh_coeffs, sh_channels],
+            device,
+        );
+        Self::remap_state(&mut self.raw_opacities, origins, &[], device);
+    }
+
+    fn remap_state<const D: usize>(
+        state: &mut AdamState<B, D>,
+        origins: &[Option<usize>],
+        inner_dims: &[usize],
+        device: &B::Device,
+    ) {
+        let Some(moment1) = state.moment1.clone() else {
+            return;
+        };
+        let dims = moment1.dims();
+        let layout_matches = dims.len() == inner_dims.len() + 1
+            && dims[1..].iter().copied().eq(inner_dims.iter().copied());
+        if !layout_matches {
+            Self::reset_state(state);
+            return;
+        }
+        state.moment1 = Some(Self::remap_moment_rows(moment1, origins, device));
+        if let Some(moment2) = state.moment2.clone() {
+            state.moment2 = Some(Self::remap_moment_rows(moment2, origins, device));
+        }
+    }
+
+    fn remap_moment_rows<const D: usize>(
+        tensor: Tensor<B, D>,
+        origins: &[Option<usize>],
+        device: &B::Device,
+    ) -> Tensor<B, D> {
+        let dims = tensor.dims();
+        let mut out_dims = dims;
+        out_dims[0] = origins.len();
+        if origins.is_empty() {
+            return Tensor::zeros(out_dims, device);
+        }
+        let row_width = dims.iter().skip(1).copied().product::<usize>().max(1);
+        let old_len = dims[0];
+        let flat = tensor.reshape([old_len, row_width]);
+        let mut index_values = Vec::with_capacity(origins.len() * row_width);
+        let mut mask_values = Vec::with_capacity(origins.len() * row_width);
+        for origin in origins {
+            let (index, keep) = match origin {
+                Some(source) if *source < old_len => (*source as i32, 1.0),
+                _ => (0, 0.0),
+            };
+            index_values.extend(std::iter::repeat_n(index, row_width));
+            mask_values.extend(std::iter::repeat_n(keep, row_width));
+        }
+        let indices = Tensor::<B, 2, Int>::from_data(
+            burn::tensor::TensorData::new(index_values, [origins.len(), row_width]),
+            device,
+        );
+        let mask = Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(mask_values, [origins.len(), row_width]),
+            device,
+        );
+        flat.gather(0, indices)
+            .mul(mask)
+            .reshape(out_dims)
+    }
+
     pub fn set_transform_scaling(&mut self, scaling: Tensor<B, 2>) {
         self.transforms.scaling = Some(scaling);
     }
@@ -926,5 +1004,50 @@ mod tests {
         assert!(!reset_state.contains("AdamState::default"));
         assert!(reset_state.contains("moment1 = None"));
         assert!(reset_state.contains("step = 0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn optimizer_remap_keeps_surviving_moments_and_step() {
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut splats = test_splats(&device);
+        // Grow to three rows so origins [Some(1), None, Some(0)] are expressible.
+        let transforms = Tensor::<GsDiffBackend, 2>::from_data(
+            TensorData::new(
+                (0..30).map(|value| value as f32 * 0.01).collect(),
+                Shape::new([3, 10]),
+            ),
+            &device,
+        );
+        let sh_coeffs = Tensor::<GsDiffBackend, 3>::from_data(
+            TensorData::new(
+                (0..36).map(|value| value as f32 * 0.005).collect(),
+                Shape::new([3, 4, 3]),
+            ),
+            &device,
+        );
+        let raw_opacities = Tensor::<GsDiffBackend, 1>::from_floats([0.1, -0.2, 0.3], &device);
+        splats.transforms = Param::from_tensor(transforms);
+        splats.sh_coeffs = Param::from_tensor(sh_coeffs);
+        splats.raw_opacities = Param::from_tensor(raw_opacities);
+
+        let mut optimizer = optimizer_with_scaling(&device);
+        for _ in 0..7 {
+            optimizer_step(&mut optimizer, &mut splats, &device);
+        }
+        let before = optimizer.checkpoint().await.expect("checkpoint before remap");
+        assert_eq!(before.transforms.step, 7);
+
+        optimizer.remap_origins(&[Some(1), None, Some(0)], 4, 3, &device);
+        let after = optimizer.checkpoint().await.expect("checkpoint after remap");
+        assert_eq!(after.transforms.step, 7);
+        assert_eq!(after.sh_coeffs.step, 7);
+        assert_eq!(after.raw_opacities.step, 7);
+
+        let before_moments = before.transforms.moment1.expect("original moment");
+        let moments = after.transforms.moment1.expect("remapped moment");
+        assert_eq!(moments.shape, vec![3, 10]);
+        assert_eq!(&moments.values[..10], &before_moments.values[10..20]);
+        assert!(moments.values[10..20].iter().all(|value| *value == 0.0));
+        assert_eq!(&moments.values[20..30], &before_moments.values[..10]);
     }
 }

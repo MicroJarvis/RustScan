@@ -1,11 +1,11 @@
 use burn::prelude::*;
-use burn::tensor::{Int, Tensor, TensorMetadata};
+use burn::tensor::{Int, Tensor};
 use burn_cubecl::cubecl::{prelude::KernelId, server::KernelArguments, CubeCount};
 use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElement, IntElement};
 use burn_wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime};
 use bytemuck::{Pod, Zeroable};
 
-use crate::training::gpu_primitives::{prefix_sum::PrefixSumBackend, radix_sort::RadixSortBackend};
+use crate::training::gpu_primitives::prefix_sum::PrefixSumBackend;
 
 use super::compose_shader;
 
@@ -83,14 +83,18 @@ pub(crate) trait TileMappingBackend: Backend {
     fn map_gaussians_to_intersects_primitive(
         projected: Self::FloatTensorPrimitive,
         cum_tiles_hit: Self::IntTensorPrimitive,
+        logical_visible: Self::IntTensorPrimitive,
         num_intersections: usize,
         uniforms: MGIUniforms,
+        dispatch: CubeCount,
     ) -> (Self::IntTensorPrimitive, Self::IntTensorPrimitive);
 
     fn get_tile_offsets_primitive(
         tile_id_from_isect: Self::IntTensorPrimitive,
+        logical_intersections: Self::IntTensorPrimitive,
         num_intersections: usize,
         tile_bounds: (u32, u32),
+        dispatch: CubeCount,
     ) -> Self::IntTensorPrimitive;
 }
 
@@ -103,26 +107,28 @@ where
     fn map_gaussians_to_intersects_primitive(
         projected: Self::FloatTensorPrimitive,
         cum_tiles_hit: Self::IntTensorPrimitive,
+        logical_visible: Self::IntTensorPrimitive,
         num_intersections: usize,
         uniforms: MGIUniforms,
+        dispatch: CubeCount,
     ) -> (Self::IntTensorPrimitive, Self::IntTensorPrimitive) {
         let projected = into_contiguous(projected);
         let cum_tiles_hit = into_contiguous(cum_tiles_hit);
+        let logical_visible = into_contiguous(logical_visible);
         let device = projected.device.clone();
         let client = projected.client.clone();
-        let num_visible = projected.shape()[0];
 
         let tile_id_from_isect = Tensor::<Self, 1, Int>::zeros([num_intersections], &device);
         let compact_gid_from_isect = Tensor::<Self, 1, Int>::zeros([num_intersections], &device);
 
-        if num_visible > 0 && num_intersections > 0 {
+        if !dispatch.is_empty() {
             let uniforms_handle = client.create_from_slice(bytemuck::bytes_of(&uniforms));
             client.launch(
                 Box::new(SourceKernel::new(
                     MapGaussiansKernel,
                     CubeDim::new_1d(WORKGROUP_SIZE),
                 )),
-                CubeCount::Static((num_visible as u32).div_ceil(WORKGROUP_SIZE), 1, 1),
+                dispatch,
                 KernelArguments::new().with_buffers(vec![
                     projected.handle.binding(),
                     cum_tiles_hit.handle.binding(),
@@ -133,6 +139,7 @@ where
                         .handle
                         .binding(),
                     uniforms_handle.binding(),
+                    logical_visible.handle.binding(),
                 ]),
             );
         }
@@ -145,16 +152,19 @@ where
 
     fn get_tile_offsets_primitive(
         tile_id_from_isect: Self::IntTensorPrimitive,
+        logical_intersections: Self::IntTensorPrimitive,
         num_intersections: usize,
         tile_bounds: (u32, u32),
+        dispatch: CubeCount,
     ) -> Self::IntTensorPrimitive {
         let tile_id_from_isect = into_contiguous(tile_id_from_isect);
+        let logical_intersections = into_contiguous(logical_intersections);
         let device = tile_id_from_isect.device.clone();
         let client = tile_id_from_isect.client.clone();
         let num_tiles = (tile_bounds.0 * tile_bounds.1) as usize;
         let tile_offsets = Tensor::<Self, 1, Int>::zeros([2 * num_tiles], &device);
 
-        if num_intersections > 0 {
+        if !dispatch.is_empty() {
             let uniforms = TileOffsetsUniforms {
                 num_intersections: num_intersections as u32,
                 num_tiles: tile_bounds.0 * tile_bounds.1,
@@ -166,11 +176,12 @@ where
                     GetTileOffsetsKernel,
                     CubeDim::new_1d(WORKGROUP_SIZE),
                 )),
-                CubeCount::Static((num_intersections as u32).div_ceil(WORKGROUP_SIZE), 1, 1),
+                dispatch,
                 KernelArguments::new().with_buffers(vec![
                     tile_id_from_isect.handle.binding(),
                     tile_offsets.clone().into_primitive().handle.binding(),
                     uniforms_handle.binding(),
+                    logical_intersections.handle.binding(),
                 ]),
             );
         }
@@ -179,40 +190,31 @@ where
     }
 }
 
-pub(crate) fn tile_mapping<B: TileMappingBackend + PrefixSumBackend + RadixSortBackend>(
+pub(crate) fn tile_mapping<B: TileMappingBackend + PrefixSumBackend>(
     projected_splats: &Tensor<B, 2>,
     intersect_counts: Tensor<B, 1, Int>,
+    logical_visible: &Tensor<B, 1, Int>,
     num_intersections: usize,
-    num_tiles: u32,
+    _num_tiles: u32,
     tile_bounds: (u32, u32),
+    map_dispatch: CubeCount,
     _device: &B::Device,
 ) -> TileMappingOutput<B> {
-    let num_visible = projected_splats.dims()[0];
     let cum_tiles_hit = Tensor::<B, 1, Int>::from_primitive(
         B::prefix_sum_u32_primitive(intersect_counts.into_primitive()).expect("prefix sum"),
     );
-
     let (tile_id_from_isect, compact_gid_from_isect) = B::map_gaussians_to_intersects_primitive(
         projected_splats.clone().into_primitive().tensor(),
         cum_tiles_hit.into_primitive(),
+        logical_visible.clone().into_primitive(),
         num_intersections,
         MGIUniforms {
             tile_bounds: [tile_bounds.0, tile_bounds.1],
-            num_visible: num_visible as u32,
+            num_visible: projected_splats.dims()[0] as u32,
             pad: 0,
         },
+        map_dispatch,
     );
-
-    if num_intersections <= 1 || num_tiles <= 1 {
-        return TileMappingOutput {
-            tile_id_from_isect: Tensor::from_primitive(tile_id_from_isect),
-            compact_gid_from_isect: Tensor::from_primitive(compact_gid_from_isect),
-        };
-    }
-
-    let (tile_id_from_isect, compact_gid_from_isect) =
-        B::radix_sort_by_key_u32_primitive(tile_id_from_isect, compact_gid_from_isect)
-            .expect("tile sort");
 
     TileMappingOutput {
         tile_id_from_isect: Tensor::from_primitive(tile_id_from_isect),
@@ -222,13 +224,17 @@ pub(crate) fn tile_mapping<B: TileMappingBackend + PrefixSumBackend + RadixSortB
 
 pub(crate) fn get_tile_offsets<B: TileMappingBackend>(
     tile_id_from_isect: Tensor<B, 1, Int>,
+    logical_intersections: &Tensor<B, 1, Int>,
     num_intersections: usize,
     tile_bounds: (u32, u32),
+    dispatch: CubeCount,
     _device: &B::Device,
 ) -> Tensor<B, 1, Int> {
     Tensor::from_primitive(B::get_tile_offsets_primitive(
         tile_id_from_isect.into_primitive(),
+        logical_intersections.clone().into_primitive(),
         num_intersections,
         tile_bounds,
+        dispatch,
     ))
 }

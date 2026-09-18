@@ -1,8 +1,9 @@
 use super::{LiteGsDensifySelection, TopologyAnalysis, TopologyPolicy};
 use crate::training::{LiteGsOpacityResetMode, TrainingConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum TopologyExecutionDisposition {
+    #[default]
     Apply,
     SkipNoEligibleCandidates,
 }

@@ -227,6 +227,7 @@ pub(crate) fn plan_topology_from_host_snapshot(
     };
 
     let mut plan = plan_topology_mutation(&metrics, request);
+    plan.disposition = execution.disposition;
     plan.telemetry_sample = Some(topology_step_sample(
         &policy,
         &metrics,
@@ -798,6 +799,7 @@ pub(crate) struct TopologyMutationPlan {
     pub(crate) pruned: usize,
     pub(crate) refine_decay: Option<TopologyRefineDecay>,
     pub(crate) telemetry_sample: Option<ParityTopologyStepSample>,
+    disposition: schedule::TopologyExecutionDisposition,
     pub(super) aftermath: TopologyMutationAftermath,
 }
 
@@ -814,6 +816,14 @@ impl TopologyMutationPlan {
             .iter()
             .map(|row| row.is_existing().then_some(row.source_idx()))
             .collect()
+    }
+
+    /// No mutation and no opacity reset: keep the gradient window so the next
+    /// scheduled step is not an empty observation.
+    pub(crate) fn should_retain_accumulators(&self) -> bool {
+        self.disposition == schedule::TopologyExecutionDisposition::SkipNoEligibleCandidates
+            && !self.mutates_splats()
+            && !self.aftermath.apply_opacity_reset
     }
 }
 
@@ -875,6 +885,7 @@ fn plan_brush_refine_mutation(
         pruned,
         refine_decay: request.refine_decay,
         telemetry_sample: None,
+        disposition: schedule::TopologyExecutionDisposition::Apply,
         aftermath,
     }
 }
@@ -1039,20 +1050,20 @@ fn litegs_should_prune_candidate(
     let history_invisible_prune = old_enough
         && info.visible_count == 0
         && info.consecutive_invisible_epochs >= policy.litegs.pruning.prune_invisible_epochs;
+    // Threshold: opacity or a long invisible window, both using real visibility.
+    // Weight: the same, so default densify+prune steps can still drop Gaussians
+    // that never rasterize. Visibility does not replace the opacity rule.
+    // VisibilityWeight: Weight plus a low actual-visibility-ratio rule.
     let contribution_prune = match policy.litegs.pruning.prune_mode {
-        LiteGsPruneMode::Threshold => opacity_prune || history_invisible_prune,
-        LiteGsPruneMode::Weight => {
-            (opacity_prune_enabled && opacity_prune)
-                || (!opacity_prune_enabled && history_invisible_prune)
+        LiteGsPruneMode::Threshold | LiteGsPruneMode::Weight => {
+            (opacity_prune_enabled && opacity_prune) || history_invisible_prune
         }
         LiteGsPruneMode::VisibilityWeight => {
             let visibility_prune = old_enough
                 && info.actual_visibility_ratio.is_finite()
                 && info.actual_visibility_ratio < policy.litegs.pruning.prune_visibility_threshold
                 && info.opacity < policy.litegs.pruning.prune_high_opacity_threshold;
-            (opacity_prune_enabled && opacity_prune)
-                || (!opacity_prune_enabled && history_invisible_prune)
-                || visibility_prune
+            (opacity_prune_enabled && opacity_prune) || history_invisible_prune || visibility_prune
         }
     };
     let scale_small = scale
@@ -1221,5 +1232,94 @@ mod budget_tests {
 
         assert_eq!(plan.rows.len(), 5);
         assert!(plan.rows.len() <= config.litegs.topology.target_primitives);
+    }
+
+    fn prune_info(
+        opacity: f32,
+        visible_count: usize,
+        invisible_epochs: usize,
+    ) -> TopologyCandidateInfo {
+        TopologyCandidateInfo {
+            opacity,
+            mean2d_grad: 0.0,
+            screen_mean2d_grad: 0.0,
+            abs_mean2d_grad: 0.0,
+            abs_pixel_mean2d_grad: 0.0,
+            pixel_coverage: 0.0,
+            camera_depth: 1.0,
+            depth_scale: 1.0,
+            split_score: 0.0,
+            growth_weight: 0.0,
+            visible_count,
+            actual_visible_count: visible_count,
+            actual_visibility_ratio: if visible_count == 0 { 0.0 } else { 1.0 },
+            age: 6,
+            consecutive_invisible_epochs: invisible_epochs,
+            prune_candidate: false,
+            growth_candidate: false,
+            split_candidate: false,
+            clone_candidate: false,
+        }
+    }
+
+    #[test]
+    fn default_weight_prune_candidates_long_invisible_gaussians() {
+        let policy = TopologyPolicy::from_training_config(&TrainingConfig::default(), 1.0);
+        assert_eq!(policy.litegs.pruning.prune_mode, LiteGsPruneMode::Weight);
+        let args = ([0.01, 0.01, 0.01], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 10.0, true);
+
+        assert!(litegs_should_prune_candidate(
+            &policy,
+            &prune_info(0.5, 0, 10),
+            args.1,
+            args.0,
+            args.2,
+            args.3,
+            args.4,
+            true,
+        ));
+        assert!(!litegs_should_prune_candidate(
+            &policy,
+            &prune_info(0.5, 8, 0),
+            args.1,
+            args.0,
+            args.2,
+            args.3,
+            args.4,
+            true,
+        ));
+    }
+
+    #[test]
+    fn three_splat_weight_fixture_prunes_only_invisible_low_contribution() {
+        let policy = TopologyPolicy::from_training_config(&TrainingConfig::default(), 1.0);
+        let scale = [0.01, 0.01, 0.01];
+        let center = [0.0, 0.0, 0.0];
+        let position = [0.0, 0.0, 0.0];
+        let invisible = prune_info(0.01, 0, 10);
+        let visible = prune_info(0.9, 12, 0);
+        let split_source = prune_info(0.5, 8, 0);
+        assert!(litegs_should_prune_candidate(
+            &policy, &invisible, position, scale, center, 10.0, true, true
+        ));
+        assert!(!litegs_should_prune_candidate(
+            &policy, &visible, position, scale, center, 10.0, true, true
+        ));
+        assert!(!litegs_should_prune_candidate(
+            &policy, &split_source, position, scale, center, 10.0, true, true
+        ));
+    }
+
+    #[test]
+    fn no_candidate_topology_step_retains_accumulators() {
+        let mut plan = TopologyMutationPlan::default();
+        assert!(!plan.should_retain_accumulators());
+        plan.disposition = schedule::TopologyExecutionDisposition::SkipNoEligibleCandidates;
+        assert!(plan.should_retain_accumulators());
+        plan.aftermath.apply_opacity_reset = true;
+        assert!(!plan.should_retain_accumulators());
+        plan.aftermath.apply_opacity_reset = false;
+        plan.pruned = 1;
+        assert!(!plan.should_retain_accumulators());
     }
 }

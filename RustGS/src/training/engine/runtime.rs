@@ -399,6 +399,7 @@ async fn warm_up_training_kernels(
             start_iteration + 1,
             cameras.len(),
             false,
+            true,
         )
         .await?;
     log::debug!(

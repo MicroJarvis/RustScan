@@ -1,6 +1,6 @@
 # RustScan Documentation Index
 
-**Updated:** 2026-08-15
+**Updated:** 2026-09-17
 
 此索引先列出当前作为执行、验证或状态依据的文档；带日期的设计、计划和实验记录仅在其仍有审计价值时保留，不替代当前入口。
 
@@ -31,6 +31,7 @@
 |---|---|
 | [../RustGS/README.md](../RustGS/README.md) | build、test、CLI 与 artifact contract |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前 wgpu training module layout、public surface 和 ownership boundary |
+| [RustGS-TODO-训练效果与效率优化-2026-09-17.md](RustGS-TODO-训练效果与效率优化-2026-09-17.md) | RustGS 训练质量、GPU 吞吐和拓扑优化的执行清单与验收门槛 |
 
 The dated RustGS TUM benchmark and dataset-research records remain outside the
 maintained entry set. Read them only as historical evidence and verify every

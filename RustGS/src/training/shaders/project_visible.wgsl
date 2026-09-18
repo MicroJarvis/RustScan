@@ -6,6 +6,7 @@
 @group(0) @binding(3) var<storage, read> global_from_compact_gid: array<u32>;
 @group(0) @binding(4) var<storage, read_write> projected: array<helpers::ProjectedSplat>;
 @group(0) @binding(5) var<storage, read> uniforms: helpers::ProjectUniforms;
+@group(0) @binding(6) var<storage, read> logical_visible: array<u32>;
 
 struct ShCoeffs {
     b0_c0: vec3<f32>,
@@ -129,7 +130,7 @@ fn sh_coeffs_to_color(degree: u32, viewdir: vec3<f32>, sh: ShCoeffs) -> vec3<f32
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let compact_gid = gid.x;
-    if compact_gid >= uniforms.num_visible {
+    if compact_gid >= logical_visible[0] {
         return;
     }
 

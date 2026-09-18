@@ -11,11 +11,12 @@ struct MGIUniforms {
 @group(0) @binding(2) var<storage, read_write> tile_id_from_isect: array<u32>;
 @group(0) @binding(3) var<storage, read_write> compact_gid_from_isect: array<u32>;
 @group(0) @binding(4) var<storage, read> uniforms: MGIUniforms;
+@group(0) @binding(5) var<storage, read> logical_visible: array<u32>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let compact_gid = gid.x;
-    if compact_gid >= uniforms.num_visible {
+    if compact_gid >= logical_visible[0] {
         return;
     }
 
