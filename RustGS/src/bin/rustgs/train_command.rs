@@ -2214,6 +2214,12 @@ fn maybe_write_optimization_report(
             status_readbacks_pause: telemetry.and_then(|t| t.status_readbacks_pause),
             status_readbacks_cancel: telemetry.and_then(|t| t.status_readbacks_cancel),
             status_readbacks_training_end: telemetry.and_then(|t| t.status_readbacks_training_end),
+            status_readbacks_forward_abort: telemetry
+                .and_then(|t| t.status_readbacks_forward_abort),
+            gpu_gate_optimizer_skips: telemetry.and_then(|t| t.gpu_gate_optimizer_skips),
+            gpu_gate_backward_skips: telemetry.and_then(|t| t.gpu_gate_backward_skips),
+            gpu_gate_topology_skips: telemetry.and_then(|t| t.gpu_gate_topology_skips),
+            host_safety_point_aborts: telemetry.and_then(|t| t.host_safety_point_aborts),
             sort_dispatch_count_p50: telemetry.and_then(|t| t.radix_dispatch_count_p50),
             sort_dispatch_count_p95: telemetry.and_then(|t| t.radix_dispatch_count_p95),
             scan_dispatch_count_p50: telemetry.and_then(|t| t.scan_dispatch_count_p50),

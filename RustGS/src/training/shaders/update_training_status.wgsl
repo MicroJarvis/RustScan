@@ -7,7 +7,8 @@
 // word 3: first overflow intersection_capacity
 // word 4: committed_optimizer_steps
 // word 5: mutation_gate for the current step (0 = blocked, 1 = allowed)
-// word 6/7: reserved
+// word 6: gpu_gate_optimizer_skips (atomicAdd when prepare blocks)
+// word 7: reserved
 
 const STATUS_FORWARD_OVERFLOW: u32 = 1u;
 const STATUS_NON_FINITE_LOSS: u32 = 2u;

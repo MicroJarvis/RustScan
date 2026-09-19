@@ -54,6 +54,9 @@ pub(crate) enum StatusReadbackReason {
     Pause,
     Cancel,
     TrainingEnd,
+    /// Diagnostic read after the device gate already marked the step unhealthy.
+    /// Never used on healthy steps.
+    ForwardAbort,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -220,9 +223,18 @@ struct OptimizationTimingSamples {
     status_readbacks_pause: usize,
     status_readbacks_cancel: usize,
     status_readbacks_training_end: usize,
+    status_readbacks_forward_abort: usize,
     capacity_telemetry_readbacks: usize,
     loss_value_readbacks: usize,
     checkpoint_tensor_readbacks: usize,
+    /// Device prepare_optimizer launches that blocked (from status word 6).
+    gpu_gate_optimizer_skips: usize,
+    /// Host-inferred backward skips once a sticky anomaly is observed.
+    gpu_gate_backward_skips: usize,
+    /// Host-inferred topology accumulate skips once a sticky anomaly is observed.
+    gpu_gate_topology_skips: usize,
+    /// Safety-point / ForwardAbort paths that returned a structured training error.
+    host_safety_point_aborts: usize,
     sort_dispatches: Vec<usize>,
     scan_dispatches: Vec<usize>,
     sort_workspace_bytes: Option<usize>,
@@ -293,7 +305,15 @@ impl OptimizationTimingSamples {
                 self.status_readbacks_training_end =
                     self.status_readbacks_training_end.saturating_add(1);
             }
+            StatusReadbackReason::ForwardAbort => {
+                self.status_readbacks_forward_abort =
+                    self.status_readbacks_forward_abort.saturating_add(1);
+            }
         }
+    }
+
+    fn record_host_safety_point_abort(&mut self) {
+        self.host_safety_point_aborts = self.host_safety_point_aborts.saturating_add(1);
     }
 
     fn flush_into(&self, telemetry: &mut LiteGsTrainingTelemetry) {
@@ -311,9 +331,14 @@ impl OptimizationTimingSamples {
         telemetry.status_readbacks_pause = Some(self.status_readbacks_pause);
         telemetry.status_readbacks_cancel = Some(self.status_readbacks_cancel);
         telemetry.status_readbacks_training_end = Some(self.status_readbacks_training_end);
+        telemetry.status_readbacks_forward_abort = Some(self.status_readbacks_forward_abort);
         telemetry.capacity_telemetry_readbacks = Some(self.capacity_telemetry_readbacks);
         telemetry.loss_value_readbacks = Some(self.loss_value_readbacks);
         telemetry.checkpoint_tensor_readbacks = Some(self.checkpoint_tensor_readbacks);
+        telemetry.gpu_gate_optimizer_skips = Some(self.gpu_gate_optimizer_skips);
+        telemetry.gpu_gate_backward_skips = Some(self.gpu_gate_backward_skips);
+        telemetry.gpu_gate_topology_skips = Some(self.gpu_gate_topology_skips);
+        telemetry.host_safety_point_aborts = Some(self.host_safety_point_aborts);
         telemetry.radix_dispatch_count_p50 = percentile_usize(&self.sort_dispatches, 50.0);
         telemetry.radix_dispatch_count_p95 = percentile_usize(&self.sort_dispatches, 95.0);
         telemetry.scan_dispatch_count_p50 = percentile_usize(&self.scan_dispatches, 50.0);
@@ -717,6 +742,16 @@ impl WgpuTrainer {
         collect_topology_stats: bool,
         read_loss: bool,
     ) -> Result<Option<f32>, TrainingError> {
+        // Prior safety-point may already own sticky overflow / non-finite on the
+        // host mirror. Refuse to start another logical iteration; refresh device
+        // diagnostics under ForwardAbort without running forward/loss/backward.
+        if self.device_status.host_snapshot().to_error().is_some() {
+            return self
+                .ensure_device_status_healthy(StatusReadbackReason::ForwardAbort)
+                .await
+                .map(|_| None);
+        }
+
         self.prefix_sum_workspace.begin_step();
         // Safety: workspace field is only accessed via TLS during this step; no
         // overlapping `&mut self.prefix_sum_workspace` Rust borrows.
@@ -969,10 +1004,22 @@ impl WgpuTrainer {
         }
 
         if self.should_apply_topology(iteration, frame_count) {
-            self.ensure_device_status_healthy(StatusReadbackReason::TopologyBoundary)
-                .await?;
-            self.apply_topology_mutations(splats, iteration, frame_count)
-                .await;
+            match self
+                .ensure_device_status_healthy(StatusReadbackReason::TopologyBoundary)
+                .await
+            {
+                Ok(_) => {
+                    self.apply_topology_mutations(splats, iteration, frame_count)
+                        .await;
+                }
+                Err(err) => {
+                    self.optimization_samples.gpu_gate_topology_skips = self
+                        .optimization_samples
+                        .gpu_gate_topology_skips
+                        .saturating_add(1);
+                    return Err(err);
+                }
+            }
         }
 
         if !read_loss {
@@ -1375,10 +1422,31 @@ impl WgpuTrainer {
     ) -> Result<TrainingStatusSnapshot, TrainingError> {
         let status = self.device_status.read().await?;
         self.device_status.adopt_device_snapshot(status);
-        self.optimization_samples.record_status_readback(reason);
+        // Once sticky flags are set on device, classify diagnostic reads as
+        // ForwardAbort so healthy LossCadence counters stay honest.
+        let effective_reason = if !status.is_healthy()
+            && matches!(
+                reason,
+                StatusReadbackReason::LossCadence
+                    | StatusReadbackReason::TopologyBoundary
+                    | StatusReadbackReason::TrainingEnd
+            ) {
+            StatusReadbackReason::ForwardAbort
+        } else {
+            reason
+        };
+        self.optimization_samples
+            .record_status_readback(effective_reason);
         self.optimizer
             .sync_committed_steps(status.committed_optimizer_steps as usize);
+        self.optimization_samples
+            .gpu_gate_optimizer_skips = status.gpu_gate_optimizer_skips as usize;
         if let Some(err) = status.to_error() {
+            self.optimization_samples.record_host_safety_point_abort();
+            if status.has_forward_overflow() || status.has_non_finite_loss() {
+                self.optimization_samples.gpu_gate_backward_skips =
+                    self.optimization_samples.gpu_gate_backward_skips.saturating_add(1);
+            }
             return Err(err);
         }
         Ok(status)
@@ -2774,6 +2842,149 @@ mod tests {
             "sticky first overflow iteration must survive continuous overflows"
         );
         assert_eq!(after.5.mutation_gate, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sticky_host_overflow_aborts_next_step_without_mutation() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let camera = fault_injection_camera();
+
+        trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                1,
+                1,
+                true,
+                true,
+            )
+            .await
+            .expect("healthy step with loss read");
+
+        trainer.intersection_capacity_override = Some(1);
+        let overflow_err = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                2,
+                1,
+                true,
+                true,
+            )
+            .await
+            .expect_err("loss-cadence overflow must surface ForwardCapacityExceeded");
+        assert!(
+            matches!(
+                overflow_err,
+                TrainingError::ForwardCapacityExceeded {
+                    first_iteration: 2,
+                    ..
+                }
+            ),
+            "got {overflow_err:?}"
+        );
+        assert!(trainer.optimization_samples.status_readbacks_forward_abort >= 1);
+        assert!(trainer.optimization_samples.host_safety_point_aborts >= 1);
+        assert!(trainer.optimization_samples.gpu_gate_optimizer_skips >= 1);
+        assert!(trainer.optimization_samples.gpu_gate_backward_skips >= 1);
+
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
+        let aborted = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                3,
+                1,
+                true,
+                false,
+            )
+            .await
+            .expect_err("sticky host overflow must abort the next logical iteration");
+        assert!(
+            matches!(aborted, TrainingError::ForwardCapacityExceeded { .. }),
+            "got {aborted:?}"
+        );
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.3, before.3);
+        assert_eq!(after.5.committed_optimizer_steps, before.5.committed_optimizer_steps);
+        assert!(trainer.optimization_samples.status_readbacks_forward_abort >= 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn train_step_nan_with_read_loss_returns_unique_non_finite_error() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let camera = fault_injection_camera();
+
+        trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                1,
+                1,
+                true,
+                true,
+            )
+            .await
+            .expect("healthy step");
+
+        let err = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, f32::NAN),
+                (8, 8),
+                2,
+                1,
+                true,
+                true,
+            )
+            .await
+            .expect_err("loss-cadence NaN must surface NonFiniteLoss");
+        assert!(
+            matches!(
+                err,
+                TrainingError::NonFiniteLoss {
+                    first_iteration: 2
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(trainer.optimization_samples.host_safety_point_aborts >= 1);
+        assert!(trainer.optimization_samples.gpu_gate_optimizer_skips >= 1);
+
+        let follow = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                3,
+                1,
+                true,
+                false,
+            )
+            .await
+            .expect_err("sticky non-finite must not be cleared by a later step");
+        assert!(matches!(follow, TrainingError::NonFiniteLoss { .. }));
     }
 
     #[tokio::test(flavor = "current_thread")]

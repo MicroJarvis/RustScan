@@ -22,6 +22,7 @@ const WORD_REQUESTED: usize = 2;
 const WORD_CAPACITY: usize = 3;
 const WORD_COMMITTED_STEPS: usize = 4;
 const WORD_MUTATION_GATE: usize = 5;
+const WORD_GPU_GATE_OPTIMIZER_SKIPS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TrainingStatusSnapshot {
@@ -31,6 +32,8 @@ pub(crate) struct TrainingStatusSnapshot {
     pub intersection_capacity: u32,
     pub committed_optimizer_steps: u32,
     pub mutation_gate: u32,
+    /// Device-side count of prepare_optimizer launches that blocked mutation.
+    pub gpu_gate_optimizer_skips: u32,
 }
 
 impl Default for TrainingStatusSnapshot {
@@ -42,6 +45,7 @@ impl Default for TrainingStatusSnapshot {
             intersection_capacity: 0,
             committed_optimizer_steps: 0,
             mutation_gate: 0,
+            gpu_gate_optimizer_skips: 0,
         }
     }
 }
@@ -86,6 +90,7 @@ pub(crate) fn encode_training_status(snapshot: TrainingStatusSnapshot) -> [u32; 
     words[WORD_CAPACITY] = snapshot.intersection_capacity;
     words[WORD_COMMITTED_STEPS] = snapshot.committed_optimizer_steps;
     words[WORD_MUTATION_GATE] = snapshot.mutation_gate;
+    words[WORD_GPU_GATE_OPTIMIZER_SKIPS] = snapshot.gpu_gate_optimizer_skips;
     words
 }
 
@@ -97,6 +102,7 @@ pub(crate) fn decode_training_status(words: &[u32; STATUS_WORD_COUNT]) -> Traini
         intersection_capacity: words[WORD_CAPACITY],
         committed_optimizer_steps: words[WORD_COMMITTED_STEPS],
         mutation_gate: words[WORD_MUTATION_GATE],
+        gpu_gate_optimizer_skips: words[WORD_GPU_GATE_OPTIMIZER_SKIPS],
     }
 }
 

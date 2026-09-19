@@ -506,6 +506,7 @@ mod tests {
             intersection_capacity: 0,
             committed_optimizer_steps: 3,
             mutation_gate: 1,
+            gpu_gate_optimizer_skips: 0,
         });
 
         let sentinel = accumulator_fixture(&device);

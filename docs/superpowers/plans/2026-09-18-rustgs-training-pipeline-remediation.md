@@ -16,7 +16,7 @@
 
 阶段 1、阶段 2，以及阶段 3 的 exact/bounded parity 已实现并通过对应 GPU 测试；阶段 4.1 的实验身份 comparator 已实现。整个 remediation 计划尚未完成，最近 review 仍发现：
 
-- **P0/P1 forward hard-stop 缺口：** RustGS/src/training/engine/trainer.rs:1379 的 ensure_forward_capacity_before_update() 只检查 forward 之后的 host 状态镜像。GPU overflow 发生后，read_loss=false 的 step 仍可能进入 loss/backward，随后才在安全点读回；Adam/topology gate 能阻止持久 mutation，但不能满足异常 step 立即停止，也浪费 backward 计算。
+- **P0 forward hard-stop：** 同 step device gate（P0.1）与安全点 ForwardAbort / skip telemetry（P0.2）已落地；异常 step 不再依赖 mid-step host mirror。
 - **P1 scan 所有权缺口：** RustGS/src/training/gpu_primitives/prefix_sum.rs:371 的训练路径每次仍调用 empty_tensor 创建输出。workspace 只复用递归 scratch，step_fresh_allocations 没有统计该输出分配；prefix_sum.rs:291 与 trainer.rs:720 的 TLS raw pointer 绑定跨越 await，在多线程异步 runtime 下不安全。
 - **P1 阶段 4.2–6 不完整：** 尚无完整 training/reporting/gpu_profiler.rs、GPU completion timing、adapter/driver metadata、runtime device memory、unsupported reason、可复现实验 split manifest、完整 gradient boundary suite、显式 SH schedule 和 TUM 阶梯包。
 - **P2 格式门禁失败：** cargo fmt --package rustgs --check 当前仍报告 RustGS/src/lib.rs、RustGS/src/training/engine/trainer.rs、RustGS/src/training/forward/parity.rs、RustGS/src/training/forward/sorting.rs 差异。
@@ -86,13 +86,14 @@ shader 在写 dispatch 前用 atomicOr/atomicMin 记录 overflow，随后写入 
 
 **文件：** RustGS/src/training/engine/trainer.rs、engine/runtime.rs、reporting/telemetry.rs。
 
-- [ ] 为 StatusReadbackReason 增加 ForwardAbort，仅用于 gate 已判定异常后的诊断读回，不在健康 step 调用。
-- [ ] 将失败 step 的命令计数、backward skipped、optimizer skipped、topology skipped 写入 telemetry；区分 GPU gate skip 和 host safety-point abort。
-- [ ] 增加训练 API 测试：forward overflow、loss NaN、取消和 checkpoint 错误都返回唯一错误类别，且不会被后续 healthy step 覆盖。
-- [ ] 验证错误路径不会把部分写入的 transient tensor 当作可恢复 checkpoint 状态。
+- [x] 为 StatusReadbackReason 增加 ForwardAbort，仅用于 gate 已判定异常后的诊断读回，不在健康 step 调用。
+- [x] 将失败 step 的命令计数、backward skipped、optimizer skipped、topology skipped 写入 telemetry；区分 GPU gate skip 和 host safety-point abort。
+- [x] 增加训练 API 测试：forward overflow、loss NaN、取消和 checkpoint 错误都返回唯一错误类别，且不会被后续 healthy step 覆盖。
+- [x] 验证错误路径不会把部分写入的 transient tensor 当作可恢复 checkpoint 状态。
 
 **验收标准：** 每种失败都能从 error、status snapshot 和 telemetry 三处定位；错误发生后不会继续完成一个逻辑 iteration。
 
+**P0.2 落地说明（2026-09-19）：** `ForwardAbort` 用于 sticky 异常后的诊断读回；host mirror 已异常时 `train_step` 入口直接 abort；`prepare_optimizer` 累计 device `gpu_gate_optimizer_skips`（status word 6）；telemetry 区分 GPU gate skip 与 `host_safety_point_aborts`。overflow/NaN 唯一错误类别与 sticky 后续 step abort fixture 已通过。
 ---
 
 # P1：Scan workspace 与分配证据

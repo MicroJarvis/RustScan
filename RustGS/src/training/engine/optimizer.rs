@@ -907,6 +907,7 @@ mod tests {
             intersection_capacity: 0,
             committed_optimizer_steps: 7,
             mutation_gate: 1,
+            gpu_gate_optimizer_skips: 0,
         });
 
         optimizer_step(&mut optimizer, &mut splats, &status, &device);

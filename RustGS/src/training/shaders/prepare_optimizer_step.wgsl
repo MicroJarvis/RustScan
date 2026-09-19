@@ -24,5 +24,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicAdd(&status[4], 1u);
     } else {
         atomicStore(&status[5], 0u);
+        // Count device-side optimizer gate skips for safety-point telemetry.
+        atomicAdd(&status[6], 1u);
     }
 }
