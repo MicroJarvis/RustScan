@@ -11,5 +11,7 @@ pub(crate) use backend::{GsBackendBase, GsDevice, GsDiffBackend};
 pub(crate) use device_status::{
     DeviceTrainingStatus, TrainingStatusSnapshot, STATUS_FORWARD_OVERFLOW, STATUS_NON_FINITE_LOSS,
 };
+pub(crate) use loss::{combined_loss_with_kernel, gaussian_kernel_1d, SsimConfig};
 pub(crate) use runtime::train_splats;
 pub(crate) use splats::{device_splats_to_host, host_splats_to_device, DeviceSplats};
+pub(crate) use trainer::WgpuTrainer;

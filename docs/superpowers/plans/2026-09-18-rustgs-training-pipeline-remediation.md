@@ -182,10 +182,10 @@ v2 要求长度等于 splat count、值 finite 且非负；v1 用旧累计 visib
 
 新建 `RustGS/tests/bounded_forward_parity.rs`，覆盖 zero visible、zero intersections、1/255/256/257 intersections、恰好满容量、capacity 少 1、partial tile、duplicate depth key、low alpha、near-plane。容量足够时比较 logical/requested count、排序 key/value、tile offsets、RGB/depth/visibility 和三组 gradient；整数完全相等，浮点默认 `1e-5`，只有能解释归约顺序时才局部放宽到 `1e-4`。capacity 少 1 必须复用阶段 1 的状态不变断言。
 
-- [ ] 先写 fixture 并确认没有 parity 入口。
-- [ ] 实现 exact/bounded 双跑 helper 和测试所需最小入口暴露。
-- [ ] 修复差异，不得用整体放宽容差绕过。
-- [ ] 提交 `test(rustgs): cover bounded forward pipeline parity`。
+- [x] 先写 fixture 并确认没有 parity 入口。
+- [x] 实现 exact/bounded 双跑 helper 和测试所需最小入口暴露。
+- [x] 修复差异，不得用整体放宽容差绕过。
+- [x] 提交 `test(rustgs): cover bounded forward pipeline parity`。
 
 ## Task 3.2：PrefixSum workspace 复用
 

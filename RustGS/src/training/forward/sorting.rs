@@ -47,15 +47,19 @@ where
         return global_from_presort_gid;
     }
 
-    let depth_bits = Tensor::<B, 1, Int>::from_primitive(B::reinterpret_f32_as_u32_primitive(
+    // Canonicalize racey atomic compaction order by splat id, then stable-sort by
+    // depth so equal-depth ties stay deterministic across Exact/Bounded launches.
+    let depth_u32 = Tensor::<B, 1, Int>::from_primitive(B::reinterpret_f32_as_u32_primitive(
         depths.into_primitive().tensor(),
     ));
-
-    let (_, sorted) = B::radix_sort_by_key_u32_primitive(
-        depth_bits.into_primitive(),
+    let (sorted_gids, sorted_depth_u32) = B::radix_sort_by_key_u32_primitive(
         global_from_presort_gid.into_primitive(),
+        depth_u32.into_primitive(),
     )
-    .expect("depth sort");
+    .expect("depth pre-sort by splat id");
+
+    let (_, sorted) = B::radix_sort_by_key_u32_primitive(sorted_depth_u32, sorted_gids)
+        .expect("depth sort");
 
     Tensor::from_primitive(sorted)
 }
@@ -70,12 +74,21 @@ pub(crate) fn sort_by_depth_counted<B>(
 where
     B: SortingBackend + RadixSortBackend,
 {
-    let depth_bits = Tensor::<B, 1, Int>::from_primitive(B::reinterpret_f32_as_u32_primitive(
+    let depth_u32 = Tensor::<B, 1, Int>::from_primitive(B::reinterpret_f32_as_u32_primitive(
         depths.into_primitive().tensor(),
     ));
-    let (_, sorted) = B::radix_sort_counted_primitive(
-        depth_bits.into_primitive(),
+    let (sorted_gids, sorted_depth_u32) = B::radix_sort_counted_primitive(
         global_from_presort_gid.into_primitive(),
+        depth_u32.into_primitive(),
+        logical_visible.clone().into_primitive(),
+        dispatch.clone().into_primitive(),
+        0,
+    )
+    .expect("counted depth pre-sort by splat id");
+
+    let (_, sorted) = B::radix_sort_counted_primitive(
+        sorted_depth_u32,
+        sorted_gids,
         logical_visible.clone().into_primitive(),
         dispatch.clone().into_primitive(),
         value_fill,

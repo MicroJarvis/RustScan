@@ -94,10 +94,11 @@ pub use crate::training::{
 #[cfg(feature = "gpu")]
 pub use crate::training::{
     evaluate_splats, evaluation_device, last_training_telemetry, render_evaluation_frame,
-    runtime_from_splats, LiteGsOptimizerLrs, LiteGsTrainingTelemetry, TrainingCheckpointPolicy,
-    TrainingCheckpointReady, TrainingCheckpointReason, TrainingCheckpointSink, TrainingControl,
-    TrainingEvent, TrainingEventCadence, TrainingEventRoute, TrainingIterationProgress,
-    TrainingOptions, TrainingPlanSelected, TrainingRun, TrainingRunCancelled, TrainingRunCompleted,
+    runtime_from_splats, run_bounded_forward_parity_suite, LiteGsOptimizerLrs,
+    LiteGsTrainingTelemetry, TrainingCheckpointPolicy, TrainingCheckpointReady,
+    TrainingCheckpointReason, TrainingCheckpointSink, TrainingControl, TrainingEvent,
+    TrainingEventCadence, TrainingEventRoute, TrainingIterationProgress, TrainingOptions,
+    TrainingPlanSelected, TrainingRun, TrainingRunCancelled, TrainingRunCompleted,
     TrainingRunDisposition, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
     TrainingSnapshotReady,
 };

@@ -201,9 +201,8 @@ pub struct WgpuTrainer {
     intersection_capacity: usize,
     device_status: DeviceTrainingStatus<GsBackendBase>,
     optimization_samples: OptimizationTimingSamples,
-    /// When set (tests only), forces forward capacity below the planned size so
-    /// overflow sticky flags can be exercised through `train_step`.
-    #[cfg(test)]
+    /// When set (tests / parity harness only), forces forward capacity below the
+    /// planned size so overflow sticky flags can be exercised through `train_step`.
     intersection_capacity_override: Option<usize>,
 }
 
@@ -451,7 +450,6 @@ impl WgpuTrainer {
             intersection_capacity: 0,
             device_status: DeviceTrainingStatus::new(&device, 0),
             optimization_samples: OptimizationTimingSamples::default(),
-            #[cfg(test)]
             intersection_capacity_override: None,
         }
     }
@@ -1175,7 +1173,6 @@ impl WgpuTrainer {
     }
 
     fn intersection_capacity_for(&mut self, splat_count: usize, img_size: (u32, u32)) -> usize {
-        #[cfg(test)]
         if let Some(capacity) = self.intersection_capacity_override {
             self.intersection_capacity = capacity.max(1);
             return self.intersection_capacity;
@@ -1192,6 +1189,161 @@ impl WgpuTrainer {
         let capacity = self.intersection_capacity.max(planned).min(hard);
         self.intersection_capacity = capacity;
         capacity
+    }
+
+    /// Force a fixed intersection workspace capacity (parity / fault-injection).
+    pub fn force_intersection_capacity_for_test(&mut self, capacity: usize) {
+        self.intersection_capacity_override = Some(capacity.max(1));
+    }
+
+    /// Stage-1 overflow hard-stop reused by bounded-forward parity (capacity − 1).
+    pub async fn assert_overflow_capacity_minus_one_mutates_nothing_for_test(
+        &mut self,
+        splats: &mut DeviceSplats<GsDiffBackend>,
+        camera: &GaussianCamera,
+        target: Tensor<GsDiffBackend, 3>,
+        image_dims: (usize, usize),
+        capacity: usize,
+    ) -> Result<(), TrainingError> {
+        let healthy = self
+            .train_step(
+                splats,
+                camera,
+                target.clone(),
+                image_dims,
+                1,
+                1,
+                true,
+                false,
+            )
+            .await?;
+        debug_assert!(healthy.is_none());
+
+        let before = self.snapshot_mutation_state_for_test(splats).await?;
+        self.force_intersection_capacity_for_test(capacity);
+
+        let overflowed = self
+            .train_step(splats, camera, target, image_dims, 2, 1, true, false)
+            .await?;
+        debug_assert!(overflowed.is_none());
+
+        let after = self.snapshot_mutation_state_for_test(splats).await?;
+        let mut mismatches = Vec::new();
+        if after.0 != before.0 {
+            mismatches.push("transforms");
+        }
+        if after.1 != before.1 {
+            mismatches.push("sh");
+        }
+        if after.2 != before.2 {
+            mismatches.push("opacity");
+        }
+        if after.3 != before.3 {
+            mismatches.push("adam");
+        }
+        if after.4 != before.4 {
+            mismatches.push("topology");
+        }
+        if after.6 != before.6 {
+            mismatches.push("birth");
+        }
+        if after.7 != before.7 {
+            mismatches.push("invisible");
+        }
+        if after.5.committed_optimizer_steps != before.5.committed_optimizer_steps {
+            mismatches.push("committed_optimizer_steps");
+        }
+        if !mismatches.is_empty() {
+            return Err(TrainingError::TrainingFailed(format!(
+                "capacity-1 overflow mutated trainer state ({})",
+                mismatches.join(",")
+            )));
+        }
+        if !after.5.has_forward_overflow() {
+            return Err(TrainingError::TrainingFailed(format!(
+                "capacity-1 overflow missing sticky forward overflow flag (flags={:#x}, requested={}, capacity={})",
+                after.5.flags,
+                after.5.requested_intersections,
+                after.5.intersection_capacity
+            )));
+        }
+        Ok(())
+    }
+
+    async fn snapshot_mutation_state_for_test(
+        &mut self,
+        splats: &DeviceSplats<GsDiffBackend>,
+    ) -> Result<
+        (
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            crate::training::AdamCheckpoint,
+            crate::training::TopologyCheckpoint,
+            TrainingStatusSnapshot,
+            Vec<usize>,
+            Vec<usize>,
+        ),
+        TrainingError,
+    > {
+        let status = self.device_status.read().await?;
+        self.device_status.adopt_device_snapshot(status);
+        self.optimizer
+            .sync_committed_steps(status.committed_optimizer_steps as usize);
+        let transforms = splats
+            .transforms
+            .val()
+            .into_data_async()
+            .await
+            .map_err(|e| TrainingError::TrainingFailed(format!("transforms read: {e}")))?
+            .into_vec::<f32>()
+            .map_err(|e| TrainingError::TrainingFailed(format!("transforms cast: {e:?}")))?;
+        let sh = splats
+            .sh_coeffs
+            .val()
+            .into_data_async()
+            .await
+            .map_err(|e| TrainingError::TrainingFailed(format!("sh read: {e}")))?
+            .into_vec::<f32>()
+            .map_err(|e| TrainingError::TrainingFailed(format!("sh cast: {e:?}")))?;
+        let opacity = splats
+            .raw_opacities
+            .val()
+            .into_data_async()
+            .await
+            .map_err(|e| TrainingError::TrainingFailed(format!("opacity read: {e}")))?
+            .into_vec::<f32>()
+            .map_err(|e| TrainingError::TrainingFailed(format!("opacity cast: {e:?}")))?;
+        let adam = self.optimizer.checkpoint().await?;
+        let topology = TopologyAccumulatorSet {
+            grad_2d: self.grad_2d_accum.clone(),
+            screen_grad_2d: self.screen_grad_2d_accum.clone(),
+            abs_grad_2d: self.abs_grad_2d_accum.clone(),
+            abs_pixel_grad_2d: self.abs_pixel_grad_2d_accum.clone(),
+            pixel_coverage: self.pixel_coverage_accum.clone(),
+            camera_depth: self.camera_depth_accum.clone(),
+            grad_color: self.grad_color_accum.clone(),
+            num_observations: self.num_observations.clone(),
+            visible_observations: self.visible_observations.clone(),
+            actual_visible_observations: self.actual_visible_observations.clone(),
+        }
+        .checkpoint(
+            &self.splat_birth_iterations,
+            &self.splat_invisible_windows,
+            &self.visibility_window_baseline,
+            &self.actual_visibility_window_baseline,
+        )
+        .await?;
+        Ok((
+            transforms,
+            sh,
+            opacity,
+            adam,
+            topology,
+            status,
+            self.splat_birth_iterations.clone(),
+            self.splat_invisible_windows.clone(),
+        ))
     }
 
     async fn ensure_forward_capacity_before_update(

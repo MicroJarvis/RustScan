@@ -11,6 +11,7 @@ use crate::training::engine::DeviceSplats;
 use crate::training::gpu_primitives::{prefix_sum::PrefixSumBackend, radix_sort::RadixSortBackend};
 
 pub mod dispatch;
+pub mod parity;
 pub mod project_visible;
 pub mod projection;
 pub mod rasterize;
@@ -163,9 +164,11 @@ pub(crate) struct RenderOutput<B: Backend> {
     pub visible: Tensor<B, 1>,
     pub projected_splats: Tensor<B, 2>,
     pub global_from_compact_gid: Tensor<B, 1, Int>,
+    pub tile_id_from_isect: Tensor<B, 1, Int>,
     pub compact_gid_from_isect: Tensor<B, 1, Int>,
     pub tile_offsets: Tensor<B, 1, Int>,
     pub logical_visible: Tensor<B, 1, Int>,
+    pub logical_intersections: Tensor<B, 1, Int>,
     pub visible_dispatch: Tensor<B, 1, Int>,
     pub intersection_overflow: Tensor<B, 1, Int>,
     pub requested_intersections: Tensor<B, 1, Int>,
@@ -314,9 +317,11 @@ where
             visible: raster_out.visible,
             projected_splats,
             global_from_compact_gid: empty_indices.clone(),
+            tile_id_from_isect: empty_indices.clone(),
             compact_gid_from_isect: empty_indices,
             tile_offsets,
             logical_visible: bounds.logical_visible,
+            logical_intersections: bounds.logical_intersections,
             visible_dispatch: bounds.visible_dispatch,
             intersection_overflow: bounds.overflow,
             requested_intersections: bounds.requested_intersections.clone(),
@@ -377,9 +382,11 @@ where
             visible: raster_out.visible,
             projected_splats,
             global_from_compact_gid,
+            tile_id_from_isect: compact_gid_from_isect.clone(),
             compact_gid_from_isect,
             tile_offsets,
             logical_visible: bounds.logical_visible,
+            logical_intersections: bounds.logical_intersections,
             visible_dispatch: bounds.visible_dispatch,
             intersection_overflow: bounds.overflow,
             requested_intersections: bounds.requested_intersections.clone(),
@@ -420,7 +427,7 @@ where
     };
 
     let tile_offsets = get_tile_offsets(
-        tile_id_from_isect,
+        tile_id_from_isect.clone(),
         &bounds.logical_intersections,
         bounds.intersections,
         tile_bounds,
@@ -446,9 +453,11 @@ where
         visible: raster_out.visible,
         projected_splats,
         global_from_compact_gid,
+        tile_id_from_isect,
         compact_gid_from_isect,
         tile_offsets,
         logical_visible: bounds.logical_visible,
+        logical_intersections: bounds.logical_intersections,
         visible_dispatch: bounds.visible_dispatch,
         intersection_overflow: bounds.overflow,
         requested_intersections: bounds.requested_intersections,

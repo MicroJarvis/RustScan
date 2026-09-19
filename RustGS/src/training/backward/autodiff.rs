@@ -163,7 +163,7 @@ async fn render_splats_impl<B, C>(
     img_size: (u32, u32),
     background: [f32; 3],
     cov_blur: f32,
-    intersection_capacity: usize,
+    count_policy: CountPolicy,
     training_status: Option<(u32, Tensor<B, 1, Int>)>,
 ) -> RenderSplatsOutput<Autodiff<B, C>>
 where
@@ -206,9 +206,7 @@ where
         background,
         &device,
         cov_blur,
-        CountPolicy::Bounded {
-            intersection_capacity,
-        },
+        count_policy,
         training_status,
     )
     .await;
@@ -289,7 +287,32 @@ pub(crate) async fn render_splats_with_visibility_active_sh(
         img_size,
         background,
         cov_blur,
-        intersection_capacity,
+        CountPolicy::Bounded {
+            intersection_capacity,
+        },
+        training_status,
+    )
+    .await
+}
+
+pub(crate) async fn render_splats_with_count_policy(
+    splats: &DeviceSplats<GsDiffBackend>,
+    active_sh_degree: u32,
+    camera: &GaussianCamera,
+    img_size: (u32, u32),
+    background: [f32; 3],
+    cov_blur: f32,
+    count_policy: CountPolicy,
+    training_status: Option<(u32, Tensor<GsBackendBase, 1, Int>)>,
+) -> RenderSplatsOutput<GsDiffBackend> {
+    render_splats_impl::<GsBackendBase, NoCheckpointing>(
+        splats,
+        active_sh_degree,
+        camera,
+        img_size,
+        background,
+        cov_blur,
+        count_policy,
         training_status,
     )
     .await

@@ -91,6 +91,9 @@ pub use reporting::telemetry::{
 };
 
 #[cfg(feature = "gpu")]
+pub use forward::parity::run_bounded_forward_parity_suite;
+
+#[cfg(feature = "gpu")]
 pub fn train_splats(
     dataset: &TrainingDataset,
     config: &TrainingConfig,
