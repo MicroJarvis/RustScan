@@ -362,6 +362,7 @@ async fn capture_forward(
         COV_BLUR,
         policy,
         Some((1, status.buffer().clone())),
+        None,
     )
     .await;
 

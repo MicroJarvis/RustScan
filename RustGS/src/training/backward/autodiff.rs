@@ -23,7 +23,10 @@ use crate::training::forward::{
     self, calc_tile_bounds, project_visible, projection, rasterize, sorting, tile_mapping,
     CountPolicy,
 };
-use crate::training::gpu_primitives::{prefix_sum::PrefixSumBackend, radix_sort::RadixSortBackend};
+use crate::training::gpu_primitives::{
+    prefix_sum::{PrefixSumBackend, PrefixSumWorkspace},
+    radix_sort::RadixSortBackend,
+};
 
 trait RenderBackend:
     Backend
@@ -168,6 +171,7 @@ async fn render_splats_impl<B, C>(
     cov_blur: f32,
     count_policy: CountPolicy,
     training_status: Option<(u32, Tensor<B, 1, Int>)>,
+    prefix_workspace: Option<&mut PrefixSumWorkspace>,
 ) -> RenderSplatsOutput<Autodiff<B, C>>
 where
     B: RenderBackend,
@@ -220,6 +224,7 @@ where
         cov_blur,
         count_policy,
         training_status,
+        prefix_workspace,
     )
     .await;
     let visible = Tensor::<AD<B, C>, 1>::from_inner(fwd_out.visible.clone());
@@ -292,6 +297,7 @@ pub(crate) async fn render_splats_with_visibility_active_sh(
     cov_blur: f32,
     intersection_capacity: usize,
     training_status: Option<(u32, Tensor<GsBackendBase, 1, Int>)>,
+    prefix_workspace: Option<&mut PrefixSumWorkspace>,
 ) -> RenderSplatsOutput<GsDiffBackend> {
     render_splats_impl::<GsBackendBase, NoCheckpointing>(
         splats,
@@ -304,6 +310,7 @@ pub(crate) async fn render_splats_with_visibility_active_sh(
             intersection_capacity,
         },
         training_status,
+        prefix_workspace,
     )
     .await
 }
@@ -327,6 +334,7 @@ pub(crate) async fn render_splats_with_count_policy(
         cov_blur,
         count_policy,
         training_status,
+        None,
     )
     .await
 }

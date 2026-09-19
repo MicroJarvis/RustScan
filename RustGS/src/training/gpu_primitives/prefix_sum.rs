@@ -1,5 +1,3 @@
-use std::cell::Cell;
-
 use burn::tensor::{DType, Shape, TensorMetadata};
 use burn_cubecl::cubecl::{prelude::KernelId, server::KernelArguments, CubeCount};
 use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElement, IntElement};
@@ -55,6 +53,12 @@ struct ScanParams {
 
 pub trait PrefixSumBackend: burn::tensor::backend::Backend {
     fn prefix_sum_u32_primitive(
+        input: Self::IntTensorPrimitive,
+    ) -> Result<Self::IntTensorPrimitive, String>;
+
+    /// Training-path scan that reuses `workspace` scratch levels.
+    fn prefix_sum_u32_with_workspace(
+        workspace: &mut PrefixSumWorkspace,
         input: Self::IntTensorPrimitive,
     ) -> Result<Self::IntTensorPrimitive, String>;
 }
@@ -288,63 +292,25 @@ impl PrefixSumWorkspace {
     }
 }
 
-thread_local! {
-    static TRAINING_PREFIX_WS: Cell<*mut PrefixSumWorkspace> = const { Cell::new(std::ptr::null_mut()) };
-}
-
-/// RAII bind of a trainer-owned workspace for the current async train step.
-pub(crate) struct TrainingPrefixWorkspaceGuard {
-    previous: *mut PrefixSumWorkspace,
-}
-
-impl Drop for TrainingPrefixWorkspaceGuard {
-    fn drop(&mut self) {
-        TRAINING_PREFIX_WS.with(|cell| cell.set(self.previous));
+/// Training-path scan that reuses reserved scratch in `workspace`.
+/// Output storage is still allocated per call (P1.2 reuses it); levels are reused.
+pub(crate) fn inclusive_scan_with_workspace(
+    workspace: &mut PrefixSumWorkspace,
+    input: CubeTensor<WgpuRuntime>,
+) -> Result<CubeTensor<WgpuRuntime>, String> {
+    let input = into_contiguous(input);
+    if input.dtype() != DType::U32 && input.dtype() != DType::I32 {
+        return Err(format!(
+            "prefix_sum_u32 expects a 32-bit integer tensor, got {:?}",
+            input.dtype()
+        ));
     }
-}
-
-/// Bind `workspace` until the returned guard is dropped (safe across `.await`).
-///
-/// # Safety
-/// `workspace` must remain exclusively usable as `&mut PrefixSumWorkspace` for the
-/// guard's lifetime (no overlapping Rust borrows of that field).
-pub(crate) unsafe fn bind_training_prefix_workspace_ptr(
-    workspace: *mut PrefixSumWorkspace,
-) -> TrainingPrefixWorkspaceGuard {
-    TRAINING_PREFIX_WS.with(|cell| {
-        let previous = cell.replace(workspace);
-        TrainingPrefixWorkspaceGuard { previous }
-    })
-}
-
-/// Bind `workspace` until the returned guard is dropped (safe across `.await`).
-pub(crate) fn bind_training_prefix_workspace(
-    workspace: &mut PrefixSumWorkspace,
-) -> TrainingPrefixWorkspaceGuard {
-    // Safety: exclusive `&mut` covers the guard lifetime in sync scopes.
-    unsafe { bind_training_prefix_workspace_ptr(workspace as *mut PrefixSumWorkspace) }
-}
-
-/// Sync helper for unit tests that do not cross `.await` while scanning.
-pub(crate) fn with_training_prefix_workspace<R>(
-    workspace: &mut PrefixSumWorkspace,
-    f: impl FnOnce() -> R,
-) -> R {
-    let _guard = bind_training_prefix_workspace(workspace);
-    f()
-}
-
-fn active_training_workspace<R>(f: impl FnOnce(&mut PrefixSumWorkspace) -> R) -> Option<R> {
-    TRAINING_PREFIX_WS.with(|cell| {
-        let ptr = cell.get();
-        if ptr.is_null() {
-            None
-        } else {
-            // Safety: pointer is set only while `TrainingPrefixWorkspaceGuard` / sync
-            // helper keeps the exclusive `&mut PrefixSumWorkspace` alive on this thread.
-            Some(f(unsafe { &mut *ptr }))
-        }
-    })
+    let len = input.shape()[0];
+    if len <= 1 {
+        return Ok(input);
+    }
+    let output = empty_tensor(&input, len);
+    workspace.inclusive_scan_into(input, len, output)
 }
 
 impl<F, I, BT> PrefixSumBackend for CubeBackend<WgpuRuntime, F, I, BT>
@@ -368,16 +334,15 @@ where
             return Ok(input);
         }
 
-        // Training path: reuse reserved level scratch; output stays independent so
-        // prior scan results remain live across later same-length scans.
-        if let Some(scanned) = active_training_workspace(|ws| {
-            let output = empty_tensor(&input, len);
-            ws.inclusive_scan_into(input.clone(), len, output)
-        }) {
-            return scanned;
-        }
-
+        // Public / eval convenience path: independent allocation semantics.
         inclusive_scan_fresh(input)
+    }
+
+    fn prefix_sum_u32_with_workspace(
+        workspace: &mut PrefixSumWorkspace,
+        input: Self::IntTensorPrimitive,
+    ) -> Result<Self::IntTensorPrimitive, String> {
+        inclusive_scan_with_workspace(workspace, input)
     }
 }
 
@@ -435,7 +400,7 @@ fn inclusive_scan_fresh(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<Wgp
 mod tests {
     use super::{
         hillis_steele_dispatch_count, prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
-        with_training_prefix_workspace, PrefixSumBackend, PrefixSumWorkspace,
+        PrefixSumBackend, PrefixSumWorkspace,
     };
 
     #[test]
@@ -643,9 +608,7 @@ mod tests {
             let len = values.len();
             let input =
                 Tensor::<GsBackendBase, 1, Int>::from_data(TensorData::new(values, [len]), &device);
-            with_training_prefix_workspace(ws, || {
-                GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("scan")
-            })
+            GsBackendBase::prefix_sum_u32_with_workspace(ws, input.into_primitive()).expect("scan")
         };
 
         ws.begin_step();
@@ -702,9 +665,9 @@ mod tests {
         let fresh = GsBackendBase::prefix_sum_u32_primitive(input_fresh.into_primitive())
             .expect("fresh");
         let mut ws = PrefixSumWorkspace::new();
-        let reused = with_training_prefix_workspace(&mut ws, || {
-            GsBackendBase::prefix_sum_u32_primitive(input_ws.into_primitive()).expect("ws")
-        });
+        let reused =
+            GsBackendBase::prefix_sum_u32_with_workspace(&mut ws, input_ws.into_primitive())
+                .expect("ws");
 
         let fresh_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(fresh)
             .into_data_async()
@@ -719,5 +682,75 @@ mod tests {
             .into_vec::<i32>()
             .expect("ws data");
         assert_eq!(fresh_vals, ws_vals);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_owned_workspaces_do_not_interfere() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let left_values: Vec<i32> = (0..128).map(|i| (i % 5) as i32 + 1).collect();
+        let right_values: Vec<i32> = (0..128).map(|i| (i % 7) as i32 + 2).collect();
+        let expected_left = {
+            let mut acc = 0i32;
+            left_values
+                .iter()
+                .map(|v| {
+                    acc = acc.wrapping_add(*v);
+                    acc
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_right = {
+            let mut acc = 0i32;
+            right_values
+                .iter()
+                .map(|v| {
+                    acc = acc.wrapping_add(*v);
+                    acc
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut left_ws = PrefixSumWorkspace::new();
+        let mut right_ws = PrefixSumWorkspace::new();
+        let left_input = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(left_values, [128]),
+            &device,
+        );
+        let right_input = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(right_values, [128]),
+            &device,
+        );
+
+        // Explicit ownership: each task holds its own &mut workspace. No TLS
+        // pointer can be overwritten across awaits.
+        let left = GsBackendBase::prefix_sum_u32_with_workspace(
+            &mut left_ws,
+            left_input.into_primitive(),
+        )
+        .expect("left scan");
+        let right = GsBackendBase::prefix_sum_u32_with_workspace(
+            &mut right_ws,
+            right_input.into_primitive(),
+        )
+        .expect("right scan");
+
+        let left_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(left)
+            .into_data_async()
+            .await
+            .expect("left read")
+            .into_vec::<i32>()
+            .expect("left data");
+        let right_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(right)
+            .into_data_async()
+            .await
+            .expect("right read")
+            .into_vec::<i32>()
+            .expect("right data");
+        assert_eq!(left_vals, expected_left);
+        assert_eq!(right_vals, expected_right);
     }
 }

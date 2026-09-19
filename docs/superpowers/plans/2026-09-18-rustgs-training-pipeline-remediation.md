@@ -117,14 +117,15 @@ shader 在写 dispatch 前用 atomicOr/atomicMin 记录 overflow，随后写入 
 
 workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWorkspace 传入；不得再通过 thread-local raw pointer 绑定。inclusive_scan_into 返回 workspace-owned output，调用方在 backward 完成前不能触发下一次 scan 或 reserve。
 
-- [ ] 先添加多线程 tokio/wgpu fixture，证明旧 TLS 绑定可被不同 task 交错覆盖；测试当前实现失败。
-- [ ] 删除 TLS pointer 和 bind/unbind API，改为显式 &mut 传递；把 workspace 生命周期覆盖 forward 到 backward 的最后一个 consumer。
-- [ ] 明确 input/output alias 规则：输入不能与 output 共享 storage；reserve 增长时不得使当前 step 仍在使用的 tensor 失效。
-- [ ] 对训练路径使用 inclusive_scan_into；公共 convenience inclusive_scan 保持独立 allocation 语义。
-- [ ] 运行 prefix/radix/parity 和单线程、多线程 GPU tests。
+- [x] 先添加多线程 tokio/wgpu fixture，证明旧 TLS 绑定可被不同 task 交错覆盖；测试当前实现失败。
+- [x] 删除 TLS pointer 和 bind/unbind API，改为显式 &mut 传递；把 workspace 生命周期覆盖 forward 到 backward 的最后一个 consumer。
+- [x] 明确 input/output alias 规则：输入不能与 output 共享 storage；reserve 增长时不得使当前 step 仍在使用的 tensor 失效。
+- [x] 对训练路径使用 inclusive_scan_into；公共 convenience inclusive_scan 保持独立 allocation 语义。
+- [x] 运行 prefix/radix/parity 和单线程、多线程 GPU tests。
 
 **验收标准：** 无 unsafe TLS pointer；并发测试无数据竞争；scan output 在 backward 完成前稳定；短→长→短容量复用结果正确。
 
+**P1.1 落地说明（2026-09-19）：** 删除 `thread_local` raw pointer bind/unbind；trainer 经 `render_splats` → `tile_mapping` 显式传入 `&mut PrefixSumWorkspace`；`PrefixSumBackend::prefix_sum_u32_with_workspace` 走 `inclusive_scan_into`，无 workspace 的 eval 路径仍用独立 `inclusive_scan_fresh`。并发双 workspace fixture 与 GPU library/parity/checkpoint 已通过。输出 buffer 复用见 P1.2。
 ## Task P1.2：消除每次 scan 的 output allocation 并建立计数
 
 **文件：** RustGS/src/training/gpu_primitives/prefix_sum.rs、training/reporting/telemetry.rs、engine/trainer.rs。

@@ -8,7 +8,10 @@ use wgpu::naga;
 
 use crate::core::GaussianCamera;
 use crate::training::engine::DeviceSplats;
-use crate::training::gpu_primitives::{prefix_sum::PrefixSumBackend, radix_sort::RadixSortBackend};
+use crate::training::gpu_primitives::{
+    prefix_sum::{PrefixSumBackend, PrefixSumWorkspace},
+    radix_sort::RadixSortBackend,
+};
 
 pub mod dispatch;
 pub mod parity;
@@ -204,6 +207,7 @@ where
         cov_blur,
         CountPolicy::Exact,
         None,
+        None,
     )
     .await
 }
@@ -218,6 +222,7 @@ pub(crate) async fn render_forward_with_active_sh<B>(
     cov_blur: f32,
     count_policy: CountPolicy,
     training_status: Option<(u32, Tensor<B, 1, Int>)>,
+    prefix_workspace: Option<&mut PrefixSumWorkspace>,
 ) -> RenderOutput<B>
 where
     B: projection::ProjectionBackend
@@ -404,6 +409,7 @@ where
         tile_bounds,
         bounds.visible_cube_count(),
         device,
+        prefix_workspace,
     );
     let (tile_id_from_isect, compact_gid_from_isect) = if bounds.device_counted {
         let (keys, values) = B::radix_sort_counted_primitive(

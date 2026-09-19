@@ -5,7 +5,7 @@ use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElemen
 use burn_wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime};
 use bytemuck::{Pod, Zeroable};
 
-use crate::training::gpu_primitives::prefix_sum::PrefixSumBackend;
+use crate::training::gpu_primitives::prefix_sum::{PrefixSumBackend, PrefixSumWorkspace};
 
 use super::compose_shader;
 
@@ -199,10 +199,17 @@ pub(crate) fn tile_mapping<B: TileMappingBackend + PrefixSumBackend>(
     tile_bounds: (u32, u32),
     map_dispatch: CubeCount,
     _device: &B::Device,
+    prefix_workspace: Option<&mut PrefixSumWorkspace>,
 ) -> TileMappingOutput<B> {
-    let cum_tiles_hit = Tensor::<B, 1, Int>::from_primitive(
-        B::prefix_sum_u32_primitive(intersect_counts.into_primitive()).expect("prefix sum"),
-    );
+    let cum_tiles_hit = match prefix_workspace {
+        Some(workspace) => Tensor::<B, 1, Int>::from_primitive(
+            B::prefix_sum_u32_with_workspace(workspace, intersect_counts.into_primitive())
+                .expect("prefix sum"),
+        ),
+        None => Tensor::<B, 1, Int>::from_primitive(
+            B::prefix_sum_u32_primitive(intersect_counts.into_primitive()).expect("prefix sum"),
+        ),
+    };
     let (tile_id_from_isect, compact_gid_from_isect) = B::map_gaussians_to_intersects_primitive(
         projected_splats.clone().into_primitive().tensor(),
         cum_tiles_hit.into_primitive(),

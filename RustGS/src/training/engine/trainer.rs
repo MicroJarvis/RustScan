@@ -16,8 +16,7 @@ use crate::training::gpu_primitives::device_radix::{
     radix_sort_dispatch_count, radix_sort_workspace_bytes,
 };
 use crate::training::gpu_primitives::prefix_sum::{
-    bind_training_prefix_workspace_ptr, prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
-    PrefixSumWorkspace,
+    prefix_sum_dispatch_count, prefix_sum_workspace_bytes, PrefixSumWorkspace,
 };
 use crate::training::reporting::metrics::{
     step_intersection_overflowed, ParityLossCurveSample, ParityTopologyMetrics,
@@ -753,13 +752,6 @@ impl WgpuTrainer {
         }
 
         self.prefix_sum_workspace.begin_step();
-        // Safety: workspace field is only accessed via TLS during this step; no
-        // overlapping `&mut self.prefix_sum_workspace` Rust borrows.
-        let _prefix_ws_guard = unsafe {
-            bind_training_prefix_workspace_ptr(
-                std::ptr::addr_of_mut!(self.prefix_sum_workspace),
-            )
-        };
 
         let profile_step = log::log_enabled!(log::Level::Debug)
             && (iteration <= 3 || iteration.is_multiple_of(100));
@@ -779,6 +771,7 @@ impl WgpuTrainer {
             self.raster_cov_blur_at(iteration, frame_count),
             self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32)),
             Some((iteration as u32, self.device_status.buffer().clone())),
+            Some(&mut self.prefix_sum_workspace),
         )
         .await;
         self.optimization_samples.record_scan_workspace_stats(
