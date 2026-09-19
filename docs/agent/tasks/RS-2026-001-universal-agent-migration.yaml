@@ -40,6 +40,5 @@ artifacts:
   - docs/agent/review-template.md
 
 known_limitations:
-  - "Stage 2 removal of .codex and historical Superpowers references is not complete."
-  - "scripts/agent checks are not implemented yet."
-next_action: "Review this protocol, then classify and remove tool-specific files in a separate step."
+  - "Historical Superpowers plans still contain old tool-specific wording and require classification before any selective rewrite."
+next_action: "Review the protocol and classify historical plans before the next cleanup checkpoint."

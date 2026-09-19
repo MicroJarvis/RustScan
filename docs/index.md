@@ -32,6 +32,10 @@
 |---|---|
 | [superpowers/plans/2026-08-14-rustsfm-review-hardening.md](superpowers/plans/2026-08-14-rustsfm-review-hardening.md) | Completed build, output, CI, and GPU error-handling hardening record |
 
+The `docs/superpowers/` directory is historical context only. Its old
+tool-specific instructions are not required; current Agent work follows
+[the tool-neutral protocol](agent/README.md).
+
 ## Current RustGS Docs
 
 | Document | Purpose |

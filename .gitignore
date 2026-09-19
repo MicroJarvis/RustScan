@@ -46,11 +46,7 @@ test_data/video/
 # OpenMesh source (external dependency)
 Mirror/
 
-.codex
-.claude
-.gemini
 .github/
-openspec/
 
 # Generated outputs
 /output/
