@@ -27,7 +27,6 @@ use ceres_solver::solver::{
 use ceres_solver::{CostFunctionType, NllsProblem};
 type Quat = nalgebra::UnitQuaternion<f32>;
 type Vec3 = nalgebra::Vector3<f32>;
-use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use nalgebra::SMatrix;
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
@@ -2356,7 +2355,7 @@ mod tests {
     fn image_pose_ambient_jacobian_matches_numeric_ceres_block() {
         let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
         let pose = SE3::from_quat_translation(
-            crate::geometry::quat_from_rotation_y(0.17).normalize(),
+            crate::geometry::quat_from_rotation_y(0.17),
             Vec3::new(0.2, -0.1, 0.05),
         );
         let point = [0.25, -0.1, 2.5];
@@ -2378,11 +2377,11 @@ mod tests {
     fn frame_pose_ambient_jacobian_matches_numeric_ceres_block() {
         let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
         let sensor_pose = SE3::from_quat_translation(
-            crate::geometry::quat_from_rotation_x(-0.11).normalize(),
+            crate::geometry::quat_from_rotation_x(-0.11),
             Vec3::new(0.15, 0.03, -0.02),
         );
         let rig_pose = SE3::from_quat_translation(
-            crate::geometry::quat_from_rotation_y(0.17).normalize(),
+            crate::geometry::quat_from_rotation_y(0.17),
             Vec3::new(0.2, -0.1, 0.05),
         );
         let point = [0.25, -0.1, 2.5];
@@ -2418,11 +2417,11 @@ mod tests {
     fn sensor_pose_ambient_jacobian_matches_numeric_ceres_block() {
         let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
         let sensor_pose = SE3::from_quat_translation(
-            crate::geometry::quat_from_rotation_x(-0.11).normalize(),
+            crate::geometry::quat_from_rotation_x(-0.11),
             Vec3::new(0.15, 0.03, -0.02),
         );
         let rig_pose = SE3::from_quat_translation(
-            crate::geometry::quat_from_rotation_y(0.17).normalize(),
+            crate::geometry::quat_from_rotation_y(0.17),
             Vec3::new(0.2, -0.1, 0.05),
         );
         let point = [0.25, -0.1, 2.5];
