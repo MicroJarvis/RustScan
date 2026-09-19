@@ -36,3 +36,14 @@ No active `openspec/` directory was present. The installed OpenSpec CLI was
 
 The source repository also contained detached, long-lived, and prunable
 worktrees. This migration records them but does not delete or alter them.
+
+Observed at baseline:
+
+```text
+/private/tmp/rustgs-baseline-09f9254       09f9254 detached
+/private/tmp/rustscan-baseline-400e0cb     400e0cb detached, prunable
+.worktrees/gpu-five-point-baseline         f313dbd detached
+.worktrees/gpu-five-point-f32              4a53dc6 branch gpu-five-point-f32
+.worktrees/retry-state-sync                d1d1023 branch codex/retry-state-sync
+.worktrees/rustscan-macos-app              930fbc7 branch feature/rustscan-macos-app
+```

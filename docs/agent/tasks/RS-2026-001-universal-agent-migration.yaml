@@ -10,6 +10,7 @@ goal: "Introduce the tool-neutral Agent protocol without deleting existing tool 
 
 scope:
   - AGENTS.md
+  - README.md
   - docs/agent/
   - docs/index.md
   - .gitignore

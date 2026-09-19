@@ -22,15 +22,10 @@ This README is intentionally brief. Current status lives in a small set of canon
 
 ## Current Verification
 
-RustSFM was verified in this workspace on 2026-08-14:
-
-- Default RustSFM library suite: `709 passed; 0 failed; 19 ignored external-fixture tests`
-- Minimal RustSFM library suite: `581 passed; 0 failed; 19 ignored external-fixture tests`
-- Minimal `sequence_registration` integration suite: `62 passed; 0 failed`
-
-The ignored `real_colmap_sparse_*` tests require the external
-`test_data/flowers2_colmap` fixture, which is not distributed through Git or
-submodules. See the RustSFM README for the explicit parity command.
+The maintained verification snapshot, dates, fixtures, feature flags, and
+limitations are recorded in
+[`docs/current-project-status.md`](./docs/current-project-status.md). This
+README intentionally does not duplicate dated test counts.
 
 ## Documentation
 
