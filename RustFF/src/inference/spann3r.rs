@@ -8,8 +8,8 @@
 
 use crate::inference::procrustes;
 use crate::models::{InferenceConfig, InferenceError, PointmapResult};
-use glam::Mat4;
 use image::DynamicImage;
+use nalgebra::Matrix4;
 
 #[cfg(feature = "onnx-ort")]
 use log::info;
@@ -208,9 +208,9 @@ impl Spann3RInference {
     }
 
     /// Extract camera pose from pointmap via weighted Procrustes alignment
-    fn extract_pose(&self, pointmap: &[[f32; 3]]) -> Mat4 {
+    fn extract_pose(&self, pointmap: &[[f32; 3]]) -> Matrix4<f32> {
         if pointmap.is_empty() {
-            return Mat4::IDENTITY;
+            return Matrix4::identity();
         }
 
         // Generate confidence from pointmap (non-zero points are valid)

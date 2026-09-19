@@ -13,7 +13,7 @@
 
 use crate::connectivity::RustMesh;
 use crate::handles::{FaceHandle, HalfedgeHandle, VertexHandle};
-use glam::Vec3;
+use crate::{Point3, Vec3};
 use std::collections::HashMap;
 
 /// Result type for dualization operations
@@ -134,8 +134,8 @@ pub fn is_dualizable(mesh: &RustMesh) -> bool {
 }
 
 /// Compute the centroid of a face
-fn face_centroid(mesh: &RustMesh, fh: FaceHandle) -> Vec3 {
-    let mut centroid = Vec3::ZERO;
+fn face_centroid(mesh: &RustMesh, fh: FaceHandle) -> Point3 {
+    let mut centroid = Vec3::zeros();
     let mut count = 0;
 
     if let Some(start_heh) = mesh.face_halfedge_handle(fh) {
@@ -143,7 +143,7 @@ fn face_centroid(mesh: &RustMesh, fh: FaceHandle) -> Vec3 {
         loop {
             let vh = mesh.from_vertex_handle(current);
             if let Some(point) = mesh.point(vh) {
-                centroid += point;
+                centroid += point.coords;
                 count += 1;
             }
 
@@ -155,9 +155,9 @@ fn face_centroid(mesh: &RustMesh, fh: FaceHandle) -> Vec3 {
     }
 
     if count > 0 {
-        centroid / count as f32
+        Point3::from(centroid / count as f32)
     } else {
-        Vec3::ZERO
+        Point3::origin()
     }
 }
 
@@ -385,22 +385,22 @@ fn find_next_boundary_halfedge(
 }
 
 /// Compute the centroid of a boundary loop
-fn boundary_loop_centroid(mesh: &RustMesh, loop_hehs: &[HalfedgeHandle]) -> Vec3 {
-    let mut centroid = Vec3::ZERO;
+fn boundary_loop_centroid(mesh: &RustMesh, loop_hehs: &[HalfedgeHandle]) -> Point3 {
+    let mut centroid = Vec3::zeros();
     let mut count = 0;
 
     for heh in loop_hehs {
         let vh = mesh.from_vertex_handle(*heh);
         if let Some(point) = mesh.point(vh) {
-            centroid += point;
+            centroid += point.coords;
             count += 1;
         }
     }
 
     if count > 0 {
-        centroid / count as f32
+        Point3::from(centroid / count as f32)
     } else {
-        Vec3::ZERO
+        Point3::origin()
     }
 }
 
@@ -494,7 +494,7 @@ pub fn dualize(mesh: &mut RustMesh) -> DualResult<()> {
 
     // Step 1: Compute face centroids (these become dual vertices)
     let n_faces = mesh.n_faces();
-    let mut face_centroids: Vec<Vec3> = Vec::with_capacity(n_faces);
+    let mut face_centroids: Vec<Point3> = Vec::with_capacity(n_faces);
     let mut face_centroid_map: HashMap<usize, usize> = HashMap::new(); // original face idx -> dual vertex idx
 
     for fh in mesh.faces() {
@@ -604,7 +604,7 @@ pub fn dual_mesh(mesh: &RustMesh) -> DualResult<RustMesh> {
 
     // Compute face centroids
     let n_faces = mesh.n_faces();
-    let mut face_centroids: Vec<Vec3> = Vec::with_capacity(n_faces);
+    let mut face_centroids: Vec<Point3> = Vec::with_capacity(n_faces);
     let mut face_centroid_map: HashMap<usize, usize> = HashMap::new();
 
     for fh in mesh.faces() {
@@ -740,7 +740,7 @@ fn dualize_virtual_vertex(mesh: &mut RustMesh) -> DualResult<()> {
 
     // Compute face centroids (these become dual vertices for interior faces)
     let n_faces = mesh.n_faces();
-    let mut face_centroids: Vec<Vec3> = Vec::with_capacity(n_faces);
+    let mut face_centroids: Vec<Point3> = Vec::with_capacity(n_faces);
     let mut dual_vertex_from_face: HashMap<usize, usize> = HashMap::new();
 
     for fh in mesh.faces() {
@@ -750,7 +750,7 @@ fn dualize_virtual_vertex(mesh: &mut RustMesh) -> DualResult<()> {
     }
 
     // Compute boundary loop centroids (these become additional dual vertices)
-    let mut boundary_loop_centroids: Vec<Vec3> = Vec::new();
+    let mut boundary_loop_centroids: Vec<Point3> = Vec::new();
     let mut dual_vertex_from_boundary_loop: HashMap<usize, usize> = HashMap::new();
 
     for (loop_idx, loop_hehs) in boundary_loops.iter().enumerate() {
@@ -835,7 +835,7 @@ fn dual_mesh_virtual_vertex(mesh: &RustMesh) -> DualResult<RustMesh> {
     let boundary_loops = find_boundary_loops(mesh);
 
     let n_faces = mesh.n_faces();
-    let mut face_centroids: Vec<Vec3> = Vec::with_capacity(n_faces);
+    let mut face_centroids: Vec<Point3> = Vec::with_capacity(n_faces);
     let mut dual_vertex_from_face: HashMap<usize, usize> = HashMap::new();
 
     for fh in mesh.faces() {
@@ -844,7 +844,7 @@ fn dual_mesh_virtual_vertex(mesh: &RustMesh) -> DualResult<RustMesh> {
         dual_vertex_from_face.insert(fh.idx_usize(), face_centroids.len() - 1);
     }
 
-    let mut boundary_loop_centroids: Vec<Vec3> = Vec::new();
+    let mut boundary_loop_centroids: Vec<Point3> = Vec::new();
     let mut dual_vertex_from_boundary_loop: HashMap<usize, usize> = HashMap::new();
 
     for (loop_idx, loop_hehs) in boundary_loops.iter().enumerate() {
@@ -973,7 +973,7 @@ fn order_dual_vertices_around_vertex(
 fn dualize_skip_boundary(mesh: &mut RustMesh) -> DualResult<()> {
     // Compute face centroids
     let n_faces = mesh.n_faces();
-    let mut face_centroids: Vec<Vec3> = Vec::with_capacity(n_faces);
+    let mut face_centroids: Vec<Point3> = Vec::with_capacity(n_faces);
 
     for fh in mesh.faces() {
         let centroid = face_centroid(mesh, fh);
@@ -1047,7 +1047,7 @@ fn dualize_skip_boundary(mesh: &mut RustMesh) -> DualResult<()> {
 
 fn dual_mesh_skip_boundary(mesh: &RustMesh) -> DualResult<RustMesh> {
     let n_faces = mesh.n_faces();
-    let mut face_centroids: Vec<Vec3> = Vec::with_capacity(n_faces);
+    let mut face_centroids: Vec<Point3> = Vec::with_capacity(n_faces);
 
     for fh in mesh.faces() {
         face_centroids.push(face_centroid(mesh, fh));
@@ -1228,9 +1228,9 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create a simple triangle (3 vertices, 1 face = boundary mesh)
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(0.5, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
 
         // Add a single face - this creates a boundary around it
         mesh.add_face(&[v0, v1, v2]);
@@ -1244,10 +1244,10 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create two triangles sharing an edge
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(0.5, 1.0, 0.0));
-        let v3 = mesh.add_vertex(Vec3::new(1.5, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(1.5, 1.0, 0.0));
 
         // Two triangles sharing edge v1-v2
         mesh.add_face(&[v0, v1, v2]);
@@ -1263,15 +1263,15 @@ mod tests {
 
         // Create two separated triangles
         // Triangle 1
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(0.5, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
 
         // Triangle 2 (separated)
-        let v3 = mesh.add_vertex(Vec3::new(3.0, 0.0, 0.0));
-        let v4 = mesh.add_vertex(Vec3::new(4.0, 0.0, 0.0));
-        let v5 = mesh.add_vertex(Vec3::new(3.5, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(3.0, 0.0, 0.0));
+        let v4 = mesh.add_vertex(Point3::new(4.0, 0.0, 0.0));
+        let v5 = mesh.add_vertex(Point3::new(3.5, 1.0, 0.0));
         mesh.add_face(&[v3, v4, v5]);
 
         mesh

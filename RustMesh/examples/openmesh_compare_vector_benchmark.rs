@@ -1,6 +1,6 @@
+use rustmesh::{RustMesh, Vec3, Vec4};
 mod openmesh_compare_common;
 
-use glam::{Vec3, Vec4};
 use openmesh_compare_common::{openmesh_root, print_header};
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,7 +15,7 @@ fn main() {
     println!("Reference sources:");
     println!("  - Mirror/OpenMesh-11.0.0/src/Benchmark/VectorT.cpp");
     println!("  - Mirror/OpenMesh-11.0.0/src/Benchmark/VectorT_new.cpp");
-    println!("This example benchmarks Rust `glam` against OpenMesh `VectorT` using the same case shapes.");
+    println!("This example benchmarks Rust `nalgebra` against OpenMesh `VectorT` using the same case shapes.");
 
     let rust_cases = run_rust_cases();
     let openmesh_cases = run_openmesh_cases().ok();
@@ -29,11 +29,11 @@ fn main() {
         {
             Some(openmesh_ns) => {
                 println!(
-                    "{name}: RustMesh/glam={rust_ns:.3}, OpenMesh={openmesh_ns:.3}, OpenMesh/RustMesh={:.2}x",
+                    "{name}: RustMesh/nalgebra={rust_ns:.3}, OpenMesh={openmesh_ns:.3}, OpenMesh/RustMesh={:.2}x",
                     openmesh_ns / rust_ns
                 );
             }
-            None => println!("{name}: RustMesh/glam={rust_ns:.3}"),
+            None => println!("{name}: RustMesh/nalgebra={rust_ns:.3}"),
         }
     }
 
@@ -108,8 +108,8 @@ fn run_openmesh_cases() -> std::io::Result<BTreeMap<String, f64>> {
 }
 
 fn bench_vec3_add_compare() -> f64 {
-    let mut v1 = Vec3::ZERO;
-    let mut v2 = Vec3::splat(1000.0);
+    let mut v1 = Vec3::zeros();
+    let mut v2 = Vec3::repeat(1000.0);
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec3::new(1.1, 1.2, 1.3);
@@ -119,64 +119,64 @@ fn bench_vec3_add_compare() -> f64 {
             v2 += v1;
         }
     }
-    std::hint::black_box(v1.length() + v2.length());
+    std::hint::black_box(v1.norm() + v2.norm());
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec3_cross_product() -> f64 {
-    let mut v1 = Vec3::ZERO;
-    let mut v2 = Vec3::splat(1000.0);
+    let mut v1 = Vec3::zeros();
+    let mut v2 = Vec3::repeat(1000.0);
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec3::new(1.1, 1.2, 1.3);
         v2 -= Vec3::new(1.1, 1.2, 1.3);
-        v1 = v1.cross(v2);
+        v1 = v1.cross(&v2);
     }
-    std::hint::black_box(v1.length() + v2.length());
+    std::hint::black_box(v1.norm() + v2.norm());
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec3_scalar_product() -> f64 {
-    let mut v1 = Vec3::ZERO;
-    let mut v2 = Vec3::splat(1000.0);
+    let mut v1 = Vec3::zeros();
+    let mut v2 = Vec3::repeat(1000.0);
     let mut acc = 0.0f32;
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec3::new(1.1, 1.2, 1.3);
         v2 -= Vec3::new(1.1, 1.2, 1.3);
-        acc += v1.dot(v2);
+        acc += v1.dot(&v2);
     }
     std::hint::black_box(acc);
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec3_norm() -> f64 {
-    let mut v1 = Vec3::ZERO;
+    let mut v1 = Vec3::zeros();
     let mut acc = 0.0f32;
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec3::new(1.1, 1.2, 1.3);
-        acc += v1.length();
+        acc += v1.norm();
     }
     std::hint::black_box(acc);
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec3_times_scalar() -> f64 {
-    let mut v1 = Vec3::ONE;
+    let mut v1 = Vec3::repeat(1.0);
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec3::new(1.1, 1.2, 1.3);
         v1 *= 1.0 / v1.x;
         v1 *= v1.y;
     }
-    std::hint::black_box(v1.length());
+    std::hint::black_box(v1.norm());
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec4_add_compare() -> f64 {
-    let mut v1 = Vec4::ZERO;
-    let mut v2 = Vec4::splat(1000.0);
+    let mut v1 = Vec4::zeros();
+    let mut v2 = Vec4::repeat(1000.0);
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec4::new(1.1, 1.2, 1.3, 1.4);
@@ -186,13 +186,13 @@ fn bench_vec4_add_compare() -> f64 {
             v2 += v1;
         }
     }
-    std::hint::black_box(v1.length() + v2.length());
+    std::hint::black_box(v1.norm() + v2.norm());
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec4_add_compare_glam_eq() -> f64 {
-    let mut v1 = Vec4::ZERO;
-    let mut v2 = Vec4::splat(1000.0);
+    let mut v1 = Vec4::zeros();
+    let mut v2 = Vec4::repeat(1000.0);
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec4::new(1.1, 1.2, 1.3, 1.4);
@@ -202,7 +202,7 @@ fn bench_vec4_add_compare_glam_eq() -> f64 {
             v2 += v1;
         }
     }
-    std::hint::black_box(v1.length() + v2.length());
+    std::hint::black_box(v1.norm() + v2.norm());
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
@@ -212,40 +212,40 @@ fn vec4_eq_components(lhs: Vec4, rhs: Vec4) -> bool {
 }
 
 fn bench_vec4_scalar_product() -> f64 {
-    let mut v1 = Vec4::ZERO;
-    let mut v2 = Vec4::splat(1000.0);
+    let mut v1 = Vec4::zeros();
+    let mut v2 = Vec4::repeat(1000.0);
     let mut acc = 0.0f32;
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec4::new(1.1, 1.2, 1.3, 1.4);
         v2 -= Vec4::new(1.1, 1.2, 1.3, 1.4);
-        acc += v1.dot(v2);
+        acc += v1.dot(&v2);
     }
     std::hint::black_box(acc);
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec4_norm() -> f64 {
-    let mut v1 = Vec4::ZERO;
+    let mut v1 = Vec4::zeros();
     let mut acc = 0.0f32;
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec4::new(1.1, 1.2, 1.3, 1.4);
-        acc += v1.length();
+        acc += v1.norm();
     }
     std::hint::black_box(acc);
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 
 fn bench_vec4_times_scalar() -> f64 {
-    let mut v1 = Vec4::ONE;
+    let mut v1 = Vec4::repeat(1.0);
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         v1 += Vec4::new(1.1, 1.2, 1.3, 1.4);
         v1 *= 1.0 / v1.x;
         v1 *= v1.y;
     }
-    std::hint::black_box(v1.length());
+    std::hint::black_box(v1.norm());
     start.elapsed().as_nanos() as f64 / ITERATIONS as f64
 }
 

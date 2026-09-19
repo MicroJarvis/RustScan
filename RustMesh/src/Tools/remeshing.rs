@@ -17,6 +17,7 @@
 //! - Botsch, M., & Kobbelt, L. (2004). "A Remeshing Approach to Multiresolution Modeling".
 //!   Symposium on Geometry Processing.
 
+use crate::{Vec3, Point3};
 use crate::handles::{EdgeHandle, VertexHandle};
 use crate::smoother::{tangential_smooth, SmootherConfig};
 use crate::RustMesh;
@@ -68,7 +69,7 @@ pub fn edge_length_statistics(mesh: &RustMesh) -> EdgeLengthStats {
             let (Some(p0), Some(p1)) = (mesh.point(v0), mesh.point(v1)) else {
                 continue;
             };
-            let length = (p1 - p0).length();
+            let length = (p1 - p0).norm();
             if !length.is_finite() || length <= f32::EPSILON {
                 continue;
             }
@@ -107,7 +108,7 @@ pub fn edge_length_statistics(mesh: &RustMesh) -> EdgeLengthStats {
 pub fn split_long_edges(mesh: &mut RustMesh, max_length: f32) -> usize {
     mesh.garbage_collection();
 
-    let mut edges_to_split: Vec<(VertexHandle, VertexHandle, glam::Vec3)> = Vec::new();
+    let mut edges_to_split: Vec<(VertexHandle, VertexHandle, Vec3)> = Vec::new();
 
     for i in 0..mesh.n_edges() {
         let eh = EdgeHandle::new(i as u32);
@@ -115,7 +116,7 @@ pub fn split_long_edges(mesh: &mut RustMesh, max_length: f32) -> usize {
             let (Some(p0), Some(p1)) = (mesh.point(v0), mesh.point(v1)) else {
                 continue;
             };
-            let length = (p1 - p0).length();
+            let length = (p1 - p0).norm();
             if length > max_length {
                 edges_to_split.push((v0, v1, (p0 + p1) * 0.5));
             }
@@ -164,7 +165,7 @@ pub fn collapse_short_edges(mesh: &mut RustMesh, min_length: f32) -> usize {
         let v1 = mesh.to_vertex_handle(h0);
 
         if let (Some(p0), Some(p1)) = (mesh.point(v0), mesh.point(v1)) {
-            let length = (p1 - p0).length();
+            let length = (p1 - p0).norm();
             if length < min_length {
                 edges_to_collapse.push(eh);
             }
@@ -533,10 +534,10 @@ mod tests {
 
     fn make_two_triangle_patch(width: f32, height: f32) -> RustMesh {
         let mut mesh = RustMesh::new();
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(width, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(width, height, 0.0));
-        let v3 = mesh.add_vertex(glam::vec3(0.0, height, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(width, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(width, height, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, height, 0.0));
         mesh.add_face(&[v0, v1, v2]);
         mesh.add_face(&[v0, v2, v3]);
         mesh
@@ -670,10 +671,10 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create two triangles sharing an edge
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.5, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::vec3(0.5, -1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.5, -1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
         mesh.add_face(&[v0, v3, v1]);
@@ -711,9 +712,9 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create a single triangle (boundary edges)
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.5, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
 
@@ -729,9 +730,9 @@ mod tests {
     fn test_optimal_valence() {
         let mut mesh = RustMesh::new();
 
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.5, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
 

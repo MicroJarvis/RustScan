@@ -391,52 +391,59 @@ pub(super) fn database_frames(
         .map(|image| (image.name.as_str(), image))
         .collect::<HashMap<_, _>>();
 
-    paths
-        .iter()
-        .enumerate()
-        .map(|(id, path)| {
-            let name = path
-                .file_name()
-                .with_context(|| format!("image path has no file name: {}", path.display()))?
-                .to_string_lossy()
-                .into_owned();
-            let database_dimensions = images_by_name
-                .get(name.as_str())
-                .and_then(|image| database.cache.cameras.get(&image.camera_id))
-                .map(|camera| (camera.camera.width, camera.camera.height));
-            let (width, height) = match database_dimensions {
-                Some(dimensions) => dimensions,
-                None => ImageReader::open(path)
-                    .with_context(|| format!("failed to open {}", path.display()))?
-                    .with_guessed_format()
-                    .with_context(|| format!("failed to detect format for {}", path.display()))?
-                    .into_dimensions()
-                    .with_context(|| format!("failed to read dimensions for {}", path.display()))?,
-            };
-            let keypoints = database
-                .keypoints_by_name
-                .get(name.as_str())
-                .cloned()
-                .unwrap_or_default();
-            Ok(ImageFrame {
-                id,
-                name,
-                path: path.clone(),
-                width,
-                height,
-                keypoints,
-                descriptors: rustslam::Descriptors::new(),
-                sift: crate::sift::SiftFeatures::default(),
-                wide_descriptors: crate::wide::WideDescriptors {
-                    data: Vec::new(),
-                    dim: 0,
-                    count: 0,
-                },
-                strong_feature_indices: Vec::new(),
-                colors: Vec::new(),
-            })
-        })
-        .collect()
+    // COLMAP's DatabaseCache only loads match-connected images. Skip files under
+    // image_path that are absent from the cache so frame count, min_model_size,
+    // and multi-model stop conditions stay tied to the database fixture.
+    let mut frames = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .with_context(|| format!("image path has no file name: {}", path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let Some(image) = images_by_name.get(name.as_str()) else {
+            continue;
+        };
+        let (width, height) = database
+            .cache
+            .cameras
+            .get(&image.camera_id)
+            .map(|camera| (camera.camera.width, camera.camera.height))
+            .with_context(|| {
+                format!(
+                    "database image '{}' is missing camera_id={}",
+                    name, image.camera_id
+                )
+            })?;
+        let keypoints = database
+            .keypoints_by_name
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let id = frames.len();
+        frames.push(ImageFrame {
+            id,
+            name,
+            path: path.clone(),
+            width,
+            height,
+            keypoints,
+            descriptors: rustslam::Descriptors::new(),
+            sift: crate::sift::SiftFeatures::default(),
+            wide_descriptors: crate::wide::WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            },
+            strong_feature_indices: Vec::new(),
+            colors: Vec::new(),
+        });
+    }
+    anyhow::ensure!(
+        !frames.is_empty(),
+        "database contains no images that match files under the image path"
+    );
+    Ok(frames)
 }
 
 pub(super) fn database_camera_setup(

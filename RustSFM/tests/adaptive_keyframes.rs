@@ -3,6 +3,7 @@ use rustsfm::database::{
     ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint,
     COLMAP_FEATURE_SIFT,
 };
+use rustsfm::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use rustsfm::types::{CameraModel, COLMAP_PINHOLE};
 use rustsfm::{
     generate_matching_pairs, run_adaptive_keyframe_selection, run_keyframe_reconstruction,
@@ -492,8 +493,8 @@ fn preseed_projected_sift_database(database_path: &Path, frames: &[SequenceFrame
     let poses = (0..frames.len())
         .map(|index| {
             rustslam::SE3::from_quat_translation(
-                glam::Quat::from_rotation_y((index as f32 - 2.5) * 0.012),
-                glam::Vec3::new(index as f32 * -0.11, (index % 2) as f32 * 0.01, 0.0),
+                rustsfm::geometry::quat_from_rotation_y((index as f32 - 2.5) * 0.012),
+                nalgebra::Vector3::new(index as f32 * -0.11, (index % 2) as f32 * 0.01, 0.0),
             )
         })
         .collect::<Vec<_>>();

@@ -5,7 +5,8 @@
 
 use crate::handles::{EdgeHandle, FaceHandle, HalfedgeHandle, VertexHandle};
 use crate::items::{Edge, Face, Halfedge};
-use glam::{Vec2, Vec3, Vec4};
+use crate::{Point3, Vec2, Vec3, Vec4};
+
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
@@ -76,9 +77,9 @@ impl DynamicProperty {
     fn resize(&mut self, size: usize) {
         match self {
             DynamicProperty::Float(v) => v.resize(size, 0.0),
-            DynamicProperty::Vec2(v) => v.resize(size, Vec2::ZERO),
-            DynamicProperty::Vec3(v) => v.resize(size, Vec3::ZERO),
-            DynamicProperty::Vec4(v) => v.resize(size, Vec4::ZERO),
+            DynamicProperty::Vec2(v) => v.resize(size, Vec2::zeros()),
+            DynamicProperty::Vec3(v) => v.resize(size, Vec3::zeros()),
+            DynamicProperty::Vec4(v) => v.resize(size, Vec4::zeros()),
             DynamicProperty::Int(v) => v.resize(size, 0),
         }
     }
@@ -589,7 +590,7 @@ impl AttribSoAKernel {
 
     /// Add a new vertex and return its handle
     #[inline]
-    pub fn add_vertex(&mut self, point: Vec3) -> VertexHandle {
+    pub fn add_vertex(&mut self, point: Point3) -> VertexHandle {
         let idx = self.x.len() as u32;
         self.x.push(point.x);
         self.y.push(point.y);
@@ -598,13 +599,13 @@ impl AttribSoAKernel {
 
         // Resize preset attribute arrays if they exist
         if let Some(ref mut normals) = self.vertex_normals {
-            normals.push(Vec3::ZERO);
+            normals.push(Vec3::zeros());
         }
         if let Some(ref mut colors) = self.vertex_colors {
             colors.push(Vec4::new(1.0, 1.0, 1.0, 1.0));
         }
         if let Some(ref mut texcoords) = self.vertex_texcoords {
-            texcoords.push(Vec2::ZERO);
+            texcoords.push(Vec2::zeros());
         }
 
         self.vertex_props.resize_all(self.x.len());
@@ -666,9 +667,9 @@ impl AttribSoAKernel {
 
     /// Get vertex position by index
     #[inline]
-    pub fn point(&self, idx: usize) -> Option<Vec3> {
+    pub fn point(&self, idx: usize) -> Option<Point3> {
         if idx < self.x.len() {
-            Some(Vec3::new(self.x[idx], self.y[idx], self.z[idx]))
+            Some(Point3::new(self.x[idx], self.y[idx], self.z[idx]))
         } else {
             None
         }
@@ -676,13 +677,13 @@ impl AttribSoAKernel {
 
     /// Get vertex position (unchecked)
     #[inline]
-    pub unsafe fn point_unchecked(&self, idx: usize) -> Vec3 {
-        Vec3::new(self.x[idx], self.y[idx], self.z[idx])
+    pub unsafe fn point_unchecked(&self, idx: usize) -> Point3 {
+        Point3::new(self.x[idx], self.y[idx], self.z[idx])
     }
 
     /// Set vertex position
     #[inline]
-    pub fn set_point(&mut self, idx: usize, point: Vec3) {
+    pub fn set_point(&mut self, idx: usize, point: Point3) {
         if idx < self.x.len() {
             self.x[idx] = point.x;
             self.y[idx] = point.y;
@@ -944,30 +945,30 @@ impl AttribSoAKernel {
     fn resize_halfedge_attrs(&mut self) {
         let size = self.halfedges.len();
         if let Some(ref mut normals) = self.halfedge_normals {
-            normals.resize(size, Vec3::ZERO);
+            normals.resize(size, Vec3::zeros());
         }
         if let Some(ref mut colors) = self.halfedge_colors {
-            colors.resize(size, Vec4::ZERO);
+            colors.resize(size, Vec4::zeros());
         }
         if let Some(ref mut texcoords) = self.halfedge_texcoords {
-            texcoords.resize(size, Vec2::ZERO);
+            texcoords.resize(size, Vec2::zeros());
         }
     }
 
     fn resize_edge_attrs(&mut self) {
         let size = self.edges.len();
         if let Some(ref mut colors) = self.edge_colors {
-            colors.resize(size, Vec4::ZERO);
+            colors.resize(size, Vec4::zeros());
         }
     }
 
     fn resize_face_attrs(&mut self) {
         let size = self.faces.len();
         if let Some(ref mut normals) = self.face_normals {
-            normals.resize(size, Vec3::ZERO);
+            normals.resize(size, Vec3::zeros());
         }
         if let Some(ref mut colors) = self.face_colors {
-            colors.resize(size, Vec4::ZERO);
+            colors.resize(size, Vec4::zeros());
         }
     }
 
@@ -979,7 +980,7 @@ impl AttribSoAKernel {
     pub fn request_vertex_normals(&mut self) {
         if self.vertex_normals.is_none() {
             let size = self.x.len();
-            self.vertex_normals = Some(vec![Vec3::ZERO; size]);
+            self.vertex_normals = Some(vec![Vec3::zeros(); size]);
         }
     }
 
@@ -1037,7 +1038,7 @@ impl AttribSoAKernel {
     pub fn request_vertex_texcoords(&mut self) {
         if self.vertex_texcoords.is_none() {
             let size = self.x.len();
-            self.vertex_texcoords = Some(vec![Vec2::ZERO; size]);
+            self.vertex_texcoords = Some(vec![Vec2::zeros(); size]);
         }
     }
 
@@ -1070,7 +1071,7 @@ impl AttribSoAKernel {
     pub fn request_halfedge_normals(&mut self) {
         if self.halfedge_normals.is_none() {
             let size = self.halfedges.len();
-            self.halfedge_normals = Some(vec![Vec3::ZERO; size]);
+            self.halfedge_normals = Some(vec![Vec3::zeros(); size]);
         }
     }
 
@@ -1099,7 +1100,7 @@ impl AttribSoAKernel {
     pub fn request_halfedge_colors(&mut self) {
         if self.halfedge_colors.is_none() {
             let size = self.halfedges.len();
-            self.halfedge_colors = Some(vec![Vec4::ZERO; size]);
+            self.halfedge_colors = Some(vec![Vec4::zeros(); size]);
         }
     }
 
@@ -1128,7 +1129,7 @@ impl AttribSoAKernel {
     pub fn request_halfedge_texcoords(&mut self) {
         if self.halfedge_texcoords.is_none() {
             let size = self.halfedges.len();
-            self.halfedge_texcoords = Some(vec![Vec2::ZERO; size]);
+            self.halfedge_texcoords = Some(vec![Vec2::zeros(); size]);
         }
     }
 
@@ -1161,7 +1162,7 @@ impl AttribSoAKernel {
     pub fn request_edge_colors(&mut self) {
         if self.edge_colors.is_none() {
             let size = self.edges.len();
-            self.edge_colors = Some(vec![Vec4::ZERO; size]);
+            self.edge_colors = Some(vec![Vec4::zeros(); size]);
         }
     }
 
@@ -1194,7 +1195,7 @@ impl AttribSoAKernel {
     pub fn request_face_normals(&mut self) {
         if self.face_normals.is_none() {
             let size = self.faces.len();
-            self.face_normals = Some(vec![Vec3::ZERO; size]);
+            self.face_normals = Some(vec![Vec3::zeros(); size]);
         }
     }
 
@@ -1223,7 +1224,7 @@ impl AttribSoAKernel {
     pub fn request_face_colors(&mut self) {
         if self.face_colors.is_none() {
             let size = self.faces.len();
-            self.face_colors = Some(vec![Vec4::ZERO; size]);
+            self.face_colors = Some(vec![Vec4::zeros(); size]);
         }
     }
 
@@ -1431,19 +1432,19 @@ mod tests {
     #[test]
     fn test_add_vertex() {
         let mut kernel = AttribSoAKernel::new();
-        let vh = kernel.add_vertex(Vec3::new(1.0, 2.0, 3.0));
+        let vh = kernel.add_vertex(Point3::new(1.0, 2.0, 3.0));
 
         assert_eq!(kernel.n_vertices(), 1);
         assert_eq!(
             kernel.point(vh.idx() as usize),
-            Some(Vec3::new(1.0, 2.0, 3.0))
+            Some(Point3::new(1.0, 2.0, 3.0))
         );
     }
 
     #[test]
     fn test_vertex_attributes() {
         let mut kernel = AttribSoAKernel::new();
-        let vh = kernel.add_vertex(Vec3::new(1.0, 2.0, 3.0));
+        let vh = kernel.add_vertex(Point3::new(1.0, 2.0, 3.0));
 
         // Request and set normals
         kernel.request_vertex_normals();
@@ -1463,7 +1464,7 @@ mod tests {
     #[test]
     fn test_dynamic_property() {
         let mut kernel = AttribSoAKernel::new();
-        let vh = kernel.add_vertex(Vec3::new(1.0, 2.0, 3.0));
+        let vh = kernel.add_vertex(Point3::new(1.0, 2.0, 3.0));
         let prop = kernel.add_vertex_property::<f32>("custom_float");
 
         assert!(kernel.has_vertex_property(prop));
@@ -1476,11 +1477,11 @@ mod tests {
     #[test]
     fn test_vertex_property_auto_resizes() {
         let mut kernel = AttribSoAKernel::new();
-        let first = kernel.add_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let first = kernel.add_vertex(Point3::new(0.0, 0.0, 0.0));
         let quality = kernel.add_vertex_property::<f32>("quality");
         assert!(kernel.set_vertex_property(quality, first, 1.0));
 
-        let second = kernel.add_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let second = kernel.add_vertex(Point3::new(1.0, 0.0, 0.0));
         assert_eq!(kernel.vertex_property(quality, first), Some(1.0));
         assert_eq!(kernel.vertex_property(quality, second), Some(0.0));
     }
@@ -1488,8 +1489,8 @@ mod tests {
     #[test]
     fn test_edge_and_halfedge_properties_auto_resize() {
         let mut kernel = AttribSoAKernel::new();
-        let v0 = kernel.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = kernel.add_vertex(Vec3::new(1.0, 0.0, 0.0));
+        let v0 = kernel.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = kernel.add_vertex(Point3::new(1.0, 0.0, 0.0));
 
         let edge_quality = kernel.add_edge_property::<i32>("edge_quality");
         let halfedge_flow = kernel.add_halfedge_property::<Vec2>("halfedge_flow");
@@ -1509,11 +1510,11 @@ mod tests {
         assert_eq!(kernel.edge_property(edge_quality, eh), Some(0));
         assert_eq!(
             kernel.halfedge_property(halfedge_flow, heh),
-            Some(Vec2::ZERO)
+            Some(Vec2::zeros())
         );
         assert_eq!(
             kernel.halfedge_property(halfedge_flow, opp),
-            Some(Vec2::ZERO)
+            Some(Vec2::zeros())
         );
 
         assert!(kernel.set_edge_property(edge_quality, eh, 7));
@@ -1526,7 +1527,7 @@ mod tests {
         );
         assert_eq!(
             kernel.halfedge_property(halfedge_flow, opp),
-            Some(Vec2::ZERO)
+            Some(Vec2::zeros())
         );
     }
 
@@ -1538,7 +1539,7 @@ mod tests {
 
         assert!(kernel.has_face_property(priority));
         assert_eq!(kernel.face_property_name(priority), Some("priority"));
-        assert_eq!(kernel.face_property(priority, fh), Some(Vec3::ZERO));
+        assert_eq!(kernel.face_property(priority, fh), Some(Vec3::zeros()));
         assert!(kernel.set_face_property(priority, fh, Vec3::new(1.0, 2.0, 3.0)));
         assert_eq!(
             kernel.face_property(priority, fh),

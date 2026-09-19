@@ -1,4 +1,4 @@
-use rustmesh::{QuadricT, Vec3};
+use rustmesh::{Point3, QuadricT};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -16,7 +16,7 @@ fn main() {
 
     // value
     let q = QuadricT::from_plane(0.0, 0.0, 1.0, 0.0);
-    let v = Vec3::new(1.0, 2.0, 3.0);
+    let v = Point3::new(1.0, 2.0, 3.0);
     let start = Instant::now();
     for _ in 0..iterations {
         black_box(q.value(v));

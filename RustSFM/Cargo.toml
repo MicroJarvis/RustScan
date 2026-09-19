@@ -21,11 +21,10 @@ blake3 = "1"
 bytemuck = { version = "1.25", features = ["derive"], optional = true }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
-glam = "0.25"
 image = "0.25"
 log = "0.4"
 lowe-sift = "0.2.1"
-nalgebra = "0.33"
+nalgebra = { workspace = true }
 pollster = { version = "0.3", optional = true }
 rand = "0.8"
 rayon = "1.10"

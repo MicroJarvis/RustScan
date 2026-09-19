@@ -4,36 +4,36 @@ use openmesh_compare_common::{
     measure, mesh_digest, print_duration_compare, print_header, print_mesh_digest,
 };
 use rustmesh::{
-    generate_noisy_sphere, laplace_smooth, RustMesh, SmootherConfig, Vec3, VertexHandle,
+    generate_noisy_sphere, laplace_smooth, Point3, RustMesh, SmootherConfig, Vec3, VertexHandle,
 };
 use std::time::Duration;
 
 fn tutorial_style_smooth(mesh: &mut RustMesh, iterations: usize) {
     let vhs: Vec<VertexHandle> = mesh.vertices().collect();
-    let mut next_positions = vec![Vec3::ZERO; vhs.len()];
+    let mut next_positions = vec![Point3::origin(); vhs.len()];
 
     for _ in 0..iterations {
         for (i, &vh) in vhs.iter().enumerate() {
-            let current = mesh.point(vh).unwrap_or(Vec3::ZERO);
+            let current = mesh.point(vh).unwrap_or(Point3::origin());
             next_positions[i] = current;
 
             if is_boundary_vertex(mesh, vh) {
                 continue;
             }
 
-            let mut neighbor_sum = Vec3::ZERO;
+            let mut neighbor_sum = Vec3::zeros();
             let mut neighbor_count = 0usize;
             if let Some(vv) = mesh.vertex_vertices(vh) {
                 for neighbor in vv {
                     if let Some(point) = mesh.point(neighbor) {
-                        neighbor_sum += point;
+                        neighbor_sum += point.coords;
                         neighbor_count += 1;
                     }
                 }
             }
 
             if neighbor_count > 0 {
-                next_positions[i] = neighbor_sum / neighbor_count as f32;
+                next_positions[i] = Point3::from(neighbor_sum / neighbor_count as f32);
             }
         }
 
@@ -64,7 +64,7 @@ fn max_position_delta(lhs: &RustMesh, rhs: &RustMesh) -> f32 {
         let Some(rp) = rhs.point(VertexHandle::from_usize(idx)) else {
             continue;
         };
-        max_delta = max_delta.max((lp - rp).length());
+        max_delta = max_delta.max((lp - rp).norm());
     }
     max_delta
 }

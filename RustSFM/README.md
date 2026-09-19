@@ -320,11 +320,16 @@ cargo test -p rustsfm --release --lib
 Existing clones can also run `./scripts/setup_rustsfm_deps.sh` to bootstrap
 RustSFM's native dependencies. The dependency-minimal library still compiles,
 but bundle adjustment is unavailable without `ceres-ba` and SIFT matching is
-unavailable without `gpu-wgpu`; this configuration is a compile gate, not a
-full pipeline test:
+unavailable without `gpu-wgpu`. A missing GPU feature returns
+`SIFT matching requires RustSFM to be compiled with the gpu-wgpu feature`;
+it does not fall back to a CPU matcher or an empty result. `--no-default-features`
+is a compile gate, not a full pipeline test. Matching and sequence tests that
+need a real adapter must enable `gpu-wgpu` and `vlfeat-sift` explicitly:
 
 ```bash
-cargo check -p rustsfm --release --lib --no-default-features
+cargo check -p rustsfm --release --no-default-features --all-targets
+cargo test -p rustsfm --lib --features gpu-wgpu,vlfeat-sift -- --test-threads=1
+cargo test -p rustsfm --test sequence_registration --features gpu-wgpu,vlfeat-sift -- --test-threads=1
 ```
 
 The `real_colmap_sparse_*` parity tests require a compatible external

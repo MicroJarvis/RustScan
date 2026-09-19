@@ -1,3 +1,4 @@
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use anyhow::{bail, Context, Result};
 use lowe_sift::Descriptor;
 use rayon::prelude::*;
@@ -798,7 +799,6 @@ pub fn match_sift_guided_with_options(
     matches
 }
 
-
 fn epipolar_line_distance_px(point: (f32, f32), line: (f64, f64, f64)) -> f32 {
     let (a, b, c) = line;
     let numerator = (a * point.0 as f64 + b * point.1 as f64 + c).abs();
@@ -1281,6 +1281,7 @@ mod tests {
         bytes
     }
 
+    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
     #[test]
     fn vlfeat_profiling_preserves_feature_bits() -> Result<()> {
         // Odd rectangular dimensions exercise convolution tails and asymmetric
@@ -1361,6 +1362,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
     #[test]
     fn profiled_grayscale_extraction_reports_nested_sift_stages() -> Result<()> {
         let width = 256u32;

@@ -10,12 +10,16 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
-use glam::{Mat3, Mat4, Vec3, Vec4};
+use nalgebra::{Matrix3, Matrix4, Point3, Vector3};
 use rustscan_types::colmap::{
     colmap_camera_model_by_id, colmap_camera_model_by_name, ColmapCameraModelSpec, COLMAP_PINHOLE,
     COLMAP_SIMPLE_PINHOLE,
 };
 
+use crate::core::matrix::{
+    homogeneous_from_linear_translation, matrix3_from_quat, quat_from_matrix3, rotate_vec3,
+    se3_to_homogeneous_matrix,
+};
 use crate::{Intrinsics, ScenePose, TrainingDataset, TrainingError, SE3};
 
 /// Configuration for loading a COLMAP dataset.
@@ -154,9 +158,9 @@ pub fn load_colmap_dataset(
     let intrinsics = pinhole_intrinsics(camera)?;
 
     let mut poses: Vec<SE3> = images.iter().map(scene_pose_from_colmap_image).collect();
-    let mut point_positions: Vec<Vec3> = points
+    let mut point_positions: Vec<Vector3<f32>> = points
         .iter()
-        .map(|point| Vec3::new(point.x as f32, point.y as f32, point.z as f32))
+        .map(|point| Vector3::new(point.x as f32, point.y as f32, point.z as f32))
         .collect();
 
     if config.normalize_world_space {
@@ -462,7 +466,7 @@ fn image_name_from_header(line: &str) -> Option<String> {
     None
 }
 
-fn normalize_world_space(poses: &mut [SE3], points: &mut [Vec3]) {
+fn normalize_world_space(poses: &mut [SE3], points: &mut [Vector3<f32>]) {
     if poses.is_empty() || points.is_empty() {
         return;
     }
@@ -478,104 +482,111 @@ fn normalize_world_space(poses: &mut [SE3], points: &mut [Vec3]) {
     let z_median = median(points.iter().map(|point| point.z).collect());
     let z_mean = points.iter().map(|point| point.z).sum::<f32>() / points.len() as f32;
     if z_median > z_mean {
-        let flip = Mat4::from_cols(
-            Vec4::new(1.0, 0.0, 0.0, 0.0),
-            Vec4::new(0.0, -1.0, 0.0, 0.0),
-            Vec4::new(0.0, 0.0, -1.0, 0.0),
-            Vec4::new(0.0, 0.0, 0.0, 1.0),
+        let flip = Matrix4::new(
+            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         );
         transform_poses(flip, poses);
         transform_points(flip, points);
     }
 }
 
-fn transform_poses(transform: Mat4, poses: &mut [SE3]) {
+fn transform_poses(transform: Matrix4<f32>, poses: &mut [SE3]) {
     for pose in poses {
-        let transformed = transform * se3_to_mat4(*pose);
-        let scale = transformed.x_axis.truncate().length();
+        let transformed = transform * se3_to_homogeneous_matrix(*pose);
+        let scale = Vector3::new(
+            transformed[(0, 0)],
+            transformed[(1, 0)],
+            transformed[(2, 0)],
+        )
+        .norm();
         let inv_scale = if scale > 1e-12 { scale.recip() } else { 1.0 };
-        let rotation = Mat3::from_cols(
-            transformed.x_axis.truncate() * inv_scale,
-            transformed.y_axis.truncate() * inv_scale,
-            transformed.z_axis.truncate() * inv_scale,
+        let rotation = Matrix3::from_columns(&[
+            Vector3::new(
+                transformed[(0, 0)],
+                transformed[(1, 0)],
+                transformed[(2, 0)],
+            ) * inv_scale,
+            Vector3::new(
+                transformed[(0, 1)],
+                transformed[(1, 1)],
+                transformed[(2, 1)],
+            ) * inv_scale,
+            Vector3::new(
+                transformed[(0, 2)],
+                transformed[(1, 2)],
+                transformed[(2, 2)],
+            ) * inv_scale,
+        ]);
+        let translation = Vector3::new(
+            transformed[(0, 3)],
+            transformed[(1, 3)],
+            transformed[(2, 3)],
         );
-        let translation = transformed.w_axis.truncate();
-        *pose = SE3::from_quat_translation(glam::Quat::from_mat3(&rotation), translation);
+        *pose = SE3::from_quat_translation(quat_from_matrix3(&rotation), translation);
     }
 }
 
-fn transform_points(transform: Mat4, points: &mut [Vec3]) {
-    let linear = Mat3::from_cols(
-        transform.x_axis.truncate(),
-        transform.y_axis.truncate(),
-        transform.z_axis.truncate(),
-    );
-    let translation = transform.w_axis.truncate();
+fn transform_points(transform: Matrix4<f32>, points: &mut [Vector3<f32>]) {
     for point in points {
-        *point = linear * *point + translation;
+        let transformed = transform * nalgebra::Vector4::new(point.x, point.y, point.z, 1.0);
+        *point = Vector3::new(transformed.x, transformed.y, transformed.z);
     }
 }
 
-fn se3_to_mat4(pose: SE3) -> Mat4 {
-    Mat4::from_rotation_translation(pose.quat(), pose.vec())
-}
-
-fn similarity_from_cameras(poses: &[SE3]) -> Mat4 {
+fn similarity_from_cameras(poses: &[SE3]) -> Matrix4<f32> {
     let mut positions = Vec::with_capacity(poses.len());
     let mut ups = Vec::with_capacity(poses.len());
     let mut forwards = Vec::with_capacity(poses.len());
 
     for pose in poses {
-        let rotation = Mat3::from_quat(pose.quat());
+        let rotation = matrix3_from_quat(pose.quat());
         positions.push(pose.vec());
-        ups.push(rotation * Vec3::new(0.0, -1.0, 0.0));
-        forwards.push(rotation * Vec3::new(0.0, 0.0, 1.0));
+        ups.push(rotate_vec3(rotation, Vector3::new(0.0, -1.0, 0.0)));
+        forwards.push(rotate_vec3(rotation, Vector3::new(0.0, 0.0, 1.0)));
     }
 
-    let mut world_up = Vec3::ZERO;
+    let mut world_up = Vector3::zeros();
     for up in &ups {
         world_up += *up;
     }
     world_up /= ups.len() as f32;
     world_up = world_up
-        .try_normalize()
-        .unwrap_or(Vec3::new(0.0, -1.0, 0.0));
+        .try_normalize(f32::EPSILON)
+        .unwrap_or_else(Vector3::zeros);
 
-    let up_camspace = Vec3::new(0.0, -1.0, 0.0);
-    let c = up_camspace.dot(world_up);
-    let cross = world_up.cross(up_camspace);
+    let up_camspace = Vector3::new(0.0, -1.0, 0.0);
+    let c = up_camspace.dot(&world_up);
+    let cross = world_up.cross(&up_camspace);
     let align = if c > -1.0 {
-        let skew = Mat3::from_cols(
-            Vec3::new(0.0, -cross.z, cross.y),
-            Vec3::new(cross.z, 0.0, -cross.x),
-            Vec3::new(-cross.y, cross.x, 0.0),
+        let skew = Matrix3::new(
+            0.0, -cross.z, cross.y, cross.z, 0.0, -cross.x, -cross.y, cross.x, 0.0,
         );
-        Mat3::IDENTITY + skew + (skew * skew) * (1.0 / (1.0 + c))
+        Matrix3::identity() + skew + (skew * skew) * (1.0 / (1.0 + c))
     } else {
-        Mat3::from_cols(
-            Vec3::new(-1.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
-        )
+        Matrix3::from_columns(&[
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ])
     };
 
     for position in &mut positions {
-        *position = align * *position;
+        *position = rotate_vec3(align, *position);
     }
     for forward in &mut forwards {
-        *forward = align * *forward;
+        *forward = rotate_vec3(align, *forward);
     }
 
-    let nearest_points: Vec<Vec3> = positions
+    let nearest_points: Vec<Vector3<f32>> = positions
         .iter()
         .zip(forwards.iter())
-        .map(|(position, forward)| *position + (-*position).dot(*forward) * *forward)
+        .map(|(position, forward)| *position + (-*position).dot(forward) * *forward)
         .collect();
     let translate = -median_vec3(&nearest_points);
 
     let distances: Vec<f32> = positions
         .iter()
-        .map(|position| (*position + translate).length())
+        .map(|position| (*position + translate).norm())
         .collect();
     let median_distance = median(distances);
     let scale = if median_distance > 1e-12 {
@@ -584,49 +595,32 @@ fn similarity_from_cameras(poses: &[SE3]) -> Mat4 {
         1.0
     };
 
-    Mat4::from_cols(
-        (align.x_axis * scale).extend(0.0),
-        (align.y_axis * scale).extend(0.0),
-        (align.z_axis * scale).extend(0.0),
-        (translate * scale).extend(1.0),
-    )
+    homogeneous_from_linear_translation(align * scale, translate * scale)
 }
 
-fn align_principal_axes(points: &[Vec3]) -> Mat4 {
+fn align_principal_axes(points: &[Vector3<f32>]) -> Matrix4<f32> {
     if points.is_empty() {
-        return Mat4::IDENTITY;
+        return Matrix4::identity();
     }
 
     let centroid = median_vec3(points);
-    let mut covariance = [[0.0_f64; 3]; 3];
-    let mut mean = [0.0_f64; 3];
+    let mut covariance = Matrix3::<f64>::zeros();
+    let mut mean = Vector3::<f64>::zeros();
 
     for point in points {
-        let translated = [
+        let translated = Vector3::new(
             (point.x - centroid.x) as f64,
             (point.y - centroid.y) as f64,
             (point.z - centroid.z) as f64,
-        ];
-        for i in 0..3 {
-            mean[i] += translated[i];
-            for j in 0..3 {
-                covariance[i][j] += translated[i] * translated[j];
-            }
-        }
+        );
+        mean += translated;
+        covariance += translated * translated.transpose();
     }
 
     let denom = points.len().saturating_sub(1).max(1) as f64;
-    for (mean_value, covariance_row) in mean.iter_mut().zip(covariance.iter_mut()) {
-        *mean_value /= points.len() as f64;
-        for covariance_value in covariance_row {
-            *covariance_value /= denom;
-        }
-    }
-    for (i, covariance_row) in covariance.iter_mut().enumerate() {
-        for (j, covariance_value) in covariance_row.iter_mut().enumerate() {
-            *covariance_value -= mean[i] * mean[j];
-        }
-    }
+    mean /= points.len() as f64;
+    covariance /= denom;
+    covariance -= mean * mean.transpose();
 
     let (eigenvectors, eigenvalues) = jacobi_eigen_3x3(covariance);
     let mut order = [0usize, 1, 2];
@@ -637,38 +631,33 @@ fn align_principal_axes(points: &[Vec3]) -> Mat4 {
     });
 
     let mut eigen_cols = [
-        vec3_from_f64_col(eigenvectors, order[0]),
-        vec3_from_f64_col(eigenvectors, order[1]),
-        vec3_from_f64_col(eigenvectors, order[2]),
+        vec3_from_f64_col(&eigenvectors, order[0]),
+        vec3_from_f64_col(&eigenvectors, order[1]),
+        vec3_from_f64_col(&eigenvectors, order[2]),
     ];
-    if eigen_cols[0].cross(eigen_cols[1]).dot(eigen_cols[2]) < 0.0 {
+    if eigen_cols[0].cross(&eigen_cols[1]).dot(&eigen_cols[2]) < 0.0 {
         eigen_cols[0] = -eigen_cols[0];
     }
 
-    let eigen = Mat3::from_cols(eigen_cols[0], eigen_cols[1], eigen_cols[2]);
+    let eigen = Matrix3::from_columns(&[
+        Vector3::new(eigen_cols[0].x, eigen_cols[0].y, eigen_cols[0].z),
+        Vector3::new(eigen_cols[1].x, eigen_cols[1].y, eigen_cols[1].z),
+        Vector3::new(eigen_cols[2].x, eigen_cols[2].y, eigen_cols[2].z),
+    ]);
     let rotation = eigen.transpose();
-    let translation = -(rotation * centroid);
-    Mat4::from_cols(
-        rotation.x_axis.extend(0.0),
-        rotation.y_axis.extend(0.0),
-        rotation.z_axis.extend(0.0),
-        translation.extend(1.0),
-    )
+    homogeneous_from_linear_translation(rotation, -rotate_vec3(rotation, centroid))
 }
 
-fn jacobi_eigen_3x3(mut a: [[f64; 3]; 3]) -> ([[f64; 3]; 3], [f32; 3]) {
-    let mut eigenvectors = [[0.0_f64; 3]; 3];
-    for (i, row) in eigenvectors.iter_mut().enumerate() {
-        row[i] = 1.0;
-    }
+fn jacobi_eigen_3x3(mut a: Matrix3<f64>) -> (Matrix3<f64>, [f32; 3]) {
+    let mut eigenvectors = Matrix3::<f64>::identity();
 
     for _ in 0..12 {
         let mut p = 0usize;
         let mut q = 1usize;
-        let mut max_off_diag = a[0][1].abs();
-        for (i, row) in a.iter().enumerate() {
-            for (j, entry) in row.iter().enumerate().skip(i + 1) {
-                let value = entry.abs();
+        let mut max_off_diag = a[(0, 1)].abs();
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                let value = a[(i, j)].abs();
                 if value > max_off_diag {
                     max_off_diag = value;
                     p = i;
@@ -680,61 +669,38 @@ fn jacobi_eigen_3x3(mut a: [[f64; 3]; 3]) -> ([[f64; 3]; 3], [f32; 3]) {
             break;
         }
 
-        let theta = 0.5 * (2.0 * a[p][q]).atan2(a[q][q] - a[p][p]);
+        let theta = 0.5 * (2.0 * a[(p, q)]).atan2(a[(q, q)] - a[(p, p)]);
         let c = theta.cos();
         let s = theta.sin();
 
-        let mut g = [[0.0_f64; 3]; 3];
-        for (i, row) in g.iter_mut().enumerate() {
-            row[i] = 1.0;
-        }
-        g[p][p] = c;
-        g[p][q] = -s;
-        g[q][p] = s;
-        g[q][q] = c;
+        let mut g = Matrix3::<f64>::identity();
+        g[(p, p)] = c;
+        g[(p, q)] = -s;
+        g[(q, p)] = s;
+        g[(q, q)] = c;
 
-        a = mat3_mul(mat3_mul(mat3_transpose(g), a), g);
-        eigenvectors = mat3_mul(eigenvectors, g);
+        a = g.transpose() * a * g;
+        eigenvectors *= g;
     }
 
     (
         eigenvectors,
-        [a[0][0] as f32, a[1][1] as f32, a[2][2] as f32],
+        [a[(0, 0)] as f32, a[(1, 1)] as f32, a[(2, 2)] as f32],
     )
 }
 
-fn vec3_from_f64_col(matrix: [[f64; 3]; 3], col: usize) -> Vec3 {
-    Vec3::new(
-        matrix[0][col] as f32,
-        matrix[1][col] as f32,
-        matrix[2][col] as f32,
-    )
-    .normalize_or_zero()
+fn vec3_from_f64_col(matrix: &Matrix3<f64>, col: usize) -> Vector3<f32> {
+    let column = matrix.column(col);
+    Vector3::new(column[0] as f32, column[1] as f32, column[2] as f32)
+        .try_normalize(f32::EPSILON)
+        .unwrap_or_else(Vector3::zeros)
 }
 
-fn mat3_transpose(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    [
-        [matrix[0][0], matrix[1][0], matrix[2][0]],
-        [matrix[0][1], matrix[1][1], matrix[2][1]],
-        [matrix[0][2], matrix[1][2], matrix[2][2]],
-    ]
-}
-
-fn mat3_mul(lhs: [[f64; 3]; 3], rhs: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut out = [[0.0_f64; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            out[i][j] = lhs[i][0] * rhs[0][j] + lhs[i][1] * rhs[1][j] + lhs[i][2] * rhs[2][j];
-        }
-    }
-    out
-}
-
-fn median_vec3(values: &[Vec3]) -> Vec3 {
+fn median_vec3(values: &[Vector3<f32>]) -> Vector3<f32> {
     if values.is_empty() {
-        return Vec3::ZERO;
+        return Vector3::zeros();
     }
-    Vec3::new(
+    Vector3::new(
         median(values.iter().map(|value| value.x).collect()),
         median(values.iter().map(|value| value.y).collect()),
         median(values.iter().map(|value| value.z).collect()),
@@ -1538,5 +1504,89 @@ mod tests {
             Intrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480)
         );
         assert_eq!(dataset.initial_points[0].0, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn transform_points_applies_non_symmetric_homogeneous_matrix() {
+        let transform = Matrix4::new(
+            0.8, 0.1, 0.2, 1.5, -0.2, 0.9, 0.05, -2.0, 0.1, -0.15, 1.1, 0.75, 0.0, 0.0, 0.0, 1.0,
+        );
+        let mut points = [Vector3::new(1.1, -0.4, 3.2)];
+        transform_points(transform, &mut points);
+        let expected = transform * nalgebra::Vector4::new(1.1, -0.4, 3.2, 1.0);
+        assert!((points[0].x - expected.x).abs() < 1e-6);
+        assert!((points[0].y - expected.y).abs() < 1e-6);
+        assert!((points[0].z - expected.z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transform_poses_matches_normalized_similarity_product() {
+        let rotation = rustscan_types::Rotation3f::from_euler_angles(0.2, -0.3, 0.4);
+        let pose = SE3::from_quat_translation(rotation, Vector3::new(0.5, -1.25, 2.0));
+        let sim_rotation = nalgebra::Rotation3::from_euler_angles(0.15, -0.25, 0.35);
+        let transform = homogeneous_from_linear_translation(
+            sim_rotation.into_inner() * 1.7,
+            Vector3::new(1.25, -2.5, 3.75),
+        );
+
+        let product = transform * se3_to_homogeneous_matrix(pose);
+        let scale = Vector3::new(product[(0, 0)], product[(1, 0)], product[(2, 0)]).norm();
+        let inv_scale = scale.recip();
+        let expected_rotation = Matrix3::from_columns(&[
+            Vector3::new(product[(0, 0)], product[(1, 0)], product[(2, 0)]) * inv_scale,
+            Vector3::new(product[(0, 1)], product[(1, 1)], product[(2, 1)]) * inv_scale,
+            Vector3::new(product[(0, 2)], product[(1, 2)], product[(2, 2)]) * inv_scale,
+        ]);
+        let expected_translation = Vector3::new(product[(0, 3)], product[(1, 3)], product[(2, 3)]);
+
+        let mut poses = [pose];
+        transform_poses(transform, &mut poses);
+        let actual = se3_to_homogeneous_matrix(poses[0]);
+
+        for col in 0..3 {
+            for row in 0..3 {
+                assert!(
+                    (actual[(row, col)] - expected_rotation[(row, col)]).abs() < 1e-5,
+                    "rotation mismatch at ({row}, {col})"
+                );
+            }
+        }
+        assert!((poses[0].vec() - expected_translation).norm() < 1e-5);
+    }
+
+    #[test]
+    fn similarity_transform_preserves_camera_projection_ratio() {
+        let rotation = rustscan_types::Rotation3f::from_euler_angles(0.2, -0.3, 0.4);
+        let pose = SE3::from_quat_translation(rotation, Vector3::new(0.5, -1.25, 2.0));
+        let point = Vector3::new(1.1, -0.4, 3.2);
+        let camera_before = pose
+            .inverse()
+            .transform_point3(Point3::new(point.x, point.y, point.z));
+
+        let sim_rotation = nalgebra::Rotation3::from_euler_angles(0.15, -0.25, 0.35);
+        let transform = homogeneous_from_linear_translation(
+            sim_rotation.into_inner() * 1.7,
+            Vector3::new(1.25, -2.5, 3.75),
+        );
+
+        let mut poses = [pose];
+        let mut points = [point];
+        transform_poses(transform, &mut poses);
+        transform_points(transform, &mut points);
+
+        let camera_after =
+            poses[0]
+                .inverse()
+                .transform_point3(Point3::new(points[0].x, points[0].y, points[0].z));
+        let ratio_before = [
+            camera_before.x / camera_before.z,
+            camera_before.y / camera_before.z,
+        ];
+        let ratio_after = [
+            camera_after.x / camera_after.z,
+            camera_after.y / camera_after.z,
+        ];
+        assert!((ratio_before[0] - ratio_after[0]).abs() < 1e-4);
+        assert!((ratio_before[1] - ratio_after[1]).abs() < 1e-4);
     }
 }

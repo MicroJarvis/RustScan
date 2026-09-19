@@ -4,7 +4,10 @@ use crate::database::{
     ColmapDatabase, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint, ColmapTwoViewGeometry,
 };
 use crate::feature_matching::{generate_matching_pairs, MatchingPairStrategy};
-use crate::geometry::{estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions};
+use crate::geometry::{
+    estimate_pair_geometry_with_options_and_cameras, PairEstimationOptions, UnitQuatNormalize,
+    Vec3GlamExt,
+};
 use crate::gpu::WgpuGeometryTiming;
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::{WgpuContext, WgpuModelScorer, WgpuSiftMatcher, WgpuSiftMatcherTiming};
@@ -2339,48 +2342,41 @@ fn cap_guided_densify_matches(
 ) -> (Vec<rustslam::Match>, Vec<rustslam::Match>) {
     const MIN_CAP: usize = 768;
     const ABS_CAP: usize = 1280;
-    let inlier_cap = baseline_inliers
-        .saturating_mul(2)
-        .max(MIN_CAP)
-        .min(ABS_CAP);
+    let inlier_cap = baseline_inliers.saturating_mul(2).max(MIN_CAP).min(ABS_CAP);
     // Keep match list close to inlier set — reconstruct loads every match.
     let match_cap = inlier_cap;
 
     let mut inliers = densified_inliers;
     if inliers.len() > inlier_cap {
-        inliers.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.query_idx.cmp(&b.query_idx))
-                .then_with(|| a.train_idx.cmp(&b.train_idx))
-        });
+        sort_matches_by_descriptor_distance(&mut inliers);
         inliers.truncate(inlier_cap);
     }
 
-    let mut matches = guided;
-    if matches.len() > match_cap {
-        matches.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.query_idx.cmp(&b.query_idx))
-                .then_with(|| a.train_idx.cmp(&b.train_idx))
-        });
-        matches.truncate(match_cap);
-    }
-
-    // Ensure every kept inlier is also present in the match list.
-    let match_keys: std::collections::HashSet<(u32, u32)> = matches
-        .iter()
-        .map(|m| (m.query_idx, m.train_idx))
+    // Reserve the cap for kept inliers first. Filling the best guided matches
+    // and then appending missing inliers can push the list well past ABS_CAP.
+    let inlier_keys: std::collections::HashSet<(u32, u32)> =
+        inliers.iter().map(|m| (m.query_idx, m.train_idx)).collect();
+    let mut extras: Vec<rustslam::Match> = guided
+        .into_iter()
+        .filter(|m| !inlier_keys.contains(&(m.query_idx, m.train_idx)))
         .collect();
-    for m in &inliers {
-        if !match_keys.contains(&(m.query_idx, m.train_idx)) {
-            matches.push(m.clone());
-        }
-    }
+    sort_matches_by_descriptor_distance(&mut extras);
+
+    let mut matches = Vec::with_capacity(match_cap.min(inliers.len() + extras.len()));
+    matches.extend(inliers.iter().cloned());
+    let room = match_cap.saturating_sub(matches.len());
+    matches.extend(extras.into_iter().take(room));
     (matches, inliers)
+}
+
+fn sort_matches_by_descriptor_distance(matches: &mut [rustslam::Match]) {
+    matches.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.query_idx.cmp(&b.query_idx))
+            .then_with(|| a.train_idx.cmp(&b.train_idx))
+    });
 }
 
 /// Build vocabulary-tree candidate pairs from the in-memory frame descriptors.
@@ -2546,6 +2542,73 @@ mod tests {
         assert_eq!(MatchFeaturesOptions::default().task_pair_batch_size, 32);
     }
 
+    #[cfg(not(feature = "gpu-wgpu"))]
+    #[test]
+    fn matching_without_gpu_feature_returns_typed_error() {
+        let error = match_features_to_database(
+            std::path::Path::new("missing.db"),
+            &MatchFeaturesOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "SIFT matching requires RustSFM to be compiled with the gpu-wgpu feature"
+            ),
+            "{error:#}"
+        );
+    }
+
+    fn densify_match(query_idx: u32, distance: f32) -> rustslam::Match {
+        rustslam::Match {
+            query_idx,
+            train_idx: query_idx,
+            distance,
+        }
+    }
+
+    #[test]
+    fn guided_densify_cap_keeps_inliers_without_exceeding_absolute_limit() {
+        let guided: Vec<_> = (0..3000)
+            .map(|idx| densify_match(idx, idx as f32))
+            .collect();
+        // Weak descriptor scores: these inliers are past the first 1280 guided matches.
+        let densified_inliers: Vec<_> = (1280..3000)
+            .map(|idx| densify_match(idx, idx as f32))
+            .collect();
+
+        let (matches, inliers) = cap_guided_densify_matches(guided, densified_inliers, 1000);
+
+        assert_eq!(inliers.len(), 1280);
+        assert_eq!(matches.len(), 1280);
+        let match_keys: std::collections::HashSet<_> =
+            matches.iter().map(|m| (m.query_idx, m.train_idx)).collect();
+        for inlier in &inliers {
+            assert!(match_keys.contains(&(inlier.query_idx, inlier.train_idx)));
+        }
+    }
+
+    #[test]
+    fn guided_densify_cap_fills_leftover_slots_with_closest_non_inliers() {
+        let guided: Vec<_> = (0..2000)
+            .map(|idx| densify_match(idx, idx as f32))
+            .collect();
+        let densified_inliers: Vec<_> = (1900..2000)
+            .map(|idx| densify_match(idx, idx as f32))
+            .collect();
+
+        let (matches, inliers) = cap_guided_densify_matches(guided, densified_inliers, 100);
+
+        assert_eq!(inliers.len(), 100);
+        assert_eq!(matches.len(), 768);
+        let match_keys: std::collections::HashSet<_> =
+            matches.iter().map(|m| (m.query_idx, m.train_idx)).collect();
+        for inlier in &inliers {
+            assert!(match_keys.contains(&(inlier.query_idx, inlier.train_idx)));
+        }
+        assert!(match_keys.contains(&(0, 0)));
+        assert!(!match_keys.contains(&(700, 700)));
+    }
+
     #[test]
     fn match_feature_timing_defaults_when_deserializing_legacy_report() -> Result<()> {
         let report: MatchFeaturesReport = serde_json::from_value(serde_json::json!({
@@ -2567,6 +2630,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn match_feature_timing_counts_attempted_pairs_and_committed_batches() -> Result<()> {
         for batch_size in [1, 2] {
@@ -2836,6 +2900,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_matching_reports_bounded_pair_progress() -> Result<()> {
         use crate::task::{
@@ -2887,6 +2952,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_computed_matching_cancel_keeps_exactly_first_batch() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
@@ -2925,6 +2991,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_computed_matching_uses_bounded_progress_batches() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent};
@@ -2960,6 +3027,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_explicit_matching_session_reuses_only_requested_database_pairs() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent};
@@ -3061,6 +3129,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn gpu_only_matching_ignores_legacy_fifo_trace_control() -> Result<()> {
         let _env_guard = MATCHING_ENV_LOCK
@@ -3088,6 +3157,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn gpu_only_matching_ignores_legacy_fifo_replay_control() -> Result<()> {
         let _env_guard = MATCHING_ENV_LOCK
@@ -3137,6 +3207,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_live_fifo_cancel_commits_only_first_prefix() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
@@ -3178,6 +3249,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_replay_fifo_cancel_commits_only_first_prefix() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
@@ -3222,6 +3294,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_matching_pause_keeps_only_committed_pair_prefix() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent, SfmTaskStop};
@@ -3260,6 +3333,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_matching_rolls_back_failed_batch_and_keeps_prior_batch() -> Result<()> {
         use crate::correspondence_graph::image_pair_to_pair_id;
@@ -3303,6 +3377,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn controlled_matching_zero_batch_size_behaves_as_one() -> Result<()> {
         use crate::task::{SfmTaskContext, SfmTaskControl, SfmTaskEvent};
@@ -3797,6 +3872,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn matching_failure_preserves_existing_database_results() -> Result<()> {
         let dir = tempdir()?;

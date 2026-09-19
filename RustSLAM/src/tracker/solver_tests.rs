@@ -10,7 +10,7 @@ mod tests {
         compute_ransac_num_trials, format_pnp_ransac_timing, pnp_ransac_chunk_end, EssentialSolver,
         PnPModelScorer, PnPModelSupport, PnPProblem, PnPSolver, Sim3Solver, Triangulator,
     };
-    use glam::{Mat3, Vec3};
+    use nalgebra::{Matrix3, Vector3};
 
     // =========================================================================
     // PnP Solver Tests
@@ -775,7 +775,7 @@ mod tests {
         let (E, _inliers) = result.unwrap();
 
         // E should be 3x3 (check using row/cols methods)
-        let _ = E.row(0); // This is how we access rows in glam
+        let _ = E.row(0);
 
         // Check rank-2 constraint (det(E) ≈ 0)
         let det = E.determinant();
@@ -830,29 +830,29 @@ mod tests {
         }
 
         let truth_rotation = truth.rotation_matrix();
-        let rotation = Mat3::from_cols(
-            Vec3::new(
+        let rotation = Matrix3::from_columns(&[
+            Vector3::new(
                 truth_rotation[0][0],
                 truth_rotation[1][0],
                 truth_rotation[2][0],
             ),
-            Vec3::new(
+            Vector3::new(
                 truth_rotation[0][1],
                 truth_rotation[1][1],
                 truth_rotation[2][1],
             ),
-            Vec3::new(
+            Vector3::new(
                 truth_rotation[0][2],
                 truth_rotation[1][2],
                 truth_rotation[2][2],
             ),
-        );
-        let translation = Vec3::from(truth.translation());
-        let skew_translation = Mat3::from_cols(
-            Vec3::new(0.0, translation.z, -translation.y),
-            Vec3::new(-translation.z, 0.0, translation.x),
-            Vec3::new(translation.y, -translation.x, 0.0),
-        );
+        ]);
+        let translation = Vector3::from(truth.translation());
+        let skew_translation = Matrix3::from_columns(&[
+            Vector3::new(0.0, translation.z, -translation.y),
+            Vector3::new(-translation.z, 0.0, translation.x),
+            Vector3::new(translation.y, -translation.x, 0.0),
+        ]);
         let true_essential = skew_translation * rotation;
 
         assert_recovered_pose_matches(
@@ -887,7 +887,7 @@ mod tests {
         solver: &EssentialSolver,
         triangulator: &Triangulator,
         truth: &SE3,
-        essential: Mat3,
+        essential: Matrix3<f32>,
         pts1: &[[f32; 2]],
         pts2: &[[f32; 2]],
         max_rotation_error_rad: f32,
@@ -920,9 +920,9 @@ mod tests {
             rotation_error
         );
 
-        let truth_t = Vec3::from(truth.translation()).normalize();
-        let best_t = Vec3::from(best.translation()).normalize();
-        let translation_angle = truth_t.dot(best_t).clamp(-1.0, 1.0).acos();
+        let truth_t = Vector3::from(truth.translation()).normalize();
+        let best_t = Vector3::from(best.translation()).normalize();
+        let translation_angle = truth_t.dot(&best_t).clamp(-1.0, 1.0).acos();
         assert!(
             translation_angle < max_translation_error_rad,
             "translation direction error too large: {} rad",
@@ -1060,7 +1060,7 @@ mod tests {
         let solver = Sim3Solver::new(0.01);
 
         // Simple scale 2x transform
-        let sim3 = solver.create_sim3(2.0, Vec3::ZERO, Mat3::IDENTITY);
+        let sim3 = solver.create_sim3(2.0, Vector3::zeros(), Matrix3::identity());
 
         // Apply to a point
         let point = [1.0, 2.0, 3.0];

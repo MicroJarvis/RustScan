@@ -1,4 +1,4 @@
-use rustmesh::{decimate_mesh, read_obj, HalfedgeHandle, QuadricT, RustMesh};
+use rustmesh::{decimate_mesh, read_obj, HalfedgeHandle, Point3, QuadricT, RustMesh};
 
 fn main() {
     let path = "../test_data/large/FinalBaseMesh.obj";
@@ -40,8 +40,8 @@ fn main() {
 
             let edge1 = p1 - p0;
             let edge2 = p2 - p0;
-            let normal = edge1.cross(edge2).normalize();
-            let center = (p0 + p1 + p2) / 3.0;
+            let normal = edge1.cross(&edge2).normalize();
+            let center = Point3::from((p0.coords + p1.coords + p2.coords) / 3.0);
 
             let q = QuadricT::from_face(normal, center);
 

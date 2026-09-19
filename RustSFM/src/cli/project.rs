@@ -325,14 +325,14 @@ pub(super) fn resolve_colmap_mapper_args(
                 &project,
                 "Mapper.ba_global_frames_ratio",
             )?)
-            .unwrap_or(1.5),
+            .unwrap_or(1.1),
         global_ba_points_ratio: args
             .global_ba_points_ratio
             .or(parse_project_value(
                 &project,
                 "Mapper.ba_global_points_ratio",
             )?)
-            .unwrap_or(1.5),
+            .unwrap_or(1.1),
         global_ba_images_freq: args
             .global_ba_images_freq
             .or(parse_project_value(
@@ -559,7 +559,7 @@ num_threads=-1
     }
 
     #[test]
-    fn colmap_mapper_uses_native_global_ba_ratio_defaults_when_unspecified() -> Result<()> {
+    fn colmap_mapper_uses_colmap_global_ba_ratio_defaults_when_unspecified() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let project_path = dir.path().join("project.ini");
         std::fs::write(
@@ -569,8 +569,8 @@ num_threads=-1
 
         let resolved = resolve_colmap_mapper_args(&base_mapper_args(project_path))?;
 
-        assert_eq!(resolved.global_ba_images_ratio, 1.5);
-        assert_eq!(resolved.global_ba_points_ratio, 1.5);
+        assert_eq!(resolved.global_ba_images_ratio, 1.1);
+        assert_eq!(resolved.global_ba_points_ratio, 1.1);
         assert_eq!(resolved.ba_linear_solver, "auto");
         assert_eq!(resolved.ba_sparse_backend, "auto");
         Ok(())

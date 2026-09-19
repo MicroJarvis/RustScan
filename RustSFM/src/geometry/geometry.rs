@@ -7,30 +7,159 @@ use crate::two_view::{
 };
 use crate::types::{CameraModel, ImageFrame, PairGeometry};
 use anyhow::Result;
-use glam::{Quat, Vec3};
-use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
+use nalgebra::{Matrix3, SMatrix, SVector, Unit, UnitQuaternion, Vector3};
+use rustscan_types::{
+    matrix3_from_rotation, rotation_from_axis_angle_x, rotation_from_axis_angle_y,
+    rotation_from_axis_angle_z, rotation_from_matrix3, rotation_from_xyzw, rotation_to_xyzw,
+    Rotation3f, Vec3f,
+};
 use rustslam::{Match, SE3};
 
+pub type Quat = Rotation3f;
+pub type Vec3 = Vec3f;
+
+pub fn quat_from_xyzw(x: f32, y: f32, z: f32, w: f32) -> Rotation3f {
+    rotation_from_xyzw([x, y, z, w])
+}
+
+pub fn quat_from_array(xyzw: [f32; 4]) -> Rotation3f {
+    rotation_from_xyzw(xyzw)
+}
+
+pub fn quat_from_rotation_x(angle: f32) -> Rotation3f {
+    rotation_from_axis_angle_x(angle)
+}
+
+pub fn quat_from_rotation_y(angle: f32) -> Rotation3f {
+    rotation_from_axis_angle_y(angle)
+}
+
+pub fn quat_from_rotation_z(angle: f32) -> Rotation3f {
+    rotation_from_axis_angle_z(angle)
+}
+
+pub fn quat_from_axis_angle(axis: Vector3<f32>, angle: f32) -> Rotation3f {
+    Unit::try_new(axis, f32::EPSILON)
+        .map(|axis| UnitQuaternion::from_axis_angle(&axis, angle))
+        .unwrap_or_else(UnitQuaternion::identity)
+}
+
+pub fn quat_from_mat3(rotation: &Matrix3<f32>) -> Rotation3f {
+    rotation_from_matrix3(rotation)
+}
+
+pub fn mat3_from_quat(rotation: Rotation3f) -> Matrix3<f32> {
+    matrix3_from_rotation(rotation)
+}
+
+pub fn quat_xyzw(rotation: Rotation3f) -> [f32; 4] {
+    rotation_to_xyzw(rotation)
+}
+
+pub fn quat_imag(rotation: Rotation3f) -> Vector3<f32> {
+    let q = rotation.into_inner();
+    Vector3::new(q.i, q.j, q.k)
+}
+
+pub trait UnitQuatNormalize {
+    fn normalize(self) -> Self;
+    fn is_finite(self) -> bool;
+    fn abs_diff_eq(self, other: Self, max_abs_diff: f32) -> bool;
+    fn to_array(self) -> [f32; 4];
+}
+
+impl UnitQuatNormalize for Rotation3f {
+    fn normalize(self) -> Self {
+        UnitQuaternion::new_normalize(self.into_inner())
+    }
+
+    fn is_finite(self) -> bool {
+        let q = self.into_inner();
+        q.w.is_finite() && q.i.is_finite() && q.j.is_finite() && q.k.is_finite()
+    }
+
+    fn abs_diff_eq(self, other: Self, max_abs_diff: f32) -> bool {
+        let a = rotation_to_xyzw(self);
+        let b = rotation_to_xyzw(other);
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() <= max_abs_diff)
+            || a.iter().zip(b).all(|(x, y)| (x + y).abs() <= max_abs_diff)
+    }
+
+    fn to_array(self) -> [f32; 4] {
+        rotation_to_xyzw(self)
+    }
+}
+
+pub trait Vec3GlamExt {
+    fn is_finite(self) -> bool;
+    fn to_array(self) -> [f32; 3];
+    fn clamp_length_max(self, max: f32) -> Self;
+    fn abs_diff_eq(self, other: Self, max_abs_diff: f32) -> bool;
+    fn length(self) -> f32;
+    fn distance(self, other: Self) -> f32;
+    fn any_orthonormal_vector(self) -> Vector3<f32>;
+}
+
+impl Vec3GlamExt for Vector3<f32> {
+    fn is_finite(self) -> bool {
+        self.iter().all(|c| c.is_finite())
+    }
+
+    fn to_array(self) -> [f32; 3] {
+        [self.x, self.y, self.z]
+    }
+
+    fn clamp_length_max(self, max: f32) -> Self {
+        let n = self.norm();
+        if n > max && n > 0.0 {
+            self * (max / n)
+        } else {
+            self
+        }
+    }
+
+    fn abs_diff_eq(self, other: Self, max_abs_diff: f32) -> bool {
+        (self.x - other.x).abs() <= max_abs_diff
+            && (self.y - other.y).abs() <= max_abs_diff
+            && (self.z - other.z).abs() <= max_abs_diff
+    }
+
+    fn length(self) -> f32 {
+        self.norm()
+    }
+
+    fn distance(self, other: Self) -> f32 {
+        (self - other).norm()
+    }
+
+    fn any_orthonormal_vector(self) -> Vector3<f32> {
+        let other = if self.x.abs() < 0.9 {
+            Vector3::x()
+        } else {
+            Vector3::y()
+        };
+        self.cross(&other).normalize()
+    }
+}
+
+pub fn quat_neg(q: Rotation3f) -> Rotation3f {
+    UnitQuaternion::new_normalize(-q.into_inner())
+}
+
 pub fn camera_center(pose: SE3) -> Vec3 {
-    let q = pose.quaternion();
-    let r = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
-    let t = Vec3::from_array(pose.translation());
-    -(r.inverse() * t)
+    -(pose.rotation_quat().inverse() * pose.translation_vector())
 }
 
 pub fn pose_from_rotation_center(rotation: Quat, center: Vec3) -> SE3 {
-    SE3::from_quat_translation(rotation.normalize(), -(rotation.normalize() * center))
+    SE3::from_quat_translation(rotation, -(rotation * center))
 }
 
 pub fn pose_rotation(pose: SE3) -> Quat {
-    let q = pose.quaternion();
-    Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize()
+    pose.rotation_quat()
 }
 
 pub fn pose_with_flipped_translation(pose: SE3) -> SE3 {
-    let rotation = pose_rotation(pose);
-    let translation = -Vec3::from_array(pose.translation());
-    SE3::from_quat_translation(rotation, translation)
+    SE3::from_quat_translation(pose.rotation_quat(), -pose.translation_vector())
 }
 
 pub fn relative_rotation_deg(a: SE3, b: SE3) -> f32 {
@@ -1144,8 +1273,8 @@ fn relative_reprojection_residual4(
     p2: [f32; 2],
 ) -> Option<SVector<f32, 4>> {
     let point = crate::two_view::triangulate_relative_pose_point(pose, p1, p2)?;
-    let p_left = Vec3::from_array(point);
-    let p_right = Vec3::from_array(pose.transform_point(&point));
+    let p_left = Vec3::from(point);
+    let p_right = Vec3::from(pose.transform_point(&point));
     if p_left.z <= 1.0e-6 || p_right.z <= 1.0e-6 {
         return None;
     }
@@ -1183,10 +1312,10 @@ fn numerical_relative_reprojection_jacobian4(
 fn triangulation_angle_deg(left_pose: SE3, right_pose: SE3, point: [f32; 3]) -> Option<f32> {
     let left_center = camera_center(left_pose);
     let right_center = camera_center(right_pose);
-    let point = Vec3::from_array(point);
-    let left_ray = (point - left_center).try_normalize()?;
-    let right_ray = (point - right_center).try_normalize()?;
-    let angle = left_ray.dot(right_ray).clamp(-1.0, 1.0).acos();
+    let point = Vec3::from(point);
+    let left_ray = (point - left_center).try_normalize(f32::EPSILON)?;
+    let right_ray = (point - right_center).try_normalize(f32::EPSILON)?;
+    let angle = left_ray.dot(&right_ray).clamp(-1.0, 1.0).acos();
     Some(angle.min(std::f32::consts::PI - angle).to_degrees())
 }
 
@@ -1252,14 +1381,14 @@ fn numerical_sampson_jacobian(pose: SE3, p1: [f32; 2], p2: [f32; 2]) -> Option<S
 
 fn perturb_relative_pose(pose: SE3, delta: SVector<f32, 6>) -> Option<SE3> {
     let rotation = pose_rotation(pose);
-    let dr = Quat::from_scaled_axis(Vec3::new(delta[0], delta[1], delta[2]));
-    let t = Vec3::from_array(pose.translation()) + Vec3::new(delta[3], delta[4], delta[5]);
-    let t = t.try_normalize()?;
-    Some(SE3::from_quat_translation((dr * rotation).normalize(), t))
+    let dr = UnitQuaternion::from_scaled_axis(Vector3::new(delta[0], delta[1], delta[2]));
+    let t = pose.translation_vector() + Vector3::new(delta[3], delta[4], delta[5]);
+    let t = t.try_normalize(f32::EPSILON)?;
+    Some(SE3::from_quat_translation(dr * rotation, t))
 }
 
 fn normalize_relative_translation(pose: SE3) -> Option<SE3> {
-    let t = Vec3::from_array(pose.translation()).try_normalize()?;
+    let t = pose.translation_vector().try_normalize(f32::EPSILON)?;
     Some(SE3::from_quat_translation(pose_rotation(pose), t))
 }
 

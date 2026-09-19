@@ -7,8 +7,11 @@
 //! - Classify Gaussians as Stable/Unstable
 //! - Only optimize unstable Gaussians
 
-use crate::fusion::gaussian::{Gaussian3D, GaussianMap, GaussianState};
+use crate::fusion::gaussian::{
+    matrix3_from_stored_pose_array, Gaussian3D, GaussianMap, GaussianState,
+};
 use crate::fusion::renderer::GaussianRenderer;
+use nalgebra::Vector3;
 
 /// Configuration for Gaussian mapping
 #[derive(Debug, Clone)]
@@ -166,12 +169,8 @@ impl GaussianMapper {
         let mut added = 0;
 
         // Compute camera rotation matrix
-        let r = glam::Mat3::from_cols(
-            glam::Vec3::new(rotation[0][0], rotation[0][1], rotation[0][2]),
-            glam::Vec3::new(rotation[1][0], rotation[1][1], rotation[1][2]),
-            glam::Vec3::new(rotation[2][0], rotation[2][1], rotation[2][2]),
-        );
-        let t = glam::Vec3::new(translation[0], translation[1], translation[2]);
+        let r = matrix3_from_stored_pose_array(rotation);
+        let t = Vector3::new(translation[0], translation[1], translation[2]);
 
         // Sample points from depth
         for y in (0..height).step_by(step) {
@@ -189,7 +188,7 @@ impl GaussianMapper {
                 let y_cam = (y as f32 - cy) * z / fy;
 
                 // Transform to world frame
-                let p_cam = glam::Vec3::new(x_cam, y_cam, z);
+                let p_cam = Vector3::new(x_cam, y_cam, z);
                 let p_world = r * p_cam + t;
 
                 // Create Gaussian
@@ -286,9 +285,7 @@ impl GaussianMapper {
                 gaussian.opacity = (gaussian.opacity + 0.02 * steps as f32).clamp(0.0, 1.0);
                 let shrink = 0.99f32.powi(steps as i32);
                 gaussian.scale *= shrink;
-                gaussian.scale = gaussian
-                    .scale
-                    .clamp(glam::Vec3::splat(0.001), glam::Vec3::splat(0.1));
+                gaussian.scale = gaussian.scale.map(|x| x.clamp(0.001, 0.1));
                 gaussian.state = GaussianState::Stable;
             }
         }
@@ -300,8 +297,8 @@ impl GaussianMapper {
     pub fn prune(&mut self) -> usize {
         let removed = self.map.retain(|gaussian| {
             gaussian.opacity >= self.config.prune_opacity_threshold
-                && gaussian.scale.min_element() >= 0.001
-                && gaussian.scale.max_element() <= 0.5
+                && gaussian.scale.min() >= 0.001
+                && gaussian.scale.max() <= 0.5
         });
         self.optimize_ids = self.map.get_unstable();
         removed

@@ -7,9 +7,9 @@ use crate::colmap_rng::{
 };
 use crate::core::SE3;
 use crate::features::base::Match;
-use glam::{Mat3, Vec3};
 use nalgebra::{
-    DMatrix, Matrix3, Matrix4, SMatrix, SVector, SymmetricEigen, Vector3 as NaVec3, Vector4,
+    DMatrix, Matrix3, Matrix4, SMatrix, SVector, SymmetricEigen, Vector3 as NaVec3, Vector3,
+    Vector4,
 };
 use std::f32::consts::PI;
 use std::time::Instant;
@@ -3343,7 +3343,7 @@ impl EssentialSolver {
         _matches: &[Match],
         pts1: &[[f32; 2]],
         pts2: &[[f32; 2]],
-    ) -> Option<(Mat3, Vec<bool>)> {
+    ) -> Option<(Matrix3<f32>, Vec<bool>)> {
         if pts1.len() < 8 || pts2.len() < 8 {
             return None;
         }
@@ -3405,10 +3405,10 @@ impl EssentialSolver {
     }
 
     /// Normalize points for numerical stability
-    fn normalize_points(&self, pts: &[[f32; 2]]) -> (Vec<[f32; 2]>, Mat3) {
+    fn normalize_points(&self, pts: &[[f32; 2]]) -> (Vec<[f32; 2]>, Matrix3<f32>) {
         let n = pts.len();
         if n == 0 {
-            return (vec![], Mat3::IDENTITY);
+            return (vec![], Matrix3::identity());
         }
 
         // Compute centroid
@@ -3435,17 +3435,17 @@ impl EssentialSolver {
             .collect();
 
         // Transformation matrix
-        let t = Mat3::from_cols(
-            Vec3::new(scale, 0.0, 0.0),
-            Vec3::new(0.0, scale, 0.0),
-            Vec3::new(-cx * scale, -cy * scale, 1.0),
-        );
+        let t = Matrix3::from_columns(&[
+            NaVec3::new(scale, 0.0, 0.0),
+            NaVec3::new(0.0, scale, 0.0),
+            NaVec3::new(-cx * scale, -cy * scale, 1.0),
+        ]);
 
         (normalized, t)
     }
 
     /// Solve using 8-point algorithm
-    fn solve_8point(&self, a: &[[f32; 9]]) -> Option<Mat3> {
+    fn solve_8point(&self, a: &[[f32; 9]]) -> Option<Matrix3<f32>> {
         let n = a.len();
         if n < 8 {
             return None;
@@ -3468,13 +3468,12 @@ impl EssentialSolver {
             e_vec[8],
         ]);
 
-        Some(mat3_from_na(&e))
+        Some(e)
     }
 
     /// Enforce rank-2 constraint on essential matrix
-    pub fn enforce_rank2(&self, e: Mat3) -> Mat3 {
-        let na_e = mat3_to_na(&e);
-        let svd = na_e.svd(true, true);
+    pub fn enforce_rank2(&self, e: Matrix3<f32>) -> Matrix3<f32> {
+        let svd = e.svd(true, true);
         let mut u = svd.u.unwrap_or(Matrix3::identity());
         let mut v_t = svd.v_t.unwrap_or(Matrix3::identity());
         if u.determinant() < 0.0 {
@@ -3488,22 +3487,21 @@ impl EssentialSolver {
         let essential_sigma = 0.5 * (s[0] + s[1]);
         let sigma = Matrix3::from_diagonal(&NaVec3::new(essential_sigma, essential_sigma, 0.0));
         let e_rank2 = u * sigma * v_t;
-        mat3_from_na(&e_rank2)
+        e_rank2
     }
 
     /// RANSAC filtering
-    fn inlier_mask(&self, pts1: &[[f32; 2]], pts2: &[[f32; 2]], e: &Mat3) -> Vec<bool> {
+    fn inlier_mask(&self, pts1: &[[f32; 2]], pts2: &[[f32; 2]], e: &Matrix3<f32>) -> Vec<bool> {
         let n = pts1.len().min(pts2.len());
-        let na_e = mat3_to_na(e);
         let threshold = self.ransac_threshold.max(1e-6);
         let mut inliers = Vec::with_capacity(n);
 
         for i in 0..n {
             let x1 = NaVec3::new(pts1[i][0], pts1[i][1], 1.0);
             let x2 = NaVec3::new(pts2[i][0], pts2[i][1], 1.0);
-            let ex1 = na_e * x1;
-            let etx2 = na_e.transpose() * x2;
-            let x2t_ex1 = x2.transpose() * na_e * x1;
+            let ex1 = e * x1;
+            let etx2 = e.transpose() * x2;
+            let x2t_ex1 = x2.transpose() * e * x1;
             let denom = ex1[0] * ex1[0] + ex1[1] * ex1[1] + etx2[0] * etx2[0] + etx2[1] * etx2[1];
             let dist = if denom > 1e-12 {
                 (x2t_ex1[(0, 0)] * x2t_ex1[(0, 0)]) / denom
@@ -3520,11 +3518,10 @@ impl EssentialSolver {
         &self,
         pts1: &[[f32; 2]],
         pts2: &[[f32; 2]],
-        e: &Mat3,
+        e: &Matrix3<f32>,
         inliers: &[bool],
     ) -> (usize, f32) {
         let n = pts1.len().min(pts2.len()).min(inliers.len());
-        let na_e = mat3_to_na(e);
         let mut count = 0usize;
         let mut total_error = 0.0f32;
 
@@ -3534,9 +3531,9 @@ impl EssentialSolver {
             }
             let x1 = NaVec3::new(pts1[i][0], pts1[i][1], 1.0);
             let x2 = NaVec3::new(pts2[i][0], pts2[i][1], 1.0);
-            let ex1 = na_e * x1;
-            let etx2 = na_e.transpose() * x2;
-            let x2t_ex1 = x2.transpose() * na_e * x1;
+            let ex1 = e * x1;
+            let etx2 = e.transpose() * x2;
+            let x2t_ex1 = x2.transpose() * e * x1;
             let denom = ex1[0] * ex1[0] + ex1[1] * ex1[1] + etx2[0] * etx2[0] + etx2[1] * etx2[1];
             if denom > 1e-12 {
                 total_error += (x2t_ex1[(0, 0)] * x2t_ex1[(0, 0)]) / denom;
@@ -3555,9 +3552,8 @@ impl EssentialSolver {
     /// Recover pose from essential matrix
     ///
     /// Returns: 4 possible pose solutions
-    pub fn recover_pose(&self, e: Mat3) -> [SE3; 4] {
-        let na_e = mat3_to_na(&e);
-        let svd = na_e.svd(true, true);
+    pub fn recover_pose(&self, e: Matrix3<f32>) -> [SE3; 4] {
+        let svd = e.svd(true, true);
         let mut u = svd.u.unwrap_or(Matrix3::identity());
         let mut v_t = svd.v_t.unwrap_or(Matrix3::identity());
 
@@ -3591,7 +3587,7 @@ impl EssentialSolver {
 }
 
 impl EssentialSolver {
-    fn compute_essential(&self, pts1: &[[f32; 2]], pts2: &[[f32; 2]]) -> Option<Mat3> {
+    fn compute_essential(&self, pts1: &[[f32; 2]], pts2: &[[f32; 2]]) -> Option<Matrix3<f32>> {
         let n = pts1.len().min(pts2.len());
         if n < 8 {
             return None;
@@ -3621,24 +3617,6 @@ impl EssentialSolver {
         let e = t2.transpose() * e_norm * t1;
         Some(self.enforce_rank2(e))
     }
-}
-
-fn mat3_to_na(mat: &Mat3) -> Matrix3<f32> {
-    Matrix3::from_column_slice(&mat.to_cols_array())
-}
-
-fn mat3_from_na(mat: &Matrix3<f32>) -> Mat3 {
-    Mat3::from_cols_array(&[
-        mat[(0, 0)],
-        mat[(1, 0)],
-        mat[(2, 0)],
-        mat[(0, 1)],
-        mat[(1, 1)],
-        mat[(2, 1)],
-        mat[(0, 2)],
-        mat[(1, 2)],
-        mat[(2, 2)],
-    ])
 }
 
 fn mat3_to_array(mat: &Matrix3<f32>) -> [[f32; 3]; 3] {
@@ -3751,7 +3729,7 @@ impl Triangulator {
         let c2 = pose2.inverse().translation();
 
         // Check triangulation angle
-        let baseline = (Vec3::from(c2) - Vec3::from(c1)).length();
+        let baseline = (Vector3::from(c2) - Vector3::from(c1)).norm();
         let max_range = baseline * 100.0;
 
         if baseline < self.min_dist {
@@ -3765,16 +3743,16 @@ impl Triangulator {
             // Check if point is valid
             if let Some(point) = pt {
                 // Check if point is in front of both cameras
-                let p = Vec3::from(point);
-                let ray1 = p - Vec3::from(c1);
-                let ray2 = p - Vec3::from(c2);
+                let p = Vector3::from(point);
+                let ray1 = p - Vector3::from(c1);
+                let ray2 = p - Vector3::from(c2);
                 let depth1 = pose1.transform_point(&point)[2];
                 let depth2 = pose2.transform_point(&point)[2];
-                let range1 = ray1.length();
-                let range2 = ray2.length();
+                let range1 = ray1.norm();
+                let range2 = ray2.norm();
 
                 // Check angle
-                let angle = ray1.angle_between(ray2);
+                let angle = ray1.angle(&ray2);
 
                 if angle > self.min_angle
                     && depth1 > 0.0
@@ -3861,16 +3839,16 @@ impl Triangulator {
     /// Check if a point is observable from a camera pose
     #[allow(dead_code)]
     fn is_observable(&self, point: &[f32; 3], pose: &SE3) -> bool {
-        let cam_center = Vec3::from(pose.inverse().translation());
-        let point_vec = Vec3::new(point[0], point[1], point[2]);
+        let cam_center = Vector3::from(pose.inverse().translation());
+        let point_vec = Vector3::new(point[0], point[1], point[2]);
         let ray = point_vec - cam_center;
 
         // Point should be in front of camera (positive z in camera frame)
         let pose_inv = pose.inverse();
         let r = pose_inv.rotation_matrix();
-        let z_dir = Vec3::new(r[0][2], r[1][2], r[2][2]);
+        let z_dir = Vector3::new(r[0][2], r[1][2], r[2][2]);
 
-        ray.dot(z_dir) > 0.0
+        ray.dot(&z_dir) > 0.0
     }
 }
 
@@ -3903,7 +3881,7 @@ impl Sim3Solver {
         &self,
         pts1: &[[f32; 3]],
         pts2: &[[f32; 3]],
-    ) -> Option<((f32, [f32; 3], Mat3), Vec<bool>)> {
+    ) -> Option<((f32, [f32; 3], Matrix3<f32>), Vec<bool>)> {
         if pts1.len() < 3 || pts2.len() < 3 {
             return None;
         }
@@ -3921,14 +3899,14 @@ impl Sim3Solver {
         let rotation = self.compute_rotation(pts1, c1, pts2, c2, n);
 
         // Compute translation: t = c2 - s * R * c1
-        let rc1 = rotation * (Vec3::from(c1) * scale);
+        let rc1 = rotation * (Vector3::from(c1) * scale);
         let translation = [c2[0] - rc1.x, c2[1] - rc1.y, c2[2] - rc1.z];
 
         // Compute inliers
         let mut inliers = vec![false; n];
         for i in 0..n {
             let transformed = self.apply_sim3((scale, translation, rotation), pts1[i]);
-            let error = (Vec3::from(transformed) - Vec3::from(pts2[i])).length();
+            let error = (Vector3::from(transformed) - Vector3::from(pts2[i])).norm();
             if error < self.ransac_threshold * 10.0 {
                 inliers[i] = true;
             }
@@ -3945,7 +3923,7 @@ impl Sim3Solver {
         pts2: &[[f32; 3]],
         c2: [f32; 3],
         n: usize,
-    ) -> Mat3 {
+    ) -> Matrix3<f32> {
         // Build cross-covariance matrix H = sum(q2_i * q1_i^T)
         // where q1 = pts1 - c1, q2 = pts2 - c2
         let mut h = Matrix3::<f32>::zeros();
@@ -3970,7 +3948,7 @@ impl Sim3Solver {
         let correction = Matrix3::from_diagonal(&NaVec3::new(1.0, 1.0, sign));
         let r = u * correction * v_t;
 
-        mat3_from_na(&r)
+        r
     }
 
     /// Compute centroid of points
@@ -4021,9 +3999,9 @@ impl Sim3Solver {
     pub fn create_sim3(
         &self,
         scale: f32,
-        translation: Vec3,
-        rotation: Mat3,
-    ) -> (f32, [f32; 3], Mat3) {
+        translation: Vector3<f32>,
+        rotation: Matrix3<f32>,
+    ) -> (f32, [f32; 3], Matrix3<f32>) {
         (
             scale,
             [translation.x, translation.y, translation.z],
@@ -4032,10 +4010,10 @@ impl Sim3Solver {
     }
 
     /// Apply Sim3 transform to a point
-    pub fn apply_sim3(&self, sim3: (f32, [f32; 3], Mat3), point: [f32; 3]) -> [f32; 3] {
+    pub fn apply_sim3(&self, sim3: (f32, [f32; 3], Matrix3<f32>), point: [f32; 3]) -> [f32; 3] {
         let (scale, translation, rotation) = sim3;
-        let p = Vec3::from(point);
-        let transformed = rotation * (p * scale) + Vec3::from(translation);
+        let p = Vector3::from(point);
+        let transformed = rotation * (p * scale) + Vector3::from(translation);
         [transformed.x, transformed.y, transformed.z]
     }
 }

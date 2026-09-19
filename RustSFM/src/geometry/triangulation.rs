@@ -231,7 +231,7 @@ pub fn calculate_angle_between_vectors(v1: &Vector3<f64>, v2: &Vector3<f64>) -> 
     if squared_norm1 == 0.0 || squared_norm2 == 0.0 {
         return 0.0;
     }
-    (v1.dot(v2) / (squared_norm1 * squared_norm2).sqrt())
+    (v1.dot(&v2) / (squared_norm1 * squared_norm2).sqrt())
         .clamp(-1.0, 1.0)
         .acos()
 }

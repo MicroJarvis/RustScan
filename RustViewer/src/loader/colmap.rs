@@ -157,6 +157,16 @@ fn classify_colmap_error(input: &Path, err: rustgs::TrainingError) -> LoadError 
         rustgs::TrainingError::Gpu(message) | rustgs::TrainingError::TrainingFailed(message) => {
             LoadError::ColmapLoadFailed(message)
         }
+        rustgs::TrainingError::ForwardCapacityExceeded {
+            logical_intersections,
+            capacity,
+            first_iteration,
+        } => LoadError::ColmapLoadFailed(format!(
+            "Gaussian forward capacity {capacity} exceeded ({logical_intersections} intersections) at iteration {first_iteration}"
+        )),
+        rustgs::TrainingError::NonFiniteLoss { first_iteration } => LoadError::ColmapLoadFailed(
+            format!("Gaussian training produced a non-finite loss at iteration {first_iteration}"),
+        ),
     }
 }
 

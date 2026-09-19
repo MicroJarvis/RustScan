@@ -1,7 +1,61 @@
 //! Arcball camera controller for 3D navigation.
 
 use crate::renderer::scene::SceneBounds;
-use glam::{Mat3, Mat4, Quat, Vec3};
+use nalgebra::{Matrix3, Matrix4, Point3, Unit, UnitQuaternion, Vector3, Vector4};
+use rustscan_types::matrix4_to_column_major_array;
+
+pub type Vec3 = Vector3<f32>;
+pub type Quat = UnitQuaternion<f32>;
+
+pub(crate) fn normalize_or_zero(v: Vec3) -> Vec3 {
+    v.try_normalize(f32::EPSILON).unwrap_or_else(Vec3::zeros)
+}
+
+pub(crate) fn vec3_is_finite(v: Vec3) -> bool {
+    v.iter().copied().all(f32::is_finite)
+}
+
+pub(crate) fn vec4_xyz(v: Vector4<f32>) -> Vec3 {
+    Vec3::new(v.x, v.y, v.z)
+}
+
+/// wgpu/Vulkan clip-space perspective: NDC z in `[0, 1]`.
+///
+/// nalgebra's `new_perspective` uses OpenGL `[-1, 1]` depth, so this keeps the
+/// previous glam `perspective_rh` convention used by the wgpu mesh uniforms.
+pub(crate) fn perspective_rh_wgpu(
+    fov_y: f32,
+    aspect: f32,
+    z_near: f32,
+    z_far: f32,
+) -> Matrix4<f32> {
+    let (sin_fov, cos_fov) = (0.5 * fov_y).sin_cos();
+    let h = cos_fov / sin_fov;
+    let w = h / aspect;
+    let r = z_far / (z_near - z_far);
+    Matrix4::new(
+        w,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        h,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        r,
+        r * z_near,
+        0.0,
+        0.0,
+        -1.0,
+        0.0,
+    )
+}
+
+pub(crate) fn look_at_rh(eye: Vec3, target: Vec3, up: Vec3) -> Matrix4<f32> {
+    Matrix4::look_at_rh(&Point3::from(eye), &Point3::from(target), &up)
+}
 
 /// Arcball camera: orbits around a target point.
 #[derive(Debug, Clone)]
@@ -18,7 +72,14 @@ pub struct ArcballCamera {
 
 impl Default for ArcballCamera {
     fn default() -> Self {
-        Self::from_angles(Vec3::ZERO, 5.0, 0.0, 0.3, 0.0, std::f32::consts::FRAC_PI_4)
+        Self::from_angles(
+            Vec3::zeros(),
+            5.0,
+            0.0,
+            0.3,
+            0.0,
+            std::f32::consts::FRAC_PI_4,
+        )
     }
 }
 
@@ -37,13 +98,13 @@ impl ArcballCamera {
         roll: f32,
         fov_y: f32,
     ) -> Self {
-        let yaw = Quat::from_rotation_y(yaw);
-        let pitch = Quat::from_rotation_x(-pitch);
-        let roll = Quat::from_rotation_z(roll);
+        let yaw = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw);
+        let pitch = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), -pitch);
+        let roll = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), roll);
         Self {
             target,
             distance,
-            orientation: (yaw * pitch * roll).normalize(),
+            orientation: yaw * pitch * roll,
             fov_y,
         }
     }
@@ -52,28 +113,28 @@ impl ArcballCamera {
         Self {
             target,
             distance: distance.max(Self::MIN_DISTANCE),
-            orientation: orientation.normalize(),
+            orientation,
             fov_y,
         }
     }
 
     pub fn from_eye_target(eye: Vec3, target: Vec3, up_hint: Vec3, fov_y: f32) -> Self {
-        let distance = eye.distance(target).max(Self::MIN_DISTANCE);
-        let target = if eye.distance_squared(target) <= 1e-8 {
-            eye + Vec3::NEG_Z
+        let distance = (eye - target).norm().max(Self::MIN_DISTANCE);
+        let target = if (eye - target).norm_squared() <= 1e-8 {
+            eye - Vector3::z()
         } else {
             target
         };
-        let backward = (eye - target).normalize_or_zero();
-        let right = up_hint.cross(backward).normalize_or_zero();
-        let up = backward.cross(right).normalize_or_zero();
-        let orientation = if backward.length_squared() > 0.0
-            && right.length_squared() > 0.0
-            && up.length_squared() > 0.0
+        let backward = normalize_or_zero(eye - target);
+        let right = normalize_or_zero(up_hint.cross(&backward));
+        let up = normalize_or_zero(backward.cross(&right));
+        let orientation = if backward.norm_squared() > 0.0
+            && right.norm_squared() > 0.0
+            && up.norm_squared() > 0.0
         {
-            Quat::from_mat3(&Mat3::from_cols(right, up, backward)).normalize()
+            UnitQuaternion::from_matrix(&Matrix3::from_columns(&[right, up, backward]))
         } else {
-            Quat::IDENTITY
+            UnitQuaternion::identity()
         };
         Self::from_raw(target, distance, orientation, fov_y)
     }
@@ -85,32 +146,37 @@ impl ArcballCamera {
 
     /// Camera right direction in world space.
     pub fn right(&self) -> Vec3 {
-        (self.orientation * Vec3::X).normalize()
+        (self.orientation * Vector3::x()).normalize()
     }
 
     /// Camera up direction in world space.
     pub fn up(&self) -> Vec3 {
-        (self.orientation * Vec3::Y).normalize()
+        (self.orientation * Vector3::y()).normalize()
     }
 
     /// Direction from target to eye in world space.
     pub fn backward(&self) -> Vec3 {
-        (self.orientation * Vec3::Z).normalize()
+        (self.orientation * Vector3::z()).normalize()
     }
 
     /// View matrix (right-handed, looking from eye toward target).
-    pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.eye(), self.target, self.up())
+    pub fn view_matrix(&self) -> Matrix4<f32> {
+        look_at_rh(self.eye(), self.target, self.up())
     }
 
-    /// Perspective projection matrix.
-    pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(self.fov_y, aspect, 0.01, 1000.0)
+    /// Perspective projection matrix in wgpu clip space.
+    pub fn proj_matrix(&self, aspect: f32) -> Matrix4<f32> {
+        perspective_rh_wgpu(self.fov_y, aspect, 0.01, 1000.0)
     }
 
     /// Combined view-projection matrix.
-    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+    pub fn view_proj(&self, aspect: f32) -> Matrix4<f32> {
         self.proj_matrix(aspect) * self.view_matrix()
+    }
+
+    /// Column-major `[[column]; 4]` packing for wgpu uniforms: `array[col][row]`.
+    pub fn view_proj_column_major_array(&self, aspect: f32) -> [[f32; 4]; 4] {
+        matrix4_to_column_major_array(self.view_proj(aspect))
     }
 
     /// Orbit around target (left-button drag).
@@ -118,15 +184,24 @@ impl ArcballCamera {
         // Match common DCC/model-viewer interaction:
         // dragging the pointer should make the scene appear to move
         // in the same direction as the drag.
-        let yaw = Quat::from_axis_angle(self.up(), -delta_x * Self::ORBIT_SENSITIVITY);
-        let pitch = Quat::from_axis_angle(self.right(), -delta_y * Self::ORBIT_SENSITIVITY);
-        self.orientation = (yaw * pitch * self.orientation).normalize();
+        let yaw = UnitQuaternion::from_axis_angle(
+            &Unit::new_normalize(self.up()),
+            -delta_x * Self::ORBIT_SENSITIVITY,
+        );
+        let pitch = UnitQuaternion::from_axis_angle(
+            &Unit::new_normalize(self.right()),
+            -delta_y * Self::ORBIT_SENSITIVITY,
+        );
+        self.orientation = yaw * pitch * self.orientation;
     }
 
     /// Roll the camera around the current viewing direction.
     pub fn roll(&mut self, delta_x: f32) {
-        let roll = Quat::from_axis_angle(self.backward(), -delta_x * Self::ORBIT_SENSITIVITY);
-        self.orientation = (roll * self.orientation).normalize();
+        let roll = UnitQuaternion::from_axis_angle(
+            &Unit::new_normalize(self.backward()),
+            -delta_x * Self::ORBIT_SENSITIVITY,
+        );
+        self.orientation = roll * self.orientation;
     }
 
     /// Pan the target point (right-button drag).
@@ -167,17 +242,17 @@ impl ArcballCamera {
         let backward = self.backward();
         let yaw = backward.x.atan2(backward.z);
         let pitch = backward.y.clamp(-1.0, 1.0).asin();
-        let reference_up = if backward.dot(Vec3::Y).abs() > 0.999 {
-            Vec3::Z
+        let reference_up = if backward.dot(&Vector3::y()).abs() > 0.999 {
+            Vector3::z()
         } else {
-            Vec3::Y
+            Vector3::y()
         };
-        let reference_up = (reference_up - backward * reference_up.dot(backward)).normalize();
+        let reference_up = (reference_up - backward * reference_up.dot(&backward)).normalize();
         let up = self.up();
         let roll = reference_up
-            .cross(up)
-            .dot(backward)
-            .atan2(reference_up.dot(up));
+            .cross(&up)
+            .dot(&backward)
+            .atan2(reference_up.dot(&up));
         (yaw, pitch, roll)
     }
 }
@@ -185,11 +260,18 @@ impl ArcballCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustscan_types::matrix4_from_column_major_array;
 
     #[test]
     fn test_eye_position() {
-        let cam =
-            ArcballCamera::from_angles(Vec3::ZERO, 5.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_4);
+        let cam = ArcballCamera::from_angles(
+            Vec3::zeros(),
+            5.0,
+            0.0,
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_PI_4,
+        );
         let eye = cam.eye();
         assert!(
             (eye.z - 5.0).abs() < 1e-4,
@@ -204,9 +286,9 @@ mod tests {
     fn test_orbit_can_cross_poles_without_losing_up_vector() {
         let mut cam = ArcballCamera::default();
         cam.orbit(0.0, -400.0);
-        assert!(cam.up().is_finite());
-        assert!(cam.backward().is_finite());
-        assert!(cam.up().dot(cam.backward()).abs() < 1e-4);
+        assert!(vec3_is_finite(cam.up()));
+        assert!(vec3_is_finite(cam.backward()));
+        assert!(cam.up().dot(&cam.backward()).abs() < 1e-4);
     }
 
     #[test]
@@ -231,8 +313,8 @@ mod tests {
 
         cam.roll(100.0);
 
-        assert!((cam.eye() - eye).length() < 1e-4);
-        assert!(cam.up().dot(up) < 0.99);
+        assert!((cam.eye() - eye).norm() < 1e-4);
+        assert!(cam.up().dot(&up) < 0.99);
     }
 
     #[test]
@@ -253,7 +335,23 @@ mod tests {
 
         cam.focus_on(target);
 
-        assert!((cam.eye() - eye).length() < 1e-4);
-        assert!((cam.target - target).length() < 1e-4);
+        assert!((cam.eye() - eye).norm() < 1e-4);
+        assert!((cam.target - target).norm() < 1e-4);
+    }
+
+    #[test]
+    fn view_proj_column_major_array_round_trips_non_symmetric_pose() {
+        let cam = ArcballCamera::from_eye_target(
+            Vec3::new(1.25, -2.5, 3.75),
+            Vec3::new(0.4, -1.1, 2.2),
+            Vec3::new(0.2, 0.9, 0.1),
+            std::f32::consts::FRAC_PI_4,
+        );
+        let matrix = cam.view_proj(16.0 / 9.0);
+        let columns = cam.view_proj_column_major_array(16.0 / 9.0);
+        let restored = matrix4_from_column_major_array(&columns);
+        let point = Vector4::new(0.7, -1.2, 2.4, 1.0);
+        assert!((restored * point - matrix * point).norm() < 1e-5);
+        assert!((columns[3][0] - matrix[(0, 3)]).abs() < 1e-6);
     }
 }

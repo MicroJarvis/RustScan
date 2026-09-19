@@ -5,6 +5,7 @@
 
 use crate::handles::{EdgeHandle, FaceHandle, HalfedgeHandle, VertexHandle};
 use crate::soa_kernel::SoAKernel;
+use crate::{Point3, Vec2, Vec3, Vec4};
 use std::collections::{HashMap, VecDeque};
 
 // ============================================================================
@@ -118,7 +119,7 @@ impl RustMesh {
 
     /// Add a vertex at the given position
     #[inline]
-    pub fn add_vertex(&mut self, point: glam::Vec3) -> VertexHandle {
+    pub fn add_vertex(&mut self, point: Point3) -> VertexHandle {
         self.kernel.add_vertex(point)
     }
 
@@ -157,19 +158,19 @@ impl RustMesh {
 
     /// Get vertex position by handle
     #[inline]
-    pub fn point(&self, vh: VertexHandle) -> Option<glam::Vec3> {
+    pub fn point(&self, vh: VertexHandle) -> Option<Point3> {
         self.kernel.point(vh.idx_usize())
     }
 
     /// Get vertex position by index (for internal use)
     #[inline]
-    pub unsafe fn point_unchecked(&self, idx: usize) -> glam::Vec3 {
+    pub unsafe fn point_unchecked(&self, idx: usize) -> Point3 {
         self.kernel.point_unchecked(idx)
     }
 
     /// Set vertex position
     #[inline]
-    pub fn set_point(&mut self, vh: VertexHandle, point: glam::Vec3) {
+    pub fn set_point(&mut self, vh: VertexHandle, point: Point3) {
         self.kernel.set_point(vh.idx_usize(), point);
     }
 
@@ -1142,10 +1143,10 @@ impl RustMesh {
         }
 
         let mut remap: Vec<Option<usize>> = vec![None; old_vertex_count];
-        let mut positions: Vec<glam::Vec3> = Vec::new();
-        let mut normals: Vec<glam::Vec3> = Vec::new();
-        let mut colors: Vec<glam::Vec4> = Vec::new();
-        let mut texcoords: Vec<glam::Vec2> = Vec::new();
+        let mut positions: Vec<Point3> = Vec::new();
+        let mut normals: Vec<Vec3> = Vec::new();
+        let mut colors: Vec<Vec4> = Vec::new();
+        let mut texcoords: Vec<Vec2> = Vec::new();
 
         for (idx, &used) in used_vertices.iter().enumerate() {
             if !used {
@@ -1160,19 +1161,16 @@ impl RustMesh {
             positions.push(point);
 
             if preserve_normals {
-                normals.push(self.vertex_normal_by_index(idx).unwrap_or(glam::Vec3::ZERO));
+                normals.push(self.vertex_normal_by_index(idx).unwrap_or(Vec3::zeros()));
             }
             if preserve_colors {
                 colors.push(
                     self.vertex_color_by_index(idx)
-                        .unwrap_or(glam::Vec4::new(1.0, 1.0, 1.0, 1.0)),
+                        .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0)),
                 );
             }
             if preserve_texcoords {
-                texcoords.push(
-                    self.vertex_texcoord_by_index(idx)
-                        .unwrap_or(glam::Vec2::ZERO),
-                );
+                texcoords.push(self.vertex_texcoord_by_index(idx).unwrap_or(Vec2::zeros()));
             }
         }
 
@@ -1229,32 +1227,29 @@ impl RustMesh {
         let preserve_colors = self.has_vertex_colors();
         let preserve_texcoords = self.has_vertex_texcoords();
 
-        let positions: Vec<glam::Vec3> = (0..old_vertex_count)
-            .map(|idx| self.point_by_index(idx).unwrap_or(glam::Vec3::ZERO))
+        let positions: Vec<Point3> = (0..old_vertex_count)
+            .map(|idx| self.point_by_index(idx).unwrap_or(Point3::origin()))
             .collect();
-        let normals: Vec<glam::Vec3> = if preserve_normals {
+        let normals: Vec<Vec3> = if preserve_normals {
             (0..old_vertex_count)
-                .map(|idx| self.vertex_normal_by_index(idx).unwrap_or(glam::Vec3::ZERO))
+                .map(|idx| self.vertex_normal_by_index(idx).unwrap_or(Vec3::zeros()))
                 .collect()
         } else {
             Vec::new()
         };
-        let colors: Vec<glam::Vec4> = if preserve_colors {
+        let colors: Vec<Vec4> = if preserve_colors {
             (0..old_vertex_count)
                 .map(|idx| {
                     self.vertex_color_by_index(idx)
-                        .unwrap_or(glam::Vec4::new(1.0, 1.0, 1.0, 1.0))
+                        .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0))
                 })
                 .collect()
         } else {
             Vec::new()
         };
-        let texcoords: Vec<glam::Vec2> = if preserve_texcoords {
+        let texcoords: Vec<Vec2> = if preserve_texcoords {
             (0..old_vertex_count)
-                .map(|idx| {
-                    self.vertex_texcoord_by_index(idx)
-                        .unwrap_or(glam::Vec2::ZERO)
-                })
+                .map(|idx| self.vertex_texcoord_by_index(idx).unwrap_or(Vec2::zeros()))
                 .collect()
         } else {
             Vec::new()
@@ -1304,12 +1299,12 @@ impl RustMesh {
     }
 
     /// Get vertex normal
-    pub fn normal(&self, vh: VertexHandle) -> Option<glam::Vec3> {
+    pub fn normal(&self, vh: VertexHandle) -> Option<Vec3> {
         self.kernel.vertex_normal(vh)
     }
 
     /// Set vertex normal
-    pub fn set_normal(&mut self, vh: VertexHandle, n: glam::Vec3) {
+    pub fn set_normal(&mut self, vh: VertexHandle, n: Vec3) {
         self.kernel.set_vertex_normal(vh, n);
     }
 
@@ -1324,12 +1319,12 @@ impl RustMesh {
     }
 
     /// Get vertex color
-    pub fn color(&self, vh: VertexHandle) -> Option<glam::Vec4> {
+    pub fn color(&self, vh: VertexHandle) -> Option<Vec4> {
         self.kernel.vertex_color(vh)
     }
 
     /// Set vertex color
-    pub fn set_color(&mut self, vh: VertexHandle, c: glam::Vec4) {
+    pub fn set_color(&mut self, vh: VertexHandle, c: Vec4) {
         self.kernel.set_vertex_color(vh, c);
     }
 
@@ -1344,12 +1339,12 @@ impl RustMesh {
     }
 
     /// Get vertex texcoord
-    pub fn texcoord(&self, vh: VertexHandle) -> Option<glam::Vec2> {
+    pub fn texcoord(&self, vh: VertexHandle) -> Option<Vec2> {
         self.kernel.vertex_texcoord(vh)
     }
 
     /// Set vertex texcoord
-    pub fn set_texcoord(&mut self, vh: VertexHandle, t: glam::Vec2) {
+    pub fn set_texcoord(&mut self, vh: VertexHandle, t: Vec2) {
         self.kernel.set_vertex_texcoord(vh, t);
     }
 
@@ -1368,12 +1363,12 @@ impl RustMesh {
     }
 
     /// Get face normal
-    pub fn f_normal(&self, fh: FaceHandle) -> Option<glam::Vec3> {
+    pub fn f_normal(&self, fh: FaceHandle) -> Option<Vec3> {
         self.kernel.face_normal(fh)
     }
 
     /// Set face normal
-    pub fn set_f_normal(&mut self, fh: FaceHandle, n: glam::Vec3) {
+    pub fn set_f_normal(&mut self, fh: FaceHandle, n: Vec3) {
         self.kernel.set_face_normal(fh, n);
     }
 
@@ -1388,12 +1383,12 @@ impl RustMesh {
     }
 
     /// Get face color
-    pub fn f_color(&self, fh: FaceHandle) -> Option<glam::Vec4> {
+    pub fn f_color(&self, fh: FaceHandle) -> Option<Vec4> {
         self.kernel.face_color(fh)
     }
 
     /// Set face color
-    pub fn set_f_color(&mut self, fh: FaceHandle, c: glam::Vec4) {
+    pub fn set_f_color(&mut self, fh: FaceHandle, c: Vec4) {
         self.kernel.set_face_color(fh, c);
     }
 
@@ -1412,12 +1407,12 @@ impl RustMesh {
     }
 
     /// Get halfedge normal
-    pub fn h_normal(&self, heh: HalfedgeHandle) -> Option<glam::Vec3> {
+    pub fn h_normal(&self, heh: HalfedgeHandle) -> Option<Vec3> {
         self.kernel.halfedge_normal(heh)
     }
 
     /// Set halfedge normal
-    pub fn set_h_normal(&mut self, heh: HalfedgeHandle, n: glam::Vec3) {
+    pub fn set_h_normal(&mut self, heh: HalfedgeHandle, n: Vec3) {
         self.kernel.set_halfedge_normal(heh, n);
     }
 
@@ -1432,12 +1427,12 @@ impl RustMesh {
     }
 
     /// Get halfedge color
-    pub fn h_color(&self, heh: HalfedgeHandle) -> Option<glam::Vec4> {
+    pub fn h_color(&self, heh: HalfedgeHandle) -> Option<Vec4> {
         self.kernel.halfedge_color(heh)
     }
 
     /// Set halfedge color
-    pub fn set_h_color(&mut self, heh: HalfedgeHandle, c: glam::Vec4) {
+    pub fn set_h_color(&mut self, heh: HalfedgeHandle, c: Vec4) {
         self.kernel.set_halfedge_color(heh, c);
     }
 
@@ -1452,12 +1447,12 @@ impl RustMesh {
     }
 
     /// Get halfedge texcoord
-    pub fn h_texcoord(&self, heh: HalfedgeHandle) -> Option<glam::Vec2> {
+    pub fn h_texcoord(&self, heh: HalfedgeHandle) -> Option<Vec2> {
         self.kernel.halfedge_texcoord(heh)
     }
 
     /// Set halfedge texcoord
-    pub fn set_h_texcoord(&mut self, heh: HalfedgeHandle, t: glam::Vec2) {
+    pub fn set_h_texcoord(&mut self, heh: HalfedgeHandle, t: Vec2) {
         self.kernel.set_halfedge_texcoord(heh, t);
     }
 
@@ -1476,12 +1471,12 @@ impl RustMesh {
     }
 
     /// Get edge color
-    pub fn e_color(&self, eh: EdgeHandle) -> Option<glam::Vec4> {
+    pub fn e_color(&self, eh: EdgeHandle) -> Option<Vec4> {
         self.kernel.edge_color(eh)
     }
 
     /// Set edge color
-    pub fn set_e_color(&mut self, eh: EdgeHandle, c: glam::Vec4) {
+    pub fn set_e_color(&mut self, eh: EdgeHandle, c: Vec4) {
         self.kernel.set_edge_color(eh, c);
     }
 
@@ -1490,12 +1485,12 @@ impl RustMesh {
     // =========================================================================
 
     /// Get vertex position by index (for IO operations)
-    pub fn point_by_index(&self, idx: usize) -> Option<glam::Vec3> {
+    pub fn point_by_index(&self, idx: usize) -> Option<Point3> {
         self.kernel.point(idx)
     }
 
     /// Get vertex normal by index (for IO operations)
-    pub fn vertex_normal_by_index(&self, idx: usize) -> Option<glam::Vec3> {
+    pub fn vertex_normal_by_index(&self, idx: usize) -> Option<Vec3> {
         if idx < self.n_vertices() {
             self.kernel.vertex_normal(VertexHandle::from_usize(idx))
         } else {
@@ -1504,7 +1499,7 @@ impl RustMesh {
     }
 
     /// Get vertex color by index (for IO operations)
-    pub fn vertex_color_by_index(&self, idx: usize) -> Option<glam::Vec4> {
+    pub fn vertex_color_by_index(&self, idx: usize) -> Option<Vec4> {
         if idx < self.n_vertices() {
             self.kernel.vertex_color(VertexHandle::from_usize(idx))
         } else {
@@ -1513,7 +1508,7 @@ impl RustMesh {
     }
 
     /// Get vertex texcoord by index (for IO operations)
-    pub fn vertex_texcoord_by_index(&self, idx: usize) -> Option<glam::Vec2> {
+    pub fn vertex_texcoord_by_index(&self, idx: usize) -> Option<Vec2> {
         if idx < self.n_vertices() {
             self.kernel.vertex_texcoord(VertexHandle::from_usize(idx))
         } else {
@@ -1522,7 +1517,7 @@ impl RustMesh {
     }
 
     /// Set vertex normal by index (for IO operations)
-    pub fn set_vertex_normal_by_index(&mut self, idx: usize, normal: glam::Vec3) {
+    pub fn set_vertex_normal_by_index(&mut self, idx: usize, normal: Vec3) {
         if idx < self.n_vertices() {
             self.kernel
                 .set_vertex_normal(VertexHandle::from_usize(idx), normal);
@@ -1530,7 +1525,7 @@ impl RustMesh {
     }
 
     /// Set vertex color by index (for IO operations)
-    pub fn set_vertex_color_by_index(&mut self, idx: usize, color: glam::Vec4) {
+    pub fn set_vertex_color_by_index(&mut self, idx: usize, color: Vec4) {
         if idx < self.n_vertices() {
             self.kernel
                 .set_vertex_color(VertexHandle::from_usize(idx), color);
@@ -1538,7 +1533,7 @@ impl RustMesh {
     }
 
     /// Set vertex texcoord by index (for IO operations)
-    pub fn set_vertex_texcoord_by_index(&mut self, idx: usize, texcoord: glam::Vec2) {
+    pub fn set_vertex_texcoord_by_index(&mut self, idx: usize, texcoord: Vec2) {
         if idx < self.n_vertices() {
             self.kernel
                 .set_vertex_texcoord(VertexHandle::from_usize(idx), texcoord);
@@ -1602,9 +1597,9 @@ impl RustMesh {
     /// - normals: optional per-vertex normals
     /// - colors: optional per-vertex colors (RGB as [f32; 3])
     pub fn from_triangle_mesh(
-        vertices: &[glam::Vec3],
+        vertices: &[Point3],
         triangles: &[[usize; 3]],
-        normals: Option<&[glam::Vec3]>,
+        normals: Option<&[Vec3]>,
         colors: Option<&[[f32; 3]]>,
     ) -> Self {
         let mut mesh = RustMesh::new();
@@ -1630,7 +1625,7 @@ impl RustMesh {
             for (i, color) in cols.iter().enumerate() {
                 if i < mesh.n_vertices() {
                     // Convert RGB to RGBA (add alpha = 1.0)
-                    let rgba = glam::Vec4::new(color[0], color[1], color[2], 1.0);
+                    let rgba = Vec4::new(color[0], color[1], color[2], 1.0);
                     mesh.set_vertex_color_by_index(i, rgba);
                 }
             }
@@ -1839,9 +1834,9 @@ mod tests_soa {
         let mut mesh = RustMesh::new();
 
         // Add vertices
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         // Add face
         let face = mesh.add_face(&[v0, v1, v2]);
@@ -1852,9 +1847,9 @@ mod tests_soa {
         assert_eq!(mesh.n_faces(), 1);
 
         // Check vertex access
-        assert_eq!(mesh.point(v0), Some(glam::vec3(0.0, 0.0, 0.0)));
-        assert_eq!(mesh.point(v1), Some(glam::vec3(1.0, 0.0, 0.0)));
-        assert_eq!(mesh.point(v2), Some(glam::vec3(0.0, 1.0, 0.0)));
+        assert_eq!(mesh.point(v0), Some(Point3::new(0.0, 0.0, 0.0)));
+        assert_eq!(mesh.point(v1), Some(Point3::new(1.0, 0.0, 0.0)));
+        assert_eq!(mesh.point(v2), Some(Point3::new(0.0, 1.0, 0.0)));
 
         // Check SIMD pointers
         assert!(!mesh.x_ptr().is_null());
@@ -1867,14 +1862,14 @@ mod tests_soa {
         let mut mesh = RustMesh::new();
 
         // Add vertices of a cube
-        mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        mesh.add_vertex(glam::vec3(1.0, 1.0, 0.0));
-        mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
-        mesh.add_vertex(glam::vec3(0.0, 0.0, 1.0));
-        mesh.add_vertex(glam::vec3(1.0, 0.0, 1.0));
-        mesh.add_vertex(glam::vec3(1.0, 1.0, 1.0));
-        mesh.add_vertex(glam::vec3(0.0, 1.0, 1.0));
+        mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+        mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
+        mesh.add_vertex(Point3::new(0.0, 0.0, 1.0));
+        mesh.add_vertex(Point3::new(1.0, 0.0, 1.0));
+        mesh.add_vertex(Point3::new(1.0, 1.0, 1.0));
+        mesh.add_vertex(Point3::new(0.0, 1.0, 1.0));
 
         let (min_x, max_x, min_y, max_y, min_z, max_z) = mesh.bounding_box();
 
@@ -1891,9 +1886,9 @@ mod tests_soa {
         let mut mesh = RustMesh::new();
 
         // Add vertices
-        mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        mesh.add_vertex(glam::vec3(2.0, 0.0, 0.0));
-        mesh.add_vertex(glam::vec3(0.0, 2.0, 0.0));
+        mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        mesh.add_vertex(Point3::new(2.0, 0.0, 0.0));
+        mesh.add_vertex(Point3::new(0.0, 2.0, 0.0));
 
         let (cx, cy, cz) = mesh.centroid();
 
@@ -1908,36 +1903,36 @@ mod tests_soa {
         let mut mesh = RustMesh::new();
 
         // Add vertices
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         // Request and set vertex normals
         mesh.request_vertex_normals();
         assert!(mesh.has_vertex_normals());
 
-        mesh.set_normal(v0, glam::vec3(0.0, 0.0, 1.0));
-        mesh.set_normal(v1, glam::vec3(0.0, 0.0, 1.0));
-        mesh.set_normal(v2, glam::vec3(0.0, 0.0, 1.0));
+        mesh.set_normal(v0, Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_normal(v1, Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_normal(v2, Vec3::new(0.0, 0.0, 1.0));
 
-        assert_eq!(mesh.normal(v0), Some(glam::vec3(0.0, 0.0, 1.0)));
+        assert_eq!(mesh.normal(v0), Some(Vec3::new(0.0, 0.0, 1.0)));
 
         // Request and set vertex colors
         mesh.request_vertex_colors();
         assert!(mesh.has_vertex_colors());
 
-        mesh.set_color(v0, glam::vec4(1.0, 0.0, 0.0, 1.0));
-        assert_eq!(mesh.color(v0), Some(glam::vec4(1.0, 0.0, 0.0, 1.0)));
+        mesh.set_color(v0, Vec4::new(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(mesh.color(v0), Some(Vec4::new(1.0, 0.0, 0.0, 1.0)));
 
         // Request and set vertex texcoords
         mesh.request_vertex_texcoords();
         assert!(mesh.has_vertex_texcoords());
 
-        mesh.set_texcoord(v0, glam::vec2(0.0, 0.0));
-        mesh.set_texcoord(v1, glam::vec2(1.0, 0.0));
-        mesh.set_texcoord(v2, glam::vec2(0.0, 1.0));
+        mesh.set_texcoord(v0, Vec2::new(0.0, 0.0));
+        mesh.set_texcoord(v1, Vec2::new(1.0, 0.0));
+        mesh.set_texcoord(v2, Vec2::new(0.0, 1.0));
 
-        assert_eq!(mesh.texcoord(v0), Some(glam::vec2(0.0, 0.0)));
+        assert_eq!(mesh.texcoord(v0), Some(Vec2::new(0.0, 0.0)));
     }
 
     #[test]
@@ -1945,29 +1940,29 @@ mod tests_soa {
         let mut mesh = RustMesh::new();
 
         // Add vertices and face
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
 
         // Request face normals
         mesh.request_face_normals();
         assert!(mesh.has_face_normals());
 
-        mesh.set_f_normal(FaceHandle::new(0), glam::vec3(0.0, 0.0, 1.0));
+        mesh.set_f_normal(FaceHandle::new(0), Vec3::new(0.0, 0.0, 1.0));
         assert_eq!(
             mesh.f_normal(FaceHandle::new(0)),
-            Some(glam::vec3(0.0, 0.0, 1.0))
+            Some(Vec3::new(0.0, 0.0, 1.0))
         );
 
         // Request face colors
         mesh.request_face_colors();
         assert!(mesh.has_face_colors());
 
-        mesh.set_f_color(FaceHandle::new(0), glam::vec4(0.5, 0.5, 0.5, 1.0));
+        mesh.set_f_color(FaceHandle::new(0), Vec4::new(0.5, 0.5, 0.5, 1.0));
         assert_eq!(
             mesh.f_color(FaceHandle::new(0)),
-            Some(glam::vec4(0.5, 0.5, 0.5, 1.0))
+            Some(Vec4::new(0.5, 0.5, 0.5, 1.0))
         );
     }
 }

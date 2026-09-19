@@ -89,6 +89,12 @@ pub struct MapperConfig {
     pub matching_pair_strategy: MatchingPairStrategy,
     pub experimental_sequence_heuristics: bool,
     pub experimental_ring_closure: bool,
+    /// Enable COLMAP-main structure-less next-image registration.
+    ///
+    /// COLMAP 3.13.0 only runs structure-based `FindNextImages` /
+    /// `RegisterNextImage`. Structure-less registration landed after 3.13, so
+    /// this defaults to false for 3.13 parity.
+    pub structureless_registration: bool,
     pub experimental_structureless_pair_pose_fallback: bool,
     pub min_matches: usize,
     pub min_inliers: usize,
@@ -181,6 +187,7 @@ impl Default for MapperConfig {
             matching_pair_strategy: MatchingPairStrategy::default(),
             experimental_sequence_heuristics: false,
             experimental_ring_closure: false,
+            structureless_registration: false,
             experimental_structureless_pair_pose_fallback: true,
             min_matches: 15,
             min_inliers: 15,
@@ -212,8 +219,8 @@ impl Default for MapperConfig {
             ba_sparse_backend: BundleAdjustmentSparseLinearAlgebra::Auto,
             ba_taskflow: None,
             global_ba_iterations: 50,
-            global_ba_images_ratio: 1.5,
-            global_ba_points_ratio: 1.5,
+            global_ba_images_ratio: 1.1,
+            global_ba_points_ratio: 1.1,
             global_ba_images_freq: 500,
             global_ba_points_freq: 250_000,
             global_ba_max_refinements: 5,
@@ -228,7 +235,7 @@ impl Default for MapperConfig {
             min_focal_length_ratio: 0.1,
             max_focal_length_ratio: 10.0,
             max_extra_param: 1.0,
-            max_reprojection_error_px: 8.0,
+            max_reprojection_error_px: 4.0,
             ignore_two_view_tracks: true,
             global_mapper: false,
             pose_graph: false,

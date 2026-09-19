@@ -1,4 +1,4 @@
-use rustmesh::{read_obj, read_off, write_off, FaceHandle, RustMesh, Vec3};
+use rustmesh::{read_obj, read_off, write_off, FaceHandle, Point3, RustMesh, Vec3};
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, BufRead, BufReader};
@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 pub struct MeshDigest {
     pub vertices: usize,
     pub faces: usize,
-    pub bbox_min: Vec3,
-    pub bbox_max: Vec3,
-    pub centroid: Vec3,
+    pub bbox_min: Point3,
+    pub bbox_max: Point3,
+    pub centroid: Point3,
     pub checksum_l1: f32,
 }
 
@@ -155,9 +155,9 @@ pub fn active_vertices(mesh: &RustMesh) -> usize {
 }
 
 pub fn mesh_digest(mesh: &RustMesh) -> MeshDigest {
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    let mut sum = Vec3::ZERO;
+    let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut sum = Vec3::zeros();
     let mut count = 0usize;
     let mut checksum = 0.0f32;
     let mut used = vec![false; mesh.n_vertices()];
@@ -185,9 +185,9 @@ pub fn mesh_digest(mesh: &RustMesh) -> MeshDigest {
         }
 
         if let Some(point) = mesh.point(vh) {
-            min = min.min(point);
-            max = max.max(point);
-            sum += point;
+            min = Point3::from(min.coords.inf(&point.coords));
+            max = Point3::from(max.coords.sup(&point.coords));
+            sum += point.coords;
             checksum += point.x.abs() + point.y.abs() + point.z.abs();
             count += 1;
         }
@@ -197,9 +197,9 @@ pub fn mesh_digest(mesh: &RustMesh) -> MeshDigest {
         return MeshDigest {
             vertices: 0,
             faces: 0,
-            bbox_min: Vec3::ZERO,
-            bbox_max: Vec3::ZERO,
-            centroid: Vec3::ZERO,
+            bbox_min: Point3::origin(),
+            bbox_max: Point3::origin(),
+            centroid: Point3::origin(),
             checksum_l1: 0.0,
         };
     }
@@ -209,7 +209,7 @@ pub fn mesh_digest(mesh: &RustMesh) -> MeshDigest {
         faces: active_faces(mesh),
         bbox_min: min,
         bbox_max: max,
-        centroid: sum / count as f32,
+        centroid: Point3::from(sum / count as f32),
         checksum_l1: checksum,
     }
 }
@@ -239,7 +239,7 @@ pub fn off_digest(path: &Path) -> io::Result<MeshDigest> {
         let x = parse_f32(parts.next(), "vertex x")?;
         let y = parse_f32(parts.next(), "vertex y")?;
         let z = parse_f32(parts.next(), "vertex z")?;
-        vertices.push(Vec3::new(x, y, z));
+        vertices.push(Point3::new(x, y, z));
     }
 
     let mut used = vec![false; vertex_count];
@@ -255,9 +255,9 @@ pub fn off_digest(path: &Path) -> io::Result<MeshDigest> {
         }
     }
 
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    let mut sum = Vec3::ZERO;
+    let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut sum = Vec3::zeros();
     let mut count = 0usize;
     let mut checksum = 0.0f32;
 
@@ -265,9 +265,9 @@ pub fn off_digest(path: &Path) -> io::Result<MeshDigest> {
         if !used.get(idx).copied().unwrap_or(false) {
             continue;
         }
-        min = min.min(point);
-        max = max.max(point);
-        sum += point;
+        min = Point3::from(min.coords.inf(&point.coords));
+        max = Point3::from(max.coords.sup(&point.coords));
+        sum += point.coords;
         checksum += point.x.abs() + point.y.abs() + point.z.abs();
         count += 1;
     }
@@ -276,9 +276,9 @@ pub fn off_digest(path: &Path) -> io::Result<MeshDigest> {
         return Ok(MeshDigest {
             vertices: 0,
             faces: face_count,
-            bbox_min: Vec3::ZERO,
-            bbox_max: Vec3::ZERO,
-            centroid: Vec3::ZERO,
+            bbox_min: Point3::origin(),
+            bbox_max: Point3::origin(),
+            centroid: Point3::origin(),
             checksum_l1: 0.0,
         });
     }
@@ -288,7 +288,7 @@ pub fn off_digest(path: &Path) -> io::Result<MeshDigest> {
         faces: face_count,
         bbox_min: min,
         bbox_max: max,
-        centroid: sum / count as f32,
+        centroid: Point3::from(sum / count as f32),
         checksum_l1: checksum,
     })
 }

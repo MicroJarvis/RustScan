@@ -58,9 +58,9 @@ cargo test --manifest-path RustMesh/Cargo.toml --lib
 # RustSLAM
 cargo test --manifest-path RustSLAM/Cargo.toml --lib
 
-# RustSFM
-cargo test -p rustsfm --lib
-cargo test -p rustsfm --lib --no-default-features
+# RustSFM. --no-default-features is a compile gate, not a matching pipeline test.
+cargo test -p rustsfm --lib --features gpu-wgpu,vlfeat-sift
+cargo check -p rustsfm --no-default-features --all-targets
 ```
 
 ## Notes

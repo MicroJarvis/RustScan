@@ -271,7 +271,6 @@ impl WgpuContext {
             offsets,
             receiver,
             submission,
-            wait_started: Instant::now(),
             copy_submit_seconds,
             total_started,
             map_decode_started,
@@ -282,8 +281,12 @@ impl WgpuContext {
         &self,
         pending: PendingReadback,
     ) -> Result<(Vec<Vec<u8>>, WgpuReadbackTiming)> {
+        // Time only the device wait. The caller runs overlap CPU work after
+        // start_read_regions returns and before this call; including that span
+        // would inflate readback wait and hide the overlap benefit.
+        let wait_started = Instant::now();
         self.wait_for(pending.submission)?;
-        let wait_seconds = pending.wait_started.elapsed().as_secs_f64();
+        let wait_seconds = wait_started.elapsed().as_secs_f64();
         pending
             .receiver
             .recv()
@@ -323,7 +326,6 @@ struct PendingReadback {
     offsets: Vec<(u64, u64)>,
     receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
     submission: wgpu::SubmissionIndex,
-    wait_started: Instant,
     copy_submit_seconds: f64,
     total_started: Instant,
     map_decode_started: Instant,

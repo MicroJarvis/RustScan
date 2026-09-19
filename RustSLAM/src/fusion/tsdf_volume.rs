@@ -7,7 +7,7 @@
 //! - Kinect Fusion algorithm
 //! - PGSR (Planar-based Gaussian Splatting Reconstruction)
 
-use glam::{Mat4, Vec3};
+use nalgebra::{Matrix4, Point3, Vector3};
 use std::collections::HashMap;
 
 /// A 3D voxel cell in the TSDF volume
@@ -42,8 +42,8 @@ pub struct TsdfConfig {
     /// Truncation distance (typically 3-5 * voxel_size)
     pub sdf_trunc: f32,
     /// Volume bounds
-    pub min_bound: Vec3,
-    pub max_bound: Vec3,
+    pub min_bound: Point3<f32>,
+    pub max_bound: Point3<f32>,
     /// Maximum weight per voxel
     pub max_weight: f32,
     /// Integration weight
@@ -55,8 +55,8 @@ impl Default for TsdfConfig {
         Self {
             voxel_size: 0.01, // 1cm voxels
             sdf_trunc: 0.03,  // 3cm truncation
-            min_bound: Vec3::new(-1.0, -1.0, -1.0),
-            max_bound: Vec3::new(1.0, 1.0, 1.0),
+            min_bound: Point3::new(-1.0, -1.0, -1.0),
+            max_bound: Point3::new(1.0, 1.0, 1.0),
             max_weight: 100.0,
             integration_weight: 1.0,
         }
@@ -97,15 +97,15 @@ impl TsdfVolume {
         let config = TsdfConfig {
             voxel_size,
             sdf_trunc: voxel_size * 3.0,
-            min_bound: Vec3::new(-half, -half, -half),
-            max_bound: Vec3::new(half, half, half),
+            min_bound: Point3::new(-half, -half, -half),
+            max_bound: Point3::new(half, half, half),
             ..Default::default()
         };
         Self::new(config)
     }
 
     /// Convert world position to voxel index
-    pub fn world_to_voxel(&self, pos: Vec3) -> Option<(i32, i32, i32)> {
+    pub fn world_to_voxel(&self, pos: Point3<f32>) -> Option<(i32, i32, i32)> {
         let x = ((pos.x - self.config.min_bound.x) / self.config.voxel_size).floor() as i32;
         let y = ((pos.y - self.config.min_bound.y) / self.config.voxel_size).floor() as i32;
         let z = ((pos.z - self.config.min_bound.z) / self.config.voxel_size).floor() as i32;
@@ -124,8 +124,8 @@ impl TsdfVolume {
     }
 
     /// Convert voxel index to world position (center of voxel)
-    pub fn voxel_to_world(&self, ix: i32, iy: i32, iz: i32) -> Vec3 {
-        Vec3::new(
+    pub fn voxel_to_world(&self, ix: i32, iy: i32, iz: i32) -> Point3<f32> {
+        Point3::new(
             self.config.min_bound.x + (ix as f32 + 0.5) * self.config.voxel_size,
             self.config.min_bound.y + (iy as f32 + 0.5) * self.config.voxel_size,
             self.config.min_bound.z + (iz as f32 + 0.5) * self.config.voxel_size,
@@ -160,7 +160,7 @@ impl TsdfVolume {
         width: usize,
         height: usize,
         intrinsics: [f32; 4],
-        extrinsics: &Mat4,
+        extrinsics: &Matrix4<f32>,
     ) {
         let depth_fn = |idx: usize| -> f32 { depth.get(idx).copied().unwrap_or(0.0) };
         let color_fn =
@@ -187,7 +187,7 @@ impl TsdfVolume {
         width: usize,
         height: usize,
         intrinsics: [f32; 4],
-        extrinsics: &Mat4,
+        extrinsics: &Matrix4<f32>,
     ) where
         F: Fn(usize) -> f32,
     {
@@ -208,7 +208,7 @@ impl TsdfVolume {
         width: usize,
         height: usize,
         intrinsics: [f32; 4],
-        extrinsics: &Mat4,
+        extrinsics: &Matrix4<f32>,
     ) {
         let [fx, fy, cx, cy] = intrinsics;
         let trunc = self.config.sdf_trunc.max(self.config.voxel_size);
@@ -223,14 +223,14 @@ impl TsdfVolume {
                     continue;
                 }
 
-                let ray_dir = Vec3::new((x as f32 - cx) / fx, (y as f32 - cy) / fy, 1.0);
+                let ray_dir = Vector3::new((x as f32 - cx) / fx, (y as f32 - cy) / fy, 1.0);
                 let mut t = (z - trunc).max(0.0);
                 let t_end = z + trunc;
                 let mut last_voxel: Option<(i32, i32, i32)> = None;
 
                 while t <= t_end {
-                    let cam_pos = ray_dir * t;
-                    let world_pos = extrinsics.transform_point3(cam_pos);
+                    let cam_pos = Point3::from(ray_dir * t);
+                    let world_pos = extrinsics.transform_point(&cam_pos);
                     if let Some((vx, vy, vz)) = self.world_to_voxel(world_pos) {
                         if last_voxel != Some((vx, vy, vz)) {
                             let sdf = z - t;
@@ -335,6 +335,8 @@ impl Default for TsdfVolume {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SE3;
+    use nalgebra::{Point3, UnitQuaternion, Vector3};
 
     #[test]
     fn test_voxel_creation() {
@@ -348,14 +350,14 @@ mod tests {
     fn test_world_voxel_conversion() {
         let volume = TsdfVolume::centered(1.0, 0.01);
 
-        let pos = Vec3::new(0.0, 0.0, 0.0);
+        let pos = Point3::new(0.0, 0.0, 0.0);
         let voxel = volume.world_to_voxel(pos);
         assert!(voxel.is_some());
 
         let (vx, vy, vz) = voxel.unwrap();
         let world = volume.voxel_to_world(vx, vy, vz);
 
-        assert!(world.distance(pos) < 0.01);
+        assert!((world - pos).norm() < 0.01);
     }
 
     #[test]
@@ -365,7 +367,7 @@ mod tests {
         // Simple depth map: 10x10, all at z=1.0
         let depth = vec![1.0f32; 10 * 10];
         let intrinsics = [500.0, 500.0, 5.0, 5.0];
-        let extrinsics = Mat4::IDENTITY;
+        let extrinsics = Matrix4::identity();
 
         volume.integrate(&depth, None, 10, 10, intrinsics, &extrinsics);
 
@@ -377,10 +379,27 @@ mod tests {
         let mut volume = TsdfVolume::centered(0.5, 0.05);
         let depth = vec![0.2f32; 1];
         let intrinsics = [1.0, 1.0, 0.0, 0.0];
-        let extrinsics = Mat4::IDENTITY;
+        let extrinsics = Matrix4::identity();
 
         volume.integrate(&depth, None, 1, 1, intrinsics, &extrinsics);
 
         assert!(volume.num_voxels() > 1);
+    }
+
+    #[test]
+    fn extrinsics_match_se3_homogeneous_for_non_symmetric_pose() {
+        let pose = SE3::from_quat_translation(
+            UnitQuaternion::from_euler_angles(0.3, -0.4, 0.5),
+            Vector3::new(1.25, -2.5, 3.75),
+        );
+        let matrix = pose.to_homogeneous_matrix();
+        let point = Point3::new(0.4, -1.2, 2.8);
+        let from_pose = pose.transform_point3(point);
+        let from_matrix = matrix.transform_point(&point);
+        assert!((from_pose - from_matrix).norm() < 1e-5);
+
+        let rows = pose.to_row_major_array();
+        let from_rows = rustscan_types::matrix4_from_row_major_array(&rows);
+        assert!((from_rows.transform_point(&point) - from_pose).norm() < 1e-5);
     }
 }

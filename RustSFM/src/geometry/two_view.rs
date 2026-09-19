@@ -1,13 +1,14 @@
 use crate::colmap_eigen;
 use crate::five_point::estimate_five_point_essential;
-use crate::geometry::relative_rotation_deg;
+use crate::geometry::{relative_rotation_deg, UnitQuatNormalize, Vec3GlamExt};
 #[cfg(feature = "gpu-wgpu")]
 use crate::gpu::{GpuModelSupport, TwoViewModelKind, WgpuModelScorer, WgpuModelScoringSession};
 use crate::gpu::{WgpuGeometryTiming, WgpuRansacStageTiming};
 use crate::types::CameraModel;
 #[cfg(feature = "gpu-wgpu")]
 use anyhow::Context;
-use glam::{Quat, Vec3};
+type Quat = nalgebra::UnitQuaternion<f32>;
+type Vec3 = nalgebra::Vector3<f32>;
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix3x4, Rotation3, UnitQuaternion, Vector3};
 use rustslam::{
     colmap_ransac_num_trials, ColmapMt19937, ColmapRandomSampler, ColmapRansacOptions, SE3,
@@ -5828,7 +5829,8 @@ fn triangulation_angle_deg(
 fn se3_from_parts(r: &Matrix3<f64>, t: &Vector3<f64>) -> Option<SE3> {
     let rotation = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(*r));
     let q = rotation.into_inner();
-    let quat = Quat::from_xyzw(q.i as f32, q.j as f32, q.k as f32, q.w as f32).normalize();
+    let quat =
+        crate::geometry::quat_from_xyzw(q.i as f32, q.j as f32, q.k as f32, q.w as f32).normalize();
     let translation = Vec3::new(t.x as f32, t.y as f32, t.z as f32);
     (translation.is_finite() && quat.is_finite())
         .then_some(SE3::from_quat_translation(quat, translation))
@@ -8208,7 +8210,7 @@ mod tests {
         let rays2 = rays1
             .iter()
             .map(|ray| {
-                let point = distance * ray / normal.dot(ray);
+                let point = distance * ray / normal.dot(&ray);
                 (rotation * point + translation).normalize()
             })
             .collect::<Vec<_>>();
@@ -8774,7 +8776,10 @@ mod tests {
         let mut pts2 = Vec::new();
         let mut obs1 = Vec::new();
         let mut obs2 = Vec::new();
-        let pose = SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0));
+        let pose = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
+        );
         for i in 0..40 {
             let x = 20.0 + i as f32 * 11.0;
             let y = if i % 2 == 0 {

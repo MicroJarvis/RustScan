@@ -5,7 +5,8 @@ use openmesh_compare_common::{
     mesh_digest, print_header, print_mesh_digest, write_temp_off,
 };
 use rustmesh::{
-    generate_cube, generate_sphere, read_obj, write_off, FaceHandle, RustMesh, VertexHandle,
+    generate_cube, generate_sphere, read_obj, write_off, FaceHandle, Point3, RustMesh, Vec3,
+    VertexHandle,
 };
 use std::path::Path;
 
@@ -13,14 +14,14 @@ fn build_tutorial08_cube() -> RustMesh {
     let mut mesh = RustMesh::new();
 
     let v = [
-        mesh.add_vertex(glam::vec3(-1.0, -1.0, 1.0)),
-        mesh.add_vertex(glam::vec3(1.0, -1.0, 1.0)),
-        mesh.add_vertex(glam::vec3(1.0, 1.0, 1.0)),
-        mesh.add_vertex(glam::vec3(-1.0, 1.0, 1.0)),
-        mesh.add_vertex(glam::vec3(-1.0, -1.0, -1.0)),
-        mesh.add_vertex(glam::vec3(1.0, -1.0, -1.0)),
-        mesh.add_vertex(glam::vec3(1.0, 1.0, -1.0)),
-        mesh.add_vertex(glam::vec3(-1.0, 1.0, -1.0)),
+        mesh.add_vertex(Point3::new(-1.0, -1.0, 1.0)),
+        mesh.add_vertex(Point3::new(1.0, -1.0, 1.0)),
+        mesh.add_vertex(Point3::new(1.0, 1.0, 1.0)),
+        mesh.add_vertex(Point3::new(-1.0, 1.0, 1.0)),
+        mesh.add_vertex(Point3::new(-1.0, -1.0, -1.0)),
+        mesh.add_vertex(Point3::new(1.0, -1.0, -1.0)),
+        mesh.add_vertex(Point3::new(1.0, 1.0, -1.0)),
+        mesh.add_vertex(Point3::new(-1.0, 1.0, -1.0)),
     ];
 
     mesh.add_face(&[v[0], v[1], v[2], v[3]]).unwrap();

@@ -270,8 +270,14 @@ impl OptimizationTimingSamples {
         self.scan_workspace_bytes = Some(self.scan_workspace_bytes.unwrap_or(0).max(scan_bytes));
     }
 
-    fn record_scan_workspace_stats(&mut self, reserved_bytes: usize, growth_count: usize, step_fresh: usize) {
-        self.scan_workspace_bytes = Some(self.scan_workspace_bytes.unwrap_or(0).max(reserved_bytes));
+    fn record_scan_workspace_stats(
+        &mut self,
+        reserved_bytes: usize,
+        growth_count: usize,
+        step_fresh: usize,
+    ) {
+        self.scan_workspace_bytes =
+            Some(self.scan_workspace_bytes.unwrap_or(0).max(reserved_bytes));
         self.scan_workspace_growth_count = growth_count;
         self.scan_workspace_step_fresh_allocations.push(step_fresh);
     }
@@ -1432,13 +1438,15 @@ impl WgpuTrainer {
             .record_status_readback(effective_reason);
         self.optimizer
             .sync_committed_steps(status.committed_optimizer_steps as usize);
-        self.optimization_samples
-            .gpu_gate_optimizer_skips = status.gpu_gate_optimizer_skips as usize;
+        self.optimization_samples.gpu_gate_optimizer_skips =
+            status.gpu_gate_optimizer_skips as usize;
         if let Some(err) = status.to_error() {
             self.optimization_samples.record_host_safety_point_abort();
             if status.has_forward_overflow() || status.has_non_finite_loss() {
-                self.optimization_samples.gpu_gate_backward_skips =
-                    self.optimization_samples.gpu_gate_backward_skips.saturating_add(1);
+                self.optimization_samples.gpu_gate_backward_skips = self
+                    .optimization_samples
+                    .gpu_gate_backward_skips
+                    .saturating_add(1);
             }
             return Err(err);
         }
@@ -2812,7 +2820,9 @@ mod tests {
                 )
                 .await
                 .unwrap_or_else(|err| {
-                    panic!("continuous overflow step {iteration} must stay Ok when loss unread: {err}")
+                    panic!(
+                        "continuous overflow step {iteration} must stay Ok when loss unread: {err}"
+                    )
                 });
             assert!(overflowed.is_none());
         }
@@ -2911,7 +2921,10 @@ mod tests {
         let after = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(after.0, before.0);
         assert_eq!(after.3, before.3);
-        assert_eq!(after.5.committed_optimizer_steps, before.5.committed_optimizer_steps);
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
         assert!(trainer.optimization_samples.status_readbacks_forward_abort >= 2);
     }
 
@@ -2953,12 +2966,7 @@ mod tests {
             .await
             .expect_err("loss-cadence NaN must surface NonFiniteLoss");
         assert!(
-            matches!(
-                err,
-                TrainingError::NonFiniteLoss {
-                    first_iteration: 2
-                }
-            ),
+            matches!(err, TrainingError::NonFiniteLoss { first_iteration: 2 }),
             "got {err:?}"
         );
         assert!(trainer.optimization_samples.host_safety_point_aborts >= 1);

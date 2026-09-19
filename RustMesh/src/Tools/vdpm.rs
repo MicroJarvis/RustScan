@@ -3,7 +3,7 @@
 // Based on the progressive mesh paper by Hugues Hoppe
 // ============================================================================
 
-use crate::{FaceHandle, HalfedgeHandle, QuadricT, RustMesh, Vec3, VertexHandle};
+use crate::{FaceHandle, HalfedgeHandle, Point3, QuadricT, RustMesh, VertexHandle};
 use std::collections::VecDeque;
 
 /// Record of a single edge collapse operation
@@ -17,11 +17,11 @@ pub struct CollapseRecord {
     /// The vertex that was kept
     pub v_kept: VertexHandle,
     /// The original position of v_kept before the collapse
-    pub original_v_kept_position: Vec3,
+    pub original_v_kept_position: Point3,
     /// The original position of v_removed before the collapse
-    pub original_v_removed_position: Vec3,
+    pub original_v_removed_position: Point3,
     /// The new position after collapse (where v_kept moved to)
-    pub new_position: Vec3,
+    pub new_position: Point3,
     /// The error/priority of this collapse
     pub error: f32,
     /// Exact mesh state before the collapse, used for deterministic replay.
@@ -45,9 +45,9 @@ pub struct SplitTopologyInfo {
     /// The new vertex to create
     pub v_new: VertexHandle,
     /// Position for the new vertex
-    pub new_position: Vec3,
+    pub new_position: Point3,
     /// Position for the split vertex
-    pub split_position: Vec3,
+    pub split_position: Point3,
     /// The fan vertices that will be separated
     pub left_fan: Vec<VertexHandle>,
     pub right_fan: Vec<VertexHandle>,
@@ -130,13 +130,13 @@ impl ProgressiveMesh {
             // Compute face normal and center
             let edge1 = p1 - p0;
             let edge2 = p2 - p0;
-            let normal = edge1.cross(edge2);
-            let len = normal.length();
+            let normal = edge1.cross(&edge2);
+            let len = normal.norm();
             if len < 1e-10 {
                 continue;
             }
             let normal = normal / len;
-            let center = (p0 + p1 + p2) / 3.0;
+            let center = Point3::from((p0.coords + p1.coords + p2.coords) / 3.0);
 
             // Create face quadric
             let face_quadric = QuadricT::from_face(normal, center);
@@ -154,12 +154,12 @@ impl ProgressiveMesh {
     }
 
     /// Get the optimal collapse position using quadrics
-    fn compute_optimal_position(&self, v0: VertexHandle, v1: VertexHandle) -> Vec3 {
+    fn compute_optimal_position(&self, v0: VertexHandle, v1: VertexHandle) -> Point3 {
         let idx0 = v0.idx_usize();
         let idx1 = v1.idx_usize();
 
         if idx0 >= self.vertex_quadrics.len() || idx1 >= self.vertex_quadrics.len() {
-            return self.current.point(v1).unwrap_or(Vec3::ZERO);
+            return self.current.point(v1).unwrap_or(Point3::origin());
         }
 
         // Combine quadrics
@@ -187,14 +187,14 @@ impl ProgressiveMesh {
     /// Find the best collapse candidate (halfedge with lowest error)
     fn find_best_collapse(
         &self,
-    ) -> Option<(HalfedgeHandle, VertexHandle, VertexHandle, Vec3, f32)> {
+    ) -> Option<(HalfedgeHandle, VertexHandle, VertexHandle, Point3, f32)> {
         let n_halfedges = self.current.n_halfedges();
 
         let mut best_heh = None;
         let mut best_error = f32::MAX;
         let mut best_v0 = VertexHandle::invalid();
         let mut best_v1 = VertexHandle::invalid();
-        let mut best_pos = Vec3::ZERO;
+        let mut best_pos = Point3::origin();
 
         // Sample halfedges for performance (not all need checking)
         let step = if n_halfedges > 1000 {
@@ -334,8 +334,8 @@ pub fn simplify(pm: &mut ProgressiveMesh, target_faces: usize) -> usize {
         let (heh, v_removed, v_kept, new_pos, error) = collapse;
 
         // Get original positions before collapse
-        let original_v_kept_pos = pm.current.point(v_kept).unwrap_or(Vec3::ZERO);
-        let original_v_removed_pos = pm.current.point(v_removed).unwrap_or(Vec3::ZERO);
+        let original_v_kept_pos = pm.current.point(v_kept).unwrap_or(Point3::origin());
+        let original_v_removed_pos = pm.current.point(v_removed).unwrap_or(Point3::origin());
         let pre_collapse_mesh = Box::new(pm.current.clone());
 
         // Collect topology info before collapse
@@ -540,7 +540,7 @@ mod tests {
                 continue;
             }
             if let Some(point) = mesh.point(vh) {
-                vertices.push((idx, point.to_array()));
+                vertices.push((idx, point.into()));
             }
         }
 

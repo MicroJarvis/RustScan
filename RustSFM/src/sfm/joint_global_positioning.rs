@@ -23,7 +23,9 @@ use crate::global_positioning::{
 use crate::track_establishment::Track;
 use crate::triangulation::triangulate_multi_view_point;
 use crate::types::{CameraModel, ImageFrame, PairGeometry};
-use glam::{Quat, Vec3};
+type Quat = nalgebra::UnitQuaternion<f32>;
+type Vec3 = nalgebra::Vector3<f32>;
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use nalgebra::{Matrix3x4, Vector2};
 use rustslam::SE3;
 
@@ -321,7 +323,7 @@ fn camera_ray_world(rotation: Quat, camera: CameraModel, x: f32, y: f32) -> Opti
     let uv = camera.cam_from_img_f32(x, y)?;
     let bearing_cam = Vec3::new(uv[0], uv[1], 1.0);
     bearing_cam
-        .try_normalize()
+        .try_normalize(f32::EPSILON)
         .map(|bearing| (rotation.inverse() * bearing).normalize())
 }
 
@@ -341,7 +343,7 @@ fn initialize_centers(
         }
     }
 
-    let mut centers = vec![Vec3::ZERO; num_views];
+    let mut centers = vec![Vec3::zeros(); num_views];
     if observations.is_empty() {
         return None;
     }
@@ -349,7 +351,7 @@ fn initialize_centers(
         centers[obs.camera] += obs.ray_world;
     }
     for center in &mut centers {
-        if center.length_squared() > 1.0e-12 {
+        if center.norm_squared() > 1.0e-12 {
             *center = center.normalize();
         }
     }
@@ -364,7 +366,7 @@ fn initialize_points_from_poses(
     frames: &[ImageFrame],
     camera: CameraModel,
 ) -> Vec<Vec3> {
-    let mut points = vec![Vec3::ZERO; num_tracks];
+    let mut points = vec![Vec3::zeros(); num_tracks];
     for track_idx in 0..num_tracks {
         let mut cams_from_world = Vec::new();
         let mut cam_points = Vec::new();
@@ -457,7 +459,7 @@ fn update_centers(
     depths: &[f64],
     weights: &[f64],
 ) -> Vec<Vec3> {
-    let mut numerators = vec![Vec3::ZERO; num_views];
+    let mut numerators = vec![Vec3::zeros(); num_views];
     let mut denominators = vec![0.0f64; num_views];
     for (obs, (&depth, &weight)) in observations.iter().zip(depths.iter().zip(weights.iter())) {
         if weight <= 0.0 || depth <= 0.0 {
@@ -469,7 +471,7 @@ fn update_centers(
         numerators[obs.camera] += target * (weight * d as f64) as f32;
         denominators[obs.camera] += weight * d2 as f64;
     }
-    let mut centers = vec![Vec3::ZERO; num_views];
+    let mut centers = vec![Vec3::zeros(); num_views];
     for (center, (numerator, denom)) in centers
         .iter_mut()
         .zip(numerators.iter().zip(denominators.iter()))
@@ -482,11 +484,11 @@ fn update_centers(
 }
 
 pub(crate) fn inverse_depth_along_ray(ray_world: Vec3, delta: Vec3) -> f64 {
-    let denom = delta.length_squared() as f64;
+    let denom = delta.norm_squared() as f64;
     if denom < 1.0e-12 {
         return 1.0;
     }
-    (ray_world.dot(delta).max(0.0) as f64) / denom
+    (ray_world.dot(&delta).max(0.0) as f64) / denom
 }
 
 pub(crate) fn apply_origin_gauge(centers: &mut [Vec3], points: &mut [Vec3]) {
@@ -500,7 +502,7 @@ pub(crate) fn apply_origin_gauge(centers: &mut [Vec3], points: &mut [Vec3]) {
     for point in points.iter_mut() {
         *point -= shift;
     }
-    centers[0] = Vec3::ZERO;
+    centers[0] = Vec3::zeros();
 }
 
 fn update_points(
@@ -510,7 +512,7 @@ fn update_points(
     depths: &[f64],
     weights: &[f64],
 ) -> Vec<Vec3> {
-    let mut numerators = vec![Vec3::ZERO; num_tracks];
+    let mut numerators = vec![Vec3::zeros(); num_tracks];
     let mut denominators = vec![0.0f64; num_tracks];
     for (obs, (&depth, &weight)) in observations.iter().zip(depths.iter().zip(weights.iter())) {
         if weight <= 0.0 || depth <= 0.0 {
@@ -522,7 +524,7 @@ fn update_points(
         numerators[obs.track] += target * (weight * d as f64) as f32;
         denominators[obs.track] += weight * d2 as f64;
     }
-    let mut points = vec![Vec3::ZERO; num_tracks];
+    let mut points = vec![Vec3::zeros(); num_tracks];
     for (point, (numerator, denom)) in points
         .iter_mut()
         .zip(numerators.iter().zip(denominators.iter()))
@@ -538,7 +540,7 @@ pub(crate) fn normalize_joint_scale(centers: &mut [Vec3], points: &mut [Vec3], d
     let sum_sq: f64 = centers
         .iter()
         .chain(points.iter())
-        .map(|v| v.length_squared() as f64)
+        .map(|v| v.norm_squared() as f64)
         .sum::<f64>();
     let count = centers.len().max(1) + points.len();
     let rms = (sum_sq / count as f64).sqrt();
@@ -611,7 +613,7 @@ mod tests {
     use super::*;
     use crate::track_establishment::FeatureNode;
     use crate::types::PairGeometry;
-    use glam::Quat;
+    type Quat = nalgebra::UnitQuaternion<f32>;
     use rustslam::{ColmapMt19937, Match, SE3};
 
     fn unit(rng: &mut ColmapMt19937) -> f32 {
@@ -619,13 +621,15 @@ mod tests {
     }
 
     fn random_quat(rng: &mut ColmapMt19937) -> Quat {
-        let axis = Vec3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5).normalize_or_zero();
-        let axis = if axis.length_squared() < 1.0e-6 {
-            Vec3::X
+        let axis = Vec3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5)
+            .try_normalize(f32::EPSILON)
+            .unwrap_or_else(nalgebra::Vector3::zeros);
+        let axis = if axis.norm_squared() < 1.0e-6 {
+            Vec3::x()
         } else {
             axis
         };
-        Quat::from_axis_angle(axis, unit(rng) * std::f32::consts::PI)
+        crate::geometry::quat_from_axis_angle(axis, unit(rng) * std::f32::consts::PI)
     }
 
     fn test_camera() -> CameraModel {
@@ -711,8 +715,8 @@ mod tests {
         let mut num = 0.0f32;
         let mut den = 0.0f32;
         for (e, g) in est.iter().zip(gt.iter()) {
-            num += e.dot(*g);
-            den += e.dot(*e);
+            num += e.dot(&*g);
+            den += e.dot(&*e);
         }
         if den < 1.0e-12 {
             1.0
@@ -725,9 +729,9 @@ mod tests {
     fn recovers_identity_rotations_layout() {
         let camera = test_camera();
         let n = 5;
-        let rotations = vec![Quat::IDENTITY; n];
+        let rotations = vec![Quat::identity(); n];
         let centers = vec![
-            Vec3::ZERO,
+            Vec3::zeros(),
             Vec3::new(0.5, 0.0, 0.0),
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(1.5, 0.0, 0.0),
@@ -795,9 +799,9 @@ mod tests {
     fn joint_refinement_improves_noisy_init() {
         let camera = test_camera();
         let n = 5;
-        let rotations = vec![Quat::IDENTITY; n];
+        let rotations = vec![Quat::identity(); n];
         let centers = vec![
-            Vec3::ZERO,
+            Vec3::zeros(),
             Vec3::new(0.5, 0.0, 0.0),
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(1.5, 0.0, 0.0),
@@ -851,8 +855,8 @@ mod tests {
         let camera = test_camera();
         let n = 7;
         let num_points = 12;
-        let mut rotations = vec![Quat::IDENTITY];
-        let mut centers = vec![Vec3::ZERO];
+        let mut rotations = vec![Quat::identity()];
+        let mut centers = vec![Vec3::zeros()];
         for _ in 1..n {
             rotations.push(random_quat(&mut rng));
             centers.push(Vec3::new(
@@ -940,7 +944,7 @@ mod tests {
     fn rejects_empty_tracks() {
         let camera = test_camera();
         assert!(estimate_joint_global_positions(
-            &[Quat::IDENTITY, Quat::IDENTITY],
+            &[Quat::identity(), Quat::identity()],
             &[],
             &[],
             camera,

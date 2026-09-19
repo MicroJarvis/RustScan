@@ -215,17 +215,23 @@ impl ColmapTwoViewGeometry {
         self.e_matrix = self.e_matrix.map(transpose3);
         self.h_matrix = self.h_matrix.and_then(invert_matrix3);
         if let (Some(qvec), Some(tvec)) = (self.qvec, self.tvec) {
-            let rotation = glam::DQuat::from_xyzw(qvec[1], qvec[2], qvec[3], qvec[0]).normalize();
-            let translation = glam::DVec3::from_array(tvec);
+            let rotation = nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+                qvec[0], qvec[1], qvec[2], qvec[3],
+            ));
+            let translation = nalgebra::Vector3::new(tvec[0], tvec[1], tvec[2]);
             let inverse_rotation = rotation.inverse();
             let inverse_translation = -(inverse_rotation * translation);
             self.qvec = Some([
                 inverse_rotation.w,
-                inverse_rotation.x,
-                inverse_rotation.y,
-                inverse_rotation.z,
+                inverse_rotation.i,
+                inverse_rotation.j,
+                inverse_rotation.k,
             ]);
-            self.tvec = Some(inverse_translation.to_array());
+            self.tvec = Some([
+                inverse_translation.x,
+                inverse_translation.y,
+                inverse_translation.z,
+            ]);
         }
         for match_ in &mut self.inlier_matches {
             std::mem::swap(&mut match_.point2d_idx1, &mut match_.point2d_idx2);
@@ -2275,7 +2281,15 @@ impl ColmapDatabase {
                 .add_image(image_id, num_points2d)
                 .map_err(|err| anyhow::anyhow!("{err:?}"))?;
         }
-        for (pair_id, geometry) in self.read_two_view_geometries()? {
+        let match_pair_ids = self
+            .read_num_matches()?
+            .into_iter()
+            .map(|(pair_id, _)| pair_id)
+            .collect::<Vec<_>>();
+        for (pair_id, geometry) in two_view_geometries_in_match_table_order(
+            &match_pair_ids,
+            self.read_two_view_geometries()?,
+        ) {
             let (image_id1, image_id2) =
                 pair_id_to_image_pair(pair_id).map_err(|err| anyhow::anyhow!("{err:?}"))?;
             if !graph.exists_image(image_id1) || !graph.exists_image(image_id2) {
@@ -2354,7 +2368,15 @@ impl ColmapDatabase {
             }
         }
         let keypoint_counts = self.read_keypoint_counts()?;
-        let two_view_geometries = self.read_two_view_geometries()?;
+        let match_pair_ids = self
+            .read_num_matches()?
+            .into_iter()
+            .map(|(pair_id, _)| pair_id)
+            .collect::<Vec<_>>();
+        let two_view_geometries = two_view_geometries_in_match_table_order(
+            &match_pair_ids,
+            self.read_two_view_geometries()?,
+        );
         let image_to_frame = images
             .iter()
             .map(|(&image_id, image)| (image_id, image.frame_id.unwrap_or(image_id)))
@@ -3183,6 +3205,33 @@ fn validate_dynamic_blob(
         );
     }
     Ok(())
+}
+
+fn two_view_geometries_in_match_table_order(
+    match_pair_ids: &[ImagePairId],
+    geometries: Vec<(ImagePairId, ColmapTwoViewGeometry)>,
+) -> Vec<(ImagePairId, ColmapTwoViewGeometry)> {
+    let sql_order = geometries
+        .iter()
+        .map(|(pair_id, _)| *pair_id)
+        .collect::<Vec<_>>();
+    let mut remaining = geometries.into_iter().collect::<HashMap<_, _>>();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    let mut seen = HashMap::<ImagePairId, ()>::new();
+    for pair_id in match_pair_ids {
+        if seen.insert(*pair_id, ()).is_some() {
+            continue;
+        }
+        if let Some(geometry) = remaining.remove(pair_id) {
+            ordered.push((*pair_id, geometry));
+        }
+    }
+    for pair_id in sql_order {
+        if let Some(geometry) = remaining.remove(&pair_id) {
+            ordered.push((pair_id, geometry));
+        }
+    }
+    ordered
 }
 
 fn validate_keypoints_blob(blob: &ColmapKeypointsBlob) -> Result<()> {

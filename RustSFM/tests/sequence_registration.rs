@@ -7,6 +7,7 @@ use rustsfm::database::{
     ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint,
     ColmapTwoViewGeometry, COLMAP_FEATURE_SIFT, COLMAP_TWO_VIEW_CALIBRATED,
 };
+use rustsfm::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use rustsfm::types::{CameraModel, Point3D, Reconstruction, TrackObservation, COLMAP_PINHOLE};
 use rustsfm::{
     register_remaining_sequence_frames, require_complete_pose_coverage,
@@ -136,8 +137,8 @@ fn synthetic_sequence_fixture(
     let poses = (0..6)
         .map(|index| {
             rustslam::SE3::from_quat_translation(
-                glam::Quat::from_rotation_y((index as f32 - 2.5) * 0.012),
-                glam::Vec3::new(index as f32 * -0.11, (index % 2) as f32 * 0.01, 0.0),
+                rustsfm::geometry::quat_from_rotation_y((index as f32 - 2.5) * 0.012),
+                nalgebra::Vector3::new(index as f32 * -0.11, (index % 2) as f32 * 0.01, 0.0),
             )
         })
         .collect::<Vec<_>>();
@@ -501,6 +502,7 @@ fn sequence_memory_chain_plans_missing_remaining_before_first_node() -> anyhow::
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn sequence_memory_cached_independent_entries_keep_floor_and_typed_pause() -> anyhow::Result<()> {
     for entry in ["keyframe", "adaptive", "remaining"] {
@@ -724,6 +726,7 @@ fn sequence_memory_missing_sparse_model_after_queue_fails_closed() -> anyhow::Re
     })
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn sequence_memory_cached_chain_keeps_two_nodes_and_final_ba_order() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
@@ -810,6 +813,7 @@ fn sequence_memory_cached_chain_keeps_two_nodes_and_final_ba_order() -> anyhow::
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn sequence_memory_no_pending_uses_only_caller_floor() -> anyhow::Result<()> {
     let (_temp, output, frames, mut keyframes, mut config) = synthetic_sequence_fixture(None)?;
@@ -1183,6 +1187,7 @@ fn remaining_stage_rejects_mismatched_keyframe_database_camera() -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn partial_keyframe_model_retries_missing_selected_keyframe() -> anyhow::Result<()> {
     let (_temp, output, frames, mut keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
@@ -1232,6 +1237,7 @@ fn partial_keyframe_model_retries_missing_selected_keyframe() -> anyhow::Result<
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
@@ -1397,6 +1403,7 @@ fn taskflow_sequence_waits_for_budget_and_runs_final_global_ba_once() -> anyhow:
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn pause_before_sparse_publish_preserves_old_model_byte_for_byte() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
@@ -1435,6 +1442,7 @@ fn pause_before_sparse_publish_preserves_old_model_byte_for_byte() -> anyhow::Re
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn pause_after_sparse_publish_resumes_from_immutable_keyframes() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
@@ -1505,6 +1513,7 @@ fn pause_after_sparse_publish_resumes_from_immutable_keyframes() -> anyhow::Resu
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn narrow_round_does_not_publish_same_round_registrations_as_support() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
@@ -1549,6 +1558,7 @@ fn narrow_round_does_not_publish_same_round_registrations_as_support() -> anyhow
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn wide_round_can_use_tracks_committed_by_narrow_non_keyframe() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
@@ -1601,6 +1611,7 @@ fn wide_round_can_use_tracks_committed_by_narrow_non_keyframe() -> anyhow::Resul
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn default_pnp_seed_is_stable_across_intervening_registration_calls() -> anyhow::Result<()> {
     let (_temp_a, output_a, frames_a, keyframes_a, mut mapper_a) =
@@ -1706,6 +1717,7 @@ fn default_pnp_seed_is_stable_across_intervening_registration_calls() -> anyhow:
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn blank_sequence_frame_returns_unresolved_incomplete_coverage() -> anyhow::Result<()> {
     let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(Some(3))?;
@@ -1945,6 +1957,7 @@ fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -
     Ok(())
 }
 
+#[cfg(feature = "gpu-wgpu")]
 #[test]
 fn keyframe_stage_uses_private_snapshot_and_removes_legacy_shared_directory() -> anyhow::Result<()>
 {

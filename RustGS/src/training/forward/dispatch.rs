@@ -289,7 +289,10 @@ mod tests {
         run_dispatch_status(1_025, 1_024, 2, &status).await;
         let snap = status.read().await.expect("read status");
         assert!(snap.has_forward_overflow());
-        assert_eq!(snap.mutation_gate, 0, "overflow must clear same-step mutation_gate");
+        assert_eq!(
+            snap.mutation_gate, 0,
+            "overflow must clear same-step mutation_gate"
+        );
         assert_eq!(snap.first_invalid_iteration, 2);
         assert_eq!(snap.requested_intersections, 1_025);
         assert_eq!(snap.intersection_capacity, 1_024);

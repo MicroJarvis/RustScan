@@ -1,6 +1,6 @@
 //! MapPoint representation
 
-use glam::Vec3;
+use nalgebra::{Point3, Vector3};
 
 /// A 3D map point
 #[derive(Debug, Clone)]
@@ -8,9 +8,9 @@ pub struct MapPoint {
     /// Unique ID
     pub id: u64,
     /// 3D position in world frame
-    pub position: Vec3,
+    pub position: Point3<f32>,
     /// Normal direction (optional)
-    pub normal: Option<Vec3>,
+    pub normal: Option<Vector3<f32>>,
     /// Optional color (normalized RGB, used for Gaussian initialization)
     pub color: Option<[f32; 3]>,
     /// Reference keyframe ID
@@ -23,7 +23,7 @@ pub struct MapPoint {
 
 impl MapPoint {
     /// Create a new map point
-    pub fn new(id: u64, position: Vec3, reference_kf: u64) -> Self {
+    pub fn new(id: u64, position: Point3<f32>, reference_kf: u64) -> Self {
         Self {
             id,
             position,
@@ -51,7 +51,7 @@ impl MapPoint {
     }
 
     /// Set normal direction
-    pub fn set_normal(&mut self, normal: Vec3) {
+    pub fn set_normal(&mut self, normal: Vector3<f32>) {
         self.normal = Some(normal);
     }
 

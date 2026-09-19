@@ -15,7 +15,8 @@ use crate::generalized_pose::{
 use crate::geometry::{
     camera_center, estimate_pair_geometry_with_options_and_cameras,
     mean_pair_reprojection_error_with_cameras, pose_from_rotation_center, pose_rotation,
-    pose_with_flipped_translation, relative_rotation_deg, PairEstimationOptions,
+    pose_with_flipped_translation, relative_rotation_deg, PairEstimationOptions, UnitQuatNormalize,
+    Vec3GlamExt,
 };
 use crate::global_mapper::{
     run_global_reconstructions, GlobalMapperOptions, GlobalReconstructionOptions,
@@ -98,7 +99,11 @@ use reconstruction_input::{
 };
 pub use reconstruction_input::{reference_camera_setup, ReconstructionSeed, ReferenceCameraSetup};
 pub use state::InitialPairFailure;
-use state::{IncrementalMapperSession, InitialPairSelectionState, RegistrationStats};
+use state::{
+    IncrementalMapperSession, InitialPairAttemptError, InitialPairCandidateDecision,
+    InitialPairCandidateRecord, InitialPairRejection, InitialPairRejectionReason,
+    InitialPairSelectionState, RegistrationStats,
+};
 
 pub(crate) type DynPnPModelScorer = dyn PnPModelScorer<Error = anyhow::Error>;
 
@@ -273,7 +278,7 @@ pub(crate) fn register_single_target_from_seed(
     let mut observation_manager = ObservationManager::new(frames, pairs, &reconstruction);
     let graph = observation_manager.correspondence_graph();
     let mut telemetry = IncrementalRegistrationTelemetry::default();
-    let Some(absolute_pose) = solve_absolute_pose_with_pnp_scorer(
+    let Ok(absolute_pose) = solve_absolute_pose_with_pnp_scorer(
         target_image,
         frames,
         pairs,
@@ -860,7 +865,13 @@ fn run_reconstruction_prepared(
     if let Some(database) = mapper_database.as_ref() {
         config.pose_priors = database.cache.pose_priors.clone();
         if reference_camera_setup.is_none() {
-            reference_camera_setup = database_camera_setup(&database.cache, &paths).ok();
+            // Align setup image order with database_frames, which drops paths
+            // that are not present in the match-connected database cache.
+            let frame_paths = frames
+                .iter()
+                .map(|frame| frame.path.clone())
+                .collect::<Vec<_>>();
+            reference_camera_setup = database_camera_setup(&database.cache, &frame_paths).ok();
             if let Some(setup) = &mut reference_camera_setup {
                 for setup_camera in &mut setup.cameras {
                     if let Some(fx) = config.fx {
@@ -1661,7 +1672,9 @@ pub fn database_pair_matches_for_frames(
             matches,
         });
     }
-    out.sort_by_key(|pair| (pair.left, pair.right));
+    // Keep `read_num_matches()` / graph insertion order. Do not sort by
+    // (left, right): that changes which orientation `oriented_initial_pair`
+    // sees first when both directions are stored.
     Ok(out)
 }
 
@@ -1781,10 +1794,7 @@ fn estimate_database_pair_geometries(
                         );
                         if accepted {
                             if let Some(stored_pair) = stored_pair {
-                                stored_accepted.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                stored_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 note_pair_geometry_path_progress(
                                     &pairs_done,
                                     &stored_accepted,
@@ -1802,6 +1812,22 @@ fn estimate_database_pair_geometries(
                                 return Some(stored_pair);
                             }
                         }
+                        eprintln!(
+                            "stored_pair_reject {} -> {} config={} inliers={} tri={} err={:.3} med_tri={:.3}",
+                            frames[pair_ref.left].name,
+                            frames[pair_ref.right].name,
+                            geometry.config,
+                            stored_pair.as_ref().map(|p| p.inliers).unwrap_or(0),
+                            stored_pair.as_ref().map(|p| p.triangulated).unwrap_or(0),
+                            stored_pair
+                                .as_ref()
+                                .map(|p| p.mean_reprojection_error_px)
+                                .unwrap_or(f32::NAN),
+                            stored_pair
+                                .as_ref()
+                                .map(|p| p.median_triangulation_angle_deg)
+                                .unwrap_or(f32::NAN),
+                        );
                         stored_rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -1811,12 +1837,7 @@ fn estimate_database_pair_geometries(
                     .correspondence_graph
                     .extract_matches_between_images(pair_ref.left_image_id, pair_ref.right_image_id)
                     .ok()
-                    .map(|matches| {
-                        matches
-                            .into_iter()
-                            .map(Into::into)
-                            .collect::<Vec<_>>()
-                    });
+                    .map(|matches| matches.into_iter().map(Into::into).collect::<Vec<_>>());
                 let Some(matches) = matches else {
                     fallback_ns.fetch_add(
                         fallback_start.elapsed().as_nanos() as u64,
@@ -2040,20 +2061,20 @@ fn database_pair_refs_for_frames(
             right_image_id,
         });
     }
-    out.sort_by_key(|pair| (pair.left, pair.right));
     Ok(out)
 }
 
 fn stored_two_view_pose(geometry: &ColmapTwoViewGeometry) -> Option<SE3> {
     let q = geometry.qvec?;
     let t = geometry.tvec?;
-    let rotation = glam::Quat::from_xyzw(q[1] as f32, q[2] as f32, q[3] as f32, q[0] as f32);
+    let rotation =
+        crate::geometry::quat_from_xyzw(q[1] as f32, q[2] as f32, q[3] as f32, q[0] as f32);
     if !rotation.is_finite() {
         return None;
     }
     let rotation = rotation.normalize();
-    let translation = glam::Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32);
-    let translation = translation.try_normalize()?;
+    let translation = nalgebra::Vector3::new(t[0] as f32, t[1] as f32, t[2] as f32);
+    let translation = translation.try_normalize(f32::EPSILON)?;
     Some(SE3::from_quat_translation(rotation, translation))
 }
 
@@ -2148,12 +2169,14 @@ fn stored_pose_pair_metrics(
 }
 
 fn pair_triangulation_angle_deg(left_pose: SE3, right_pose: SE3, point: [f32; 3]) -> Option<f32> {
+    // COLMAP CalculateTriangulationAngle: acos(dot(ray1, ray2)).abs(), without
+    // folding the dot product through abs (that maps wide baselines to ~0°).
     let c1 = camera_center(left_pose);
     let c2 = camera_center(right_pose);
-    let p = glam::Vec3::from_array(point);
-    let v1 = (p - c1).try_normalize()?;
-    let v2 = (p - c2).try_normalize()?;
-    Some(v1.dot(v2).abs().clamp(-1.0, 1.0).acos().to_degrees())
+    let p = nalgebra::Vector3::from(point);
+    let v1 = (c1 - p).try_normalize(f32::EPSILON)?;
+    let v2 = (c2 - p).try_normalize(f32::EPSILON)?;
+    Some(v1.dot(&v2).clamp(-1.0, 1.0).acos().abs().to_degrees())
 }
 
 fn median_f32(values: &mut [f32]) -> f32 {
@@ -2554,13 +2577,22 @@ fn keep_stored_database_pair(pair: &PairGeometry, config: &MapperConfig) -> bool
     ) {
         return false;
     }
-    pair.mean_reprojection_error_px.is_finite()
-        && pair.inliers >= config.min_inliers
-        && pair.triangulated >= config.min_triangulated
-        && pair.mean_reprojection_error_px
-            <= config
-                .max_reprojection_error_px
-                .max(STORED_POSE_MAX_REPROJ_PX)
+    if !pair.mean_reprojection_error_px.is_finite()
+        || pair.inliers < config.min_inliers
+        || pair.triangulated < config.min_triangulated
+    {
+        return false;
+    }
+    // COLMAP DatabaseCache trusts verified UNCALIBRATED geometries as-is. Their
+    // stored pose can have large reprojection under our camera model; rejecting
+    // them and falling back drops pairs COLMAP keeps (flowers2: both config=3).
+    if pair.two_view_config == crate::database::COLMAP_TWO_VIEW_UNCALIBRATED {
+        return true;
+    }
+    pair.mean_reprojection_error_px
+        <= config
+            .max_reprojection_error_px
+            .max(STORED_POSE_MAX_REPROJ_PX)
 }
 
 fn keep_pair_for_mapping(pair: &PairGeometry, config: &MapperConfig) -> bool {
@@ -2745,11 +2777,11 @@ fn enforce_adjacent_translation_continuity(pairs: &mut [PairGeometry]) {
     for (_, idx) in adjacent {
         let pose = pairs[idx].relative_pose;
         let center = camera_center(pose);
-        let Some(mut direction) = center.try_normalize() else {
+        let Some(mut direction) = center.try_normalize(f32::EPSILON) else {
             continue;
         };
         if let Some(prev) = prev_direction {
-            if direction.dot(prev) < -0.25 {
+            if direction.dot(&prev) < -0.25 {
                 pairs[idx].relative_pose = pose_with_flipped_translation(pose);
                 direction = -direction;
             }
@@ -2764,7 +2796,7 @@ fn regularize_low_parallax_adjacent_translations(pairs: &mut [PairGeometry]) {
         return;
     }
     let chain_rotations = adjacent_chain_rotations(max_image + 1, pairs);
-    let mut votes = vec![Vec::<glam::Vec3>::new(); max_image + 1];
+    let mut votes = vec![Vec::<nalgebra::Vector3<f32>>::new(); max_image + 1];
     let original_adjacent_dirs = adjacent_world_directions(pairs);
     for idx in 0..original_adjacent_dirs.len() {
         let Some(dir) = original_adjacent_dirs[idx] else {
@@ -2844,7 +2876,7 @@ fn regularize_low_parallax_adjacent_translations(pairs: &mut [PairGeometry]) {
             continue;
         };
         let angle = current_dir
-            .dot(vote_dir)
+            .dot(&vote_dir)
             .clamp(-1.0, 1.0)
             .acos()
             .to_degrees();
@@ -2867,17 +2899,17 @@ fn regularize_low_parallax_adjacent_translations(pairs: &mut [PairGeometry]) {
             continue;
         };
         let Some(current_dir) =
-            glam::Vec3::from_array(pair.relative_pose.translation()).try_normalize()
+            nalgebra::Vector3::from(pair.relative_pose.translation()).try_normalize(f32::EPSILON)
         else {
             continue;
         };
         let Some(anchor_dir) =
-            glam::Vec3::from_array(anchor.relative_pose.translation()).try_normalize()
+            nalgebra::Vector3::from(anchor.relative_pose.translation()).try_normalize(f32::EPSILON)
         else {
             continue;
         };
         let angle = current_dir
-            .dot(anchor_dir)
+            .dot(&anchor_dir)
             .clamp(-1.0, 1.0)
             .acos()
             .to_degrees();
@@ -2915,8 +2947,11 @@ fn local_anchor_score(pair: &PairGeometry) -> f32 {
         / pair.mean_reprojection_error_px.max(0.1)
 }
 
-fn adjacent_chain_rotations(image_count: usize, pairs: &[PairGeometry]) -> Vec<glam::Quat> {
-    let mut rotations = vec![glam::Quat::IDENTITY; image_count];
+fn adjacent_chain_rotations(
+    image_count: usize,
+    pairs: &[PairGeometry],
+) -> Vec<nalgebra::UnitQuaternion<f32>> {
+    let mut rotations = vec![nalgebra::UnitQuaternion::<f32>::identity(); image_count];
     for idx in 1..image_count {
         if let Some(pair) = pairs
             .iter()
@@ -2932,35 +2967,42 @@ fn adjacent_chain_rotations(image_count: usize, pairs: &[PairGeometry]) -> Vec<g
 
 fn pair_world_direction_with_rotations(
     pair: &PairGeometry,
-    rotations: &[glam::Quat],
-) -> Option<glam::Vec3> {
+    rotations: &[nalgebra::UnitQuaternion<f32>],
+) -> Option<nalgebra::Vector3<f32>> {
     let right_rotation = *rotations.get(pair.right)?;
-    let t = glam::Vec3::from_array(pair.relative_pose.translation()).try_normalize()?;
-    (-(right_rotation.inverse() * t)).try_normalize()
+    let t =
+        nalgebra::Vector3::from(pair.relative_pose.translation()).try_normalize(f32::EPSILON)?;
+    (-(right_rotation.inverse() * t)).try_normalize(f32::EPSILON)
 }
 
-fn robust_mean_direction(dirs: &[glam::Vec3]) -> Option<glam::Vec3> {
+fn robust_mean_direction(dirs: &[nalgebra::Vector3<f32>]) -> Option<nalgebra::Vector3<f32>> {
     if dirs.len() < 2 {
         return None;
     }
-    let mut mean = glam::Vec3::ZERO;
+    let mut mean = nalgebra::Vector3::<f32>::zeros();
     for &dir in dirs {
-        if mean.length_squared() > 0.0 && mean.dot(dir) < 0.0 {
+        if mean.norm_squared() > 0.0 && mean.dot(&dir) < 0.0 {
             mean -= dir;
         } else {
             mean += dir;
         }
     }
-    mean.try_normalize()
+    mean.try_normalize(f32::EPSILON)
 }
 
-fn pose_with_world_translation_direction(pose: SE3, world_direction: glam::Vec3) -> SE3 {
+fn pose_with_world_translation_direction(
+    pose: SE3,
+    world_direction: nalgebra::Vector3<f32>,
+) -> SE3 {
     let rotation = pose_rotation(pose);
     let t = -(rotation * world_direction.normalize());
     SE3::from_quat_translation(rotation, t)
 }
 
-fn pose_with_local_translation_direction(pose: SE3, local_direction: glam::Vec3) -> SE3 {
+fn pose_with_local_translation_direction(
+    pose: SE3,
+    local_direction: nalgebra::Vector3<f32>,
+) -> SE3 {
     let rotation = pose_rotation(pose);
     SE3::from_quat_translation(rotation, local_direction.normalize())
 }
@@ -2986,13 +3028,13 @@ fn filter_translation_outlier_pairs(pairs: &mut Vec<PairGeometry>) {
         }
         let mean_dir = votes
             .iter()
-            .fold(glam::Vec3::ZERO, |acc, dir| acc + *dir)
-            .try_normalize();
+            .fold(nalgebra::Vector3::<f32>::zeros(), |acc, dir| acc + *dir)
+            .try_normalize(f32::EPSILON);
         let Some(mean_dir) = mean_dir else {
             return true;
         };
         let angle = edge_dir
-            .dot(mean_dir)
+            .dot(&mean_dir)
             .abs()
             .clamp(-1.0, 1.0)
             .acos()
@@ -3008,7 +3050,7 @@ fn filter_translation_outlier_pairs(pairs: &mut Vec<PairGeometry>) {
     });
 }
 
-fn adjacent_world_directions(pairs: &[PairGeometry]) -> Vec<Option<glam::Vec3>> {
+fn adjacent_world_directions(pairs: &[PairGeometry]) -> Vec<Option<nalgebra::Vector3<f32>>> {
     let max_right = pairs.iter().map(|p| p.right).max().unwrap_or(0);
     let mut dirs = vec![None; max_right + 1];
     for pair in pairs.iter().filter(|p| p.left + 1 == p.right) {
@@ -3017,10 +3059,11 @@ fn adjacent_world_directions(pairs: &[PairGeometry]) -> Vec<Option<glam::Vec3>> 
     dirs
 }
 
-fn relative_world_direction(pair: &PairGeometry) -> Option<glam::Vec3> {
-    let rotation = crate::geometry::pose_rotation(pair.relative_pose);
-    let t = glam::Vec3::from_array(pair.relative_pose.translation()).try_normalize()?;
-    (-(rotation.inverse() * t)).try_normalize()
+fn relative_world_direction(pair: &PairGeometry) -> Option<nalgebra::Vector3<f32>> {
+    let rotation = pose_rotation(pair.relative_pose);
+    let t =
+        nalgebra::Vector3::from(pair.relative_pose.translation()).try_normalize(f32::EPSILON)?;
+    (-(rotation.inverse() * t)).try_normalize(f32::EPSILON)
 }
 
 #[allow(dead_code)]
@@ -3233,15 +3276,12 @@ fn incremental_pipeline_map_with_pnp_scorer_and_events(
                         return Err(err);
                     }
                     events.checkpoint()?;
-                    let message = err.to_string();
-                    let initial_failure = err.downcast_ref::<InitialPairFailure>().copied();
-                    debug_log.push(format!(
-                        "initialization_attempt_failed stage={} trial={} error={message}",
-                        initialization_stage_name(stage_config.stage),
+                    let no_initial_pair = record_initialization_attempt_failure(
+                        &mut debug_log,
+                        stage_config.stage,
                         trial,
-                    ));
-                    let no_initial_pair =
-                        initial_failure == Some(InitialPairFailure::NoInitialPair);
+                        &err,
+                    );
                     last_error = Some(err);
                     if no_initial_pair {
                         break;
@@ -3252,9 +3292,11 @@ fn incremental_pipeline_map_with_pnp_scorer_and_events(
     }
 
     if reconstructions.is_empty() {
-        return Err(last_error
-            .unwrap_or_else(|| anyhow::anyhow!("no reconstruction models kept"))
-            .context("no reconstruction models kept"));
+        return Err(initialization_failure_with_log(
+            last_error,
+            &debug_log,
+            "no reconstruction models kept",
+        ));
     }
     Ok(IncrementalPipelineMapResult {
         reconstructions,
@@ -3339,7 +3381,7 @@ pub fn run_incremental_pipeline(
             IncrementalPipelineResult {
                 status,
                 reconstructions: Vec::new(),
-                debug_log: vec![err.to_string()],
+                debug_log: format!("{err:#}").lines().map(str::to_string).collect(),
             }
         }
     }
@@ -3403,11 +3445,11 @@ fn register_and_triangulate_initial_image_pair(
     reconstruction: &mut Reconstruction,
     triangulation_state: &mut IncrementalTriangulatorState,
     tri_options: &IncrementalTriangulatorOptions,
-    init_min_tri_angle_deg: f32,
     initial: &PairGeometry,
 ) {
-    let mut initial_tri_options = *tri_options;
-    initial_tri_options.min_angle_deg = initial_pair_create_min_angle_deg(init_min_tri_angle_deg);
+    // COLMAP IncrementalPipeline after RegisterInitialImagePair calls
+    // TriangulateImage with TriangulationOptions (min_angle=1.5°), not
+    // MapperOptions.init_min_tri_angle (pair-selection gate only).
     triangulation_state
         .observation_manager_mut()
         .register_image(frames, pairs, reconstruction, initial.left, SE3::identity());
@@ -3424,13 +3466,8 @@ fn register_and_triangulate_initial_image_pair(
     let right_unit = reconstruction.image_indices_for_registration_unit(initial.right);
     let mut triangulator =
         IncrementalTriangulator::new(frames, pairs, reconstruction, triangulation_state);
-    triangulate_registration_unit(&mut triangulator, &initial_tri_options, &left_unit);
-    triangulate_registration_unit(&mut triangulator, &initial_tri_options, &right_unit);
-}
-
-fn initial_pair_create_min_angle_deg(init_min_tri_angle_deg: f32) -> f32 {
-    const INITIAL_CREATE_MIN_ANGLE_COMPENSATION_DEG: f32 = 0.325;
-    init_min_tri_angle_deg + INITIAL_CREATE_MIN_ANGLE_COMPENSATION_DEG
+    triangulate_registration_unit(&mut triangulator, tri_options, &left_unit);
+    triangulate_registration_unit(&mut triangulator, tri_options, &right_unit);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3466,6 +3503,65 @@ fn initialization_stage_configs(config: &MapperConfig) -> Vec<InitializationStag
         });
     }
     stages
+}
+
+fn initialization_failure_with_log(
+    error: Option<anyhow::Error>,
+    debug_log: &[String],
+    fallback: &str,
+) -> anyhow::Error {
+    let fallback_owned = fallback.to_string();
+    let error = match error {
+        Some(error) => error,
+        None => anyhow::anyhow!(fallback_owned.clone()),
+    };
+    error.context(debug_log.join("\n")).context(fallback_owned)
+}
+
+fn find_initial_pair_failure(error: &anyhow::Error) -> Option<InitialPairFailure> {
+    let mut current: &(dyn std::error::Error + 'static) = error.as_ref();
+    loop {
+        if let Some(failure) = current.downcast_ref::<InitialPairFailure>() {
+            return Some(*failure);
+        }
+        if let Some(attempt) = current.downcast_ref::<InitialPairAttemptError>() {
+            return Some(attempt.failure);
+        }
+        current = current.source()?;
+    }
+}
+
+fn record_initialization_attempt_failure(
+    debug_log: &mut Vec<String>,
+    stage: InitializationRelaxationStage,
+    trial: usize,
+    error: &anyhow::Error,
+) -> bool {
+    let stage_name = initialization_stage_name(stage);
+    let failure = find_initial_pair_failure(error);
+    debug_log.push(format!(
+        "initialization_attempt_failed stage={stage_name} trial={trial} error={}",
+        failure
+            .map(|failure| failure.to_string())
+            .unwrap_or_else(|| error.to_string())
+    ));
+    for line in initial_pair_attempt_diagnostics(error) {
+        debug_log.push(format!("stage={stage_name} trial={trial} {line}"));
+    }
+    failure == Some(InitialPairFailure::NoInitialPair)
+}
+
+fn initial_pair_attempt_diagnostics(error: &anyhow::Error) -> Vec<String> {
+    let mut current: &(dyn std::error::Error + 'static) = error.as_ref();
+    loop {
+        if let Some(attempt) = current.downcast_ref::<InitialPairAttemptError>() {
+            return attempt.diagnostics.clone();
+        }
+        match current.source() {
+            Some(source) => current = source,
+            None => return Vec::new(),
+        }
+    }
 }
 
 fn initialization_stage_name(stage: InitializationRelaxationStage) -> &'static str {
@@ -3527,15 +3623,12 @@ fn incremental_map_with_session(
                     return Ok((reconstruction, debug_log));
                 }
                 Err(err) => {
-                    let message = err.to_string();
-                    let initial_failure = err.downcast_ref::<InitialPairFailure>().copied();
-                    debug_log.push(format!(
-                        "initialization_attempt_failed stage={} trial={} error={message}",
-                        initialization_stage_name(stage_config.stage),
+                    let no_initial_pair = record_initialization_attempt_failure(
+                        &mut debug_log,
+                        stage_config.stage,
                         trial,
-                    ));
-                    let no_initial_pair =
-                        initial_failure == Some(InitialPairFailure::NoInitialPair);
+                        &err,
+                    );
                     last_error = Some(err);
                     if no_initial_pair {
                         break;
@@ -3544,9 +3637,11 @@ fn incremental_map_with_session(
             }
         }
     }
-    Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("no initialization attempts configured"))
-        .context("no initial pair after initialization trials and relaxations"))
+    Err(initialization_failure_with_log(
+        last_error,
+        &debug_log,
+        "no initial pair after initialization trials and relaxations",
+    ))
 }
 
 fn incremental_map_single_attempt(
@@ -3669,16 +3764,46 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         image
     } else {
         let mut initial_pair_state = session.initial_pair_selection_state(&reconstruction);
-        let initial = choose_initial_pair(
+        let initial = match choose_initial_pair(
             pairs,
             &reconstruction,
             config,
             &camera_has_prior_focal_length,
             &mut initial_pair_state,
-        )
-        .ok_or(InitialPairFailure::NoInitialPair)?;
+        ) {
+            Some(pair) => pair,
+            None => {
+                let mut diagnostics = initial_pair_order_log_lines(
+                    frames,
+                    &reconstruction,
+                    pairs,
+                    &initial_pair_state,
+                );
+                diagnostics.extend(
+                    initial_pair_state
+                        .rejections
+                        .iter()
+                        .map(|rejection| initial_pair_rejection_log_line(frames, rejection)),
+                );
+                debug_log.extend(diagnostics.iter().cloned());
+                return Err(InitialPairAttemptError {
+                    failure: InitialPairFailure::NoInitialPair,
+                    diagnostics,
+                }
+                .into());
+            }
+        };
         initial_pair_state.register_initial_pair(&reconstruction, initial.left, initial.right);
         session.commit_initial_pair_selection_state(&reconstruction, &initial_pair_state);
+        debug_log.extend(initial_pair_order_log_lines(
+            frames,
+            &reconstruction,
+            pairs,
+            &initial_pair_state,
+        ));
+        for rejection in &initial_pair_state.rejections {
+            debug_log.push(initial_pair_rejection_log_line(frames, rejection));
+        }
         debug_log.push(format!(
             "initial_pair {} -> {} inliers={} triangulated={}",
             frames[initial.left].name,
@@ -3693,7 +3818,6 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 &mut reconstruction,
                 &mut triangulation_state,
                 &tri_options,
-                config.init_min_tri_angle_deg,
                 &initial,
             );
         }
@@ -3783,6 +3907,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
         let NextRegistrationSelection {
             choice,
             failed_attempts,
+            structure_based_candidates,
         } = choose_next_registration_with_failures_and_pnp_scorer(
             frames,
             pairs,
@@ -3798,10 +3923,24 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             &mut telemetry,
             pnp_scorer,
         )?;
+        if !structure_based_candidates.is_empty() {
+            let preview = structure_based_candidates
+                .iter()
+                .map(|(image, rank, visible)| {
+                    format!("{}:rank={:.0}:vis={}", frames[*image].name, rank, visible)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            debug_log.push(format!(
+                "next_images_ranked reg_images={} {}",
+                registered_image_count(&reconstruction),
+                preview
+            ));
+        }
         telemetry.next_image_ms += next_image_start.elapsed().as_secs_f64() * 1000.0;
         events.checkpoint()?;
         let normal_attempted_candidates = !failed_attempts.is_empty();
-        for (failed_image, mode) in failed_attempts {
+        for (failed_image, mode, reject_reason) in failed_attempts {
             let support = registration_unit_support(
                 &reconstruction,
                 failed_image,
@@ -3809,9 +3948,18 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 mode,
             );
             retry_state.record_failure(&reconstruction, failed_image, mode, support);
+            let visible_points = registration_unit_num_visible_points3d(
+                &reconstruction,
+                failed_image,
+                triangulation_state.observation_manager(),
+            );
             debug_log.push(format!(
-                "registration_attempt_failed {} mode={:?}",
-                frames[failed_image].name, mode
+                "registration_attempt_failed {} mode={:?} support={} visible_points={} reason={}",
+                frames[failed_image].name,
+                mode,
+                support,
+                visible_points,
+                reject_reason.unwrap_or("unknown")
             ));
         }
         let choice = if let Some(choice) = choice {
@@ -3827,6 +3975,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             let NextRegistrationSelection {
                 choice,
                 failed_attempts,
+                structure_based_candidates: _,
             } = choose_next_registration_with_failures_and_pnp_scorer(
                 frames,
                 pairs,
@@ -3843,7 +3992,7 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 pnp_scorer,
             )?;
             events.checkpoint()?;
-            for (failed_image, mode) in failed_attempts {
+            for (failed_image, mode, reject_reason) in failed_attempts {
                 let support = registration_unit_support(
                     &reconstruction,
                     failed_image,
@@ -3851,9 +4000,18 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                     mode,
                 );
                 retry_state.record_failure(&reconstruction, failed_image, mode, support);
+                let visible_points = registration_unit_num_visible_points3d(
+                    &reconstruction,
+                    failed_image,
+                    triangulation_state.observation_manager(),
+                );
                 debug_log.push(format!(
-                    "registration_attempt_failed {} mode={:?} fallback=true",
-                    frames[failed_image].name, mode
+                    "registration_attempt_failed {} mode={:?} support={} visible_points={} reason={} fallback=true",
+                    frames[failed_image].name,
+                    mode,
+                    support,
+                    visible_points,
+                    reject_reason.unwrap_or("unknown")
                 ));
             }
             let Some(choice) = choice else {
@@ -3962,7 +4120,20 @@ fn incremental_map_single_attempt_with_pnp_scorer(
                 &mut reconstruction,
                 &mut triangulation_state,
             );
-            triangulate_registration_unit(&mut triangulator, &tri_options, &unit_images);
+            let mut created = 0usize;
+            let mut continued = 0usize;
+            for &frame_image in &unit_images {
+                let report = triangulator.triangulate_image(&tri_options, frame_image);
+                created += report.created_points;
+                continued += report.continued_observations;
+            }
+            debug_log.push(format!(
+                "triangulate_image image={} created={} continued={} points={}",
+                frames[choice.image].name,
+                created,
+                continued,
+                reconstruction.points.len()
+            ));
         }
         {
             let mut triangulator = IncrementalTriangulator::new(
@@ -3975,7 +4146,9 @@ fn incremental_map_single_attempt_with_pnp_scorer(
             triangulator.complete_tracks(&tri_options, &modified);
             let modified = triangulator.get_modified_points3d().clone();
             triangulator.merge_tracks(&tri_options, &modified);
-            triangulator.retriangulate(&tri_options);
+            // COLMAP only Retriangulate inside IterativeGlobalRefinement, not
+            // after every TriangulateImage. Extra per-image retriangulation
+            // over-fills sequential neighbors and skews MinUncertainty ranks.
         }
         telemetry.triangulation_ms += triangulation_start.elapsed().as_secs_f64() * 1000.0;
         filter_modified_reprojection_tracks_with_state(
@@ -4630,7 +4803,9 @@ impl IncrementalRegistrationTelemetry {
 #[derive(Debug, Clone)]
 struct NextRegistrationSelection {
     choice: Option<RegistrationChoice>,
-    failed_attempts: Vec<(usize, NextImageRegistrationMode)>,
+    failed_attempts: Vec<(usize, NextImageRegistrationMode, Option<&'static str>)>,
+    /// Ranked StructureBased candidates for the successful selection pass.
+    structure_based_candidates: Vec<(usize, f32, usize)>,
 }
 
 #[cfg(test)]
@@ -4717,6 +4892,7 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
 ) -> Result<NextRegistrationSelection> {
     let correspondence_graph = obs_manager.correspondence_graph();
     let mut failed_attempts = Vec::new();
+    let mut structure_based_candidates = Vec::new();
     for mode in next_registration_modes(config) {
         let next_images = find_next_registration_images_with_retry_state(
             reconstruction,
@@ -4728,6 +4904,19 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
             pass,
             telemetry,
         );
+        if mode == NextImageRegistrationMode::StructureBased {
+            structure_based_candidates = next_images
+                .iter()
+                .take(8)
+                .map(|&image| {
+                    (
+                        image,
+                        next_image_rank(reconstruction, image, obs_manager, config),
+                        registration_unit_num_visible_points3d(reconstruction, image, obs_manager),
+                    )
+                })
+                .collect();
+        }
         telemetry.candidate_units += next_images.len();
         for image in next_images {
             match mode {
@@ -4738,7 +4927,7 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
                     telemetry.structureless_attempts += 1;
                 }
             }
-            if let Some(choice) = registration_choice_for_image_with_pnp_scorer(
+            let (choice, reject_reason) = registration_choice_for_image_with_pnp_scorer(
                 image,
                 frames,
                 pairs,
@@ -4752,19 +4941,22 @@ fn choose_next_registration_with_failures_and_pnp_scorer(
                 mode,
                 telemetry,
                 pnp_scorer,
-            )? {
+            )?;
+            if let Some(choice) = choice {
                 return Ok(NextRegistrationSelection {
                     choice: Some(choice),
                     failed_attempts,
+                    structure_based_candidates,
                 });
             } else {
-                failed_attempts.push((image, mode));
+                failed_attempts.push((image, mode, reject_reason));
             }
         }
     }
     Ok(NextRegistrationSelection {
         choice: None,
         failed_attempts,
+        structure_based_candidates,
     })
 }
 
@@ -4776,9 +4968,10 @@ fn next_registration_modes(config: &MapperConfig) -> Vec<NextImageRegistrationMo
     modes
 }
 
-fn structureless_registration_enabled(_config: &MapperConfig) -> bool {
-    // COLMAP always runs a structure-less registration bucket after structure-based.
-    true
+fn structureless_registration_enabled(config: &MapperConfig) -> bool {
+    // COLMAP 3.13.0 has no structure-less next-image bucket. Newer COLMAP runs
+    // structure-less after structure-based; enable via config when targeting that.
+    config.structureless_registration
 }
 
 fn registration_unit_num_visible_points3d(
@@ -4867,12 +5060,27 @@ fn find_next_registration_images_with_retry_state(
         if registration_unit_is_registered(reconstruction, image) {
             continue;
         }
+        let visible_points =
+            registration_unit_num_visible_points3d(reconstruction, image, obs_manager);
         let support = registration_unit_support(reconstruction, image, obs_manager, mode);
-        let min_support = match mode {
-            NextImageRegistrationMode::StructureBased => config.abs_pose_min_num_inliers,
-            NextImageRegistrationMode::StructureLess => structureless_min_num_inliers(config),
+        // COLMAP FindNextImages always gates on NumVisiblePoints3D >=
+        // abs_pose_min_num_inliers (structure-less only changes ranking). The
+        // experimental pair-pose fallback may still select candidates by
+        // correspondence support when no 3D points are visible.
+        let eligible = match mode {
+            NextImageRegistrationMode::StructureBased => {
+                visible_points >= config.abs_pose_min_num_inliers
+            }
+            NextImageRegistrationMode::StructureLess => {
+                if config.experimental_structureless_pair_pose_fallback {
+                    visible_points >= config.abs_pose_min_num_inliers
+                        || support >= structureless_min_num_inliers(config)
+                } else {
+                    visible_points >= config.abs_pose_min_num_inliers
+                }
+            }
         };
-        if support < min_support {
+        if !eligible {
             continue;
         }
         if !retry_state.is_eligible(
@@ -4932,7 +5140,7 @@ fn registration_choice_for_image_with_pnp_scorer(
     mode: NextImageRegistrationMode,
     telemetry: &mut IncrementalRegistrationTelemetry,
     pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
-) -> Result<Option<RegistrationChoice>> {
+) -> Result<(Option<RegistrationChoice>, Option<&'static str>)> {
     let registration_reconstruction =
         reconstruction_with_reset_frame_cameras(reconstruction, image, config, camera_priors);
     let structureless_estimates_before = telemetry.structureless_estimates;
@@ -4962,25 +5170,26 @@ fn registration_choice_for_image_with_pnp_scorer(
                     registration_stats,
                     correspondence_graph,
                 ) else {
-                    return Ok(None);
+                    return Ok((None, Some("generalized_pose_failed")));
                 };
                 (abs_pose, "generalized_frame")
-            } else if let Some(abs_pose) = solve_absolute_pose_with_pnp_scorer(
-                image,
-                frames,
-                pairs,
-                &registration_reconstruction,
-                config,
-                camera_priors,
-                camera_has_prior_focal_length,
-                registration_stats,
-                correspondence_graph,
-                pnp_scorer.as_deref_mut(),
-                telemetry,
-            )? {
-                (abs_pose, "pnp")
             } else {
-                return Ok(None);
+                match solve_absolute_pose_with_pnp_scorer(
+                    image,
+                    frames,
+                    pairs,
+                    &registration_reconstruction,
+                    config,
+                    camera_priors,
+                    camera_has_prior_focal_length,
+                    registration_stats,
+                    correspondence_graph,
+                    pnp_scorer.as_deref_mut(),
+                    telemetry,
+                )? {
+                    Ok(abs_pose) => (abs_pose, "pnp"),
+                    Err(reason) => return Ok((None, Some(reason))),
+                }
             }
         }
         NextImageRegistrationMode::StructureLess => {
@@ -5001,7 +5210,7 @@ fn registration_choice_for_image_with_pnp_scorer(
                 correspondence_graph,
                 telemetry,
             ) else {
-                return Ok(None);
+                return Ok((None, Some("structureless_pose_failed")));
             };
             (abs_pose, "structureless")
         }
@@ -5011,7 +5220,7 @@ fn registration_choice_for_image_with_pnp_scorer(
     if mode == NextImageRegistrationMode::StructureLess
         && (!pair_rot_error.is_finite() || pair_rot_error > absolute_pose_pair_rotation_limit_deg())
     {
-        return Ok(None);
+        return Ok((None, Some("structureless_pair_rotation")));
     }
     if mode == NextImageRegistrationMode::StructureLess
         && telemetry.structureless_estimates > structureless_estimates_before
@@ -5021,21 +5230,24 @@ fn registration_choice_for_image_with_pnp_scorer(
     let visible_points = obs_manager.num_visible_points3d(image);
     let num_observations = obs_manager.num_observations(image).max(1);
     let visible_points_ratio = visible_points as f32 / num_observations as f32;
-    Ok(Some(RegistrationChoice {
-        image,
-        pose: abs_pose.pose,
-        camera: abs_pose.camera,
-        source,
-        pnp_inliers: abs_pose.inliers,
-        inlier_ratio: abs_pose.inlier_ratio,
-        visible_points,
-        visible_points_ratio,
-        mean_error_px: abs_pose.mean_error_px,
-        pair_rot_error,
-        structureless_inliers: abs_pose.structureless_inliers,
-        frame_image_poses: abs_pose.frame_image_poses,
-        generalized_inliers: abs_pose.generalized_inliers,
-    }))
+    Ok((
+        Some(RegistrationChoice {
+            image,
+            pose: abs_pose.pose,
+            camera: abs_pose.camera,
+            source,
+            pnp_inliers: abs_pose.inliers,
+            inlier_ratio: abs_pose.inlier_ratio,
+            visible_points,
+            visible_points_ratio,
+            mean_error_px: abs_pose.mean_error_px,
+            pair_rot_error,
+            structureless_inliers: abs_pose.structureless_inliers,
+            frame_image_poses: abs_pose.frame_image_poses,
+            generalized_inliers: abs_pose.generalized_inliers,
+        }),
+        None,
+    ))
 }
 
 fn next_image_rank(
@@ -5188,6 +5400,7 @@ fn mark_unregistered_images_with_no_absolute_pose_and_pnp_scorer(
                 pnp_scorer.as_deref_mut(),
                 &mut telemetry,
             )?
+            .ok()
         };
         let pose = if structure_based_pose.is_some() {
             structure_based_pose
@@ -5440,7 +5653,7 @@ impl GlobalBaOutcome {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ReconstructionNormalizationTransform {
     scale: f32,
-    translation: glam::Vec3,
+    translation: nalgebra::Vector3<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5612,6 +5825,20 @@ fn refine_initial_global_bundle(
     if gauge_images.is_empty() {
         return false;
     }
+    let neg_depth = filter_observations_with_negative_depth(
+        frames,
+        pairs,
+        reconstruction,
+        triangulation_state.observation_manager_mut(),
+    );
+    if neg_depth > 0 {
+        debug_log.push(format!(
+            "global_ba_negative_depth reason=initial removed={neg_depth}"
+        ));
+    }
+    if reconstruction.points.is_empty() || reconstruction_num_observations(reconstruction) == 0 {
+        return false;
+    }
     let mut ba_options = mapper_global_ba_options(
         config,
         reconstruction,
@@ -5649,10 +5876,10 @@ fn refine_initial_global_bundle(
         debug_log.push(format!(
             "global_ba_align_priors reason=initial round=1 scale={:.6} rotation=({:.4},{:.4},{:.4},{:.4}) translation=({:.6},{:.6},{:.6})",
             transform.scale,
-            glam::Quat::from_mat3(&transform.rotation).x,
-            glam::Quat::from_mat3(&transform.rotation).y,
-            glam::Quat::from_mat3(&transform.rotation).z,
-            glam::Quat::from_mat3(&transform.rotation).w,
+            crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[0],
+            crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[1],
+            crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[2],
+            crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[3],
             transform.translation.x,
             transform.translation.y,
             transform.translation.z
@@ -5825,6 +6052,23 @@ fn refine_global_bundle_with_postprocessing_using_solver(
         if gauge_images.is_empty() {
             break;
         }
+        let neg_depth = filter_observations_with_negative_depth(
+            frames,
+            pairs,
+            reconstruction,
+            triangulation_state.observation_manager_mut(),
+        );
+        if neg_depth > 0 {
+            debug_log.push(format!(
+                "global_ba_negative_depth reason={reason} round={} removed={}",
+                round + 1,
+                neg_depth
+            ));
+        }
+        if reconstruction.points.is_empty() || reconstruction_num_observations(reconstruction) == 0
+        {
+            break;
+        }
         let redundant_point_ids = global_ba_redundant_point_ids(config, reconstruction);
         if let Some(redundant_point_ids) = redundant_point_ids.as_ref() {
             debug_log.push(format!(
@@ -5874,10 +6118,10 @@ fn refine_global_bundle_with_postprocessing_using_solver(
             debug_log.push(format!(
                 "global_ba_align_priors reason={reason} round=1 scale={:.6} rotation=({:.4},{:.4},{:.4},{:.4}) translation=({:.6},{:.6},{:.6})",
                 transform.scale,
-                glam::Quat::from_mat3(&transform.rotation).x,
-                glam::Quat::from_mat3(&transform.rotation).y,
-                glam::Quat::from_mat3(&transform.rotation).z,
-                glam::Quat::from_mat3(&transform.rotation).w,
+                crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[0],
+                crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[1],
+                crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[2],
+                crate::geometry::quat_xyzw(crate::geometry::quat_from_mat3(&transform.rotation))[3],
                 transform.translation.x,
                 transform.translation.y,
                 transform.translation.z
@@ -6064,31 +6308,30 @@ pub(crate) fn global_ba_enabled(config: &MapperConfig) -> bool {
     config.global_ba && global_ba_iterations(config) > 0 && config.global_ba_max_refinements > 0
 }
 
-// Scheduled BA recurs on model-growth thresholds, so repeated full refinements
-// have diminishing value before the next trigger. Keep the full configured
-// budget for initial/final quality closure and cap only intermediate passes.
-// On dense guided tracks, each scheduled round at size=large is tens of seconds;
-// a second round rarely moves >0.5% of observations, so cap large scheduled to 1.
+// Scheduled BA recurs on model-growth thresholds. COLMAP still uses the full
+// `ba_global_max_refinements` / `ba_global_max_num_iterations` budget every time.
+// Cap only large/dense scheduled passes (960-frame guided scenes); small
+// reconstructions must match COLMAP so early FindNext visibility stays aligned.
 fn global_ba_max_refinements_for_reason(
     config: &MapperConfig,
     reason: &str,
     reconstruction: &Reconstruction,
 ) -> usize {
-    const MAX_SCHEDULED_REFINEMENTS: usize = 2;
     const MAX_LARGE_SCHEDULED_REFINEMENTS: usize = 1;
     if reason == "scheduled" {
         let observations = reconstruction_num_observations(reconstruction);
         // Second scheduled rounds above ~50k observations repeat a 3–15s solve
         // and change <0.3% of observations. One round is enough before the next
         // growth trigger.
-        let cap = if observations >= 50_000 {
-            MAX_LARGE_SCHEDULED_REFINEMENTS
-        } else if global_ba_size_tag(reconstruction, config) == "large" {
-            MAX_LARGE_SCHEDULED_REFINEMENTS
+        let cap_large =
+            observations >= 50_000 || global_ba_size_tag(reconstruction, config) == "large";
+        if cap_large {
+            config
+                .global_ba_max_refinements
+                .min(MAX_LARGE_SCHEDULED_REFINEMENTS)
         } else {
-            MAX_SCHEDULED_REFINEMENTS
-        };
-        config.global_ba_max_refinements.min(cap)
+            config.global_ba_max_refinements
+        }
     } else {
         config.global_ba_max_refinements
     }
@@ -6124,10 +6367,13 @@ fn global_ba_iterations_for_reason(
     reconstruction: &Reconstruction,
     reason: &str,
 ) -> usize {
-    const MAX_SCHEDULED_ITERATIONS: usize = 15;
+    const MAX_LARGE_SCHEDULED_ITERATIONS: usize = 15;
     let configured = global_ba_iterations_for_reconstruction(config, reconstruction);
-    if reason == "scheduled" {
-        configured.min(MAX_SCHEDULED_ITERATIONS)
+    if reason == "scheduled"
+        && (reconstruction_num_observations(reconstruction) >= 50_000
+            || global_ba_size_tag(reconstruction, config) == "large")
+    {
+        configured.min(MAX_LARGE_SCHEDULED_ITERATIONS)
     } else {
         configured
     }
@@ -6388,7 +6634,7 @@ fn normalize_reconstruction_colmap(
         reconstruction
             .points
             .iter()
-            .map(|point| glam::Vec3::from_array(point.xyz))
+            .map(|point| nalgebra::Vector3::from(point.xyz))
             .collect::<Vec<_>>()
     };
     if coords.len() < 2 {
@@ -6410,7 +6656,9 @@ fn normalize_reconstruction_colmap(
     Some(transform)
 }
 
-fn registered_reconstruction_camera_centers(reconstruction: &Reconstruction) -> Vec<glam::Vec3> {
+fn registered_reconstruction_camera_centers(
+    reconstruction: &Reconstruction,
+) -> Vec<nalgebra::Vector3<f32>> {
     reconstruction
         .poses
         .iter()
@@ -6419,10 +6667,14 @@ fn registered_reconstruction_camera_centers(reconstruction: &Reconstruction) -> 
 }
 
 fn robust_bbox_and_centroid_colmap(
-    coords: Vec<glam::Vec3>,
+    coords: Vec<nalgebra::Vector3<f32>>,
     min_percentile: f32,
     max_percentile: f32,
-) -> Option<(glam::Vec3, glam::Vec3, glam::Vec3)> {
+) -> Option<(
+    nalgebra::Vector3<f32>,
+    nalgebra::Vector3<f32>,
+    nalgebra::Vector3<f32>,
+)> {
     if coords.is_empty() || min_percentile > max_percentile {
         return None;
     }
@@ -6435,12 +6687,13 @@ fn robust_bbox_and_centroid_colmap(
     coords_x.sort_by(|a, b| a.total_cmp(b));
     coords_y.sort_by(|a, b| a.total_cmp(b));
     coords_z.sort_by(|a, b| a.total_cmp(b));
-    let bbox_min = glam::Vec3::new(coords_x[min_idx], coords_y[min_idx], coords_z[min_idx]);
-    let bbox_max = glam::Vec3::new(coords_x[max_idx], coords_y[max_idx], coords_z[max_idx]);
+    let bbox_min = nalgebra::Vector3::new(coords_x[min_idx], coords_y[min_idx], coords_z[min_idx]);
+    let bbox_max = nalgebra::Vector3::new(coords_x[max_idx], coords_y[max_idx], coords_z[max_idx]);
     let normalization = 1.0 / (max_idx - min_idx + 1) as f32;
-    let mut centroid = glam::Vec3::ZERO;
+    let mut centroid = nalgebra::Vector3::<f32>::zeros();
     for idx in min_idx..=max_idx {
-        centroid += normalization * glam::Vec3::new(coords_x[idx], coords_y[idx], coords_z[idx]);
+        centroid +=
+            normalization * nalgebra::Vector3::new(coords_x[idx], coords_y[idx], coords_z[idx]);
     }
     Some((bbox_min, bbox_max, centroid))
 }
@@ -6483,7 +6736,7 @@ fn transform_reconstruction_colmap(
         }
     }
     for point in &mut reconstruction.points {
-        point.xyz = (transform.scale * glam::Vec3::from_array(point.xyz) + transform.translation)
+        point.xyz = (transform.scale * nalgebra::Vector3::from(point.xyz) + transform.translation)
             .to_array();
     }
     sync_registered_image_poses_from_frames(reconstruction);
@@ -6596,12 +6849,7 @@ fn filter_registered_frames(
         }
         let unit = registration_unit_key(reconstruction, image);
         if !seen_units.insert(unit)
-            || !registered_unit_should_be_filtered(
-                reconstruction,
-                image,
-                config,
-                triangulation_state.observation_manager(),
-            )
+            || !registered_unit_should_be_filtered(reconstruction, image, config)
             || (config.fix_existing_frames
                 && registration_stats.is_existing_registration_unit(reconstruction, image))
         {
@@ -6632,12 +6880,11 @@ fn registered_unit_should_be_filtered(
     reconstruction: &Reconstruction,
     image: usize,
     config: &MapperConfig,
-    observation_manager: &ObservationManager,
 ) -> bool {
-    // The old scan walked every feature slot of every registered image after
-    // each registration (960 × ~8k × 958). The manager already keeps a
-    // per-image 3D visibility count, and the gate is only "any observation".
-    let mut num_point3d_observations = 0usize;
+    // Zero-observation filtering must use reconstruction.observations, not
+    // ObservationManager visibility. Visibility is a correspondence-graph count
+    // and is zero when pairs are missing, even if sparse observations exist.
+    let mut has_valid_observation = false;
     for frame_image in reconstruction.image_indices_for_registration_unit(image) {
         if reconstruction
             .poses
@@ -6651,9 +6898,22 @@ fn registered_unit_should_be_filtered(
         if camera_has_bogus_params(reconstruction.camera_for_image(frame_image), config) {
             return true;
         }
-        num_point3d_observations += observation_manager.num_visible_points3d(frame_image);
+        if image_has_valid_point3d_observation(reconstruction, frame_image) {
+            has_valid_observation = true;
+        }
     }
-    num_point3d_observations < 1
+    !has_valid_observation
+}
+
+fn image_has_valid_point3d_observation(reconstruction: &Reconstruction, image: usize) -> bool {
+    let Some(observations) = reconstruction.observations.get(image) else {
+        return false;
+    };
+    let point_count = reconstruction.points.len();
+    observations
+        .iter()
+        .flatten()
+        .any(|point3d_id| *point3d_id < point_count)
 }
 
 fn refine_local_bundle_after_registration(
@@ -6782,13 +7042,42 @@ fn refine_local_bundle_round(
         let complete_report = triangulator.complete_image(tri_options, registered_image);
         (merged, completed, complete_report.total_observations())
     };
-    let filtered_observations = filter_modified_reprojection_tracks_with_state(
-        frames,
-        pairs,
-        reconstruction,
-        config,
-        triangulation_state,
-    );
+    // COLMAP AdjustLocalBundle: FilterPoints3DInImages(local images) +
+    // FilterPoints3D(ba point ids). Filtering only "modified" points under-filters
+    // and leaves enough structure for model-0 to keep growing past 3 images.
+    let mut filter_point_ids = post_ba_point_ids;
+    for &image in local_bundle
+        .variable_images
+        .iter()
+        .chain(std::iter::once(&gauge_image))
+    {
+        if let Some(observations) = reconstruction.observations.get(image) {
+            for point_id in observations.iter().flatten() {
+                filter_point_ids.insert(*point_id);
+            }
+        }
+    }
+    for &point_id in triangulation_state
+        .observation_manager()
+        .modified_point3d_ids()
+    {
+        filter_point_ids.insert(point_id);
+    }
+    let filtered_observations = if filter_point_ids.is_empty() {
+        0
+    } else {
+        filter_reprojection_tracks_subset_with_state(
+            frames,
+            pairs,
+            reconstruction,
+            config,
+            triangulation_state,
+            &filter_point_ids,
+        )
+    };
+    let _ = triangulation_state
+        .observation_manager_mut()
+        .take_modified_point3d_ids();
     let changed_observation_ratio = local_ba_refinement_change_ratio(
         report.observations,
         merged_observations,
@@ -7120,61 +7409,6 @@ fn choose_initial_pair(
     camera_has_prior_focal_length: &[bool],
     selection_state: &mut InitialPairSelectionState,
 ) -> Option<PairGeometry> {
-    if initial_pair_probe_num_threads(config) > 1 {
-        choose_initial_pair_parallel(
-            pairs,
-            reconstruction,
-            config,
-            camera_has_prior_focal_length,
-            selection_state,
-        )
-    } else {
-        choose_initial_pair_sequential(
-            pairs,
-            reconstruction,
-            config,
-            camera_has_prior_focal_length,
-            selection_state,
-        )
-    }
-}
-
-fn choose_initial_pair_sequential(
-    pairs: &[PairGeometry],
-    reconstruction: &Reconstruction,
-    config: &MapperConfig,
-    camera_has_prior_focal_length: &[bool],
-    selection_state: &mut InitialPairSelectionState,
-) -> Option<PairGeometry> {
-    let image_correspondences = image_correspondence_counts(pairs);
-    for image_id1 in sorted_initial_image_ids(
-        reconstruction,
-        &image_correspondences,
-        camera_has_prior_focal_length,
-        selection_state,
-        config,
-    ) {
-        if let Some(pair) = probe_initial_pairs_for_first_image(
-            pairs,
-            reconstruction,
-            config,
-            camera_has_prior_focal_length,
-            selection_state,
-            image_id1,
-        ) {
-            return Some(pair);
-        }
-    }
-    None
-}
-
-fn choose_initial_pair_parallel(
-    pairs: &[PairGeometry],
-    reconstruction: &Reconstruction,
-    config: &MapperConfig,
-    camera_has_prior_focal_length: &[bool],
-    selection_state: &mut InitialPairSelectionState,
-) -> Option<PairGeometry> {
     let candidates = initial_pair_candidates_in_colmap_order(
         pairs,
         reconstruction,
@@ -7182,55 +7416,172 @@ fn choose_initial_pair_parallel(
         camera_has_prior_focal_length,
         selection_state,
     );
-    let results = crate::execution::parallel(|| {
-        candidates
-            .par_iter()
-            .map(|candidate| {
-                probe_initial_pair_candidate(pairs, reconstruction, config, candidate)
-                    .map(|pair| (candidate.pair_id, pair))
+    selection_state.candidates = candidates
+        .iter()
+        .map(|candidate| InitialPairCandidateRecord {
+            left: candidate.image_id1,
+            right: candidate.image_id2,
+            pair_id: candidate.pair_id,
+        })
+        .collect();
+    let batch_size = initial_pair_probe_num_threads(config);
+    let mut offset = 0;
+    while offset < candidates.len() {
+        let end = (offset + batch_size).min(candidates.len());
+        let batch = &candidates[offset..end];
+        selection_state.probe_batch_bounds.push((offset, end));
+        let probes = if batch_size > 1 {
+            crate::execution::parallel(|| {
+                batch
+                    .par_iter()
+                    .map(|candidate| {
+                        probe_initial_pair_candidate(pairs, reconstruction, config, candidate)
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
-    });
-
-    for (candidate, result) in candidates.iter().zip(results) {
-        selection_state.init_image_pairs.insert(candidate.pair_id);
-        if let Some((_, pair)) = result {
+        } else {
+            vec![probe_initial_pair_candidate(
+                pairs,
+                reconstruction,
+                config,
+                &batch[0],
+            )]
+        };
+        selection_state.probes += probes.len();
+        if let Some(pair) = commit_initial_pair_probes(batch, probes, selection_state) {
             return Some(pair);
+        }
+        offset = end;
+    }
+    None
+}
+
+fn commit_initial_pair_probes(
+    candidates: &[InitialPairCandidate],
+    probes: Vec<std::result::Result<PairGeometry, InitialPairRejectionReason>>,
+    selection_state: &mut InitialPairSelectionState,
+) -> Option<PairGeometry> {
+    for (candidate, probe) in candidates.iter().zip(probes) {
+        selection_state.init_image_pairs.insert(candidate.pair_id);
+        match probe {
+            Ok(pair) => {
+                selection_state
+                    .decisions
+                    .push(InitialPairCandidateDecision {
+                        left: candidate.image_id1,
+                        right: candidate.image_id2,
+                        pair_id: candidate.pair_id,
+                        accepted: true,
+                        reason: None,
+                    });
+                return Some(pair);
+            }
+            Err(reason) => {
+                let rejection = InitialPairRejection {
+                    left: candidate.image_id1,
+                    right: candidate.image_id2,
+                    reason,
+                };
+                log::debug!(
+                    "initial_pair_reject left={} right={} reason={}",
+                    rejection.left,
+                    rejection.right,
+                    rejection.reason.as_str()
+                );
+                selection_state
+                    .decisions
+                    .push(InitialPairCandidateDecision {
+                        left: candidate.image_id1,
+                        right: candidate.image_id2,
+                        pair_id: candidate.pair_id,
+                        accepted: false,
+                        reason: Some(reason),
+                    });
+                selection_state.rejections.push(rejection);
+            }
         }
     }
     None
 }
 
-fn probe_initial_pairs_for_first_image(
-    pairs: &[PairGeometry],
+fn initial_pair_order_log_lines(
+    frames: &[ImageFrame],
     reconstruction: &Reconstruction,
-    config: &MapperConfig,
-    camera_has_prior_focal_length: &[bool],
-    selection_state: &mut InitialPairSelectionState,
-    image_id1: usize,
-) -> Option<PairGeometry> {
-    for image_id2 in sorted_second_initial_image_ids(
-        pairs,
-        reconstruction,
-        image_id1,
-        camera_has_prior_focal_length,
-        selection_state,
-        config,
-    ) {
-        if !selection_state.mark_initial_pair_tried(reconstruction, image_id1, image_id2) {
-            continue;
-        }
-        let Some(pair) = oriented_initial_pair(pairs, image_id1, image_id2) else {
-            continue;
-        };
-        let Some(pair) = initial_pair_geometry_for_gate(&pair, reconstruction, config) else {
-            continue;
-        };
-        if is_colmap_style_initial_pair(&pair, reconstruction, config) {
-            return Some(pair);
-        }
+    pairs: &[PairGeometry],
+    selection_state: &InitialPairSelectionState,
+) -> Vec<String> {
+    let mut lines = vec![format!("database_pair_enum_count={}", pairs.len())];
+    for (index, pair) in pairs.iter().enumerate().take(128) {
+        let left_image_id = reconstruction.image_id(pair.left);
+        let right_image_id = reconstruction.image_id(pair.right);
+        let pair_id = image_pair_to_pair_id(left_image_id, right_image_id)
+            .map(|pair_id| pair_id.to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        lines.push(format!(
+            "database_pair_enum index={index} pair_id={pair_id} left_image_id={left_image_id} right_image_id={right_image_id} left_name={} right_name={}",
+            frame_name(frames, pair.left),
+            frame_name(frames, pair.right),
+        ));
     }
-    None
+    lines.push(format!(
+        "mapper_candidate_count={} mapper_probe_count={}",
+        selection_state.candidates.len(),
+        selection_state.probes
+    ));
+    for (index, candidate) in selection_state.candidates.iter().enumerate().take(128) {
+        lines.push(format!(
+            "mapper_candidate index={index} pair_id={} left_image_id={} right_image_id={} left_name={} right_name={}",
+            candidate.pair_id,
+            reconstruction.image_id(candidate.left),
+            reconstruction.image_id(candidate.right),
+            frame_name(frames, candidate.left),
+            frame_name(frames, candidate.right),
+        ));
+    }
+    for (index, decision) in selection_state.decisions.iter().enumerate() {
+        let decision_name = if decision.accepted {
+            "accepted"
+        } else {
+            decision
+                .reason
+                .map(InitialPairRejectionReason::as_str)
+                .unwrap_or("rejected")
+        };
+        lines.push(format!(
+            "mapper_probe index={index} pair_id={} left_image_id={} right_image_id={} left_name={} right_name={} decision={decision_name}",
+            decision.pair_id,
+            reconstruction.image_id(decision.left),
+            reconstruction.image_id(decision.right),
+            frame_name(frames, decision.left),
+            frame_name(frames, decision.right),
+        ));
+    }
+    lines
+}
+
+fn frame_name(frames: &[ImageFrame], image: usize) -> &str {
+    frames
+        .get(image)
+        .map(|frame| frame.name.as_str())
+        .unwrap_or("?")
+}
+
+fn initial_pair_rejection_log_line(
+    frames: &[ImageFrame],
+    rejection: &InitialPairRejection,
+) -> String {
+    let left = frames
+        .get(rejection.left)
+        .map(|frame| frame.name.as_str())
+        .unwrap_or("?");
+    let right = frames
+        .get(rejection.right)
+        .map(|frame| frame.name.as_str())
+        .unwrap_or("?");
+    format!(
+        "initial_pair_reject {left} -> {right} reason={}",
+        rejection.reason.as_str()
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7287,10 +7638,20 @@ fn probe_initial_pair_candidate(
     reconstruction: &Reconstruction,
     config: &MapperConfig,
     candidate: &InitialPairCandidate,
-) -> Option<PairGeometry> {
-    let pair = oriented_initial_pair(pairs, candidate.image_id1, candidate.image_id2)?;
-    let pair = initial_pair_geometry_for_gate(&pair, reconstruction, config)?;
-    is_colmap_style_initial_pair(&pair, reconstruction, config).then_some(pair)
+) -> std::result::Result<PairGeometry, InitialPairRejectionReason> {
+    let Some(pair) = oriented_initial_pair(pairs, candidate.image_id1, candidate.image_id2) else {
+        return Err(InitialPairRejectionReason::MissingPair);
+    };
+    let Some(pair) = initial_pair_geometry_for_gate(&pair, reconstruction, config) else {
+        return Err(rejection_for_missing_initial_geometry(
+            &pair,
+            reconstruction,
+        ));
+    };
+    if let Some(reason) = initial_pair_rejection_reason(&pair, reconstruction, config) {
+        return Err(reason);
+    }
+    Ok(pair)
 }
 
 fn initial_pair_geometry_for_gate(
@@ -7383,17 +7744,54 @@ fn initial_pair_frame_from_reconstruction(
     })
 }
 
-fn is_colmap_style_initial_pair(
+fn initial_pair_rejection_reason(
     pair: &PairGeometry,
     reconstruction: &Reconstruction,
     config: &MapperConfig,
-) -> bool {
-    pair.inliers >= config.init_min_num_inliers
-        && pair.median_triangulation_angle_deg > config.init_min_tri_angle_deg
-        && pair.triangulated >= config.min_triangulated
-        && initial_pair_forward_motion(pair) < config.init_max_forward_motion
-        && !same_registration_frame(reconstruction, pair.left, pair.right)
-        && generalized_initial_pair_gate(pair, reconstruction)
+) -> Option<InitialPairRejectionReason> {
+    if pair.inliers < config.init_min_num_inliers {
+        return Some(InitialPairRejectionReason::Inliers);
+    }
+    if pair.median_triangulation_angle_deg <= config.init_min_tri_angle_deg {
+        return Some(InitialPairRejectionReason::TriangulationAngle);
+    }
+    if pair.triangulated < config.min_triangulated {
+        return Some(InitialPairRejectionReason::Triangulated);
+    }
+    if initial_pair_forward_motion(pair) >= config.init_max_forward_motion {
+        return Some(InitialPairRejectionReason::ForwardMotion);
+    }
+    if same_registration_frame(reconstruction, pair.left, pair.right) {
+        return Some(InitialPairRejectionReason::SameFrame);
+    }
+    if !generalized_initial_pair_gate(pair, reconstruction) {
+        return Some(InitialPairRejectionReason::RigGate);
+    }
+    None
+}
+
+fn rejection_for_missing_initial_geometry(
+    pair: &PairGeometry,
+    reconstruction: &Reconstruction,
+) -> InitialPairRejectionReason {
+    if initial_pair_camera_invalid(reconstruction, pair.left)
+        || initial_pair_camera_invalid(reconstruction, pair.right)
+    {
+        InitialPairRejectionReason::CameraValidity
+    } else {
+        // The estimator returns `None` for failed pose search, including
+        // cheirality. Do not invent a separate cheirality gate here.
+        InitialPairRejectionReason::ReestimationFailed
+    }
+}
+
+fn initial_pair_camera_invalid(reconstruction: &Reconstruction, image: usize) -> bool {
+    let camera = reconstruction.camera_for_image(image);
+    camera.width == 0
+        || camera.height == 0
+        || !camera.fx.is_finite()
+        || !camera.fy.is_finite()
+        || camera.params.iter().any(|param| !param.is_finite())
 }
 
 fn same_registration_frame(reconstruction: &Reconstruction, left: usize, right: usize) -> bool {
@@ -7547,17 +7945,23 @@ fn invert_pair_geometry(pair: &PairGeometry) -> PairGeometry {
     inverted.e_matrix = pair.e_matrix.map(transpose3);
     inverted.h_matrix = pair.h_matrix.and_then(invert_matrix3);
     if let (Some(qvec), Some(tvec)) = (pair.qvec, pair.tvec) {
-        let rotation = glam::DQuat::from_xyzw(qvec[1], qvec[2], qvec[3], qvec[0]).normalize();
-        let translation = glam::DVec3::from_array(tvec);
+        let rotation = nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+            qvec[0], qvec[1], qvec[2], qvec[3],
+        ));
+        let translation = nalgebra::Vector3::new(tvec[0], tvec[1], tvec[2]);
         let inverse_rotation = rotation.inverse();
         let inverse_translation = -(inverse_rotation * translation);
         inverted.qvec = Some([
             inverse_rotation.w,
-            inverse_rotation.x,
-            inverse_rotation.y,
-            inverse_rotation.z,
+            inverse_rotation.i,
+            inverse_rotation.j,
+            inverse_rotation.k,
         ]);
-        inverted.tvec = Some(inverse_translation.to_array());
+        inverted.tvec = Some([
+            inverse_translation.x,
+            inverse_translation.y,
+            inverse_translation.z,
+        ]);
     }
     inverted
 }
@@ -7612,7 +8016,7 @@ fn initial_pair_forward_motion(pair: &PairGeometry) -> f32 {
             return tz;
         }
     }
-    let translation = glam::Vec3::from_array(pair.relative_pose.translation());
+    let translation = nalgebra::Vector3::from(pair.relative_pose.translation());
     let norm = translation.length();
     if norm <= f32::EPSILON || !norm.is_finite() {
         return f32::INFINITY;
@@ -8350,8 +8754,8 @@ struct StructurelessPairConstraint {
     other_pose: SE3,
     relative_pose: SE3,
     candidate_pose: SE3,
-    line_origin: glam::Vec3,
-    line_direction: glam::Vec3,
+    line_origin: nalgebra::Vector3<f32>,
+    line_direction: nalgebra::Vector3<f32>,
     inliers: usize,
     mean_error_px: f32,
     matches: Vec<StructurelessInlier>,
@@ -8757,7 +9161,8 @@ fn collect_structureless_pair_constraints(
         };
         let line_origin = camera_center(other_pose);
         let candidate_center = camera_center(candidate_pose);
-        let Some(line_direction) = (candidate_center - line_origin).try_normalize() else {
+        let Some(line_direction) = (candidate_center - line_origin).try_normalize(f32::EPSILON)
+        else {
             continue;
         };
         constraints.push(StructurelessPairConstraint {
@@ -8822,7 +9227,7 @@ fn valid_structureless_matches(
 }
 
 fn compatible_structureless_constraints(
-    rotation: glam::Quat,
+    rotation: nalgebra::UnitQuaternion<f32>,
     constraints: &[StructurelessPairConstraint],
 ) -> Vec<StructurelessPairConstraint> {
     constraints
@@ -8976,7 +9381,7 @@ fn evaluate_structureless_pose_sampson(
 fn structureless_rotation_sampson_step(
     pose: SE3,
     camera: CameraModel,
-    center: glam::Vec3,
+    center: nalgebra::Vector3<f32>,
     inliers: &[StructurelessInlier],
     frames: &[ImageFrame],
     reconstruction: &Reconstruction,
@@ -9026,7 +9431,7 @@ fn structureless_sampson_huber_delta() -> f32 {
 fn numerical_structureless_rotation_sampson_jacobian(
     pose: SE3,
     camera: CameraModel,
-    center: glam::Vec3,
+    center: nalgebra::Vector3<f32>,
     inlier: StructurelessInlier,
     frames: &[ImageFrame],
     reconstruction: &Reconstruction,
@@ -9130,7 +9535,7 @@ fn distinct_structureless_inlier_neighbors(inliers: &[StructurelessInlier]) -> u
 }
 
 fn weighted_structureless_rotation_error(
-    rotation: glam::Quat,
+    rotation: nalgebra::UnitQuaternion<f32>,
     constraints: &[StructurelessPairConstraint],
 ) -> Option<f32> {
     let mut total = 0.0f32;
@@ -9144,10 +9549,10 @@ fn weighted_structureless_rotation_error(
 }
 
 fn structureless_pair_rotation_error(
-    rotation: glam::Quat,
+    rotation: nalgebra::UnitQuaternion<f32>,
     constraint: &StructurelessPairConstraint,
 ) -> Option<f32> {
-    let pose = SE3::from_quat_translation(rotation, glam::Vec3::ZERO);
+    let pose = SE3::from_quat_translation(rotation, nalgebra::Vector3::<f32>::zeros());
     let predicted = if constraint
         .other_pose
         .translation()
@@ -9178,7 +9583,7 @@ fn structureless_pair_rotation_error(
 
 fn estimate_structureless_camera_center(
     constraints: &[StructurelessPairConstraint],
-) -> Option<glam::Vec3> {
+) -> Option<nalgebra::Vector3<f32>> {
     if constraints.len() < 2 {
         return None;
     }
@@ -9202,7 +9607,7 @@ fn estimate_structureless_camera_center(
         b += projector * origin * weight;
     }
     let center = a.lu().solve(&b)?;
-    let center = glam::Vec3::new(center.x, center.y, center.z);
+    let center = nalgebra::Vector3::new(center.x, center.y, center.z);
     center.is_finite().then_some(center)
 }
 
@@ -9261,8 +9666,6 @@ fn collect_absolute_pose_observations_from_graph(
     graph: &CorrespondenceGraph,
 ) -> Vec<AbsolutePoseObservation> {
     let mut pose_observations = Vec::new();
-    let mut used_features = HashSet::new();
-    let mut used_points = HashSet::new();
     let num_features = frames
         .get(image)
         .map(|frame| frame.keypoints.len())
@@ -9271,6 +9674,9 @@ fn collect_absolute_pose_observations_from_graph(
         let Ok(corrs) = graph.find_correspondences(image as u32, feature as u32) else {
             continue;
         };
+        // Match COLMAP RegisterNextImage: unique 3D ids only within this
+        // feature's correspondence list. Do not stop after the first hit.
+        let mut used_points = HashSet::new();
         for corr in corrs {
             let other = corr.image_id as usize;
             let other_feature = corr.point2d_idx as usize;
@@ -9289,7 +9695,7 @@ fn collect_absolute_pose_observations_from_graph(
             else {
                 continue;
             };
-            if !used_features.insert(feature) || !used_points.insert(point_id) {
+            if !used_points.insert(point_id) {
                 continue;
             }
             let kp = &frames[image].keypoints[feature];
@@ -9299,7 +9705,6 @@ fn collect_absolute_pose_observations_from_graph(
                 xy: [kp.x(), kp.y()],
                 xyz: reconstruction.points[point_id].xyz,
             });
-            break;
         }
     }
     pose_observations
@@ -9386,6 +9791,7 @@ fn solve_absolute_pose(
         &mut telemetry,
     )
     .expect("CPU absolute pose route is infallible")
+    .ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9401,7 +9807,7 @@ fn solve_absolute_pose_with_pnp_scorer(
     graph: Option<&CorrespondenceGraph>,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
     telemetry: &mut IncrementalRegistrationTelemetry,
-) -> Result<Option<AbsolutePose>> {
+) -> Result<std::result::Result<AbsolutePose, &'static str>> {
     let camera = registration_camera_for_image(
         image,
         reconstruction,
@@ -9410,7 +9816,7 @@ fn solve_absolute_pose_with_pnp_scorer(
         registration_stats,
     );
     if camera_has_bogus_params(camera, config) {
-        return Ok(None);
+        return Ok(Err("bogus_camera"));
     }
     let collect_observations_start = Instant::now();
     let pose_observations =
@@ -9418,10 +9824,10 @@ fn solve_absolute_pose_with_pnp_scorer(
     telemetry.collect_observations_ms +=
         collect_observations_start.elapsed().as_secs_f64() * 1000.0;
     let pose_solve_refine_start = Instant::now();
-    let result = (|| -> Result<Option<AbsolutePose>> {
+    let result = (|| -> Result<std::result::Result<AbsolutePose, &'static str>> {
         let num_correspondences = pose_observations.len();
         if num_correspondences < config.abs_pose_min_num_inliers.max(4) {
-            return Ok(None);
+            return Ok(Err("too_few_correspondences"));
         }
         let estimate_focal = absolute_pose_estimate_focal_length_enabled(
             image,
@@ -9431,30 +9837,28 @@ fn solve_absolute_pose_with_pnp_scorer(
             camera_has_prior_focal_length,
             registration_stats,
         );
-        let Some((pose, inliers, camera)) =
-            solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
+        let (pose, inliers, camera) =
+            match solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
                 &pose_observations,
                 camera,
                 estimate_focal,
                 config,
                 pnp_scorer,
                 telemetry,
-            )?
-        else {
-            return Ok(None);
-        };
-        let Some(initial_eval) =
+            )? {
+                Ok(result) => result,
+                Err(reason) => return Ok(Err(reason)),
+            };
+        let initial_eval =
             evaluate_absolute_pose(pose, &pose_observations, Some(&inliers), camera, config)
-        else {
-            return Ok(None);
-        };
-        if !accept_absolute_pose_eval(initial_eval, num_correspondences, config) {
-            return Ok(None);
-        }
+                .unwrap_or(AbsolutePoseEval {
+                    inliers: inliers.iter().filter(|&&value| value).count(),
+                    mean_error_px: config.pnp_threshold_px,
+                });
         let refinement_observations =
             inlier_absolute_pose_observations(&pose_observations, &inliers);
         if refinement_observations.len() < config.abs_pose_min_num_inliers {
-            return Ok(None);
+            return Ok(Err("too_few_refinement_inliers"));
         }
         let Some((pose, camera)) = refine_absolute_pose_reprojection(
             pose,
@@ -9472,28 +9876,27 @@ fn solve_absolute_pose_with_pnp_scorer(
             ),
             config,
         ) else {
-            return Ok(None);
+            return Ok(Err("refine_failed"));
         };
-        let Some(final_eval) =
-            evaluate_absolute_pose(pose, &pose_observations, None, camera, config)
-        else {
-            return Ok(None);
-        };
-        if !accept_absolute_pose_eval(final_eval, num_correspondences, config) {
-            return Ok(None);
-        }
+        // COLMAP continues tracks from the estimation inlier mask after refine;
+        // it does not re-run an accept gate on all observations.
+        let final_eval =
+            evaluate_absolute_pose(pose, &pose_observations, Some(&inliers), camera, config)
+                .unwrap_or(initial_eval);
         let point_inliers = final_absolute_pose_point_inliers(
             pose,
             &pose_observations,
             camera,
             config.pnp_threshold_px,
         );
-        debug_assert_eq!(point_inliers.len(), final_eval.inliers);
-        Ok(Some(AbsolutePose {
+        let inliers = final_eval
+            .inliers
+            .max(inliers.iter().filter(|&&value| value).count());
+        Ok(Ok(AbsolutePose {
             pose,
             camera,
-            inliers: final_eval.inliers,
-            inlier_ratio: final_eval.inliers as f32 / num_correspondences.max(1) as f32,
+            inliers,
+            inlier_ratio: inliers as f32 / num_correspondences.max(1) as f32,
             mean_error_px: final_eval.mean_error_px,
             point_inliers,
             structureless_inliers: Vec::new(),
@@ -9562,6 +9965,7 @@ fn solve_absolute_pose_with_camera_hypotheses(
         &mut telemetry,
     )
     .expect("CPU absolute pose route is infallible")
+    .ok()
 }
 
 fn solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
@@ -9571,42 +9975,46 @@ fn solve_absolute_pose_with_camera_hypotheses_and_pnp_scorer(
     config: &MapperConfig,
     pnp_scorer: Option<&mut DynPnPModelScorer>,
     telemetry: &mut IncrementalRegistrationTelemetry,
-) -> Result<Option<(SE3, Vec<bool>, CameraModel)>> {
+) -> Result<std::result::Result<(SE3, Vec<bool>, CameraModel), &'static str>> {
     #[cfg(not(feature = "gpu-wgpu"))]
     let _ = telemetry;
     if estimate_focal {
         if config.use_gpu_pnp {
             #[cfg(feature = "gpu-wgpu")]
             {
-                return solve_absolute_pose_with_gpu_focal_dispatch(
-                    observations,
-                    camera,
-                    config,
-                    telemetry,
-                    solve_absolute_pose_with_gpu_focal_estimation,
+                return Ok(
+                    match solve_absolute_pose_with_gpu_focal_dispatch(
+                        observations,
+                        camera,
+                        config,
+                        telemetry,
+                        solve_absolute_pose_with_gpu_focal_estimation,
+                    )? {
+                        Some(result) => Ok(result),
+                        None => Err("focal_estimate_failed"),
+                    },
                 );
             }
         }
-        return Ok(solve_absolute_pose_with_focal_estimation(
-            observations,
-            camera,
-            config,
-        ));
+        return Ok(
+            match solve_absolute_pose_with_focal_estimation(observations, camera, config) {
+                Some(result) => Ok(result),
+                None => Err("focal_estimate_failed"),
+            },
+        );
     }
-    let mut best = None::<(AbsolutePoseEval, SE3, Vec<bool>, CameraModel)>;
     let Some((pose, inliers)) =
         solve_absolute_pose_for_camera_with_pnp_scorer(observations, camera, config, pnp_scorer)?
     else {
-        return Ok(None);
+        return Ok(Err("pnp_solve_failed"));
     };
-    let Some(eval) = evaluate_absolute_pose(pose, observations, Some(&inliers), camera, config)
-    else {
-        return Ok(None);
-    };
-    if accept_absolute_pose_eval(eval, observations.len(), config) {
-        best = Some((eval, pose, inliers, camera));
+    // COLMAP RegisterNextImage uses EstimateAbsolutePose's inlier count directly.
+    // Do not re-threshold the mask through evaluate_absolute_pose before accept.
+    let num_inliers = inliers.iter().filter(|&&value| value).count();
+    if num_inliers < config.abs_pose_min_num_inliers {
+        return Ok(Err("pnp_accept_failed"));
     }
-    Ok(best.map(|(_, pose, inliers, camera)| (pose, inliers, camera)))
+    Ok(Ok((pose, inliers, camera)))
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -9840,9 +10248,13 @@ fn solve_absolute_pose_for_camera_with_pnp_scorer(
     let mut problem = PnPProblem::new();
     for observation in observations {
         let Some(norm_xy) = camera.cam_from_img_f32(observation.xy[0], observation.xy[1]) else {
-            return Ok(None);
+            // COLMAP skips invalid projections; do not abort the whole solve.
+            continue;
         };
         problem.add_correspondence(norm_xy, observation.xyz);
+    }
+    if problem.image_points.len() < config.abs_pose_min_num_inliers.max(4) {
+        return Ok(None);
     }
     if let Some(scorer) = pnp_scorer {
         solver
@@ -9961,7 +10373,10 @@ fn accept_absolute_pose_eval(
     _num_correspondences: usize,
     config: &MapperConfig,
 ) -> bool {
-    eval.inliers >= config.abs_pose_min_num_inliers && eval.mean_error_px <= config.pnp_threshold_px
+    // COLMAP RegisterNextImage only gates on abs_pose_min_num_inliers after
+    // EstimateAbsolutePose. Mean reprojection is not a separate accept gate;
+    // RANSAC already used abs_pose_max_error / pnp_threshold_px.
+    eval.inliers >= config.abs_pose_min_num_inliers
 }
 
 fn refine_absolute_pose_reprojection(
@@ -11078,6 +11493,51 @@ fn point_has_positive_depth(point: [f32; 3], pose: SE3) -> bool {
     cam_point[2].is_finite() && cam_point[2] > 1.0e-12
 }
 
+/// COLMAP `ObservationManager::FilterObservationsWithNegativeDepth`.
+/// Called at the start of every AdjustGlobalBundle before solving.
+fn filter_observations_with_negative_depth(
+    frames: &[ImageFrame],
+    pairs: &[PairGeometry],
+    reconstruction: &mut Reconstruction,
+    observation_manager: &mut ObservationManager,
+) -> usize {
+    let mut removed = 0usize;
+    let registered_images = (0..reconstruction.poses.len())
+        .filter(|&image| reconstruction.poses.get(image).copied().flatten().is_some())
+        .collect::<Vec<_>>();
+    for image in registered_images {
+        let num_features = frames
+            .get(image)
+            .map(|frame| frame.keypoints.len())
+            .unwrap_or(0);
+        for feature in 0..num_features {
+            let Some(point_id) = reconstruction
+                .observations
+                .get(image)
+                .and_then(|obs| obs.get(feature))
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            if point_id >= reconstruction.points.len() {
+                continue;
+            }
+            let Some(pose) = reconstruction.poses.get(image).copied().flatten() else {
+                continue;
+            };
+            if point_has_positive_depth(reconstruction.points[point_id].xyz, pose) {
+                continue;
+            }
+            if observation_manager.delete_observation(frames, pairs, reconstruction, image, feature)
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 fn track_has_positive_depth(
     point: [f32; 3],
     observations: &[TrackObservation],
@@ -11210,7 +11670,7 @@ fn refine_rotations_harmonic_reprojection(
     if angles.len() != end - start {
         return;
     }
-    let mut params = vec![glam::Vec3::ZERO; 2];
+    let mut params = vec![nalgebra::Vector3::<f32>::zeros(); 2];
     let mut base_cost =
         total_reprojection_cost(frames, reconstruction, &observations_by_image, config);
     if !base_cost.is_finite() {
@@ -11322,8 +11782,8 @@ fn refine_registered_rotations_fixed_centers(
 }
 
 fn dominant_circle_segment(
-    centers: &[Option<glam::Vec3>],
-) -> Option<(usize, usize, glam::Vec3, glam::Vec3)> {
+    centers: &[Option<nalgebra::Vector3<f32>>],
+) -> Option<(usize, usize, nalgebra::Vector3<f32>, nalgebra::Vector3<f32>)> {
     let period = 192usize;
     if centers.len() < period {
         return None;
@@ -11337,7 +11797,7 @@ fn dominant_circle_segment(
     let mean = points
         .iter()
         .copied()
-        .fold(glam::Vec3::ZERO, |acc, p| acc + p)
+        .fold(nalgebra::Vector3::<f32>::zeros(), |acc, p| acc + p)
         / points.len() as f32;
     let mut cov = Matrix3::<f64>::zeros();
     for point in &points {
@@ -11353,25 +11813,26 @@ fn dominant_circle_segment(
         }
     }
     let n = eig.eigenvectors.column(min_idx);
-    let normal = glam::Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32).try_normalize()?;
+    let normal = nalgebra::Vector3::new(n[0] as f32, n[1] as f32, n[2] as f32)
+        .try_normalize(f32::EPSILON)?;
     Some((start, end, mean, normal))
 }
 
 fn harmonic_angles(
-    centers: &[Option<glam::Vec3>],
+    centers: &[Option<nalgebra::Vector3<f32>>],
     start: usize,
     end: usize,
-    center: glam::Vec3,
-    normal: glam::Vec3,
+    center: nalgebra::Vector3<f32>,
+    normal: nalgebra::Vector3<f32>,
 ) -> Vec<f32> {
     let basis_u = normal.any_orthonormal_vector();
-    let Some(basis_v) = normal.cross(basis_u).try_normalize() else {
+    let Some(basis_v) = normal.cross(&basis_u).try_normalize(f32::EPSILON) else {
         return Vec::new();
     };
     (start..end)
         .filter_map(|idx| {
             let d = centers.get(idx).copied().flatten()? - center;
-            Some(d.dot(basis_v).atan2(d.dot(basis_u)))
+            Some(d.dot(&basis_v).atan2(d.dot(&basis_u)))
         })
         .collect()
 }
@@ -11421,7 +11882,7 @@ fn harmonic_reprojection_step(
     start: usize,
     end: usize,
     angles: &[f32],
-    params: &[glam::Vec3],
+    params: &[nalgebra::Vector3<f32>],
 ) -> Option<Vec<f32>> {
     let variable_count = 6usize;
     let mut h = DMatrix::<f64>::zeros(variable_count, variable_count);
@@ -11482,7 +11943,11 @@ fn harmonic_reprojection_step(
     Some(solution.iter().map(|value| *value as f32).collect())
 }
 
-fn harmonic_params_with_step(params: &[glam::Vec3], step: &[f32], scale: f32) -> Vec<glam::Vec3> {
+fn harmonic_params_with_step(
+    params: &[nalgebra::Vector3<f32>],
+    step: &[f32],
+    scale: f32,
+) -> Vec<nalgebra::Vector3<f32>> {
     let mut out = params.to_vec();
     for var in 0..6 {
         out[var / 3][var % 3] += (step[var] * scale).clamp(-0.02, 0.02);
@@ -11496,7 +11961,7 @@ fn apply_harmonic_rotation_delta(
     start: usize,
     end: usize,
     angles: &[f32],
-    params: &[glam::Vec3],
+    params: &[nalgebra::Vector3<f32>],
 ) {
     for image in start..end {
         let Some(base_pose) = base_poses[image] else {
@@ -11506,10 +11971,11 @@ fn apply_harmonic_rotation_delta(
     }
 }
 
-fn harmonic_pose(pose: SE3, angle: f32, params: &[glam::Vec3]) -> SE3 {
+fn harmonic_pose(pose: SE3, angle: f32, params: &[nalgebra::Vector3<f32>]) -> SE3 {
     let delta = params[0] * angle.cos() + params[1] * angle.sin();
     let center = camera_center(pose);
-    let rotation = (glam::Quat::from_scaled_axis(delta) * pose_rotation(pose)).normalize();
+    let rotation =
+        (nalgebra::UnitQuaternion::from_scaled_axis(delta) * pose_rotation(pose)).normalize();
     pose_from_rotation_center(rotation, center)
 }
 
@@ -11719,7 +12185,7 @@ fn pair_rotation_residual(
     pose: SE3,
     other_pose: SE3,
     pair: &PairGeometry,
-) -> glam::Vec3 {
+) -> nalgebra::Vector3<f32> {
     let predicted = if pair.left == image {
         other_pose.compose(&pose.inverse())
     } else {
@@ -11756,23 +12222,23 @@ fn numerical_pair_rotation_jacobian(
     Some(jacobian)
 }
 
-fn rotation_residual_vector(predicted: SE3, observed: SE3) -> glam::Vec3 {
+fn rotation_residual_vector(predicted: SE3, observed: SE3) -> nalgebra::Vector3<f32> {
     let delta = (pose_rotation(observed) * pose_rotation(predicted).inverse()).normalize();
     quat_log_local(delta)
 }
 
-fn quat_log_local(q: glam::Quat) -> glam::Vec3 {
+fn quat_log_local(q: nalgebra::UnitQuaternion<f32>) -> nalgebra::Vector3<f32> {
     let mut q = q.normalize();
     if q.w < 0.0 {
-        q = -q;
+        q = crate::geometry::quat_neg(q);
     }
     let w = q.w.clamp(-1.0, 1.0);
     let angle = 2.0 * w.acos();
     let sin_half = (1.0 - w * w).sqrt();
     if sin_half < 1.0e-6 || angle.abs() < 1.0e-6 {
-        glam::Vec3::ZERO
+        nalgebra::Vector3::<f32>::zeros()
     } else {
-        glam::Vec3::new(q.x, q.y, q.z) * (angle / sin_half)
+        nalgebra::Vector3::new(q.i, q.j, q.k) * (angle / sin_half)
     }
 }
 
@@ -11787,7 +12253,7 @@ fn pose_pair_rotation_weight() -> f32 {
 fn rotation_only_gauss_newton_step(
     image: usize,
     pose: SE3,
-    center: glam::Vec3,
+    center: nalgebra::Vector3<f32>,
     frames: &[ImageFrame],
     reconstruction: &Reconstruction,
     observations_by_image: &[Vec<(usize, usize)>],
@@ -11880,9 +12346,14 @@ fn apply_pose_delta(pose: SE3, delta: SVector<f32, 6>) -> SE3 {
     SE3::exp(&tangent).compose(&pose)
 }
 
-fn apply_rotation_delta_fixed_center(pose: SE3, center: glam::Vec3, delta: SVector<f32, 3>) -> SE3 {
-    let rotation = (glam::Quat::from_scaled_axis(glam::Vec3::new(delta[0], delta[1], delta[2]))
-        * pose_rotation(pose))
+fn apply_rotation_delta_fixed_center(
+    pose: SE3,
+    center: nalgebra::Vector3<f32>,
+    delta: SVector<f32, 3>,
+) -> SE3 {
+    let rotation = (nalgebra::UnitQuaternion::from_scaled_axis(nalgebra::Vector3::new(
+        delta[0], delta[1], delta[2],
+    )) * pose_rotation(pose))
     .normalize();
     pose_from_rotation_center(rotation, center)
 }
@@ -11910,7 +12381,7 @@ fn numerical_pose_jacobian(
 fn numerical_rotation_jacobian_fixed_center(
     point: [f32; 3],
     pose: SE3,
-    center: glam::Vec3,
+    center: nalgebra::Vector3<f32>,
     camera: CameraModel,
 ) -> Option<SMatrix<f32, 2, 3>> {
     let mut jacobian = SMatrix::<f32, 2, 3>::zeros();
@@ -12145,6 +12616,7 @@ mod tests {
 
     fn experimental_structureless_config() -> MapperConfig {
         MapperConfig {
+            structureless_registration: true,
             experimental_structureless_pair_pose_fallback: true,
             ..MapperConfig::default()
         }
@@ -12304,7 +12776,10 @@ mod tests {
         let error = solve_absolute_pose_for_camera_with_pnp_scorer(
             &observations,
             camera,
-            &MapperConfig::default(),
+            &MapperConfig {
+                abs_pose_min_num_inliers: 4,
+                ..MapperConfig::default()
+            },
             Some(&mut scorer),
         )
         .expect_err("GPU scorer error must propagate");
@@ -12570,7 +13045,11 @@ mod tests {
         Ok(())
     }
 
-    fn assert_vec3_near(actual: glam::Vec3, expected: glam::Vec3, tolerance: f32) {
+    fn assert_vec3_near(
+        actual: nalgebra::Vector3<f32>,
+        expected: nalgebra::Vector3<f32>,
+        tolerance: f32,
+    ) {
         assert!(
             actual.abs_diff_eq(expected, tolerance),
             "expected {expected:?}, got {actual:?}"
@@ -13084,6 +13563,79 @@ mod tests {
         assert!(frames[0].wide_descriptors.data.is_empty());
         assert!(frames[0].strong_feature_indices.is_empty());
         assert!(frames[0].colors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn database_frames_skip_paths_absent_from_match_connected_cache() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let connected = [dir.path().join("left.png"), dir.path().join("right.png")];
+        let stray = dir.path().join("stray.png");
+        for path in connected.iter().chain(std::iter::once(&stray)) {
+            image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])).save(path)?;
+        }
+
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 8,
+                    height: 8,
+                    params: vec![4.0, 4.0, 4.0, 4.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(1, "left.png"), (2, "right.png")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(image_id, &[ColmapKeypoint::new(1.0, 1.0)])?;
+        }
+        db.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![FeatureMatch::new(0, 0)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let paths = vec![connected[0].clone(), stray.clone(), connected[1].clone()];
+        let lookup_frames = paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| {
+                let mut frame = minimal_frame(id, path.file_name().unwrap().to_str().unwrap());
+                frame.path = path.clone();
+                frame
+            })
+            .collect::<Vec<_>>();
+        let database =
+            load_mapper_database(Some(&db_path), &lookup_frames, 0)?.expect("database input");
+
+        let frames = reconstruction_input::database_frames(&paths, &database)?;
+        let setup = database_camera_setup(
+            &database.cache,
+            &frames.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        )?;
+
+        assert_eq!(
+            frames.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["left.png", "right.png"]
+        );
+        assert_eq!(setup.image_ids, vec![1, 2]);
+        assert_eq!(setup.image_ids.len(), frames.len());
         Ok(())
     }
 
@@ -13608,8 +14160,8 @@ mod tests {
         assert_eq!(config.local_ba_max_refinements, 2);
         assert_eq!(config.local_ba_max_refinement_change, 0.001);
         assert_eq!(config.global_ba_iterations, 50);
-        assert_eq!(config.global_ba_images_ratio, 1.5);
-        assert_eq!(config.global_ba_points_ratio, 1.5);
+        assert_eq!(config.global_ba_images_ratio, 1.1);
+        assert_eq!(config.global_ba_points_ratio, 1.1);
 
         let options = mapper_ba_options(
             &config,
@@ -13817,7 +14369,7 @@ mod tests {
             None,
         );
         assert_eq!(registered_frame_count(&reconstruction), 9);
-        assert_eq!(small_options.iterations, 50);
+        assert_eq!(small_options.iterations, 100);
         assert_eq!(small_options.function_tolerance, 0.0);
         assert_eq!(small_options.gradient_tolerance, 0.1);
         assert_eq!(small_options.parameter_tolerance, 0.0);
@@ -14032,17 +14584,17 @@ mod tests {
     #[test]
     fn normalization_uses_colmap_robust_bbox_and_transforms_points_and_poses() {
         let coords = vec![
-            glam::Vec3::new(2.0, 3.0, 4.0),
-            glam::Vec3::new(-1.0, -2.0, -3.0),
-            glam::Vec3::new(5.0, 5.0, 5.0),
-            glam::Vec3::new(100.0, 100.0, 100.0),
-            glam::Vec3::new(-100.0, -100.0, -100.0),
+            nalgebra::Vector3::new(2.0, 3.0, 4.0),
+            nalgebra::Vector3::new(-1.0, -2.0, -3.0),
+            nalgebra::Vector3::new(5.0, 5.0, 5.0),
+            nalgebra::Vector3::new(100.0, 100.0, 100.0),
+            nalgebra::Vector3::new(-100.0, -100.0, -100.0),
         ];
         let (bbox_min, bbox_max, centroid) =
             robust_bbox_and_centroid_colmap(coords, 0.3, 0.7).unwrap();
-        assert_vec3_near(bbox_min, glam::Vec3::new(-1.0, -2.0, -3.0), 1.0e-6);
-        assert_vec3_near(bbox_max, glam::Vec3::new(5.0, 5.0, 5.0), 1.0e-6);
-        assert_vec3_near(centroid, glam::Vec3::new(2.0, 2.0, 2.0), 1.0e-6);
+        assert_vec3_near(bbox_min, nalgebra::Vector3::new(-1.0, -2.0, -3.0), 1.0e-6);
+        assert_vec3_near(bbox_max, nalgebra::Vector3::new(5.0, 5.0, 5.0), 1.0e-6);
+        assert_vec3_near(centroid, nalgebra::Vector3::new(2.0, 2.0, 2.0), 1.0e-6);
 
         let frames = vec![
             minimal_frame(0, "a.jpg"),
@@ -14050,11 +14602,11 @@ mod tests {
             minimal_frame(2, "c.jpg"),
         ];
         let mut reconstruction = test_reconstruction(&frames);
-        let rotation = glam::Quat::from_rotation_y(0.2);
+        let rotation = crate::geometry::quat_from_rotation_y(0.2);
         for (image, z) in [-20.0, -10.0, 0.0].into_iter().enumerate() {
             reconstruction.poses[image] = Some(pose_from_rotation_center(
                 rotation,
-                glam::Vec3::new(0.0, 0.0, z),
+                nalgebra::Vector3::new(0.0, 0.0, z),
             ));
             reconstruction.points.push(Point3D {
                 xyz: [0.0, 0.0, z],
@@ -14071,27 +14623,27 @@ mod tests {
         assert_eq!(transform.scale, 1.0);
         assert_vec3_near(
             transform.translation,
-            glam::Vec3::new(0.0, 0.0, 10.0),
+            nalgebra::Vector3::new(0.0, 0.0, 10.0),
             1.0e-6,
         );
         assert_vec3_near(
             camera_center(reconstruction.poses[0].unwrap()),
-            glam::Vec3::new(0.0, 0.0, -10.0),
+            nalgebra::Vector3::new(0.0, 0.0, -10.0),
             1.0e-5,
         );
         assert_vec3_near(
             camera_center(reconstruction.poses[1].unwrap()),
-            glam::Vec3::ZERO,
+            nalgebra::Vector3::<f32>::zeros(),
             1.0e-5,
         );
         assert_vec3_near(
             camera_center(reconstruction.poses[2].unwrap()),
-            glam::Vec3::new(0.0, 0.0, 10.0),
+            nalgebra::Vector3::new(0.0, 0.0, 10.0),
             1.0e-5,
         );
         assert_vec3_near(
-            glam::Vec3::from_array(reconstruction.points[0].xyz),
-            glam::Vec3::new(0.0, 0.0, -10.0),
+            nalgebra::Vector3::from(reconstruction.points[0].xyz),
+            nalgebra::Vector3::new(0.0, 0.0, -10.0),
             1.0e-6,
         );
         assert!(pose_rotation(reconstruction.poses[0].unwrap()).abs_diff_eq(rotation, 1.0e-6));
@@ -14099,8 +14651,8 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         for (image, z) in [-20.0, -10.0, 0.0].into_iter().enumerate() {
             reconstruction.poses[image] = Some(pose_from_rotation_center(
-                glam::Quat::IDENTITY,
-                glam::Vec3::new(0.0, 0.0, z),
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.0, 0.0, z),
             ));
             reconstruction.points.push(Point3D {
                 xyz: [0.0, 0.0, z],
@@ -14116,25 +14668,25 @@ mod tests {
         assert!((transform.scale - 0.5).abs() < 1.0e-6);
         assert_vec3_near(
             transform.translation,
-            glam::Vec3::new(0.0, 0.0, 5.0),
+            nalgebra::Vector3::new(0.0, 0.0, 5.0),
             1.0e-6,
         );
         assert_vec3_near(
             camera_center(reconstruction.poses[0].unwrap()),
-            glam::Vec3::new(0.0, 0.0, -5.0),
+            nalgebra::Vector3::new(0.0, 0.0, -5.0),
             1.0e-6,
         );
         assert_vec3_near(
-            glam::Vec3::from_array(reconstruction.points[2].xyz),
-            glam::Vec3::new(0.0, 0.0, 5.0),
+            nalgebra::Vector3::from(reconstruction.points[2].xyz),
+            nalgebra::Vector3::new(0.0, 0.0, 5.0),
             1.0e-6,
         );
 
         let mut reconstruction = test_reconstruction(&frames);
         for (image, z) in [-20.0, -10.0, 0.0].into_iter().enumerate() {
             reconstruction.poses[image] = Some(pose_from_rotation_center(
-                glam::Quat::IDENTITY,
-                glam::Vec3::new(0.0, 0.0, z),
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.0, 0.0, z),
             ));
         }
         let transform =
@@ -14143,12 +14695,12 @@ mod tests {
         assert!((transform.scale - 0.5).abs() < 1.0e-6);
         assert_vec3_near(
             transform.translation,
-            glam::Vec3::new(0.0, 0.0, 5.0),
+            nalgebra::Vector3::new(0.0, 0.0, 5.0),
             1.0e-6,
         );
         assert_vec3_near(
             camera_center(reconstruction.poses[2].unwrap()),
-            glam::Vec3::new(0.0, 0.0, 5.0),
+            nalgebra::Vector3::new(0.0, 0.0, 5.0),
             1.0e-6,
         );
     }
@@ -14194,8 +14746,8 @@ mod tests {
                 frame_id: 9,
                 rig_id: 3,
                 rig_from_world: Rigid3::from_se3(pose_from_rotation_center(
-                    glam::Quat::IDENTITY,
-                    glam::Vec3::new(0.0, 0.0, -20.0),
+                    nalgebra::UnitQuaternion::<f32>::identity(),
+                    nalgebra::Vector3::new(0.0, 0.0, -20.0),
                 )),
                 data_ids: vec![
                     DataId {
@@ -14273,17 +14825,17 @@ mod tests {
         );
         assert_vec3_near(
             camera_center(reconstruction.frames[0].rig_from_world.to_se3()),
-            glam::Vec3::new(0.0, 0.0, -5.0),
+            nalgebra::Vector3::new(0.0, 0.0, -5.0),
             1.0e-6,
         );
         assert_vec3_near(
             camera_center(reconstruction.poses[0].unwrap()),
-            glam::Vec3::new(0.0, 0.0, -5.0),
+            nalgebra::Vector3::new(0.0, 0.0, -5.0),
             1.0e-6,
         );
         assert_vec3_near(
             camera_center(reconstruction.poses[1].unwrap()),
-            glam::Vec3::new(-1.0, 0.0, -5.0),
+            nalgebra::Vector3::new(-1.0, 0.0, -5.0),
             1.0e-6,
         );
         assert!(reconstruction.poses[2].is_none());
@@ -14715,8 +15267,8 @@ mod tests {
             IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
 
         reconstruction.poses[2] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         let tri_options = IncrementalTriangulatorOptions {
             re_min_ratio: 0.5,
@@ -15104,6 +15656,17 @@ mod tests {
         assert!(reconstruction.observations[1]
             .iter()
             .all(|obs| obs.is_none()));
+        for (point_id, point) in reconstruction.points.iter().enumerate() {
+            assert!(!point.track.is_empty());
+            for obs in &point.track {
+                assert!(obs.image >= 2);
+                assert_eq!(
+                    reconstruction.observations[obs.image][obs.feature],
+                    Some(point_id)
+                );
+            }
+        }
+        assert_observation_manager_matches_fresh(&frames, &[], &reconstruction, &tri_state);
     }
 
     #[test]
@@ -15125,8 +15688,8 @@ mod tests {
             *pose = Some(SE3::identity());
         }
         reconstruction.poses[3] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         for image in 4..frames.len() {
             let point_id = reconstruction.points.len();
@@ -15181,6 +15744,134 @@ mod tests {
         );
         assert_observation_manager_matches_fresh(&frames, &pairs, &reconstruction, &tri_state);
         assert_eq!(registered_frame_count(&reconstruction), 19);
+    }
+
+    fn push_registered_observation(reconstruction: &mut Reconstruction, image: usize) {
+        let point_id = reconstruction.points.len();
+        reconstruction.observations[image][0] = Some(point_id);
+        reconstruction.point_ids.push(point_id as u64 + 1);
+        reconstruction.points.push(Point3D {
+            xyz: [image as f32, 0.0, 5.0],
+            color: [0, 0, 0],
+            error: 0.0,
+            track: vec![TrackObservation { image, feature: 0 }],
+        });
+    }
+
+    #[test]
+    fn filter_registered_frames_keeps_frame_when_only_one_sibling_has_observations() {
+        let frames = (0..21)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        let mut reconstruction = test_reconstruction(&frames);
+        attach_two_image_rig_frame(&mut reconstruction, 0, 1);
+        for pose in &mut reconstruction.poses {
+            *pose = Some(SE3::identity());
+        }
+        push_registered_observation(&mut reconstruction, 0);
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+
+        let filtered = filter_registered_frames(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut stats,
+            Some(&mut filtered_units),
+            &mut tri_state,
+        );
+
+        assert_eq!(filtered, 19);
+        assert!(!filtered_units.contains(&RegistrationUnitKey::Frame(0)));
+        assert!(reconstruction.poses[0].is_some());
+        assert!(reconstruction.poses[1].is_some());
+        assert!(reconstruction.poses[2..].iter().all(Option::is_none));
+        assert_eq!(stats.num_total_reg_images, 2);
+        assert_eq!(reconstruction.points.len(), 1);
+        assert_eq!(reconstruction.observations[0][0], Some(0));
+        assert!(reconstruction.observations[1].iter().all(Option::is_none));
+        assert_observation_manager_matches_fresh(&frames, &[], &reconstruction, &tri_state);
+    }
+
+    #[test]
+    fn filter_registered_frames_drops_bogus_camera_even_with_observations() {
+        let frames = (0..21)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.cameras = vec![
+            CameraModel::new_pinhole(100, 100, 1.0, 1.0, 50.0, 50.0),
+            CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+        ];
+        reconstruction.camera_ids = vec![11, 12];
+        reconstruction.image_camera_indices = vec![1; frames.len()];
+        reconstruction.image_camera_indices[0] = 0;
+        for pose in &mut reconstruction.poses {
+            *pose = Some(SE3::identity());
+        }
+        for image in 0..frames.len() {
+            push_registered_observation(&mut reconstruction, image);
+        }
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+
+        let filtered = filter_registered_frames(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut stats,
+            Some(&mut filtered_units),
+            &mut tri_state,
+        );
+
+        assert_eq!(filtered, 1);
+        assert!(filtered_units.contains(&RegistrationUnitKey::Image(0)));
+        assert!(reconstruction.poses[0].is_none());
+        assert!(reconstruction.poses[1..].iter().all(|pose| pose.is_some()));
+        assert_eq!(stats.num_total_reg_images, 20);
+        assert_eq!(reconstruction.points.len(), 20);
+        assert!(reconstruction.observations[0].iter().all(Option::is_none));
+        assert_observation_manager_matches_fresh(&frames, &[], &reconstruction, &tri_state);
+    }
+
+    #[test]
+    fn filter_registered_frames_ignores_out_of_range_point_ids() {
+        let frames = (0..21)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        let mut reconstruction = test_reconstruction(&frames);
+        for pose in &mut reconstruction.poses {
+            *pose = Some(SE3::identity());
+        }
+        reconstruction.observations[0][0] = Some(999);
+        for image in 1..frames.len() {
+            push_registered_observation(&mut reconstruction, image);
+        }
+        let mut stats = RegistrationStats::from_reconstruction(&reconstruction);
+        let mut filtered_units = HashSet::new();
+        let mut tri_state = IncrementalTriangulatorState::new(&frames, &[], &reconstruction);
+
+        let filtered = filter_registered_frames(
+            &frames,
+            &[],
+            &mut reconstruction,
+            &MapperConfig::default(),
+            &mut stats,
+            Some(&mut filtered_units),
+            &mut tri_state,
+        );
+
+        assert_eq!(filtered, 1);
+        assert!(filtered_units.contains(&RegistrationUnitKey::Image(0)));
+        assert!(reconstruction.poses[0].is_none());
+        assert!(reconstruction.poses[1..].iter().all(|pose| pose.is_some()));
+        assert!(reconstruction.observations[0].iter().all(Option::is_none));
+        assert_eq!(reconstruction.points.len(), 20);
+        assert_observation_manager_matches_fresh(&frames, &[], &reconstruction, &tri_state);
     }
 
     #[test]
@@ -15312,12 +16003,12 @@ mod tests {
         }];
         reconstruction.image_frame_indices = vec![Some(0), Some(0)];
         reconstruction.poses[0] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(5.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(5.0, 0.0, 0.0),
         ));
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(99.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(99.0, 0.0, 0.0),
         ));
 
         sync_registered_frame_poses_from_images(&mut reconstruction);
@@ -15531,8 +16222,8 @@ mod tests {
         let initial_camera = CameraModel::new_pinhole(120, 100, 40.0, 40.0, 60.0, 50.0);
         let provider_pose = SE3::identity();
         let candidate_pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.04),
-            glam::Vec3::new(-0.18, 0.02, 0.04),
+            crate::geometry::quat_from_rotation_y(0.04),
+            nalgebra::Vector3::new(-0.18, 0.02, 0.04),
         );
         let ref_sensor = SensorId {
             sensor_type: SensorType::Camera,
@@ -15748,8 +16439,8 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         for (idx, xyz) in [
             [0.0, 0.0, 2.0],
@@ -15841,8 +16532,8 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         reconstruction.points.push(Point3D {
             xyz: [0.0, 0.0, 2.0],
@@ -15859,8 +16550,8 @@ mod tests {
         reconstruction.cameras[0].set_fy(2000.0);
         reconstruction.camera = reconstruction.cameras[0];
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(2.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
         ));
         reconstruction.points[0].xyz = [9.0, 9.0, 9.0];
 
@@ -15887,8 +16578,8 @@ mod tests {
         let good_camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
         let provider_pose = SE3::identity();
         let candidate_pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.08),
-            glam::Vec3::new(-0.15, 0.02, 0.05),
+            crate::geometry::quat_from_rotation_y(0.08),
+            nalgebra::Vector3::new(-0.15, 0.02, 0.05),
         );
         let points = (0..30)
             .map(|idx| {
@@ -15999,8 +16690,8 @@ mod tests {
         let good_camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
         let provider_pose = SE3::identity();
         let candidate_pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.06),
-            glam::Vec3::new(-0.2, 0.03, 0.02),
+            crate::geometry::quat_from_rotation_y(0.06),
+            nalgebra::Vector3::new(-0.2, 0.03, 0.02),
         );
         let points = (0..32)
             .map(|idx| {
@@ -16099,8 +16790,8 @@ mod tests {
         let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
         let provider_pose = SE3::identity();
         let candidate_pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.06),
-            glam::Vec3::new(-0.2, 0.03, 0.02),
+            crate::geometry::quat_from_rotation_y(0.06),
+            nalgebra::Vector3::new(-0.2, 0.03, 0.02),
         );
         let points = (0..32)
             .map(|idx| {
@@ -16140,8 +16831,10 @@ mod tests {
             .map(|idx| (idx, idx))
             .collect::<Vec<_>>();
         let mut pair = pair_with_inliers(0, 1, &matches);
-        pair.relative_pose =
-            SE3::from_quat_translation(glam::Quat::from_rotation_y(0.8), glam::Vec3::X);
+        pair.relative_pose = SE3::from_quat_translation(
+            crate::geometry::quat_from_rotation_y(0.8),
+            nalgebra::Vector3::<f32>::x(),
+        );
         let config = MapperConfig {
             abs_pose_min_num_inliers: 24,
             random_seed: 0,
@@ -16182,11 +16875,14 @@ mod tests {
             sensor_id: 12,
         };
         let ref_from_rig = SE3::identity();
-        let aux_from_rig =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.35, 0.0, 0.0));
+        let aux_from_rig = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(0.35, 0.0, 0.0),
+        );
         let rig_from_world = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.04) * glam::Quat::from_rotation_x(-0.02),
-            glam::Vec3::new(-0.18, 0.02, 0.06),
+            crate::geometry::quat_from_rotation_y(0.04)
+                * crate::geometry::quat_from_rotation_x(-0.02),
+            nalgebra::Vector3::new(-0.18, 0.02, 0.06),
         );
         let points = (0..36)
             .map(|idx| {
@@ -16353,15 +17049,19 @@ mod tests {
             sensor_type: SensorType::Camera,
             sensor_id: 22,
         };
-        let aux_from_rig =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.42, 0.02, 0.0));
+        let aux_from_rig = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(0.42, 0.02, 0.0),
+        );
         let true_rig_from_world = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.03) * glam::Quat::from_rotation_x(-0.015),
-            glam::Vec3::new(-0.12, 0.04, 0.05),
+            crate::geometry::quat_from_rotation_y(0.03)
+                * crate::geometry::quat_from_rotation_x(-0.015),
+            nalgebra::Vector3::new(-0.12, 0.04, 0.05),
         );
         let initial_rig_from_world = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.065) * glam::Quat::from_rotation_x(-0.035),
-            glam::Vec3::new(-0.22, 0.0, 0.09),
+            crate::geometry::quat_from_rotation_y(0.065)
+                * crate::geometry::quat_from_rotation_x(-0.035),
+            nalgebra::Vector3::new(-0.22, 0.0, 0.09),
         );
         let points = (0..30)
             .map(|idx| {
@@ -16559,12 +17259,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(-0.25, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(-0.25, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.03),
-                glam::Vec3::new(0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.03),
+                nalgebra::Vector3::new(0.35, 0.0, 0.0),
             ),
         ];
         let point = [0.0, 0.0, 3.0];
@@ -16647,12 +17347,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(-0.25, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(-0.25, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.03),
-                glam::Vec3::new(0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.03),
+                nalgebra::Vector3::new(0.35, 0.0, 0.0),
             ),
         ];
         let point = [0.05, -0.02, 3.2];
@@ -16707,8 +17407,8 @@ mod tests {
         assert_eq!(reconstruction.points.len(), 1);
         assert_eq!(reconstruction.points[0].track.len(), 3);
         assert_eq!(reconstruction.observations[1][0], Some(0));
-        let xyz = glam::Vec3::from_array(reconstruction.points[0].xyz);
-        assert!((xyz - glam::Vec3::from_array(point)).length() < 1.0e-3);
+        let xyz = nalgebra::Vector3::from(reconstruction.points[0].xyz);
+        assert!((xyz - nalgebra::Vector3::from(point)).length() < 1.0e-3);
     }
 
     #[test]
@@ -16724,6 +17424,8 @@ mod tests {
         ];
         let config = MapperConfig {
             abs_pose_min_num_inliers: 20,
+            structureless_registration: true,
+            experimental_structureless_pair_pose_fallback: true,
             ..MapperConfig::default()
         };
 
@@ -16746,12 +17448,29 @@ mod tests {
             assert_eq!(choice.image, 1);
             assert_eq!(choice.source, "structureless");
         } else {
-            let choice =
-                choice.expect("default experimental structureless fallback should register");
+            let choice = choice.expect("experimental structureless fallback should register");
             assert_eq!(choice.image, 1);
             assert_eq!(choice.source, "structureless");
             assert!(config.experimental_structureless_pair_pose_fallback);
         }
+    }
+
+    #[test]
+    fn colmap_313_default_skips_structureless_registration_mode() {
+        assert_eq!(
+            next_registration_modes(&MapperConfig::default()),
+            vec![NextImageRegistrationMode::StructureBased]
+        );
+        assert_eq!(
+            next_registration_modes(&MapperConfig {
+                structureless_registration: true,
+                ..MapperConfig::default()
+            }),
+            vec![
+                NextImageRegistrationMode::StructureBased,
+                NextImageRegistrationMode::StructureLess,
+            ]
+        );
     }
 
     #[test]
@@ -16787,8 +17506,8 @@ mod tests {
         assert_eq!(choice.image, 1);
         assert_eq!(choice.source, "structureless");
         assert_eq!(choice.pnp_inliers, 60);
-        let actual_t = glam::Vec3::from_array(choice.pose.translation());
-        let expected_t = glam::Vec3::from_array(poses[1].translation());
+        let actual_t = nalgebra::Vector3::from(choice.pose.translation());
+        let expected_t = nalgebra::Vector3::from(poses[1].translation());
         assert!((actual_t - expected_t).length() < 1.0e-3);
         assert!(crate::geometry::relative_rotation_deg(choice.pose, poses[1]) < 1.0e-4);
     }
@@ -16799,12 +17518,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(-0.25, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(-0.25, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.03),
-                glam::Vec3::new(0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.03),
+                nalgebra::Vector3::new(0.35, 0.0, 0.0),
             ),
         ];
         let points = (0..48)
@@ -16876,12 +17595,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(-0.25, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(-0.25, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.03),
-                glam::Vec3::new(0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.03),
+                nalgebra::Vector3::new(0.35, 0.0, 0.0),
             ),
         ];
         let points = (0..64)
@@ -16927,7 +17646,7 @@ mod tests {
             collect_structureless_pair_constraints(1, &frames, &pairs, &reconstruction, &config);
         let center = camera_center(poses[1]);
         let initial_pose = pose_from_rotation_center(
-            (glam::Quat::from_rotation_x(0.015) * pose_rotation(poses[1])).normalize(),
+            (crate::geometry::quat_from_rotation_x(0.015) * pose_rotation(poses[1])).normalize(),
             center,
         );
         let initial_inliers = structureless_inliers_from_pose(
@@ -17664,16 +18383,16 @@ mod tests {
     fn pose_prior_alignment_keeps_pose_and_point_transforms_consistent() {
         let alignment = PosePriorAlignment {
             scale: 0.4,
-            rotation: glam::Mat3::from_quat(glam::Quat::from_rotation_y(0.7)),
-            translation: glam::Vec3::new(3.0, -1.0, 2.0),
+            rotation: crate::geometry::mat3_from_quat(crate::geometry::quat_from_rotation_y(0.7)),
+            translation: nalgebra::Vector3::new(3.0, -1.0, 2.0),
         };
         let pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_x(0.3),
-            glam::Vec3::new(1.0, 2.0, 3.0),
+            crate::geometry::quat_from_rotation_x(0.3),
+            nalgebra::Vector3::new(1.0, 2.0, 3.0),
         );
-        let point = glam::Vec3::new(0.5, -0.25, 4.0);
-        let camera_point = glam::Vec3::from_array(pose.transform_point(&point.to_array()));
-        let transformed_camera_point = glam::Vec3::from_array(
+        let point = nalgebra::Vector3::new(0.5, -0.25, 4.0);
+        let camera_point = nalgebra::Vector3::from(pose.transform_point(&point.to_array()));
+        let transformed_camera_point = nalgebra::Vector3::from(
             alignment
                 .transform_pose(pose)
                 .transform_point(&alignment.transform_point(point).to_array()),
@@ -17690,9 +18409,10 @@ mod tests {
         // Nearly collinear prior positions: the rotation about the position
         // line is unobservable and must be removed from the alignment.
         let src = [[0.0, 0.0, 0.0], [1.0, 0.001, 0.002], [2.0, 0.003, 0.001]];
-        let mut rotation = glam::Mat3::from_quat(glam::Quat::from_rotation_x(0.2));
+        let mut rotation =
+            crate::geometry::mat3_from_quat(crate::geometry::quat_from_rotation_x(0.2));
         remove_degenerate_alignment_rotation(&mut rotation, &src);
-        let (_, angle) = glam::Quat::from_mat3(&rotation).to_axis_angle();
+        let angle = crate::geometry::quat_from_mat3(&rotation).angle();
         assert!(
             angle.abs() < 1.0e-2,
             "line rotation component must be removed"
@@ -17707,9 +18427,10 @@ mod tests {
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 1.0],
         ];
-        let mut rotation = glam::Mat3::from_quat(glam::Quat::from_rotation_z(0.3));
+        let mut rotation =
+            crate::geometry::mat3_from_quat(crate::geometry::quat_from_rotation_z(0.3));
         remove_degenerate_alignment_rotation(&mut rotation, &src);
-        let (_, angle) = glam::Quat::from_mat3(&rotation).to_axis_angle();
+        let angle = crate::geometry::quat_from_mat3(&rotation).angle();
         assert!(
             (angle - 0.3).abs() < 1.0e-4,
             "well-conditioned rotation must stay"
@@ -17773,13 +18494,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_global_ba_caps_refinements_while_initial_and_final_keep_config() {
+    fn scheduled_global_ba_keeps_colmap_budget_on_small_models() {
         let mut config = MapperConfig::default();
         let reconstruction = test_reconstruction(&structureless_frames(3));
         config.global_ba_max_refinements = 5;
         assert_eq!(
             global_ba_max_refinements_for_reason(&config, "scheduled", &reconstruction),
-            2
+            5
         );
         assert_eq!(
             global_ba_max_refinements_for_reason(&config, "initial", &reconstruction),
@@ -17803,7 +18524,7 @@ mod tests {
         config.global_ba_iterations = 50;
         assert_eq!(
             global_ba_iterations_for_reason(&config, &reconstruction, "scheduled"),
-            15
+            50
         );
         assert_eq!(
             global_ba_iterations_for_reason(&config, &reconstruction, "final"),
@@ -18173,8 +18894,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_database_pair_geometries_keeps_stored_wide_baseline_under_eight_px() -> Result<()>
-    {
+    fn estimate_database_pair_geometries_keeps_stored_wide_baseline_under_eight_px() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("database.db");
         let db = ColmapDatabase::open(&db_path)?;
@@ -18283,6 +19003,20 @@ mod tests {
         assert!(!keep_stored_database_pair(&pair, &config));
     }
 
+    #[test]
+    fn stored_uncalibrated_pair_kept_despite_high_reprojection_error() {
+        let mut pair = test_pair(0, 20, 60, 50, 12.0, [1.0, 0.0, 0.0]);
+        pair.two_view_config = crate::database::COLMAP_TWO_VIEW_UNCALIBRATED;
+        pair.mean_reprojection_error_px = 27.0;
+        let config = MapperConfig {
+            max_reprojection_error_px: 4.0,
+            min_inliers: 15,
+            min_triangulated: 4,
+            ..MapperConfig::default()
+        };
+        assert!(keep_stored_database_pair(&pair, &config));
+    }
+
     fn stored_database_pair_rejects_high_reprojection_error() {
         let mut pair = test_pair(0, 20, 60, 50, 12.0, [1.0, 0.0, 0.0]);
         pair.mean_reprojection_error_px = 2.0;
@@ -18336,8 +19070,10 @@ mod tests {
         )
         .unwrap();
         let left_pose = SE3::identity();
-        let right_pose =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-1.0, 0.0, 0.0));
+        let right_pose = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(-1.0, 0.0, 0.0),
+        );
         let points = [
             [-0.2, -0.1, 3.0],
             [0.2, -0.1, 3.2],
@@ -18733,16 +19469,16 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.02),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.02),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.03),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.03),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(0.9, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(0.9, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -18916,8 +19652,8 @@ mod tests {
         let camera = CameraModel::new_pinhole(320, 240, 220.0, 220.0, 160.0, 120.0);
         let seed_pose = SE3::identity();
         let target_pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.035),
-            glam::Vec3::new(-0.3, 0.02, 0.01),
+            crate::geometry::quat_from_rotation_y(0.035),
+            nalgebra::Vector3::new(-0.3, 0.02, 0.01),
         );
         let points = (0..64)
             .map(|index| {
@@ -19817,16 +20553,16 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.02),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.02),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.03),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.03),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(0.9, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(0.9, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -19888,29 +20624,122 @@ mod tests {
     }
 
     #[test]
+    fn strict_rejection_remains_in_relaxed_success_diagnostics() {
+        let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
+        let poses = [
+            SE3::identity(),
+            SE3::from_quat_translation(
+                crate::geometry::quat_from_rotation_y(0.02),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
+            ),
+        ];
+        let points = (0..12)
+            .map(|idx| {
+                let col = (idx % 4) as f32;
+                let row = (idx / 4) as f32;
+                [-0.3 + col * 0.2, -0.2 + row * 0.18, 3.0 + idx as f32 * 0.03]
+            })
+            .collect::<Vec<_>>();
+        let mut frames = (0..2)
+            .map(|idx| minimal_frame(idx, &format!("image_{idx}.jpg")))
+            .collect::<Vec<_>>();
+        for (image, pose) in poses.iter().copied().enumerate() {
+            frames[image].width = camera.width;
+            frames[image].height = camera.height;
+            frames[image].keypoints = points
+                .iter()
+                .map(|&point| project_test_point(camera, pose, point))
+                .collect();
+            frames[image].colors = vec![[image as u8, 0, 0]; points.len()];
+        }
+        let pair = initial_pair_from_projected_points(0, 1, poses[0], poses[1], points.len());
+        let config = MapperConfig {
+            init_num_trials: 1,
+            init_min_num_inliers: 4,
+            init_min_tri_angle_deg: 10.0,
+            min_triangulated: 0,
+            abs_pose_min_num_inliers: 4,
+            local_ba: false,
+            global_ba: false,
+            ignore_two_view_tracks: false,
+            threads: Some(1),
+            multiple_models: false,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        let result = run_incremental_pipeline(&frames, camera, None, &[pair], &config, None);
+        let log = result.debug_log.join("\n");
+
+        assert_eq!(result.status, IncrementalPipelineStatus::Success, "{log}");
+        assert!(
+            log.contains(
+                "initialization_attempt_failed stage=strict trial=0 error=no initial pair"
+            ),
+            "{log}"
+        );
+        assert!(
+            log.contains("stage=strict trial=0 initial_pair_reject image_0.jpg -> image_1.jpg reason=triangulation_angle"),
+            "{log}"
+        );
+        assert!(
+            log.contains("initial_pair image_0.jpg -> image_1.jpg"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn public_pipeline_keeps_rejection_reasons_when_every_stage_fails() {
+        let pair = test_pair(0, 1, 200, 140, 1.0, [1.0, 0.0, 0.0]);
+        let frames = structureless_frames(2);
+        let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let config = MapperConfig {
+            threads: Some(1),
+            local_ba: false,
+            global_ba: false,
+            init_num_trials: 1,
+            multiple_models: false,
+            extract_colors: false,
+            ..MapperConfig::default()
+        };
+
+        let result = run_incremental_pipeline(&frames, camera, None, &[pair], &config, None);
+        let log = result.debug_log.join("\n");
+
+        assert_eq!(
+            result.status,
+            IncrementalPipelineStatus::NoInitialPair,
+            "{log}"
+        );
+        assert!(log.contains("stage=strict"), "{log}");
+        assert!(log.contains("reason=triangulation_angle"), "{log}");
+        assert!(log.contains("initial_pair_reject"), "{log}");
+    }
+
+    #[test]
     fn pipeline_keeps_first_small_model_and_discards_later_small_models_like_colmap() {
         let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(0.9, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(0.9, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.01),
-                glam::Vec3::new(1.3, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.01),
+                nalgebra::Vector3::new(1.3, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.02),
-                glam::Vec3::new(1.7, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.02),
+                nalgebra::Vector3::new(1.7, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -19977,12 +20806,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20047,12 +20876,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20162,12 +20991,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20309,12 +21138,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20496,12 +21325,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20597,12 +21426,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20673,12 +21502,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20802,12 +21631,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -20902,14 +21731,17 @@ mod tests {
         let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
         let poses = [
             SE3::identity(),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.35, 0.0, 0.0)),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.9, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.9, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -21212,6 +22044,216 @@ mod tests {
         .unwrap();
 
         assert_eq!((chosen.left, chosen.right), (2, 3));
+    }
+
+    #[test]
+    fn initial_pair_uses_first_stored_orientation_instead_of_left_right_sort() {
+        let weak_then_strong = vec![
+            test_pair(1, 0, 40, 30, 20.0, [1.0, 0.0, 0.0]),
+            test_pair(0, 1, 200, 140, 20.0, [1.0, 0.0, 0.0]),
+        ];
+        let strong_then_weak = vec![
+            test_pair(0, 1, 200, 140, 20.0, [1.0, 0.0, 0.0]),
+            test_pair(1, 0, 40, 30, 20.0, [1.0, 0.0, 0.0]),
+        ];
+        let frames = structureless_frames(2);
+        let reconstruction = test_reconstruction(&frames);
+        let config = MapperConfig {
+            threads: Some(1),
+            ..MapperConfig::default()
+        };
+        let flags = camera_prior_focal_flags(&reconstruction, true);
+
+        let weak_first =
+            choose_initial_pair_for_test(&weak_then_strong, &reconstruction, &config, &flags);
+        let strong_first =
+            choose_initial_pair_for_test(&strong_then_weak, &reconstruction, &config, &flags);
+
+        assert!(weak_first.is_none());
+        assert_eq!(
+            strong_first.map(|pair| (pair.left, pair.right, pair.inliers)),
+            Some((0, 1, 200))
+        );
+    }
+
+    #[test]
+    fn mapper_candidate_order_is_not_database_enumeration_order() {
+        // Unique canonical pair IDs. Frame order is c/a/b, image ids are 30/10/20,
+        // so match-table order (a,b) then (b,c) is not the focal/correspondence sort.
+        let database_enum = vec![
+            test_pair(1, 2, 150, 80, 20.0, [1.0, 0.0, 0.0]),
+            test_pair(0, 2, 400, 200, 20.0, [1.0, 0.0, 0.0]),
+        ];
+        let frames = vec![
+            minimal_frame(0, "c.jpg"),
+            minimal_frame(1, "a.jpg"),
+            minimal_frame(2, "b.jpg"),
+        ];
+        let mut reconstruction = test_reconstruction(&frames);
+        reconstruction.image_ids = vec![30, 10, 20];
+        let flags = camera_prior_focal_flags(&reconstruction, true);
+        let database_first_pair_id = image_pair_to_pair_id(10, 20).unwrap();
+        let correspondence_first_pair_id = image_pair_to_pair_id(20, 30).unwrap();
+        assert_ne!(database_first_pair_id, correspondence_first_pair_id);
+
+        let (chosen, state) =
+            choose_initial_pair_with_threads(&database_enum, &reconstruction, &flags, Some(1));
+
+        assert_eq!(
+            state.candidates.first().map(|candidate| (
+                candidate.left,
+                candidate.right,
+                candidate.pair_id
+            )),
+            Some((2, 0, correspondence_first_pair_id))
+        );
+        assert_ne!(
+            state.candidates.first().map(|candidate| candidate.pair_id),
+            Some(database_first_pair_id)
+        );
+        assert_eq!(state.probes, 1);
+        assert_eq!(state.decisions.len(), 1);
+        assert!(state.decisions[0].accepted);
+        assert_eq!(state.decisions[0].pair_id, correspondence_first_pair_id);
+        assert_eq!(chosen.map(|pair| (pair.left, pair.right)), Some((2, 0)));
+        assert!(state.candidates.len() > state.probes);
+    }
+
+    #[test]
+    fn initial_pair_rejection_reasons_match_across_thread_counts() {
+        let low_angle = test_pair(0, 1, 200, 140, 1.0, [1.0, 0.0, 0.0]);
+        let forward = test_pair(0, 2, 180, 140, 20.0, [0.0, 0.0, 1.0]);
+        let accepted = test_pair(0, 3, 160, 140, 20.0, [1.0, 0.0, 0.0]);
+        let pairs = vec![low_angle, forward, accepted];
+        let frames = structureless_frames(4);
+        let reconstruction = test_reconstruction(&frames);
+        let flags = camera_prior_focal_flags(&reconstruction, true);
+
+        let (single, single_state) =
+            choose_initial_pair_with_threads(&pairs, &reconstruction, &flags, Some(1));
+        let (parallel, parallel_state) =
+            choose_initial_pair_with_threads(&pairs, &reconstruction, &flags, Some(4));
+
+        assert_eq!(single.map(|pair| (pair.left, pair.right)), Some((0, 3)));
+        assert_eq!(parallel.map(|pair| (pair.left, pair.right)), Some((0, 3)));
+        assert_eq!(single_state.probes, 3);
+        assert_eq!(
+            single_state.probe_batch_bounds,
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+        assert_eq!(parallel_state.probe_batch_bounds, vec![(0, 3)]);
+        assert_eq!(parallel_state.probes, 3);
+        assert_eq!(
+            single_state.rejections,
+            vec![
+                InitialPairRejection {
+                    left: 0,
+                    right: 1,
+                    reason: InitialPairRejectionReason::TriangulationAngle,
+                },
+                InitialPairRejection {
+                    left: 0,
+                    right: 2,
+                    reason: InitialPairRejectionReason::ForwardMotion,
+                },
+            ]
+        );
+        assert_eq!(single_state.rejections, parallel_state.rejections);
+    }
+
+    #[test]
+    fn single_thread_initial_pair_stops_probing_at_first_success() {
+        let accepted = test_pair(0, 1, 400, 300, 20.0, [1.0, 0.0, 0.0]);
+        let mut later = test_pair(0, 2, 150, 80, 20.0, [1.0, 0.0, 0.0]);
+        later.inlier_matches = vec![
+            rustslam::Match {
+                query_idx: 0,
+                train_idx: 0,
+                distance: 0.0,
+            };
+            8_000
+        ];
+        let pairs = vec![accepted, later];
+        let frames = structureless_frames(3);
+        let reconstruction = test_reconstruction(&frames);
+        let flags = camera_prior_focal_flags(&reconstruction, true);
+
+        let (chosen, state) =
+            choose_initial_pair_with_threads(&pairs, &reconstruction, &flags, Some(1));
+
+        assert_eq!(chosen.map(|pair| (pair.left, pair.right)), Some((0, 1)));
+        assert_eq!(state.probes, 1);
+        assert!(state.rejections.is_empty());
+        assert_eq!(state.init_image_pairs.len(), 1);
+    }
+
+    #[test]
+    fn parallel_initial_pair_batches_stop_after_the_successful_batch() {
+        let pairs = (1..=6)
+            .map(|second| {
+                let inliers = 300 - second * 10;
+                if second == 5 {
+                    test_pair(0, second, inliers, 80, 20.0, [1.0, 0.0, 0.0])
+                } else {
+                    test_pair(0, second, inliers, 80, 1.0, [1.0, 0.0, 0.0])
+                }
+            })
+            .collect::<Vec<_>>();
+        let frames = structureless_frames(7);
+        let reconstruction = test_reconstruction(&frames);
+        let flags = camera_prior_focal_flags(&reconstruction, true);
+
+        let (single, single_state) =
+            choose_initial_pair_with_threads(&pairs, &reconstruction, &flags, Some(1));
+        let (parallel, parallel_state) =
+            choose_initial_pair_with_threads(&pairs, &reconstruction, &flags, Some(4));
+
+        assert_eq!(single.map(|pair| (pair.left, pair.right)), Some((0, 5)));
+        assert_eq!(parallel.map(|pair| (pair.left, pair.right)), Some((0, 5)));
+        assert_eq!(single_state.probes, 5);
+        assert_eq!(single_state.rejections.len(), 4);
+        assert_eq!(parallel_state.probe_batch_bounds, vec![(0, 4), (4, 6)]);
+        assert_eq!(parallel_state.probes, 6);
+        assert_eq!(parallel_state.rejections, single_state.rejections);
+        assert_eq!(
+            parallel_state.init_image_pairs.len(),
+            single_state.init_image_pairs.len()
+        );
+    }
+
+    #[test]
+    fn initial_pair_labels_estimator_failure_without_changing_the_gate() {
+        let mut estimated = test_pair(0, 1, 200, 140, 20.0, [1.0, 0.0, 0.0]);
+        estimated.e_matrix = Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        let pairs = vec![estimated];
+        let frames = structureless_frames(2);
+        let valid = test_reconstruction(&frames);
+        let mut invalid = valid.clone();
+        invalid.camera.width = 0;
+        if let Some(camera) = invalid.cameras.first_mut() {
+            camera.width = 0;
+        }
+        let flags = camera_prior_focal_flags(&valid, true);
+        let config = MapperConfig {
+            threads: Some(1),
+            ..MapperConfig::default()
+        };
+
+        let mut valid_state = InitialPairSelectionState::from_reconstruction(&valid);
+        assert!(choose_initial_pair(&pairs, &valid, &config, &flags, &mut valid_state).is_none());
+        assert_eq!(
+            valid_state.rejections[0].reason,
+            InitialPairRejectionReason::ReestimationFailed
+        );
+
+        let mut invalid_state = InitialPairSelectionState::from_reconstruction(&invalid);
+        assert!(
+            choose_initial_pair(&pairs, &invalid, &config, &flags, &mut invalid_state).is_none()
+        );
+        assert_eq!(
+            invalid_state.rejections[0].reason,
+            InitialPairRejectionReason::CameraValidity
+        );
     }
 
     #[test]
@@ -21815,8 +22857,8 @@ mod tests {
         let camera = CameraModel::new_pinhole(160, 120, 70.0, 70.0, 80.0, 60.0);
         let provider_pose = SE3::identity();
         let candidate_pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.03),
-            glam::Vec3::new(-0.2, 0.01, 0.05),
+            crate::geometry::quat_from_rotation_y(0.03),
+            nalgebra::Vector3::new(-0.2, 0.01, 0.05),
         );
         let points = (0..40)
             .map(|idx| {
@@ -21920,8 +22962,8 @@ mod tests {
         let camera = CameraModel::new_pinhole(160, 120, 70.0, 70.0, 80.0, 60.0);
         let provider_pose = SE3::identity();
         let good_pose = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.03),
-            glam::Vec3::new(-0.2, 0.01, 0.05),
+            crate::geometry::quat_from_rotation_y(0.03),
+            nalgebra::Vector3::new(-0.2, 0.01, 0.05),
         );
         let points = (0..48)
             .map(|idx| {
@@ -22005,10 +23047,13 @@ mod tests {
             &obs_manager,
         );
 
+        assert_eq!(selection.failed_attempts.len(), 1);
+        assert_eq!(selection.failed_attempts[0].0, 1);
         assert_eq!(
-            selection.failed_attempts,
-            vec![(1, NextImageRegistrationMode::StructureBased)]
+            selection.failed_attempts[0].1,
+            NextImageRegistrationMode::StructureBased
         );
+        assert!(selection.failed_attempts[0].2.is_some());
         let choice = selection
             .choice
             .expect("second queue candidate should register");
@@ -22029,12 +23074,12 @@ mod tests {
             reconstruction.poses[image] = Some(SE3::identity());
         }
         reconstruction.poses[2] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         reconstruction.poses[3] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(0.01, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(0.01, 0.0, 0.0),
         ));
         for point_id in 0..4 {
             reconstruction.points.push(Point3D {
@@ -22109,12 +23154,12 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(0.0, 0.0, -4.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(0.0, 0.0, -4.0),
         ));
         reconstruction.poses[2] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(0);
@@ -22168,10 +23213,14 @@ mod tests {
     fn track_filter_updates_error_without_retriangulating_xyz() {
         let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
         let pose0 = SE3::identity();
-        let pose1 =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0));
-        let pose2 =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.0, 1.0, 0.0));
+        let pose1 = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
+        );
+        let pose2 = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(0.0, 1.0, 0.0),
+        );
         let original_xyz = [0.0, 0.0, 4.0];
         let measured_xyz = [0.04, -0.03, 4.08];
         let mut frames = vec![
@@ -22246,8 +23295,8 @@ mod tests {
         reconstruction.image_camera_indices = vec![0, 1];
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(0);
@@ -22285,8 +23334,8 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(0.001, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(0.001, 0.0, 0.0),
         ));
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(0);
@@ -22331,8 +23380,8 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(0);
@@ -22383,8 +23432,8 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses.fill(Some(SE3::identity()));
         reconstruction.poses[5] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         let tracks = [
             vec![
@@ -22533,12 +23582,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(-0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -22631,8 +23680,8 @@ mod tests {
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(0);
@@ -22767,7 +23816,6 @@ mod tests {
             &mut reconstruction,
             &mut triangulation_state,
             &tri_options,
-            initial.median_triangulation_angle_deg.max(0.1) * 0.5,
             &initial,
         );
         assert!(
@@ -22796,12 +23844,12 @@ mod tests {
         let poses = [
             SE3::identity(),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(-0.25, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(-0.25, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.03),
-                glam::Vec3::new(0.35, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(-0.03),
+                nalgebra::Vector3::new(0.35, 0.0, 0.0),
             ),
         ];
         let point = [0.05, -0.02, 3.2];
@@ -24316,15 +25364,15 @@ mod tests {
     }
 
     fn pose_translation_direction_error_deg(a: SE3, b: SE3) -> f32 {
-        let ta = glam::Vec3::from_array(a.translation());
-        let tb = glam::Vec3::from_array(b.translation());
-        let Some(ta) = ta.try_normalize() else {
+        let ta = nalgebra::Vector3::from(a.translation());
+        let tb = nalgebra::Vector3::from(b.translation());
+        let Some(ta) = ta.try_normalize(f32::EPSILON) else {
             return f32::INFINITY;
         };
-        let Some(tb) = tb.try_normalize() else {
+        let Some(tb) = tb.try_normalize(f32::EPSILON) else {
             return f32::INFINITY;
         };
-        ta.dot(tb).clamp(-1.0, 1.0).acos().to_degrees()
+        ta.dot(&tb).clamp(-1.0, 1.0).acos().to_degrees()
     }
 
     fn position_prior_covariance(stddev: f64) -> [f64; 9] {
@@ -24342,14 +25390,17 @@ mod tests {
         let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
         let poses = [
             SE3::identity(),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.35, 0.0, 0.0)),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.03),
-                glam::Vec3::new(0.45, 0.0, 0.0),
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-0.35, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.02),
-                glam::Vec3::new(0.9, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.03),
+                nalgebra::Vector3::new(0.45, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                crate::geometry::quat_from_rotation_y(-0.02),
+                nalgebra::Vector3::new(0.9, 0.0, 0.0),
             ),
         ];
         let points = (0..12)
@@ -24545,8 +25596,8 @@ mod tests {
             matches: Vec::new(),
             inlier_matches: Vec::new(),
             relative_pose: SE3::from_quat_translation(
-                glam::Quat::IDENTITY,
-                glam::Vec3::from_array(translation),
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::from(translation),
             ),
             inliers,
             triangulated,
@@ -24590,20 +25641,20 @@ mod tests {
     fn structureless_world_poses() -> [SE3; 4] {
         [
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.02),
-                glam::Vec3::new(0.0, 0.0, 0.0),
+                crate::geometry::quat_from_rotation_y(0.02),
+                nalgebra::Vector3::new(0.0, 0.0, 0.0),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.11),
-                glam::Vec3::new(-0.45, 0.02, 0.04),
+                crate::geometry::quat_from_rotation_y(0.11),
+                nalgebra::Vector3::new(-0.45, 0.02, 0.04),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(-0.05),
-                glam::Vec3::new(0.75, -0.01, 0.02),
+                crate::geometry::quat_from_rotation_y(-0.05),
+                nalgebra::Vector3::new(0.75, -0.01, 0.02),
             ),
             SE3::from_quat_translation(
-                glam::Quat::from_rotation_y(0.04),
-                glam::Vec3::new(1.4, 0.03, -0.03),
+                crate::geometry::quat_from_rotation_y(0.04),
+                nalgebra::Vector3::new(1.4, 0.03, -0.03),
             ),
         ]
     }
@@ -24668,6 +25719,95 @@ mod tests {
         log.iter()
             .position(|line| line == expected)
             .unwrap_or_else(|| panic!("missing log line: {expected}"))
+    }
+
+    #[test]
+    fn database_pair_input_follows_match_table_order_not_left_right() -> Result<()> {
+        let dir = tempdir()?;
+        let db = ColmapDatabase::open(dir.path().join("database.db"))?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        // Image ids and frame indices disagree, so pair-id order is not
+        // `(left, right)` frame order. `matches.pair_id` is an INTEGER
+        // PRIMARY KEY, so `read_num_matches()` follows that key.
+        for (image_id, name) in [(30, "c.jpg"), (10, "a.jpg"), (20, "b.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(
+                image_id,
+                &[ColmapKeypoint::new(0.0, 0.0), ColmapKeypoint::new(1.0, 1.0)],
+            )?;
+        }
+        for (left, right) in [(20, 30), (10, 20)] {
+            db.write_matches(left, right, &[FeatureMatch::new(0, 0)])?;
+            db.write_two_view_geometry(
+                left,
+                right,
+                &ColmapTwoViewGeometry {
+                    config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+                    inlier_matches: vec![FeatureMatch::new(0, 0)],
+                    ..ColmapTwoViewGeometry::default()
+                },
+            )?;
+        }
+        let cache = db.load_cache(&DatabaseCacheOptions {
+            load_all_images: true,
+            ..DatabaseCacheOptions::default()
+        })?;
+        let frames = vec![
+            minimal_frame(0, "c.jpg"),
+            minimal_frame(1, "a.jpg"),
+            minimal_frame(2, "b.jpg"),
+        ];
+        let pairs = database_pair_matches_for_frames(&frames, &cache)?
+            .into_iter()
+            .map(|pair| (pair.left, pair.right))
+            .collect::<Vec<_>>();
+        let mut by_left_right = pairs.clone();
+        by_left_right.sort();
+
+        assert_eq!(pairs, vec![(1, 2), (0, 2)]);
+        assert_ne!(pairs, by_left_right);
+        Ok(())
+    }
+
+    fn choose_initial_pair_with_threads(
+        pairs: &[PairGeometry],
+        reconstruction: &Reconstruction,
+        camera_has_prior_focal_length: &[bool],
+        threads: Option<usize>,
+    ) -> (Option<PairGeometry>, InitialPairSelectionState) {
+        let mut selection_state = InitialPairSelectionState::from_reconstruction(reconstruction);
+        let config = MapperConfig {
+            threads,
+            ..MapperConfig::default()
+        };
+        let chosen = choose_initial_pair(
+            pairs,
+            reconstruction,
+            &config,
+            camera_has_prior_focal_length,
+            &mut selection_state,
+        );
+        (chosen, selection_state)
     }
 
     fn choose_initial_pair_for_test(

@@ -94,17 +94,23 @@ impl TwoViewGeometryRecord {
         self.e_matrix = self.e_matrix.map(transpose3);
         self.h_matrix = self.h_matrix.and_then(invert_matrix3);
         if let (Some(qvec), Some(tvec)) = (self.qvec, self.tvec) {
-            let rotation = glam::DQuat::from_xyzw(qvec[1], qvec[2], qvec[3], qvec[0]).normalize();
-            let translation = glam::DVec3::from_array(tvec);
+            let rotation = nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+                qvec[0], qvec[1], qvec[2], qvec[3],
+            ));
+            let translation = nalgebra::Vector3::new(tvec[0], tvec[1], tvec[2]);
             let inverse_rotation = rotation.inverse();
             let inverse_translation = -(inverse_rotation * translation);
             self.qvec = Some([
                 inverse_rotation.w,
-                inverse_rotation.x,
-                inverse_rotation.y,
-                inverse_rotation.z,
+                inverse_rotation.i,
+                inverse_rotation.j,
+                inverse_rotation.k,
             ]);
-            self.tvec = Some(inverse_translation.to_array());
+            self.tvec = Some([
+                inverse_translation.x,
+                inverse_translation.y,
+                inverse_translation.z,
+            ]);
         }
         for match_ in &mut self.inlier_matches {
             std::mem::swap(&mut match_.point2d_idx1, &mut match_.point2d_idx2);
@@ -130,6 +136,8 @@ pub struct CorrespondenceGraph {
     finalized: bool,
     images: HashMap<ImageId, ImageData>,
     image_pairs: HashMap<ImagePairId, ImagePairData>,
+    /// Insertion order. `image_pairs` is a `HashMap` and must not be treated as database order.
+    pair_order: Vec<ImagePairId>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -236,7 +244,8 @@ impl CorrespondenceGraph {
     }
 
     pub fn image_pairs(&self) -> Vec<ImagePairId> {
-        self.image_pairs.keys().copied().collect()
+        debug_assert_eq!(self.pair_order.len(), self.image_pairs.len());
+        self.pair_order.clone()
     }
 
     pub fn add_image(&mut self, image_id: ImageId, num_points2d: usize) -> Result<()> {
@@ -339,6 +348,7 @@ impl CorrespondenceGraph {
                 two_view_geometry,
             },
         );
+        self.pair_order.push(pair_id);
         Ok(())
     }
 

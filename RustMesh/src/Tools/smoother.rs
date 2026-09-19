@@ -5,7 +5,7 @@
 use crate::geometry::{cotangent, triangle_angle_at};
 use crate::handles::VertexHandle;
 use crate::RustMesh;
-use crate::Vec3;
+use crate::{Point3, Vec3};
 
 /// Smoothing configuration
 #[derive(Debug, Clone)]
@@ -49,15 +49,15 @@ fn compute_laplacian_uniform(mesh: &RustMesh, vh: VertexHandle) -> Option<Vec3> 
     }
 
     let avg = neighbor_sum / neighbor_count as f32;
-    Some(avg - current)
+    Some(avg - current.coords)
 }
 
 fn accumulate_neighbor_positions(
     mesh: &RustMesh,
     vh: VertexHandle,
-    cached_positions: Option<&[Vec3]>,
+    cached_positions: Option<&[Point3]>,
 ) -> (Vec3, usize) {
-    let mut sum = Vec3::ZERO;
+    let mut sum = Vec3::zeros();
     let mut count = 0usize;
 
     if let Some(vv) = mesh.vertex_vertices(vh) {
@@ -67,7 +67,7 @@ fn accumulate_neighbor_positions(
                 .or_else(|| mesh.point(neighbor));
 
             if let Some(point) = position {
-                sum += point;
+                sum += point.coords;
                 count += 1;
             }
         }
@@ -107,13 +107,13 @@ pub fn laplace_smooth(mesh: &mut RustMesh, config: SmootherConfig) -> SmoothResu
     } else {
         vec![false; n_vertices]
     };
-    let mut current_positions = vec![Vec3::ZERO; n_vertices];
-    let mut next_positions = vec![Vec3::ZERO; n_vertices];
+    let mut current_positions = vec![Point3::origin(); n_vertices];
+    let mut next_positions = vec![Point3::origin(); n_vertices];
     let mut max_displacement = 0.0f32;
 
     for _ in 0..config.iterations {
         for (i, &vh) in vhs.iter().enumerate() {
-            let point = mesh.point(vh).unwrap_or(Vec3::ZERO);
+            let point = mesh.point(vh).unwrap_or(Point3::origin());
             current_positions[i] = point;
             next_positions[i] = point;
         }
@@ -130,8 +130,8 @@ pub fn laplace_smooth(mesh: &mut RustMesh, config: SmootherConfig) -> SmoothResu
             }
 
             let avg = neighbor_sum / neighbor_count as f32;
-            let displacement = (avg - current_positions[i]) * config.strength;
-            max_displacement = max_displacement.max(displacement.length());
+            let displacement = (avg - current_positions[i].coords) * config.strength;
+            max_displacement = max_displacement.max(displacement.norm());
             next_positions[i] = current_positions[i] + displacement;
         }
 
@@ -167,19 +167,19 @@ pub fn tangential_smooth(mesh: &mut RustMesh, config: SmootherConfig) -> SmoothR
     } else {
         vec![false; n_vertices]
     };
-    let mut current_positions = vec![Vec3::ZERO; n_vertices];
-    let mut next_positions = vec![Vec3::ZERO; n_vertices];
+    let mut current_positions = vec![Point3::origin(); n_vertices];
+    let mut next_positions = vec![Point3::origin(); n_vertices];
     let mut max_displacement = 0.0f32;
 
     for _ in 0..config.iterations {
-        let mut centroid_sum = Vec3::ZERO;
+        let mut centroid_sum = Vec3::zeros();
         for (i, &vh) in vhs.iter().enumerate() {
-            let point = mesh.point(vh).unwrap_or(Vec3::ZERO);
+            let point = mesh.point(vh).unwrap_or(Point3::origin());
             current_positions[i] = point;
             next_positions[i] = point;
-            centroid_sum += point;
+            centroid_sum += point.coords;
         }
-        let centroid = centroid_sum / n_vertices as f32;
+        let centroid = Point3::from(centroid_sum / n_vertices as f32);
 
         for (i, &vh) in vhs.iter().enumerate() {
             if boundary_mask[i] {
@@ -192,11 +192,13 @@ pub fn tangential_smooth(mesh: &mut RustMesh, config: SmootherConfig) -> SmoothR
                 continue;
             }
 
-            let laplacian = neighbor_sum / neighbor_count as f32 - current_positions[i];
-            let normal = (current_positions[i] - centroid).normalize_or_zero();
-            let tangential = laplacian - normal * laplacian.dot(normal);
+            let laplacian = neighbor_sum / neighbor_count as f32 - current_positions[i].coords;
+            let normal = (current_positions[i] - centroid)
+                .try_normalize(f32::EPSILON)
+                .unwrap_or_else(Vec3::zeros);
+            let tangential = laplacian - normal * laplacian.dot(&normal);
             let displacement = tangential * config.strength;
-            max_displacement = max_displacement.max(displacement.length());
+            max_displacement = max_displacement.max(displacement.norm());
             next_positions[i] = current_positions[i] + displacement;
         }
 
@@ -226,7 +228,7 @@ pub fn cotangent_weight_laplacian(mesh: &RustMesh, vh: VertexHandle) -> Option<V
         return None;
     }
 
-    let mut laplacian = Vec3::ZERO;
+    let mut laplacian = Vec3::zeros();
     let mut total_weight = 0.0f32;
 
     for heh in halfedges {
@@ -304,14 +306,14 @@ pub fn cotangent_smooth(mesh: &mut RustMesh, config: SmootherConfig) -> SmoothRe
         vec![false; n_vertices]
     };
 
-    let mut current_positions = vec![Vec3::ZERO; n_vertices];
-    let mut next_positions = vec![Vec3::ZERO; n_vertices];
+    let mut current_positions = vec![Point3::origin(); n_vertices];
+    let mut next_positions = vec![Point3::origin(); n_vertices];
     let mut max_displacement = 0.0f32;
 
     for _ in 0..config.iterations {
         // Cache current positions
         for (i, &vh) in vhs.iter().enumerate() {
-            let point = mesh.point(vh).unwrap_or(Vec3::ZERO);
+            let point = mesh.point(vh).unwrap_or(Point3::origin());
             current_positions[i] = point;
             next_positions[i] = point;
         }
@@ -324,7 +326,7 @@ pub fn cotangent_smooth(mesh: &mut RustMesh, config: SmootherConfig) -> SmoothRe
 
             if let Some(laplacian) = cotangent_weight_laplacian(mesh, vh) {
                 let displacement = laplacian * config.strength;
-                max_displacement = max_displacement.max(displacement.length());
+                max_displacement = max_displacement.max(displacement.norm());
                 next_positions[i] = current_positions[i] + displacement;
             }
         }
@@ -349,7 +351,7 @@ pub fn cotangent_smooth(mesh: &mut RustMesh, config: SmootherConfig) -> SmoothRe
 /// Higher values indicate sharper features (edges, corners).
 pub fn estimate_mean_curvature(mesh: &RustMesh, vh: VertexHandle) -> Option<f32> {
     let laplacian = cotangent_weight_laplacian(mesh, vh)?;
-    Some(laplacian.length())
+    Some(laplacian.norm())
 }
 
 /// Compute curvature for all vertices
@@ -424,8 +426,8 @@ pub fn adaptive_smooth(mesh: &mut RustMesh, config: AdaptiveSmootherConfig) -> S
         vec![false; n_vertices]
     };
 
-    let mut current_positions = vec![Vec3::ZERO; n_vertices];
-    let mut next_positions = vec![Vec3::ZERO; n_vertices];
+    let mut current_positions = vec![Point3::origin(); n_vertices];
+    let mut next_positions = vec![Point3::origin(); n_vertices];
     let mut max_displacement = 0.0f32;
 
     // Precompute curvature range
@@ -435,7 +437,7 @@ pub fn adaptive_smooth(mesh: &mut RustMesh, config: AdaptiveSmootherConfig) -> S
     for _ in 0..config.iterations {
         // Cache current positions
         for (i, &vh) in vhs.iter().enumerate() {
-            let point = mesh.point(vh).unwrap_or(Vec3::ZERO);
+            let point = mesh.point(vh).unwrap_or(Point3::origin());
             current_positions[i] = point;
             next_positions[i] = point;
         }
@@ -465,7 +467,7 @@ pub fn adaptive_smooth(mesh: &mut RustMesh, config: AdaptiveSmootherConfig) -> S
             let strength = config.min_strength + strength_range * (1.0 - t);
 
             let displacement = laplacian * strength;
-            max_displacement = max_displacement.max(displacement.length());
+            max_displacement = max_displacement.max(displacement.norm());
             next_positions[i] = current_positions[i] + displacement;
         }
 
@@ -566,10 +568,10 @@ mod tests {
     fn test_cotangent_weight_laplacian() {
         // Create a simple triangle mesh
         let mut mesh = RustMesh::new();
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(0.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
         mesh.add_face(&[v1, v3, v2]);
@@ -586,10 +588,10 @@ mod tests {
     #[test]
     fn test_estimate_mean_curvature() {
         let mut mesh = RustMesh::new();
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(0.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(Vec3::new(1.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
         mesh.add_face(&[v1, v3, v2]);
@@ -653,7 +655,7 @@ mod tests {
         // Store original edge positions
         let original_positions: Vec<_> = mesh
             .vertices()
-            .map(|vh| mesh.point(vh).unwrap_or(Vec3::ZERO))
+            .map(|vh| mesh.point(vh).unwrap_or(Point3::origin()))
             .collect();
 
         let config = AdaptiveSmootherConfig {
@@ -670,12 +672,12 @@ mod tests {
         // Cube corners (high curvature) should be well preserved
         let new_positions: Vec<_> = mesh
             .vertices()
-            .map(|vh| mesh.point(vh).unwrap_or(Vec3::ZERO))
+            .map(|vh| mesh.point(vh).unwrap_or(Point3::origin()))
             .collect();
 
         // Check that vertices haven't moved too much
         for (orig, new) in original_positions.iter().zip(new_positions.iter()) {
-            let displacement = (*new - *orig).length();
+            let displacement = (*new - *orig).norm();
             // Adaptive smooth with fixed boundary should preserve corners
             assert!(
                 displacement < 0.1,

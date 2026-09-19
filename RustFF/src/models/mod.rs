@@ -1,6 +1,6 @@
 //! Shared data structures and error types
 
-use glam::Mat4;
+use nalgebra::Matrix4;
 use thiserror::Error;
 
 /// Inference configuration
@@ -28,7 +28,7 @@ impl Default for InferenceConfig {
 #[derive(Debug, Clone)]
 pub struct PointmapResult {
     /// Camera pose in world coordinates [4x4]
-    pub pose: Mat4,
+    pub pose: Matrix4<f32>,
     /// Dense 3D pointmap [H x W x 3], in world coordinates
     pub points: Vec<[f32; 3]>,
     /// Per-pixel confidence [H x W]

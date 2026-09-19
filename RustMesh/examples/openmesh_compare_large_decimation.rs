@@ -4,7 +4,7 @@
 mod openmesh_compare_common;
 
 use openmesh_compare_common::print_header;
-use rustmesh::{loop_subdivide, write_off, Decimater, RustMesh};
+use rustmesh::{loop_subdivide, write_off, Decimater, Point3, RustMesh, Vec3};
 use std::time::Instant;
 
 /// Create a subdivided sphere for large-scale testing using Loop subdivision
@@ -24,12 +24,12 @@ fn create_octahedron() -> RustMesh {
     let mut mesh = RustMesh::new();
 
     // Add 6 vertices
-    let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0)); // top
-    let v1 = mesh.add_vertex(glam::Vec3::new(0.0, -1.0, 0.0)); // bottom
-    let v2 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0)); // right
-    let v3 = mesh.add_vertex(glam::Vec3::new(-1.0, 0.0, 0.0)); // left
-    let v4 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 1.0)); // front
-    let v5 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, -1.0)); // back
+    let v0 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0)); // top
+    let v1 = mesh.add_vertex(Point3::new(0.0, -1.0, 0.0)); // bottom
+    let v2 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0)); // right
+    let v3 = mesh.add_vertex(Point3::new(-1.0, 0.0, 0.0)); // left
+    let v4 = mesh.add_vertex(Point3::new(0.0, 0.0, 1.0)); // front
+    let v5 = mesh.add_vertex(Point3::new(0.0, 0.0, -1.0)); // back
 
     // Add 8 triangular faces (top half)
     mesh.add_face(&[v0, v4, v2]);

@@ -1,6 +1,7 @@
 use burn::module::Param;
 use burn::prelude::*;
-use glam::{Quat, Vec3};
+use nalgebra::Vector3;
+use rustscan_types::rotation_from_xyzw;
 
 use crate::core::HostSplats;
 use crate::training::engine::{host_splats_to_device, DeviceSplats};
@@ -95,14 +96,9 @@ fn rebuild_host_snapshot(snapshot: &HostSplats, plan: &TopologyMutationPlan) -> 
 }
 
 fn brush_refine_offset(rotation: [f32; 4], scale: [f32; 3], sample_scalar: f32) -> [f32; 3] {
-    let quat = Quat::from_xyzw(rotation[1], rotation[2], rotation[3], rotation[0]);
-    let quat = if quat.length_squared() > 0.0 {
-        quat.normalize()
-    } else {
-        Quat::IDENTITY
-    };
-    let rotated = quat * (Vec3::from_array(scale) * sample_scalar);
-    rotated.to_array()
+    let quat = rotation_from_xyzw([rotation[1], rotation[2], rotation[3], rotation[0]]);
+    let rotated = quat * (Vector3::new(scale[0], scale[1], scale[2]) * sample_scalar);
+    [rotated.x, rotated.y, rotated.z]
 }
 
 fn brush_refine_scale(scale: [f32; 3]) -> [f32; 3] {

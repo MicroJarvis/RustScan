@@ -1,3 +1,4 @@
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use crate::types::{
     colmap_camera_model_id, colmap_camera_model_name, colmap_camera_model_num_params, CameraModel,
     DataId, Frame, Point3D, Reconstruction, Rig, RigSensor, Rigid3, SensorId, SensorType,
@@ -641,7 +642,7 @@ fn keypoint_from_colmap_point2d(point: &ColmapPoint2D) -> rustslam::KeyPoint {
 }
 
 fn se3_from_colmap_pose(qvec: [f64; 4], tvec: [f64; 3]) -> SE3 {
-    let rotation = glam::Quat::from_xyzw(
+    let rotation = crate::geometry::quat_from_xyzw(
         qvec[1] as f32,
         qvec[2] as f32,
         qvec[3] as f32,
@@ -650,7 +651,7 @@ fn se3_from_colmap_pose(qvec: [f64; 4], tvec: [f64; 3]) -> SE3 {
     .normalize();
     SE3::from_quat_translation(
         rotation,
-        glam::Vec3::new(tvec[0] as f32, tvec[1] as f32, tvec[2] as f32),
+        nalgebra::Vector3::new(tvec[0] as f32, tvec[1] as f32, tvec[2] as f32),
     )
 }
 

@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{Camera, SE3};
@@ -577,7 +576,7 @@ impl TumRgbdDataset {
                 ))
             })?;
 
-            // Parse quaternion (xyzw order in TUM, but we use glam's xyzw)
+            // Parse quaternion (xyzw order in TUM)
             let qx: f32 = parts[4].parse().map_err(|e| {
                 DatasetError::Format(format!(
                     "Line {}: invalid qx '{}': {}",
@@ -612,8 +611,8 @@ impl TumRgbdDataset {
             })?;
 
             // Create SE3 from translation and quaternion
-            let translation = Vec3::new(tx, ty, tz);
-            let rotation = Quat::from_xyzw(qx, qy, qz, qw);
+            let translation = nalgebra::Vector3::new(tx, ty, tz);
+            let rotation = rustscan_types::rotation_from_xyzw([qx, qy, qz, qw]);
             let pose = SE3::from_quat_translation(rotation, translation);
 
             poses.push((timestamp, pose));
@@ -1067,8 +1066,8 @@ impl EurocDataset {
                     poses.push((
                         timestamp,
                         SE3::from_quat_translation(
-                            Quat::from_xyzw(qx, qy, qz, qw),
-                            Vec3::new(tx, ty, tz),
+                            rustscan_types::rotation_from_xyzw([qx, qy, qz, qw]),
+                            nalgebra::Vector3::new(tx, ty, tz),
                         ),
                     ));
                 }

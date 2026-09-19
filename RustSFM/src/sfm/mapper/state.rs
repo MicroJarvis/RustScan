@@ -181,11 +181,75 @@ impl RegistrationStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InitialPairRejectionReason {
+    MissingPair,
+    CameraValidity,
+    /// Pose reestimation returned no geometry. Cheirality is not a separate
+    /// estimator result, so it is recorded here rather than as a new gate.
+    ReestimationFailed,
+    Inliers,
+    TriangulationAngle,
+    Triangulated,
+    ForwardMotion,
+    SameFrame,
+    RigGate,
+}
+
+impl InitialPairRejectionReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingPair => "missing_pair",
+            Self::CameraValidity => "camera_validity",
+            Self::ReestimationFailed => "reestimation_failed",
+            Self::Inliers => "inliers",
+            Self::TriangulationAngle => "triangulation_angle",
+            Self::Triangulated => "triangulated",
+            Self::ForwardMotion => "forward_motion",
+            Self::SameFrame => "same_frame",
+            Self::RigGate => "rig_gate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InitialPairRejection {
+    pub(super) left: usize,
+    pub(super) right: usize,
+    pub(super) reason: InitialPairRejectionReason,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct InitialPairSelectionState {
     pub(super) init_num_reg_trials: Vec<usize>,
     pub(super) num_registrations: Vec<usize>,
     pub(super) init_image_pairs: HashSet<ImagePairId>,
+    pub(super) rejections: Vec<InitialPairRejection>,
+    /// Candidates actually probed, not merely generated.
+    pub(super) probes: usize,
+    /// Inclusive-exclusive ranges of each probe batch. Sequential batches are length 1.
+    pub(super) probe_batch_bounds: Vec<(usize, usize)>,
+    /// Full mapper candidate order from focal/correspondence/image-index sort.
+    /// Independent of database enumeration order. Generating this list does not probe geometry.
+    pub(super) candidates: Vec<InitialPairCandidateRecord>,
+    /// Consumed candidate prefix only. Later batch members that were not committed stay out.
+    pub(super) decisions: Vec<InitialPairCandidateDecision>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InitialPairCandidateRecord {
+    pub(super) left: usize,
+    pub(super) right: usize,
+    pub(super) pair_id: ImagePairId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InitialPairCandidateDecision {
+    pub(super) left: usize,
+    pub(super) right: usize,
+    pub(super) pair_id: ImagePairId,
+    pub(super) accepted: bool,
+    pub(super) reason: Option<InitialPairRejectionReason>,
 }
 
 impl InitialPairSelectionState {
@@ -194,6 +258,11 @@ impl InitialPairSelectionState {
             init_num_reg_trials: vec![0; reconstruction.poses.len()],
             num_registrations: vec![0; reconstruction.poses.len()],
             init_image_pairs: HashSet::new(),
+            rejections: Vec::new(),
+            probes: 0,
+            probe_batch_bounds: Vec::new(),
+            candidates: Vec::new(),
+            decisions: Vec::new(),
         }
     }
 
@@ -275,6 +344,29 @@ impl fmt::Display for InitialPairFailure {
 
 impl std::error::Error for InitialPairFailure {}
 
+/// Failure payload that survives `Err` even when the attempt-local debug log is dropped.
+#[derive(Debug)]
+pub struct InitialPairAttemptError {
+    pub failure: InitialPairFailure,
+    pub diagnostics: Vec<String>,
+}
+
+impl fmt::Display for InitialPairAttemptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.failure)?;
+        for line in &self.diagnostics {
+            write!(formatter, "\n{line}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for InitialPairAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
+}
+
 impl IncrementalMapperSession {
     pub(super) fn reset_initialization_stats(&mut self) {
         self.init_num_reg_trials.clear();
@@ -340,6 +432,11 @@ impl IncrementalMapperSession {
                 })
                 .collect(),
             init_image_pairs: self.init_image_pairs.clone(),
+            rejections: Vec::new(),
+            probes: 0,
+            probe_batch_bounds: Vec::new(),
+            candidates: Vec::new(),
+            decisions: Vec::new(),
         }
     }
 

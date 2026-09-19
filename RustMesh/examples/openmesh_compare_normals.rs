@@ -3,7 +3,7 @@ mod openmesh_compare_common;
 use openmesh_compare_common::{
     measure, mesh_digest, openmesh_root, print_duration_compare, print_header, print_mesh_digest,
 };
-use rustmesh::{generate_sphere, write_off, RustMesh, VertexHandle};
+use rustmesh::{generate_sphere, write_off, RustMesh, Vec3, VertexHandle};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -250,7 +250,7 @@ fn vertex_normal_checksum(mesh: &RustMesh) -> f64 {
         .sum()
 }
 
-fn normal_l1(normal: glam::Vec3) -> f64 {
+fn normal_l1(normal: Vec3) -> f64 {
     (normal.x.abs() + normal.y.abs() + normal.z.abs()) as f64
 }
 
@@ -275,7 +275,7 @@ fn update_vertex_normals_area_weighted(mesh: &mut RustMesh) {
     if !mesh.has_vertex_normals() {
         mesh.request_vertex_normals();
     }
-    let mut normal_sums = vec![glam::Vec3::ZERO; mesh.n_vertices()];
+    let mut normal_sums = vec![Vec3::zeros(); mesh.n_vertices()];
     for fh in mesh.faces() {
         let verts = mesh.face_vertices_vec(fh);
         if verts.len() < 3 {
@@ -289,32 +289,29 @@ fn update_vertex_normals_area_weighted(mesh: &mut RustMesh) {
         }
     }
     for (idx, normal) in normal_sums.into_iter().enumerate() {
-        if normal.length_squared() > 0.0 {
+        if normal.norm_squared() > 0.0 {
             mesh.set_normal(VertexHandle::from_usize(idx), normal.normalize());
         }
     }
 }
 
-fn compute_face_normal(mesh: &RustMesh, fh: rustmesh::FaceHandle) -> Option<glam::Vec3> {
+fn compute_face_normal(mesh: &RustMesh, fh: rustmesh::FaceHandle) -> Option<Vec3> {
     let verts = mesh.face_vertices_vec(fh);
     compute_face_normal_and_area(mesh, &verts).map(|(normal, _)| normal)
 }
 
-fn compute_face_normal_and_area(
-    mesh: &RustMesh,
-    verts: &[VertexHandle],
-) -> Option<(glam::Vec3, f32)> {
+fn compute_face_normal_and_area(mesh: &RustMesh, verts: &[VertexHandle]) -> Option<(Vec3, f32)> {
     let p0 = mesh.point(*verts.first()?)?;
     let mut area_sum = 0.0f32;
-    let mut normal_sum = glam::Vec3::ZERO;
+    let mut normal_sum = Vec3::zeros();
     for tri in 1..verts.len().saturating_sub(1) {
         let p1 = mesh.point(verts[tri])?;
         let p2 = mesh.point(verts[tri + 1])?;
-        let area_normal = (p1 - p0).cross(p2 - p0);
-        area_sum += area_normal.length() * 0.5;
+        let area_normal = (p1 - p0).cross(&(p2 - p0));
+        area_sum += area_normal.norm() * 0.5;
         normal_sum += area_normal;
     }
-    if normal_sum.length_squared() > 0.0 {
+    if normal_sum.norm_squared() > 0.0 {
         Some((normal_sum.normalize(), area_sum))
     } else {
         None

@@ -5,15 +5,15 @@ use openmesh_compare_common::{
     parse_openmesh_tri_benchmark, print_duration_compare, print_header, print_mesh_digest,
     reference_root, run_capture,
 };
-use rustmesh::{triangle_area, RustMesh, Vec3};
+use rustmesh::{triangle_area, Point3, RustMesh, Vec3};
 use std::time::Duration;
 
 fn build_tetrahedron() -> RustMesh {
     let mut mesh = RustMesh::new();
-    let v0 = mesh.add_vertex(Vec3::new(-1.0, -1.0, -1.0));
-    let v1 = mesh.add_vertex(Vec3::new(1.0, -1.0, -1.0));
-    let v2 = mesh.add_vertex(Vec3::new(1.0, 1.0, -1.0));
-    let v3 = mesh.add_vertex(Vec3::new(-1.0, 1.0, -1.0));
+    let v0 = mesh.add_vertex(Point3::new(-1.0, -1.0, -1.0));
+    let v1 = mesh.add_vertex(Point3::new(1.0, -1.0, -1.0));
+    let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, -1.0));
+    let v3 = mesh.add_vertex(Point3::new(-1.0, 1.0, -1.0));
 
     mesh.add_face(&[v0, v1, v2]).unwrap();
     mesh.add_face(&[v0, v2, v3]).unwrap();
@@ -39,9 +39,9 @@ fn measure_triangle_area(mesh: &RustMesh) -> (usize, f32) {
             let Some(v1) = fv.next() else { continue };
             let Some(v2) = fv.next() else { continue };
 
-            let p0 = mesh.point(v0).unwrap_or(Vec3::ZERO);
-            let p1 = mesh.point(v1).unwrap_or(Vec3::ZERO);
-            let p2 = mesh.point(v2).unwrap_or(Vec3::ZERO);
+            let p0 = mesh.point(v0).unwrap_or(Point3::origin());
+            let p1 = mesh.point(v1).unwrap_or(Point3::origin());
+            let p2 = mesh.point(v2).unwrap_or(Point3::origin());
             accumulated += triangle_area(p0, p1, p2);
             iterations += 1;
         }
@@ -135,9 +135,9 @@ fn main() {
         for _ in 0..1000 {
             let mut mesh = RustMesh::new();
             for j in 0..1000 {
-                let v0 = mesh.add_vertex(Vec3::new(j as f32, 0.0, 0.0));
-                let v1 = mesh.add_vertex(Vec3::new(j as f32 + 1.0, 0.0, 0.0));
-                let v2 = mesh.add_vertex(Vec3::new(j as f32 + 1.0, 1.0, 0.0));
+                let v0 = mesh.add_vertex(Point3::new(j as f32, 0.0, 0.0));
+                let v1 = mesh.add_vertex(Point3::new(j as f32 + 1.0, 0.0, 0.0));
+                let v2 = mesh.add_vertex(Point3::new(j as f32 + 1.0, 1.0, 0.0));
                 if mesh.add_face(&[v0, v1, v2]).is_some() {
                     total += 1;
                 }

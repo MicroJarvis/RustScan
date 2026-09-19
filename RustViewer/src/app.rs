@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::renderer::camera::{normalize_or_zero, vec3_is_finite, vec4_xyz, ArcballCamera, Vec3};
 use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::egui_wgpu;
 use eframe::wgpu;
-use glam::{Vec3, Vec4};
+use nalgebra::Vector4;
 use rustgs::{ColmapConfig, HostSplats, SharedWgpuContext, TrainingConfig};
 
 use crate::loader::checkpoint::LoadError;
@@ -27,7 +28,6 @@ use crate::project::{
     ProjectCreateRequest, ProjectErrorRecord, ProjectSessionSummary, ProjectStage, ProjectStore,
     SourceSpec, SuggestedAction,
 };
-use crate::renderer::camera::ArcballCamera;
 use crate::renderer::scene::{GaussianSplat, Scene};
 use crate::renderer::ViewerCallback;
 use crate::robot::{GroundPlane, NavigationMode, RobotController, RobotInput};
@@ -1782,11 +1782,12 @@ fn world_to_screen(camera: &ArcballCamera, viewport_rect: Rect, point: Vec3) -> 
     if size.x <= 1.0 || size.y <= 1.0 {
         return None;
     }
-    let clip = camera.view_proj(size.x / size.y.max(1.0)) * point.extend(1.0);
+    let clip =
+        camera.view_proj(size.x / size.y.max(1.0)) * Vector4::new(point.x, point.y, point.z, 1.0);
     if clip.w <= 1e-8 {
         return None;
     }
-    let ndc = clip.truncate() / clip.w;
+    let ndc = vec4_xyz(clip) / clip.w;
     if ndc.z < -1.0 || ndc.z > 1.0 {
         return None;
     }
@@ -1825,7 +1826,7 @@ fn focus_from_camera_depth(camera: &ArcballCamera, ray_dir: Vec3, depth: f32) ->
         return None;
     }
     let forward = -camera.backward();
-    let denom = ray_dir.dot(forward);
+    let denom = ray_dir.dot(&forward);
     if !denom.is_finite() || denom <= 1e-6 {
         return None;
     }
@@ -1846,17 +1847,17 @@ fn viewport_ray(
     let x = ((pointer_pos.x - viewport_rect.left()) / size.x) * 2.0 - 1.0;
     let y = 1.0 - ((pointer_pos.y - viewport_rect.top()) / size.y) * 2.0;
     let aspect = size.x / size.y.max(1.0);
-    let inv_view_proj = camera.view_proj(aspect).inverse();
-    let near = inv_view_proj * Vec4::new(x, y, -1.0, 1.0);
-    let far = inv_view_proj * Vec4::new(x, y, 1.0, 1.0);
+    let inv_view_proj = camera.view_proj(aspect).try_inverse()?;
+    let near = inv_view_proj * Vector4::new(x, y, -1.0, 1.0);
+    let far = inv_view_proj * Vector4::new(x, y, 1.0, 1.0);
     if near.w.abs() <= 1e-8 || far.w.abs() <= 1e-8 {
         return None;
     }
 
-    let near = near.truncate() / near.w;
-    let far = far.truncate() / far.w;
-    let dir = (far - near).normalize_or_zero();
-    (dir.length_squared() > 0.0).then_some((near, dir))
+    let near = vec4_xyz(near) / near.w;
+    let far = vec4_xyz(far) / far.w;
+    let dir = normalize_or_zero(far - near);
+    (dir.norm_squared() > 0.0).then_some((near, dir))
 }
 
 fn pick_mesh_focus(scene: &Scene, ray: (Vec3, Vec3)) -> Option<Vec3> {
@@ -1880,9 +1881,9 @@ fn pick_mesh_focus(scene: &Scene, ray: (Vec3, Vec3)) -> Option<Vec3> {
         if let Some(t) = ray_triangle_t(
             origin,
             dir,
-            Vec3::from_array(a.position),
-            Vec3::from_array(b.position),
-            Vec3::from_array(c.position),
+            Vec3::from(a.position),
+            Vec3::from(b.position),
+            Vec3::from(c.position),
         ) {
             if t < best_t {
                 best_t = t;
@@ -1897,26 +1898,26 @@ fn pick_mesh_focus(scene: &Scene, ray: (Vec3, Vec3)) -> Option<Vec3> {
 fn ray_triangle_t(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
     let edge1 = b - a;
     let edge2 = c - a;
-    let h = dir.cross(edge2);
-    let det = edge1.dot(h);
+    let h = dir.cross(&edge2);
+    let det = edge1.dot(&h);
     if det.abs() < 1e-8 {
         return None;
     }
 
     let inv_det = 1.0 / det;
     let s = origin - a;
-    let u = inv_det * s.dot(h);
+    let u = inv_det * s.dot(&h);
     if !(0.0..=1.0).contains(&u) {
         return None;
     }
 
-    let q = s.cross(edge1);
-    let v = inv_det * dir.dot(q);
+    let q = s.cross(&edge1);
+    let v = inv_det * dir.dot(&q);
     if v < 0.0 || u + v > 1.0 {
         return None;
     }
 
-    let t = inv_det * edge2.dot(q);
+    let t = inv_det * edge2.dot(&q);
     (t > 1e-5).then_some(t)
 }
 
@@ -2442,7 +2443,7 @@ mod tests {
         let (origin, dir) = viewport_ray(&camera, rect, rect.center()).unwrap();
         let to_target = (camera.target - origin).normalize();
 
-        assert!(dir.dot(to_target) > 0.999);
+        assert!(dir.dot(&to_target) > 0.999);
     }
 
     #[test]
@@ -2453,7 +2454,7 @@ mod tests {
 
         let picked = focus_from_camera_depth(&camera, dir, camera.distance).unwrap();
 
-        assert!((picked - Vec3::ZERO).length() < 1e-4);
+        assert!((picked - Vec3::zeros()).norm() < 1e-4);
     }
 
     #[test]
@@ -2478,9 +2479,9 @@ mod tests {
         ];
         scene.mesh_indices = vec![0, 1, 2];
 
-        let hit = pick_mesh_focus(&scene, (Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z)).unwrap();
+        let hit = pick_mesh_focus(&scene, (Vec3::new(0.0, 0.0, 5.0), -Vec3::z())).unwrap();
 
-        assert!((hit - Vec3::ZERO).length() < 1e-4);
+        assert!((hit - Vec3::zeros()).norm() < 1e-4);
     }
 
     #[test]

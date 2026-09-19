@@ -5,7 +5,10 @@
 //! - "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
 //! - RTG-SLAM: Real-time 3D Reconstruction
 
-use crate::fusion::gaussian::{Gaussian3D, GaussianCamera, GaussianMap};
+use crate::fusion::gaussian::{
+    matrix3_from_stored_pose_array, Gaussian3D, GaussianCamera, GaussianMap,
+};
+use nalgebra::Vector3;
 
 /// Output of rendering
 #[derive(Debug, Clone)]
@@ -66,30 +69,9 @@ impl GaussianRenderer {
                     &camera.translation,
                 ) {
                     // Compute camera-space depth from the rotation and translation
-                    use glam::{Mat3, Vec3};
-                    let r = Mat3::from_cols(
-                        Vec3::new(
-                            camera.rotation[0][0],
-                            camera.rotation[0][1],
-                            camera.rotation[0][2],
-                        ),
-                        Vec3::new(
-                            camera.rotation[1][0],
-                            camera.rotation[1][1],
-                            camera.rotation[1][2],
-                        ),
-                        Vec3::new(
-                            camera.rotation[2][0],
-                            camera.rotation[2][1],
-                            camera.rotation[2][2],
-                        ),
-                    );
-                    let t = Vec3::new(
-                        camera.translation[0],
-                        camera.translation[1],
-                        camera.translation[2],
-                    );
-                    let cam_pos = r.transpose() * (g.position - t);
+                    let r = matrix3_from_stored_pose_array(&camera.rotation);
+                    let t = Vector3::from(camera.translation);
+                    let cam_pos = r.transpose() * (g.position.coords - t);
                     let cam_depth = cam_pos.z;
                     if cam_depth > 0.0 && cam_depth < 100.0 {
                         Some((g, cam_depth, ux, uy, radius))
@@ -171,31 +153,10 @@ impl GaussianRenderer {
     ///
     /// Returns a depth map in camera-space (z-distance from camera center).
     pub fn render_depth(&self, map: &GaussianMap, camera: &GaussianCamera) -> Vec<f32> {
-        use glam::{Mat3, Vec3};
         let mut depth = vec![0.0f32; self.width * self.height];
 
-        let r = Mat3::from_cols(
-            Vec3::new(
-                camera.rotation[0][0],
-                camera.rotation[0][1],
-                camera.rotation[0][2],
-            ),
-            Vec3::new(
-                camera.rotation[1][0],
-                camera.rotation[1][1],
-                camera.rotation[1][2],
-            ),
-            Vec3::new(
-                camera.rotation[2][0],
-                camera.rotation[2][1],
-                camera.rotation[2][2],
-            ),
-        );
-        let t = Vec3::new(
-            camera.translation[0],
-            camera.translation[1],
-            camera.translation[2],
-        );
+        let r = matrix3_from_stored_pose_array(&camera.rotation);
+        let t = Vector3::from(camera.translation);
 
         // Project all Gaussians and compute camera-space depth
         let mut gaussians_projected: Vec<(&Gaussian3D, f32, f32, f32, f32)> = map
@@ -210,7 +171,7 @@ impl GaussianRenderer {
                     &camera.rotation,
                     &camera.translation,
                 ) {
-                    let cam_pos = r.transpose() * (g.position - t);
+                    let cam_pos = r.transpose() * (g.position.coords - t);
                     let cam_depth = cam_pos.z;
                     if cam_depth > 0.001 && cam_depth < 100.0 {
                         Some((g, cam_depth, ux, uy, radius))
@@ -242,32 +203,11 @@ impl GaussianRenderer {
         map: &GaussianMap,
         camera: &GaussianCamera,
     ) -> (Vec<f32>, Vec<[u8; 3]>) {
-        use glam::{Mat3, Vec3};
         let mut depth = vec![0.0f32; self.width * self.height];
         let mut color = vec![[0u8; 3]; self.width * self.height];
 
-        let r = Mat3::from_cols(
-            Vec3::new(
-                camera.rotation[0][0],
-                camera.rotation[0][1],
-                camera.rotation[0][2],
-            ),
-            Vec3::new(
-                camera.rotation[1][0],
-                camera.rotation[1][1],
-                camera.rotation[1][2],
-            ),
-            Vec3::new(
-                camera.rotation[2][0],
-                camera.rotation[2][1],
-                camera.rotation[2][2],
-            ),
-        );
-        let t = Vec3::new(
-            camera.translation[0],
-            camera.translation[1],
-            camera.translation[2],
-        );
+        let r = matrix3_from_stored_pose_array(&camera.rotation);
+        let t = Vector3::from(camera.translation);
 
         let mut gaussians_projected: Vec<(&Gaussian3D, f32, f32, f32, f32)> = map
             .gaussians()
@@ -281,7 +221,7 @@ impl GaussianRenderer {
                     &camera.rotation,
                     &camera.translation,
                 ) {
-                    let cam_pos = r.transpose() * (g.position - t);
+                    let cam_pos = r.transpose() * (g.position.coords - t);
                     let cam_depth = cam_pos.z;
                     if cam_depth > 0.001 && cam_depth < 100.0 {
                         Some((g, cam_depth, ux, uy, radius))

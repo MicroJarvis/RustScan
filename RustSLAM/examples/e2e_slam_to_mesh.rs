@@ -6,7 +6,7 @@
 //! 3. Gaussian mapping for 3D reconstruction
 //! 4. Mesh extraction and export
 
-use glam::Vec3;
+use nalgebra::Point3;
 use std::fs;
 use std::path::PathBuf;
 
@@ -175,8 +175,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tsdf_config = TsdfConfig {
         voxel_size,
         sdf_trunc: voxel_size * 4.0,
-        min_bound: Vec3::new(-1.0, -1.0, -1.0),
-        max_bound: Vec3::new(1.0, 1.0, 1.0),
+        min_bound: Point3::new(-1.0, -1.0, -1.0),
+        max_bound: Point3::new(1.0, 1.0, 1.0),
         max_weight: 100.0,
         integration_weight: 1.0,
     };
@@ -194,28 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, pose) in keyframe_poses.iter().enumerate() {
         if let Ok(frame) = dataset.get_frame(keyframe_indices[i]) {
             if let Some(depth) = &frame.depth {
-                // Convert SE3 to Mat4 for TSDF integration
-                let pose_mat = pose.to_matrix();
-                // Flatten the 4x4 matrix to [f32; 16]
-                let pose_flat: [f32; 16] = [
-                    pose_mat[0][0],
-                    pose_mat[0][1],
-                    pose_mat[0][2],
-                    pose_mat[0][3],
-                    pose_mat[1][0],
-                    pose_mat[1][1],
-                    pose_mat[1][2],
-                    pose_mat[1][3],
-                    pose_mat[2][0],
-                    pose_mat[2][1],
-                    pose_mat[2][2],
-                    pose_mat[2][3],
-                    pose_mat[3][0],
-                    pose_mat[3][1],
-                    pose_mat[3][2],
-                    pose_mat[3][3],
-                ];
-                let pose_mat4 = glam::Mat4::from_cols_array(&pose_flat);
+                let pose_mat4 = pose.to_homogeneous_matrix();
 
                 let color: Vec<[u8; 3]> =
                     frame.color.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();

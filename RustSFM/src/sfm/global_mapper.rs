@@ -882,8 +882,9 @@ fn build_reconstruction_scaffold(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{camera_center, pose_rotation};
-    use glam::{Quat, Vec3};
+    use crate::geometry::{camera_center, pose_rotation, UnitQuatNormalize, Vec3GlamExt};
+    type Quat = nalgebra::UnitQuaternion<f32>;
+    type Vec3 = nalgebra::Vector3<f32>;
     use rustslam::ColmapMt19937;
     use rustslam::Match;
 
@@ -892,13 +893,15 @@ mod tests {
     }
 
     fn random_quat(rng: &mut ColmapMt19937) -> Quat {
-        let axis = Vec3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5).normalize_or_zero();
-        let axis = if axis.length_squared() < 1.0e-6 {
-            Vec3::X
+        let axis = Vec3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5)
+            .try_normalize(f32::EPSILON)
+            .unwrap_or_else(nalgebra::Vector3::zeros);
+        let axis = if axis.norm_squared() < 1.0e-6 {
+            Vec3::x()
         } else {
             axis
         };
-        Quat::from_axis_angle(axis, unit(rng) * std::f32::consts::PI)
+        crate::geometry::quat_from_axis_angle(axis, unit(rng) * std::f32::consts::PI)
     }
 
     fn random_center(rng: &mut ColmapMt19937) -> Vec3 {
@@ -951,8 +954,8 @@ mod tests {
         let mut rng = ColmapMt19937::new(2024);
         let n = 9;
         // Gauge: view 0 at identity rotation and origin to match the solver gauge.
-        let mut rotations = vec![Quat::IDENTITY];
-        let mut centers = vec![Vec3::ZERO];
+        let mut rotations = vec![Quat::identity()];
+        let mut centers = vec![Vec3::zeros()];
         for _ in 1..n {
             rotations.push(random_quat(&mut rng));
             centers.push(random_center(&mut rng));
@@ -979,8 +982,8 @@ mod tests {
         let mut num = 0.0f32;
         let mut den = 0.0f32;
         for (e, g) in est_centers.iter().zip(centers.iter()) {
-            num += e.dot(*g);
-            den += e.dot(*e);
+            num += e.dot(&*g);
+            den += e.dot(&*e);
         }
         let scale = if den < 1.0e-12 { 1.0 } else { num / den };
 
@@ -997,8 +1000,8 @@ mod tests {
 
     #[test]
     fn leaves_disconnected_views_unregistered() {
-        let rotations = vec![Quat::IDENTITY; 4];
-        let centers = vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z];
+        let rotations = vec![Quat::identity(); 4];
+        let centers = vec![Vec3::zeros(), Vec3::x(), Vec3::y(), Vec3::z()];
         // Only views 0,1 are connected.
         let pairs = vec![synth_pair(0, 1, &rotations, &centers, 50)];
         let result = run_global_mapper(4, &pairs, &GlobalMapperOptions::default()).unwrap();
@@ -1074,10 +1077,10 @@ mod tests {
         let camera = test_camera();
         let point = [0.0, 0.0, 5.0];
         let n = 6;
-        let mut rotations = vec![Quat::IDENTITY];
-        let mut centers = vec![Vec3::ZERO];
+        let mut rotations = vec![Quat::identity()];
+        let mut centers = vec![Vec3::zeros()];
         for view in 1..n {
-            rotations.push(Quat::IDENTITY);
+            rotations.push(Quat::identity());
             centers.push(Vec3::new(view as f32 * 0.25, 0.0, 0.0));
         }
 
@@ -1157,7 +1160,7 @@ mod tests {
                     distance: 0.0,
                 },
             ],
-            relative_pose: SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(1.0, 0.0, 0.0)),
+            relative_pose: SE3::from_quat_translation(Quat::identity(), Vec3::new(1.0, 0.0, 0.0)),
             inliers: 2,
             triangulated: 2,
             mean_reprojection_error_px: 0.5,
@@ -1172,7 +1175,7 @@ mod tests {
             &[
                 Some(SE3::identity()),
                 Some(SE3::from_quat_translation(
-                    Quat::IDENTITY,
+                    Quat::identity(),
                     Vec3::new(1.0, 0.0, 0.0),
                 )),
             ],
@@ -1213,7 +1216,7 @@ mod tests {
         let mut frames = (0..3)
             .map(|view| {
                 let pose =
-                    SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(view as f32, 0.0, 0.0));
+                    SE3::from_quat_translation(Quat::identity(), Vec3::new(view as f32, 0.0, 0.0));
                 synth_frame(view, vec![project_keypoint(camera, pose, point)])
             })
             .collect::<Vec<_>>();
@@ -1224,16 +1227,16 @@ mod tests {
             synth_pair_with_matches(
                 0,
                 1,
-                &[Quat::IDENTITY; 3],
-                &[Vec3::ZERO, Vec3::X, Vec3::splat(2.0)],
+                &[Quat::identity(); 3],
+                &[Vec3::zeros(), Vec3::x(), Vec3::repeat(2.0)],
                 0,
                 2,
             ),
             synth_pair_with_matches(
                 1,
                 2,
-                &[Quat::IDENTITY; 3],
-                &[Vec3::ZERO, Vec3::X, Vec3::splat(2.0)],
+                &[Quat::identity(); 3],
+                &[Vec3::zeros(), Vec3::x(), Vec3::repeat(2.0)],
                 0,
                 2,
             ),
@@ -1244,8 +1247,11 @@ mod tests {
             camera,
             &[
                 Some(SE3::identity()),
-                Some(SE3::from_quat_translation(Quat::IDENTITY, Vec3::X)),
-                Some(SE3::from_quat_translation(Quat::IDENTITY, Vec3::splat(2.0))),
+                Some(SE3::from_quat_translation(Quat::identity(), Vec3::x())),
+                Some(SE3::from_quat_translation(
+                    Quat::identity(),
+                    Vec3::repeat(2.0),
+                )),
             ],
         );
         assert!(reconstruction.points.is_empty());
@@ -1274,8 +1280,8 @@ mod tests {
         let camera = test_camera();
         let point = [0.0, 0.0, 5.0];
         let n = 6;
-        let rotations = vec![Quat::IDENTITY; n];
-        let mut centers = vec![Vec3::ZERO; n];
+        let rotations = vec![Quat::identity(); n];
+        let mut centers = vec![Vec3::zeros(); n];
         for view in 0..n {
             centers[view] = Vec3::new((view % 3) as f32 * 0.25, (view / 3) as f32, 0.0);
         }

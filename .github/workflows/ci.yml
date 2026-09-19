@@ -30,6 +30,8 @@ jobs:
             libeigen3-dev
       - name: Format
         run: cargo fmt --check
+      - name: Forbid CPU glam types
+        run: python3 scripts/check_cpu_glam.py
       - name: Workspace check
         run: cargo check --workspace --all-targets
       - name: rustscan-types tests
@@ -70,10 +72,13 @@ jobs:
             mesa-vulkan-drivers
       - name: RustSFM format
         run: cargo fmt --package rustsfm --check
-      - name: RustSFM sparse parity tests
-        run: cargo test -p rustsfm --lib -- --test-threads=1
-      - name: RustSFM minimal feature compile check
-        run: cargo check -p rustsfm --lib --no-default-features
+      - name: RustSFM no-default compile gate
+        run: cargo check -p rustsfm --no-default-features --all-targets
+      - name: RustSFM library tests
+        run: >-
+          cargo test -p rustsfm --lib
+          --features gpu-wgpu,vlfeat-sift
+          -- --test-threads=1
       - name: RustSFM GPU integration tests
         env:
           WGPU_BACKEND: vulkan
@@ -111,9 +116,14 @@ jobs:
       - name: Provision flowers2_colmap fixture
         run: ./scripts/provision_flowers2_colmap_fixture.sh
       - name: RustSFM ignored flowers2 parity suite
-        run: cargo test -p rustsfm --lib -- --ignored --test-threads=1
+        run: >-
+          cargo test -p rustsfm --lib
+          --features gpu-wgpu,vlfeat-sift
+          -- --ignored --test-threads=1
 
   rustsfm-windows-filesystem:
+    # No-default is a compile/codec gate. This job runs only filesystem tests
+    # that do not require SIFT matching or a wgpu adapter.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

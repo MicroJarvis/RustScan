@@ -18,13 +18,16 @@ use crate::database::{
     COLMAP_TWO_VIEW_PLANAR_OR_PANORAMIC, COLMAP_TWO_VIEW_UNCALIBRATED, COLMAP_TWO_VIEW_UNDEFINED,
     COLMAP_TWO_VIEW_WATERMARK,
 };
-use crate::geometry::{estimate_pair_geometry_with_options, pose_rotation, PairEstimationOptions};
+use crate::geometry::{
+    estimate_pair_geometry_with_options, pose_rotation, PairEstimationOptions, UnitQuatNormalize,
+    Vec3GlamExt,
+};
 use crate::rotation_averaging::{
     estimate_global_rotations, relative_rotations_from_pairs, RotationAveragingOptions,
 };
 use crate::triangulation::triangulate_mid_point;
 use crate::types::{CameraModel, ImageFrame, PairGeometry};
-use glam::Quat;
+type Quat = nalgebra::UnitQuaternion<f32>;
 use nalgebra::{Matrix3, Vector3};
 use rustslam::{Match, SE3};
 
@@ -603,7 +606,8 @@ fn triangulation_angle_deg(
 mod tests {
     use super::*;
     use crate::database::COLMAP_TWO_VIEW_CALIBRATED;
-    use glam::{Quat, Vec3};
+    type Quat = nalgebra::UnitQuaternion<f32>;
+    type Vec3 = nalgebra::Vector3<f32>;
 
     fn test_camera() -> CameraModel {
         CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0)
@@ -679,7 +683,7 @@ mod tests {
             1,
             left_kp,
             right_kp,
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.01, 0.0, 0.0)),
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.01, 0.0, 0.0)),
             [0.0, -0.01, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
         let frames = vec![
@@ -692,10 +696,10 @@ mod tests {
 
     #[test]
     fn filter_rotation_inconsistent_pairs_removes_outlier_edge() {
-        let pose01 = SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(1.0, 0.0, 0.0));
-        let pose02 = SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(2.0, 0.0, 0.0));
+        let pose01 = SE3::from_quat_translation(Quat::identity(), Vec3::new(1.0, 0.0, 0.0));
+        let pose02 = SE3::from_quat_translation(Quat::identity(), Vec3::new(2.0, 0.0, 0.0));
         let bad_pose12 = SE3::from_quat_translation(
-            Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2),
+            crate::geometry::quat_from_axis_angle(Vec3::y(), std::f32::consts::FRAC_PI_2),
             Vec3::new(1.0, 0.0, 0.0),
         );
         let mk = |left: usize, right: usize, pose: SE3| PairGeometry {

@@ -15,7 +15,7 @@ use crate::attrib_soa_kernel::{
 };
 use crate::handles::{EdgeHandle, FaceHandle, HalfedgeHandle, VertexHandle};
 use crate::items::{Edge, Face, Halfedge};
-use glam::{Vec2, Vec3, Vec4};
+use crate::{Point3, Vec2, Vec3, Vec4};
 
 #[derive(Debug, Clone, Copy)]
 struct EdgeLookupEntry {
@@ -84,13 +84,13 @@ impl SoAKernel {
     fn resize_halfedge_attrs(&mut self) {
         let size = self.halfedges.len();
         if let Some(ref mut normals) = self.halfedge_normals {
-            normals.resize(size, Vec3::ZERO);
+            normals.resize(size, Vec3::zeros());
         }
         if let Some(ref mut colors) = self.halfedge_colors {
             colors.resize(size, Vec4::new(0.5, 0.5, 0.5, 1.0));
         }
         if let Some(ref mut texcoords) = self.halfedge_texcoords {
-            texcoords.resize(size, Vec2::ZERO);
+            texcoords.resize(size, Vec2::zeros());
         }
     }
 
@@ -104,7 +104,7 @@ impl SoAKernel {
     fn resize_face_attrs(&mut self) {
         let size = self.faces.len();
         if let Some(ref mut normals) = self.face_normals {
-            normals.resize(size, Vec3::ZERO);
+            normals.resize(size, Vec3::zeros());
         }
         if let Some(ref mut colors) = self.face_colors {
             colors.resize(size, Vec4::new(0.8, 0.8, 0.8, 1.0));
@@ -181,7 +181,7 @@ impl SoAKernel {
 
     /// Add a new vertex and return its handle
     #[inline]
-    pub fn add_vertex(&mut self, point: Vec3) -> VertexHandle {
+    pub fn add_vertex(&mut self, point: Point3) -> VertexHandle {
         let idx = self.x.len() as u32;
         self.x.push(point.x);
         self.y.push(point.y);
@@ -192,13 +192,13 @@ impl SoAKernel {
 
         // Resize attribute arrays if they exist
         if let Some(ref mut normals) = self.vertex_normals {
-            normals.push(Vec3::ZERO);
+            normals.push(Vec3::zeros());
         }
         if let Some(ref mut colors) = self.vertex_colors {
             colors.push(Vec4::new(1.0, 1.0, 1.0, 1.0));
         }
         if let Some(ref mut texcoords) = self.vertex_texcoords {
-            texcoords.push(Vec2::ZERO);
+            texcoords.push(Vec2::zeros());
         }
         self.vertex_props.resize_all(self.x.len());
 
@@ -257,9 +257,9 @@ impl SoAKernel {
 
     /// Get vertex position by index
     #[inline]
-    pub fn point(&self, idx: usize) -> Option<Vec3> {
+    pub fn point(&self, idx: usize) -> Option<Point3> {
         if idx < self.x.len() {
-            Some(Vec3::new(self.x[idx], self.y[idx], self.z[idx]))
+            Some(Point3::new(self.x[idx], self.y[idx], self.z[idx]))
         } else {
             None
         }
@@ -267,8 +267,8 @@ impl SoAKernel {
 
     /// Get vertex position by index (unsafe, unchecked)
     #[inline]
-    pub unsafe fn point_unchecked(&self, idx: usize) -> Vec3 {
-        Vec3::new(self.x[idx], self.y[idx], self.z[idx])
+    pub unsafe fn point_unchecked(&self, idx: usize) -> Point3 {
+        Point3::new(self.x[idx], self.y[idx], self.z[idx])
     }
 
     /// Get x by index
@@ -309,7 +309,7 @@ impl SoAKernel {
 
     /// Set vertex position
     #[inline]
-    pub fn set_point(&mut self, idx: usize, point: Vec3) {
+    pub fn set_point(&mut self, idx: usize, point: Point3) {
         if idx < self.x.len() {
             self.x[idx] = point.x;
             self.y[idx] = point.y;
@@ -1324,7 +1324,7 @@ impl SoAKernel {
     pub fn request_vertex_normals(&mut self) {
         if self.vertex_normals.is_none() {
             let size = self.x.len();
-            self.vertex_normals = Some(vec![Vec3::ZERO; size]);
+            self.vertex_normals = Some(vec![Vec3::zeros(); size]);
         }
     }
 
@@ -1387,7 +1387,7 @@ impl SoAKernel {
     pub fn request_vertex_texcoords(&mut self) {
         if self.vertex_texcoords.is_none() {
             let size = self.x.len();
-            self.vertex_texcoords = Some(vec![Vec2::ZERO; size]);
+            self.vertex_texcoords = Some(vec![Vec2::zeros(); size]);
         }
     }
 
@@ -1418,7 +1418,7 @@ impl SoAKernel {
     pub fn request_halfedge_normals(&mut self) {
         if self.halfedge_normals.is_none() {
             let size = self.halfedges.len();
-            self.halfedge_normals = Some(vec![Vec3::ZERO; size]);
+            self.halfedge_normals = Some(vec![Vec3::zeros(); size]);
         }
     }
 
@@ -1476,7 +1476,7 @@ impl SoAKernel {
     pub fn request_halfedge_texcoords(&mut self) {
         if self.halfedge_texcoords.is_none() {
             let size = self.halfedges.len();
-            self.halfedge_texcoords = Some(vec![Vec2::ZERO; size]);
+            self.halfedge_texcoords = Some(vec![Vec2::zeros(); size]);
         }
     }
 
@@ -1538,7 +1538,7 @@ impl SoAKernel {
     pub fn request_face_normals(&mut self) {
         if self.face_normals.is_none() {
             let size = self.faces.len();
-            self.face_normals = Some(vec![Vec3::ZERO; size]);
+            self.face_normals = Some(vec![Vec3::zeros(); size]);
         }
     }
 

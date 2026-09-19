@@ -1,5 +1,5 @@
 //! QuadricT Mesh Decimation Test
-use rustmesh::{generate_cube, generate_sphere, generate_torus, QuadricT, RustMesh, Vec3};
+use rustmesh::{generate_cube, generate_sphere, generate_torus, Point3, QuadricT, RustMesh, Vec3};
 
 fn main() {
     println!("=== QuadricT Mesh Decimation Test ===\n");
@@ -37,8 +37,8 @@ fn test_mesh(mesh: &RustMesh, expected_v: usize, expected_f: usize) {
                 let p2 = mesh.point(vs[2]).unwrap();
                 let edge1 = p1 - p0;
                 let edge2 = p2 - p0;
-                let normal = edge1.cross(edge2).normalize();
-                let center = (p0 + p1 + p2) / 3.0;
+                let normal = edge1.cross(&edge2).normalize();
+                let center = Point3::from((p0.coords + p1.coords + p2.coords) / 3.0);
                 let q = QuadricT::from_face(normal, center);
 
                 let (opt, err) = q.optimize();

@@ -3746,15 +3746,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glam"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4850,6 +4841,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
+ "serde",
  "simba",
  "typenum",
 ]
@@ -5137,6 +5129,7 @@ dependencies = [
  "bytemuck",
  "num-traits",
  "rand 0.8.5",
+ "serde",
 ]
 
 [[package]]
@@ -6908,8 +6901,8 @@ dependencies = [
  "eframe",
  "egui",
  "fs2",
- "glam",
  "image",
+ "nalgebra",
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-core-media",
@@ -6918,6 +6911,7 @@ dependencies = [
  "rfd",
  "rustgs",
  "rustix 1.1.4",
+ "rustscan-types",
  "rustsfm",
  "rustslam",
  "serde",
@@ -6963,9 +6957,9 @@ dependencies = [
  "candle-onnx",
  "clap",
  "env_logger",
- "glam",
  "image",
  "log",
+ "nalgebra",
  "ort",
  "serde",
  "tempfile",
@@ -6988,12 +6982,12 @@ dependencies = [
  "bytes",
  "clap",
  "env_logger",
- "glam",
  "image",
  "kiddo",
  "libc",
  "log",
  "naga_oil",
+ "nalgebra",
  "rand 0.8.5",
  "rayon",
  "rustscan-types",
@@ -7073,7 +7067,6 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "criterion",
- "glam",
  "itertools 0.13.0",
  "nalgebra",
  "rand 0.8.5",
@@ -7089,8 +7082,8 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
- "glam",
  "log",
+ "nalgebra",
  "rustgs",
  "rustmesh",
  "rustscan-types",
@@ -7112,7 +7105,7 @@ dependencies = [
 name = "rustscan-types"
 version = "0.1.0"
 dependencies = [
- "glam",
+ "nalgebra",
  "serde",
  "serde_json",
 ]
@@ -7128,7 +7121,6 @@ dependencies = [
  "ceres-solver",
  "clap",
  "env_logger",
- "glam",
  "image",
  "log",
  "lowe-sift",
@@ -7157,7 +7149,6 @@ dependencies = [
  "crossbeam-channel",
  "env_logger",
  "ffmpeg-next",
- "glam",
  "image",
  "kiddo",
  "log",

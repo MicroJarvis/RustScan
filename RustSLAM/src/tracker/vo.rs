@@ -8,7 +8,7 @@ use crate::features::{
 };
 use crate::loop_closing::Relocalizer;
 use crate::tracker::solver::{EssentialSolver, PnPSolver, Triangulator};
-use glam::Vec3;
+use nalgebra::Point3;
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -628,7 +628,7 @@ impl VisualOdometry {
             }
             let point_id = self.relocalization_map.add_point(MapPoint::new(
                 0,
-                Vec3::from(*point_world),
+                Point3::from(*point_world),
                 frame_id,
             ));
             if idx < features.map_points.len() {
@@ -734,7 +734,11 @@ impl VisualOdometry {
             let Some(map_point) = self.relocalization_map.get_point(point_id) else {
                 continue;
             };
-            if map_point.is_outlier || !map_point.position.is_finite() {
+            if map_point.is_outlier
+                || !(map_point.position.x.is_finite()
+                    && map_point.position.y.is_finite()
+                    && map_point.position.z.is_finite())
+            {
                 continue;
             }
             seeded_points[query_idx] = Some([
@@ -995,7 +999,7 @@ mod tests {
             .iter()
             .map(|point_world| {
                 let pixel = camera
-                    .project(&glam::Vec3::from(*point_world))
+                    .project(&nalgebra::Vector3::from(*point_world))
                     .expect("point visible in previous view");
                 KeyPoint::new(pixel.x, pixel.y)
             })
@@ -1005,7 +1009,7 @@ mod tests {
             .map(|point_world| {
                 let point_camera = relative_pose.transform_point(point_world);
                 let pixel = camera
-                    .project(&glam::Vec3::from(point_camera))
+                    .project(&nalgebra::Vector3::from(point_camera))
                     .expect("point visible in current view");
                 KeyPoint::new(pixel.x, pixel.y)
             })
@@ -1126,7 +1130,7 @@ mod tests {
             .iter()
             .map(|point_world| {
                 let pixel = camera
-                    .project(&glam::Vec3::from(*point_world))
+                    .project(&nalgebra::Vector3::from(*point_world))
                     .expect("anchor point visible");
                 KeyPoint::new(pixel.x, pixel.y)
             })
@@ -1136,7 +1140,7 @@ mod tests {
             .map(|point_world| {
                 let point_camera = current_pose.transform_point(point_world);
                 let pixel = camera
-                    .project(&glam::Vec3::from(point_camera))
+                    .project(&nalgebra::Vector3::from(point_camera))
                     .expect("current point visible");
                 KeyPoint::new(pixel.x, pixel.y)
             })

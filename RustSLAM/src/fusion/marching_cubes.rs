@@ -6,14 +6,14 @@
 //! Based on: "Marching Cubes: A High Resolution Surface Reconstruction Algorithm"
 
 use super::tsdf_volume::TsdfVolume;
-use glam::Vec3;
+use nalgebra::{Point3, Vector3};
 use std::collections::{HashMap, HashSet};
 
 /// A vertex in the extracted mesh
 #[derive(Debug, Clone)]
 pub struct MeshVertex {
-    pub position: Vec3,
-    pub normal: Vec3,
+    pub position: Point3<f32>,
+    pub normal: Vector3<f32>,
     pub color: [f32; 3],
 }
 
@@ -377,11 +377,11 @@ const EDGE_VERTS: [[usize; 2]; 12] = [
 /// Marching Cubes for mesh extraction
 pub struct MarchingCubes {
     voxel_size: f32,
-    min_bound: Vec3,
+    min_bound: Point3<f32>,
 }
 
 impl MarchingCubes {
-    pub fn new(voxel_size: f32, min_bound: Vec3) -> Self {
+    pub fn new(voxel_size: f32, min_bound: Point3<f32>) -> Self {
         Self {
             voxel_size,
             min_bound,
@@ -389,7 +389,13 @@ impl MarchingCubes {
     }
 
     /// Interpolate vertex position along an edge
-    fn interpolate_edge(&self, v1: Vec3, v2: Vec3, tsdf1: f32, tsdf2: f32) -> Vec3 {
+    fn interpolate_edge(
+        &self,
+        v1: Point3<f32>,
+        v2: Point3<f32>,
+        tsdf1: f32,
+        tsdf2: f32,
+    ) -> Point3<f32> {
         if tsdf1.abs() < 0.00001 {
             return v1;
         }
@@ -458,7 +464,7 @@ impl MarchingCubes {
                     let tri_edges = TRI_TABLE[cube_index as usize];
 
                     // Interpolate vertices on edges
-                    let mut edge_vertices = [Vec3::ZERO; 12];
+                    let mut edge_vertices = [Point3::origin(); 12];
                     let mut edge_colors = [[0.0f32; 3]; 12];
 
                     for e in 0..12 {
@@ -496,11 +502,10 @@ impl MarchingCubes {
                         // Calculate normal
                         let edge1 = v1 - v0;
                         let edge2 = v2 - v0;
-                        let normal = if edge1.length_squared() > 0.0 && edge2.length_squared() > 0.0
-                        {
-                            edge1.cross(edge2).normalize()
+                        let normal = if edge1.norm_squared() > 0.0 && edge2.norm_squared() > 0.0 {
+                            edge1.cross(&edge2).normalize()
                         } else {
-                            Vec3::new(0.0, 1.0, 0.0)
+                            Vector3::y()
                         };
 
                         // Add vertices
@@ -537,10 +542,10 @@ impl MarchingCubes {
         mesh
     }
 
-    fn voxel_to_world(&self, x: i32, y: i32, z: i32, corner: usize) -> Vec3 {
+    fn voxel_to_world(&self, x: i32, y: i32, z: i32, corner: usize) -> Point3<f32> {
         let [cx, cy, cz] = CUBE_VERTICES[corner];
         self.min_bound
-            + Vec3::new(
+            + Vector3::new(
                 (x as f32 + cx) * self.voxel_size,
                 (y as f32 + cy) * self.voxel_size,
                 (z as f32 + cz) * self.voxel_size,
@@ -695,7 +700,7 @@ pub fn extract_mesh_from_tsdf(volume: &TsdfVolume) -> Mesh {
                     ];
 
                     // Normal will be computed later from triangle edges
-                    let normal = Vec3::ZERO;
+                    let normal = Vector3::zeros();
 
                     let idx = mesh.vertices.len();
                     mesh.vertices.push(MeshVertex {
@@ -732,7 +737,7 @@ pub fn extract_mesh_from_tsdf(volume: &TsdfVolume) -> Mesh {
     }
 
     // Compute normals from triangle faces
-    let mut vertex_normals: Vec<Vec3> = vec![Vec3::ZERO; mesh.vertices.len()];
+    let mut vertex_normals: Vec<Vector3<f32>> = vec![Vector3::zeros(); mesh.vertices.len()];
     let mut vertex_counts: Vec<u32> = vec![0; mesh.vertices.len()];
 
     for tri in &mesh.triangles {
@@ -742,7 +747,7 @@ pub fn extract_mesh_from_tsdf(volume: &TsdfVolume) -> Mesh {
 
         let edge1 = v1 - v0;
         let edge2 = v2 - v0;
-        let normal = edge1.cross(edge2);
+        let normal = edge1.cross(&edge2);
 
         for &idx in &tri.indices {
             vertex_normals[idx] += normal;
@@ -755,7 +760,7 @@ pub fn extract_mesh_from_tsdf(volume: &TsdfVolume) -> Mesh {
         if vertex_counts[i] > 0 {
             vertex.normal = vertex_normals[i].normalize();
         } else {
-            vertex.normal = Vec3::new(0.0, 1.0, 0.0);
+            vertex.normal = Vector3::y();
         }
     }
 
@@ -770,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_marching_cubes_creation() {
-        let mc = MarchingCubes::new(0.01, Vec3::new(-1.0, -1.0, -1.0));
+        let mc = MarchingCubes::new(0.01, Point3::new(-1.0, -1.0, -1.0));
         assert_eq!(mc.voxel_size, 0.01);
     }
 
@@ -857,7 +862,7 @@ mod tests {
     #[test]
     fn test_sphere_extraction() {
         // Create synthetic sphere TSDF
-        let tsdf = create_sphere_tsdf(Vec3::ZERO, 1.0, 0.1);
+        let tsdf = create_sphere_tsdf(Point3::origin(), 1.0, 0.1);
 
         // Extract mesh
         let mesh = extract_mesh_from_tsdf(&tsdf);
@@ -869,7 +874,7 @@ mod tests {
         // Verify vertices are roughly on sphere surface
         let tolerance = 0.2; // Allow some tolerance due to voxelization
         for vertex in &mesh.vertices {
-            let dist_from_center = vertex.position.length();
+            let dist_from_center = vertex.position.coords.norm();
             assert!(
                 (dist_from_center - 1.0).abs() < tolerance,
                 "Vertex at {:?} is {} from center (expected ~1.0)",
@@ -885,8 +890,8 @@ mod tests {
         let config = TsdfConfig {
             voxel_size: 0.1,
             sdf_trunc: 0.4,
-            min_bound: Vec3::new(-1.0, -1.0, -1.0),
-            max_bound: Vec3::new(1.0, 1.0, 1.0),
+            min_bound: Point3::new(-1.0, -1.0, -1.0),
+            max_bound: Point3::new(1.0, 1.0, 1.0),
             max_weight: 100.0,
             integration_weight: 1.0,
         };
@@ -912,8 +917,8 @@ mod tests {
         let config = TsdfConfig {
             voxel_size: 1.0,
             sdf_trunc: 3.0,
-            min_bound: Vec3::ZERO,
-            max_bound: Vec3::new(2.0, 2.0, 2.0),
+            min_bound: Point3::origin(),
+            max_bound: Point3::new(2.0, 2.0, 2.0),
             max_weight: 1.0,
             integration_weight: 1.0,
         };
@@ -936,8 +941,8 @@ mod tests {
         let config = TsdfConfig {
             voxel_size: 0.01, // 1cm voxels
             sdf_trunc: 0.03,
-            min_bound: Vec3::new(-2.0, -2.0, -2.0), // 4m volume (400x400x400 = 64 million voxels if dense)
-            max_bound: Vec3::new(2.0, 2.0, 2.0),
+            min_bound: Point3::new(-2.0, -2.0, -2.0), // 4m volume (400x400x400 = 64 million voxels if dense)
+            max_bound: Point3::new(2.0, 2.0, 2.0),
             max_weight: 100.0,
             integration_weight: 1.0,
         };
@@ -1014,15 +1019,15 @@ mod tests {
         let config = TsdfConfig {
             voxel_size: 0.01,
             sdf_trunc: 0.03,
-            min_bound: Vec3::new(-1.0, -1.0, -1.0),
-            max_bound: Vec3::new(1.0, 1.0, 1.0),
+            min_bound: Point3::new(-1.0, -1.0, -1.0),
+            max_bound: Point3::new(1.0, 1.0, 1.0),
             max_weight: 100.0,
             integration_weight: 1.0,
         };
         let mut volume = TsdfVolume::new(config);
 
         // Add a small sphere of surface voxels (not the full 8 million!)
-        let center = Vec3::new(0.0, 0.0, 0.0);
+        let center = Point3::new(0.0, 0.0, 0.0);
         let radius = 0.3; // 30cm radius sphere
         let r_voxels = (radius / 0.01) as i32;
         let center_voxel = (1.0 / 0.01) as i32 / 2; // center at (100, 100, 100)
@@ -1077,7 +1082,7 @@ mod tests {
 
     fn run_single_cube(case_index: u8) -> Mesh {
         let voxel_size = 1.0;
-        let min_bound = Vec3::ZERO;
+        let min_bound = Point3::origin();
         let mc = MarchingCubes::new(voxel_size, min_bound);
 
         let dims = (2, 2, 2);

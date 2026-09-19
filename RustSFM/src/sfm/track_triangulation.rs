@@ -311,9 +311,12 @@ pub fn track_to_observations(track: &Track) -> Vec<TrackObservation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
     use crate::types::CameraModel;
-    use glam::{Quat, Vec3};
     use std::path::PathBuf;
+
+    type Quat = nalgebra::UnitQuaternion<f32>;
+    type Vec3 = nalgebra::Vector3<f32>;
 
     fn test_camera() -> CameraModel {
         CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0)
@@ -380,8 +383,10 @@ mod tests {
         let mut frames = Vec::new();
         let mut poses = Vec::new();
         for view in 0..n {
-            let pose =
-                SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(view as f32 * 0.25, 0.0, 0.0));
+            let pose = SE3::from_quat_translation(
+                Quat::identity(),
+                Vec3::new(view as f32 * 0.25, 0.0, 0.0),
+            );
             poses.push(Some(pose));
             frames.push(test_frame(
                 view,
@@ -411,7 +416,7 @@ mod tests {
         assert_eq!(stats.num_triangulated, 1);
         assert_eq!(reconstruction.points.len(), 1);
         let recovered = reconstruction.points[0].xyz;
-        let err = Vec3::from_array(recovered).distance(Vec3::from_array(point));
+        let err = Vec3::from(recovered).distance(Vec3::from(point));
         assert!(err < 1.0e-2, "triangulation error {err}");
     }
 
@@ -420,7 +425,7 @@ mod tests {
         let camera = test_camera();
         let point = [0.0, 0.0, 2.0];
         let pose0 = SE3::identity();
-        let pose1 = SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.5, 0.0, 0.0));
+        let pose1 = SE3::from_quat_translation(Quat::identity(), Vec3::new(0.5, 0.0, 0.0));
         let frames = vec![
             test_frame(0, vec![project_keypoint(camera, pose0, point)]),
             test_frame(1, vec![project_keypoint(camera, pose1, point)]),

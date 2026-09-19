@@ -1,4 +1,5 @@
 use crate::correspondence_graph::{build_correspondence_graph_from_pairs, CorrespondenceGraph};
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
 use crate::visibility_pyramid::VisibilityPyramid;
 use rustslam::SE3;
@@ -1489,8 +1490,10 @@ mod tests {
         let mut reconstruction = reconstruction(&frames);
         add_two_camera_rig_frame(&mut reconstruction, 0, 1);
         let mut manager = ObservationManager::new(&frames, &pairs, &reconstruction);
-        let selected_pose =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(10.0, 0.0, 0.0));
+        let selected_pose = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(10.0, 0.0, 0.0),
+        );
 
         assert!(manager.register_image(&frames, &pairs, &mut reconstruction, 1, selected_pose));
 

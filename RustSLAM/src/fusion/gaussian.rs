@@ -7,17 +7,18 @@
 //! - RTG-SLAM: Real-time 3D Reconstruction at Scale Using Gaussian Splatting
 //! - SplaTAM: Splat, Track & Map 3D Gaussians for Dense RGB-D SLAM
 
-use glam::{Mat3, Quat, Vec3};
+use nalgebra::{Matrix3, Point3, UnitQuaternion, Vector3};
+use rustscan_types::matrix3_from_column_major_array;
 
 /// A single 3D Gaussian primitive
 #[derive(Debug, Clone)]
 pub struct Gaussian3D {
     /// Position (mean) of the Gaussian
-    pub position: Vec3,
+    pub position: Point3<f32>,
     /// Scale factors (sx, sy, sz)
-    pub scale: Vec3,
+    pub scale: Vector3<f32>,
     /// Rotation quaternion
-    pub rotation: Quat,
+    pub rotation: UnitQuaternion<f32>,
     /// Opacity (0-1)
     pub opacity: f32,
     /// Spherical Harmonics coefficients for color
@@ -45,9 +46,9 @@ impl Gaussian3D {
     /// Create a new Gaussian from depth point
     pub fn from_depth_point(x: f32, y: f32, z: f32, color: [u8; 3]) -> Self {
         Self {
-            position: Vec3::new(x, y, z),
-            scale: Vec3::splat(0.01), // 1cm default scale
-            rotation: Quat::IDENTITY,
+            position: Point3::new(x, y, z),
+            scale: Vector3::repeat(0.01), // 1cm default scale
+            rotation: UnitQuaternion::identity(),
             opacity: 0.5,
             color: [
                 color[0] as f32 / 255.0,
@@ -61,9 +62,9 @@ impl Gaussian3D {
 
     /// Get the approximate covariance matrix (simplified)
     /// In practice, we use diagonal approximation with scale
-    pub fn covariance_diagonal(&self) -> Vec3 {
+    pub fn covariance_diagonal(&self) -> Vector3<f32> {
         // Simplified: use scale as approximate std dev
-        self.scale * self.scale
+        self.scale.component_mul(&self.scale)
     }
 
     /// Project Gaussian to 2D (for rendering)
@@ -77,15 +78,12 @@ impl Gaussian3D {
         pose: &[[f32; 3]; 3],
         t: &[f32; 3],
     ) -> Option<[f32; 3]> {
-        // Transform to camera frame
-        let r = Mat3::from_cols(
-            Vec3::new(pose[0][0], pose[0][1], pose[0][2]),
-            Vec3::new(pose[1][0], pose[1][1], pose[1][2]),
-            Vec3::new(pose[2][0], pose[2][1], pose[2][2]),
-        );
+        // Transform to camera frame. `pose` is interpreted as column-major to
+        // match the previous glam `Mat3::from_cols(row0, row1, row2)` construction.
+        let r = matrix3_from_stored_pose_array(pose);
 
-        let translation = Vec3::new(t[0], t[1], t[2]);
-        let cam_pos = r.transpose() * (self.position - translation);
+        let translation = Vector3::new(t[0], t[1], t[2]);
+        let cam_pos = r.transpose() * (self.position.coords - translation);
 
         // Behind camera
         if cam_pos.z <= 0.0 {
@@ -109,7 +107,7 @@ impl Gaussian3D {
     }
 
     /// Apply scale
-    pub fn with_scale(mut self, scale: Vec3) -> Self {
+    pub fn with_scale(mut self, scale: Vector3<f32>) -> Self {
         self.scale = scale;
         self
     }
@@ -118,15 +116,21 @@ impl Gaussian3D {
 impl Default for Gaussian3D {
     fn default() -> Self {
         Self {
-            position: Vec3::ZERO,
-            scale: Vec3::splat(0.01),
-            rotation: Quat::IDENTITY,
+            position: Point3::origin(),
+            scale: Vector3::repeat(0.01),
+            rotation: UnitQuaternion::identity(),
             opacity: 0.5,
             color: [0.5, 0.5, 0.5],
             features: None,
             state: GaussianState::New,
         }
     }
+}
+
+/// Interpret a stored `[[f32; 3]; 3]` the way previous glam
+/// `Mat3::from_cols(pose[0], pose[1], pose[2])` did: each inner array is a column.
+pub(crate) fn matrix3_from_stored_pose_array(pose: &[[f32; 3]; 3]) -> Matrix3<f32> {
+    matrix3_from_column_major_array(pose)
 }
 
 /// A collection of Gaussians (the scene representation)
@@ -181,12 +185,8 @@ impl GaussianMap {
         pose: &[[f32; 3]; 3],
         t: &[f32; 3],
     ) -> usize {
-        let r = Mat3::from_cols(
-            Vec3::new(pose[0][0], pose[0][1], pose[0][2]),
-            Vec3::new(pose[1][0], pose[1][1], pose[1][2]),
-            Vec3::new(pose[2][0], pose[2][1], pose[2][2]),
-        );
-        let translation = Vec3::new(t[0], t[1], t[2]);
+        let r = matrix3_from_stored_pose_array(pose);
+        let translation = Vector3::new(t[0], t[1], t[2]);
 
         let mut added = 0;
 
@@ -203,7 +203,7 @@ impl GaussianMap {
                     let y = (v as f32 - cy) * z / fy;
 
                     // Transform to world frame
-                    let cam_pos = Vec3::new(x, y, z);
+                    let cam_pos = Vector3::new(x, y, z);
                     let world_pos = r * cam_pos + translation;
 
                     let gaussian = Gaussian3D::from_depth_point(
@@ -333,11 +333,16 @@ impl GaussianCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SE3;
+    use nalgebra::{Point3, Vector3};
+    use rustscan_types::{
+        matrix3_from_column_major_array, matrix3_to_column_major_array, Rotation3f,
+    };
 
     #[test]
     fn test_gaussian_creation() {
         let g = Gaussian3D::from_depth_point(0.0, 0.0, 1.0, [255, 128, 64]);
-        assert!(g.position.abs_diff_eq(Vec3::new(0.0, 0.0, 1.0), 0.001));
+        assert!((g.position - Point3::new(0.0, 0.0, 1.0)).norm() < 0.001);
         assert!(g.color[0] > 0.9);
     }
 
@@ -360,6 +365,28 @@ mod tests {
         let [u, v, _] = result.unwrap();
         assert!((u - 320.0).abs() < 0.1);
         assert!((v - 240.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn stored_pose_array_round_trips_non_symmetric_rotation() {
+        let rotation = Rotation3f::from_euler_angles(0.3, -0.4, 0.5);
+        let translation = Vector3::new(1.25, -2.5, 3.75);
+        let pose = SE3::from_quat_translation(rotation, translation);
+        let stored = pose.rotation_matrix();
+        let matrix = matrix3_from_stored_pose_array(&stored);
+        let round_trip = matrix3_to_column_major_array(matrix);
+
+        for col in 0..3 {
+            for row in 0..3 {
+                assert!((round_trip[col][row] - stored[col][row]).abs() < 1e-6);
+            }
+        }
+
+        let point = Point3::new(0.4, -1.2, 2.8);
+        let cam_pos = matrix.transpose() * (point.coords - translation);
+        let expected =
+            matrix3_from_column_major_array(&stored).transpose() * (point.coords - translation);
+        assert!((cam_pos - expected).norm() < 1e-5);
     }
 
     #[test]

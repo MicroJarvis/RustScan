@@ -8,7 +8,7 @@ use ceres_solver::loss::LossFunction;
 use ceres_solver::parameter_block::ParameterBlockOrIndex;
 use ceres_solver::solver::{LinearSolverType, SolverOptions};
 use ceres_solver::{CostFunctionType, NllsProblem};
-use glam::Vec3;
+type Vec3 = nalgebra::Vector3<f32>;
 use std::collections::HashMap;
 
 struct RayResidualBinding {
@@ -29,18 +29,18 @@ pub(crate) fn solve_joint_global_positioning_ceres(
     }
 
     apply_origin_gauge(&mut centers, &mut points);
-    centers[0] = Vec3::ZERO;
+    centers[0] = Vec3::zeros();
 
     let mut block_values = HashMap::<usize, Vec<f64>>::new();
     for view in 0..num_views {
-        let center = centers.get(view).copied().unwrap_or(Vec3::ZERO);
+        let center = centers.get(view).copied().unwrap_or(Vec3::zeros());
         block_values.insert(
             camera_param_index(view),
             vec![center.x as f64, center.y as f64, center.z as f64],
         );
     }
     for track in 0..num_tracks {
-        let point = points.get(track).copied().unwrap_or(Vec3::ZERO);
+        let point = points.get(track).copied().unwrap_or(Vec3::zeros());
         block_values.insert(
             point_param_index(track, num_views),
             vec![point.x as f64, point.y as f64, point.z as f64],
@@ -332,7 +332,8 @@ mod tests {
     };
     use crate::track_establishment::{FeatureNode, Track};
     use crate::types::{CameraModel, PairGeometry};
-    use glam::Quat;
+    type Quat = nalgebra::UnitQuaternion<f32>;
+    use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
     use rustslam::SE3;
 
     fn test_camera() -> CameraModel {
@@ -366,7 +367,7 @@ mod tests {
         i: usize,
         j: usize,
         rotations: &[Quat],
-        centers: &[glam::Vec3],
+        centers: &[nalgebra::Vector3<f32>],
         inliers: usize,
     ) -> PairGeometry {
         let r_ij = (rotations[j] * rotations[i].inverse()).normalize();
@@ -396,18 +397,18 @@ mod tests {
     fn ceres_joint_positioning_improves_bata_warm_start() {
         let camera = test_camera();
         let n = 5;
-        let rotations = vec![Quat::IDENTITY; n];
+        let rotations = vec![Quat::identity(); n];
         let centers = vec![
-            glam::Vec3::ZERO,
-            glam::Vec3::new(0.5, 0.0, 0.0),
-            glam::Vec3::new(1.0, 0.0, 0.0),
-            glam::Vec3::new(1.5, 0.0, 0.0),
-            glam::Vec3::new(2.0, 0.0, 0.0),
+            nalgebra::Vector3::<f32>::zeros(),
+            nalgebra::Vector3::new(0.5, 0.0, 0.0),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
+            nalgebra::Vector3::new(1.5, 0.0, 0.0),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
         ];
         let gt_points = vec![
-            glam::Vec3::new(0.5, 0.0, 4.0),
-            glam::Vec3::new(1.0, 0.25, 5.0),
-            glam::Vec3::new(1.5, -0.1, 4.5),
+            nalgebra::Vector3::new(0.5, 0.0, 4.0),
+            nalgebra::Vector3::new(1.0, 0.25, 5.0),
+            nalgebra::Vector3::new(1.5, -0.1, 4.5),
         ];
 
         let mut frames = vec![synth_frame(0, Vec::new()); n];
@@ -478,17 +479,17 @@ mod tests {
     fn ceres_joint_positioning_matches_or_beats_alternating() {
         let camera = test_camera();
         let n = 5;
-        let rotations = vec![Quat::IDENTITY; n];
+        let rotations = vec![Quat::identity(); n];
         let centers = vec![
-            glam::Vec3::ZERO,
-            glam::Vec3::new(0.5, 0.0, 0.0),
-            glam::Vec3::new(1.0, 0.0, 0.0),
-            glam::Vec3::new(1.5, 0.0, 0.0),
-            glam::Vec3::new(2.0, 0.0, 0.0),
+            nalgebra::Vector3::<f32>::zeros(),
+            nalgebra::Vector3::new(0.5, 0.0, 0.0),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
+            nalgebra::Vector3::new(1.5, 0.0, 0.0),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
         ];
         let gt_points = vec![
-            glam::Vec3::new(0.5, 0.0, 4.0),
-            glam::Vec3::new(1.0, 0.25, 5.0),
+            nalgebra::Vector3::new(0.5, 0.0, 4.0),
+            nalgebra::Vector3::new(1.0, 0.25, 5.0),
         ];
 
         let mut frames = vec![synth_frame(0, Vec::new()); n];
@@ -522,11 +523,11 @@ mod tests {
         let options = JointGlobalPositioningOptions::default();
         let noisy_centers = centers
             .iter()
-            .map(|c| *c + glam::Vec3::new(0.05, -0.03, 0.02))
+            .map(|c| *c + nalgebra::Vector3::new(0.05, -0.03, 0.02))
             .collect::<Vec<_>>();
         let noisy_points = gt_points
             .iter()
-            .map(|p| *p + glam::Vec3::new(-0.1, 0.08, -0.15))
+            .map(|p| *p + nalgebra::Vector3::new(-0.1, 0.08, -0.15))
             .collect::<Vec<_>>();
 
         let (_, _, _, alt_residual) = solve_joint_global_positioning_alternating(

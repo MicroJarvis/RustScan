@@ -291,6 +291,7 @@ mod tests {
         assert!(benchmark_match_pairs(missing, 5, Some(1), 0, &options).is_err());
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn match_pair_benchmark_repeats_without_modifying_source_database() {
         let dir = tempfile::tempdir().unwrap();
@@ -344,6 +345,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn match_pair_benchmark_retains_independent_artifact_databases() {
         let dir = tempfile::tempdir().unwrap();
@@ -454,6 +456,7 @@ mod tests {
         assert_eq!(run.result_fingerprint, "");
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
     fn match_pair_benchmark_snapshots_source_with_uncheckpointed_wal() {
         let dir = tempfile::tempdir().unwrap();

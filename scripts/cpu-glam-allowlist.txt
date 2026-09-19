@@ -1,0 +1,4 @@
+# Explicit allowlist for CPU glam policy checks.
+# Format: <repo-relative-path> # reason
+# Blank lines and full-line # comments are ignored.
+# Default is empty: no CPU glam types are permitted.

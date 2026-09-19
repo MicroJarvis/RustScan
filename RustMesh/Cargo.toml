@@ -6,9 +6,8 @@ description = "Rust port of OpenMesh - A versatile geometric data structure"
 authors = ["RustMesh Developers"]
 
 [dependencies]
-# 几何库
-glam = "0.25"
-nalgebra = "0.33"
+# CPU geometry uses nalgebra (see AGENTS.md). Arrays remain only at IO boundaries.
+nalgebra = { workspace = true }
 
 # 序列化
 serde = { version = "1.0", features = ["derive"] }

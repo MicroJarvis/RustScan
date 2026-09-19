@@ -1,8 +1,7 @@
 # RustSFM COLMAP Parity Roadmap (non-GUI)
 
-**Updated:** 2026-09-10 (committed pinned flowers2 reference text + opt-in CI
-job; dated numerical measurements below retain their original observation
-dates)
+**Updated:** 2026-09-17 (P0 gate remeasure; dated numerical measurements
+below retain their original observation dates)
 
 Target: 100% COLMAP behavior parity excluding Qt GUI and Python bindings.
 GPU: **wgpu** only (no CUDA/SiftGPU).
@@ -11,7 +10,8 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
 
 - [x] Stage-based `compare` (`features`, `matches`, `twoview`, `registration`, `tracks`, `ba`)
 - [x] Tests and adapters for the external `flowers2_colmap` sparse fixture
-- [x] CI execution for default and `--no-default-features` RustSFM suites
+- [x] CI execution for the GPU feature suite; `--no-default-features` is a
+      compile gate, not a matching pipeline test (2026-09-17)
 - [x] Versioned source and opt-in CI provisioning for `test_data/flowers2_colmap`
   - Runtime tree stays out of ordinary clones; tests remain `#[ignore]`d by
     default.
@@ -24,6 +24,12 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
     `workflow_dispatch` or PR label `flowers2-parity`.
   - 2026-08-31 measured ignored suite: `19 passed; 0 failed` (after the
     scheduled-BA trigger and pose-prior alignment fixes recorded below).
+  - 2026-09-17 remeasure after initial-pair early-stop and failure
+    diagnostics, Darwin arm64, `--features gpu-wgpu,vlfeat-sift`,
+    `--test-threads=1`: lib `792 passed; 0 failed; 19 ignored`; sequence
+    `72 passed; 0 failed`; ignored suite `19 passed; 0 failed`. This does not
+    close mapper initial-pair parity; the earlier 784 count is only the
+    pre-init-change snapshot in `output/p0_baseline_20260917/REPORT.md`.
 
 ## Phase 1 — Sparse SfM core → 100% (in progress)
 
@@ -31,7 +37,7 @@ GPU: **wgpu** only (no CUDA/SiftGPU).
 |--------|-----:|--------------|
 | ObservationManager | 99% | initial-pair + structureless fixtures (added 2026-06-24) |
 | IncrementalTriangulator | 99% | logic line-verified vs COLMAP (2026-06-27); len-2 gap is bit-exact-SVD only |
-| Incremental mapper | 89% | exact stored two-view rows still choose a different initial pair; align initialization/registration order |
+| Incremental mapper | 93% | 2026-09-19g: UNCALIBRATED stored pairs kept (89/89); FindNext MinUncertainty ranks `0009`>`0003` on RustSFM scores at model-1 step 5 — COLMAP picks `0003`, so remaining order gap is triangulation/visibility state (Task 5), not the sorter |
 | optim/RANSAC | 90% | recorded FIFO verifier schedule now replays exactly; default parallel `random_seed=-1` remains schedule-realization dependent |
 | Two-view geometry | 96% | recorded COLMAP verifier trace now matches config/inliers/masks exactly; default schedule replay remains diagnostic |
 | Pose solvers | 65% | Ceres generalized refinement/covariance |
@@ -279,6 +285,19 @@ adjacent relative rotation mean `0.356 deg`, and adjacent translation-angle mean
 `0.262 deg` with similarity scale `0.948947`. This pins the next first-tier gap
 on mapper initialization order, track creation/completion/filtering under that
 order, and BA scheduling/normalization, not on pair verification.
+
+**2026-09-17 fixed-seed init comparison.** The 2026-06-30
+`frame_0005.jpg -> frame_0013.jpg` line is not the current golden. On the same
+replay database (SHA-256
+`21b74e7302acf6f79364eba3ece36530cfdc24067b78eee648c3bfdc304c16f0`), COLMAP
+3.13.0 and RustSFM with `Mapper.num_threads 1` and `Mapper.random_seed 0` both
+accepted `frame_0002.jpg -> frame_0018.jpg` (image ids 2 and 12) as the first
+pair. Database enumeration order is not that pair: the first match-table pair
+is `frame_0008.jpg -> frame_0009.jpg`. As of 2026-09-19e, RustSFM also keeps the
+3-image first model, starts the second model at `frame_0005.jpg -> frame_0013.jpg`,
+and matches COLMAP's first four model-1 registrations before diverging at
+`frame_0003.jpg` vs `frame_0009.jpg`. Task 4 stays open for mid-order / missing
+UNCALIBRATED pair parity; do not change init thresholds from this log.
 
 **2026-06-30 sparse binary compatibility note.** While running the above
 `tracks`/`ba` comparison, `compare` exposed an import bug in COLMAP

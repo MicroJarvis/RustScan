@@ -2,6 +2,7 @@
 //!
 //! Object File Format - simple format for polygonal meshes.
 
+use crate::Point3;
 use crate::RustMesh;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -138,7 +139,7 @@ fn read_off_impl(path: &Path, mode: OffReadMode) -> io::Result<RustMesh> {
         let x = parse_f32(parts[0], "vertex x")?;
         let y = parse_f32(parts[1], "vertex y")?;
         let z = parse_f32(parts[2], "vertex z")?;
-        mesh.add_vertex(glam::Vec3::new(x, y, z));
+        mesh.add_vertex(Point3::new(x, y, z));
     }
 
     for face_idx in 0..n_faces {
@@ -233,10 +234,10 @@ mod tests {
     #[test]
     fn test_off_roundtrip() {
         let mut mesh = RustMesh::new();
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(1.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2, v3]).unwrap();
 
         let path = "/tmp/test_mesh.off";

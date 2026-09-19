@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 use clap::Args;
-use glam::{Mat4, Vec3};
+use nalgebra::{Matrix4, Point3, Vector3};
 use rustgs::{EvaluationDevice, GaussianCamera, HostSplats, SplatEvaluationRenderer};
 use rustmesh::RustMesh;
 use rustscan_types::{Intrinsics, ScenePose, TrainingDataset, SE3};
@@ -47,7 +47,7 @@ pub struct MeshFromGsArgs {
 
     /// Override volume center as x,y,z. Defaults to the Gaussian centroid.
     #[arg(long, value_parser = parse_vec3)]
-    volume_center: Option<Vec3>,
+    volume_center: Option<Point3<f32>>,
 
     /// Minimum connected triangle component size to keep.
     #[arg(long, default_value = "100")]
@@ -117,8 +117,8 @@ pub fn run_mesh_from_gs(args: MeshFromGsArgs) -> anyhow::Result<()> {
         tsdf_config: TsdfConfig {
             voxel_size: args.voxel_size,
             sdf_trunc: truncation_distance,
-            min_bound: volume_center - Vec3::splat(half),
-            max_bound: volume_center + Vec3::splat(half),
+            min_bound: volume_center - Vector3::repeat(half),
+            max_bound: volume_center + Vector3::repeat(half),
             max_weight: 100.0,
             integration_weight: 1.0,
         },
@@ -305,29 +305,29 @@ fn intrinsics_array(intrinsics: Intrinsics) -> [f32; 4] {
     [intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy]
 }
 
-fn pose_to_mat4(pose: SE3) -> Mat4 {
-    Mat4::from_cols_array_2d(&pose.to_matrix())
+fn pose_to_mat4(pose: SE3) -> Matrix4<f32> {
+    pose.to_homogeneous_matrix()
 }
 
-fn scene_center_and_extent(splats: &HostSplats) -> (Vec3, f32) {
+fn scene_center_and_extent(splats: &HostSplats) -> (Point3<f32>, f32) {
     if splats.is_empty() {
-        return (Vec3::ZERO, 0.0);
+        return (Point3::origin(), 0.0);
     }
 
-    let mut center = Vec3::ZERO;
+    let mut center = Vector3::zeros();
     for idx in 0..splats.len() {
         let [x, y, z] = splats.position(idx);
-        center += Vec3::new(x, y, z);
+        center += Vector3::new(x, y, z);
     }
     center /= splats.len() as f32;
 
     let mut extent = 0.0f32;
     for idx in 0..splats.len() {
         let [x, y, z] = splats.position(idx);
-        extent = extent.max(Vec3::new(x, y, z).distance(center));
+        extent = extent.max((Vector3::new(x, y, z) - center).norm());
     }
 
-    (center, extent.max(1e-6))
+    (Point3::from(center), extent.max(1e-6))
 }
 
 fn export_with_rustmesh(mesh: &Mesh, output_dir: &Path) -> anyhow::Result<()> {
@@ -363,7 +363,7 @@ fn export_with_rustmesh(mesh: &Mesh, output_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_vec3(value: &str) -> Result<Vec3, String> {
+fn parse_vec3(value: &str) -> Result<Point3<f32>, String> {
     let parts = value
         .split(',')
         .map(str::trim)
@@ -378,7 +378,7 @@ fn parse_vec3(value: &str) -> Result<Vec3, String> {
     if parts.iter().any(|value| !value.is_finite()) {
         return Err("all components must be finite".to_string());
     }
-    Ok(Vec3::new(parts[0], parts[1], parts[2]))
+    Ok(Point3::new(parts[0], parts[1], parts[2]))
 }
 
 #[cfg(test)]
@@ -389,7 +389,7 @@ mod tests {
     fn parse_vec3_accepts_xyz_triplet() {
         assert_eq!(
             parse_vec3("1.0, 2.5, -3").unwrap(),
-            Vec3::new(1.0, 2.5, -3.0)
+            Point3::new(1.0, 2.5, -3.0)
         );
     }
 
@@ -411,6 +411,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(frames, vec![0, 2]);
+    }
+
+    #[test]
+    fn pose_to_mat4_matches_homogeneous_point_transform() {
+        let pose = SE3::from_quat_translation(
+            rustscan_types::Rotation3f::from_euler_angles(0.3, -0.4, 0.5),
+            Vector3::new(1.25, -2.5, 3.75),
+        );
+        let matrix = pose_to_mat4(pose);
+        let point = Point3::new(0.4, -1.2, 2.8);
+        let expected = pose.transform_point3(point);
+        let transformed = matrix.transform_point(&point);
+        assert!((transformed - expected).norm() < 1e-5);
     }
 
     #[test]

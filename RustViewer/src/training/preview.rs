@@ -2,7 +2,7 @@
 
 use crate::renderer::camera::ArcballCamera;
 use eframe::egui::Vec2;
-use glam::{Mat3, Quat};
+use nalgebra::{Matrix3, UnitQuaternion};
 use rustgs::{GaussianCamera, Intrinsics, SE3};
 
 /// Integer preview target size used by GPU viewport paths.
@@ -104,8 +104,7 @@ fn arcball_pose_w2c(arcball: &ArcballCamera) -> SE3 {
     let forward = -arcball.backward();
     let right = arcball.right();
     let down = -arcball.up();
-    let rotation = Mat3::from_cols(right, down, forward);
-    let rotation = Quat::from_mat3(&rotation);
+    let rotation = UnitQuaternion::from_matrix(&Matrix3::from_columns(&[right, down, forward]));
 
     SE3::from_quat_translation(rotation, eye).inverse()
 }
@@ -116,14 +115,20 @@ mod tests {
         gaussian_camera_from_arcball, gaussian_camera_from_arcball_viewport, PreviewResolution,
     };
     use crate::renderer::camera::ArcballCamera;
+    use crate::renderer::camera::Vec3;
     use eframe::egui::Vec2;
-    use glam::Vec3;
     use rustgs::Intrinsics;
 
     #[test]
     fn gaussian_camera_from_arcball_scales_intrinsics_and_projects_target_to_center() {
-        let arcball =
-            ArcballCamera::from_angles(Vec3::ZERO, 5.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_4);
+        let arcball = ArcballCamera::from_angles(
+            Vec3::zeros(),
+            5.0,
+            0.0,
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_PI_4,
+        );
         let dataset_intrinsics = Intrinsics::new(400.0, 300.0, 320.0, 240.0, 640, 480);
         let resolution = PreviewResolution::new(320, 240).unwrap();
 
@@ -142,8 +147,14 @@ mod tests {
 
     #[test]
     fn gaussian_camera_from_arcball_matches_viewer_screen_axes() {
-        let arcball =
-            ArcballCamera::from_angles(Vec3::ZERO, 5.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_4);
+        let arcball = ArcballCamera::from_angles(
+            Vec3::zeros(),
+            5.0,
+            0.0,
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_PI_4,
+        );
         let dataset_intrinsics = Intrinsics::new(400.0, 400.0, 320.0, 240.0, 640, 480);
         let resolution = PreviewResolution::new(640, 480).unwrap();
 
@@ -157,8 +168,14 @@ mod tests {
 
     #[test]
     fn gaussian_camera_from_arcball_viewport_uses_fov_intrinsics() {
-        let arcball =
-            ArcballCamera::from_angles(Vec3::ZERO, 5.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2);
+        let arcball = ArcballCamera::from_angles(
+            Vec3::zeros(),
+            5.0,
+            0.0,
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+        );
         let resolution = PreviewResolution::new(800, 600).unwrap();
 
         let camera = gaussian_camera_from_arcball_viewport(&arcball, resolution);

@@ -4,13 +4,13 @@
 //! These represent the fundamental elements stored in the mesh.
 
 use crate::handles::{EdgeHandle, FaceHandle, HalfedgeHandle, VertexHandle};
-use glam::Vec3;
+use crate::Point3;
 
 /// A vertex in the mesh
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vertex {
     /// Position of the vertex in 3D space
-    pub point: Vec3,
+    pub point: Point3,
     /// Handle to one of the outgoing halfedges
     pub halfedge_handle: Option<HalfedgeHandle>,
 }
@@ -18,7 +18,7 @@ pub struct Vertex {
 impl Default for Vertex {
     fn default() -> Self {
         Self {
-            point: Vec3::ZERO,
+            point: Point3::origin(),
             halfedge_handle: None,
         }
     }
@@ -26,7 +26,7 @@ impl Default for Vertex {
 
 impl Vertex {
     /// Create a new vertex at the given position
-    pub fn new(point: Vec3) -> Self {
+    pub fn new(point: Point3) -> Self {
         Self {
             point,
             halfedge_handle: None,
@@ -224,8 +224,8 @@ mod tests {
 
     #[test]
     fn test_vertex_creation() {
-        let v = Vertex::new(glam::vec3(1.0, 2.0, 3.0));
-        assert_eq!(v.point, glam::vec3(1.0, 2.0, 3.0));
+        let v = Vertex::new(Point3::new(1.0, 2.0, 3.0));
+        assert_eq!(v.point, Point3::new(1.0, 2.0, 3.0));
         assert!(v.is_isolated());
     }
 

@@ -22,6 +22,7 @@
 
 use crate::connectivity::RustMesh;
 use crate::handles::{FaceHandle, HalfedgeHandle, VertexHandle};
+use crate::{Point3, Vec3};
 use std::collections::HashMap;
 
 /// Error types for subdivision operations
@@ -286,12 +287,12 @@ pub fn split_edge(
     // Calculate new vertex position
     let new_pos = if is_boundary {
         // For boundary edges: midpoint
-        (p0 + p1) * 0.5
+        Point3::from((p0.coords + p1.coords) * 0.5)
     } else {
         // For interior edges: weighted average (Loop scheme for edge points)
         // New edge point = 3/8 * (p0 + p1) + 1/8 * (p_opposite0 + p_opposite1)
 
-        let mut sum = p0 + p1;
+        let mut sum = p0.coords + p1.coords;
         let mut count = 0;
 
         // Find the two faces adjacent to this edge
@@ -302,7 +303,7 @@ pub fn split_edge(
                 for &fv in &face_verts {
                     if fv != v0 && fv != v1 {
                         if let Some(p) = mesh.point(fv) {
-                            sum = sum + p;
+                            sum += p.coords;
                             count += 1;
                         }
                     }
@@ -316,7 +317,7 @@ pub fn split_edge(
                 for &fv in &face_verts {
                     if fv != v0 && fv != v1 {
                         if let Some(p) = mesh.point(fv) {
-                            sum = sum + p;
+                            sum += p.coords;
                             count += 1;
                         }
                     }
@@ -325,9 +326,9 @@ pub fn split_edge(
         }
 
         if count > 0 {
-            sum / (count as f32 + 2.0) // (p0 + p1 + sum_of_opposites) / (2 + count)
+            Point3::from(sum / (count as f32 + 2.0)) // (p0 + p1 + sum_of_opposites) / (2 + count)
         } else {
-            (p0 + p1) * 0.5
+            Point3::from((p0.coords + p1.coords) * 0.5)
         }
     };
 
@@ -369,9 +370,9 @@ pub fn split_edge(
 /// * `vh` - The vertex to update
 ///
 /// # Returns
-/// * `Ok(glam::Vec3)` - The new position
+/// * `Ok(Vec3)` - The new position
 /// * `Err(SubdivisionError)` - If the vertex is invalid
-fn calculate_loop_new_position(mesh: &RustMesh, vh: VertexHandle) -> SubdivisionResult<glam::Vec3> {
+fn calculate_loop_new_position(mesh: &RustMesh, vh: VertexHandle) -> SubdivisionResult<Point3> {
     let old_pos = mesh.point(vh).ok_or(SubdivisionError::VertexNotFound)?;
     let neighbors = get_vertex_neighbors(mesh, vh);
     let n = neighbors.len();
@@ -416,19 +417,21 @@ fn calculate_loop_new_position(mesh: &RustMesh, vh: VertexHandle) -> Subdivision
             if boundary_neighbors.len() >= 2 {
                 let right = boundary_neighbors[1];
                 let right_pos = mesh.point(right).unwrap_or(old_pos);
-                return Ok(old_pos * 0.125 + left_pos * 0.375 + right_pos * 0.375);
+                return Ok(Point3::from(
+                    old_pos.coords * 0.125 + left_pos.coords * 0.375 + right_pos.coords * 0.375,
+                ));
             } else {
                 // Only one boundary neighbor - use endpoint of boundary
-                return Ok(old_pos * 0.75 + left_pos * 0.25);
+                return Ok(Point3::from(old_pos.coords * 0.75 + left_pos.coords * 0.25));
             }
         }
 
         // Fallback: just average all neighbors
-        let sum: glam::Vec3 = neighbors
+        let sum: Vec3 = neighbors
             .iter()
             .filter_map(|&nh| mesh.point(nh))
-            .fold(glam::Vec3::ZERO, |a, b| a + b);
-        return Ok(old_pos * 0.25 + sum * 0.25);
+            .fold(Vec3::zeros(), |a, b| a + b.coords);
+        return Ok(Point3::from(old_pos.coords * 0.25 + sum * 0.25));
     } else {
         // Interior vertex: full Loop scheme
         // Beta calculation: beta = 1/n * (5/8 - (3/8 + 1/4*cos(2*pi/n))^2)
@@ -442,13 +445,13 @@ fn calculate_loop_new_position(mesh: &RustMesh, vh: VertexHandle) -> Subdivision
         let beta = (5.0 / 8.0 - (3.0 / 8.0 + 0.25 * cos_theta).powi(2)) / n_f32;
 
         // Sum of neighbor positions
-        let neighbor_sum: glam::Vec3 = neighbors
+        let neighbor_sum: Vec3 = neighbors
             .iter()
             .filter_map(|&nh| mesh.point(nh))
-            .fold(glam::Vec3::ZERO, |a, b| a + b);
+            .fold(Vec3::zeros(), |a, b| a + b.coords);
 
         // New position
-        let new_pos = old_pos * (1.0 - n_f32 * beta) + neighbor_sum * beta;
+        let new_pos = Point3::from(old_pos.coords * (1.0 - n_f32 * beta) + neighbor_sum * beta);
 
         Ok(new_pos)
     }
@@ -487,7 +490,7 @@ pub fn loop_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<SubdivisionStats
     let original_faces = mesh.n_faces();
 
     // Store original vertex positions for update after splitting
-    let mut original_positions: HashMap<u32, glam::Vec3> = HashMap::new();
+    let mut original_positions: HashMap<u32, Point3> = HashMap::new();
     for vh in mesh.vertices() {
         if let Some(pos) = mesh.point(vh) {
             original_positions.insert(vh.idx(), pos);
@@ -714,12 +717,9 @@ pub fn is_mesh_triangular(mesh: &RustMesh) -> bool {
 /// # Returns
 #[allow(dead_code)]
 
-/// * `Ok(glam::Vec3)` - The new position
+/// * `Ok(Vec3)` - The new position
 /// * `Err(SubdivisionError)` - If the vertex is invalid
-fn calculate_sqrt3_new_position(
-    mesh: &RustMesh,
-    vh: VertexHandle,
-) -> SubdivisionResult<glam::Vec3> {
+fn calculate_sqrt3_new_position(mesh: &RustMesh, vh: VertexHandle) -> SubdivisionResult<Point3> {
     let old_pos = mesh.point(vh).ok_or(SubdivisionError::VertexNotFound)?;
     let neighbors = get_vertex_neighbors(mesh, vh);
 
@@ -736,16 +736,16 @@ fn calculate_sqrt3_new_position(
     } else {
         // Interior vertex: apply Sqrt3 smoothing
         // Laplacian = average of neighbors - vertex
-        let neighbor_sum: glam::Vec3 = neighbors
+        let neighbor_sum: Vec3 = neighbors
             .iter()
             .filter_map(|&nh| mesh.point(nh))
-            .fold(glam::Vec3::ZERO, |a, b| a + b);
+            .fold(Vec3::zeros(), |a, b| a + b.coords);
 
         let neighbor_count = neighbors.len() as f32;
         let average = neighbor_sum / neighbor_count;
 
         // new_pos = old_pos + (average - old_pos) / 3
-        let laplacian = average - old_pos;
+        let laplacian = average - old_pos.coords;
         let new_pos = old_pos + laplacian * (1.0 / 3.0);
 
         Ok(new_pos)
@@ -787,12 +787,12 @@ pub fn sqrt3_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<SubdivisionStat
 
     // Step 1: Collect original vertex handles and their positions
     let original_vertices_list: Vec<VertexHandle> = mesh.vertices().collect();
-    let mut original_vertex_positions: Vec<glam::Vec3> = Vec::new();
+    let mut original_vertex_positions: Vec<Point3> = Vec::new();
     for &vh in &original_vertices_list {
         if let Some(pos) = mesh.point(vh) {
             original_vertex_positions.push(pos);
         } else {
-            original_vertex_positions.push(glam::Vec3::ZERO);
+            original_vertex_positions.push(Point3::origin());
         }
     }
 
@@ -814,14 +814,14 @@ pub fn sqrt3_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<SubdivisionStat
         let v2 = face_verts[2];
 
         // Get positions
-        let p0 = mesh.point(v0).unwrap_or(glam::Vec3::ZERO);
-        let p1 = mesh.point(v1).unwrap_or(glam::Vec3::ZERO);
-        let p2 = mesh.point(v2).unwrap_or(glam::Vec3::ZERO);
+        let p0 = mesh.point(v0).unwrap_or(Point3::origin());
+        let p1 = mesh.point(v1).unwrap_or(Point3::origin());
+        let p2 = mesh.point(v2).unwrap_or(Point3::origin());
 
         // Compute edge midpoints
-        let m01_pos = (p0 + p1) * 0.5;
-        let m12_pos = (p1 + p2) * 0.5;
-        let m20_pos = (p2 + p0) * 0.5;
+        let m01_pos = Point3::from((p0.coords + p1.coords) * 0.5);
+        let m12_pos = Point3::from((p1.coords + p2.coords) * 0.5);
+        let m20_pos = Point3::from((p2.coords + p0.coords) * 0.5);
 
         // Create vertices at edge midpoints
         let m01 = mesh.add_vertex(m01_pos);
@@ -875,16 +875,16 @@ pub fn sqrt3_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<SubdivisionStat
         }
 
         // Compute average of neighbors
-        let neighbor_sum: glam::Vec3 = neighbors
+        let neighbor_sum: Vec3 = neighbors
             .iter()
             .filter_map(|&nh| mesh.point(nh))
-            .fold(glam::Vec3::ZERO, |a, b| a + b);
+            .fold(Vec3::zeros(), |a, b| a + b.coords);
 
         let neighbor_count = neighbors.len() as f32;
         let average = neighbor_sum / neighbor_count;
 
         // new_pos = old_pos + (average - old_pos) / 3
-        let laplacian = average - old_pos;
+        let laplacian = average - old_pos.coords;
         let new_pos = old_pos + laplacian * (1.0 / 3.0);
 
         mesh.set_point(vh, new_pos);
@@ -936,18 +936,18 @@ pub fn sqrt3_subdivide_iterations(
 
 /// Compute the face point (centroid) of a face
 /// Face point = average of all vertices of the face
-fn compute_face_point(mesh: &RustMesh, fh: FaceHandle) -> glam::Vec3 {
+fn compute_face_point(mesh: &RustMesh, fh: FaceHandle) -> Point3 {
     let vertices = get_face_vertices_polygonal(mesh, fh);
     if vertices.is_empty() {
-        return glam::Vec3::ZERO;
+        return Point3::origin();
     }
 
-    let sum: glam::Vec3 = vertices
+    let sum: Vec3 = vertices
         .iter()
         .filter_map(|&vh| mesh.point(vh))
-        .fold(glam::Vec3::ZERO, |a, b| a + b);
+        .fold(Vec3::zeros(), |a, b| a + b.coords);
 
-    sum / vertices.len() as f32
+    Point3::from(sum / vertices.len() as f32)
 }
 
 /// Get all vertices of a face (works for n-gons)
@@ -1046,9 +1046,9 @@ fn is_boundary_edge(mesh: &RustMesh, v0: VertexHandle, v1: VertexHandle) -> bool
 /// Edge point = average of:
 /// - Midpoint of edge endpoints
 /// - Face points of adjacent faces (if interior) or just endpoints (if boundary)
-fn compute_edge_point(mesh: &RustMesh, v0: VertexHandle, v1: VertexHandle) -> glam::Vec3 {
-    let p0 = mesh.point(v0).unwrap_or(glam::Vec3::ZERO);
-    let p1 = mesh.point(v1).unwrap_or(glam::Vec3::ZERO);
+fn compute_edge_point(mesh: &RustMesh, v0: VertexHandle, v1: VertexHandle) -> Point3 {
+    let p0 = mesh.point(v0).unwrap_or(Point3::origin());
+    let p1 = mesh.point(v1).unwrap_or(Point3::origin());
 
     // Get the two faces adjacent to this edge
     let mut adjacent_faces: Vec<FaceHandle> = Vec::new();
@@ -1080,16 +1080,16 @@ fn compute_edge_point(mesh: &RustMesh, v0: VertexHandle, v1: VertexHandle) -> gl
     // Calculate edge point
     if adjacent_faces.is_empty() {
         // Boundary edge: just use midpoint
-        (p0 + p1) * 0.5
+        Point3::from((p0.coords + p1.coords) * 0.5)
     } else if adjacent_faces.len() == 1 {
         // One adjacent face (boundary): average of midpoint and face point
         let face_point = compute_face_point(mesh, adjacent_faces[0]);
-        (p0 + p1) * 0.25 + face_point * 0.5
+        Point3::from((p0.coords + p1.coords) * 0.25 + face_point.coords * 0.5)
     } else {
         // Interior edge: average of midpoint and both face points
         let fp0 = compute_face_point(mesh, adjacent_faces[0]);
         let fp1 = compute_face_point(mesh, adjacent_faces[1]);
-        (p0 + p1) * 0.25 + (fp0 + fp1) * 0.25
+        Point3::from((p0.coords + p1.coords) * 0.25 + (fp0.coords + fp1.coords) * 0.25)
     }
 }
 
@@ -1103,7 +1103,7 @@ fn compute_edge_point(mesh: &RustMesh, v0: VertexHandle, v1: VertexHandle) -> gl
 fn calculate_catmull_clark_new_position(
     mesh: &RustMesh,
     vh: VertexHandle,
-) -> SubdivisionResult<glam::Vec3> {
+) -> SubdivisionResult<Point3> {
     let p = mesh.point(vh).ok_or(SubdivisionError::VertexNotFound)?;
 
     // Get all incident faces
@@ -1115,15 +1115,15 @@ fn calculate_catmull_clark_new_position(
     }
 
     // Calculate F: average of face points
-    let f_sum: glam::Vec3 = faces
+    let f_sum: Vec3 = faces
         .iter()
         .map(|&fh| compute_face_point(mesh, fh))
-        .fold(glam::Vec3::ZERO, |a, b| a + b);
+        .fold(Vec3::zeros(), |a, b| a + b.coords);
     let f = f_sum / n as f32;
 
     // Calculate R: average of edge points
     // Get unique edges incident to this vertex
-    let mut edge_points: Vec<glam::Vec3> = Vec::new();
+    let mut edge_points: Vec<Point3> = Vec::new();
 
     if let Some(heh) = mesh.halfedge_handle(vh) {
         let mut current = heh;
@@ -1141,12 +1141,12 @@ fn calculate_catmull_clark_new_position(
     }
 
     // Calculate average of edge points
-    let r_sum: glam::Vec3 = edge_points.iter().fold(glam::Vec3::ZERO, |a, &b| a + b);
+    let r_sum: Vec3 = edge_points.iter().fold(Vec3::zeros(), |a, b| a + b.coords);
     let r = r_sum / edge_points.len() as f32;
 
     // Apply Catmull-Clark formula: (F + 2R + (n-2)P) / n
     let n_f32 = n as f32;
-    let new_pos = (f + r * 2.0 + p * (n_f32 - 2.0)) / n_f32;
+    let new_pos = Point3::from((f + r * 2.0 + p.coords * (n_f32 - 2.0)) / n_f32);
 
     Ok(new_pos)
 }
@@ -1185,7 +1185,7 @@ pub fn catmull_clark_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<Subdivi
         (0..original_faces as u32).map(FaceHandle::new).collect();
 
     // Store original positions for vertices
-    let mut original_positions: HashMap<u32, glam::Vec3> = HashMap::new();
+    let mut original_positions: HashMap<u32, Point3> = HashMap::new();
     for vh in mesh.vertices() {
         if let Some(pos) = mesh.point(vh) {
             original_positions.insert(vh.idx(), pos);
@@ -1193,7 +1193,7 @@ pub fn catmull_clark_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<Subdivi
     }
 
     // Step 1: Compute all face points and store them
-    let mut face_points: HashMap<u32, glam::Vec3> = HashMap::new();
+    let mut face_points: HashMap<u32, Point3> = HashMap::new();
     for fh in mesh.faces() {
         let fp = compute_face_point(mesh, fh);
         face_points.insert(fh.idx(), fp);
@@ -1202,7 +1202,7 @@ pub fn catmull_clark_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<Subdivi
     // Step 2: Compute all edge points and create new vertices
     // We need to track: (v0, v1) -> new_vertex_handle
     let mut edge_to_new_vertex: HashMap<(u32, u32), VertexHandle> = HashMap::new();
-    let mut edge_points_map: HashMap<(u32, u32), glam::Vec3> = HashMap::new();
+    let mut edge_points_map: HashMap<(u32, u32), Point3> = HashMap::new();
 
     // Iterate through all halfedges to find unique edges
     let n_halfedges = mesh.n_halfedges();
@@ -1454,9 +1454,9 @@ pub fn midpoint_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<SubdivisionS
         }
 
         // Create midpoint vertex
-        let p0 = mesh.point(min_v).unwrap_or(glam::Vec3::ZERO);
-        let p1 = mesh.point(max_v).unwrap_or(glam::Vec3::ZERO);
-        let midpoint = (p0 + p1) * 0.5;
+        let p0 = mesh.point(min_v).unwrap_or(Point3::origin());
+        let p1 = mesh.point(max_v).unwrap_or(Point3::origin());
+        let midpoint = Point3::from((p0.coords + p1.coords) * 0.5);
 
         let new_vh = mesh.add_vertex(midpoint);
         edge_to_midpoint.insert((min_v.idx(), max_v.idx()), new_vh);
@@ -1543,11 +1543,11 @@ pub fn midpoint_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<SubdivisionS
             let m30 = edge_midpoints[3];
 
             // Compute face center
-            let p0 = mesh.point(v0).unwrap_or(glam::Vec3::ZERO);
-            let p1 = mesh.point(v1).unwrap_or(glam::Vec3::ZERO);
-            let p2 = mesh.point(v2).unwrap_or(glam::Vec3::ZERO);
-            let p3 = mesh.point(v3).unwrap_or(glam::Vec3::ZERO);
-            let center_pos = (p0 + p1 + p2 + p3) * 0.25;
+            let p0 = mesh.point(v0).unwrap_or(Point3::origin());
+            let p1 = mesh.point(v1).unwrap_or(Point3::origin());
+            let p2 = mesh.point(v2).unwrap_or(Point3::origin());
+            let p3 = mesh.point(v3).unwrap_or(Point3::origin());
+            let center_pos = Point3::from((p0.coords + p1.coords + p2.coords + p3.coords) * 0.25);
             let center = mesh.add_vertex(center_pos);
 
             if m01.is_valid() && m12.is_valid() && m23.is_valid() && m30.is_valid() {
@@ -1559,11 +1559,11 @@ pub fn midpoint_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<SubdivisionS
         } else {
             // General n-gon: create center vertex and n new faces
             // Compute face center
-            let mut center_sum = glam::Vec3::ZERO;
+            let mut center_sum = Vec3::zeros();
             for &v in &face_verts {
-                center_sum += mesh.point(v).unwrap_or(glam::Vec3::ZERO);
+                center_sum += mesh.point(v).unwrap_or(Point3::origin()).coords;
             }
-            let center_pos = center_sum / n as f32;
+            let center_pos = Point3::from(center_sum / n as f32);
             let center = mesh.add_vertex(center_pos);
 
             // Create n new faces
@@ -1726,9 +1726,9 @@ pub fn butterfly_subdivide(mesh: &mut RustMesh) -> SubdivisionResult<Subdivision
                 Some(&mid_vh) => edge_midpoints.push(mid_vh),
                 None => {
                     // Fallback: create midpoint if not found
-                    let pi = mesh.point(vi).unwrap_or(glam::Vec3::ZERO);
-                    let pj = mesh.point(vj).unwrap_or(glam::Vec3::ZERO);
-                    let mid_vh = mesh.add_vertex((pi + pj) * 0.5);
+                    let pi = mesh.point(vi).unwrap_or(Point3::origin());
+                    let pj = mesh.point(vj).unwrap_or(Point3::origin());
+                    let mid_vh = mesh.add_vertex(Point3::from((pi.coords + pj.coords) * 0.5));
                     edge_midpoints.push(mid_vh);
                 }
             }
@@ -1784,22 +1784,22 @@ fn compute_butterfly_position(
     mesh: &RustMesh,
     v0: VertexHandle,
     v1: VertexHandle,
-    p0: glam::Vec3,
-    p1: glam::Vec3,
-) -> glam::Vec3 {
+    p0: Point3,
+    p1: Point3,
+) -> Point3 {
     // Standard Butterfly weight
     const W: f32 = 1.0 / 8.0;
 
     // Start with the edge midpoint contribution
-    let mut new_pos = (p0 + p1) * 0.5;
+    let mut new_pos = Point3::from((p0.coords + p1.coords) * 0.5);
 
     // Get the two adjacent triangles
     let he0 = find_halfedge_between(mesh, v0, v1);
     let he1 = he0.and_then(|he| Some(mesh.opposite_halfedge_handle(he)));
 
     // Find the opposite vertices in the two adjacent triangles
-    let mut opposite_vertices: Vec<glam::Vec3> = Vec::with_capacity(2);
-    let mut far_vertices: Vec<glam::Vec3> = Vec::with_capacity(4);
+    let mut opposite_vertices: Vec<Point3> = Vec::with_capacity(2);
+    let mut far_vertices: Vec<Point3> = Vec::with_capacity(4);
 
     if let Some(he) = he0 {
         // Get the opposite vertex in the triangle on the he side
@@ -1860,9 +1860,9 @@ fn compute_butterfly_position(
     // w * (v2 + v3)
     let opp_count = opposite_vertices.len().min(2);
     if opp_count > 0 {
-        let mut opp_sum = glam::Vec3::ZERO;
+        let mut opp_sum = Vec3::zeros();
         for p in opposite_vertices.iter().take(opp_count) {
-            opp_sum += *p;
+            opp_sum += p.coords;
         }
         new_pos += W * opp_sum;
     }
@@ -1871,9 +1871,9 @@ fn compute_butterfly_position(
     // -w/2 * (v4 + v5 + v6 + v7)
     let far_count = far_vertices.len().min(4);
     if far_count > 0 {
-        let mut far_sum = glam::Vec3::ZERO;
+        let mut far_sum = Vec3::zeros();
         for p in far_vertices.iter().take(far_count) {
-            far_sum += *p;
+            far_sum += p.coords;
         }
         new_pos -= (W / 2.0) * far_sum;
     }
@@ -1922,9 +1922,9 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create a simple triangle
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.5, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
 
@@ -1935,10 +1935,10 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create a quad as two triangles (boundary mesh)
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(1.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
         mesh.add_face(&[v0, v2, v3]);
@@ -1951,10 +1951,10 @@ mod tests {
 
         // Tetrahedron (closed mesh) - faces must have consistent orientation
         // so adjacent faces share edges in opposite directions
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.5, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::vec3(0.5, 0.5, 1.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.5, 0.5, 1.0));
 
         mesh.add_face(&[v0, v1, v2]); // Base
         mesh.add_face(&[v0, v2, v3]);
@@ -2038,7 +2038,7 @@ mod tests {
 
         // Check new vertex position
         let new_pos = mesh.point(new_vh).unwrap();
-        let expected = glam::vec3(0.5, 0.0, 0.0); // Midpoint of (0,0,0) and (1,0,0)
+        let expected = Vec3::new(0.5, 0.0, 0.0); // Midpoint of (0,0,0) and (1,0,0)
 
         assert!((new_pos.x - expected.x).abs() < 0.001);
         assert!((new_pos.y - expected.y).abs() < 0.001);
@@ -2181,7 +2181,7 @@ mod tests {
         let calculated = new_pos.unwrap();
 
         // Should be a weighted average, so slightly different
-        let diff = (calculated - old_pos).length();
+        let diff = (calculated - old_pos).norm();
         assert!(diff >= 0.0);
     }
 
@@ -2205,14 +2205,14 @@ mod tests {
         // Using 20 triangles - a simple subdivision test
 
         // Center top
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         // Upper ring (5 vertices)
         let angle_step = std::f32::consts::TAU / 5.0;
         let upper: Vec<_> = (0..5)
             .map(|i| {
                 let angle = i as f32 * angle_step;
-                mesh.add_vertex(glam::vec3(angle.sin() * 0.8, 0.6, angle.cos() * 0.8))
+                mesh.add_vertex(Point3::new(angle.sin() * 0.8, 0.6, angle.cos() * 0.8))
             })
             .collect();
 
@@ -2220,12 +2220,12 @@ mod tests {
         let lower: Vec<_> = (0..5)
             .map(|i| {
                 let angle = (i as f32 + 0.5) * angle_step;
-                mesh.add_vertex(glam::vec3(angle.sin() * 0.8, -0.6, angle.cos() * 0.8))
+                mesh.add_vertex(Point3::new(angle.sin() * 0.8, -0.6, angle.cos() * 0.8))
             })
             .collect();
 
         // Bottom
-        let _v11 = mesh.add_vertex(glam::vec3(0.0, -1.0, 0.0));
+        let _v11 = mesh.add_vertex(Point3::new(0.0, -1.0, 0.0));
 
         // Add faces (simplified - upper cap)
         for i in 0..5 {
@@ -2271,10 +2271,10 @@ mod tests {
         // v3 --- v2
         // |      |
         // v0 --- v1
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(1.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2, v3]);
 
@@ -2286,16 +2286,16 @@ mod tests {
 
         // Create a cube (8 vertices, 6 quad faces)
         // Front face
-        let v0 = mesh.add_vertex(glam::vec3(-1.0, -1.0, 1.0)); // front bottom-left
-        let v1 = mesh.add_vertex(glam::vec3(1.0, -1.0, 1.0)); // front bottom-right
-        let v2 = mesh.add_vertex(glam::vec3(1.0, 1.0, 1.0)); // front top-right
-        let v3 = mesh.add_vertex(glam::vec3(-1.0, 1.0, 1.0)); // front top-left
+        let v0 = mesh.add_vertex(Point3::new(-1.0, -1.0, 1.0)); // front bottom-left
+        let v1 = mesh.add_vertex(Point3::new(1.0, -1.0, 1.0)); // front bottom-right
+        let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, 1.0)); // front top-right
+        let v3 = mesh.add_vertex(Point3::new(-1.0, 1.0, 1.0)); // front top-left
 
         // Back face
-        let v4 = mesh.add_vertex(glam::vec3(-1.0, -1.0, -1.0)); // back bottom-left
-        let v5 = mesh.add_vertex(glam::vec3(1.0, -1.0, -1.0)); // back bottom-right
-        let v6 = mesh.add_vertex(glam::vec3(1.0, 1.0, -1.0)); // back top-right
-        let v7 = mesh.add_vertex(glam::vec3(-1.0, 1.0, -1.0)); // back top-left
+        let v4 = mesh.add_vertex(Point3::new(-1.0, -1.0, -1.0)); // back bottom-left
+        let v5 = mesh.add_vertex(Point3::new(1.0, -1.0, -1.0)); // back bottom-right
+        let v6 = mesh.add_vertex(Point3::new(1.0, 1.0, -1.0)); // back top-right
+        let v7 = mesh.add_vertex(Point3::new(-1.0, 1.0, -1.0)); // back top-left
 
         // Front face
         mesh.add_face(&[v0, v1, v2, v3]);
@@ -2488,11 +2488,11 @@ mod tests {
         //  |
         //  v3--v4
         //
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(0.5, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::vec3(0.0, -1.0, 0.0));
-        let v4 = mesh.add_vertex(glam::vec3(1.0, -1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, -1.0, 0.0));
+        let v4 = mesh.add_vertex(Point3::new(1.0, -1.0, 0.0));
 
         // Triangle face
         mesh.add_face(&[v0, v1, v2]);
@@ -2774,14 +2774,14 @@ mod tests {
 
         // Create an icosahedron-like mesh (20 triangles)
         // Center top
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         // Upper ring (5 vertices)
         let angle_step = std::f32::consts::TAU / 5.0;
         let upper: Vec<_> = (0..5)
             .map(|i| {
                 let angle = i as f32 * angle_step;
-                mesh.add_vertex(glam::vec3(angle.sin() * 0.8, 0.6, angle.cos() * 0.8))
+                mesh.add_vertex(Point3::new(angle.sin() * 0.8, 0.6, angle.cos() * 0.8))
             })
             .collect();
 
@@ -2789,12 +2789,12 @@ mod tests {
         let lower: Vec<_> = (0..5)
             .map(|i| {
                 let angle = (i as f32 + 0.5) * angle_step;
-                mesh.add_vertex(glam::vec3(angle.sin() * 0.8, -0.6, angle.cos() * 0.8))
+                mesh.add_vertex(Point3::new(angle.sin() * 0.8, -0.6, angle.cos() * 0.8))
             })
             .collect();
 
         // Bottom
-        let v11 = mesh.add_vertex(glam::vec3(0.0, -1.0, 0.0));
+        let v11 = mesh.add_vertex(Point3::new(0.0, -1.0, 0.0));
 
         // Add faces (simplified - upper cap)
         for i in 0..5 {
@@ -2838,10 +2838,10 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create a quad (not triangular)
-        let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::vec3(1.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2, v3]);
 
@@ -3128,9 +3128,9 @@ mod tests {
         // Check midpoint positions
         // Edge 0-1 midpoint should be at (0.5, 0, 0)
         let midpoint_01 = mesh.point(VertexHandle::new(3)).unwrap();
-        let expected_midpoint_01 = (original_v0 + original_v1) * 0.5;
+        let expected_midpoint_01 = Point3::from((original_v0.coords + original_v1.coords) * 0.5);
         assert!(
-            (midpoint_01 - expected_midpoint_01).length() < 0.001,
+            (midpoint_01 - expected_midpoint_01).norm() < 0.001,
             "Midpoint should be at edge center"
         );
     }

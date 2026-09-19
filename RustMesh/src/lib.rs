@@ -5,12 +5,12 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use rustmesh::{RustMesh, Vec3};
+//! use rustmesh::{Point3, RustMesh};
 //!
 //! let mut mesh = RustMesh::new();
-//! let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-//! let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-//! let v2 = mesh.add_vertex(Vec3::new(0.0, 1.0, 0.0));
+//! let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+//! let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+//! let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 //! mesh.add_face(&[v0, v1, v2]);
 //! ```
 
@@ -44,7 +44,12 @@ pub use subdivision::{
 pub use test_data::*;
 pub use vdpm::*;
 
-pub use glam::Vec3;
+pub type Vec2 = nalgebra::Vector2<f32>;
+pub type Vec3 = nalgebra::Vector3<f32>;
+pub type Vec4 = nalgebra::Vector4<f32>;
+pub type DVec3 = nalgebra::Vector3<f64>;
+pub type Point3 = nalgebra::Point3<f32>;
+pub type Point = Point3;
 
 // ============================================================================
 // Module Structure (following OpenMesh: Core + Tools + Utils)

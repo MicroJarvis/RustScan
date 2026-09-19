@@ -1,4 +1,5 @@
 use super::*;
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use rustslam::loop_closing::detector::compute_sim3_from_matches;
 use std::fmt;
 
@@ -393,9 +394,12 @@ pub(super) fn apply_colmap_small_reconstruction_global_ba_solver_options(
     if registered_frame_count(reconstruction) >= MIN_NUM_REG_FRAMES_FOR_FAST_BA {
         return;
     }
+    // COLMAP AdjustGlobalBundle for NumRegFrames < 10:
+    // tolerances /= 10, max_num_iterations *= 2, max_linear_solver_iterations = 200.
     options.function_tolerance /= 10.0;
     options.gradient_tolerance /= 10.0;
     options.parameter_tolerance /= 10.0;
+    options.iterations = options.iterations.saturating_mul(2);
     options.max_linear_solver_iterations = 200;
 }
 
@@ -459,8 +463,12 @@ pub(super) enum BundleAdjustmentSkipReason {
     SolverReturnedNone,
     AdmissionFailed(String),
     UnusableSolution(crate::ba::BundleAdjustmentReport),
-    #[allow(dead_code)] // retained so skip-reason Display/tests still cover the historical log form
-    PostBogusCameras { indices: Vec<usize>, audit: String },
+    #[allow(dead_code)]
+    // retained so skip-reason Display/tests still cover the historical log form
+    PostBogusCameras {
+        indices: Vec<usize>,
+        audit: String,
+    },
 }
 
 impl fmt::Display for BundleAdjustmentSkipReason {
@@ -825,8 +833,8 @@ pub(super) fn expand_images_to_registration_frames(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct PosePriorAlignment {
     pub scale: f32,
-    pub rotation: glam::Mat3,
-    pub translation: glam::Vec3,
+    pub rotation: nalgebra::Matrix3<f32>,
+    pub translation: nalgebra::Vector3<f32>,
 }
 
 impl PosePriorAlignment {
@@ -837,15 +845,15 @@ impl PosePriorAlignment {
         // `transform_pose(pose).transform_point(transform_point(p))` equals the
         // camera-frame coordinates of `p` scaled by the similarity.
         let world_from_camera = pose.inverse();
-        let rotation = glam::Quat::from_mat3(&self.rotation)
-            * glam::Quat::from_array(world_from_camera.quaternion());
+        let rotation = crate::geometry::quat_from_mat3(&self.rotation)
+            * crate::geometry::quat_from_array(world_from_camera.quaternion());
         let translation = self.scale
-            * (self.rotation * glam::Vec3::from_array(world_from_camera.translation()))
+            * (self.rotation * nalgebra::Vector3::from(world_from_camera.translation()))
             + self.translation;
         SE3::from_quat_translation(rotation, translation).inverse()
     }
 
-    pub fn transform_point(&self, point: glam::Vec3) -> glam::Vec3 {
+    pub fn transform_point(&self, point: nalgebra::Vector3<f32>) -> nalgebra::Vector3<f32> {
         self.scale * (self.rotation * point) + self.translation
     }
 }
@@ -867,7 +875,7 @@ pub(super) fn align_reconstruction_to_pose_priors(
             continue;
         };
         src.push(camera_center(pose));
-        tgt.push(glam::Vec3::new(
+        tgt.push(nalgebra::Vector3::new(
             prior.position[0] as f32,
             prior.position[1] as f32,
             prior.position[2] as f32,
@@ -883,7 +891,7 @@ pub(super) fn align_reconstruction_to_pose_priors(
     }
     for point in reconstruction.points.iter_mut() {
         point.xyz = transform
-            .transform_point(glam::Vec3::from_array(point.xyz))
+            .transform_point(nalgebra::Vector3::from(point.xyz))
             .to_array();
     }
     for frame in reconstruction.frames.iter_mut() {
@@ -930,8 +938,8 @@ fn pose_prior_alignment_max_error(priors: &[crate::ba::BundleAdjustmentPosePrior
 }
 
 fn estimate_sim3_robust(
-    src: &[glam::Vec3],
-    tgt: &[glam::Vec3],
+    src: &[nalgebra::Vector3<f32>],
+    tgt: &[nalgebra::Vector3<f32>],
     max_error: f32,
     random_seed: i32,
 ) -> Option<PosePriorAlignment> {
@@ -980,7 +988,7 @@ fn estimate_sim3_robust(
     Some(PosePriorAlignment {
         scale: refined.scale,
         rotation,
-        translation: glam::Vec3::from_array(refined.translation),
+        translation: nalgebra::Vector3::from(refined.translation),
     })
 }
 
@@ -990,15 +998,21 @@ fn estimate_sim3_robust(
 /// that line, which would rotate the whole reconstruction away from the prior
 /// frame. Among the rotations that fit the position pairs equally well, keep
 /// the one with minimal angular change. Non-degenerate data is unaffected.
-pub(super) fn remove_degenerate_alignment_rotation(rotation: &mut glam::Mat3, src: &[[f32; 3]]) {
+pub(super) fn remove_degenerate_alignment_rotation(
+    rotation: &mut nalgebra::Matrix3<f32>,
+    src: &[[f32; 3]],
+) {
     const DEGENERACY_RATIO: f32 = 1.0e-3;
     let n = src.len() as f32;
-    let center = src.iter().fold(glam::Vec3::ZERO, |sum, point| {
-        sum + glam::Vec3::from_array(*point)
-    }) / n;
+    let center = src
+        .iter()
+        .fold(nalgebra::Vector3::<f32>::zeros(), |sum, point| {
+            sum + nalgebra::Vector3::from(*point)
+        })
+        / n;
     let mut covariance = nalgebra::Matrix3::<f32>::zeros();
     for point in src {
-        let delta = glam::Vec3::from_array(*point) - center;
+        let delta = nalgebra::Vector3::from(*point) - center;
         let column = nalgebra::Vector3::new(delta.x, delta.y, delta.z);
         covariance += column * column.transpose();
     }
@@ -1017,21 +1031,22 @@ pub(super) fn remove_degenerate_alignment_rotation(rotation: &mut glam::Mat3, sr
         return;
     }
     let line_axis = eigen.eigenvectors.column(max_index);
-    let line_axis = glam::Vec3::new(line_axis.x, line_axis.y, line_axis.z).normalize_or_zero();
-    if line_axis.length_squared() < 0.5 {
+    let line_axis = nalgebra::Vector3::new(line_axis.x, line_axis.y, line_axis.z)
+        .try_normalize(f32::EPSILON)
+        .unwrap_or_else(nalgebra::Vector3::zeros);
+    if line_axis.norm_squared() < 0.5 {
         return;
     }
-    let current = glam::Quat::from_mat3(rotation);
-    let (current_axis, current_angle) = current.to_axis_angle();
-    let degenerate_component = current_angle * current_axis.dot(line_axis);
-    let correction = glam::Quat::from_axis_angle(line_axis, -degenerate_component);
-    *rotation = glam::Mat3::from_quat(correction * current);
+    let current = crate::geometry::quat_from_mat3(rotation);
+    let degenerate_component = current.scaled_axis().dot(&line_axis);
+    let correction = crate::geometry::quat_from_axis_angle(line_axis, -degenerate_component);
+    *rotation = crate::geometry::mat3_from_quat(correction * current);
 }
 
 /// Sim3 rotation rows are indexed (row, column); glam's `Mat3` is
 /// column-major, so the row arrays are transposed into columns here.
-fn sim3_rotation_matrix(rotation: &[[f32; 3]; 3]) -> glam::Mat3 {
-    glam::Mat3::from_cols_array_2d(&[
+fn sim3_rotation_matrix(rotation: &[[f32; 3]; 3]) -> nalgebra::Matrix3<f32> {
+    rustscan_types::matrix3_from_column_major_array(&[
         [rotation[0][0], rotation[1][0], rotation[2][0]],
         [rotation[0][1], rotation[1][1], rotation[2][1]],
         [rotation[0][2], rotation[1][2], rotation[2][2]],
@@ -1045,13 +1060,13 @@ fn sim3_inliers(
     max_error_sq: f64,
 ) -> Vec<usize> {
     let rotation = sim3_rotation_matrix(&model.rotation);
-    let translation = glam::Vec3::from_array(model.translation);
+    let translation = nalgebra::Vector3::from(model.translation);
     (0..src.len())
         .filter(|&idx| {
             let predicted =
-                model.scale * (rotation * glam::Vec3::from_array(src[idx])) + translation;
-            let diff = predicted - glam::Vec3::from_array(tgt[idx]);
-            (diff.length_squared() as f64) <= max_error_sq
+                model.scale * (rotation * nalgebra::Vector3::from(src[idx])) + translation;
+            let diff = predicted - nalgebra::Vector3::from(tgt[idx]);
+            (diff.norm_squared() as f64) <= max_error_sq
         })
         .collect()
 }

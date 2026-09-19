@@ -1,6 +1,7 @@
-use crate::geometry::{camera_center, pose_rotation};
+use crate::geometry::{camera_center, pose_rotation, UnitQuatNormalize, Vec3GlamExt};
 use crate::types::PairGeometry;
-use glam::{Mat3 as GMat3, Quat, Vec3};
+type Quat = nalgebra::UnitQuaternion<f32>;
+type Vec3 = nalgebra::Vector3<f32>;
 use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, UnitQuaternion, Vector3};
 use rustslam::SE3;
 
@@ -11,7 +12,7 @@ pub fn initialize_pose_graph(
 ) -> Vec<SE3> {
     let seed_rotations = seed_poses
         .iter()
-        .map(|pose| pose.map(pose_rotation).unwrap_or(Quat::IDENTITY))
+        .map(|pose| pose.map(pose_rotation).unwrap_or(Quat::identity()))
         .collect::<Vec<_>>();
     let first_pass_rotations = average_rotations(image_count, pairs, &seed_rotations);
     let rotation_edges =
@@ -81,7 +82,7 @@ fn filter_rotation_consistent_edges(
 }
 
 fn chain_rotations_from_adjacent(image_count: usize, pairs: &[PairGeometry]) -> Vec<Quat> {
-    let mut rotations = vec![Quat::IDENTITY; image_count];
+    let mut rotations = vec![Quat::identity(); image_count];
     for idx in 1..image_count {
         if let Some(pair) = pairs
             .iter()
@@ -126,11 +127,13 @@ fn filter_translation_consistent_edges(
             let Some(edge_dir) = edge_world_direction(pair, rotations[pair.right]) else {
                 return false;
             };
-            let Some(delta_dir) = (centers[pair.right] - centers[pair.left]).try_normalize() else {
+            let Some(delta_dir) =
+                (centers[pair.right] - centers[pair.left]).try_normalize(f32::EPSILON)
+            else {
                 return false;
             };
             let angle = edge_dir
-                .dot(delta_dir)
+                .dot(&delta_dir)
                 .abs()
                 .clamp(-1.0, 1.0)
                 .acos()
@@ -151,7 +154,7 @@ fn average_rotations(
     pairs: &[PairGeometry],
     seed_rotations: &[Quat],
 ) -> Vec<Quat> {
-    let mut rotations = vec![Quat::IDENTITY; image_count];
+    let mut rotations = vec![Quat::identity(); image_count];
     for idx in 1..image_count {
         if let Some(pair) = pairs
             .iter()
@@ -187,7 +190,7 @@ fn average_rotations(
                 max_step = max_step.max(step.length());
                 rotations[idx] = (Quat::from_scaled_axis(step) * rotations[idx]).normalize();
             }
-            rotations[0] = Quat::IDENTITY;
+            rotations[0] = Quat::identity();
             if max_step < 1.0e-7 {
                 break;
             }
@@ -195,7 +198,7 @@ fn average_rotations(
         return rotations;
     }
     for _ in 0..rotation_iterations {
-        let mut gradients = vec![Vec3::ZERO; image_count];
+        let mut gradients = vec![Vec3::zeros(); image_count];
         let mut weights = vec![0.0f32; image_count];
         for pair in pairs {
             if is_segment_break_edge(pair) {
@@ -223,7 +226,7 @@ fn average_rotations(
             let step = (gradients[idx] / weights[idx]).clamp_length_max(rotation_step_limit());
             rotations[idx] = (Quat::from_scaled_axis(step) * rotations[idx]).normalize();
         }
-        rotations[0] = Quat::IDENTITY;
+        rotations[0] = Quat::identity();
     }
     rotations
 }
@@ -312,29 +315,18 @@ fn average_rotations_chordal(image_count: usize, pairs: &[PairGeometry]) -> Opti
         let rotation = project_matrix_to_rotation(m)?;
         rotations.push(matrix_to_quat(rotation));
     }
-    rotations[0] = Quat::IDENTITY;
+    rotations[0] = Quat::identity();
     Some(rotations)
 }
 
 fn quat_to_matrix(q: Quat) -> Matrix3<f64> {
-    let cols = GMat3::from_quat(q.normalize()).to_cols_array();
-    Matrix3::from_row_slice(&[
-        cols[0] as f64,
-        cols[3] as f64,
-        cols[6] as f64,
-        cols[1] as f64,
-        cols[4] as f64,
-        cols[7] as f64,
-        cols[2] as f64,
-        cols[5] as f64,
-        cols[8] as f64,
-    ])
+    nalgebra::convert(crate::geometry::mat3_from_quat(q.normalize()))
 }
 
 fn matrix_to_quat(rotation: Matrix3<f64>) -> Quat {
     let q = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(rotation))
         .into_inner();
-    Quat::from_xyzw(q.i as f32, q.j as f32, q.k as f32, q.w as f32).normalize()
+    crate::geometry::quat_from_xyzw(q.i as f32, q.j as f32, q.k as f32, q.w as f32).normalize()
 }
 
 fn project_matrix_to_rotation(matrix: Matrix3<f64>) -> Option<Matrix3<f64>> {
@@ -354,7 +346,7 @@ fn solve_rotation_increment(
     rotations: &[Quat],
 ) -> Option<Vec<Vec3>> {
     if image_count < 2 {
-        return Some(vec![Vec3::ZERO; image_count]);
+        return Some(vec![Vec3::zeros(); image_count]);
     }
     let variable_count = (image_count - 1) * 3;
     let mut h = DMatrix::<f64>::zeros(variable_count, variable_count);
@@ -406,7 +398,7 @@ fn solve_rotation_increment(
     if !solution.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let mut increments = vec![Vec3::ZERO; image_count];
+    let mut increments = vec![Vec3::zeros(); image_count];
     for idx in 1..image_count {
         increments[idx] = Vec3::new(
             solution[(idx - 1) * 3] as f32,
@@ -438,15 +430,15 @@ fn rotation_step_limit() -> f32 {
 fn quat_log(q: Quat) -> Vec3 {
     let mut q = q.normalize();
     if q.w < 0.0 {
-        q = -q;
+        q = crate::geometry::quat_neg(q);
     }
     let w = q.w.clamp(-1.0, 1.0);
     let angle = 2.0 * w.acos();
     let sin_half = (1.0 - w * w).sqrt();
     if sin_half < 1.0e-6 || angle.abs() < 1.0e-6 {
-        Vec3::ZERO
+        Vec3::zeros()
     } else {
-        Vec3::new(q.x, q.y, q.z) * (angle / sin_half)
+        Vec3::new(q.i, q.j, q.k) * (angle / sin_half)
     }
 }
 
@@ -520,12 +512,12 @@ fn project_center_segment_to_circle(centers: &mut [Vec3]) -> Option<CircleFit> {
     let Some((mean, basis_u, basis_v)) = fit_center_plane(centers) else {
         return None;
     };
-    let normal = basis_u.cross(basis_v).try_normalize()?;
+    let normal = basis_u.cross(&basis_v).try_normalize(f32::EPSILON)?;
     let coords = centers
         .iter()
         .map(|&center| {
             let d = center - mean;
-            (d.dot(basis_u), d.dot(basis_v))
+            (d.dot(&basis_u), d.dot(&basis_v))
         })
         .collect::<Vec<_>>();
     let Some((circle_center, radius)) = fit_circle_2d(&coords) else {
@@ -569,7 +561,11 @@ fn circle_prior_min_images() -> usize {
 }
 
 fn fit_center_plane(centers: &[Vec3]) -> Option<(Vec3, Vec3, Vec3)> {
-    let mean = centers.iter().copied().fold(Vec3::ZERO, |acc, c| acc + c) / centers.len() as f32;
+    let mean = centers
+        .iter()
+        .copied()
+        .fold(Vec3::zeros(), |acc, c| acc + c)
+        / centers.len() as f32;
     let mut cov = Matrix3::<f64>::zeros();
     for &center in centers {
         let d = center - mean;
@@ -585,12 +581,13 @@ fn fit_center_plane(centers: &[Vec3]) -> Option<(Vec3, Vec3, Vec3)> {
     });
     let u = eig.eigenvectors.column(order[0]);
     let v = eig.eigenvectors.column(order[1]);
-    let basis_u = Vec3::new(u[0] as f32, u[1] as f32, u[2] as f32).try_normalize()?;
-    let mut basis_v = Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32).try_normalize()?;
-    if basis_u.cross(basis_v).length_squared() <= 1.0e-8 {
+    let basis_u = Vec3::new(u[0] as f32, u[1] as f32, u[2] as f32).try_normalize(f32::EPSILON)?;
+    let mut basis_v =
+        Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32).try_normalize(f32::EPSILON)?;
+    if basis_u.cross(&basis_v).norm_squared() <= 1.0e-8 {
         return None;
     }
-    basis_v = (basis_v - basis_u * basis_v.dot(basis_u)).try_normalize()?;
+    basis_v = (basis_v - basis_u * basis_v.dot(&basis_u)).try_normalize(f32::EPSILON)?;
     Some((mean, basis_u, basis_v))
 }
 
@@ -723,8 +720,8 @@ fn regularize_rotation_segment(
     for normal in candidate_circle_normals(segment.normal) {
         let local_frames = (segment.start..segment.end)
             .filter_map(|idx| {
-                let radial = (segment.center - centers[idx]).try_normalize()?;
-                let tangent = normal.cross(radial).try_normalize()?;
+                let radial = (segment.center - centers[idx]).try_normalize(f32::EPSILON)?;
+                let tangent = normal.cross(&radial).try_normalize(f32::EPSILON)?;
                 Some([radial, tangent, normal])
             })
             .collect::<Vec<_>>();
@@ -898,7 +895,7 @@ fn estimate_view_target(
     let mut b = Vector3::<f64>::zeros();
     for idx in segment.start..segment.end {
         let center = centers[idx];
-        let direction = (rotations[idx].inverse() * Vec3::Z).try_normalize()?;
+        let direction = (rotations[idx].inverse() * Vec3::z()).try_normalize(f32::EPSILON)?;
         let d = direction.to_na_vec3();
         let p = Matrix3::<f64>::identity() - d * d.transpose();
         a += p;
@@ -916,9 +913,9 @@ fn estimate_view_target(
 }
 
 fn look_at_frame_rotation(center: Vec3, target: Vec3, up: Vec3) -> Option<Quat> {
-    let z_axis = (target - center).try_normalize()?;
-    let x_axis = up.cross(z_axis).try_normalize()?;
-    let y_axis = z_axis.cross(x_axis).try_normalize()?;
+    let z_axis = (target - center).try_normalize(f32::EPSILON)?;
+    let x_axis = up.cross(&z_axis).try_normalize(f32::EPSILON)?;
+    let y_axis = z_axis.cross(&x_axis).try_normalize(f32::EPSILON)?;
     rotation_from_world_axes([x_axis, y_axis, z_axis])
 }
 
@@ -931,11 +928,11 @@ fn look_at_prior_max_delta_deg() -> f32 {
 }
 
 fn candidate_circle_normals(base_normal: Vec3) -> Vec<Vec3> {
-    let Some(base) = base_normal.try_normalize() else {
+    let Some(base) = base_normal.try_normalize(f32::EPSILON) else {
         return Vec::new();
     };
     let u = base.any_orthonormal_vector();
-    let Some(v) = base.cross(u).try_normalize() else {
+    let Some(v) = base.cross(&u).try_normalize(f32::EPSILON) else {
         return vec![base, -base];
     };
     let max_deg = std::env::var("RUSTSFM_CIRCLE_NORMAL_SEARCH_DEG")
@@ -963,7 +960,7 @@ fn candidate_circle_normals(base_normal: Vec3) -> Vec<Vec3> {
                 } else {
                     iv as f32 * max_deg.to_radians() / steps as f32
                 };
-                if let Some(normal) = (signed_base + u * du + v * dv).try_normalize() {
+                if let Some(normal) = (signed_base + u * du + v * dv).try_normalize(f32::EPSILON) {
                     normals.push(normal);
                 }
             }
@@ -990,7 +987,7 @@ fn optimize_circle_rotation_offset(
         let mut plus_by_axis = Vec::with_capacity(3);
         let mut minus_by_axis = Vec::with_capacity(3);
         for axis in 0..3 {
-            let mut delta = Vec3::ZERO;
+            let mut delta = Vec3::zeros();
             delta[axis] = eps;
             let plus_offset = (Quat::from_scaled_axis(delta) * offset).normalize();
             let minus_offset = (Quat::from_scaled_axis(-delta) * offset).normalize();
@@ -1062,7 +1059,7 @@ fn circle_rotation_relative_cost(
     let mut total = 0.0f32;
     let mut weight_sum = 0.0f32;
     for (residual, weight) in residuals {
-        total += residual.length_squared() * weight;
+        total += residual.norm_squared() * weight;
         weight_sum += weight;
     }
     if weight_sum <= 0.0 {
@@ -1107,14 +1104,14 @@ fn circle_rotation_residuals(
         if !centers.is_empty() {
             let left_center = *centers.get(pair.left)?;
             let right_center = *centers.get(pair.right)?;
-            let delta = (left_center - right_center).try_normalize()?;
-            let predicted_t = (offset * (right_frame * delta)).try_normalize()?;
+            let delta = (left_center - right_center).try_normalize(f32::EPSILON)?;
+            let predicted_t = (offset * (right_frame * delta)).try_normalize(f32::EPSILON)?;
             let mut observed_t =
-                Vec3::from_array(pair.relative_pose.translation()).try_normalize()?;
-            if predicted_t.dot(observed_t) < 0.0 {
+                Vec3::from(pair.relative_pose.translation()).try_normalize(f32::EPSILON)?;
+            if predicted_t.dot(&observed_t) < 0.0 {
                 observed_t = -observed_t;
             }
-            let cross = predicted_t.cross(observed_t);
+            let cross = predicted_t.cross(&observed_t);
             if cross.is_finite() && cross.length() <= 0.35 {
                 let translation_weight = (edge_weight(pair).min(edge_weight_cap(pair))
                     * circle_translation_weight_scale())
@@ -1184,7 +1181,7 @@ fn refine_rotation_harmonic_segment(
     if angles.len() != segment.end - segment.start {
         return;
     }
-    let mut params = vec![Vec3::ZERO; 2];
+    let mut params = vec![Vec3::zeros(); 2];
     for _ in 0..12 {
         let Some(step) = harmonic_rotation_step(
             rotations,
@@ -1218,10 +1215,10 @@ fn segment_angles(centers: &[Vec3], segment: CircleSegment) -> Vec<f32> {
     (segment.start..segment.end)
         .filter_map(|idx| {
             let d = centers[idx] - segment.center;
-            let x = d.dot(segment.normal.any_orthonormal_vector());
+            let x = d.dot(&segment.normal.any_orthonormal_vector());
             let basis_u = segment.normal.any_orthonormal_vector();
-            let basis_v = segment.normal.cross(basis_u).try_normalize()?;
-            Some(d.dot(basis_v).atan2(x))
+            let basis_v = segment.normal.cross(&basis_u).try_normalize(f32::EPSILON)?;
+            Some(d.dot(&basis_v).atan2(x))
         })
         .collect()
 }
@@ -1325,14 +1322,14 @@ fn harmonic_residuals(
         if harmonic_translation_residuals_enabled() {
             let left_center = *centers.get(pair.left)?;
             let right_center = *centers.get(pair.right)?;
-            let delta = (left_center - right_center).try_normalize()?;
-            let predicted_t = (right_rotation * delta).try_normalize()?;
+            let delta = (left_center - right_center).try_normalize(f32::EPSILON)?;
+            let predicted_t = (right_rotation * delta).try_normalize(f32::EPSILON)?;
             let mut observed_t =
-                Vec3::from_array(pair.relative_pose.translation()).try_normalize()?;
-            if predicted_t.dot(observed_t) < 0.0 {
+                Vec3::from(pair.relative_pose.translation()).try_normalize(f32::EPSILON)?;
+            if predicted_t.dot(&observed_t) < 0.0 {
                 observed_t = -observed_t;
             }
-            let cross = predicted_t.cross(observed_t);
+            let cross = predicted_t.cross(&observed_t);
             if cross.is_finite() && cross.length() <= 0.35 {
                 let translation_weight = (edge_weight(pair).min(edge_weight_cap(pair))
                     * harmonic_translation_weight_scale())
@@ -1392,7 +1389,7 @@ fn rotation_from_world_axes(rows: [Vec3; 3]) -> Option<Quat> {
     if !rows.iter().all(|axis| axis.is_finite()) {
         return None;
     }
-    let det = rows[0].dot(rows[1].cross(rows[2]));
+    let det = rows[0].dot(&rows[1].cross(&rows[2]));
     if det <= 0.5 {
         return None;
     }
@@ -1418,9 +1415,9 @@ fn average_quaternions(quaternions: &[Quat]) -> Option<Quat> {
     for &quat in quaternions {
         let mut q = quat.normalize();
         if q.w < 0.0 {
-            q = -q;
+            q = crate::geometry::quat_neg(q);
         }
-        let v = nalgebra::Vector4::new(q.x as f64, q.y as f64, q.z as f64, q.w as f64);
+        let v = nalgebra::Vector4::new(q.i as f64, q.j as f64, q.k as f64, q.w as f64);
         accum += v * v.transpose();
     }
     let eig = accum.symmetric_eigen();
@@ -1431,9 +1428,10 @@ fn average_quaternions(quaternions: &[Quat]) -> Option<Quat> {
         }
     }
     let q = eig.eigenvectors.column(best);
-    let mut quat = Quat::from_xyzw(q[0] as f32, q[1] as f32, q[2] as f32, q[3] as f32);
+    let mut quat =
+        crate::geometry::quat_from_xyzw(q[0] as f32, q[1] as f32, q[2] as f32, q[3] as f32);
     if quat.w < 0.0 {
-        quat = -quat;
+        quat = crate::geometry::quat_neg(quat);
     }
     quat.is_finite().then_some(quat.normalize())
 }
@@ -1469,7 +1467,7 @@ fn periodic_rotation_scale() -> f32 {
 fn estimate_seam_observed_rotation(rotations: &[Quat]) -> Quat {
     let end = rotations.len() - 1;
     let window = 6usize.min(end);
-    let mut total = Vec3::ZERO;
+    let mut total = Vec3::zeros();
     let mut count = 0.0f32;
     for idx in 0..window {
         let log = quat_log((rotations[idx + 1] * rotations[idx].inverse()).normalize());
@@ -1486,7 +1484,7 @@ fn estimate_seam_observed_rotation(rotations: &[Quat]) -> Quat {
         }
     }
     if count <= 0.0 {
-        Quat::IDENTITY
+        Quat::identity()
     } else {
         Quat::from_scaled_axis(total / count)
     }
@@ -1512,7 +1510,7 @@ fn close_center_segment(centers: &mut [Vec3]) {
 fn estimate_seam_center_step(centers: &[Vec3]) -> Vec3 {
     let end = centers.len() - 1;
     let window = 8usize.min(end);
-    let mut total = Vec3::ZERO;
+    let mut total = Vec3::zeros();
     let mut count = 0.0f32;
     for idx in 0..window {
         let delta = centers[idx + 1] - centers[idx];
@@ -1529,7 +1527,7 @@ fn estimate_seam_center_step(centers: &[Vec3]) -> Vec3 {
         }
     }
     if count <= 0.0 {
-        Vec3::ZERO
+        Vec3::zeros()
     } else {
         total / count
     }
@@ -1552,13 +1550,13 @@ fn average_translations(
                 continue;
             };
             let delta = centers[pair.right] - centers[pair.left];
-            if let Some(delta_dir) = delta.try_normalize() {
-                if delta_dir.dot(dir) < -0.2 {
+            if let Some(delta_dir) = delta.try_normalize(f32::EPSILON) {
+                if delta_dir.dot(&dir) < -0.2 {
                     dir = -dir;
                 }
             }
             let weight = edge_weight(pair).min(edge_weight_cap(pair));
-            let parallel = dir * delta.dot(dir);
+            let parallel = dir * delta.dot(&dir);
             let perpendicular_residual = delta - parallel;
             let step = 0.018 * weight;
             if pair.left != 0 {
@@ -1568,7 +1566,7 @@ fn average_translations(
 
             if should_constrain_edge_length(pair) {
                 let baseline = edge_baseline_units(pair, image_count);
-                let along_residual = delta.dot(dir) - baseline;
+                let along_residual = delta.dot(&dir) - baseline;
                 let length_weight = if pair.left + 1 == pair.right {
                     1.0
                 } else {
@@ -1583,7 +1581,7 @@ fn average_translations(
             }
         }
         apply_center_smoothness(&mut centers);
-        centers[0] = Vec3::ZERO;
+        centers[0] = Vec3::zeros();
     }
     centers
 }
@@ -1593,12 +1591,12 @@ fn chain_translation_initialization(
     pairs: &[PairGeometry],
     rotations: &[Quat],
 ) -> Vec<Vec3> {
-    let mut centers = vec![Vec3::ZERO; image_count];
-    let mut previous_dir = Vec3::X;
+    let mut centers = vec![Vec3::zeros(); image_count];
+    let mut previous_dir = Vec3::x();
     for idx in 1..image_count {
         if let Some(pair) = translation_initialization_pair(pairs, idx) {
             let dir = edge_world_direction(pair, rotations[pair.right]).unwrap_or(previous_dir);
-            let dir = if dir.dot(previous_dir) < -0.25 {
+            let dir = if dir.dot(&previous_dir) < -0.25 {
                 -dir
             } else {
                 dir
@@ -1646,7 +1644,7 @@ fn solve_translation_averaging_with_filter(
     _seed_centers: Option<&[Vec3]>,
 ) -> Option<Vec<Vec3>> {
     if image_count < 2 {
-        return Some(vec![Vec3::ZERO; image_count]);
+        return Some(vec![Vec3::zeros(); image_count]);
     }
     let variable_count = image_count * 3;
     let mut rows = Vec::<f64>::new();
@@ -1696,7 +1694,7 @@ fn solve_translation_averaging_with_filter(
                     if let Some(prev_dir) =
                         edge_world_direction(prev_pair, rotations[prev_pair.right])
                     {
-                        if signed_dir.dot(prev_dir) < -0.25 {
+                        if signed_dir.dot(&prev_dir) < -0.25 {
                             signed_dir = -signed_dir;
                         }
                     }
@@ -1749,11 +1747,12 @@ fn translation_edge_is_consistent(
     let Some(edge_dir) = edge_world_direction(pair, rotations[pair.right]) else {
         return false;
     };
-    let Some(delta_dir) = (centers[pair.right] - centers[pair.left]).try_normalize() else {
+    let Some(delta_dir) = (centers[pair.right] - centers[pair.left]).try_normalize(f32::EPSILON)
+    else {
         return false;
     };
     let angle = edge_dir
-        .dot(delta_dir)
+        .dot(&delta_dir)
         .abs()
         .clamp(-1.0, 1.0)
         .acos()
@@ -1809,7 +1808,7 @@ fn apply_center_smoothness(centers: &mut [Vec3]) {
     if scale <= 0.0 || centers.len() < 3 {
         return;
     }
-    let mut updates = vec![Vec3::ZERO; centers.len()];
+    let mut updates = vec![Vec3::zeros(); centers.len()];
     for idx in 1..centers.len() - 1 {
         let second = centers[idx - 1] - 2.0 * centers[idx] + centers[idx + 1];
         updates[idx] = second * scale;
@@ -1831,9 +1830,9 @@ fn translation_initialization_pair(pairs: &[PairGeometry], right: usize) -> Opti
 }
 
 fn edge_world_direction(pair: &PairGeometry, target_rotation: Quat) -> Option<Vec3> {
-    let t = Vec3::from_array(pair.relative_pose.translation()).try_normalize()?;
+    let t = Vec3::from(pair.relative_pose.translation()).try_normalize(f32::EPSILON)?;
     let dir = -(target_rotation.inverse() * t);
-    dir.try_normalize()
+    dir.try_normalize(f32::EPSILON)
 }
 
 fn edge_baseline_units(pair: &PairGeometry, image_count: usize) -> f32 {

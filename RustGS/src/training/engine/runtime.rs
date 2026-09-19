@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use glam::Vec3;
+use nalgebra::Vector3;
 
 use crate::core::GaussianCamera;
 use crate::core::HostSplats;
@@ -509,7 +509,7 @@ fn gaussian_camera_from_scene_pose(
 }
 
 fn camera_scene_scale(dataset: &TrainingDataset, frame_order: &[usize]) -> f32 {
-    let mut center = Vec3::ZERO;
+    let mut center = Vector3::zeros();
     let mut count = 0usize;
     for &pose_idx in frame_order {
         let Some(pose) = dataset.poses.get(pose_idx) else {
@@ -533,7 +533,7 @@ fn camera_scene_scale(dataset: &TrainingDataset, frame_order: &[usize]) -> f32 {
         };
         let position = pose.pose.vec();
         if position.x.is_finite() && position.y.is_finite() && position.z.is_finite() {
-            radius = radius.max(position.distance(center));
+            radius = radius.max((position - center).norm());
         }
     }
 

@@ -7,7 +7,7 @@ use crate::geometry::{
     bounding_sphere, gaussian_curvature, mean_curvature, principal_curvatures, triangle_area,
     triangle_quality, voronoi_area,
 };
-use crate::{FaceHandle, RustMesh, Vec3, VertexHandle};
+use crate::{FaceHandle, Point3, RustMesh, Vec3, VertexHandle};
 
 /// Curvature information for a mesh vertex
 #[derive(Debug, Clone, Copy)]
@@ -56,9 +56,9 @@ pub struct MeshAnalysis {
     /// Number of faces
     pub n_faces: usize,
     /// Bounding box (min, max)
-    pub bounding_box: (Vec3, Vec3),
+    pub bounding_box: (Point3, Point3),
     /// Bounding sphere (center, radius)
-    pub bounding_sphere: (Vec3, f32),
+    pub bounding_sphere: (Point3, f32),
     /// Mesh quality metrics
     pub quality: MeshQuality,
     /// Total surface area
@@ -75,7 +75,7 @@ pub fn compute_vertex_curvature(mesh: &RustMesh, vh: VertexHandle) -> VertexCurv
     };
 
     // Collect neighbor positions
-    let neighbors: Vec<Vec3> = match mesh.vertex_vertices(vh) {
+    let neighbors: Vec<Point3> = match mesh.vertex_vertices(vh) {
         Some(vv) => vv.filter_map(|n| mesh.point(n)).collect(),
         None => return VertexCurvature::default(),
     };
@@ -218,7 +218,7 @@ pub fn compute_volume(mesh: &RustMesh) -> Option<f32> {
         let p2 = mesh.point(vertices[2])?;
 
         // Signed volume of tetrahedron formed with origin
-        volume += p0.dot(p1.cross(p2)) / 6.0;
+        volume += p0.coords.dot(&p1.coords.cross(&p2.coords)) / 6.0;
     }
 
     if has_boundary {
@@ -231,15 +231,18 @@ pub fn compute_volume(mesh: &RustMesh) -> Option<f32> {
 /// Perform comprehensive mesh analysis
 pub fn analyze_mesh(mesh: &RustMesh) -> MeshAnalysis {
     // Bounding box
-    let mut bbox_min = Vec3::splat(f32::INFINITY);
-    let mut bbox_max = Vec3::splat(f32::NEG_INFINITY);
-
-    let points: Vec<Vec3> = mesh.vertices().filter_map(|vh| mesh.point(vh)).collect();
-
-    for &p in &points {
-        bbox_min = bbox_min.min(p);
-        bbox_max = bbox_max.max(p);
-    }
+    let points: Vec<Point3> = mesh.vertices().filter_map(|vh| mesh.point(vh)).collect();
+    let (bbox_min, bbox_max) = if points.is_empty() {
+        (Point3::origin(), Point3::origin())
+    } else {
+        let mut min = points[0];
+        let mut max = points[0];
+        for &p in &points {
+            min = Point3::from(min.coords.inf(&p.coords));
+            max = Point3::from(max.coords.sup(&p.coords));
+        }
+        (min, max)
+    };
 
     // Bounding sphere
     let (bs_center, bs_radius) = bounding_sphere(&points);
@@ -318,7 +321,7 @@ pub fn compute_edge_length_stats(mesh: &RustMesh) -> EdgeLengthStats {
         let v1 = mesh.to_vertex_handle(h0);
 
         if let (Some(p0), Some(p1)) = (mesh.point(v0), mesh.point(v1)) {
-            lengths.push((p1 - p0).length());
+            lengths.push((p1 - p0).norm());
         }
     }
 

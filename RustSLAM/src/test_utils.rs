@@ -9,15 +9,15 @@
 //!
 //! ```
 //! use rustslam::test_utils::*;
-//! use glam::Vec3;
+//! use nalgebra::Point3;
 //!
-//! let tsdf = create_sphere_tsdf(Vec3::ZERO, 1.0, 0.1);
+//! let tsdf = create_sphere_tsdf(Point3::origin(), 1.0, 0.1);
 //! let frame = create_mock_frame(640, 480, FramePattern::Checkerboard);
 //! ```
 
 use crate::core::pose::SE3;
 use crate::fusion::tsdf_volume::{TsdfConfig, TsdfVolume};
-use glam::Vec3;
+use nalgebra::{Point3, Vector3};
 use std::f32::consts::PI;
 
 /// Frame pattern for mock video frames
@@ -75,13 +75,13 @@ pub struct MockVideoFrame {
 ///
 /// # Returns
 /// A TSDF volume with a sphere signed distance field
-pub fn create_sphere_tsdf(center: Vec3, radius: f32, voxel_size: f32) -> TsdfVolume {
+pub fn create_sphere_tsdf(center: Point3<f32>, radius: f32, voxel_size: f32) -> TsdfVolume {
     let size = radius * 3.0; // Volume size to contain sphere
     let config = TsdfConfig {
         voxel_size,
         sdf_trunc: voxel_size * 4.0,
-        min_bound: center - Vec3::splat(size / 2.0),
-        max_bound: center + Vec3::splat(size / 2.0),
+        min_bound: center - Vector3::repeat(size / 2.0),
+        max_bound: center + Vector3::repeat(size / 2.0),
         max_weight: 100.0,
         integration_weight: 1.0,
     };
@@ -94,7 +94,7 @@ pub fn create_sphere_tsdf(center: Vec3, radius: f32, voxel_size: f32) -> TsdfVol
         for y in 0..dims.1 {
             for z in 0..dims.2 {
                 let pos = volume.voxel_to_world(x, y, z);
-                let dist = (pos - center).length() - radius;
+                let dist = (pos - center).norm() - radius;
                 let tsdf = dist.clamp(-voxel_size * 4.0, voxel_size * 4.0) / (voxel_size * 4.0);
 
                 let voxel = volume.get_voxel_mut(x, y, z);
@@ -118,13 +118,13 @@ pub fn create_sphere_tsdf(center: Vec3, radius: f32, voxel_size: f32) -> TsdfVol
 ///
 /// # Returns
 /// A TSDF volume with a cube signed distance field
-pub fn create_cube_tsdf(center: Vec3, size: f32, voxel_size: f32) -> TsdfVolume {
+pub fn create_cube_tsdf(center: Point3<f32>, size: f32, voxel_size: f32) -> TsdfVolume {
     let volume_size = size * 2.0; // Volume size to contain cube
     let config = TsdfConfig {
         voxel_size,
         sdf_trunc: voxel_size * 4.0,
-        min_bound: center - Vec3::splat(volume_size / 2.0),
-        max_bound: center + Vec3::splat(volume_size / 2.0),
+        min_bound: center - Vector3::repeat(volume_size / 2.0),
+        max_bound: center + Vector3::repeat(volume_size / 2.0),
         max_weight: 100.0,
         integration_weight: 1.0,
     };

@@ -13,7 +13,9 @@ use crate::types::{
     COLMAP_SIMPLE_FISHEYE, COLMAP_SIMPLE_PINHOLE, COLMAP_SIMPLE_RADIAL,
     COLMAP_SIMPLE_RADIAL_FISHEYE, COLMAP_THIN_PRISM_FISHEYE,
 };
-use glam::{Quat, Vec3};
+type Quat = nalgebra::UnitQuaternion<f32>;
+type Vec3 = nalgebra::Vector3<f32>;
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 use rustslam::SE3;
 use std::collections::{BTreeMap, HashSet};
@@ -2544,13 +2546,13 @@ pub(crate) fn sync_camera_intrinsics_from_params(camera: &mut CameraModel) {
 
 pub(crate) fn apply_pose_delta_f64(pose: SE3, delta: Vec6) -> SE3 {
     let q = pose.quaternion();
-    let base_rotation = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
+    let base_rotation = crate::geometry::quat_from_xyzw(q[0], q[1], q[2], q[3]).normalize();
     let omega = Vec3::new(delta[0] as f32, delta[1] as f32, delta[2] as f32);
     let angle = omega.length();
     let delta_rotation = if angle > 1.0e-12 {
-        Quat::from_axis_angle(omega / angle, angle)
+        crate::geometry::quat_from_axis_angle(omega / angle, angle)
     } else {
-        Quat::IDENTITY
+        Quat::identity()
     };
     let t = pose.translation();
     let translation = Vec3::new(

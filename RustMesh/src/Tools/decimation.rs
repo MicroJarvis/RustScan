@@ -3,8 +3,8 @@
 // Based on OpenMesh's DecimaterT framework
 // ============================================================================
 
-use crate::{FaceHandle, HalfedgeHandle, RustMesh, Vec3, VertexHandle};
-use glam::DVec3;
+use crate::DVec3;
+use crate::{FaceHandle, HalfedgeHandle, Point3, RustMesh, VertexHandle};
 use std::cmp::Ordering;
 use std::sync::OnceLock;
 
@@ -105,7 +105,7 @@ impl Quadricd {
     }
 
     #[inline]
-    fn value(&self, v: Vec3) -> f64 {
+    fn value(&self, v: Point3) -> f64 {
         let v = to_dvec3(v);
         self.value_d(v)
     }
@@ -129,7 +129,7 @@ impl Quadricd {
     }
 
     #[inline]
-    fn optimize(&self) -> (Vec3, f64) {
+    fn optimize(&self) -> (Point3, f64) {
         let a11 = 2.0 * self.a;
         let a12 = 2.0 * self.b;
         let a13 = 2.0 * self.c;
@@ -145,7 +145,7 @@ impl Quadricd {
             + a13 * (a12 * a23 - a22 * a13);
 
         if det.abs() < 1.0e-20 {
-            return (Vec3::ZERO, self.value(Vec3::ZERO));
+            return (Point3::origin(), self.value(Point3::origin()));
         }
 
         let det1 = b1 * (a22 * a33 - a23 * a23) - a12 * (b2 * a33 - a23 * b3)
@@ -159,19 +159,19 @@ impl Quadricd {
 
         let optimal = DVec3::new(det1 / det, det2 / det, det3 / det);
         (
-            Vec3::new(optimal.x as f32, optimal.y as f32, optimal.z as f32),
+            Point3::new(optimal.x as f32, optimal.y as f32, optimal.z as f32),
             self.value_d(optimal),
         )
     }
 }
 
 #[inline]
-fn to_dvec3(v: Vec3) -> DVec3 {
+fn to_dvec3(v: Point3) -> DVec3 {
     DVec3::new(v.x as f64, v.y as f64, v.z as f64)
 }
 
 #[inline]
-fn face_quadric_from_points(p0: Vec3, p1: Vec3, p2: Vec3) -> Option<Quadricd> {
+fn face_quadric_from_points(p0: Point3, p1: Point3, p2: Point3) -> Option<Quadricd> {
     let p0x = p0.x as f64;
     let p0y = p0.y as f64;
     let p0z = p0.z as f64;
@@ -288,7 +288,7 @@ pub struct DebugVertexState {
     pub is_deleted: bool,
     pub anchor: Option<HalfedgeHandle>,
     pub is_boundary_vertex: bool,
-    pub point: Option<Vec3>,
+    pub point: Option<Point3>,
     pub quadric: Option<DebugQuadric>,
     pub stored_in_heap: bool,
     pub heap_target: Option<HalfedgeHandle>,
@@ -568,7 +568,7 @@ pub struct CollapseInfo {
     /// The faces that will be removed
     pub faces_removed: Vec<FaceHandle>,
     /// The new position of v_kept after collapse
-    pub new_position: Vec3,
+    pub new_position: Point3,
     /// The error associated with this collapse
     pub error: f32,
 }
@@ -580,7 +580,7 @@ impl CollapseInfo {
             v_removed: VertexHandle::new(0),
             v_kept: VertexHandle::new(0),
             faces_removed: Vec::new(),
-            new_position: Vec3::ZERO,
+            new_position: Point3::origin(),
             error: 0.0,
         }
     }
@@ -741,7 +741,7 @@ impl<'a> ModQuadricT<'a> {
         };
 
         let q = q0.add_values(*q1);
-        let kept_pos = self.mesh.point(v_kept).unwrap_or(Vec3::ZERO);
+        let kept_pos = self.mesh.point(v_kept).unwrap_or(Point3::origin());
         let error = q.value(kept_pos);
         let error = match canonicalize_quadric_error(error) {
             Some(error) => error,
@@ -755,18 +755,18 @@ impl<'a> ModQuadricT<'a> {
         (error, true)
     }
 
-    pub fn optimal_position(&self, v_removed: VertexHandle, v_kept: VertexHandle) -> Vec3 {
+    pub fn optimal_position(&self, v_removed: VertexHandle, v_kept: VertexHandle) -> Point3 {
         let idx0 = v_removed.idx_usize();
         let idx1 = v_kept.idx_usize();
 
         let q0 = match self.vertex_quadrics.get(idx0) {
             Some(Some(q)) => q,
-            _ => return self.mesh.point(v_kept).unwrap_or(Vec3::ZERO),
+            _ => return self.mesh.point(v_kept).unwrap_or(Point3::origin()),
         };
 
         let q1 = match self.vertex_quadrics.get(idx1) {
             Some(Some(q)) => q,
-            _ => return self.mesh.point(v_kept).unwrap_or(Vec3::ZERO),
+            _ => return self.mesh.point(v_kept).unwrap_or(Point3::origin()),
         };
 
         let q = q0.add_values(*q1);
@@ -1306,7 +1306,7 @@ impl<'a> Decimater<'a> {
         };
 
         let combined = q0.add_values(*q1);
-        let kept_pos = self.mesh.point(v1).unwrap_or(Vec3::ZERO);
+        let kept_pos = self.mesh.point(v1).unwrap_or(Point3::origin());
         Some(combined.value(kept_pos))
     }
 
@@ -1522,7 +1522,7 @@ impl<'a> Decimater<'a> {
             };
 
             let combined = q_kept.add_values(*q_removed);
-            let kept_pos = self.mesh.point(v_kept).unwrap_or(Vec3::ZERO);
+            let kept_pos = self.mesh.point(v_kept).unwrap_or(Point3::origin());
             let error = combined.value(kept_pos);
             let error = match canonicalize_quadric_error(error) {
                 Some(error) => error,

@@ -3,6 +3,7 @@
 //! STereoLithography format for 3D printing applications.
 
 use crate::RustMesh;
+use crate::{Point3, Vec3};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -44,13 +45,16 @@ fn write_stl_ascii(mesh: &RustMesh, path: impl AsRef<Path>) -> io::Result<()> {
         }
 
         // Compute face normal
-        let p0 = mesh.point(verts[0]).unwrap_or(glam::Vec3::ZERO);
-        let p1 = mesh.point(verts[1]).unwrap_or(glam::Vec3::ZERO);
-        let p2 = mesh.point(verts[2]).unwrap_or(glam::Vec3::ZERO);
+        let p0 = mesh.point(verts[0]).unwrap_or(Point3::origin());
+        let p1 = mesh.point(verts[1]).unwrap_or(Point3::origin());
+        let p2 = mesh.point(verts[2]).unwrap_or(Point3::origin());
 
         let edge1 = p1 - p0;
         let edge2 = p2 - p0;
-        let normal = edge1.cross(edge2).normalize_or_zero();
+        let normal = edge1
+            .cross(&edge2)
+            .try_normalize(f32::EPSILON)
+            .unwrap_or_else(Vec3::zeros);
 
         writeln!(
             writer,
@@ -60,7 +64,7 @@ fn write_stl_ascii(mesh: &RustMesh, path: impl AsRef<Path>) -> io::Result<()> {
         writeln!(writer, "  outer loop")?;
 
         for vh in &verts {
-            let p = mesh.point(*vh).unwrap_or(glam::Vec3::ZERO);
+            let p = mesh.point(*vh).unwrap_or(Point3::origin());
             writeln!(writer, "    vertex {} {} {}", p.x, p.y, p.z)?;
         }
 
@@ -120,14 +124,17 @@ fn write_triangle_binary<W: Write>(
     mesh: &RustMesh,
     verts: &[crate::VertexHandle],
 ) -> io::Result<()> {
-    let p0 = mesh.point(verts[0]).unwrap_or(glam::Vec3::ZERO);
-    let p1 = mesh.point(verts[1]).unwrap_or(glam::Vec3::ZERO);
-    let p2 = mesh.point(verts[2]).unwrap_or(glam::Vec3::ZERO);
+    let p0 = mesh.point(verts[0]).unwrap_or(Point3::origin());
+    let p1 = mesh.point(verts[1]).unwrap_or(Point3::origin());
+    let p2 = mesh.point(verts[2]).unwrap_or(Point3::origin());
 
     // Compute normal
     let edge1 = p1 - p0;
     let edge2 = p2 - p0;
-    let normal = edge1.cross(edge2).normalize_or_zero();
+    let normal = edge1
+        .cross(&edge2)
+        .try_normalize(f32::EPSILON)
+        .unwrap_or_else(Vec3::zeros);
 
     // Write normal (3 floats, 12 bytes)
     writer.write_all(&normal.x.to_le_bytes())?;
@@ -290,7 +297,7 @@ fn read_stl_binary_with_count(
             let key = float_key(x, y, z);
             let vh = *vertex_map
                 .entry(key)
-                .or_insert_with(|| mesh.add_vertex(glam::Vec3::new(x, y, z)));
+                .or_insert_with(|| mesh.add_vertex(Point3::new(x, y, z)));
             verts.push(vh);
         }
 
@@ -332,7 +339,7 @@ fn parse_vertex_line(
 
         *vertex_map
             .entry(key)
-            .or_insert_with(|| mesh.add_vertex(glam::Vec3::new(x, y, z)))
+            .or_insert_with(|| mesh.add_vertex(Point3::new(x, y, z)))
     } else {
         crate::VertexHandle::invalid()
     }
@@ -344,9 +351,9 @@ mod tests {
 
     fn create_test_mesh() -> RustMesh {
         let mut mesh = RustMesh::new();
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
         mesh
     }
@@ -432,10 +439,10 @@ mod tests {
 
         let mut mesh = RustMesh::new();
         // Create two triangles sharing an edge
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(glam::Vec3::new(1.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
 
         mesh.add_face(&[v0, v1, v2]);
         mesh.add_face(&[v1, v3, v2]);

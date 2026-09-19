@@ -73,21 +73,24 @@ fn is_valid_covariance(position_covariance: &[f64; 9]) -> bool {
 }
 
 fn apply_pose_delta_f64(pose: SE3, delta: [f64; 6]) -> SE3 {
-    let omega = glam::Vec3::new(delta[0] as f32, delta[1] as f32, delta[2] as f32);
-    let angle = omega.length();
+    let omega = nalgebra::Vector3::new(delta[0] as f32, delta[1] as f32, delta[2] as f32);
+    let angle = omega.norm();
     let delta_rotation = if angle <= 1.0e-12 {
-        glam::Quat::IDENTITY
+        nalgebra::UnitQuaternion::<f32>::identity()
     } else {
-        glam::Quat::from_axis_angle(omega / angle, angle)
+        crate::geometry::quat_from_axis_angle(omega / angle, angle)
     };
-    let delta_translation = glam::Vec3::new(delta[3] as f32, delta[4] as f32, delta[5] as f32);
+    let delta_translation =
+        nalgebra::Vector3::new(delta[3] as f32, delta[4] as f32, delta[5] as f32);
     SE3::from_quat_translation(delta_rotation, delta_translation).compose(&pose)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::{Quat, Vec3};
+    type Quat = nalgebra::UnitQuaternion<f32>;
+    type Vec3 = nalgebra::Vector3<f32>;
+    use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 
     #[test]
     fn position_prior_fallback_uses_isotropic_information() {
@@ -98,7 +101,7 @@ mod tests {
 
     #[test]
     fn camera_center_jacobian_is_nonzero_for_translated_pose() {
-        let pose = SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(1.0, 2.0, 3.0));
+        let pose = SE3::from_quat_translation(Quat::identity(), Vec3::new(1.0, 2.0, 3.0));
         let jacobian = camera_center_pose_jacobian(pose);
         assert!(jacobian.norm() > 1.0e-6);
     }

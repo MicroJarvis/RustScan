@@ -215,25 +215,25 @@ pub fn export_mesh(
 mod tests {
     use super::*;
     use crate::fusion::marching_cubes::{Mesh, MeshTriangle, MeshVertex};
-    use glam::Vec3;
+    use nalgebra::{Point3, Vector3};
     use tempfile::tempdir;
 
     #[test]
     fn test_export_mesh_files() {
         let mut mesh = Mesh::new();
         mesh.vertices.push(MeshVertex {
-            position: Vec3::new(0.0, 0.0, 0.0),
-            normal: Vec3::Z,
+            position: Point3::new(0.0, 0.0, 0.0),
+            normal: Vector3::z(),
             color: [1.0, 0.0, 0.0],
         });
         mesh.vertices.push(MeshVertex {
-            position: Vec3::new(1.0, 0.0, 0.0),
-            normal: Vec3::Z,
+            position: Point3::new(1.0, 0.0, 0.0),
+            normal: Vector3::z(),
             color: [0.0, 1.0, 0.0],
         });
         mesh.vertices.push(MeshVertex {
-            position: Vec3::new(0.0, 1.0, 0.0),
-            normal: Vec3::Z,
+            position: Point3::new(0.0, 1.0, 0.0),
+            normal: Vector3::z(),
             color: [0.0, 0.0, 1.0],
         });
         mesh.triangles.push(MeshTriangle { indices: [0, 1, 2] });

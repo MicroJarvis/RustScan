@@ -400,11 +400,7 @@ async fn capture_grads(
     .await;
 
     let target = Tensor::<GsDiffBackend, 3>::full(
-        [
-            fixture.img_size.1 as usize,
-            fixture.img_size.0 as usize,
-            3,
-        ],
+        [fixture.img_size.1 as usize, fixture.img_size.0 as usize, 3],
         0.25,
         device,
     );
@@ -447,7 +443,9 @@ async fn capture_grads(
     ))
 }
 
-async fn host_from_render<B: Backend>(out: &RenderOutput<B>) -> Result<HostForwardSnapshot, String> {
+async fn host_from_render<B: Backend>(
+    out: &RenderOutput<B>,
+) -> Result<HostForwardSnapshot, String> {
     let logical_visible = read_u32_scalar(&out.logical_visible).await?;
     let logical_intersections = read_u32_scalar(&out.logical_intersections).await?;
     let requested = read_u32_scalar(&out.requested_intersections).await?;
@@ -521,11 +519,7 @@ fn compare_snapshots(
     assert_f32_close(name, "visible", &exact.visible, &bounded.visible, FLOAT_TOL)?;
 
     if exact.logical_intersections > 0 {
-        let (et, es, eo) = match (
-            &exact.grad_transforms,
-            &exact.grad_sh,
-            &exact.grad_opacity,
-        ) {
+        let (et, es, eo) = match (&exact.grad_transforms, &exact.grad_sh, &exact.grad_opacity) {
             (Some(t), Some(s), Some(o)) => (t, s, o),
             _ => return Err(format!("{name}: exact gradients missing")),
         };
@@ -544,19 +538,9 @@ fn compare_snapshots(
     Ok(())
 }
 
-fn assert_f32_close(
-    case: &str,
-    label: &str,
-    a: &[f32],
-    b: &[f32],
-    tol: f32,
-) -> Result<(), String> {
+fn assert_f32_close(case: &str, label: &str, a: &[f32], b: &[f32], tol: f32) -> Result<(), String> {
     if a.len() != b.len() {
-        return Err(format!(
-            "{case}/{label}: length {} vs {}",
-            a.len(),
-            b.len()
-        ));
+        return Err(format!("{case}/{label}: length {} vs {}", a.len(), b.len()));
     }
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         if !(x.is_finite() && y.is_finite()) {
@@ -567,9 +551,7 @@ fn assert_f32_close(
         }
         let diff = (x - y).abs();
         if diff > tol {
-            return Err(format!(
-                "{case}/{label}[{i}]: |{x} - {y}| = {diff} > {tol}"
-            ));
+            return Err(format!("{case}/{label}[{i}]: |{x} - {y}| = {diff} > {tol}"));
         }
     }
     Ok(())

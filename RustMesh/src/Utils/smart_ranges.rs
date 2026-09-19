@@ -4,6 +4,7 @@
 
 use crate::handles::{FaceHandle, VertexHandle};
 use crate::RustMesh;
+use crate::{Point3, Vec3};
 
 /// Smart vertex range with aggregation methods
 pub struct VertexRange<'a> {
@@ -110,8 +111,10 @@ impl<'a> FaceRange<'a> {
             }
 
             if points.len() >= 3 {
-                let center =
-                    points.iter().fold(glam::Vec3::ZERO, |acc, p| acc + *p) / points.len() as f32;
+                let center = Point3::from(
+                    points.iter().fold(Vec3::zeros(), |acc, p| acc + p.coords)
+                        / points.len() as f32,
+                );
                 centroids.push((center.x, center.y, center.z));
             }
         }

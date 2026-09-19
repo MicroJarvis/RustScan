@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::{Frame, FrameFeatures, KeyFrame, Map, MapPoint, SE3};
+use nalgebra::Point3;
 
 #[derive(Debug, Error)]
 pub enum CheckpointError {
@@ -234,7 +235,7 @@ impl CheckpointMapPoint {
     fn to_map_point(&self) -> MapPoint {
         MapPoint {
             id: self.id,
-            position: glam::Vec3::new(self.position[0], self.position[1], self.position[2]),
+            position: Point3::new(self.position[0], self.position[1], self.position[2]),
             normal: None,
             color: self.color,
             reference_kf: self.reference_kf,
@@ -319,9 +320,8 @@ fn parse_checkpoint_name(path: &Path) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec3;
-
     use crate::core::{Frame, FrameFeatures, KeyFrame, Map, MapPoint, SE3};
+    use nalgebra::Point3;
 
     fn build_map() -> Map {
         let mut map = Map::new();
@@ -338,7 +338,7 @@ mod tests {
         let keyframe = KeyFrame::new(frame, features);
         let kf_id = map.add_keyframe(keyframe);
 
-        let mut map_point = MapPoint::new(0, Vec3::new(1.0, 2.0, 3.0), kf_id);
+        let mut map_point = MapPoint::new(0, Point3::new(1.0, 2.0, 3.0), kf_id);
         map_point.set_color([0.1, 0.2, 0.3]);
         map.add_point(map_point);
         map
@@ -367,7 +367,7 @@ mod tests {
         let map_point = loaded_map.get_point(0).unwrap();
         assert_eq!(map_point.color, Some([0.1, 0.2, 0.3]));
 
-        let new_id = loaded_map.add_point(MapPoint::new(1, Vec3::ZERO, 0));
+        let new_id = loaded_map.add_point(MapPoint::new(1, Point3::origin(), 0));
         assert_eq!(new_id, 1);
     }
 

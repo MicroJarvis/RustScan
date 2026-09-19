@@ -5,6 +5,7 @@
 //! 2. Convert to RustMesh
 //! 3. Export to OBJ/PLY files
 
+use rustmesh::{Point3, RustMesh, Vec3};
 use std::path::Path;
 
 // This example shows how to use RustSLAM's mesh extraction with RustMesh export
@@ -24,10 +25,10 @@ fn main() -> std::io::Result<()> {
     // For demonstration, create a simple test mesh
     println!("Creating test mesh...");
     let vertices = vec![
-        glam::Vec3::new(0.0, 0.0, 0.0),
-        glam::Vec3::new(1.0, 0.0, 0.0),
-        glam::Vec3::new(0.5, 1.0, 0.0),
-        glam::Vec3::new(0.5, 0.5, 1.0),
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(0.5, 1.0, 0.0),
+        Point3::new(0.5, 0.5, 1.0),
     ];
 
     let triangles = vec![
@@ -38,10 +39,10 @@ fn main() -> std::io::Result<()> {
     ];
 
     let normals = vec![
-        glam::Vec3::new(0.0, 0.0, 1.0),
-        glam::Vec3::new(1.0, 0.0, 0.0),
-        glam::Vec3::new(0.0, 1.0, 0.0),
-        glam::Vec3::new(-1.0, -1.0, -1.0).normalize(),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(-1.0, -1.0, -1.0).normalize(),
     ];
 
     let colors = vec![
@@ -116,7 +117,7 @@ fn main() -> std::io::Result<()> {
     use rustslam::fusion::{{MeshExtractor, MeshExtractionConfig}};
 
     // 1. Extract mesh from Gaussians
-    let mut extractor = MeshExtractor::centered(Vec3::ZERO, 2.0, 0.01);
+    let mut extractor = MeshExtractor::centered(Vec3::zeros(), 2.0, 0.01);
     extractor.integrate_from_gaussians(|idx| depth[idx], ...);
     let slam_mesh = extractor.extract_with_postprocessing();
 

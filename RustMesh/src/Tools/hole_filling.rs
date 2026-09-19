@@ -6,7 +6,7 @@
 //! ## Usage
 //!
 //! ```rust
-//! use rustmesh::{RustMesh, find_boundary_loops, fill_all_holes};
+//! use rustmesh::{RustMesh, find_boundary_loops, fill_all_holes, Point3};
 //!
 //! let mut mesh = RustMesh::new();
 //! // ... create mesh with holes ...
@@ -21,8 +21,8 @@
 
 use crate::geometry::triangle_area;
 use crate::handles::{HalfedgeHandle, VertexHandle};
+use crate::Point3;
 use crate::RustMesh;
-use crate::Vec3;
 
 /// Result of a hole filling operation
 #[derive(Debug, Clone)]
@@ -53,7 +53,7 @@ pub struct BoundaryLoop {
     /// The vertices that make up this boundary loop (in order)
     pub vertices: Vec<VertexHandle>,
     /// The positions of the boundary vertices
-    pub points: Vec<Vec3>,
+    pub points: Vec<Point3>,
 }
 
 impl BoundaryLoop {
@@ -179,7 +179,7 @@ pub fn find_boundary_loops(mesh: &RustMesh) -> Vec<BoundaryLoop> {
 fn is_valid_ear(
     _mesh: &RustMesh,
     _vertices: &[VertexHandle],
-    points: &[Vec3],
+    points: &[Point3],
     prev_idx: usize,
     curr_idx: usize,
     next_idx: usize,
@@ -209,9 +209,9 @@ fn is_valid_ear(
 
     // Check 3: Minimum edge length to avoid degenerate triangles
     let min_edge = (p_curr - p_prev)
-        .length()
-        .min((p_next - p_curr).length())
-        .min((p_next - p_prev).length());
+        .norm()
+        .min((p_next - p_curr).norm())
+        .min((p_next - p_prev).norm());
     if min_edge < 1e-6 {
         return false;
     }
@@ -221,18 +221,18 @@ fn is_valid_ear(
 
 /// Check if a point is inside a triangle using barycentric coordinates
 #[inline]
-fn point_in_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> bool {
+fn point_in_triangle(p: Point3, a: Point3, b: Point3, c: Point3) -> bool {
     // Compute vectors
     let v0 = c - a;
     let v1 = b - a;
     let v2 = p - a;
 
     // Compute dot products
-    let dot00 = v0.dot(v0);
-    let dot01 = v0.dot(v1);
-    let dot02 = v0.dot(v2);
-    let dot11 = v1.dot(v1);
-    let dot12 = v1.dot(v2);
+    let dot00 = v0.dot(&v0);
+    let dot01 = v0.dot(&v1);
+    let dot02 = v0.dot(&v2);
+    let dot11 = v1.dot(&v1);
+    let dot12 = v1.dot(&v2);
 
     // Compute barycentric coordinates
     let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
@@ -466,15 +466,15 @@ mod tests {
 
         // Create a mesh surrounding a triangular hole
         // Outer square
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(2.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(2.0, 2.0, 0.0));
-        let v3 = mesh.add_vertex(Vec3::new(0.0, 2.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(2.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(2.0, 2.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 2.0, 0.0));
 
         // Inner triangle vertices (hole boundary)
-        let h0 = mesh.add_vertex(Vec3::new(0.5, 0.5, 0.0));
-        let h1 = mesh.add_vertex(Vec3::new(1.5, 0.5, 0.0));
-        let h2 = mesh.add_vertex(Vec3::new(1.0, 1.5, 0.0));
+        let h0 = mesh.add_vertex(Point3::new(0.5, 0.5, 0.0));
+        let h1 = mesh.add_vertex(Point3::new(1.5, 0.5, 0.0));
+        let h2 = mesh.add_vertex(Point3::new(1.0, 1.5, 0.0));
 
         // Faces with consistent CCW orientation (viewed from +Z)
         // The inner triangle [h0, h1, h2] is left as a hole
@@ -495,16 +495,16 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Create an L-shaped mesh with a square hole
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(1.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         // Inner square (hole)
-        let h0 = mesh.add_vertex(Vec3::new(0.3, 0.3, 0.0));
-        let h1 = mesh.add_vertex(Vec3::new(0.7, 0.3, 0.0));
-        let h2 = mesh.add_vertex(Vec3::new(0.7, 0.7, 0.0));
-        let h3 = mesh.add_vertex(Vec3::new(0.3, 0.7, 0.0));
+        let h0 = mesh.add_vertex(Point3::new(0.3, 0.3, 0.0));
+        let h1 = mesh.add_vertex(Point3::new(0.7, 0.3, 0.0));
+        let h2 = mesh.add_vertex(Point3::new(0.7, 0.7, 0.0));
+        let h3 = mesh.add_vertex(Point3::new(0.3, 0.7, 0.0));
 
         // Add faces around the hole (but not filling it)
         mesh.add_face(&[v0, v1, h1, h0]);
@@ -535,9 +535,9 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Single triangle - has boundary edges (the 3 outer edges)
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
 
         let loops = find_boundary_loops(&mesh);
@@ -587,29 +587,29 @@ mod tests {
 
     #[test]
     fn test_point_in_triangle() {
-        let a = Vec3::new(0.0, 0.0, 0.0);
-        let b = Vec3::new(1.0, 0.0, 0.0);
-        let c = Vec3::new(0.0, 1.0, 0.0);
+        let a = Point3::new(0.0, 0.0, 0.0);
+        let b = Point3::new(1.0, 0.0, 0.0);
+        let c = Point3::new(0.0, 1.0, 0.0);
 
         // Point inside triangle
-        let p_inside = Vec3::new(0.1, 0.1, 0.0);
+        let p_inside = Point3::new(0.1, 0.1, 0.0);
         assert!(point_in_triangle(p_inside, a, b, c));
 
         // Point outside triangle
-        let p_outside = Vec3::new(1.0, 1.0, 0.0);
+        let p_outside = Point3::new(1.0, 1.0, 0.0);
         assert!(!point_in_triangle(p_outside, a, b, c));
 
         // Point on edge
-        let p_edge = Vec3::new(0.5, 0.0, 0.0);
+        let p_edge = Point3::new(0.5, 0.0, 0.0);
         assert!(point_in_triangle(p_edge, a, b, c));
     }
 
     #[test]
     fn test_triangle_area() {
         // Right triangle with legs 1 and 1
-        let p0 = Vec3::new(0.0, 0.0, 0.0);
-        let p1 = Vec3::new(1.0, 0.0, 0.0);
-        let p2 = Vec3::new(0.0, 1.0, 0.0);
+        let p0 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0, 0.0, 0.0);
+        let p2 = Point3::new(0.0, 1.0, 0.0);
 
         let area = triangle_area(p0, p1, p2);
         assert!((area - 0.5).abs() < 1e-6);
@@ -655,7 +655,7 @@ mod tests {
         let mut mesh = RustMesh::new();
 
         // Add a single vertex and try to fill
-        let _v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
+        let _v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
 
         // No boundary edges yet - should fail
         let invalid_heh = HalfedgeHandle::invalid();
@@ -671,16 +671,16 @@ mod tests {
 
         // Create a simple mesh with a square hole
         // First create the outer square
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(2.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(2.0, 2.0, 0.0));
-        let v3 = mesh.add_vertex(Vec3::new(0.0, 2.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(2.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(2.0, 2.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 2.0, 0.0));
 
         // Create inner square (hole)
-        let h0 = mesh.add_vertex(Vec3::new(0.5, 0.5, 0.0));
-        let h1 = mesh.add_vertex(Vec3::new(1.5, 0.5, 0.0));
-        let h2 = mesh.add_vertex(Vec3::new(1.5, 1.5, 0.0));
-        let h3 = mesh.add_vertex(Vec3::new(0.5, 1.5, 0.0));
+        let h0 = mesh.add_vertex(Point3::new(0.5, 0.5, 0.0));
+        let h1 = mesh.add_vertex(Point3::new(1.5, 0.5, 0.0));
+        let h2 = mesh.add_vertex(Point3::new(1.5, 1.5, 0.0));
+        let h3 = mesh.add_vertex(Point3::new(0.5, 1.5, 0.0));
 
         // Create faces around the hole (leaving the inner square as a hole)
         // Bottom

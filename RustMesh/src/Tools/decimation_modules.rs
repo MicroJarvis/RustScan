@@ -10,7 +10,7 @@
 //!
 //! Multiple modules can be combined to create complex decimation behaviors.
 
-use crate::{HalfedgeHandle, RustMesh, Vec3, VertexHandle};
+use crate::{HalfedgeHandle, RustMesh, Vec3, VertexHandle, Point3};
 
 /// Information about a potential collapse operation
 #[derive(Debug, Clone)]
@@ -351,16 +351,16 @@ fn is_boundary_vertex(mesh: &RustMesh, vh: VertexHandle) -> bool {
 
 fn compute_quadric_error(mesh: &RustMesh, v0: VertexHandle, v1: VertexHandle, target: Vec3) -> f32 {
     // Simplified quadric error: distance from target to edge midpoint
-    let p0 = mesh.point(v0).unwrap_or(Vec3::ZERO);
-    let p1 = mesh.point(v1).unwrap_or(Vec3::ZERO);
+    let p0 = mesh.point(v0).unwrap_or(Point3::origin());
+    let p1 = mesh.point(v1).unwrap_or(Point3::origin());
     let midpoint = (p0 + p1) * 0.5;
-    (target - midpoint).length_squared()
+    (target - midpoint).norm_squared()
 }
 
 fn compute_normal_deviation(mesh: &RustMesh, info: &CollapseInfo) -> f32 {
     // Compute the change in normals of affected faces
-    let p_from = mesh.point(info.v_from).unwrap_or(Vec3::ZERO);
-    let p_to = mesh.point(info.v_to).unwrap_or(Vec3::ZERO);
+    let p_from = mesh.point(info.v_from).unwrap_or(Point3::origin());
+    let p_to = mesh.point(info.v_to).unwrap_or(Point3::origin());
 
     // Get faces adjacent to v_from
     let mut total_deviation = 0.0f32;
@@ -413,13 +413,13 @@ fn compute_aspect_ratio(mesh: &RustMesh, vertices: &[VertexHandle]) -> f32 {
         return 1.0;
     }
 
-    let p0 = mesh.point(vertices[0]).unwrap_or(Vec3::ZERO);
-    let p1 = mesh.point(vertices[1]).unwrap_or(Vec3::ZERO);
-    let p2 = mesh.point(vertices[2]).unwrap_or(Vec3::ZERO);
+    let p0 = mesh.point(vertices[0]).unwrap_or(Point3::origin());
+    let p1 = mesh.point(vertices[1]).unwrap_or(Point3::origin());
+    let p2 = mesh.point(vertices[2]).unwrap_or(Point3::origin());
 
-    let a = (p1 - p0).length();
-    let b = (p2 - p1).length();
-    let c = (p0 - p2).length();
+    let a = (p1 - p0).norm();
+    let b = (p2 - p1).norm();
+    let c = (p0 - p2).norm();
 
     let s = (a + b + c) * 0.5;
     let area = (s * (s - a) * (s - b) * (s - c)).max(0.0).sqrt();
@@ -527,9 +527,9 @@ mod tests {
         let mut mesh = crate::RustMesh::new();
 
         // Create an equilateral triangle
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(0.5, 0.866, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.5, 0.866, 0.0));
 
         let ratio = compute_aspect_ratio(&mesh, &[v0, v1, v2]);
         assert!(

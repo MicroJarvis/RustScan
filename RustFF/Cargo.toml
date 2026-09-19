@@ -7,7 +7,7 @@ authors = ["RustScan Team"]
 license = "MIT"
 
 [dependencies]
-glam = { workspace = true }
+nalgebra = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 image = "0.25"

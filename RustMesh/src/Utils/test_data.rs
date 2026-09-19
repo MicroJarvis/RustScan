@@ -4,6 +4,7 @@
 
 use crate::handles::VertexHandle;
 use crate::RustMesh;
+use crate::{Point3, Vec3};
 use std::path::Path;
 
 /// Generate a simple cube
@@ -12,14 +13,14 @@ pub fn generate_cube() -> RustMesh {
 
     // 8 vertices of a unit cube centered at origin
     let v = [
-        mesh.add_vertex(glam::vec3(-1.0, -1.0, -1.0)),
-        mesh.add_vertex(glam::vec3(1.0, -1.0, -1.0)),
-        mesh.add_vertex(glam::vec3(1.0, 1.0, -1.0)),
-        mesh.add_vertex(glam::vec3(-1.0, 1.0, -1.0)),
-        mesh.add_vertex(glam::vec3(-1.0, -1.0, 1.0)),
-        mesh.add_vertex(glam::vec3(1.0, -1.0, 1.0)),
-        mesh.add_vertex(glam::vec3(1.0, 1.0, 1.0)),
-        mesh.add_vertex(glam::vec3(-1.0, 1.0, 1.0)),
+        mesh.add_vertex(Point3::new(-1.0, -1.0, -1.0)),
+        mesh.add_vertex(Point3::new(1.0, -1.0, -1.0)),
+        mesh.add_vertex(Point3::new(1.0, 1.0, -1.0)),
+        mesh.add_vertex(Point3::new(-1.0, 1.0, -1.0)),
+        mesh.add_vertex(Point3::new(-1.0, -1.0, 1.0)),
+        mesh.add_vertex(Point3::new(1.0, -1.0, 1.0)),
+        mesh.add_vertex(Point3::new(1.0, 1.0, 1.0)),
+        mesh.add_vertex(Point3::new(-1.0, 1.0, 1.0)),
     ];
 
     // 6 faces - consistent orientation so adjacent faces share edges in opposite directions
@@ -37,10 +38,10 @@ pub fn generate_cube() -> RustMesh {
 pub fn generate_tetrahedron() -> RustMesh {
     let mut mesh = RustMesh::new();
 
-    let a = mesh.add_vertex(glam::vec3(1.0, 1.0, 1.0));
-    let b = mesh.add_vertex(glam::vec3(-1.0, -1.0, 1.0));
-    let c = mesh.add_vertex(glam::vec3(-1.0, 1.0, -1.0));
-    let d = mesh.add_vertex(glam::vec3(1.0, -1.0, -1.0));
+    let a = mesh.add_vertex(Point3::new(1.0, 1.0, 1.0));
+    let b = mesh.add_vertex(Point3::new(-1.0, -1.0, 1.0));
+    let c = mesh.add_vertex(Point3::new(-1.0, 1.0, -1.0));
+    let d = mesh.add_vertex(Point3::new(1.0, -1.0, -1.0));
 
     mesh.add_face(&[a, b, c]);
     mesh.add_face(&[a, c, d]);
@@ -54,11 +55,11 @@ pub fn generate_tetrahedron() -> RustMesh {
 pub fn generate_pyramid() -> RustMesh {
     let mut mesh = RustMesh::new();
 
-    let base0 = mesh.add_vertex(glam::vec3(-1.0, -1.0, 0.0));
-    let base1 = mesh.add_vertex(glam::vec3(1.0, -1.0, 0.0));
-    let base2 = mesh.add_vertex(glam::vec3(1.0, 1.0, 0.0));
-    let base3 = mesh.add_vertex(glam::vec3(-1.0, 1.0, 0.0));
-    let apex = mesh.add_vertex(glam::vec3(0.0, 0.0, 2.0));
+    let base0 = mesh.add_vertex(Point3::new(-1.0, -1.0, 0.0));
+    let base1 = mesh.add_vertex(Point3::new(1.0, -1.0, 0.0));
+    let base2 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+    let base3 = mesh.add_vertex(Point3::new(-1.0, 1.0, 0.0));
+    let apex = mesh.add_vertex(Point3::new(0.0, 0.0, 2.0));
 
     // Base
     mesh.add_face(&[base0, base1, base2, base3]);
@@ -79,18 +80,18 @@ pub fn generate_icosahedron() -> RustMesh {
     let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
 
     let v = [
-        mesh.add_vertex(glam::vec3(-1.0, t, 0.0).normalize()),
-        mesh.add_vertex(glam::vec3(1.0, t, 0.0).normalize()),
-        mesh.add_vertex(glam::vec3(-1.0, -t, 0.0).normalize()),
-        mesh.add_vertex(glam::vec3(1.0, -t, 0.0).normalize()),
-        mesh.add_vertex(glam::vec3(0.0, -1.0, t).normalize()),
-        mesh.add_vertex(glam::vec3(0.0, 1.0, t).normalize()),
-        mesh.add_vertex(glam::vec3(0.0, -1.0, -t).normalize()),
-        mesh.add_vertex(glam::vec3(0.0, 1.0, -t).normalize()),
-        mesh.add_vertex(glam::vec3(t, 0.0, -1.0).normalize()),
-        mesh.add_vertex(glam::vec3(t, 0.0, 1.0).normalize()),
-        mesh.add_vertex(glam::vec3(-t, 0.0, -1.0).normalize()),
-        mesh.add_vertex(glam::vec3(-t, 0.0, 1.0).normalize()),
+        mesh.add_vertex(Point3::from(Vec3::new(-1.0, t, 0.0).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(1.0, t, 0.0).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(-1.0, -t, 0.0).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(1.0, -t, 0.0).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(0.0, -1.0, t).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(0.0, 1.0, t).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(0.0, -1.0, -t).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(0.0, 1.0, -t).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(t, 0.0, -1.0).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(t, 0.0, 1.0).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(-t, 0.0, -1.0).normalize())),
+        mesh.add_vertex(Point3::from(Vec3::new(-t, 0.0, 1.0).normalize())),
     ];
 
     // 20 triangular faces
@@ -147,7 +148,7 @@ pub fn generate_grid(rows: usize, cols: usize) -> RustMesh {
         for j in 0..cols {
             let x = (j as f32) / ((cols - 1) as f32) - 0.5;
             let y = (i as f32) / ((rows - 1) as f32) - 0.5;
-            let vh = mesh.add_vertex(glam::vec3(x, y, 0.0));
+            let vh = mesh.add_vertex(Point3::new(x, y, 0.0));
             row.push(vh);
         }
         vertices.push(row);
@@ -185,7 +186,7 @@ pub fn generate_sphere(radius: f32, segments: usize, rings: usize) -> RustMesh {
             let y = radius * phi.cos();
             let z = radius * phi.sin() * theta.sin();
 
-            let vh = mesh.add_vertex(glam::vec3(x, y, z));
+            let vh = mesh.add_vertex(Point3::new(x, y, z));
             row.push(vh);
         }
 
@@ -231,7 +232,7 @@ pub fn generate_torus(
             let y = (major_radius + minor_radius * v.cos()) * u.sin();
             let z = minor_radius * v.sin();
 
-            let vh = mesh.add_vertex(glam::vec3(x, y, z));
+            let vh = mesh.add_vertex(Point3::new(x, y, z));
             row.push(vh);
         }
 
@@ -276,7 +277,7 @@ pub fn generate_noisy_sphere(radius: f32, noise: f32, segments: usize, rings: us
             let y = r * phi.cos();
             let z = r * phi.sin() * theta.sin();
 
-            let vh = mesh.add_vertex(glam::vec3(x, y, z));
+            let vh = mesh.add_vertex(Point3::new(x, y, z));
             row.push(vh);
         }
 

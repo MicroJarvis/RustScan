@@ -1,9 +1,12 @@
 //! Core shared data structures used by the canonical splat architecture.
 
 mod camera;
+pub(crate) mod matrix;
 pub(crate) mod splats;
 
 pub use camera::{viewmat_from_pose, GaussianCamera};
+#[cfg(feature = "gpu")]
+pub(crate) use matrix::matrix4_to_column_major_array;
 #[cfg(feature = "gpu")]
 pub(crate) use splats::HostSplatsCacheKey;
 pub use splats::{HostSplats, SplatView};

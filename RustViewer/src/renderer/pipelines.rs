@@ -1,9 +1,13 @@
 //! GPU render pipelines using eframe's wgpu re-export.
 
 use eframe::wgpu;
-use glam::Vec4;
+use nalgebra::Vector4;
+use rustscan_types::matrix4_from_column_major_array;
 
 use crate::renderer::scene::MeshGpuVertex;
+
+/// Point vertex: position + color (24 bytes).
+/// Screen-space expansion consumes a named column-major `[[f32; 4]; 4]` view-proj.
 
 /// Point vertex: position + color (24 bytes).
 #[repr(C)]
@@ -25,7 +29,8 @@ pub fn expand_points_to_quads(
     viewport_h: f32,
     view_proj: [[f32; 4]; 4],
 ) -> (Vec<PointVertex>, Vec<u32>) {
-    let vp = glam::Mat4::from_cols_array_2d(&view_proj);
+    // `view_proj` is a column-major wgpu uniform: `array[col][row]`.
+    let vp = matrix4_from_column_major_array(&view_proj);
     let ndc_w = POINT_PIXEL_SIZE / viewport_w;
     let ndc_h = POINT_PIXEL_SIZE / viewport_h;
 
@@ -33,7 +38,7 @@ pub fn expand_points_to_quads(
     let mut idxs: Vec<u32> = Vec::with_capacity(points.len() * 6);
 
     for (pos, col) in points.iter().zip(colors.iter()) {
-        let p = Vec4::new(pos[0], pos[1], pos[2], 1.0);
+        let p = Vector4::new(pos[0], pos[1], pos[2], 1.0);
         let clip = vp * p;
         if clip.w <= 0.0 {
             continue;

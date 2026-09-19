@@ -10,6 +10,7 @@
 //! - f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3 (face with all attributes)
 
 use crate::RustMesh;
+use crate::{Point3, Vec2, Vec3};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -124,18 +125,18 @@ pub fn read_obj(path: impl AsRef<Path>) -> io::Result<RustMesh> {
                 let x = parts[1].parse::<f32>().unwrap_or(0.0);
                 let y = parts[2].parse::<f32>().unwrap_or(0.0);
                 let z = parts[3].parse::<f32>().unwrap_or(0.0);
-                positions.push(glam::Vec3::new(x, y, z));
+                positions.push(Point3::new(x, y, z));
             }
             "vn" if parts.len() >= 4 => {
                 let nx = parts[1].parse::<f32>().unwrap_or(0.0);
                 let ny = parts[2].parse::<f32>().unwrap_or(0.0);
                 let nz = parts[3].parse::<f32>().unwrap_or(0.0);
-                normals.push(glam::Vec3::new(nx, ny, nz));
+                normals.push(Vec3::new(nx, ny, nz));
             }
             "vt" if parts.len() >= 3 => {
                 let u = parts[1].parse::<f32>().unwrap_or(0.0);
                 let v = parts[2].parse::<f32>().unwrap_or(0.0);
-                texcoords.push(glam::Vec2::new(u, v));
+                texcoords.push(Vec2::new(u, v));
             }
             _ => {}
         }
@@ -224,9 +225,9 @@ mod tests {
         use std::fs;
 
         let mut mesh = RustMesh::new();
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
 
         let path = "/tmp/test_mesh.obj";

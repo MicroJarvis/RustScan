@@ -2,10 +2,9 @@
 
 use std::sync::OnceLock;
 
-use glam::{Mat3, Quat, Vec3};
-
-use crate::renderer::camera::ArcballCamera;
+use crate::renderer::camera::{normalize_or_zero, vec3_is_finite, ArcballCamera, Vec3};
 use crate::renderer::scene::{MeshGpuVertex, Scene, SceneBounds};
+use nalgebra::{Matrix3, Unit, UnitQuaternion, Vector3};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavigationMode {
@@ -51,8 +50,8 @@ pub struct GroundPlane {
 
 impl GroundPlane {
     pub fn new(origin: Vec3, up: Vec3) -> Option<Self> {
-        let up = up.normalize_or_zero();
-        (origin.is_finite() && up.length_squared() > 0.0).then_some(Self { origin, up })
+        let up = normalize_or_zero(up);
+        (vec3_is_finite(origin) && up.norm_squared() > 0.0).then_some(Self { origin, up })
     }
 
     pub fn from_points(points: &[Vec3], camera_eye: Vec3) -> Option<Self> {
@@ -60,15 +59,15 @@ impl GroundPlane {
             return None;
         }
         let origin = points.iter().copied().sum::<Vec3>() / points.len() as f32;
-        let mut normal = Vec3::ZERO;
+        let mut normal = Vec3::zeros();
         for i in 0..points.len() {
             for j in (i + 1)..points.len() {
                 for k in (j + 1)..points.len() {
-                    let tri_normal = (points[j] - points[i]).cross(points[k] - points[i]);
-                    if tri_normal.length_squared() <= 1e-10 {
+                    let tri_normal = (points[j] - points[i]).cross(&(points[k] - points[i]));
+                    if tri_normal.norm_squared() <= 1e-10 {
                         continue;
                     }
-                    normal += if normal.dot(tri_normal) < 0.0 {
+                    normal += if normal.dot(&tri_normal) < 0.0 {
                         -tri_normal
                     } else {
                         tri_normal
@@ -76,22 +75,22 @@ impl GroundPlane {
                 }
             }
         }
-        if normal.length_squared() <= 1e-10 {
+        if normal.norm_squared() <= 1e-10 {
             return None;
         }
         let mut up = normal.normalize();
-        if camera_eye.is_finite() && up.dot(camera_eye - origin) < 0.0 {
+        if vec3_is_finite(camera_eye) && up.dot(&(camera_eye - origin)) < 0.0 {
             up = -up;
         }
         Self::new(origin, up)
     }
 
     pub fn project_point(&self, point: Vec3) -> Vec3 {
-        point - self.up * (point - self.origin).dot(self.up)
+        point - self.up * (point - self.origin).dot(&self.up)
     }
 
     pub fn project_direction(&self, direction: Vec3) -> Vec3 {
-        direction - self.up * direction.dot(self.up)
+        direction - self.up * direction.dot(&self.up)
     }
 }
 
@@ -121,7 +120,7 @@ impl Default for RobotController {
         Self {
             visible: true,
             camera_mode: RobotCameraMode::Follow,
-            position: Vec3::ZERO,
+            position: Vec3::zeros(),
             yaw: 0.0,
             pitch: 0.0,
             ground_plane: None,
@@ -150,7 +149,7 @@ impl RobotController {
 
     pub fn reset_to_scene(&mut self, bounds: &SceneBounds) {
         if !bounds.is_valid() {
-            self.position = Vec3::ZERO;
+            self.position = Vec3::zeros();
             self.ground_plane = None;
             self.ground_height = 0.0;
             self.walk_bounds = Some(WalkBounds {
@@ -233,16 +232,15 @@ impl RobotController {
         self.sync_ground_from_scene(&scene.bounds);
 
         let eye = camera.eye();
-        let view_forward = (camera.target - eye).normalize_or_zero();
+        let view_forward = normalize_or_zero(camera.target - eye);
         let forward = self.project_direction_to_ground(view_forward);
-        let forward = if forward.length_squared() > 1e-8 {
+        let forward = if forward.norm_squared() > 1e-8 {
             forward.normalize()
         } else {
-            self.project_direction_to_ground(-camera.backward())
-                .normalize_or_zero()
+            normalize_or_zero(self.project_direction_to_ground(-camera.backward()))
         };
         let mut position = camera.target;
-        if !position.is_finite() {
+        if !vec3_is_finite(position) {
             position = eye + forward * (self.model_height * 3.0).max(0.75);
         }
         if let Some(ground_plane) = self.ground_plane {
@@ -256,7 +254,7 @@ impl RobotController {
         }
         self.position = self.constrain_to_ground(position);
 
-        if forward.length_squared() > 1e-8 {
+        if forward.norm_squared() > 1e-8 {
             self.yaw = (-forward.x).atan2(-forward.z);
         }
         self.pitch = 0.0;
@@ -276,7 +274,7 @@ impl RobotController {
         let forward = self.forward_flat();
         let right = self.right_flat();
         let movement = forward * input.forward + right * input.strafe;
-        if movement.length_squared() > 1e-8 {
+        if movement.norm_squared() > 1e-8 {
             let direction = movement.normalize();
             self.position += direction * self.move_speed * dt;
             self.position = self.constrain_to_ground(self.position);
@@ -321,11 +319,13 @@ impl RobotController {
 
     pub fn forward_flat(&self) -> Vec3 {
         let up = self.ground_up();
-        (Quat::from_axis_angle(up, self.yaw) * self.ground_reference_forward()).normalize()
+        (UnitQuaternion::from_axis_angle(&Unit::new_normalize(up), self.yaw)
+            * self.ground_reference_forward())
+        .normalize()
     }
 
     fn right_flat(&self) -> Vec3 {
-        self.forward_flat().cross(self.ground_up()).normalize()
+        self.forward_flat().cross(&self.ground_up()).normalize()
     }
 
     fn constrain_to_ground(&self, mut position: Vec3) -> Vec3 {
@@ -364,7 +364,8 @@ impl RobotController {
     fn forward_with_pitch(&self) -> Vec3 {
         let right = self.right_flat();
         let forward = self.forward_flat();
-        (Quat::from_axis_angle(right, self.pitch) * forward).normalize()
+        (UnitQuaternion::from_axis_angle(&Unit::new_normalize(right), self.pitch) * forward)
+            .normalize()
     }
 
     fn g1_render_mesh(&self) -> RobotRenderMesh {
@@ -374,12 +375,12 @@ impl RobotController {
         let mut vertices = Vec::with_capacity(baked.vertices.len());
 
         for vertex in &baked.vertices {
-            let local = Vec3::from_array(vertex.position) * scale;
+            let local = Vec3::from(vertex.position) * scale;
             let world = self.position + rotation * local;
-            let normal = rotation * Vec3::from_array(vertex.normal);
+            let normal = rotation * Vec3::from(vertex.normal);
             vertices.push(MeshGpuVertex {
-                position: world.to_array(),
-                normal: normal.normalize_or_zero().to_array(),
+                position: world.into(),
+                normal: normalize_or_zero(normal).into(),
                 color: vertex.color,
             });
         }
@@ -394,17 +395,17 @@ impl RobotController {
     fn ground_up(&self) -> Vec3 {
         self.ground_plane
             .map(|ground_plane| ground_plane.up)
-            .unwrap_or(Vec3::Y)
+            .unwrap_or(Vector3::y())
     }
 
     fn ground_reference_forward(&self) -> Vec3 {
-        for candidate in [Vec3::NEG_Z, Vec3::X, Vec3::Z] {
+        for candidate in [(-Vector3::z()), Vector3::x(), Vector3::z()] {
             let forward = self.project_direction_to_ground(candidate);
-            if forward.length_squared() > 1e-8 {
+            if forward.norm_squared() > 1e-8 {
                 return forward.normalize();
             }
         }
-        Vec3::NEG_Z
+        (-Vector3::z())
     }
 
     fn project_direction_to_ground(&self, direction: Vec3) -> Vec3 {
@@ -415,11 +416,11 @@ impl RobotController {
         }
     }
 
-    fn body_rotation(&self) -> Quat {
+    fn body_rotation(&self) -> UnitQuaternion<f32> {
         let up = self.ground_up();
         let forward = self.forward_flat();
-        let right = forward.cross(up).normalize();
-        Quat::from_mat3(&Mat3::from_cols(right, up, -forward)).normalize()
+        let right = forward.cross(&up).normalize();
+        UnitQuaternion::from_matrix(&Matrix3::from_columns(&[right, up, -forward]))
     }
 }
 
@@ -509,14 +510,14 @@ fn fallback_proxy_mesh(height: f32) -> BakedRobotMesh {
             [0, 7, 3],
         ];
         for face in faces {
-            let p0 = center + corners[face[0]] * half_extents;
-            let p1 = center + corners[face[1]] * half_extents;
-            let p2 = center + corners[face[2]] * half_extents;
-            let normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+            let p0 = center + corners[face[0]].component_mul(&half_extents);
+            let p1 = center + corners[face[1]].component_mul(&half_extents);
+            let p2 = center + corners[face[2]].component_mul(&half_extents);
+            let normal = normalize_or_zero((p1 - p0).cross(&(p2 - p0)));
             for point in [p0, p1, p2] {
                 vertices.push(MeshGpuVertex {
-                    position: point.to_array(),
-                    normal: normal.to_array(),
+                    position: point.into(),
+                    normal: normal.into(),
                     color,
                 });
             }
@@ -667,8 +668,8 @@ mod tests {
     fn robot_camera_is_finite() {
         let robot = RobotController::default();
         let camera = robot.camera();
-        assert!(camera.eye().is_finite());
-        assert!(camera.target.is_finite());
+        assert!(vec3_is_finite(camera.eye()));
+        assert!(vec3_is_finite(camera.target));
     }
 
     #[test]
@@ -681,28 +682,28 @@ mod tests {
         ];
 
         let plane = GroundPlane::from_points(&points, Vec3::new(0.0, 5.0, 0.0)).unwrap();
-        assert!(plane.up.dot(Vec3::Y) > 0.999);
+        assert!(plane.up.dot(&Vector3::y()) > 0.999);
 
         let flipped = GroundPlane::from_points(&points, Vec3::new(0.0, -5.0, 0.0)).unwrap();
-        assert!(flipped.up.dot(Vec3::NEG_Y) > 0.999);
+        assert!(flipped.up.dot(&(-Vector3::y())) > 0.999);
     }
 
     #[test]
     fn robot_ground_plane_projects_position_and_mesh_above_ground() {
         let mut robot = RobotController::default();
         let up = Vec3::new(0.0, 1.0, 1.0).normalize();
-        let plane = GroundPlane::new(Vec3::ZERO, up).unwrap();
+        let plane = GroundPlane::new(Vec3::zeros(), up).unwrap();
         robot.set_ground_plane(plane);
         robot.position = Vec3::new(0.0, 5.0, 0.0);
         robot.snap_to_ground();
 
-        assert!((robot.position - plane.project_point(robot.position)).length() < 1e-5);
+        assert!((robot.position - plane.project_point(robot.position)).norm() < 1e-5);
 
         let mesh = robot.render_mesh().expect("robot mesh");
         let min_ground_distance = mesh
             .vertices
             .iter()
-            .map(|vertex| (Vec3::from_array(vertex.position) - plane.origin).dot(plane.up))
+            .map(|vertex| (Vec3::from(vertex.position) - plane.origin).dot(&plane.up))
             .fold(f32::INFINITY, f32::min);
         assert!(
             min_ground_distance >= -1e-4,
@@ -720,7 +721,7 @@ mod tests {
         let camera = ArcballCamera::from_eye_target(
             Vec3::new(0.0, 1.0, 8.0),
             Vec3::new(3.0, 0.4, -4.0),
-            Vec3::Y,
+            Vector3::y(),
             std::f32::consts::FRAC_PI_4,
         );
         let mut robot = RobotController::default();

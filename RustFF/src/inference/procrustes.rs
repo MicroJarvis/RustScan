@@ -5,12 +5,16 @@
 //!
 //! Reference: Python implementation in scripts/procrustes.py
 
-use glam::{Mat3, Mat4, Vec3};
+use nalgebra::{Matrix3, Matrix4, Vector3};
 
 /// Estimate rigid body transformation from source to target point cloud.
 ///
 /// Returns (R, t) where R is rotation [3x3] and t is translation [3].
-pub fn weighted_procrustes(src: &[[f32; 3]], tgt: &[[f32; 3]], weights: &[f32]) -> (Mat3, Vec3) {
+pub fn weighted_procrustes(
+    src: &[[f32; 3]],
+    tgt: &[[f32; 3]],
+    weights: &[f32],
+) -> (Matrix3<f32>, Vector3<f32>) {
     assert_eq!(src.len(), tgt.len());
     assert_eq!(src.len(), weights.len());
     assert!(!src.is_empty());
@@ -50,7 +54,7 @@ pub fn weighted_procrustes(src: &[[f32; 3]], tgt: &[[f32; 3]], weights: &[f32]) 
         })
         .collect();
 
-    // Weighted cross-covariance matrix H = src_centered^T * W * tgt_centered
+    // Weighted cross-covariance H = sum src * tgt^T, stored row-major.
     let mut h = [[0.0f32; 3]; 3];
     for i in 0..src.len() {
         for r in 0..3 {
@@ -60,39 +64,21 @@ pub fn weighted_procrustes(src: &[[f32; 3]], tgt: &[[f32; 3]], weights: &[f32]) 
         }
     }
 
-    // SVD using simple 3x3 Jacobi SVD
-    let (u, _s, vt) = svd_3x3(&h);
-
-    // Correct reflection
-    let det_uv = det_3x3(&matmul_3x3(&vt, &u));
-    let sign = if det_uv < 0.0 { -1.0 } else { 1.0 };
-
-    // R = V * diag(1, 1, sign) * U^T
-    let mut r_matrix = [[0.0f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            let mut sum = 0.0;
-            for k in 0..3 {
-                let s = if k == 2 { sign } else { 1.0 };
-                sum += vt[k][i] * s * u[k][j]; // V * diag * U^T
-            }
-            r_matrix[i][j] = sum;
-        }
+    let h_mat = Matrix3::from_fn(|row, col| h[row][col]);
+    let svd = nalgebra::SVD::new(h_mat, true, true);
+    let u = svd.u.expect("3x3 SVD must produce U");
+    let v_t = svd.v_t.expect("3x3 SVD must produce V^T");
+    let mut r = &v_t.transpose() * u.transpose();
+    if r.determinant() < 0.0 {
+        let mut v = v_t.transpose();
+        v.set_column(2, &(-v.column(2)));
+        r = v * u.transpose();
     }
 
     // Translation: t = tgt_centroid - R * src_centroid
-    let r_src = matvec_3x3(&r_matrix, &src_centroid);
-    let t = Vec3::new(
-        tgt_centroid[0] - r_src[0],
-        tgt_centroid[1] - r_src[1],
-        tgt_centroid[2] - r_src[2],
-    );
-
-    let r = Mat3::from_cols(
-        Vec3::new(r_matrix[0][0], r_matrix[1][0], r_matrix[2][0]),
-        Vec3::new(r_matrix[0][1], r_matrix[1][1], r_matrix[2][1]),
-        Vec3::new(r_matrix[0][2], r_matrix[1][2], r_matrix[2][2]),
-    );
+    let src_centroid = Vector3::from(src_centroid);
+    let tgt_centroid = Vector3::from(tgt_centroid);
+    let t = tgt_centroid - r * src_centroid;
 
     (r, t)
 }
@@ -100,7 +86,7 @@ pub fn weighted_procrustes(src: &[[f32; 3]], tgt: &[[f32; 3]], weights: &[f32]) 
 /// Extract camera pose from pointmap via weighted Procrustes.
 ///
 /// Given a predicted pointmap and confidence, estimate the camera-to-world pose.
-pub fn pointmap_to_pose(points: &[[f32; 3]], confidence: &[f32]) -> Mat4 {
+pub fn pointmap_to_pose(points: &[[f32; 3]], confidence: &[f32]) -> Matrix4<f32> {
     // Filter by confidence
     let valid: Vec<(&[f32; 3], f32)> = points
         .iter()
@@ -110,14 +96,11 @@ pub fn pointmap_to_pose(points: &[[f32; 3]], confidence: &[f32]) -> Mat4 {
         .collect();
 
     if valid.len() < 10 {
-        return Mat4::IDENTITY;
+        return Matrix4::identity();
     }
 
-    let valid_points: Vec<[f32; 3]> = valid.iter().map(|(p, _)| **p).collect();
-    let valid_conf: Vec<f32> = valid.iter().map(|(_, c)| *c).collect();
-
     // Weighted centroid
-    let w_sum: f32 = valid_conf.iter().sum();
+    let w_sum: f32 = valid.iter().map(|(_, c)| *c).sum();
     let mut centroid = [0.0f32; 3];
     for (p, c) in valid.iter() {
         for j in 0..3 {
@@ -140,42 +123,31 @@ pub fn pointmap_to_pose(points: &[[f32; 3]], confidence: &[f32]) -> Mat4 {
     let (_evals, evecs) = eigendecompose_3x3(&cov);
 
     // Build rotation from eigenvectors (column vectors)
-    let r = Mat3::from_cols(
-        Vec3::new(evecs[0][0], evecs[1][0], evecs[2][0]),
-        Vec3::new(evecs[0][1], evecs[1][1], evecs[2][1]),
-        Vec3::new(evecs[0][2], evecs[1][2], evecs[2][2]),
-    );
+    let r = Matrix3::from_fn(|row, col| evecs[row][col]);
 
-    // Build 4x4 pose
-    Mat4::from_cols(
-        r.x_axis.extend(0.0),
-        r.y_axis.extend(0.0),
-        r.z_axis.extend(0.0),
-        Vec3::new(centroid[0], centroid[1], centroid[2]).extend(1.0),
+    Matrix4::new(
+        r[(0, 0)],
+        r[(0, 1)],
+        r[(0, 2)],
+        centroid[0],
+        r[(1, 0)],
+        r[(1, 1)],
+        r[(1, 2)],
+        centroid[1],
+        r[(2, 0)],
+        r[(2, 1)],
+        r[(2, 2)],
+        centroid[2],
+        0.0,
+        0.0,
+        0.0,
+        1.0,
     )
 }
 
 // ============================================================
 // Linear algebra helpers
 // ============================================================
-
-/// Simple 3x3 SVD using Jacobi iterations
-fn svd_3x3(m: &[[f32; 3]; 3]) -> ([[f32; 3]; 3], [f32; 3], [[f32; 3]; 3]) {
-    // For simplicity, use eigendecomposition of M^T*M and M*M^T
-    let mtm = matmul_3x3t(m, m);
-    let mmt = matmul_3xt3(m, m);
-
-    let (s2, v) = eigendecompose_3x3(&mtm);
-    let (_s1, u) = eigendecompose_3x3(&mmt);
-
-    // Singular values
-    let mut s = [0.0f32; 3];
-    for i in 0..3 {
-        s[i] = s2[i].max(0.0).sqrt();
-    }
-
-    (u, s, transpose_3x3(&v))
-}
 
 /// 3x3 eigendecomposition using Jacobi rotations
 fn eigendecompose_3x3(m: &[[f32; 3]; 3]) -> ([f32; 3], [[f32; 3]; 3]) {
@@ -236,71 +208,10 @@ fn eigendecompose_3x3(m: &[[f32; 3]; 3]) -> ([f32; 3], [[f32; 3]; 3]) {
     ([a[0][0], a[1][1], a[2][2]], v)
 }
 
-fn matmul_3x3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut r = [[0.0f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            for k in 0..3 {
-                r[i][j] += a[i][k] * b[k][j];
-            }
-        }
-    }
-    r
-}
-
-fn matmul_3x3t(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut r = [[0.0f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            for k in 0..3 {
-                r[i][j] += a[k][i] * b[k][j]; // a^T * b
-            }
-        }
-    }
-    r
-}
-
-fn matmul_3xt3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut r = [[0.0f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            for k in 0..3 {
-                r[i][j] += a[i][k] * b[j][k]; // a * b^T
-            }
-        }
-    }
-    r
-}
-
-fn transpose_3x3(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut r = [[0.0f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            r[i][j] = m[j][i];
-        }
-    }
-    r
-}
-
-fn matvec_3x3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
-    let mut r = [0.0f32; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            r[i] += m[i][j] * v[j];
-        }
-    }
-    r
-}
-
-fn det_3x3(m: &[[f32; 3]; 3]) -> f32 {
-    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::Point3;
 
     #[test]
     fn test_procrustes_identity() {
@@ -315,15 +226,12 @@ mod tests {
         // Same points -> R = I, t = 0
         let (r, t) = weighted_procrustes(&points, &points, &weights);
 
-        // Check rotation is close to identity
-        let identity = Mat3::IDENTITY;
-        let diff = (r.x_axis - identity.x_axis).length()
-            + (r.y_axis - identity.y_axis).length()
-            + (r.z_axis - identity.z_axis).length();
-        assert!(diff < 0.01, "Rotation should be identity, diff={diff}");
-
-        // Check translation is close to zero
-        assert!(t.length() < 0.01, "Translation should be zero, t={t:?}");
+        assert!(
+            (r - Matrix3::identity()).norm() < 0.01,
+            "Rotation should be identity, diff={}",
+            (r - Matrix3::identity()).norm()
+        );
+        assert!(t.norm() < 0.01, "Translation should be zero, t={t:?}");
     }
 
     #[test]
@@ -343,18 +251,74 @@ mod tests {
 
         let (r, t) = weighted_procrustes(&src, &tgt, &weights);
 
-        // R should be identity
-        let identity = Mat3::IDENTITY;
-        let diff = (r.x_axis - identity.x_axis).length()
-            + (r.y_axis - identity.y_axis).length()
-            + (r.z_axis - identity.z_axis).length();
-        assert!(diff < 0.01, "Rotation should be identity, diff={diff}");
+        assert!(
+            (r - Matrix3::identity()).norm() < 0.01,
+            "Rotation should be identity, diff={}",
+            (r - Matrix3::identity()).norm()
+        );
 
-        // t should equal offset
-        let t_err = (t - Vec3::from(offset)).length();
+        let t_err = (t - Vector3::from(offset)).norm();
         assert!(
             t_err < 0.01,
             "Translation should be {offset:?}, err={t_err}"
         );
+    }
+
+    #[test]
+    fn test_procrustes_non_symmetric_rotation_and_translation() {
+        let rotation = Matrix3::new(0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        let translation = Vector3::new(1.25, -2.5, 3.75);
+        let src_points = [
+            Point3::new(0.7, -1.1, 2.3),
+            Point3::new(-0.4, 1.8, 0.2),
+            Point3::new(1.5, 0.3, -0.9),
+            Point3::new(0.1, -0.6, 1.4),
+        ];
+        let src: Vec<[f32; 3]> = src_points.iter().map(|p| [p.x, p.y, p.z]).collect();
+        let tgt: Vec<[f32; 3]> = src_points
+            .iter()
+            .map(|p| {
+                let q = rotation * p.coords + translation;
+                [q.x, q.y, q.z]
+            })
+            .collect();
+        let weights = vec![1.0; 4];
+
+        let (r, t) = weighted_procrustes(&src, &tgt, &weights);
+        assert!(
+            (r - rotation).norm() < 0.05,
+            "rotation err={}",
+            (r - rotation).norm()
+        );
+        assert!(
+            (t - translation).norm() < 0.05,
+            "translation err={}",
+            (t - translation).norm()
+        );
+
+        let pose = Matrix4::new(
+            r[(0, 0)],
+            r[(0, 1)],
+            r[(0, 2)],
+            t.x,
+            r[(1, 0)],
+            r[(1, 1)],
+            r[(1, 2)],
+            t.y,
+            r[(2, 0)],
+            r[(2, 1)],
+            r[(2, 2)],
+            t.z,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        );
+        let p = nalgebra::Vector4::new(0.7, -1.1, 2.3, 1.0);
+        let expected = {
+            let q = rotation * Vector3::new(0.7, -1.1, 2.3) + translation;
+            nalgebra::Vector4::new(q.x, q.y, q.z, 1.0)
+        };
+        assert!((pose * p - expected).norm() < 0.05);
     }
 }

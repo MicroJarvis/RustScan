@@ -1220,7 +1220,11 @@ fn collect_sparse_map_points(local_mapping: &LocalMapping) -> Vec<MapPointData> 
 
     map.valid_points()
         .filter(|point| point.observations >= 2)
-        .filter(|point| point.position.is_finite())
+        .filter(|point| {
+            point.position.x.is_finite()
+                && point.position.y.is_finite()
+                && point.position.z.is_finite()
+        })
         .map(|point| {
             MapPointData::new(
                 [point.position.x, point.position.y, point.position.z],

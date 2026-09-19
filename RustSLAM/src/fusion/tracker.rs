@@ -6,7 +6,7 @@
 use crate::core::SE3;
 use crate::fusion::gaussian::{GaussianCamera, GaussianMap};
 use crate::fusion::renderer::GaussianRenderer;
-use glam::Vec3;
+use nalgebra::Vector3;
 
 /// Tracking result
 #[derive(Debug, Clone)]
@@ -220,12 +220,12 @@ impl GaussianTracker {
         }
 
         // Simplified: compute centroid difference
-        let mut obs_centroid = Vec3::ZERO;
-        let mut rend_centroid = Vec3::ZERO;
+        let mut obs_centroid = Vector3::zeros();
+        let mut rend_centroid = Vector3::zeros();
 
         for c in correspondences {
-            obs_centroid += Vec3::new(c.observed[0], c.observed[1], c.observed[2]);
-            rend_centroid += Vec3::new(c.rendered[0], c.rendered[1], c.rendered[2]);
+            obs_centroid += Vector3::new(c.observed[0], c.observed[1], c.observed[2]);
+            rend_centroid += Vector3::new(c.rendered[0], c.rendered[1], c.rendered[2]);
         }
 
         let n = correspondences.len() as f32;

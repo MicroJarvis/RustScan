@@ -32,7 +32,9 @@
 //! Determinism: no randomness; tie handling and iteration order are fixed.
 
 use crate::types::PairGeometry;
-use glam::{Quat, Vec3};
+type Quat = nalgebra::UnitQuaternion<f32>;
+type Vec3 = nalgebra::Vector3<f32>;
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use nalgebra::DMatrix;
 
 /// A single relative-translation measurement between two views.
@@ -95,8 +97,8 @@ pub fn relative_translations_from_pairs(pairs: &[PairGeometry]) -> Vec<RelativeT
         .iter()
         .filter(|pair| !pair.pose_graph_only && pair.inliers > 0 && pair.left != pair.right)
         .filter_map(|pair| {
-            let t = Vec3::from_array(pair.relative_pose.translation());
-            (t.length_squared() > 1.0e-12).then_some(RelativeTranslation {
+            let t = Vec3::from(pair.relative_pose.translation());
+            (t.norm_squared() > 1.0e-12).then_some(RelativeTranslation {
                 i: pair.left,
                 j: pair.right,
                 translation: t,
@@ -129,7 +131,7 @@ pub fn estimate_global_positions(
             continue;
         }
         let dir = -(global_rotations[e.j].inverse() * e.translation);
-        if let Some(unit) = dir.try_normalize() {
+        if let Some(unit) = dir.try_normalize(f32::EPSILON) {
             clean.push((e.i, e.j, unit, e.weight));
         }
     }
@@ -139,7 +141,7 @@ pub fn estimate_global_positions(
 
     let connected = connectivity(num_views, &clean);
 
-    let mut centers = vec![Vec3::ZERO; num_views];
+    let mut centers = vec![Vec3::zeros(); num_views];
     let mut depths = vec![1.0f64; clean.len()];
     let mut num_iterations = 0usize;
 
@@ -168,7 +170,7 @@ pub fn estimate_global_positions(
 
         // Update depths via projection onto the (positive) baseline direction.
         for (edge_idx, &(i, j, dir, _)) in clean.iter().enumerate() {
-            let projection = dir.dot(new_centers[j] - new_centers[i]) as f64;
+            let projection = dir.dot(&(new_centers[j] - new_centers[i])) as f64;
             depths[edge_idx] = projection.max(0.0);
         }
 
@@ -249,7 +251,7 @@ fn solve_centers(
         return None;
     }
 
-    let mut centers = vec![Vec3::ZERO; num_views];
+    let mut centers = vec![Vec3::zeros(); num_views];
     for idx in 1..num_views {
         let row = idx - 1;
         centers[idx] = Vec3::new(
@@ -264,10 +266,7 @@ fn solve_centers(
 /// Scale the configuration to unit RMS center radius (and rescale depths in
 /// lockstep so the objective is unchanged). Keeps view 0 at the origin.
 fn normalize_scale(centers: &mut [Vec3], depths: &mut [f64]) {
-    let sum_sq: f64 = centers
-        .iter()
-        .map(|c| c.length_squared() as f64)
-        .sum::<f64>();
+    let sum_sq: f64 = centers.iter().map(|c| c.norm_squared() as f64).sum::<f64>();
     let rms = (sum_sq / centers.len().max(1) as f64).sqrt();
     if !rms.is_finite() || rms < 1.0e-12 {
         return;
@@ -333,13 +332,15 @@ mod tests {
     }
 
     fn random_quat(rng: &mut ColmapMt19937) -> Quat {
-        let axis = Vec3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5).normalize_or_zero();
-        let axis = if axis.length_squared() < 1.0e-6 {
-            Vec3::X
+        let axis = Vec3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5)
+            .try_normalize(f32::EPSILON)
+            .unwrap_or_else(nalgebra::Vector3::zeros);
+        let axis = if axis.norm_squared() < 1.0e-6 {
+            Vec3::x()
         } else {
             axis
         };
-        Quat::from_axis_angle(axis, unit(rng) * std::f32::consts::PI)
+        crate::geometry::quat_from_axis_angle(axis, unit(rng) * std::f32::consts::PI)
     }
 
     /// Synthesize the relative translation for an edge: t_ij = -R_j (c_j - c_i).
@@ -364,8 +365,8 @@ mod tests {
         let mut num = 0.0f32;
         let mut den = 0.0f32;
         for (e, g) in est.iter().zip(gt.iter()) {
-            num += e.dot(*g);
-            den += e.dot(*e);
+            num += e.dot(&*g);
+            den += e.dot(&*e);
         }
         if den < 1.0e-12 {
             1.0
@@ -378,8 +379,8 @@ mod tests {
     fn recovers_centers_from_clean_directions_identity_rotations() {
         let mut rng = ColmapMt19937::new(11);
         let n = 8;
-        let rotations = vec![Quat::IDENTITY; n];
-        let mut gt = vec![Vec3::ZERO];
+        let rotations = vec![Quat::identity(); n];
+        let mut gt = vec![Vec3::zeros()];
         for _ in 1..n {
             gt.push(random_vec(&mut rng));
         }
@@ -407,8 +408,8 @@ mod tests {
     fn recovers_centers_with_nonidentity_rotations() {
         let mut rng = ColmapMt19937::new(99);
         let n = 10;
-        let mut rotations = vec![Quat::IDENTITY];
-        let mut gt = vec![Vec3::ZERO];
+        let mut rotations = vec![Quat::identity()];
+        let mut gt = vec![Vec3::zeros()];
         for _ in 1..n {
             rotations.push(random_quat(&mut rng));
             gt.push(random_vec(&mut rng));
@@ -437,8 +438,8 @@ mod tests {
     fn is_robust_to_an_outlier_translation() {
         let mut rng = ColmapMt19937::new(5);
         let n = 8;
-        let rotations = vec![Quat::IDENTITY; n];
-        let mut gt = vec![Vec3::ZERO];
+        let rotations = vec![Quat::identity(); n];
+        let mut gt = vec![Vec3::zeros()];
         for _ in 1..n {
             gt.push(random_vec(&mut rng));
         }
@@ -473,8 +474,8 @@ mod tests {
 
     #[test]
     fn marks_disconnected_views() {
-        let rotations = vec![Quat::IDENTITY; 4];
-        let gt = vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::Z];
+        let rotations = vec![Quat::identity(); 4];
+        let gt = vec![Vec3::zeros(), Vec3::x(), Vec3::y(), Vec3::z()];
         let edges = vec![synth_edge(0, 1, &gt, &rotations, 10.0)];
         let result =
             estimate_global_positions(&rotations, &edges, &GlobalPositioningOptions::default())
@@ -488,7 +489,7 @@ mod tests {
     #[test]
     fn rejects_too_few_views() {
         assert!(estimate_global_positions(
-            &[Quat::IDENTITY],
+            &[Quat::identity()],
             &[],
             &GlobalPositioningOptions::default()
         )

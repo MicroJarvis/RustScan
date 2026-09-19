@@ -65,7 +65,7 @@ impl ProjectUniforms {
         let sh_degree = sh_degree.min(storage_sh_degree);
         let camera_position = camera.position();
         Self {
-            viewmat: camera.view_matrix().to_cols_array_2d(),
+            viewmat: crate::core::matrix4_to_column_major_array(camera.view_matrix()),
             focal: [camera.intrinsics.fx, camera.intrinsics.fy],
             img_size: [img_size.0, img_size.1],
             tile_bounds: [tile_bounds.0, tile_bounds.1],

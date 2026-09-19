@@ -16,9 +16,6 @@ apex-solver = "1.0"
 # 深度学习 (可选，用于 SuperPoint)
 tch = { version = "0.5", optional = true }
 
-# 数学库 (SIMD 加速)
-glam = { workspace = true }
-
 # 并发
 rayon = "1.8"
 
@@ -48,7 +45,7 @@ image = { version = "0.25", optional = true }
 kiddo = "5.2.1"
 
 # Linear algebra (required for apex-solver)
-nalgebra = "0.33"
+nalgebra = { workspace = true }
 rustscan-types = { path = "../rustscan-types" }
 
 # Video decoding

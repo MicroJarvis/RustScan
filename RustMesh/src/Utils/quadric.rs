@@ -3,7 +3,7 @@
 // 用于网格简化（Decimation）中的误差计算
 // ============================================================================
 
-use glam::Vec3;
+use crate::{Point3, Vec3};
 
 /// QuadricT - 存储 4x4 对称矩阵的上三角部分
 ///
@@ -76,19 +76,19 @@ impl QuadricT {
 
     /// 从点和法线定义的面创建
     #[inline]
-    pub fn from_face(normal: Vec3, point: Vec3) -> Self {
+    pub fn from_face(normal: Vec3, point: Point3) -> Self {
         // 平面方程：ax + by + cz + d = 0
         // d = -dot(normal, point)
         let a = normal.x;
         let b = normal.y;
         let c = normal.z;
-        let d = -glam::Vec3::dot(normal, point);
+        let d = -normal.dot(&point.coords);
         Self::from_plane(a, b, c, d)
     }
 
     /// 从点创建（点自身的误差函数）
     #[inline]
-    pub fn from_point(pt: Vec3) -> Self {
+    pub fn from_point(pt: Point3) -> Self {
         Self::new(
             1.0,
             0.0,
@@ -174,9 +174,9 @@ impl QuadricT {
     }
 
     /// 评估二次函数 Q(v) = v^T * Q * v
-    /// v 是 3D 向量
+    /// v 是 3D 位置
     #[inline]
-    pub fn value(&self, v: Vec3) -> f32 {
+    pub fn value(&self, v: Point3) -> f32 {
         let x = v.x;
         let y = v.y;
         let z = v.z;
@@ -213,7 +213,7 @@ impl QuadricT {
     ///
     /// 返回 (优化后的点, 最小误差)
     #[inline]
-    pub fn optimize(&self) -> (Vec3, f32) {
+    pub fn optimize(&self) -> (Point3, f32) {
         // 构建 3x3 线性系统的系数矩阵
         let a11 = 2.0 * self.a;
         let a12 = 2.0 * self.b;
@@ -234,7 +234,7 @@ impl QuadricT {
         // 奇异矩阵检测
         if det.abs() < 1e-10 {
             // 返回原点作为默认值
-            return (Vec3::ZERO, self.value(Vec3::ZERO));
+            return (Point3::origin(), self.value(Point3::origin()));
         }
 
         // 使用 Cramer 法则求解
@@ -251,7 +251,7 @@ impl QuadricT {
         let y = det2 / det;
         let z = det3 / det;
 
-        let optimal = Vec3::new(x, y, z);
+        let optimal = Point3::new(x, y, z);
         (optimal, self.value(optimal))
     }
 
@@ -402,13 +402,13 @@ mod tests {
         let q = QuadricT::from_plane(0.0, 0.0, 1.0, 0.0);
 
         // 点 (0,0,0) 的误差应该是 0
-        assert!((q.value(Vec3::ZERO) - 0.0).abs() < 1e-6);
+        assert!((q.value(Point3::origin()) - 0.0).abs() < 1e-6);
 
         // 点 (1,2,0) 的误差应该是 z^2 = 0
-        assert!((q.value(Vec3::new(1.0, 2.0, 0.0)) - 0.0).abs() < 1e-6);
+        assert!((q.value(Point3::new(1.0, 2.0, 0.0)) - 0.0).abs() < 1e-6);
 
         // 点 (1,2,3) 的误差应该是 z^2 = 9
-        assert!((q.value(Vec3::new(1.0, 2.0, 3.0)) - 9.0).abs() < 1e-6);
+        assert!((q.value(Point3::new(1.0, 2.0, 3.0)) - 9.0).abs() < 1e-6);
     }
 
     #[test]
@@ -442,7 +442,7 @@ mod tests {
     fn test_from_face() {
         // 三角形面：z = 0 平面上的点 (0,0,0), (1,0,0), (0,1,0)
         let normal = Vec3::new(0.0, 0.0, 1.0);
-        let point = Vec3::new(0.0, 0.0, 0.0);
+        let point = Point3::new(0.0, 0.0, 0.0);
 
         let q = QuadricT::from_face(normal, point);
 
@@ -453,11 +453,11 @@ mod tests {
 
     #[test]
     fn test_from_point() {
-        let q = QuadricT::from_point(Vec3::new(1.0, 2.0, 3.0));
+        let q = QuadricT::from_point(Point3::new(1.0, 2.0, 3.0));
 
         // 点 (1,2,3) 的误差应该等于 ||v - p||^2
-        assert!((q.value(Vec3::new(1.0, 2.0, 3.0)) - 0.0).abs() < 1e-6);
-        assert!((q.value(Vec3::ZERO) - 14.0).abs() < 1e-6); // 1+4+9=14
+        assert!((q.value(Point3::new(1.0, 2.0, 3.0)) - 0.0).abs() < 1e-6);
+        assert!((q.value(Point3::origin()) - 14.0).abs() < 1e-6); // 1+4+9=14
     }
 
     #[test]
@@ -472,6 +472,6 @@ mod tests {
     fn test_zero() {
         let q = QuadricT::zero();
 
-        assert!((q.value(Vec3::new(1.0, 2.0, 3.0)) - 0.0).abs() < 1e-6);
+        assert!((q.value(Point3::new(1.0, 2.0, 3.0)) - 0.0).abs() < 1e-6);
     }
 }

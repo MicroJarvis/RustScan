@@ -29,7 +29,8 @@
 
 use crate::geometry::pose_rotation;
 use crate::types::PairGeometry;
-use glam::Quat;
+type Quat = nalgebra::UnitQuaternion<f32>;
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use nalgebra::{DMatrix, DVector, Matrix3, Quaternion, Rotation3, UnitQuaternion, Vector3};
 
 /// A single relative-rotation measurement between two views.
@@ -345,14 +346,14 @@ fn mean_residual_deg(
 fn quat_to_rotation(q: Quat) -> Rotation3<f64> {
     let q = q.normalize();
     let unit = UnitQuaternion::from_quaternion(Quaternion::new(
-        q.w as f64, q.x as f64, q.y as f64, q.z as f64,
+        q.w as f64, q.i as f64, q.j as f64, q.k as f64,
     ));
     unit.to_rotation_matrix()
 }
 
 fn rotation_to_quat(r: &Rotation3<f64>) -> Quat {
     let q = UnitQuaternion::from_rotation_matrix(r).into_inner();
-    Quat::from_xyzw(q.i as f32, q.j as f32, q.k as f32, q.w as f32).normalize()
+    crate::geometry::quat_from_xyzw(q.i as f32, q.j as f32, q.k as f32, q.w as f32).normalize()
 }
 
 #[cfg(test)]
@@ -366,15 +367,16 @@ mod tests {
 
     fn random_quat(rng: &mut ColmapMt19937) -> Quat {
         // Uniform-ish random rotation via random axis-angle.
-        let axis =
-            glam::Vec3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5).normalize_or_zero();
-        let axis = if axis.length_squared() < 1.0e-6 {
-            glam::Vec3::X
+        let axis = nalgebra::Vector3::new(unit(rng) - 0.5, unit(rng) - 0.5, unit(rng) - 0.5)
+            .try_normalize(f32::EPSILON)
+            .unwrap_or_else(nalgebra::Vector3::zeros);
+        let axis = if axis.norm_squared() < 1.0e-6 {
+            nalgebra::Vector3::<f32>::x()
         } else {
             axis
         };
         let angle = unit(rng) * std::f32::consts::PI;
-        Quat::from_axis_angle(axis, angle)
+        crate::geometry::quat_from_axis_angle(axis, angle)
     }
 
     fn relative(i: usize, j: usize, gt: &[Quat], weight: f64) -> RelativeRotation {
@@ -396,7 +398,7 @@ mod tests {
     fn recovers_global_rotations_from_clean_chain() {
         let mut rng = ColmapMt19937::new(7);
         let n = 8;
-        let mut gt = vec![Quat::IDENTITY];
+        let mut gt = vec![Quat::identity()];
         for _ in 1..n {
             gt.push(random_quat(&mut rng));
         }
@@ -426,7 +428,7 @@ mod tests {
     fn converges_under_small_noise() {
         let mut rng = ColmapMt19937::new(42);
         let n = 12;
-        let mut gt = vec![Quat::IDENTITY];
+        let mut gt = vec![Quat::identity()];
         for _ in 1..n {
             gt.push(random_quat(&mut rng));
         }
@@ -438,13 +440,15 @@ mod tests {
                 }
                 let mut e = relative(i, j, &gt, 80.0);
                 // Inject ~<1 deg noise.
-                let noise_axis = glam::Vec3::new(
+                let noise_axis = nalgebra::Vector3::new(
                     unit(&mut rng) - 0.5,
                     unit(&mut rng) - 0.5,
                     unit(&mut rng) - 0.5,
                 )
-                .normalize_or_zero();
-                let noise = Quat::from_axis_angle(noise_axis, 0.01 * unit(&mut rng));
+                .try_normalize(f32::EPSILON)
+                .unwrap_or_else(nalgebra::Vector3::zeros);
+                let noise =
+                    crate::geometry::quat_from_axis_angle(noise_axis, 0.01 * unit(&mut rng));
                 e.rotation = (noise * e.rotation).normalize();
                 edges.push(e);
             }
@@ -464,7 +468,7 @@ mod tests {
     fn is_robust_to_a_single_outlier_edge() {
         let mut rng = ColmapMt19937::new(123);
         let n = 8;
-        let mut gt = vec![Quat::IDENTITY];
+        let mut gt = vec![Quat::identity()];
         for _ in 1..n {
             gt.push(random_quat(&mut rng));
         }
@@ -497,7 +501,7 @@ mod tests {
 
     #[test]
     fn marks_disconnected_views() {
-        let gt = vec![Quat::IDENTITY; 4];
+        let gt = vec![Quat::identity(); 4];
         // Only connect views 0-1; views 2,3 are isolated.
         let edges = vec![relative(0, 1, &gt, 10.0)];
         let result =
@@ -514,7 +518,7 @@ mod tests {
             estimate_global_rotations(3, &[], &RotationAveragingOptions::default()).unwrap();
         assert_eq!(result.global_rotations.len(), 3);
         for q in result.global_rotations {
-            assert!(angle_between_deg(q, Quat::IDENTITY) < 1.0e-6);
+            assert!(angle_between_deg(q, Quat::identity()) < 1.0e-6);
         }
     }
 }

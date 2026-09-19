@@ -1,11 +1,13 @@
 //! Two real Ceres solves plus CPU SIFT sharing one runtime. Synthetic in-memory
 //! inputs; demonstrates admission and numerical checks, not an SfM speedup claim.
 use anyhow::Result;
-use glam::{Quat, Vec3};
+type Quat = nalgebra::UnitQuaternion<f32>;
+type Vec3 = nalgebra::Vector3<f32>;
 use rustscan_taskflow::{
     Budget, CpuRequest, ResourceRequest, Runtime, RuntimeConfig, TaskGraph, TaskVariant,
 };
 use rustsfm::ba::{try_refine_bundle_adjustment, BundleAdjustmentOptions};
+use rustsfm::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use rustsfm::sift::{SiftExtractionOptions, SiftFeatures};
 use rustsfm::types::{CameraModel, ImageFrame, Point3D, Reconstruction, TrackObservation};
 use rustsfm::wide::WideDescriptors;
@@ -75,7 +77,7 @@ pub(crate) fn fixture_with_points(point_count: usize) -> (Vec<ImageFrame>, Recon
         poses: (0..5)
             .map(|image| {
                 Some(SE3::from_quat_translation(
-                    Quat::IDENTITY,
+                    Quat::identity(),
                     Vec3::new(image as f32 * 0.15, 0.0, 0.0),
                 ))
             })

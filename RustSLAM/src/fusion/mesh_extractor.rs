@@ -9,7 +9,7 @@
 //! 3. Marching Cubes extraction
 //! 4. Post-processing (clustering, floaters removal)
 
-use glam::{Mat4, Vec3};
+use nalgebra::{Matrix4, Point3, Vector3};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,8 +42,8 @@ impl Default for MeshExtractionConfig {
             tsdf_config: TsdfConfig {
                 voxel_size: 0.01, // 1cm
                 sdf_trunc: 0.03,  // 3cm truncation
-                min_bound: Vec3::new(-1.0, -1.0, -1.0),
-                max_bound: Vec3::new(1.0, 1.0, 1.0),
+                min_bound: Point3::new(-1.0, -1.0, -1.0),
+                max_bound: Point3::new(1.0, 1.0, 1.0),
                 max_weight: 100.0,
                 integration_weight: 1.0,
             },
@@ -96,13 +96,13 @@ impl MeshExtractor {
     }
 
     /// Create volume centered at a point with given size
-    pub fn centered(center: Vec3, size_meters: f32, voxel_size: f32) -> Self {
+    pub fn centered(center: Point3<f32>, size_meters: f32, voxel_size: f32) -> Self {
         let half = size_meters / 2.0;
         let config = TsdfConfig {
             voxel_size,
             sdf_trunc: voxel_size * 3.0,
-            min_bound: center - Vec3::splat(half),
-            max_bound: center + Vec3::splat(half),
+            min_bound: center - Vector3::repeat(half),
+            max_bound: center + Vector3::repeat(half),
             max_weight: 100.0,
             integration_weight: 1.0,
         };
@@ -126,7 +126,7 @@ impl MeshExtractor {
         width: usize,
         height: usize,
         intrinsics: [f32; 4],
-        extrinsics: &Mat4,
+        extrinsics: &Matrix4<f32>,
     ) {
         let start = Instant::now();
         self.volume
@@ -145,7 +145,7 @@ impl MeshExtractor {
         width: usize,
         height: usize,
         intrinsics: [f32; 4],
-        extrinsics: &Mat4,
+        extrinsics: &Matrix4<f32>,
     ) where
         F: Fn(usize) -> f32,
     {
@@ -449,7 +449,7 @@ impl MeshExtractor {
 
             for (i, vert) in mesh.vertices.iter().enumerate() {
                 if let Some(tris) = vert_tris.get(&i) {
-                    let mut avg_normal = Vec3::ZERO;
+                    let mut avg_normal = Vector3::zeros();
 
                     for &tri_idx in tris {
                         let tri = &mesh.triangles[tri_idx];
@@ -459,7 +459,7 @@ impl MeshExtractor {
 
                         let e1 = v1 - v0;
                         let e2 = v2 - v0;
-                        avg_normal += e1.cross(e2);
+                        avg_normal += e1.cross(&e2);
                     }
 
                     avg_normal = avg_normal.normalize();
@@ -550,8 +550,8 @@ fn mesh_bounding_box(mesh: &Mesh) -> ([f32; 3], [f32; 3]) {
     let mut min = mesh.vertices[0].position;
     let mut max = mesh.vertices[0].position;
     for v in &mesh.vertices[1..] {
-        min = min.min(v.position);
-        max = max.max(v.position);
+        min = Point3::from(min.coords.inf(&v.position.coords));
+        max = Point3::from(max.coords.sup(&v.position.coords));
     }
 
     ([min.x, min.y, min.z], [max.x, max.y, max.z])
@@ -566,20 +566,20 @@ mod tests {
     fn test_filter_clusters_removes_small_components() {
         let mut mesh = Mesh::new();
         let verts = vec![
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-            Vec3::new(1.0, 1.0, 0.0),
-            Vec3::new(2.0, 0.0, 0.0),
-            Vec3::new(2.0, 1.0, 0.0),
-            Vec3::new(10.0, 0.0, 0.0),
-            Vec3::new(11.0, 0.0, 0.0),
-            Vec3::new(10.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::new(11.0, 0.0, 0.0),
+            Point3::new(10.0, 1.0, 0.0),
         ];
         for v in verts {
             mesh.vertices.push(MeshVertex {
                 position: v,
-                normal: Vec3::Z,
+                normal: Vector3::z(),
                 color: [1.0, 1.0, 1.0],
             });
         }
@@ -605,14 +605,14 @@ mod tests {
         let extractor = MeshExtractor::default();
         let mut mesh = Mesh::new();
         let verts = vec![
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(0.0, 2.0, 3.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 2.0, 3.0),
         ];
         for v in verts {
             mesh.vertices.push(MeshVertex {
                 position: v,
-                normal: Vec3::Z,
+                normal: Vector3::z(),
                 color: [1.0, 1.0, 1.0],
             });
         }

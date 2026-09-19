@@ -2,26 +2,27 @@
 //!
 //! Geometric utilities for mesh operations.
 
-pub type Point = glam::Vec3;
-pub type Vector = glam::Vec3;
-pub type Normal = glam::Vec3;
+use crate::Point3 as Point;
+use crate::{Point3, Vec3};
+pub type Vector = Vec3;
+pub type Normal = Vec3;
 
 /// Calculate the centroid of a triangle
 #[inline]
 pub fn triangle_centroid(p0: Point, p1: Point, p2: Point) -> Point {
-    (p0 + p1 + p2) / 3.0
+    Point3::from((p0.coords + p1.coords + p2.coords) / 3.0)
 }
 
 /// Calculate the area of a triangle using cross product
 #[inline]
 pub fn triangle_area(p0: Point, p1: Point, p2: Point) -> f32 {
-    (p1 - p0).cross(p2 - p0).length() * 0.5
+    (p1 - p0).cross(&(p2 - p0)).norm() * 0.5
 }
 
 /// Calculate the normal of a triangle
 #[inline]
 pub fn triangle_normal(p0: Point, p1: Point, p2: Point) -> Vector {
-    (p1 - p0).cross(p2 - p0).normalize()
+    (p1 - p0).cross(&(p2 - p0)).normalize()
 }
 
 /// Check if a 2D point is inside a triangle (barycentric technique)
@@ -31,11 +32,11 @@ pub fn point_in_triangle_2d(p: Point, a: Point, b: Point, c: Point) -> bool {
     let v1 = b - a;
     let v2 = p - a;
 
-    let dot00 = v0.dot(v0);
-    let dot01 = v0.dot(v1);
-    let dot02 = v0.dot(v2);
-    let dot11 = v1.dot(v1);
-    let dot12 = v1.dot(v2);
+    let dot00 = v0.dot(&v0);
+    let dot01 = v0.dot(&v1);
+    let dot02 = v0.dot(&v2);
+    let dot11 = v1.dot(&v1);
+    let dot12 = v1.dot(&v2);
 
     let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
     let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
@@ -48,15 +49,15 @@ pub fn point_in_triangle_2d(p: Point, a: Point, b: Point, c: Point) -> bool {
 #[inline]
 pub fn bounding_box(points: &[Point]) -> (Point, Point) {
     if points.is_empty() {
-        return (Point::ZERO, Point::ZERO);
+        return (Point3::origin(), Point3::origin());
     }
 
     let mut min = points[0];
     let mut max = points[0];
 
     for &p in points {
-        min = min.min(p);
-        max = max.max(p);
+        min = Point3::from(min.coords.inf(&p.coords));
+        max = Point3::from(max.coords.sup(&p.coords));
     }
 
     (min, max)
@@ -66,23 +67,23 @@ pub fn bounding_box(points: &[Point]) -> (Point, Point) {
 #[inline]
 pub fn center_of_mass(points: &[Point]) -> Point {
     if points.is_empty() {
-        return Point::ZERO;
+        return Point3::origin();
     }
 
-    let sum: Point = points.iter().fold(Point::ZERO, |acc, &p| acc + p);
-    sum / points.len() as f32
+    let sum = points.iter().fold(Vec3::zeros(), |acc, p| acc + p.coords);
+    Point3::from(sum / points.len() as f32)
 }
 
 /// Calculate the squared distance between two points
 #[inline]
 pub fn squared_distance(p0: Point, p1: Point) -> f32 {
-    (p0 - p1).length_squared()
+    (p0 - p1).norm_squared()
 }
 
 /// Calculate the distance between two points
 #[inline]
 pub fn distance(p0: Point, p1: Point) -> f32 {
-    (p0 - p1).length()
+    (p0 - p1).norm()
 }
 
 /// Normalize a vector
@@ -94,25 +95,25 @@ pub fn normalize(v: Vector) -> Vector {
 /// Calculate the dot product of two vectors
 #[inline]
 pub fn dot(v0: Vector, v1: Vector) -> f32 {
-    v0.dot(v1)
+    v0.dot(&v1)
 }
 
 /// Calculate the cross product of two vectors
 #[inline]
 pub fn cross(v0: Vector, v1: Vector) -> Vector {
-    v0.cross(v1)
+    v0.cross(&v1)
 }
 
 /// Calculate the length of a vector
 #[inline]
 pub fn length(v: Vector) -> f32 {
-    v.length()
+    v.norm()
 }
 
 /// Calculate the squared length of a vector
 #[inline]
 pub fn squared_length(v: Vector) -> f32 {
-    v.length_squared()
+    v.norm_squared()
 }
 
 // ============================================================================
@@ -127,14 +128,14 @@ pub fn triangle_angle_at(p0: Point, p1: Point, p2: Point) -> f32 {
     let v01 = p1 - p0;
     let v02 = p2 - p0;
 
-    let len01 = v01.length();
-    let len02 = v02.length();
+    let len01 = v01.norm();
+    let len02 = v02.norm();
 
     if len01 < 1e-10 || len02 < 1e-10 {
         return 0.0;
     }
 
-    let cos_angle = (v01.dot(v02) / (len01 * len02)).clamp(-1.0, 1.0);
+    let cos_angle = (v01.dot(&v02) / (len01 * len02)).clamp(-1.0, 1.0);
     cos_angle.acos()
 }
 
@@ -260,7 +261,7 @@ pub fn dihedral_angle(
     let n0 = triangle_normal(o0, v0, v1);
     let n1 = triangle_normal(o1, v1, v0);
 
-    let cos_angle = n0.dot(n1).clamp(-1.0, 1.0);
+    let cos_angle = n0.dot(&n1).clamp(-1.0, 1.0);
     cos_angle.acos()
 }
 
@@ -274,7 +275,7 @@ pub fn dihedral_angle(
 /// Returns (center, radius)
 pub fn bounding_sphere(points: &[Point]) -> (Point, f32) {
     if points.is_empty() {
-        return (Point::ZERO, 0.0);
+        return (Point3::origin(), 0.0);
     }
 
     if points.len() == 1 {
@@ -324,7 +325,7 @@ pub fn bounding_sphere(points: &[Point]) -> (Point, f32) {
     };
 
     // Step 3: Initial sphere from the two points
-    let mut center = (p1 + p2) * 0.5;
+    let mut center = Point3::from((p1.coords + p2.coords) * 0.5);
     let mut radius = distance(p1, p2) * 0.5;
 
     // Step 4: Expand sphere to include all points
@@ -332,7 +333,9 @@ pub fn bounding_sphere(points: &[Point]) -> (Point, f32) {
         let d = distance(p, center);
         if d > radius {
             // Expand the sphere to include this point
-            let direction = (p - center).normalize_or_zero();
+            let direction = (p - center)
+                .try_normalize(f32::EPSILON)
+                .unwrap_or_else(Vec3::zeros);
             let new_radius = (radius + d) * 0.5;
             center = center + direction * (new_radius - radius);
             radius = new_radius;
@@ -364,7 +367,9 @@ pub fn minimum_enclosing_sphere(points: &[Point], iterations: usize) -> (Point, 
 
         // Move center towards the farthest point slightly
         if farthest_dist > radius {
-            let direction = (farthest_point - center).normalize_or_zero();
+            let direction = (farthest_point - center)
+                .try_normalize(f32::EPSILON)
+                .unwrap_or_else(Vec3::zeros);
             center = center + direction * (farthest_dist - radius) * 0.5;
             radius = (radius + farthest_dist) * 0.5;
         }
@@ -413,8 +418,8 @@ pub fn voronoi_area(p_center: Point, neighbors: &[Point]) -> f32 {
         } else {
             // Acute triangle: use proper Voronoi area
             // Area = (|p_center - p1|^2 * cot(angle2) + |p_center - p2|^2 * cot(angle1)) / 8
-            let d1_sq = (p_center - p1).length_squared();
-            let d2_sq = (p_center - p2).length_squared();
+            let d1_sq = (p_center - p1).norm_squared();
+            let d2_sq = (p_center - p2).norm_squared();
 
             let cot1 = cotangent(angle1);
             let cot2 = cotangent(angle2);
@@ -462,7 +467,7 @@ pub fn mean_curvature(p_center: Point, neighbors: &[Point]) -> f32 {
     }
 
     // Compute the Laplace-Beltrami using cotangent weights
-    let mut laplacian = Vector::ZERO;
+    let mut laplacian = Vector::zeros();
     let mut total_weight = 0.0;
 
     let n = neighbors.len();
@@ -491,7 +496,7 @@ pub fn mean_curvature(p_center: Point, neighbors: &[Point]) -> f32 {
     }
 
     // Mean curvature = half the magnitude of the Laplace-Beltrami
-    laplacian.length() * 0.5
+    laplacian.norm() * 0.5
 }
 
 /// Calculate the two principal curvatures from Gaussian and mean curvatures
@@ -541,12 +546,58 @@ pub fn curvature_descriptors(k1: f32, k2: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::{Point3, Vector3};
+
+    #[test]
+    fn point_and_vector_have_distinct_semantics() {
+        let p0 = Point3::new(1.0, 2.0, 3.0);
+        let p1 = Point3::new(3.0, 5.0, 7.0);
+        let delta: Vector3<f32> = p1 - p0;
+        assert_eq!(delta, Vector3::new(2.0, 3.0, 4.0));
+        assert_eq!(p0 + delta, p1);
+    }
+
+    #[test]
+    fn centroid_returns_a_point() {
+        let c = triangle_centroid(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(3.0, 0.0, 0.0),
+            Point3::new(0.0, 3.0, 0.0),
+        );
+        assert_eq!(c, Point3::new(1.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn point_translation_includes_translation_vector_does_not() {
+        // Non-origin translation: transforming a point includes translation;
+        // transforming a direction/normal does not.
+        let translation = Vector3::new(10.0, -4.0, 7.0);
+        let rotation = nalgebra::Rotation3::from_axis_angle(
+            &nalgebra::Unit::new_normalize(Vector3::new(0.2, 0.5, 0.8)),
+            0.7,
+        );
+        let transform = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(translation),
+            nalgebra::UnitQuaternion::from(rotation),
+        );
+
+        let point = Point3::new(1.0, 2.0, 3.0);
+        let direction = Vector3::new(0.0, 1.0, 0.0);
+
+        let transformed_point = transform * point;
+        let rotated_only = Point3::from(rotation * point.coords);
+        assert!((transformed_point - (rotated_only + translation)).norm() < 1e-5);
+
+        let transformed_direction = transform * direction;
+        assert!((transformed_direction - (rotation * direction)).norm() < 1e-5);
+        assert!((transformed_direction - direction).norm() > 0.1);
+    }
 
     #[test]
     fn test_triangle_area() {
-        let p0 = glam::vec3(0.0, 0.0, 0.0);
-        let p1 = glam::vec3(1.0, 0.0, 0.0);
-        let p2 = glam::vec3(0.0, 1.0, 0.0);
+        let p0 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0, 0.0, 0.0);
+        let p2 = Point3::new(0.0, 1.0, 0.0);
 
         // Right triangle with legs of length 1
         assert!((triangle_area(p0, p1, p2) - 0.5).abs() < 1e-6);
@@ -554,12 +605,12 @@ mod tests {
 
     #[test]
     fn test_triangle_normal() {
-        let p0 = glam::vec3(0.0, 0.0, 0.0);
-        let p1 = glam::vec3(1.0, 0.0, 0.0);
-        let p2 = glam::vec3(0.0, 1.0, 0.0);
+        let p0 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0, 0.0, 0.0);
+        let p2 = Point3::new(0.0, 1.0, 0.0);
 
         let normal = triangle_normal(p0, p1, p2);
-        assert!((normal.length() - 1.0).abs() < 1e-6);
+        assert!((normal.norm() - 1.0).abs() < 1e-6);
         // Should point in +Z direction
         assert!(normal.z > 0.0);
     }
@@ -567,23 +618,23 @@ mod tests {
     #[test]
     fn test_bounding_box() {
         let points = [
-            glam::vec3(0.0, 0.0, 0.0),
-            glam::vec3(1.0, 2.0, 3.0),
-            glam::vec3(-1.0, 5.0, -2.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 2.0, 3.0),
+            Point3::new(-1.0, 5.0, -2.0),
         ];
 
         let (min, max) = bounding_box(&points);
 
-        assert_eq!(min, glam::vec3(-1.0, 0.0, -2.0));
-        assert_eq!(max, glam::vec3(1.0, 5.0, 3.0));
+        assert_eq!(min, Point3::new(-1.0, 0.0, -2.0));
+        assert_eq!(max, Point3::new(1.0, 5.0, 3.0));
     }
 
     #[test]
     fn test_triangle_angles() {
         // Equilateral triangle - all angles should be 60 degrees (π/3)
-        let p0 = glam::vec3(0.0, 0.0, 0.0);
-        let p1 = glam::vec3(1.0, 0.0, 0.0);
-        let p2 = glam::vec3(0.5, (3.0_f32).sqrt() / 2.0, 0.0);
+        let p0 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0, 0.0, 0.0);
+        let p2 = Point3::new(0.5, (3.0_f32).sqrt() / 2.0, 0.0);
 
         let (a0, a1, a2) = triangle_angles(p0, p1, p2);
 
@@ -599,9 +650,9 @@ mod tests {
     #[test]
     fn test_triangle_angle_right() {
         // Right triangle with 45-45-90 angles
-        let p0 = glam::vec3(0.0, 0.0, 0.0);
-        let p1 = glam::vec3(1.0, 0.0, 0.0);
-        let p2 = glam::vec3(0.0, 1.0, 0.0);
+        let p0 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0, 0.0, 0.0);
+        let p2 = Point3::new(0.0, 1.0, 0.0);
 
         let (a0, a1, a2) = triangle_angles(p0, p1, p2);
 
@@ -626,10 +677,10 @@ mod tests {
     #[test]
     fn test_cotangent_weight() {
         // Equilateral triangle: cot(60°) = 1/sqrt(3)
-        let v0 = glam::vec3(0.0, 0.0, 0.0);
-        let v1 = glam::vec3(1.0, 0.0, 0.0);
-        let o0 = glam::vec3(0.5, (3.0_f32).sqrt() / 2.0, 0.0);
-        let o1 = glam::vec3(0.5, -(3.0_f32).sqrt() / 2.0, 0.0);
+        let v0 = Point3::new(0.0, 0.0, 0.0);
+        let v1 = Point3::new(1.0, 0.0, 0.0);
+        let o0 = Point3::new(0.5, (3.0_f32).sqrt() / 2.0, 0.0);
+        let o1 = Point3::new(0.5, -(3.0_f32).sqrt() / 2.0, 0.0);
 
         let weight = cotangent_weight(v0, v1, o0, o1);
 
@@ -643,17 +694,17 @@ mod tests {
     #[test]
     fn test_triangle_quality() {
         // Equilateral triangle should have quality close to 1
-        let p0 = glam::vec3(0.0, 0.0, 0.0);
-        let p1 = glam::vec3(1.0, 0.0, 0.0);
-        let p2 = glam::vec3(0.5, (3.0_f32).sqrt() / 2.0, 0.0);
+        let p0 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0, 0.0, 0.0);
+        let p2 = Point3::new(0.5, (3.0_f32).sqrt() / 2.0, 0.0);
 
         let quality = triangle_quality(p0, p1, p2);
         assert!(quality > 0.99);
 
         // Right triangle should have lower quality
-        let r0 = glam::vec3(0.0, 0.0, 0.0);
-        let r1 = glam::vec3(1.0, 0.0, 0.0);
-        let r2 = glam::vec3(0.0, 1.0, 0.0);
+        let r0 = Point3::new(0.0, 0.0, 0.0);
+        let r1 = Point3::new(1.0, 0.0, 0.0);
+        let r2 = Point3::new(0.0, 1.0, 0.0);
 
         let right_quality = triangle_quality(r0, r1, r2);
         assert!(right_quality < quality);
@@ -663,10 +714,10 @@ mod tests {
     #[test]
     fn test_dihedral_angle() {
         // Two coplanar triangles
-        let v0 = glam::vec3(0.0, 0.0, 0.0);
-        let v1 = glam::vec3(1.0, 0.0, 0.0);
-        let o0 = glam::vec3(0.5, 1.0, 0.0);
-        let o1 = glam::vec3(0.5, -1.0, 0.0);
+        let v0 = Point3::new(0.0, 0.0, 0.0);
+        let v1 = Point3::new(1.0, 0.0, 0.0);
+        let o0 = Point3::new(0.5, 1.0, 0.0);
+        let o1 = Point3::new(0.5, -1.0, 0.0);
 
         let angle = dihedral_angle(v0, v1, o0, o1);
 
@@ -674,10 +725,10 @@ mod tests {
         assert!(angle.abs() < 0.01);
 
         // Folded triangles (90 degrees)
-        let f0 = glam::vec3(0.0, 0.0, 0.0);
-        let f1 = glam::vec3(1.0, 0.0, 0.0);
-        let fo0 = glam::vec3(0.5, 1.0, 0.0);
-        let fo1 = glam::vec3(0.5, 0.0, 1.0);
+        let f0 = Point3::new(0.0, 0.0, 0.0);
+        let f1 = Point3::new(1.0, 0.0, 0.0);
+        let fo0 = Point3::new(0.5, 1.0, 0.0);
+        let fo1 = Point3::new(0.5, 0.0, 1.0);
 
         let folded_angle = dihedral_angle(f0, f1, fo0, fo1);
         assert!((folded_angle - std::f32::consts::PI / 2.0).abs() < 0.1);
@@ -686,10 +737,10 @@ mod tests {
     #[test]
     fn test_bounding_sphere() {
         let points = [
-            glam::vec3(0.0, 0.0, 0.0),
-            glam::vec3(1.0, 0.0, 0.0),
-            glam::vec3(0.0, 1.0, 0.0),
-            glam::vec3(0.0, 0.0, 1.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1.0),
         ];
 
         let (center, radius) = bounding_sphere(&points);
@@ -706,12 +757,12 @@ mod tests {
     #[test]
     fn test_voronoi_area() {
         // Equilateral triangle fan around center
-        let center = glam::vec3(0.0, 0.0, 0.0);
+        let center = Point3::new(0.0, 0.0, 0.0);
         let r = 1.0;
         let neighbors: Vec<Point> = (0..6)
             .map(|i| {
                 let angle = i as f32 * std::f32::consts::PI / 3.0;
-                glam::vec3(r * angle.cos(), r * angle.sin(), 0.0)
+                Point3::new(r * angle.cos(), r * angle.sin(), 0.0)
             })
             .collect();
 
@@ -727,16 +778,16 @@ mod tests {
     #[test]
     fn test_gaussian_curvature() {
         // For a flat region, Gaussian curvature should be ~0
-        let center = glam::vec3(0.0, 0.0, 0.0);
+        let center = Point3::new(0.0, 0.0, 0.0);
         let neighbors = [
-            glam::vec3(1.0, 0.0, 0.0),
-            glam::vec3(1.0, 1.0, 0.0),
-            glam::vec3(0.0, 1.0, 0.0),
-            glam::vec3(-1.0, 1.0, 0.0),
-            glam::vec3(-1.0, 0.0, 0.0),
-            glam::vec3(-1.0, -1.0, 0.0),
-            glam::vec3(0.0, -1.0, 0.0),
-            glam::vec3(1.0, -1.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(-1.0, 1.0, 0.0),
+            Point3::new(-1.0, 0.0, 0.0),
+            Point3::new(-1.0, -1.0, 0.0),
+            Point3::new(0.0, -1.0, 0.0),
+            Point3::new(1.0, -1.0, 0.0),
         ];
 
         let k = gaussian_curvature(center, &neighbors);
@@ -750,12 +801,12 @@ mod tests {
     #[test]
     fn test_mean_curvature() {
         // For a flat region, mean curvature should be ~0
-        let center = glam::vec3(0.0, 0.0, 0.0);
+        let center = Point3::new(0.0, 0.0, 0.0);
         let neighbors = [
-            glam::vec3(1.0, 0.0, 0.0),
-            glam::vec3(0.0, 1.0, 0.0),
-            glam::vec3(-1.0, 0.0, 0.0),
-            glam::vec3(0.0, -1.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(-1.0, 0.0, 0.0),
+            Point3::new(0.0, -1.0, 0.0),
         ];
 
         let h = mean_curvature(center, &neighbors);

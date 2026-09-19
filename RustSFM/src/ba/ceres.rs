@@ -29,7 +29,9 @@ pub(super) mod tests {
         TrackObservation,
     };
     use crate::wide::WideDescriptors;
-    use glam::{Quat, Vec3};
+    type Quat = nalgebra::UnitQuaternion<f32>;
+    type Vec3 = nalgebra::Vector3<f32>;
+    use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
     use rustslam::Descriptors;
     use rustslam::KeyPoint;
     use rustslam::SE3;
@@ -97,7 +99,7 @@ pub(super) mod tests {
         let fixed_pose = SE3::identity();
         reconstruction.poses[0] = Some(fixed_pose);
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            Quat::IDENTITY,
+            Quat::identity(),
             Vec3::new(0.8, 0.05, 0.0),
         ));
         for (idx, xyz) in [
@@ -203,16 +205,16 @@ pub(super) mod tests {
             sensor_id: 12,
         };
         let true_sensor_from_rig =
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.35, 0.02, 0.0));
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.35, 0.02, 0.0));
         let initial_sensor_from_rig =
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.1, -0.04, 0.0));
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.1, -0.04, 0.0));
         let rig_poses = [
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::ZERO),
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.18, 0.03, 0.0)),
+            SE3::from_quat_translation(Quat::identity(), Vec3::zeros()),
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.18, 0.03, 0.0)),
         ];
         let outside_poses = [
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.75, 0.02, 0.0)),
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(-0.65, 0.01, 0.0)),
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.75, 0.02, 0.0)),
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(-0.65, 0.01, 0.0)),
         ];
         let poses = [
             rig_poses[0],
@@ -383,9 +385,9 @@ pub(super) mod tests {
     fn ceres_pose_prior_without_explicit_gauge_pins_camera_centers() {
         let true_camera = CameraModel::new_pinhole(100, 100, 60.0, 60.0, 50.0, 50.0);
         let poses = [
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.0, 0.0, 0.0)),
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.35, 0.0, 0.0)),
-            SE3::from_quat_translation(Quat::IDENTITY, Vec3::new(0.7, 0.0, 0.0)),
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.0, 0.0, 0.0)),
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.35, 0.0, 0.0)),
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(0.7, 0.0, 0.0)),
         ];
         let points = [
             [-0.4, -0.3, 3.0],
@@ -415,7 +417,7 @@ pub(super) mod tests {
                 let shifted_center =
                     Vec3::new(center[0] as f32 + 4.0, center[1] as f32, center[2] as f32);
                 Some(crate::geometry::pose_from_rotation_center(
-                    Quat::IDENTITY,
+                    Quat::identity(),
                     shifted_center,
                 ))
             })

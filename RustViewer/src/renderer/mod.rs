@@ -6,6 +6,7 @@ pub mod scene;
 
 use eframe::egui_wgpu;
 use eframe::wgpu;
+use nalgebra::Vector4;
 
 use crate::robot::RobotRenderMesh;
 use camera::ArcballCamera;
@@ -133,7 +134,8 @@ impl SceneRenderer {
 
         let aspect = viewport_size[0] / viewport_size[1].max(1.0);
         let vp = camera.view_proj(aspect);
-        let vp_arr = vp.to_cols_array_2d();
+        // Named column-major packing for the wgpu view-proj uniform.
+        let vp_arr = camera.view_proj_column_major_array(aspect);
 
         // Update uniform buffer (view_proj matrix)
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&vp_arr));
@@ -166,7 +168,7 @@ impl SceneRenderer {
                     .iter()
                     .enumerate()
                 {
-                    let p = glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
+                    let p = Vector4::new(pos[0], pos[1], pos[2], 1.0);
                     let clip = vp * p;
                     if clip.w <= 0.0 {
                         valid = false;

@@ -1,3 +1,4 @@
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use rustslam::{Descriptors, KeyPoint, Match, SE3};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -1074,13 +1075,13 @@ impl Rigid3 {
         let z = self.qvec[3] as f32;
         let norm = (w * w + x * x + y * y + z * z).sqrt();
         let rotation = if norm > f32::EPSILON && norm.is_finite() {
-            glam::Quat::from_xyzw(x / norm, y / norm, z / norm, w / norm)
+            crate::geometry::quat_from_xyzw(x / norm, y / norm, z / norm, w / norm)
         } else {
-            glam::Quat::IDENTITY
+            nalgebra::UnitQuaternion::<f32>::identity()
         };
         SE3::from_quat_translation(
             rotation,
-            glam::Vec3::new(
+            nalgebra::Vector3::new(
                 self.tvec[0] as f32,
                 self.tvec[1] as f32,
                 self.tvec[2] as f32,

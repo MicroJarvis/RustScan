@@ -6,7 +6,7 @@
 //! - Performs local Bundle Adjustment
 //! - Filters redundant keyframes
 
-use glam::Vec3;
+use nalgebra::{Point3, Vector3};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
@@ -409,7 +409,7 @@ impl LocalMapping {
 
     /// Add a new map point to the shared map and return its assigned ID.
     fn add_map_point_to_map(&self, map: &mut Map, position: [f32; 3], ref_kf: u64) -> u64 {
-        let mut map_point = MapPoint::new(0, Vec3::from(position), ref_kf);
+        let mut map_point = MapPoint::new(0, Point3::from(position), ref_kf);
         map_point.observations = 2;
         map.add_point(map_point)
     }
@@ -521,12 +521,15 @@ impl LocalMapping {
                         if *lm_idx < landmarks.len() {
                             let lm = &landmarks[*lm_idx];
                             if let Some(mp) = map.get_point_mut(*mp_id) {
-                                let new_position = Vec3::new(
+                                let new_position = Point3::new(
                                     lm.position[0] as f32,
                                     lm.position[1] as f32,
                                     lm.position[2] as f32,
                                 );
-                                if new_position.is_finite() {
+                                if new_position.x.is_finite()
+                                    && new_position.y.is_finite()
+                                    && new_position.z.is_finite()
+                                {
                                     mp.position = new_position;
                                     mp.mark_inlier();
                                 } else {
@@ -680,7 +683,7 @@ fn reprojection_error_pixels(
     keypoint: [f32; 2],
 ) -> f32 {
     let point_camera = pose.transform_point(point_world);
-    let Some(projected) = camera.project(&Vec3::from(point_camera)) else {
+    let Some(projected) = camera.project(&Vector3::from(point_camera)) else {
         return f32::INFINITY;
     };
 
@@ -699,7 +702,7 @@ impl Default for LocalMapping {
 mod tests {
     use super::*;
     use crate::core::{Frame, FrameFeatures, Map};
-    use glam::Vec3;
+    use nalgebra::Vector3;
 
     fn make_descriptors(count: usize) -> Vec<u8> {
         let mut descriptors = vec![0u8; count * 32];
@@ -724,7 +727,7 @@ mod tests {
             .iter()
             .map(|point_world| {
                 let point_camera = pose.transform_point(point_world);
-                let pixel = camera.project(&Vec3::from(point_camera)).unwrap();
+                let pixel = camera.project(&Vector3::from(point_camera)).unwrap();
                 [pixel.x, pixel.y]
             })
             .collect::<Vec<_>>();

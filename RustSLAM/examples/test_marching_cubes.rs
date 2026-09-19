@@ -2,14 +2,14 @@
 //!
 //! Tests complete workflows from TSDF volume to mesh extraction.
 
-use glam::Vec3;
+use nalgebra::Point3;
 use rustslam::fusion::marching_cubes::extract_mesh_from_tsdf;
 use rustslam::fusion::tsdf_volume::{TsdfConfig, TsdfVolume};
 use rustslam::test_utils::*;
 
 fn test_sphere_mesh_extraction() {
     // Create sphere TSDF
-    let center = Vec3::ZERO;
+    let center = Point3::origin();
     let radius = 1.0;
     let voxel_size = 0.05;
 
@@ -33,7 +33,7 @@ fn test_sphere_mesh_extraction() {
     // Verify all vertices are roughly on sphere surface
     let tolerance = 0.15; // Allow tolerance due to voxelization
     for vertex in &mesh.vertices {
-        let dist_from_center = vertex.position.length();
+        let dist_from_center = vertex.position.coords.norm();
         assert!(
             (dist_from_center - radius).abs() < tolerance,
             "Vertex at {:?} is {} from center (expected ~{})",
@@ -45,8 +45,8 @@ fn test_sphere_mesh_extraction() {
 
     // Verify normals point outward
     for vertex in &mesh.vertices {
-        let expected_normal = vertex.position.normalize();
-        let dot = vertex.normal.dot(expected_normal);
+        let expected_normal = vertex.position.coords.normalize();
+        let dot = vertex.normal.dot(&expected_normal);
         assert!(
             dot > 0.5,
             "Normal {:?} should point outward from center (dot product: {})",
@@ -58,7 +58,7 @@ fn test_sphere_mesh_extraction() {
 
 fn test_cube_mesh_extraction() {
     // Create cube TSDF
-    let center = Vec3::ZERO;
+    let center = Point3::origin();
     let size = 1.0;
     let voxel_size = 0.05;
 
@@ -104,7 +104,7 @@ fn test_cube_mesh_extraction() {
 
 fn test_mesh_properties() {
     // Create a simple sphere
-    let tsdf = create_sphere_tsdf(Vec3::ZERO, 0.5, 0.05);
+    let tsdf = create_sphere_tsdf(Point3::origin(), 0.5, 0.05);
     let mesh = extract_mesh_from_tsdf(&tsdf);
 
     // Verify mesh is not empty
@@ -126,7 +126,7 @@ fn test_mesh_properties() {
 
     // Verify all vertices have valid normals (unit length)
     for (i, vertex) in mesh.vertices.iter().enumerate() {
-        let normal_length = vertex.normal.length();
+        let normal_length = vertex.normal.norm();
         assert!(
             (normal_length - 1.0).abs() < 0.1,
             "Vertex {} has non-unit normal (length: {})",

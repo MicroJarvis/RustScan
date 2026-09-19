@@ -6,6 +6,6 @@ description = "Shared types for RustScan crates"
 authors = ["RustScan Developers"]
 
 [dependencies]
-glam = { workspace = true, features = ["serde"] }
+nalgebra = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0"

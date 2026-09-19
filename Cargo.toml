@@ -10,7 +10,7 @@ members = ["rustscan-taskflow", "rustscan-types", "RustMesh", "RustSLAM", "RustG
 resolver = "2"
 
 [workspace.dependencies]
-glam = "0.25"
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 
@@ -23,7 +23,7 @@ cubecl-common = { path = "vendor/cubecl-common" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
-glam = { workspace = true }
+nalgebra = { workspace = true }
 log = "0.4"
 rustgs = { path = "RustGS" }
 rustmesh = { path = "RustMesh" }

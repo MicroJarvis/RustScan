@@ -1,6 +1,7 @@
 use crate::correspondence_graph::{
     build_correspondence_graph_from_pairs, CorrespondenceGraph, ImageId, Point2DIdx,
 };
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use crate::observation_manager::ObservationManager;
 use crate::triangulation_estimator::{
     calculate_angular_reprojection_error, calculate_squared_reprojection_error,
@@ -1248,8 +1249,8 @@ mod tests {
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
 
         let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
@@ -1278,8 +1279,8 @@ mod tests {
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
 
         let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
@@ -1315,12 +1316,12 @@ mod tests {
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
         reconstruction.poses[2] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(0.0, 1.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(0.0, 1.0, 0.0),
         ));
 
         let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
@@ -1392,8 +1393,8 @@ mod tests {
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(baseline_pose());
         reconstruction.poses[2] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(2.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
         ));
         reconstruction.observations[0][0] = Some(0);
         reconstruction.observations[1][0] = Some(0);
@@ -1467,8 +1468,8 @@ mod tests {
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(baseline_pose());
         reconstruction.poses[2] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(2.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
         ));
 
         let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
@@ -1590,8 +1591,10 @@ mod tests {
         let measured_xyz = [0.06, -0.02, 3.05];
         let pose0 = SE3::identity();
         let pose1 = baseline_pose();
-        let pose2 =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(2.0, 0.0, 0.0));
+        let pose2 = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
+        );
         let mut frames = vec![frame(0), frame(1), frame(2)];
         frames[0].keypoints[0] = project_keypoint(pose0, measured_xyz);
         frames[1].keypoints[0] = project_keypoint(pose1, measured_xyz);
@@ -1660,8 +1663,10 @@ mod tests {
         let measured_xyz = [0.06, -0.02, 3.05];
         let pose0 = SE3::identity();
         let pose1 = baseline_pose();
-        let pose2 =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(2.0, 0.0, 0.0));
+        let pose2 = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
+        );
         let mut frames = vec![frame(0), frame(1), frame(2)];
         frames[0].keypoints[0] = project_keypoint(pose0, measured_xyz);
         frames[1].keypoints[0] = project_keypoint(pose1, measured_xyz);
@@ -1729,10 +1734,14 @@ mod tests {
     fn merge_tracks_retries_failed_pairs_after_successful_merge_creates_new_point_identity() {
         let pose0 = SE3::identity();
         let pose1 = baseline_pose();
-        let pose2 =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(2.0, 0.0, 0.0));
-        let pose3 =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(3.0, 0.0, 0.0));
+        let pose2 = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(2.0, 0.0, 0.0),
+        );
+        let pose3 = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(3.0, 0.0, 0.0),
+        );
         let mut frames = vec![frame(0), frame(1), frame(2), frame(3)];
         let final_xyz = [0.0, 0.0, 4.0];
         for (image, pose) in [pose0, pose1, pose2, pose3].into_iter().enumerate() {
@@ -1874,8 +1883,8 @@ mod tests {
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
 
         let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
@@ -1904,8 +1913,8 @@ mod tests {
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
 
         let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
@@ -1961,8 +1970,8 @@ mod tests {
         let mut reconstruction = reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
-            glam::Quat::IDENTITY,
-            glam::Vec3::new(1.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
         ));
 
         let mut tri_state = IncrementalTriangulatorState::new(&frames, &pairs, &reconstruction);
@@ -2108,7 +2117,10 @@ mod tests {
     }
 
     fn baseline_pose() -> SE3 {
-        SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0))
+        SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
+        )
     }
 
     fn project_keypoint(pose: SE3, point: [f32; 3]) -> rustslam::KeyPoint {

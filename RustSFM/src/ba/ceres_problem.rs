@@ -25,7 +25,9 @@ use ceres_solver::solver::{
     TerminationType,
 };
 use ceres_solver::{CostFunctionType, NllsProblem};
-use glam::{Quat, Vec3};
+type Quat = nalgebra::UnitQuaternion<f32>;
+type Vec3 = nalgebra::Vector3<f32>;
+use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use nalgebra::SMatrix;
 use rustslam::SE3;
 use std::collections::{HashMap, HashSet};
@@ -1830,14 +1832,14 @@ pub(crate) fn se3_to_pose_params(pose: SE3) -> [f64; 7] {
 
 fn pose_params_to_se3(params: &[f64]) -> SE3 {
     let rotation = if params.len() >= 4 {
-        Quat::from_xyzw(
+        crate::geometry::quat_from_xyzw(
             params[0] as f32,
             params[1] as f32,
             params[2] as f32,
             params[3] as f32,
         )
     } else {
-        Quat::IDENTITY
+        Quat::identity()
     };
     SE3::from_quat_translation(
         rotation,
@@ -2015,7 +2017,8 @@ mod tests {
     use crate::sift::SiftFeatures;
     use crate::types::{CameraModel, ImageFrame, Point3D, TrackObservation};
     use crate::wide::WideDescriptors;
-    use glam::{Quat, Vec3};
+    type Quat = nalgebra::UnitQuaternion<f32>;
+    type Vec3 = nalgebra::Vector3<f32>;
     use rustslam::Descriptors;
     use rustslam::KeyPoint;
     use rustslam::SE3;
@@ -2353,7 +2356,7 @@ mod tests {
     fn image_pose_ambient_jacobian_matches_numeric_ceres_block() {
         let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
         let pose = SE3::from_quat_translation(
-            Quat::from_rotation_y(0.17).normalize(),
+            crate::geometry::quat_from_rotation_y(0.17).normalize(),
             Vec3::new(0.2, -0.1, 0.05),
         );
         let point = [0.25, -0.1, 2.5];
@@ -2375,11 +2378,11 @@ mod tests {
     fn frame_pose_ambient_jacobian_matches_numeric_ceres_block() {
         let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
         let sensor_pose = SE3::from_quat_translation(
-            Quat::from_rotation_x(-0.11).normalize(),
+            crate::geometry::quat_from_rotation_x(-0.11).normalize(),
             Vec3::new(0.15, 0.03, -0.02),
         );
         let rig_pose = SE3::from_quat_translation(
-            Quat::from_rotation_y(0.17).normalize(),
+            crate::geometry::quat_from_rotation_y(0.17).normalize(),
             Vec3::new(0.2, -0.1, 0.05),
         );
         let point = [0.25, -0.1, 2.5];
@@ -2415,11 +2418,11 @@ mod tests {
     fn sensor_pose_ambient_jacobian_matches_numeric_ceres_block() {
         let camera = CameraModel::new_pinhole(200, 160, 90.0, 96.0, 100.0, 80.0);
         let sensor_pose = SE3::from_quat_translation(
-            Quat::from_rotation_x(-0.11).normalize(),
+            crate::geometry::quat_from_rotation_x(-0.11).normalize(),
             Vec3::new(0.15, 0.03, -0.02),
         );
         let rig_pose = SE3::from_quat_translation(
-            Quat::from_rotation_y(0.17).normalize(),
+            crate::geometry::quat_from_rotation_y(0.17).normalize(),
             Vec3::new(0.2, -0.1, 0.05),
         );
         let point = [0.25, -0.1, 2.5];
@@ -2600,7 +2603,7 @@ mod tests {
             .residual_block_builder()
             .set_cost(cost, 3)
             .set_parameters([se3_to_pose_params(SE3::from_quat_translation(
-                Quat::IDENTITY,
+                Quat::identity(),
                 Vec3::new(-4.0, 0.0, 0.0),
             ))
             .to_vec()])

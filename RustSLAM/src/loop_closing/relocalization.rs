@@ -236,7 +236,7 @@ impl DescriptorsExt for Descriptors {
 mod tests {
     use super::*;
     use crate::core::{Frame, FrameFeatures, MapPoint};
-    use glam::Vec3;
+    use nalgebra::Point3;
 
     #[test]
     fn test_relocalizer_creation() {
@@ -290,14 +290,14 @@ mod tests {
         // 8 non-coplanar 3D points with correct projections for identity pose
         // u = fx * X/Z + cx, v = fy * Y/Z + cy  (fx=fy=500, cx=320, cy=240)
         let positions = [
-            Vec3::new(0.0, 0.0, 5.0),
-            Vec3::new(0.5, 0.0, 5.0),
-            Vec3::new(0.0, 0.5, 5.0),
-            Vec3::new(0.5, 0.5, 4.0),
-            Vec3::new(-0.3, -0.3, 6.0),
-            Vec3::new(0.3, -0.2, 3.0),
-            Vec3::new(-0.2, 0.4, 4.0),
-            Vec3::new(0.4, 0.3, 5.0),
+            Point3::new(0.0, 0.0, 5.0),
+            Point3::new(0.5, 0.0, 5.0),
+            Point3::new(0.0, 0.5, 5.0),
+            Point3::new(0.5, 0.5, 4.0),
+            Point3::new(-0.3, -0.3, 6.0),
+            Point3::new(0.3, -0.2, 3.0),
+            Point3::new(-0.2, 0.4, 4.0),
+            Point3::new(0.4, 0.3, 5.0),
         ];
         for (i, pos) in positions.iter().enumerate() {
             let mp = MapPoint::new(i as u64, *pos, 1);

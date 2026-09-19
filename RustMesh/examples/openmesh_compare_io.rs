@@ -9,8 +9,8 @@ use openmesh_compare_common::{
     cleanup_paths, measure, mesh_digest, print_header, print_mesh_digest, MeshDigest,
 };
 use rustmesh::{
-    generate_cube, generate_sphere, read_ply, read_stl, write_ply, write_stl, PlyFormat, RustMesh,
-    StlFormat,
+    generate_cube, generate_sphere, read_ply, read_stl, write_ply, write_stl, PlyFormat, Point3,
+    RustMesh, StlFormat, Vec3, Vec4,
 };
 use std::fs;
 use std::io::{self, BufRead, BufReader};
@@ -73,7 +73,7 @@ fn ply_digest(path: &Path) -> io::Result<MeshDigest> {
             let x: f32 = parts[0].parse().unwrap_or(0.0);
             let y: f32 = parts[1].parse().unwrap_or(0.0);
             let z: f32 = parts[2].parse().unwrap_or(0.0);
-            vertices.push(glam::Vec3::new(x, y, z));
+            vertices.push(Point3::new(x, y, z));
         }
     }
 
@@ -96,9 +96,9 @@ fn ply_digest(path: &Path) -> io::Result<MeshDigest> {
     }
 
     // Compute digest
-    let mut min = glam::Vec3::splat(f32::INFINITY);
-    let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
-    let mut sum = glam::Vec3::ZERO;
+    let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut sum = Vec3::zeros();
     let mut count = 0usize;
     let mut checksum = 0.0f32;
 
@@ -106,9 +106,9 @@ fn ply_digest(path: &Path) -> io::Result<MeshDigest> {
         if !used.get(idx).copied().unwrap_or(false) {
             continue;
         }
-        min = min.min(point);
-        max = max.max(point);
-        sum += point;
+        min = Point3::from(min.coords.inf(&point.coords));
+        max = Point3::from(max.coords.sup(&point.coords));
+        sum += point.coords;
         checksum += point.x.abs() + point.y.abs() + point.z.abs();
         count += 1;
     }
@@ -117,9 +117,9 @@ fn ply_digest(path: &Path) -> io::Result<MeshDigest> {
         return Ok(MeshDigest {
             vertices: 0,
             faces: 0,
-            bbox_min: glam::Vec3::ZERO,
-            bbox_max: glam::Vec3::ZERO,
-            centroid: glam::Vec3::ZERO,
+            bbox_min: Point3::origin(),
+            bbox_max: Point3::origin(),
+            centroid: Point3::origin(),
             checksum_l1: 0.0,
         });
     }
@@ -129,7 +129,7 @@ fn ply_digest(path: &Path) -> io::Result<MeshDigest> {
         faces: face_count,
         bbox_min: min,
         bbox_max: max,
-        centroid: sum / count as f32,
+        centroid: Point3::from(sum / count as f32),
         checksum_l1: checksum,
     })
 }
@@ -141,7 +141,7 @@ fn stl_ascii_digest(path: &Path) -> io::Result<MeshDigest> {
 
     let mut vertices_set = std::collections::HashSet::new();
     let mut face_count = 0usize;
-    let mut sum = glam::Vec3::ZERO;
+    let mut sum = Vec3::zeros();
     let mut checksum = 0.0f32;
 
     for line in lines {
@@ -163,7 +163,7 @@ fn stl_ascii_digest(path: &Path) -> io::Result<MeshDigest> {
                 );
 
                 if vertices_set.insert(key) {
-                    sum += glam::Vec3::new(x, y, z);
+                    sum += Vec3::new(x, y, z);
                     checksum += x.abs() + y.abs() + z.abs();
                 }
             }
@@ -177,23 +177,23 @@ fn stl_ascii_digest(path: &Path) -> io::Result<MeshDigest> {
         return Ok(MeshDigest {
             vertices: 0,
             faces: 0,
-            bbox_min: glam::Vec3::ZERO,
-            bbox_max: glam::Vec3::ZERO,
-            centroid: glam::Vec3::ZERO,
+            bbox_min: Point3::origin(),
+            bbox_max: Point3::origin(),
+            centroid: Point3::origin(),
             checksum_l1: 0.0,
         });
     }
 
     // Compute bounding box from unique vertices
-    let mut min = glam::Vec3::splat(f32::INFINITY);
-    let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+    let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
     for key in &vertices_set {
         let x = key.0 as f32 / 1e6;
         let y = key.1 as f32 / 1e6;
         let z = key.2 as f32 / 1e6;
-        let p = glam::Vec3::new(x, y, z);
-        min = min.min(p);
-        max = max.max(p);
+        let p = Point3::new(x, y, z);
+        min = Point3::from(min.coords.inf(&p.coords));
+        max = Point3::from(max.coords.sup(&p.coords));
     }
 
     Ok(MeshDigest {
@@ -201,7 +201,7 @@ fn stl_ascii_digest(path: &Path) -> io::Result<MeshDigest> {
         faces: face_count,
         bbox_min: min,
         bbox_max: max,
-        centroid: sum / count as f32,
+        centroid: Point3::from(sum / count as f32),
         checksum_l1: checksum,
     })
 }
@@ -309,8 +309,8 @@ fn test_stl_roundtrip_ascii(mesh: &RustMesh, label: &str) {
     );
 
     // Verify bounding box is preserved
-    let bbox_ok = (loaded_digest.bbox_min - original_digest.bbox_min).length() < 0.01
-        && (loaded_digest.bbox_max - original_digest.bbox_max).length() < 0.01;
+    let bbox_ok = (loaded_digest.bbox_min - original_digest.bbox_min).norm() < 0.01
+        && (loaded_digest.bbox_max - original_digest.bbox_max).norm() < 0.01;
     assert!(bbox_ok, "Bounding box should be preserved");
 
     cleanup_paths(&[&path]);
@@ -363,20 +363,20 @@ fn test_ply_with_attributes() {
     mesh.request_vertex_normals();
     mesh.request_vertex_colors();
 
-    let v0 = mesh.add_vertex(glam::vec3(0.0, 0.0, 0.0));
-    let v1 = mesh.add_vertex(glam::vec3(1.0, 0.0, 0.0));
-    let v2 = mesh.add_vertex(glam::vec3(0.0, 1.0, 0.0));
+    let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+    let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+    let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
     mesh.add_face(&[v0, v1, v2]);
 
     // Set normals
-    mesh.set_vertex_normal_by_index(0, glam::vec3(0.0, 0.0, 1.0));
-    mesh.set_vertex_normal_by_index(1, glam::vec3(0.0, 0.0, 1.0));
-    mesh.set_vertex_normal_by_index(2, glam::vec3(0.0, 0.0, 1.0));
+    mesh.set_vertex_normal_by_index(0, Vec3::new(0.0, 0.0, 1.0));
+    mesh.set_vertex_normal_by_index(1, Vec3::new(0.0, 0.0, 1.0));
+    mesh.set_vertex_normal_by_index(2, Vec3::new(0.0, 0.0, 1.0));
 
     // Set colors
-    mesh.set_vertex_color_by_index(0, glam::vec4(1.0, 0.0, 0.0, 1.0));
-    mesh.set_vertex_color_by_index(1, glam::vec4(0.0, 1.0, 0.0, 1.0));
-    mesh.set_vertex_color_by_index(2, glam::vec4(0.0, 0.0, 1.0, 1.0));
+    mesh.set_vertex_color_by_index(0, Vec4::new(1.0, 0.0, 0.0, 1.0));
+    mesh.set_vertex_color_by_index(1, Vec4::new(0.0, 1.0, 0.0, 1.0));
+    mesh.set_vertex_color_by_index(2, Vec4::new(0.0, 0.0, 1.0, 1.0));
 
     let path = temp_path("colors", "ply");
     write_ply(&mesh, &path, PlyFormat::Ascii).unwrap();

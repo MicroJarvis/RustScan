@@ -10,6 +10,7 @@
 use crate::connectivity::RustMesh;
 use crate::geometry::{triangle_area, triangle_normal};
 use crate::handles::{FaceHandle, VertexHandle};
+use crate::{Point3, Vec3};
 use std::collections::HashMap;
 
 /// Error type for mesh repair operations
@@ -153,7 +154,7 @@ fn compact_vertices(mesh: &mut RustMesh, keep_vertex: &[bool]) -> Result<(), Mes
     }
 
     // Store old geometry
-    let mut old_points: Vec<(VertexHandle, glam::Vec3)> = Vec::new();
+    let mut old_points: Vec<(VertexHandle, Point3)> = Vec::new();
     for i in 0..old_n_vertices {
         if keep_vertex[i] {
             let vh = VertexHandle::new(i as u32);
@@ -288,25 +289,25 @@ fn is_face_degenerate(mesh: &RustMesh, verts: &[VertexHandle]) -> bool {
 }
 
 /// Compute centroid of a polygon
-fn compute_polygon_centroid(mesh: &RustMesh, verts: &[VertexHandle]) -> glam::Vec3 {
+fn compute_polygon_centroid(mesh: &RustMesh, verts: &[VertexHandle]) -> Point3 {
     if verts.is_empty() {
-        return glam::Vec3::ZERO;
+        return Point3::origin();
     }
 
-    let mut sum = glam::Vec3::ZERO;
+    let mut sum = Vec3::zeros();
     let mut count = 0;
 
     for vh in verts {
         if let Some(p) = mesh.point(*vh) {
-            sum += p;
+            sum += p.coords;
             count += 1;
         }
     }
 
     if count > 0 {
-        sum / count as f32
+        Point3::from(sum / count as f32)
     } else {
-        glam::Vec3::ZERO
+        Point3::origin()
     }
 }
 
@@ -344,7 +345,7 @@ pub fn fix_winding_order(mesh: &mut RustMesh) -> Result<usize, MeshRepairError> 
     for fh in faces {
         if let Some(current_normal) = compute_face_normal(mesh, fh) {
             // If normals point in opposite directions, flip the face
-            if current_normal.dot(reference_normal) < 0.0 {
+            if current_normal.dot(&reference_normal) < 0.0 {
                 flip_face_winding(mesh, fh)?;
                 flipped_count += 1;
             }
@@ -355,7 +356,7 @@ pub fn fix_winding_order(mesh: &mut RustMesh) -> Result<usize, MeshRepairError> 
 }
 
 /// Compute the normal of a face
-fn compute_face_normal(mesh: &RustMesh, fh: FaceHandle) -> Option<glam::Vec3> {
+fn compute_face_normal(mesh: &RustMesh, fh: FaceHandle) -> Option<Vec3> {
     let verts = mesh.face_vertices_vec(fh);
 
     if verts.len() < 3 {
@@ -438,7 +439,7 @@ pub fn merge_close_vertices(mesh: &mut RustMesh, threshold: f32) -> Result<usize
                 None => continue,
             };
 
-            let dist_sq = (p_i - p_j).length_squared();
+            let dist_sq = (p_i - p_j).norm_squared();
 
             if dist_sq < threshold_sq {
                 // Merge j into i
@@ -524,16 +525,15 @@ impl std::fmt::Display for RepairStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Vec3;
 
     fn create_test_mesh() -> RustMesh {
         let mut mesh = RustMesh::new();
 
         // Create a simple quad
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(1.0, 1.0, 0.0));
-        let v3 = mesh.add_vertex(Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(1.0, 1.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         // Add two triangles to form a quad
         mesh.add_face(&[v0, v1, v2]);
@@ -548,15 +548,15 @@ mod tests {
         let _initial_faces = mesh.n_faces();
 
         // Add a degenerate triangle (all same point)
-        let v0 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0)); // duplicate
-        let v2 = mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0)); // duplicate
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0)); // duplicate
+        let v2 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0)); // duplicate
         mesh.add_face(&[v0, v1, v2]);
 
         // Add another degenerate (collinear)
-        let v3 = mesh.add_vertex(Vec3::new(2.0, 0.0, 0.0));
-        let v4 = mesh.add_vertex(Vec3::new(3.0, 0.0, 0.0));
-        let v5 = mesh.add_vertex(Vec3::new(4.0, 0.0, 0.0));
+        let v3 = mesh.add_vertex(Point3::new(2.0, 0.0, 0.0));
+        let v4 = mesh.add_vertex(Point3::new(3.0, 0.0, 0.0));
+        let v5 = mesh.add_vertex(Point3::new(4.0, 0.0, 0.0));
         mesh.add_face(&[v3, v4, v5]);
 
         let removed = remove_degenerate_faces(&mut mesh).unwrap();
@@ -572,9 +572,9 @@ mod tests {
         let mut mesh = create_test_mesh();
 
         // Add a face with reversed winding
-        let v0 = mesh.add_vertex(Vec3::new(2.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(Vec3::new(3.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(Vec3::new(2.5, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(2.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(3.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(2.5, 1.0, 0.0));
         mesh.add_face(&[v0, v2, v1]); // Opposite normal from the reference face
 
         let flipped = fix_winding_order(&mut mesh).unwrap();
@@ -588,8 +588,8 @@ mod tests {
         let initial_verts = mesh.n_vertices();
 
         // Add vertices very close together
-        let v0 = mesh.add_vertex(Vec3::new(0.001, 0.0, 0.0)); // very close to (0,0,0)
-        let _v1 = mesh.add_vertex(Vec3::new(0.0001, 0.0, 0.0)); // even closer
+        let v0 = mesh.add_vertex(Point3::new(0.001, 0.0, 0.0)); // very close to (0,0,0)
+        let _v1 = mesh.add_vertex(Point3::new(0.0001, 0.0, 0.0)); // even closer
         mesh.add_face(&[VertexHandle::new(0), v0, VertexHandle::new(2)]);
         mesh.add_face(&[VertexHandle::new(0), VertexHandle::new(1), v0]);
 
@@ -603,8 +603,8 @@ mod tests {
         let mut mesh = create_test_mesh();
 
         // Add two very close vertices and a face referencing one of them.
-        let v0 = mesh.add_vertex(Vec3::new(0.001, 0.0, 0.0));
-        let _v1 = mesh.add_vertex(Vec3::new(0.0009, 0.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.001, 0.0, 0.0));
+        let _v1 = mesh.add_vertex(Point3::new(0.0009, 0.0, 0.0));
         mesh.add_face(&[VertexHandle::new(0), v0, VertexHandle::new(1)]);
 
         // This should complete quickly even if connectivity is imperfect.

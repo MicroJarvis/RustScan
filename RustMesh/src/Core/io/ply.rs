@@ -8,7 +8,8 @@
 //! - Face list (vertex count + indices)
 
 use crate::core::attrib_soa_kernel::VertexPropertyRef;
-use crate::{AttribSoAKernel, FaceHandle, RustMesh, VPropHandle, VertexHandle};
+use crate::{AttribSoAKernel, FaceHandle, Point3, RustMesh, VPropHandle, VertexHandle};
+use crate::{Vec3, Vec4};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -136,7 +137,7 @@ impl AttribVertexPropertySchema {
 enum AttribVertexPropertyHandle {
     Float(VPropHandle<f32>),
     Int(VPropHandle<i32>),
-    Vec3(VPropHandle<glam::Vec3>),
+    Vec3(VPropHandle<Vec3>),
 }
 
 #[derive(Debug, Clone)]
@@ -522,7 +523,7 @@ fn create_attrib_vertex_property_bindings(
                     AttribVertexPropertyHandle::Int(mesh.add_vertex_property::<i32>(name))
                 }
                 AttribVertexPropertySchema::Vec3 { name, .. } => {
-                    AttribVertexPropertyHandle::Vec3(mesh.add_vertex_property::<glam::Vec3>(name))
+                    AttribVertexPropertyHandle::Vec3(mesh.add_vertex_property::<Vec3>(name))
                 }
             };
 
@@ -769,7 +770,7 @@ fn read_ply_ascii_data(mut reader: BufReader<File>, header: &PlyHeader) -> io::R
                 .and_then(|&i| parts.get(i).and_then(|s| s.parse::<f32>().ok()))
                 .unwrap_or(0.0);
 
-            let vh = mesh.add_vertex(glam::Vec3::new(x, y, z));
+            let vh = mesh.add_vertex(Point3::new(x, y, z));
 
             // Parse normal
             if has_normals {
@@ -787,7 +788,7 @@ fn read_ply_ascii_data(mut reader: BufReader<File>, header: &PlyHeader) -> io::R
                     .and_then(|&i| parts.get(i).and_then(|s| s.parse::<f32>().ok()))
                     .unwrap_or(1.0);
 
-                mesh.set_vertex_normal_by_index(vh.idx_usize(), glam::Vec3::new(nx, ny, nz));
+                mesh.set_vertex_normal_by_index(vh.idx_usize(), Vec3::new(nx, ny, nz));
             }
 
             // Parse color
@@ -818,7 +819,7 @@ fn read_ply_ascii_data(mut reader: BufReader<File>, header: &PlyHeader) -> io::R
 
                 mesh.set_vertex_color_by_index(
                     vh.idx_usize(),
-                    glam::Vec4::new(
+                    Vec4::new(
                         r as f32 / 255.0,
                         g as f32 / 255.0,
                         b as f32 / 255.0,
@@ -911,7 +912,7 @@ fn read_attrib_ply_ascii_data(
             let x = read_ascii_value(parts.as_slice(), prop_map.get("x"), 0.0f32);
             let y = read_ascii_value(parts.as_slice(), prop_map.get("y"), 0.0f32);
             let z = read_ascii_value(parts.as_slice(), prop_map.get("z"), 0.0f32);
-            let vh = mesh.add_vertex(glam::Vec3::new(x, y, z));
+            let vh = mesh.add_vertex(Point3::new(x, y, z));
 
             if has_normals {
                 let nx = read_ascii_value(
@@ -929,7 +930,7 @@ fn read_attrib_ply_ascii_data(
                     prop_map.get("nz").or_else(|| prop_map.get("normal_z")),
                     1.0f32,
                 );
-                mesh.set_vertex_normal(vh, glam::Vec3::new(nx, ny, nz));
+                mesh.set_vertex_normal(vh, Vec3::new(nx, ny, nz));
             }
 
             if has_colors {
@@ -961,7 +962,7 @@ fn read_attrib_ply_ascii_data(
                 );
                 mesh.set_vertex_color(
                     vh,
-                    glam::Vec4::new(
+                    Vec4::new(
                         r as f32 / 255.0,
                         g as f32 / 255.0,
                         b as f32 / 255.0,
@@ -1007,7 +1008,7 @@ fn read_attrib_ply_ascii_data(
                             prop_map.get(field_names[2].as_str()),
                             0.0f32,
                         );
-                        mesh.set_vertex_property(handle, vh, glam::Vec3::new(x, y, z));
+                        mesh.set_vertex_property(handle, vh, Vec3::new(x, y, z));
                     }
                     _ => unreachable!("attribute schema/handle mismatch"),
                 }
@@ -1105,7 +1106,7 @@ fn read_ply_binary_data_from_buffered(
             let y = y_idx.and_then(|&i| values.get(i)).copied().unwrap_or(0.0) as f32;
             let z = z_idx.and_then(|&i| values.get(i)).copied().unwrap_or(0.0) as f32;
 
-            let vh = mesh.add_vertex(glam::Vec3::new(x, y, z));
+            let vh = mesh.add_vertex(Point3::new(x, y, z));
 
             // Parse normal
             if has_normals {
@@ -1117,7 +1118,7 @@ fn read_ply_binary_data_from_buffered(
                 let ny = ny_idx.and_then(|&i| values.get(i)).copied().unwrap_or(0.0) as f32;
                 let nz = nz_idx.and_then(|&i| values.get(i)).copied().unwrap_or(1.0) as f32;
 
-                mesh.set_vertex_normal_by_index(vh.idx_usize(), glam::Vec3::new(nx, ny, nz));
+                mesh.set_vertex_normal_by_index(vh.idx_usize(), Vec3::new(nx, ny, nz));
             }
 
             // Parse color
@@ -1138,7 +1139,7 @@ fn read_ply_binary_data_from_buffered(
                 let b = b_idx.and_then(|&i| values.get(i)).copied().unwrap_or(255.0) as f32 / 255.0;
                 let a = a_idx.and_then(|&i| values.get(i)).copied().unwrap_or(255.0) as f32 / 255.0;
 
-                mesh.set_vertex_color_by_index(vh.idx_usize(), glam::Vec4::new(r, g, b, a));
+                mesh.set_vertex_color_by_index(vh.idx_usize(), Vec4::new(r, g, b, a));
             }
         }
     }
@@ -1223,7 +1224,7 @@ fn read_attrib_ply_binary_data_from_buffered(
             let x = values[prop_map["x"]] as f32;
             let y = values[prop_map["y"]] as f32;
             let z = values[prop_map["z"]] as f32;
-            let vh = mesh.add_vertex(glam::Vec3::new(x, y, z));
+            let vh = mesh.add_vertex(Point3::new(x, y, z));
 
             if has_normals {
                 let nx_idx = prop_map.get("nx").or_else(|| prop_map.get("normal_x"));
@@ -1233,7 +1234,7 @@ fn read_attrib_ply_binary_data_from_buffered(
                 let nx = nx_idx.and_then(|&i| values.get(i)).copied().unwrap_or(0.0) as f32;
                 let ny = ny_idx.and_then(|&i| values.get(i)).copied().unwrap_or(0.0) as f32;
                 let nz = nz_idx.and_then(|&i| values.get(i)).copied().unwrap_or(1.0) as f32;
-                mesh.set_vertex_normal(vh, glam::Vec3::new(nx, ny, nz));
+                mesh.set_vertex_normal(vh, Vec3::new(nx, ny, nz));
             }
 
             if has_colors {
@@ -1253,7 +1254,7 @@ fn read_attrib_ply_binary_data_from_buffered(
                 let b = b_idx.and_then(|&i| values.get(i)).copied().unwrap_or(255.0) as f32 / 255.0;
                 let a = a_idx.and_then(|&i| values.get(i)).copied().unwrap_or(255.0) as f32 / 255.0;
 
-                mesh.set_vertex_color(vh, glam::Vec4::new(r, g, b, a));
+                mesh.set_vertex_color(vh, Vec4::new(r, g, b, a));
             }
 
             for binding in &attrib_bindings {
@@ -1299,7 +1300,7 @@ fn read_attrib_ply_binary_data_from_buffered(
                             .and_then(|&i| values.get(i))
                             .copied()
                             .unwrap_or(0.0) as f32;
-                        mesh.set_vertex_property(handle, vh, glam::Vec3::new(x, y, z));
+                        mesh.set_vertex_property(handle, vh, Vec3::new(x, y, z));
                     }
                     _ => unreachable!("attribute schema/handle mismatch"),
                 }
@@ -1494,16 +1495,14 @@ fn write_attrib_ply_ascii(mesh: &AttribSoAKernel, path: impl AsRef<Path>) -> io:
         write!(writer, "{} {} {}", point.x, point.y, point.z)?;
 
         if mesh.has_vertex_normals() {
-            let normal = mesh
-                .vertex_normal(vh)
-                .unwrap_or(glam::Vec3::new(0.0, 0.0, 1.0));
+            let normal = mesh.vertex_normal(vh).unwrap_or(Vec3::new(0.0, 0.0, 1.0));
             write!(writer, " {} {} {}", normal.x, normal.y, normal.z)?;
         }
 
         if mesh.has_vertex_colors() {
             let color = mesh
                 .vertex_color(vh)
-                .unwrap_or(glam::Vec4::new(1.0, 1.0, 1.0, 1.0));
+                .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0));
             let r = (color.x.clamp(0.0, 1.0) * 255.0) as u8;
             let g = (color.y.clamp(0.0, 1.0) * 255.0) as u8;
             let b = (color.z.clamp(0.0, 1.0) * 255.0) as u8;
@@ -1735,9 +1734,7 @@ fn write_attrib_ply_binary(
         }
 
         if mesh.has_vertex_normals() {
-            let normal = mesh
-                .vertex_normal(vh)
-                .unwrap_or(glam::Vec3::new(0.0, 0.0, 1.0));
+            let normal = mesh.vertex_normal(vh).unwrap_or(Vec3::new(0.0, 0.0, 1.0));
             for coord in [normal.x, normal.y, normal.z] {
                 let bytes = if big_endian {
                     coord.to_be_bytes()
@@ -1751,7 +1748,7 @@ fn write_attrib_ply_binary(
         if mesh.has_vertex_colors() {
             let color = mesh
                 .vertex_color(vh)
-                .unwrap_or(glam::Vec4::new(1.0, 1.0, 1.0, 1.0));
+                .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0));
             let rgba = [
                 (color.x.clamp(0.0, 1.0) * 255.0) as u8,
                 (color.y.clamp(0.0, 1.0) * 255.0) as u8,
@@ -1822,32 +1819,32 @@ mod tests {
 
     fn create_test_mesh() -> RustMesh {
         let mut mesh = RustMesh::new();
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
         mesh
     }
 
     fn create_attrib_test_mesh() -> AttribSoAKernel {
         let mut mesh = AttribSoAKernel::new();
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
 
         mesh.request_vertex_normals();
-        mesh.set_vertex_normal(v0, glam::Vec3::new(0.0, 0.0, 1.0));
-        mesh.set_vertex_normal(v1, glam::Vec3::new(0.0, 0.0, 1.0));
-        mesh.set_vertex_normal(v2, glam::Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_vertex_normal(v0, Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_vertex_normal(v1, Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_vertex_normal(v2, Vec3::new(0.0, 0.0, 1.0));
 
         mesh.request_vertex_colors();
-        mesh.set_vertex_color(v0, glam::Vec4::new(1.0, 0.0, 0.0, 1.0));
-        mesh.set_vertex_color(v1, glam::Vec4::new(0.0, 1.0, 0.0, 1.0));
-        mesh.set_vertex_color(v2, glam::Vec4::new(0.0, 0.0, 1.0, 1.0));
+        mesh.set_vertex_color(v0, Vec4::new(1.0, 0.0, 0.0, 1.0));
+        mesh.set_vertex_color(v1, Vec4::new(0.0, 1.0, 0.0, 1.0));
+        mesh.set_vertex_color(v2, Vec4::new(0.0, 0.0, 1.0, 1.0));
 
         let quality = mesh.add_vertex_property::<f32>("quality");
         let region = mesh.add_vertex_property::<i32>("region");
-        let gradient = mesh.add_vertex_property::<glam::Vec3>("gradient");
+        let gradient = mesh.add_vertex_property::<Vec3>("gradient");
 
         mesh.set_vertex_property(quality, v0, 1.5);
         mesh.set_vertex_property(quality, v1, 2.5);
@@ -1857,9 +1854,9 @@ mod tests {
         mesh.set_vertex_property(region, v1, 8);
         mesh.set_vertex_property(region, v2, 9);
 
-        mesh.set_vertex_property(gradient, v0, glam::Vec3::new(1.0, 2.0, 3.0));
-        mesh.set_vertex_property(gradient, v1, glam::Vec3::new(4.0, 5.0, 6.0));
-        mesh.set_vertex_property(gradient, v2, glam::Vec3::new(7.0, 8.0, 9.0));
+        mesh.set_vertex_property(gradient, v0, Vec3::new(1.0, 2.0, 3.0));
+        mesh.set_vertex_property(gradient, v1, Vec3::new(4.0, 5.0, 6.0));
+        mesh.set_vertex_property(gradient, v2, Vec3::new(7.0, 8.0, 9.0));
 
         let e0 = mesh.add_edge(v0, v1);
         let e1 = mesh.add_edge(v1, v2);
@@ -1955,14 +1952,14 @@ mod tests {
         let mut mesh = RustMesh::new();
         mesh.request_vertex_normals();
 
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
 
-        mesh.set_vertex_normal_by_index(0, glam::Vec3::new(0.0, 0.0, 1.0));
-        mesh.set_vertex_normal_by_index(1, glam::Vec3::new(0.0, 0.0, 1.0));
-        mesh.set_vertex_normal_by_index(2, glam::Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_vertex_normal_by_index(0, Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_vertex_normal_by_index(1, Vec3::new(0.0, 0.0, 1.0));
+        mesh.set_vertex_normal_by_index(2, Vec3::new(0.0, 0.0, 1.0));
 
         let path = "/tmp/test_normals.ply";
         write_ply(&mesh, path, PlyFormat::Ascii).unwrap();
@@ -1982,14 +1979,14 @@ mod tests {
         let mut mesh = RustMesh::new();
         mesh.request_vertex_colors();
 
-        let v0 = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let v1 = mesh.add_vertex(glam::Vec3::new(1.0, 0.0, 0.0));
-        let v2 = mesh.add_vertex(glam::Vec3::new(0.0, 1.0, 0.0));
+        let v0 = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Point3::new(1.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Point3::new(0.0, 1.0, 0.0));
         mesh.add_face(&[v0, v1, v2]);
 
-        mesh.set_vertex_color_by_index(0, glam::Vec4::new(1.0, 0.0, 0.0, 1.0));
-        mesh.set_vertex_color_by_index(1, glam::Vec4::new(0.0, 1.0, 0.0, 1.0));
-        mesh.set_vertex_color_by_index(2, glam::Vec4::new(0.0, 0.0, 1.0, 1.0));
+        mesh.set_vertex_color_by_index(0, Vec4::new(1.0, 0.0, 0.0, 1.0));
+        mesh.set_vertex_color_by_index(1, Vec4::new(0.0, 1.0, 0.0, 1.0));
+        mesh.set_vertex_color_by_index(2, Vec4::new(0.0, 0.0, 1.0, 1.0));
 
         let path = "/tmp/test_colors.ply";
         write_ply(&mesh, path, PlyFormat::Ascii).unwrap();
@@ -2017,7 +2014,7 @@ mod tests {
         assert!(loaded.has_vertex_colors());
         assert_eq!(
             loaded.vertex_normal(VertexHandle::new(0)),
-            Some(glam::Vec3::new(0.0, 0.0, 1.0))
+            Some(Vec3::new(0.0, 0.0, 1.0))
         );
 
         let props = loaded.vertex_property_refs();
@@ -2035,9 +2032,9 @@ mod tests {
         assert!(matches!(
             props[2],
             VertexPropertyRef::Vec3 { name: "gradient", values }
-                if values[0] == glam::Vec3::new(1.0, 2.0, 3.0)
-                    && values[1] == glam::Vec3::new(4.0, 5.0, 6.0)
-                    && values[2] == glam::Vec3::new(7.0, 8.0, 9.0)
+                if values[0] == Vec3::new(1.0, 2.0, 3.0)
+                    && values[1] == Vec3::new(4.0, 5.0, 6.0)
+                    && values[2] == Vec3::new(7.0, 8.0, 9.0)
         ));
     }
 
@@ -2067,16 +2064,16 @@ mod tests {
         assert!(matches!(
             props[2],
             VertexPropertyRef::Vec3 { name: "gradient", values }
-                if values[1] == glam::Vec3::new(4.0, 5.0, 6.0)
+                if values[1] == Vec3::new(4.0, 5.0, 6.0)
         ));
     }
 
     #[test]
     fn test_attrib_ply_rejects_unsupported_vec4_dynamic_property() {
         let mut mesh = AttribSoAKernel::new();
-        let vh = mesh.add_vertex(glam::Vec3::new(0.0, 0.0, 0.0));
-        let weights = mesh.add_vertex_property::<glam::Vec4>("weights");
-        mesh.set_vertex_property(weights, vh, glam::Vec4::ONE);
+        let vh = mesh.add_vertex(Point3::new(0.0, 0.0, 0.0));
+        let weights = mesh.add_vertex_property::<Vec4>("weights");
+        mesh.set_vertex_property(weights, vh, Vec4::repeat(1.0));
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("attrib_unsupported_vec4.ply");

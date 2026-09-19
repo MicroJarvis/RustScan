@@ -58,8 +58,8 @@ where
     )
     .expect("depth pre-sort by splat id");
 
-    let (_, sorted) = B::radix_sort_by_key_u32_primitive(sorted_depth_u32, sorted_gids)
-        .expect("depth sort");
+    let (_, sorted) =
+        B::radix_sort_by_key_u32_primitive(sorted_depth_u32, sorted_gids).expect("depth sort");
 
     Tensor::from_primitive(sorted)
 }

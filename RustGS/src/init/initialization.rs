@@ -5,9 +5,9 @@
 //! Uses KdTree for nearest-neighbor scale computation.
 
 #[cfg(feature = "gpu")]
-use glam::Vec3;
-#[cfg(feature = "gpu")]
 use kiddo::{KdTree, SquaredEuclidean};
+#[cfg(feature = "gpu")]
+use nalgebra::Vector3;
 #[cfg(feature = "gpu")]
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -73,9 +73,9 @@ pub fn initialize_host_splats_from_points(
         );
     }
 
-    let positions_vec3: Vec<Vec3> = points
+    let positions_vec3: Vec<Vector3<f32>> = points
         .iter()
-        .map(|(p, _)| Vec3::new(p[0], p[1], p[2]))
+        .map(|(p, _)| Vector3::new(p[0], p[1], p[2]))
         .collect();
     let scales = compute_scales(&positions_vec3, config);
 
@@ -112,7 +112,7 @@ pub fn initialize_host_splats_from_points(
 }
 
 #[cfg(feature = "gpu")]
-fn compute_scales(points: &[Vec3], config: &GaussianInitConfig) -> Vec<f32> {
+fn compute_scales(points: &[Vector3<f32>], config: &GaussianInitConfig) -> Vec<f32> {
     if points.len() < 3 {
         return vec![1.0; points.len()];
     }
@@ -164,7 +164,7 @@ fn compute_scales(points: &[Vec3], config: &GaussianInitConfig) -> Vec<f32> {
 }
 
 #[cfg(feature = "gpu")]
-fn brush_scene_max_scale(points: &[Vec3]) -> f32 {
+fn brush_scene_max_scale(points: &[Vector3<f32>]) -> f32 {
     let bounds = percentile_bounds(points, 0.75);
     let mut extents = [
         (bounds.1.x - bounds.0.x) * 0.5,
@@ -177,7 +177,7 @@ fn brush_scene_max_scale(points: &[Vec3]) -> f32 {
 }
 
 #[cfg(feature = "gpu")]
-fn percentile_bounds(points: &[Vec3], percentile: f32) -> (Vec3, Vec3) {
+fn percentile_bounds(points: &[Vector3<f32>], percentile: f32) -> (Vector3<f32>, Vector3<f32>) {
     let mut xs = Vec::with_capacity(points.len());
     let mut ys = Vec::with_capacity(points.len());
     let mut zs = Vec::with_capacity(points.len());
@@ -196,8 +196,8 @@ fn percentile_bounds(points: &[Vec3], percentile: f32) -> (Vec3, Vec3) {
     let upper_idx = (len - 1).min((((1.0 + percentile) * 0.5) * len as f32) as usize);
 
     (
-        Vec3::new(xs[lower_idx], ys[lower_idx], zs[lower_idx]),
-        Vec3::new(xs[upper_idx], ys[upper_idx], zs[upper_idx]),
+        Vector3::new(xs[lower_idx], ys[lower_idx], zs[lower_idx]),
+        Vector3::new(xs[upper_idx], ys[upper_idx], zs[upper_idx]),
     )
 }
 

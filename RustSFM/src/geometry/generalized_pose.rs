@@ -1,8 +1,8 @@
-use crate::geometry::camera_center;
+use crate::geometry::{camera_center, UnitQuatNormalize, Vec3GlamExt};
 use crate::types::CameraModel;
 #[cfg(feature = "poselib")]
 use crate::types::Rigid3;
-use glam::Vec3;
+type Vec3 = nalgebra::Vector3<f32>;
 #[cfg(feature = "poselib")]
 use rustslam::{colmap_ransac_num_trials, ColmapRandomSampler};
 use rustslam::{ColmapRansacOptions, SE3};
@@ -688,7 +688,7 @@ fn point3d_is_approx(left: [f64; 3], right: [f64; 3], eps: f64) -> bool {
 
 fn rotate_ray_to_rig(cam_from_rig: SE3, ray_in_cam: [f64; 3]) -> [f64; 3] {
     let q = cam_from_rig.quaternion();
-    let rotation = glam::Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
+    let rotation = crate::geometry::quat_from_xyzw(q[0], q[1], q[2], q[3]).normalize();
     let ray = Vec3::new(
         ray_in_cam[0] as f32,
         ray_in_cam[1] as f32,
@@ -1673,8 +1673,14 @@ mod tests {
         let query_points2d = [[100.0, 50.0], [100.0, 60.0]];
         let world_camera_idxs = [0usize, 1usize];
         let world_cams_from_world = [
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-1.0, 0.0, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-1.0, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(1.0, 0.0, 0.0),
+            ),
         ];
         let world_cameras = [world_camera, world_camera];
         let mut options = StructureLessAbsolutePoseEstimationOptions::default();
@@ -1708,7 +1714,10 @@ mod tests {
         let cameras = [cam_a, cam_b];
         let cams_from_rig = [
             SE3::identity(),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.2, 0.0, 0.0)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.2, 0.0, 0.0),
+            ),
         ];
         let points2d = [[100.0, 50.0], [110.0, 50.0], [100.0, 60.0]];
         let points3d = [[0.0, 0.0, 4.0], [1.0, 0.0, 4.0], [1.0 + 5.0e-6, 0.0, 4.0]];
@@ -1771,7 +1780,10 @@ mod tests {
         let cam_b = CameraModel::new_pinhole(200, 100, 50.0, 50.0, 100.0, 50.0);
         let cams_from_rig = [
             SE3::identity(),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.2, 0.0, 0.0)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.2, 0.0, 0.0),
+            ),
         ];
         let points1 = [[100.0, 50.0], [110.0, 50.0]];
         let points2 = [[100.0, 60.0], [100.0, 50.0]];
@@ -1811,8 +1823,14 @@ mod tests {
         let cameras = [cam_a, cam_b, cam_c];
         let cams_from_rig = [
             SE3::identity(),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.2, 0.0, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.2, 0.0, 0.0)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.2, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-0.2, 0.0, 0.0),
+            ),
         ];
         let points = [[100.0, 50.0], [110.0, 50.0]];
         let camera_idxs1 = [0usize, 0usize];
@@ -1840,10 +1858,10 @@ mod tests {
     #[test]
     fn generalized_relative_preparation_rotates_panoramic_rays_into_rig() {
         let camera = CameraModel::new_pinhole(200, 100, 100.0, 100.0, 100.0, 50.0);
-        let rotation = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let rotation = crate::geometry::quat_from_rotation_y(std::f32::consts::FRAC_PI_2);
         let cams_from_rig = [
             SE3::identity(),
-            SE3::from_quat_translation(rotation, glam::Vec3::ZERO),
+            SE3::from_quat_translation(rotation, nalgebra::Vector3::<f32>::zeros()),
         ];
         let points = [[100.0, 50.0], [100.0, 50.0]];
         let camera_idxs = [0usize, 1usize];
@@ -1874,11 +1892,15 @@ mod tests {
         let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
         let cams_from_rig = [
             SE3::identity(),
-            SE3::from_quat_translation(glam::Quat::from_rotation_y(0.4), glam::Vec3::ZERO),
+            SE3::from_quat_translation(
+                crate::geometry::quat_from_rotation_y(0.4),
+                nalgebra::Vector3::<f32>::zeros(),
+            ),
         ];
         let pano2_from_pano1 = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.08) * glam::Quat::from_rotation_x(-0.03),
-            glam::Vec3::new(0.45, -0.04, 0.18).normalize(),
+            crate::geometry::quat_from_rotation_y(0.08)
+                * crate::geometry::quat_from_rotation_x(-0.03),
+            nalgebra::Vector3::new(0.45, -0.04, 0.18).normalize(),
         );
         let points_in_pano1 = [
             [-0.7, -0.3, 5.0],
@@ -1959,7 +1981,10 @@ mod tests {
         let cameras = [camera, camera];
         let cams_from_rig = [
             SE3::identity(),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.3, 0.0, 0.0)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.3, 0.0, 0.0),
+            ),
         ];
 
         let err = estimate_generalized_relative_pose(
@@ -2067,8 +2092,10 @@ mod tests {
     #[cfg(feature = "poselib")]
     #[test]
     fn generalized_relative_support_residual_sum_ignores_outliers_like_colmap() {
-        let rig2_from_rig1 =
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0));
+        let rig2_from_rig1 = SE3::from_quat_translation(
+            nalgebra::UnitQuaternion::<f32>::identity(),
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
+        );
         let observations1 = [
             GRNPObservation {
                 cam_from_rig: SE3::identity(),
@@ -2151,13 +2178,23 @@ mod tests {
     fn poselib_generalized_absolute_pose_estimates_non_panoramic_rig() {
         let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
         let cams_from_rig = [
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.25, 0.0, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.15, 0.22, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.05, -0.18, 0.12)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-0.15, 0.22, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.05, -0.18, 0.12),
+            ),
         ];
         let rig_from_world = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.08) * glam::Quat::from_rotation_x(-0.03),
-            glam::Vec3::new(0.45, -0.04, 0.18),
+            crate::geometry::quat_from_rotation_y(0.08)
+                * crate::geometry::quat_from_rotation_x(-0.03),
+            nalgebra::Vector3::new(0.45, -0.04, 0.18),
         );
         let points3d = [
             [-0.7, -0.3, 5.0],
@@ -2220,13 +2257,23 @@ mod tests {
     fn poselib_structureless_absolute_pose_reuses_generalized_relative_solver() {
         let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
         let world_cams_from_world = [
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.25, 0.0, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.15, 0.22, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.05, -0.18, 0.12)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-0.15, 0.22, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.05, -0.18, 0.12),
+            ),
         ];
         let query_cam_from_world = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.08) * glam::Quat::from_rotation_x(-0.03),
-            glam::Vec3::new(0.45, -0.04, 0.18),
+            crate::geometry::quat_from_rotation_y(0.08)
+                * crate::geometry::quat_from_rotation_x(-0.03),
+            nalgebra::Vector3::new(0.45, -0.04, 0.18),
         );
         let points_in_world = [
             [-0.7, -0.3, 5.0],
@@ -2289,13 +2336,23 @@ mod tests {
     fn poselib_structureless_absolute_pose_rejects_outliers() {
         let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
         let world_cams_from_world = [
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.25, 0.0, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.15, 0.22, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.05, -0.18, 0.12)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-0.15, 0.22, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.05, -0.18, 0.12),
+            ),
         ];
         let query_cam_from_world = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.08) * glam::Quat::from_rotation_x(-0.03),
-            glam::Vec3::new(0.45, -0.04, 0.18),
+            crate::geometry::quat_from_rotation_y(0.08)
+                * crate::geometry::quat_from_rotation_x(-0.03),
+            nalgebra::Vector3::new(0.45, -0.04, 0.18),
         );
         let points_in_world = [
             [-0.7, -0.3, 5.0],
@@ -2411,13 +2468,23 @@ mod tests {
     fn synthetic_generalized_relative_scene() -> SyntheticGeneralizedRelativeScene {
         let camera = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
         let cams_from_rig = [
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.25, 0.0, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-0.15, 0.22, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(0.05, -0.18, 0.12)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.25, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-0.15, 0.22, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(0.05, -0.18, 0.12),
+            ),
         ];
         let rig2_from_rig1 = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.08) * glam::Quat::from_rotation_x(-0.03),
-            glam::Vec3::new(0.45, -0.04, 0.18),
+            crate::geometry::quat_from_rotation_y(0.08)
+                * crate::geometry::quat_from_rotation_x(-0.03),
+            nalgebra::Vector3::new(0.45, -0.04, 0.18),
         );
         let points_in_rig1 = [
             [-0.7, -0.3, 5.0],
@@ -2473,16 +2540,16 @@ mod tests {
     #[test]
     fn recomposes_original_camera_pose_from_generalized_rig_pose() {
         let orig_cam1_from_rig1 = SE3::from_quat_translation(
-            glam::Quat::from_rotation_y(0.1),
-            glam::Vec3::new(0.3, 0.0, 0.0),
+            crate::geometry::quat_from_rotation_y(0.1),
+            nalgebra::Vector3::new(0.3, 0.0, 0.0),
         );
         let orig_cam2_from_rig2 = SE3::from_quat_translation(
-            glam::Quat::from_rotation_x(-0.2),
-            glam::Vec3::new(-0.1, 0.2, 0.0),
+            crate::geometry::quat_from_rotation_x(-0.2),
+            nalgebra::Vector3::new(-0.1, 0.2, 0.0),
         );
         let rig2_from_rig1 = SE3::from_quat_translation(
-            glam::Quat::from_rotation_z(0.3),
-            glam::Vec3::new(1.0, 0.1, 0.2),
+            crate::geometry::quat_from_rotation_z(0.3),
+            nalgebra::Vector3::new(1.0, 0.1, 0.2),
         );
 
         let recomposed = original_camera_relative_pose_from_rig_relative_pose(
@@ -2504,8 +2571,14 @@ mod tests {
         let points2d = [[100.0, 50.0], [110.0, 50.0]];
         let camera_idxs = [0usize, 1usize];
         let cams_from_world = [
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(-1.0, 0.0, 0.0)),
-            SE3::from_quat_translation(glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0)),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(-1.0, 0.0, 0.0),
+            ),
+            SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::<f32>::identity(),
+                nalgebra::Vector3::new(1.0, 0.0, 0.0),
+            ),
         ];
         let cameras = [camera, camera];
 
