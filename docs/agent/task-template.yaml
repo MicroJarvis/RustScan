@@ -1,0 +1,25 @@
+# Copy this file to docs/agent/tasks/<task-id>.yaml.
+id: RS-YYYY-NNN
+status: planned # planned | active | blocked | review | complete | archived
+owner: agent-or-human
+model: optional-model-name
+base_commit: full-or-short-git-sha
+branch: agent/RS-YYYY-NNN/short-name
+worktree: /absolute/path/to/worktree
+
+goal: "One sentence describing the observable result."
+
+scope:
+  - path/to/allowed/file-or-directory
+out_of_scope:
+  - path/to/forbidden/file-or-directory
+dependencies: []
+
+acceptance:
+  - "Concrete, testable condition."
+verification:
+  - "Exact command to run"
+
+artifacts: []
+known_limitations: []
+next_action: ""

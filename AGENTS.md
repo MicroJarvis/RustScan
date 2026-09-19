@@ -70,3 +70,37 @@ with a non-symmetric rotation, non-zero translation, point/vector operations,
 and a round-trip through every affected boundary. Identity-only tests are
 insufficient to detect transposition, row/column-layout, point/vector, and
 quaternion-component-order errors.
+
+## Tool-neutral Agent protocol
+
+This repository does not require Codex, Claude Code, OpenSpec, Superpowers,
+Spec Kit, or any other vendor-specific Agent plugin. Repository work MUST be
+possible with the files in this repository plus standard Git, shell, Rust,
+Cargo, rustfmt, and CI commands.
+
+Rules are applied in this order:
+
+1. Explicit user instructions.
+2. The nearest applicable `AGENTS.md`.
+3. The active task file under `docs/agent/tasks/` or change package under
+   `docs/agent/changes/`.
+4. Historical documents and experiment records.
+5. Local Agent-tool configuration, which MUST NOT override repository rules.
+
+Every non-trivial Agent task MUST declare:
+
+- a unique task ID and one owner;
+- the base commit, branch, and worktree;
+- files or directories in scope and explicitly out of scope;
+- acceptance conditions and exact verification commands;
+- a handoff containing changed files, results, limitations, and next action.
+
+The `main` worktree is for coordination and integration. Agents MUST use an
+isolated task worktree for implementation, MUST NOT overwrite another task's
+dirty changes, and MUST NOT run destructive cleanup such as `git reset --hard`
+or `git clean` unless the user explicitly authorizes that exact action.
+
+Small tasks MAY use only one task YAML file. Cross-crate, public API,
+numerical, GPU/CPU boundary, or parallel tasks SHOULD use a change package
+under `docs/agent/changes/<task-id>/`. The repository protocol remains valid
+when OpenSpec or any other CLI is not installed.

@@ -11,6 +11,13 @@
 | [current-project-status.md](current-project-status.md) | 当前仓库主线状态、已验证结果与下一步优先级 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前 workspace 结构与 RustGS 训练架构边界 |
 
+## Agent Workflow
+
+| Document | Purpose |
+|---|---|
+| [agent/README.md](agent/README.md) | 工具无关的 Agent 任务、worktree、验证和交接协议 |
+| [agent/universal-agent-migration-todo.md](agent/universal-agent-migration-todo.md) | 从 Codex/Superpowers 依赖迁移到通用协议的执行清单 |
+
 ## Active RustSFM Docs
 
 | Document | Purpose |
