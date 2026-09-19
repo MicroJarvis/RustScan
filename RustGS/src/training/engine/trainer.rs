@@ -16,7 +16,8 @@ use crate::training::gpu_primitives::device_radix::{
     radix_sort_dispatch_count, radix_sort_workspace_bytes,
 };
 use crate::training::gpu_primitives::prefix_sum::{
-    prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
+    bind_training_prefix_workspace_ptr, prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
+    PrefixSumWorkspace,
 };
 use crate::training::reporting::metrics::{
     step_intersection_overflowed, ParityLossCurveSample, ParityTopologyMetrics,
@@ -204,6 +205,7 @@ pub struct WgpuTrainer {
     /// When set (tests / parity harness only), forces forward capacity below the
     /// planned size so overflow sticky flags can be exercised through `train_step`.
     intersection_capacity_override: Option<usize>,
+    prefix_sum_workspace: PrefixSumWorkspace,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,6 +227,8 @@ struct OptimizationTimingSamples {
     scan_dispatches: Vec<usize>,
     sort_workspace_bytes: Option<usize>,
     scan_workspace_bytes: Option<usize>,
+    scan_workspace_growth_count: usize,
+    scan_workspace_step_fresh_allocations: Vec<usize>,
     topology_snapshot_ms: Vec<f64>,
     topology_plan_ms: Vec<f64>,
     topology_apply_ms: Vec<f64>,
@@ -253,6 +257,12 @@ impl OptimizationTimingSamples {
         let scan_bytes = prefix_sum_workspace_bytes(scan_len);
         self.sort_workspace_bytes = Some(self.sort_workspace_bytes.unwrap_or(0).max(sort_bytes));
         self.scan_workspace_bytes = Some(self.scan_workspace_bytes.unwrap_or(0).max(scan_bytes));
+    }
+
+    fn record_scan_workspace_stats(&mut self, reserved_bytes: usize, growth_count: usize, step_fresh: usize) {
+        self.scan_workspace_bytes = Some(self.scan_workspace_bytes.unwrap_or(0).max(reserved_bytes));
+        self.scan_workspace_growth_count = growth_count;
+        self.scan_workspace_step_fresh_allocations.push(step_fresh);
     }
 
     fn record_count_readbacks(&mut self, count: usize) {
@@ -310,6 +320,11 @@ impl OptimizationTimingSamples {
         telemetry.scan_dispatch_count_p95 = percentile_usize(&self.scan_dispatches, 95.0);
         telemetry.sort_workspace_bytes = self.sort_workspace_bytes;
         telemetry.scan_workspace_bytes = self.scan_workspace_bytes;
+        telemetry.scan_workspace_growth_count = Some(self.scan_workspace_growth_count);
+        telemetry.scan_workspace_step_fresh_allocations_p50 =
+            percentile_usize(&self.scan_workspace_step_fresh_allocations, 50.0);
+        telemetry.scan_workspace_step_fresh_allocations_p95 =
+            percentile_usize(&self.scan_workspace_step_fresh_allocations, 95.0);
 
         let mut snapshot_sorted = self.topology_snapshot_ms.clone();
         snapshot_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -451,6 +466,7 @@ impl WgpuTrainer {
             device_status: DeviceTrainingStatus::new(&device, 0),
             optimization_samples: OptimizationTimingSamples::default(),
             intersection_capacity_override: None,
+            prefix_sum_workspace: PrefixSumWorkspace::new(),
         }
     }
 
@@ -701,6 +717,15 @@ impl WgpuTrainer {
         collect_topology_stats: bool,
         read_loss: bool,
     ) -> Result<Option<f32>, TrainingError> {
+        self.prefix_sum_workspace.begin_step();
+        // Safety: workspace field is only accessed via TLS during this step; no
+        // overlapping `&mut self.prefix_sum_workspace` Rust borrows.
+        let _prefix_ws_guard = unsafe {
+            bind_training_prefix_workspace_ptr(
+                std::ptr::addr_of_mut!(self.prefix_sum_workspace),
+            )
+        };
+
         let profile_step = log::log_enabled!(log::Level::Debug)
             && (iteration <= 3 || iteration.is_multiple_of(100));
         let step_started_at = Instant::now();
@@ -721,6 +746,11 @@ impl WgpuTrainer {
             Some((iteration as u32, self.device_status.buffer().clone())),
         )
         .await;
+        self.optimization_samples.record_scan_workspace_stats(
+            self.prefix_sum_workspace.reserved_bytes(),
+            self.prefix_sum_workspace.growth_count(),
+            self.prefix_sum_workspace.step_fresh_allocations(),
+        );
         // Overflow sticky bits are written on-device by write_dispatch (no per-step
         // host readback). Host mirror catches up at safety-point reads; device
         // mutation gates land in Task 1.4.

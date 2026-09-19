@@ -203,10 +203,10 @@ fn inclusive_scan_into(&mut self, input: Tensor<B,1,Int>, len: usize,
 
 公共 `inclusive_scan()` 继续返回独立 allocation；训练路径使用 caller-owned output。每个递归层独立 buffer，workspace 生命周期覆盖当前 step backward，下一 step 才复用。
 
-- [ ] 保留连续同长度、短→长→短旧结果测试。
-- [ ] 增加 capacity 不增长、capacity 增长、fresh allocation count 和 output 生命周期测试。
-- [ ] telemetry 记录实际 reserved bytes、growth count、per-step fresh allocations。
-- [ ] 运行 prefix/radix/parity tests，提交 `perf(rustgs): reuse owned prefix scan workspaces`。
+- [x] 保留连续同长度、短→长→短旧结果测试。
+- [x] 增加 capacity 不增长、capacity 增长、fresh allocation count 和 output 生命周期测试。
+- [x] telemetry 记录实际 reserved bytes、growth count、per-step fresh allocations。
+- [x] 运行 prefix/radix/parity tests，提交 `perf(rustgs): reuse owned prefix scan workspaces`。
 
 **阶段 3 验收：** exact/bounded parity、overflow hard-stop、scan 无 alias、稳态递归 scratch 不再逐 step 分配。
 

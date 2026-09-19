@@ -32,6 +32,9 @@ pub struct LiteGsTrainingTelemetry {
     pub scan_dispatch_count_p95: Option<usize>,
     pub sort_workspace_bytes: Option<usize>,
     pub scan_workspace_bytes: Option<usize>,
+    pub scan_workspace_growth_count: Option<usize>,
+    pub scan_workspace_step_fresh_allocations_p50: Option<usize>,
+    pub scan_workspace_step_fresh_allocations_p95: Option<usize>,
     /// CPU submit-side loop duration percentiles (`Instant`); not GPU completion.
     pub loop_duration_p50_ms: Option<f64>,
     pub loop_duration_p95_ms: Option<f64>,

@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use burn::tensor::{DType, Shape, TensorMetadata};
 use burn_cubecl::cubecl::{prelude::KernelId, server::KernelArguments, CubeCount};
 use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElement, IntElement};
@@ -71,7 +73,7 @@ pub(crate) fn prefix_sum_dispatch_count(len: usize) -> usize {
     }
 }
 
-/// Transient output + recursive block-sum buffers for an inclusive scan of `len`.
+/// Recursive block-sum scratch bytes for an inclusive scan of `len` (no output).
 pub(crate) fn prefix_sum_workspace_bytes(len: usize) -> usize {
     if len <= 1 {
         return 0;
@@ -80,7 +82,8 @@ pub(crate) fn prefix_sum_workspace_bytes(len: usize) -> usize {
     let mut remaining = len;
     while remaining > 1 {
         let blocks = remaining.div_ceil(WORKGROUP_SIZE as usize);
-        total = total.saturating_add(remaining.saturating_add(blocks.max(1)));
+        // Each recursive level keeps raw block totals and their inclusive prefix.
+        total = total.saturating_add(blocks.max(1).saturating_mul(2));
         if blocks <= 1 {
             break;
         }
@@ -93,7 +96,6 @@ pub(crate) fn hillis_steele_dispatch_count(len: usize) -> usize {
     if len <= 1 {
         return 0;
     }
-    // Copy plus one kernel per doubling offset.
     1 + usize::BITS.saturating_sub(len.saturating_sub(1).leading_zeros()) as usize
 }
 
@@ -107,6 +109,242 @@ fn empty_tensor(like: &CubeTensor<WgpuRuntime>, len: usize) -> CubeTensor<WgpuRu
             .empty(shape.num_elements() * core::mem::size_of::<u32>()),
         like.dtype(),
     )
+}
+
+/// Per-recursion-level scratch: raw block totals plus their inclusive prefix.
+pub(crate) struct PrefixSumLevel {
+    block_sums: CubeTensor<WgpuRuntime>,
+    block_prefix: CubeTensor<WgpuRuntime>,
+    blocks: usize,
+}
+
+/// Caller-owned hierarchical scan workspace reused across training steps.
+pub(crate) struct PrefixSumWorkspace {
+    capacity: usize,
+    levels: Vec<PrefixSumLevel>,
+    reserved_bytes: usize,
+    growth_count: usize,
+    step_fresh_allocations: usize,
+}
+
+impl Default for PrefixSumWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PrefixSumWorkspace {
+    pub(crate) fn new() -> Self {
+        Self {
+            capacity: 0,
+            levels: Vec::new(),
+            reserved_bytes: 0,
+            growth_count: 0,
+            step_fresh_allocations: 0,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes
+    }
+
+    pub(crate) fn growth_count(&self) -> usize {
+        self.growth_count
+    }
+
+    pub(crate) fn step_fresh_allocations(&self) -> usize {
+        self.step_fresh_allocations
+    }
+
+    /// Reset per-step fresh allocation counter (call at the start of a train step).
+    pub(crate) fn begin_step(&mut self) {
+        self.step_fresh_allocations = 0;
+    }
+
+    /// Inclusive scan into a caller-owned `output` using reserved level scratch.
+    pub(crate) fn inclusive_scan_into(
+        &mut self,
+        input: CubeTensor<WgpuRuntime>,
+        len: usize,
+        output: CubeTensor<WgpuRuntime>,
+    ) -> Result<CubeTensor<WgpuRuntime>, String> {
+        if len <= 1 {
+            return Ok(input);
+        }
+        if output.shape()[0] < len {
+            return Err(format!(
+                "prefix scan output len {} < requested {len}",
+                output.shape()[0]
+            ));
+        }
+        self.reserve(len, &input);
+        self.scan_into_level(input, len, output, 0)
+    }
+
+    /// Grow scratch levels so an inclusive scan of `capacity` elements can run.
+    pub(crate) fn reserve(&mut self, capacity: usize, like: &CubeTensor<WgpuRuntime>) {
+        let capacity = capacity.max(1);
+        let device_ok = self
+            .levels
+            .first()
+            .is_none_or(|level| level.block_sums.device == like.device);
+        if device_ok && self.capacity >= capacity {
+            return;
+        }
+
+        let mut levels = Vec::new();
+        let mut fresh = 0usize;
+        let mut remaining = capacity;
+        loop {
+            let blocks = remaining.div_ceil(WORKGROUP_SIZE as usize).max(1);
+            levels.push(PrefixSumLevel {
+                block_sums: empty_tensor(like, blocks),
+                block_prefix: empty_tensor(like, blocks),
+                blocks,
+            });
+            fresh = fresh.saturating_add(2);
+            if blocks <= 1 || remaining <= WORKGROUP_SIZE as usize {
+                break;
+            }
+            remaining = blocks;
+        }
+
+        self.capacity = capacity;
+        self.levels = levels;
+        self.reserved_bytes = prefix_sum_workspace_bytes(capacity);
+        self.growth_count = self.growth_count.saturating_add(1);
+        self.step_fresh_allocations = self.step_fresh_allocations.saturating_add(fresh);
+    }
+
+    fn scan_into_level(
+        &mut self,
+        input: CubeTensor<WgpuRuntime>,
+        len: usize,
+        output: CubeTensor<WgpuRuntime>,
+        level: usize,
+    ) -> Result<CubeTensor<WgpuRuntime>, String> {
+        if len <= 1 {
+            return Ok(input);
+        }
+        let blocks = len.div_ceil(WORKGROUP_SIZE as usize);
+        if level >= self.levels.len() {
+            return Err(format!(
+                "prefix scan workspace missing level {level} (have {})",
+                self.levels.len()
+            ));
+        }
+        if self.levels[level].blocks < blocks {
+            return Err(format!(
+                "prefix scan level {level} blocks {} < required {blocks}",
+                self.levels[level].blocks
+            ));
+        }
+
+        let client = input.client.clone();
+        let params = ScanParams {
+            len: len as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let params_handle = client.create_from_slice(bytemuck::bytes_of(&params));
+        let cube_dim = CubeDim::new_1d(WORKGROUP_SIZE);
+        let block_sums = self.levels[level].block_sums.clone();
+        client.launch(
+            Box::new(SourceKernel::new(ScanBlockKernel, cube_dim)),
+            CubeCount::Static(blocks as u32, 1, 1),
+            KernelArguments::new().with_buffers(vec![
+                input.handle.binding(),
+                output.handle.clone().binding(),
+                block_sums.handle.clone().binding(),
+                params_handle.binding(),
+            ]),
+        );
+
+        if blocks == 1 {
+            return Ok(output);
+        }
+
+        let block_prefix = self.levels[level].block_prefix.clone();
+        let scanned_sums =
+            self.scan_into_level(block_sums.clone(), blocks, block_prefix, level + 1)?;
+        client.launch(
+            Box::new(SourceKernel::new(ScanAddKernel, cube_dim)),
+            CubeCount::Static(blocks as u32, 1, 1),
+            KernelArguments::new().with_buffers(vec![
+                output.handle.clone().binding(),
+                scanned_sums.handle.binding(),
+                block_sums.handle.binding(),
+                client
+                    .create_from_slice(bytemuck::bytes_of(&params))
+                    .binding(),
+            ]),
+        );
+        Ok(output)
+    }
+}
+
+thread_local! {
+    static TRAINING_PREFIX_WS: Cell<*mut PrefixSumWorkspace> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// RAII bind of a trainer-owned workspace for the current async train step.
+pub(crate) struct TrainingPrefixWorkspaceGuard {
+    previous: *mut PrefixSumWorkspace,
+}
+
+impl Drop for TrainingPrefixWorkspaceGuard {
+    fn drop(&mut self) {
+        TRAINING_PREFIX_WS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Bind `workspace` until the returned guard is dropped (safe across `.await`).
+///
+/// # Safety
+/// `workspace` must remain exclusively usable as `&mut PrefixSumWorkspace` for the
+/// guard's lifetime (no overlapping Rust borrows of that field).
+pub(crate) unsafe fn bind_training_prefix_workspace_ptr(
+    workspace: *mut PrefixSumWorkspace,
+) -> TrainingPrefixWorkspaceGuard {
+    TRAINING_PREFIX_WS.with(|cell| {
+        let previous = cell.replace(workspace);
+        TrainingPrefixWorkspaceGuard { previous }
+    })
+}
+
+/// Bind `workspace` until the returned guard is dropped (safe across `.await`).
+pub(crate) fn bind_training_prefix_workspace(
+    workspace: &mut PrefixSumWorkspace,
+) -> TrainingPrefixWorkspaceGuard {
+    // Safety: exclusive `&mut` covers the guard lifetime in sync scopes.
+    unsafe { bind_training_prefix_workspace_ptr(workspace as *mut PrefixSumWorkspace) }
+}
+
+/// Sync helper for unit tests that do not cross `.await` while scanning.
+pub(crate) fn with_training_prefix_workspace<R>(
+    workspace: &mut PrefixSumWorkspace,
+    f: impl FnOnce() -> R,
+) -> R {
+    let _guard = bind_training_prefix_workspace(workspace);
+    f()
+}
+
+fn active_training_workspace<R>(f: impl FnOnce(&mut PrefixSumWorkspace) -> R) -> Option<R> {
+    TRAINING_PREFIX_WS.with(|cell| {
+        let ptr = cell.get();
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: pointer is set only while `TrainingPrefixWorkspaceGuard` / sync
+            // helper keeps the exclusive `&mut PrefixSumWorkspace` alive on this thread.
+            Some(f(unsafe { &mut *ptr }))
+        }
+    })
 }
 
 impl<F, I, BT> PrefixSumBackend for CubeBackend<WgpuRuntime, F, I, BT>
@@ -125,11 +363,26 @@ where
                 input.dtype()
             ));
         }
-        inclusive_scan(input)
+        let len = input.shape()[0];
+        if len <= 1 {
+            return Ok(input);
+        }
+
+        // Training path: reuse reserved level scratch; output stays independent so
+        // prior scan results remain live across later same-length scans.
+        if let Some(scanned) = active_training_workspace(|ws| {
+            let output = empty_tensor(&input, len);
+            ws.inclusive_scan_into(input.clone(), len, output)
+        }) {
+            return scanned;
+        }
+
+        inclusive_scan_fresh(input)
     }
 }
 
-fn inclusive_scan(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<WgpuRuntime>, String> {
+/// Public / eval path: every call allocates independent output + recursive scratch.
+fn inclusive_scan_fresh(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<WgpuRuntime>, String> {
     let len = input.shape()[0];
     if len <= 1 {
         return Ok(input);
@@ -137,9 +390,6 @@ fn inclusive_scan(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<WgpuRunti
 
     let client = input.client.clone();
     let blocks = len.div_ceil(WORKGROUP_SIZE as usize);
-    // Fresh output and block-sum buffers every call (R02):
-    // - returned outputs must outlive later same-length scans
-    // - recursive block scans must not overwrite a parent frame's totals
     let output = empty_tensor(&input, len);
     let block_sums = empty_tensor(&input, blocks.max(1));
     let params = ScanParams {
@@ -165,7 +415,7 @@ fn inclusive_scan(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<WgpuRunti
         return Ok(output);
     }
 
-    let scanned_sums = inclusive_scan(block_sums.clone())?;
+    let scanned_sums = inclusive_scan_fresh(block_sums.clone())?;
     client.launch(
         Box::new(SourceKernel::new(ScanAddKernel, cube_dim)),
         CubeCount::Static(blocks as u32, 1, 1),
@@ -183,7 +433,10 @@ fn inclusive_scan(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<WgpuRunti
 
 #[cfg(test)]
 mod tests {
-    use super::{hillis_steele_dispatch_count, prefix_sum_dispatch_count};
+    use super::{
+        hillis_steele_dispatch_count, prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
+        with_training_prefix_workspace, PrefixSumBackend, PrefixSumWorkspace,
+    };
 
     #[test]
     fn hierarchical_scan_uses_fewer_dispatches_than_hillis_steele() {
@@ -206,17 +459,14 @@ mod tests {
         use crate::training::engine::GsBackendBase;
         use burn::prelude::*;
         use burn::tensor::{Int, TensorData};
-        use super::PrefixSumBackend;
 
         let device = <GsBackendBase as Backend>::Device::default();
-        let first_values = vec![1_i32, 2, 3];
-        let second_values = vec![10_i32, 20, 30];
         let first_input = Tensor::<GsBackendBase, 1, Int>::from_data(
-            TensorData::new(first_values.clone(), [3]),
+            TensorData::new(vec![1_i32, 2, 3], [3]),
             &device,
         );
         let second_input = Tensor::<GsBackendBase, 1, Int>::from_data(
-            TensorData::new(second_values.clone(), [3]),
+            TensorData::new(vec![10_i32, 20, 30], [3]),
             &device,
         );
 
@@ -226,8 +476,6 @@ mod tests {
             GsBackendBase::prefix_sum_u32_primitive(second_input.into_primitive())
                 .expect("second scan");
 
-        // Read the first result AFTER the second scan has been submitted. The
-        // historical bug overwrote the shared scratch so [1,3,6] became [10,30,60].
         let first_actual = Tensor::<GsBackendBase, 1, Int>::from_primitive(first_scanned)
             .into_data_async()
             .await
@@ -250,7 +498,6 @@ mod tests {
         use crate::training::engine::GsBackendBase;
         use burn::prelude::*;
         use burn::tensor::{Int, TensorData};
-        use super::PrefixSumBackend;
 
         fn cpu_scan(values: &[i32]) -> Vec<i32> {
             let mut acc = 0u32;
@@ -268,8 +515,8 @@ mod tests {
                 TensorData::new(values.to_vec(), [values.len()]),
                 device,
             );
-            let scanned = GsBackendBase::prefix_sum_u32_primitive(input.into_primitive())
-                .expect("scan");
+            let scanned =
+                GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("scan");
             Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
                 .into_data_async()
                 .await
@@ -297,7 +544,6 @@ mod tests {
             );
             GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("long scan")
         };
-        // Different length, then same length again while prior results are live.
         let _ = scan_vec(&device, &[9, 8, 7, 6]).await;
         let third = scan_vec(&device, &short_again).await;
 
@@ -324,7 +570,6 @@ mod tests {
         use crate::training::engine::GsBackendBase;
         use burn::prelude::*;
         use burn::tensor::{Int, TensorData};
-        use super::PrefixSumBackend;
 
         fn cpu_scan(values: &[i32]) -> Vec<i32> {
             let mut acc = 0u32;
@@ -372,8 +617,8 @@ mod tests {
                 TensorData::new(values, [expected.len()]),
                 &device,
             );
-            let scanned = GsBackendBase::prefix_sum_u32_primitive(input.into_primitive())
-                .expect("scan");
+            let scanned =
+                GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("scan");
             let actual = Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
                 .into_data_async()
                 .await
@@ -382,5 +627,97 @@ mod tests {
                 .expect("scan data");
             assert_eq!(actual, expected);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_capacity_reuses_without_growth_then_grows() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut ws = PrefixSumWorkspace::new();
+        assert_eq!(ws.growth_count(), 0);
+
+        let scan = |ws: &mut PrefixSumWorkspace, values: Vec<i32>| {
+            let len = values.len();
+            let input =
+                Tensor::<GsBackendBase, 1, Int>::from_data(TensorData::new(values, [len]), &device);
+            with_training_prefix_workspace(ws, || {
+                GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("scan")
+            })
+        };
+
+        ws.begin_step();
+        let _ = scan(&mut ws, vec![1, 2, 3, 4]);
+        assert_eq!(ws.growth_count(), 1);
+        assert!(ws.capacity() >= 4);
+        let reserved_after_first = ws.reserved_bytes();
+        assert_eq!(reserved_after_first, prefix_sum_workspace_bytes(4));
+        let fresh_first = ws.step_fresh_allocations();
+        assert!(fresh_first >= 2);
+
+        ws.begin_step();
+        let _ = scan(&mut ws, vec![5, 6, 7, 8]);
+        assert_eq!(ws.growth_count(), 1, "same capacity must not grow");
+        assert_eq!(ws.reserved_bytes(), reserved_after_first);
+        assert_eq!(ws.step_fresh_allocations(), 0, "reuse must not fresh-allocate");
+
+        ws.begin_step();
+        let long: Vec<i32> = (0..300).map(|i| (i % 3) as i32 + 1).collect();
+        let held = scan(&mut ws, long);
+        assert_eq!(ws.growth_count(), 2, "larger capacity must grow once");
+        assert!(ws.reserved_bytes() > reserved_after_first);
+        assert!(ws.step_fresh_allocations() >= 2);
+
+        ws.begin_step();
+        let _ = scan(&mut ws, vec![1, 1, 1]);
+        let held_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(held)
+            .into_data_async()
+            .await
+            .expect("held readback")
+            .into_vec::<i32>()
+            .expect("held data");
+        assert_eq!(held_vals.len(), 300);
+        assert_eq!(held_vals[0], 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_scan_matches_fresh_path() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let values: Vec<i32> = (0..257).map(|i| (i % 7) as i32 + 1).collect();
+        let input_fresh = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(values.clone(), [values.len()]),
+            &device,
+        );
+        let input_ws = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(values.clone(), [values.len()]),
+            &device,
+        );
+
+        let fresh = GsBackendBase::prefix_sum_u32_primitive(input_fresh.into_primitive())
+            .expect("fresh");
+        let mut ws = PrefixSumWorkspace::new();
+        let reused = with_training_prefix_workspace(&mut ws, || {
+            GsBackendBase::prefix_sum_u32_primitive(input_ws.into_primitive()).expect("ws")
+        });
+
+        let fresh_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(fresh)
+            .into_data_async()
+            .await
+            .expect("fresh read")
+            .into_vec::<i32>()
+            .expect("fresh data");
+        let ws_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(reused)
+            .into_data_async()
+            .await
+            .expect("ws read")
+            .into_vec::<i32>()
+            .expect("ws data");
+        assert_eq!(fresh_vals, ws_vals);
     }
 }
