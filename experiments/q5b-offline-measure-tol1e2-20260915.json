@@ -1,0 +1,85 @@
+{
+  "B_gpu_vs_f64_same_basis_on_matched_RF_trials": {
+    "any_subtype": {
+      "n": 11633,
+      "nonfinite": 0,
+      "p50": 0.000021416479674854507,
+      "p90": 0.0006117094105368289,
+      "p99": 0.013163086304207148
+    },
+    "good_B_subset": {
+      "n": 5146,
+      "nonfinite": 0,
+      "p50": 3.2245706538765022e-6,
+      "p90": 0.000011199206430763853,
+      "p99": 0.000014553915339615344
+    },
+    "with_InvalidEssential": {
+      "n": 8607,
+      "nonfinite": 0,
+      "p50": 0.000020937231711205425,
+      "p90": 0.0006070271141254279,
+      "p99": 0.012813567256725916
+    },
+    "with_NullVectorFailure": {
+      "n": 6016,
+      "nonfinite": 0,
+      "p50": 0.000041506243368199113,
+      "p90": 0.001110027455256744,
+      "p99": 0.023969839060206458
+    }
+  },
+  "absolute_gpu_slots": {
+    "InvalidEssential": 11907,
+    "NullVectorFailure": 9530
+  },
+  "decision": {
+    "rationale": "good-B matched RecoveryFailed residue is 7065 (≥500); proceed to single-variable 3×3 recovery (do not loosen gates)",
+    "stop_recovery_hack": false,
+    "threshold_good_B_matched_RF": 500
+  },
+  "inputs": {
+    "bits": "experiments/q4-verified-tol1e2-20260915.bits.json",
+    "good_b_threshold": 0.000014936871013940632,
+    "good_b_threshold_note": "default = no-loss B p90 from Q5 premeasure tol1e-3",
+    "match_tol": 0.01,
+    "n_trials": 65024,
+    "stages": "experiments/q4-verified-tol1e2-20260915.stages.bin",
+    "trials": "experiments/q4-verified-tol1e2-20260915.trials.json"
+  },
+  "kind": "offline-only",
+  "matched_RecoveryFailed": {
+    "InvalidEssential": 11416,
+    "NullVectorFailure": 8703,
+    "bad_B_InvalidEssential": 6875,
+    "bad_B_NullVectorFailure": 6179,
+    "bad_B_total": 13054,
+    "cross_tab_subtype_x_B": {
+      "InvalidEssential×bad_B": 6875,
+      "InvalidEssential×good_B": 4541,
+      "NullVectorFailure×bad_B": 6179,
+      "NullVectorFailure×good_B": 2524
+    },
+    "good_B_InvalidEssential": 4541,
+    "good_B_NullVectorFailure": 2524,
+    "good_B_total": 7065,
+    "nonfinite_B_InvalidEssential": 0,
+    "nonfinite_B_NullVectorFailure": 0,
+    "total": 20119
+  },
+  "root_classes_of_f64_real_roots": {
+    "ComplexMisclassified": 19,
+    "Covered": 248219,
+    "Duplicate": 614,
+    "GateRealAxis": 12,
+    "MissingNoSlot": 3737,
+    "NotDone": 12651,
+    "RecoveryFailed": 20119
+  },
+  "round": "Q5b-offline-measure",
+  "trials_with_any_matched_RecoveryFailed": {
+    "bad_B": 6487,
+    "good_B": 5146,
+    "nonfinite_B": 0
+  }
+}

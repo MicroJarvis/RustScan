@@ -29,92 +29,139 @@ fn estimate_five_point_essential_minimal(
     essential_models_from_basis(&basis)
 }
 
-fn essential_models_from_basis(basis: &EssentialBasis) -> Vec<Matrix3<f64>> {
-    let basis_data = basis_as_colmap_data(basis);
-    let a_data = five_point_generated::build_elimination_matrix(&basis_data);
-    let left = colmajor_10x20_block_row_major(&a_data, 0);
-    let right = colmajor_10x20_block_row_major(&a_data, 10);
-    let aa = if let Some(aa) = colmap_eigen::partial_piv_lu_solve_10x10_row_major(&left, &right) {
-        aa
-    } else {
-        let left_m = DMatrix::<f64>::from_row_slice(10, 10, &left);
-        let right_m = DMatrix::<f64>::from_row_slice(10, 10, &right);
-        let Some(solved) = left_m.lu().solve(&right_m) else {
-            return Vec::new();
+/// Offline f64 reference decomposition of the post-nullspace pipeline stages.
+///
+/// `coefficients` is `None` when the 10x10 elimination solve fails (the
+/// production path then returns no models). Diagnostic use only: this exposes
+/// the same arithmetic as `estimate_five_point_essential` so harnesses can
+/// feed a GPU-derived basis and compare polynomial coefficients, roots, and
+/// models stage by stage. It is not a runtime fallback.
+pub struct FivePointBasisReference {
+    pub coefficients: Option<[f64; 11]>,
+    pub roots: Vec<polynomial::Complex64>,
+    /// `(real root z, essential matrix)` pairs, in root order; roots whose
+    /// recovery fails (small `x[2]`, tiny norm, nonfinite) produce no entry.
+    pub models: Vec<(f64, Matrix3<f64>)>,
+}
+
+/// Run the f64 elimination → determinant polynomial → roots → recovery chain
+/// on the supplied basis, exactly as `estimate_five_point_essential` does
+/// after its own nullspace step.
+pub fn essential_reference_from_basis(basis: &EssentialBasis) -> FivePointBasisReference {
+    let Some(aa) = solve_elimination_row_major(basis) else {
+        return FivePointBasisReference {
+            coefficients: None,
+            roots: Vec::new(),
+            models: Vec::new(),
         };
-        let mut aa = [0.0f64; 100];
-        for row in 0..10 {
-            for col in 0..10 {
-                aa[row * 10 + col] = solved[(row, col)];
-            }
-        }
-        aa
     };
 
     let b_data = build_determinant_matrix_data_from_row_major(&aa);
     let coeffs = five_point_generated::determinant_coeffs(&b_data);
     let roots = polynomial::complex_roots_companion_matrix(&coeffs);
+    let models = roots
+        .iter()
+        .filter_map(|root| recover_model_for_root(basis, &b_data, root).map(|e| (root.re, e)))
+        .collect();
 
-    let mut models = Vec::with_capacity(10);
-    for root in roots {
-        if root.im.abs() > 1.0e-10 {
-            continue;
-        }
-        let z1 = root.re;
-        let z2 = z1 * z1;
-        let z3 = z2 * z1;
-        let z4 = z3 * z1;
-        let mut bz = Matrix3::<f64>::zeros();
-        for j in 0..3 {
-            bz[(j, 0)] = b_at(&b_data, 0, j) * z3
-                + b_at(&b_data, 1, j) * z2
-                + b_at(&b_data, 2, j) * z1
-                + b_at(&b_data, 3, j);
-            bz[(j, 1)] = b_at(&b_data, 4, j) * z3
-                + b_at(&b_data, 5, j) * z2
-                + b_at(&b_data, 6, j) * z1
-                + b_at(&b_data, 7, j);
-            bz[(j, 2)] = b_at(&b_data, 8, j) * z4
-                + b_at(&b_data, 9, j) * z3
-                + b_at(&b_data, 10, j) * z2
-                + b_at(&b_data, 11, j) * z1
-                + b_at(&b_data, 12, j);
-        }
-        let bz_row_major = [
-            bz[(0, 0)],
-            bz[(0, 1)],
-            bz[(0, 2)],
-            bz[(1, 0)],
-            bz[(1, 1)],
-            bz[(1, 2)],
-            bz[(2, 0)],
-            bz[(2, 1)],
-            bz[(2, 2)],
-        ];
-        let x = if let Some(x) = colmap_eigen::jacobi_svd_right_null_vector_3(&bz_row_major) {
-            Vector3::new(x[0], x[1], x[2])
-        } else {
-            let svd = bz.svd(false, true);
-            let Some(vt) = svd.v_t else { continue };
-            vt.row(2).transpose()
-        };
-        if x[2].abs() < 1.0e-10 {
-            continue;
-        }
-        let e_vec = basis.column(0) * (x[0] / x[2])
-            + basis.column(1) * (x[1] / x[2])
-            + basis.column(2) * z1
-            + basis.column(3);
-        let norm = e_vec.norm();
-        if !norm.is_finite() || norm <= 1.0e-12 {
-            continue;
-        }
-        let e = vec9_to_matrix(e_vec / norm);
-        if e.iter().all(|v| v.is_finite()) {
-            models.push(e);
+    FivePointBasisReference {
+        coefficients: Some(coeffs),
+        roots,
+        models,
+    }
+}
+
+fn essential_models_from_basis(basis: &EssentialBasis) -> Vec<Matrix3<f64>> {
+    let Some(aa) = solve_elimination_row_major(basis) else {
+        return Vec::new();
+    };
+    let b_data = build_determinant_matrix_data_from_row_major(&aa);
+    let coeffs = five_point_generated::determinant_coeffs(&b_data);
+    polynomial::complex_roots_companion_matrix(&coeffs)
+        .iter()
+        .filter_map(|root| recover_model_for_root(basis, &b_data, root))
+        .collect()
+}
+
+fn solve_elimination_row_major(basis: &EssentialBasis) -> Option<[f64; 100]> {
+    let basis_data = basis_as_colmap_data(basis);
+    let a_data = five_point_generated::build_elimination_matrix(&basis_data);
+    let left = colmajor_10x20_block_row_major(&a_data, 0);
+    let right = colmajor_10x20_block_row_major(&a_data, 10);
+    if let Some(aa) = colmap_eigen::partial_piv_lu_solve_10x10_row_major(&left, &right) {
+        return Some(aa);
+    }
+
+    let left_m = DMatrix::<f64>::from_row_slice(10, 10, &left);
+    let right_m = DMatrix::<f64>::from_row_slice(10, 10, &right);
+    let solved = left_m.lu().solve(&right_m)?;
+    let mut aa = [0.0f64; 100];
+    for row in 0..10 {
+        for col in 0..10 {
+            aa[row * 10 + col] = solved[(row, col)];
         }
     }
-    models
+    Some(aa)
+}
+
+fn recover_model_for_root(
+    basis: &EssentialBasis,
+    b_data: &[f64; 39],
+    root: &polynomial::Complex64,
+) -> Option<Matrix3<f64>> {
+    if root.im.abs() > 1.0e-10 {
+        return None;
+    }
+    let z1 = root.re;
+    let z2 = z1 * z1;
+    let z3 = z2 * z1;
+    let z4 = z3 * z1;
+    let mut bz = Matrix3::<f64>::zeros();
+    for j in 0..3 {
+        bz[(j, 0)] = b_at(b_data, 0, j) * z3
+            + b_at(b_data, 1, j) * z2
+            + b_at(b_data, 2, j) * z1
+            + b_at(b_data, 3, j);
+        bz[(j, 1)] = b_at(b_data, 4, j) * z3
+            + b_at(b_data, 5, j) * z2
+            + b_at(b_data, 6, j) * z1
+            + b_at(b_data, 7, j);
+        bz[(j, 2)] = b_at(b_data, 8, j) * z4
+            + b_at(b_data, 9, j) * z3
+            + b_at(b_data, 10, j) * z2
+            + b_at(b_data, 11, j) * z1
+            + b_at(b_data, 12, j);
+    }
+    let bz_row_major = [
+        bz[(0, 0)],
+        bz[(0, 1)],
+        bz[(0, 2)],
+        bz[(1, 0)],
+        bz[(1, 1)],
+        bz[(1, 2)],
+        bz[(2, 0)],
+        bz[(2, 1)],
+        bz[(2, 2)],
+    ];
+    let x = if let Some(x) = colmap_eigen::jacobi_svd_right_null_vector_3(&bz_row_major) {
+        Vector3::new(x[0], x[1], x[2])
+    } else {
+        let svd = bz.svd(false, true);
+        svd.v_t?.row(2).transpose()
+    };
+    if x[2].abs() < 1.0e-10 {
+        return None;
+    }
+    let e_vec = basis.column(0) * (x[0] / x[2])
+        + basis.column(1) * (x[1] / x[2])
+        + basis.column(2) * z1
+        + basis.column(3);
+    let norm = e_vec.norm();
+    if !norm.is_finite() || norm <= 1.0e-12 {
+        return None;
+    }
+    let e = vec9_to_matrix(e_vec / norm);
+    e.iter().all(|v| v.is_finite()).then_some(e)
 }
 
 pub fn five_point_nullspace(

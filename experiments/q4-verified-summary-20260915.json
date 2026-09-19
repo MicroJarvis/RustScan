@@ -1,0 +1,122 @@
+{
+  "comparisons": {
+    "0.001": {
+      "fixed_loss_p90_improvement_factor": 84.40899176053782,
+      "upstream_records_changed": 0
+    },
+    "0.01": {
+      "fixed_loss_p90_improvement_factor": 103.023319989909,
+      "upstream_records_changed": 0
+    }
+  },
+  "quality_buckets": {
+    "baseline": {
+      "zero": 2942,
+      "(0,.25)": 12758,
+      "[.25,.5)": 18024,
+      "[.5,.75)": 14895,
+      "[.75,1)": 16081,
+      ">=1": 324
+    },
+    "candidate": {
+      "zero": 2172,
+      "(0,.25)": 12767,
+      "[.25,.5)": 18117,
+      "[.5,.75)": 15009,
+      "[.75,1)": 16633,
+      ">=1": 326
+    }
+  },
+  "trial_quality_changes": {
+    "better": 5701,
+    "worse": 4200,
+    "equal": 55123
+  },
+  "pair_quality_changes": {
+    "better": 4,
+    "worse": 5,
+    "equal": 118
+  },
+  "timing": {
+    "512": {
+      "baseline_seconds": [
+        1.485368458,
+        1.480030208,
+        1.4792095,
+        1.639958042,
+        1.638608584,
+        1.647826958
+      ],
+      "candidate_seconds": [
+        1.528275833,
+        1.491640791,
+        1.482809666,
+        1.569498792,
+        1.563693542,
+        1.564773791
+      ],
+      "baseline_median": 1.561988521,
+      "candidate_median": 1.5459846874999998,
+      "candidate_over_baseline": 0.989754192630203
+    },
+    "65024": {
+      "baseline_seconds": [
+        0.07976225,
+        0.07735925,
+        0.079961541,
+        0.086877708,
+        0.084517083,
+        0.085395792
+      ],
+      "candidate_seconds": [
+        0.080842042,
+        0.078790667,
+        0.080022125,
+        0.090372958,
+        0.090493958,
+        0.081321458
+      ],
+      "baseline_median": 0.08223931200000001,
+      "candidate_median": 0.08108175000000001,
+      "candidate_over_baseline": 0.9859244688233773
+    }
+  },
+  "signatures": {
+    "baseline": {
+      "all_verified": true,
+      "cpu_f64": "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a",
+      "diagnostic": "3d04bb3edaef183049e07d6c3841e296f963da3b279bcbd99d878e1dc090c050",
+      "model": "472124c8f1a9c6299d659e2f835dc11c682ff8a593757f0b145f73454f51d6ea"
+    },
+    "candidate": {
+      "all_verified": true,
+      "cpu_f64": "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a",
+      "diagnostic": "d9e911ac6b6e2be18f7e3b8b8615417efba6257f955ce2bbf21f943a1c7f358a",
+      "model": "26e825cf97002be4f7fc36b77ce4fed682445af37746504253444e0103c5e716"
+    }
+  },
+  "artifact_sha256": {
+    "experiments/q4-baseline-20260915/tol1e3.json": "415552a35b1622e154062aabd78063ece061d1ead52add8b4f047d86dd3e6d42",
+    "experiments/q4-baseline-20260915/tol1e3.bits.json": "6711e4c5362f0cd433c10a58f7ab87659c046ccfe9d11f00c713976383a2563e",
+    "experiments/q4-baseline-20260915/tol1e3.trials.json": "9d96be6b93de8223b7dd6a580e014f1964dda791dc787e0e8fb4b59134acf187",
+    "experiments/q4-baseline-20260915/tol1e3.stages.bin": "e9bf0356291593118afea2dde9aceec714adba2c8d072ebb485d4e849c6fbedf",
+    "experiments/q4-baseline-20260915/tol1e2.json": "ca8823707408ff3f2c3c15827ff302d956c186e3bdf115e6851b03576d7d0131",
+    "experiments/q4-baseline-20260915/tol1e2.bits.json": "6711e4c5362f0cd433c10a58f7ab87659c046ccfe9d11f00c713976383a2563e",
+    "experiments/q4-baseline-20260915/tol1e2.trials.json": "64331a75fd746ccdb59b890c6f225392ffcf597e20f94ed519e04554b36a461b",
+    "experiments/q4-baseline-20260915/tol1e2.stages.bin": "e9bf0356291593118afea2dde9aceec714adba2c8d072ebb485d4e849c6fbedf",
+    "experiments/q4-verified-tol1e3-20260915.json": "34ee52c7ffb2a88d4944aa89588f77e3b54f8781a6c47171bad79165801118ab",
+    "experiments/q4-verified-tol1e3-20260915.bits.json": "2186468fb525f8a3647b961d176b0709985be9c137c86a34f35579fe0bfd2189",
+    "experiments/q4-verified-tol1e3-20260915.trials.json": "7ec26609ff43bb745dfef55aa3c742e0b9a678661ee0595dede3825eb7ea4389",
+    "experiments/q4-verified-tol1e3-20260915.stages.bin": "5ddbea5bf61032020fd06810dfd8598e5de4347a71153e01e36c393193af9718",
+    "experiments/q4-verified-tol1e2-20260915.json": "fefeff3d3a5f7bd2b5ec3447601b13c3ac8abc6007d21ae805f4a081cd58ba6a",
+    "experiments/q4-verified-tol1e2-20260915.bits.json": "2186468fb525f8a3647b961d176b0709985be9c137c86a34f35579fe0bfd2189",
+    "experiments/q4-verified-tol1e2-20260915.trials.json": "cac26a747ad661ee803be02505604af781645a499dc86f7eaeb0b9cc7569a377",
+    "experiments/q4-verified-tol1e2-20260915.stages.bin": "5ddbea5bf61032020fd06810dfd8598e5de4347a71153e01e36c393193af9718"
+  },
+  "limits": [
+    "Timings are historical baseline vs candidate, not interleaved.",
+    "Full diagnostic replay includes host/readback, not kernel-only.",
+    "Quality is fixed-input Sampson scoring, not end-to-end RANSAC.",
+    "No universal per-pair dominance or cross-device portability claim."
+  ]
+}

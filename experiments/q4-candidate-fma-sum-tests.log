@@ -1,0 +1,257 @@
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/sources/ceres-solver-sys/src/lib.rs.cc:1:
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/crate/ceres-solver-sys/src/lib.h:8:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/ceres.h:40:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/autodiff_manifold.h:37:
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:278:35: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   278 |   bool PlusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                   ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:284:50: warning: unused parameter 'x' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   284 |   bool RightMultiplyByPlusJacobian(const double* x,
+warning: ceres-solver-sys@0.5.3:       |                                                  ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:302:36: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   302 |   bool MinusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                    ^
+warning: ceres-solver-sys@0.5.3: 3 warnings generated.
+warning: ceres-solver-sys@0.5.3: In file included from src/lib.cpp:5:
+warning: ceres-solver-sys@0.5.3: In file included from /Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/target/release/build/ceres-solver-sys-26f94b939a741288/out/cxxbridge/crate/ceres-solver-sys/src/lib.h:8:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/ceres.h:40:
+warning: ceres-solver-sys@0.5.3: In file included from /opt/homebrew/include/ceres/autodiff_manifold.h:37:
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:278:35: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   278 |   bool PlusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                   ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:284:50: warning: unused parameter 'x' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   284 |   bool RightMultiplyByPlusJacobian(const double* x,
+warning: ceres-solver-sys@0.5.3:       |                                                  ^
+warning: ceres-solver-sys@0.5.3: /opt/homebrew/include/ceres/manifold.h:302:36: warning: unused parameter 'x_ptr' [-Wunused-parameter]
+warning: ceres-solver-sys@0.5.3:   302 |   bool MinusJacobian(const double* x_ptr, double* jacobian_ptr) const override {
+warning: ceres-solver-sys@0.5.3:       |                                    ^
+warning: ceres-solver-sys@0.5.3: 3 warnings generated.
+   Compiling rustsfm v0.1.0 (/Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32/RustSFM)
+warning: type `five_point_f32::Kernel` is more private than the item `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed`
+   --> RustSFM/src/gpu/five_point_f32_complete.rs:506:5
+    |
+506 | /     pub(crate) fn complete_pass_timed(
+507 | |         &self,
+508 | |         encoder: &mut wgpu::CommandEncoder,
+509 | |         kernel: &Kernel,
+...   |
+514 | |         timestamp: Option<(&wgpu::QuerySet, u32)>,
+515 | |     ) {
+    | |_____^ method `five_point_f32::complete::<impl five_point_f32::WgpuFivePointF32>::complete_pass_timed` is reachable at visibility `pub(crate)`
+    |
+note: but type `five_point_f32::Kernel` is only usable at visibility `pub(self)`
+   --> RustSFM/src/gpu/five_point_f32.rs:85:1
+    |
+ 85 | struct Kernel {
+    | ^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: function `real_gpu_stage_drains_caller_owned_context_on_error` is never used
+   --> RustSFM/src/execution_tests.rs:404:4
+    |
+404 | fn real_gpu_stage_drains_caller_owned_context_on_error() -> Result<()> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `sequence` is never used
+   --> RustSFM/src/task.rs:280:19
+    |
+163 | impl<'a> SfmTaskContext<'a> {
+    | --------------------------- method in this implementation
+...
+280 |     pub(crate) fn sequence(
+    |                   ^^^^^^^^
+
+warning: function `load_grayscale_image_for_frame` is never used
+    --> RustSFM/src/feature/feature_matching_db.rs:2265:8
+     |
+2265 | pub fn load_grayscale_image_for_frame(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu` is never used
+   --> RustSFM/src/geometry/two_view.rs:340:15
+    |
+340 | pub(crate) fn estimate_calibrated_two_view_with_observations_rays_and_cameras_gpu(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `sample` is never read
+    --> RustSFM/src/geometry/two_view.rs:2239:5
+     |
+2235 | struct GpuRansacCandidate<'a> {
+     |        ------------------ field in this struct
+...
+2239 |     sample: &'a [usize],
+     |     ^^^^^^
+     |
+     = note: `GpuRansacCandidate` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `compare_pose_scores` is never used
+    --> RustSFM/src/geometry/two_view.rs:5118:4
+     |
+5118 | fn compare_pose_scores(a: &PoseCandidateScore, b: &PoseCandidateScore) -> std::cmp::Orderi...
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: `rustsfm` (lib test) generated 7 warnings
+    Finished `release` profile [optimized] target(s) in 20.60s
+     Running unittests src/lib.rs (target/release/deps/rustsfm-30463529e7ab3978)
+
+running 11 tests
+test five_point::tests::five_point_root_filter_uses_colmap_imaginary_threshold ... ok
+test five_point::tests::five_point_nullspace_contains_true_essential ... ok
+test five_point::tests::five_point_overdetermined_nullspace_contains_true_essential ... ok
+test gpu::five_point_f32::tests::decode_builds_fixed_slots_without_losing_state_or_order ... ok
+test five_point::tests::five_point_recovers_synthetic_essential ... ok
+test two_view::tests::five_point_batch_runner_preserves_sampler_frontier_and_fnmut_path ... ok
+test two_view::tests::five_point_trial_groups_preserve_bits_ordinals_and_exhaustion ... ok
+compiling five-point pipeline main
+compiled five-point pipeline main in 319.042µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 339.125µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.429292ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 416.375µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 43.812833ms
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 438.125µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 83.583µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 320.417µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 304.875µs
+test gpu::five_point_f32::tests::five_point_session_reuses_buffers_without_stale_state ... ok
+compiling five-point pipeline main
+compiled five-point pipeline main in 189.208µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 314.083µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.25925ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 403µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 286.459µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 273.459µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 51.917µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 277.542µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 285.292µs
+compiling five-point pipeline probe
+compiled five-point pipeline probe in 50.542µs
+Q4 arithmetic probe actual=[1.0, -1.4210855e-14, 100000000.0, 1.0] expected=[1.0, -1.4210855e-14, 100000000.0, 1.0]
+Q4 actual device: GpuSiftCapabilities { backend: Wgpu, device_name: "Apple M5 Max" }
+test gpu::five_point_f32::tests::q4::five_point_q4_arithmetic_probe ... ok
+compiling five-point pipeline main
+compiled five-point pipeline main in 198.5µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 311.917µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.282334ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 432.667µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 294.334µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 275.875µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 49.541µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 300.75µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 290µs
+compiling five-point pipeline q4_load
+compiled five-point pipeline q4_load in 402.291µs
+Q4 trial 181 baseline=6.369077422382238e-2 candidate=3.132646012617449e-8
+Q4 trial 296 baseline=3.765730987303341e-2 candidate=3.077965246867539e-8
+Q4 trial 540 baseline=1.4540116825261908e-2 candidate=1.36086619588586e-8
+Q4 trial 561 baseline=1.1198130263479326e-2 candidate=2.591881914178675e-8
+Q4 trial 731 baseline=2.6521666873445697e-2 candidate=1.7660942073224668e-8
+Q4 trial 807 baseline=1.419662055549509e-2 candidate=3.9817040672509694e-8
+Q4 trial 1007 baseline=3.0189733372913544e-2 candidate=8.20568292536653e-9
+Q4 trial 1350 baseline=6.644897394912129e-2 candidate=3.1845850058056946e-8
+Q4 trial 1576 baseline=7.574261456415542e-2 candidate=2.843034605791279e-8
+Q4 trial 1585 baseline=9.81067490847984e-2 candidate=1.7173410804797677e-8
+Q4 trial 1605 baseline=2.7879316734664927e-2 candidate=1.7776649866615523e-8
+Q4 trial 1618 baseline=5.186747077884064e-2 candidate=3.449167560796135e-8
+five-point GPU: GpuSiftCapabilities { backend: Wgpu, device_name: "Apple M5 Max" }
+test gpu::five_point_f32::tests::q4::five_point_q4_same_b_compensation_survives_gpu_compiler ... ok
+compiling five-point pipeline main
+compiled five-point pipeline main in 166.167µs
+compiling five-point pipeline nullspace
+compiled five-point pipeline nullspace in 312.167µs
+compiling five-point pipeline elimination
+compiled five-point pipeline elimination in 6.301292ms
+compiling five-point pipeline algebra
+compiled five-point pipeline algebra in 434.25µs
+compiling five-point pipeline polynomial
+compiled five-point pipeline polynomial in 302.5µs
+compiling five-point pipeline validate_polynomial
+compiled five-point pipeline validate_polynomial in 278.458µs
+compiling five-point pipeline pack
+compiled five-point pipeline pack in 51µs
+compiling five-point pipeline roots
+compiled five-point pipeline roots in 296.542µs
+compiling five-point pipeline recover
+compiled five-point pipeline recover in 290.584µs
+sample 0: [A, solve, B, coeff] relative errors=[5.167559762068577e-8, 8.58305747319907e-6, 8.528237066888417e-6, 1.189903892047064e-5], pivot=0.0012304633
+sample 0: isolated polynomial relative error=0.00000002939345327068811
+sample 1: [A, solve, B, coeff] relative errors=[5.8717855084441e-8, 6.685481209330323e-7, 6.875511273315723e-7, 2.1945452659180292e-6], pivot=0.098586574
+sample 1: isolated polynomial relative error=0.00000001134942147842611
+sample 2: [A, solve, B, coeff] relative errors=[1.0081871978186468e-7, 2.2230220757856263e-6, 2.1450819827071417e-6, 1.4632514528345747e-6], pivot=0.024917394
+sample 2: isolated polynomial relative error=0.00000004913070823245337
+sample 3: [A, solve, B, coeff] relative errors=[8.496772101783082e-8, 8.69580342391818e-7, 4.4765707952958503e-7, 2.2809501640674386e-6], pivot=0.03372335
+sample 3: isolated polynomial relative error=0.000000042347808013433474
+sample 4: [A, solve, B, coeff] relative errors=[6.75541273334331e-8, 4.1352804113291716e-7, 4.5924785419847304e-7, 5.781206083309492e-7], pivot=0.045355227
+sample 4: isolated polynomial relative error=0.00000004402064378095567
+sample 5: [A, solve, B, coeff] relative errors=[7.842025488734166e-8, 1.5234230338936752e-5, 1.9333032885876083e-5, 5.853801141881351e-5], pivot=0.011425749
+sample 5: isolated polynomial relative error=0.000000022888630106191788
+sample 6: [A, solve, B, coeff] relative errors=[8.929428106608456e-8, 4.4328947753325317e-5, 4.466428388448881e-5, 7.043909958495008e-5], pivot=0.0051583718
+sample 6: isolated polynomial relative error=0.00000002833352174967893
+sample 7: [A, solve, B, coeff] relative errors=[1.3146031754869566e-7, 7.45458959831987e-7, 8.908935818369984e-7, 9.196354753231599e-7], pivot=0.0437399
+sample 7: isolated polynomial relative error=0.000000027667476046166388
+sample 8: [A, solve, B, coeff] relative errors=[1.0472955827606922e-7, 1.0892413359053554e-6, 3.9720732627553043e-7, 7.119677916264412e-7], pivot=0.24122888
+sample 8: isolated polynomial relative error=0.00000003447881604154958
+sample 9: [A, solve, B, coeff] relative errors=[7.0660430426004e-8, 4.325818777208335e-6, 4.304240690305295e-6, 3.136222401402977e-6], pivot=0.07125594
+sample 9: isolated polynomial relative error=0.000000023767695721360853
+sample 10: [A, solve, B, coeff] relative errors=[9.236823756489958e-8, 6.521344988292626e-7, 7.837366368892887e-7, 8.667622999650231e-7], pivot=0.29039696
+sample 10: isolated polynomial relative error=0.000000018840228359280256
+sample 11: [A, solve, B, coeff] relative errors=[9.261621071696108e-8, 2.0392922059557616e-6, 1.9105824095472557e-6, 2.9681839050369118e-6], pivot=0.038621392
+sample 11: isolated polynomial relative error=0.00000002641808851630042
+sample 12: [A, solve, B, coeff] relative errors=[7.139950820132146e-8, 3.111014562307205e-7, 3.5666758460446336e-7, 5.81668988535236e-7], pivot=0.22787793
+sample 12: isolated polynomial relative error=0.000000034960095758514944
+sample 13: [A, solve, B, coeff] relative errors=[9.612455420878587e-8, 2.8767293800508438e-6, 2.121104668242637e-6, 2.654698935235235e-6], pivot=0.032385107
+sample 13: isolated polynomial relative error=0.00000003866656045781754
+sample 14: [A, solve, B, coeff] relative errors=[9.527886449066496e-8, 1.8690374464995998e-6, 1.8178366459808697e-6, 1.6647023986969831e-6], pivot=0.07361331
+sample 14: isolated polynomial relative error=0.00000002797730168567965
+sample 15: [A, solve, B, coeff] relative errors=[4.805976719075266e-8, 8.157094422202904e-7, 8.389668752762991e-7, 9.418925675685491e-7], pivot=0.20316532
+sample 15: isolated polynomial relative error=0.00000001714419616473974
+root fixture 0: degree=10, iterations=12, unconverged=0, complex=0, duplicate=0, failed=false, slots=[(RealRoot, [2.1000004, 0.0]), (RealRoot, [1.1000001, 0.0]), (RealRoot, [0.19999999, 0.0]), (RealRoot, [-0.49999997, 0.0]), (RealRoot, [-1.4999999, 0.0]), (RealRoot, [-2.0000002, 0.0]), (RealRoot, [-1.0000001, 0.0]), (RealRoot, [-0.10000001, 0.0]), (RealRoot, [0.6, 0.0]), (RealRoot, [1.5999998, 0.0])]
+root fixture 1: degree=2, iterations=4, unconverged=2, complex=0, duplicate=0, failed=false, slots=[(RealAxisRejected, [0.0, 0.0]), (RealAxisRejected, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0])]
+root fixture 2: degree=2, iterations=17, unconverged=0, complex=0, duplicate=1, failed=false, slots=[(RealRoot, [1.0, 0.0]), (DuplicateRoot, [0.9999998, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0])]
+root fixture 3: degree=0, iterations=0, unconverged=0, complex=0, duplicate=0, failed=true, slots=[(Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0]), (Unused, [0.0, 0.0])]
+root fixture 4: degree=10, iterations=384, unconverged=10, complex=0, duplicate=0, failed=false, slots=[(RootNotDone, [1.4234242, 0.16921662]), (RootNotDone, [1.1829845, 0.36605152]), (RootNotDone, [0.9308863, 0.352539]), (RootNotDone, [0.76653624, 0.23770183]), (RootNotDone, [0.7035451, 0.07740101]), (RootNotDone, [0.7038107, -0.0786355]), (RootNotDone, [0.7755091, -0.22936508]), (RootNotDone, [0.9277516, -0.36526662]), (RootNotDone, [1.1891402, -0.3749844]), (RootNotDone, [1.4199393, -0.16783275])]
+full trial 0: CPU=6, GPU=6, iterations=19, unconverged=4, complex=0, duplicate=0, rejected=0, best=0.00010283852615335242
+full trial 1: CPU=4, GPU=4, iterations=24, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.0000008872175201467017
+full trial 2: CPU=6, GPU=4, iterations=35, unconverged=0, complex=4, duplicate=0, rejected=2, best=0.00008888185395054732
+full trial 3: CPU=2, GPU=1, iterations=19, unconverged=8, complex=0, duplicate=0, rejected=1, best=0.0291689715224462
+full trial 4: CPU=4, GPU=4, iterations=12, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.0000012955581247017415
+full trial 5: CPU=4, GPU=3, iterations=13, unconverged=6, complex=0, duplicate=0, rejected=1, best=0.0000035018799327819507
+full trial 6: CPU=4, GPU=4, iterations=17, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.000003249271833508477
+full trial 7: CPU=6, GPU=6, iterations=18, unconverged=4, complex=0, duplicate=0, rejected=0, best=0.000005803291267716272
+full trial 8: CPU=4, GPU=4, iterations=16, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.0000002685169296426615
+full trial 9: CPU=2, GPU=2, iterations=19, unconverged=6, complex=2, duplicate=0, rejected=0, best=0.0000043910857109853325
+full trial 10: CPU=2, GPU=2, iterations=20, unconverged=8, complex=0, duplicate=0, rejected=0, best=0.0000012430028524314544
+full trial 11: CPU=6, GPU=6, iterations=17, unconverged=4, complex=0, duplicate=0, rejected=0, best=0.0000018875740607120691
+full trial 12: CPU=6, GPU=6, iterations=31, unconverged=0, complex=4, duplicate=0, rejected=0, best=0.0000003515802788807454
+full trial 13: CPU=4, GPU=4, iterations=18, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.0000007064956264638715
+full trial 14: CPU=4, GPU=4, iterations=22, unconverged=6, complex=0, duplicate=0, rejected=0, best=0.0000009133156876421794
+full trial 15: CPU=4, GPU=3, iterations=324, unconverged=4, complex=2, duplicate=0, rejected=1, best=0.0000015050860515295539
+worst normalized A*N=0.0000007608281104430883; worst [A, solve, B, coeff]=[1.3146031754869566e-7, 4.4328947753325317e-5, 4.466428388448881e-5, 7.043909958495008e-5]; pivoted samples=13
+test gpu::five_point_f32::tests::five_point_f32_actual_gpu_stages ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 779 filtered out; finished in 0.89s

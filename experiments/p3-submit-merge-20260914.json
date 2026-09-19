@@ -1,0 +1,35 @@
+{
+  "candidate": "merge compute+copy into one submit/wait per solve",
+  "decision": "retain_candidate_a",
+  "device": "GpuSiftCapabilities { backend: Wgpu, device_name: \"Apple M5 Max\" }",
+  "diagnostic_signature_q2": "3d04bb3edaef183049e07d6c3841e296f963da3b279bcbd99d878e1dc090c050",
+  "double_buffer_next": true,
+  "input_digest": "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5",
+  "model_signature_q2": "472124c8f1a9c6299d659e2f835dc11c682ff8a593757f0b145f73454f51d6ea",
+  "retain": true,
+  "round": "P3-submit-merge",
+  "signature_ok": true,
+  "sync": {
+    "calls_per_pass": 127,
+    "p2_submits_per_pass": 254,
+    "p2_waits_per_pass": 254,
+    "submit_reduction": 0.5,
+    "submits_per_pass": 127,
+    "waits_per_pass": 127
+  },
+  "timing_seconds": {
+    "batch": 512,
+    "measure": 5,
+    "p2_steady_median_baseline": 1.774772709,
+    "relative_vs_p2": 0.24257009915515895,
+    "session_steady_median": 1.344265917,
+    "session_steady_samples": [
+      1.338533708,
+      1.341844125,
+      1.344265917,
+      1.344960459,
+      1.3497700830000001
+    ],
+    "warmup": 2
+  }
+}

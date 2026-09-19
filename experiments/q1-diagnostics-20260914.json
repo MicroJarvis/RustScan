@@ -1,0 +1,90 @@
+{
+  "cpu_signature": "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a",
+  "database": "/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db",
+  "device": "GpuSiftCapabilities { backend: Wgpu, device_name: \"Apple M5 Max\" }",
+  "diagnostic_signature_v1_historical": "1f6f3f8d88a17e4e1c42abfc85aad44a66c4b864091805594e086ca80bf9b339",
+  "diagnostic_signature_v2": "3cd8091d6033f2fdb0b598c27483e67c4dd3ee1af1232ff4f1f5ee1da86117cb",
+  "fixture_count": 23,
+  "input_digest": "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5",
+  "lost_solutions": {
+    "nullspace_rank_deficient": 10028,
+    "roots_all_rejected": 1938,
+    "roots_all_rejected_slot_statuses": {
+      "Complex": 642,
+      "DuplicateRoot": 3,
+      "InvalidEssential": 2620,
+      "NullVectorFailure": 2093,
+      "PolishRejected": 70,
+      "RealAxisRejected": 10996,
+      "RootNotDone": 2757,
+      "Unused": 199
+    },
+    "roots_all_rejected_unconverged_split": {
+      "polish_rejected": 70,
+      "real_axis_rejected": 10996,
+      "root_not_done": 2757
+    },
+    "total": 11967
+  },
+  "model_signature": "030f43068d9e8f78961142915162f20bef4ecb909d49d247a4f766a2ab5412df",
+  "model_signature_unchanged": true,
+  "nullspace_fixture_buckets": [
+    {
+      "bucket": "(1e-7,1e-5)",
+      "count": 3
+    },
+    {
+      "bucket": "<=0",
+      "count": 214
+    },
+    {
+      "bucket": "<=1e-7",
+      "count": 193
+    },
+    {
+      "bucket": "[1e-3,1e-2)",
+      "count": 192
+    },
+    {
+      "bucket": "[1e-4,1e-3)",
+      "count": 8837
+    },
+    {
+      "bucket": "[1e-5,1e-4)",
+      "count": 589
+    }
+  ],
+  "schema": "five-point-q1-diagnostics-v1",
+  "scope": "Q1 diagnostic fix only. Thresholds and rejection logic unchanged. Model signature must match the pre-fix capture.",
+  "slot_status_totals": {
+    "Accepted": 209600,
+    "Complex": 21468,
+    "DuplicateRoot": 398,
+    "InvalidEssential": 12458,
+    "NullVectorFailure": 7733,
+    "PolishRejected": 130,
+    "RealAxisRejected": 276906,
+    "RootNotDone": 20786,
+    "Unused": 100761
+  },
+  "source_commit": "3ab9c09",
+  "status_codes": {
+    "3.0": "RealAxisRejected",
+    "7.0": "RootNotDone",
+    "8.0": "PolishRejected",
+    "note": "Header unconverged still sums all three; split is derived from slot statuses at decode."
+  },
+  "unconverged_split": {
+    "cross_check": {
+      "at_cap_sum_matches_inference": true,
+      "polish_below_cap_matches_inference": true,
+      "real_axis_matches_inference": true
+    },
+    "header_total": 297822,
+    "polish_rejected": 130,
+    "polish_rejected_below_cap": 130,
+    "real_axis_rejected": 276906,
+    "root_not_done": 20786,
+    "root_not_done_or_polish_at_cap": 20786
+  }
+}

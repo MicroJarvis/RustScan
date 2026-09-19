@@ -1,0 +1,49 @@
+{
+  "cpu_signature": "9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a",
+  "device": "GpuSiftCapabilities { backend: Wgpu, device_name: \"Apple M5 Max\" }",
+  "diagnostic_signature_q2": "3d04bb3edaef183049e07d6c3841e296f963da3b279bcbd99d878e1dc090c050",
+  "flex_capacity_after_2048": 2048,
+  "input_digest": "af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5",
+  "model_signature_q2": "472124c8f1a9c6299d659e2f835dc11c682ff8a593757f0b145f73454f51d6ea",
+  "round": "P2-session",
+  "session_capacity_after_512": 512,
+  "small_large_small_model_ok": true,
+  "timing_seconds": {
+    "batch": 512,
+    "calls_per_pass": 127,
+    "measure": 5,
+    "oneshot_median": 1.801224041,
+    "oneshot_samples": [
+      1.782665709,
+      1.794716834,
+      1.801224041,
+      1.8034811670000002,
+      1.80857075
+    ],
+    "session_cold_create_and_pass_median": 1.734024,
+    "session_cold_create_and_pass_samples": [
+      1.698815292,
+      1.7047094170000001,
+      1.734024,
+      1.7731354590000001,
+      1.775525541
+    ],
+    "session_create_512_median": 0.000018917,
+    "session_create_512_samples": [
+      0.000018667,
+      0.000018917,
+      0.000018917,
+      0.000029834,
+      0.000043584
+    ],
+    "session_steady_median": 1.774772709,
+    "session_steady_samples": [
+      1.76655675,
+      1.7668113330000002,
+      1.774772709,
+      1.776663667,
+      1.781745542
+    ],
+    "warmup": 2
+  }
+}
