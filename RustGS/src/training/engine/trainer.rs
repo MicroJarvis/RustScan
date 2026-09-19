@@ -751,13 +751,9 @@ impl WgpuTrainer {
             self.prefix_sum_workspace.growth_count(),
             self.prefix_sum_workspace.step_fresh_allocations(),
         );
-        // Overflow sticky bits are written on-device by write_dispatch (no per-step
-        // host readback). Host mirror catches up at safety-point reads; device
-        // mutation gates land in Task 1.4.
-        // Fail before loss/backward/optimizer so a truncated forward cannot
-        // update Adam moments, parameters, or topology statistics.
-        self.ensure_forward_capacity_before_update(read_loss)
-            .await?;
+        // Overflow sticky bits are written on-device by write_dispatch together with
+        // the same-step mutation_gate clear. Loss/backward/Adam/topology consult the
+        // device status buffer directly — no mid-step host-mirror branch.
         let forward_elapsed = if profile_step {
             let started = Instant::now();
             let _ = rendered
@@ -869,9 +865,6 @@ impl WgpuTrainer {
             iteration.saturating_sub(1),
             splats.sh_coeffs.val().dims()[1],
         );
-        // Defense in depth: sticky must still be clear immediately before mutation.
-        self.ensure_forward_capacity_before_update(read_loss)
-            .await?;
         if collect_topology_stats {
             self.accumulate_gradients(
                 &transforms_grad,
@@ -1374,17 +1367,6 @@ impl WgpuTrainer {
             self.splat_birth_iterations.clone(),
             self.splat_invisible_windows.clone(),
         ))
-    }
-
-    async fn ensure_forward_capacity_before_update(
-        &self,
-        read_loss: bool,
-    ) -> Result<(), TrainingError> {
-        let _ = read_loss;
-        if let Some(err) = self.device_status.host_snapshot().to_error() {
-            return Err(err);
-        }
-        Ok(())
     }
 
     async fn ensure_device_status_healthy(
@@ -2721,6 +2703,77 @@ mod tests {
         );
         assert!(after.5.has_forward_overflow());
         assert_eq!(after.5.first_invalid_iteration, 2);
+        assert_eq!(
+            after.5.mutation_gate, 0,
+            "overflow step must leave mutation_gate blocked"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn train_step_continuous_overflow_with_read_loss_false_mutates_nothing() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let camera = fault_injection_camera();
+
+        let healthy = trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                1,
+                1,
+                true,
+                false,
+            )
+            .await
+            .expect("healthy step");
+        assert!(healthy.is_none());
+
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
+        trainer.intersection_capacity_override = Some(1);
+
+        for iteration in 2..=4 {
+            let overflowed = trainer
+                .train_step(
+                    &mut splats,
+                    &camera,
+                    fault_injection_target(&device, 0.4),
+                    (8, 8),
+                    iteration,
+                    1,
+                    true,
+                    false,
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("continuous overflow step {iteration} must stay Ok when loss unread: {err}")
+                });
+            assert!(overflowed.is_none());
+        }
+
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
+        assert_eq!(after.0, before.0, "transforms must not change");
+        assert_eq!(after.1, before.1, "sh must not change");
+        assert_eq!(after.2, before.2, "opacity must not change");
+        assert_eq!(after.3, before.3, "adam state must not change");
+        assert_eq!(after.4, before.4, "topology accumulators must not change");
+        assert_eq!(after.6, before.6);
+        assert_eq!(after.7, before.7);
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
+        assert!(after.5.has_forward_overflow());
+        assert_eq!(
+            after.5.first_invalid_iteration, 2,
+            "sticky first overflow iteration must survive continuous overflows"
+        );
+        assert_eq!(after.5.mutation_gate, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

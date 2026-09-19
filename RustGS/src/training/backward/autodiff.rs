@@ -73,6 +73,7 @@ pub(crate) struct RenderCheckpoint<B: Backend> {
     pub tile_offsets: Tensor<B, 1, Int>,
     pub logical_visible: Tensor<B, 1, Int>,
     pub visible_dispatch: Tensor<B, 1, Int>,
+    pub training_status: Tensor<B, 1, Int>,
     pub num_visible: usize,
 }
 
@@ -111,6 +112,7 @@ impl<B: RenderBackend> Backward<B, 4> for RenderBackward {
             state.projected_splats.clone(),
             state.out_img,
             v_output,
+            state.training_status.clone(),
             state.num_visible,
             state.img_size,
             calc_tile_bounds(state.img_size),
@@ -131,6 +133,7 @@ impl<B: RenderBackend> Backward<B, 4> for RenderBackward {
             state.logical_visible,
             raster_bwd.v_splats,
             raster_bwd.screen_grad_splats,
+            state.training_status,
             <B as crate::training::forward::dispatch::WriteDispatchBackend>::indirect_dispatch(
                 &state.visible_dispatch,
             ),
@@ -198,6 +201,15 @@ where
 
     let device = inner_splats.transforms.val().device();
     let active_sh_degree = active_sh_degree.min(splats.sh_degree);
+    // Backward kernels gate on sticky flags in this buffer. Training passes the
+    // live status; eval / one-off paths get an isolated healthy dummy so they
+    // never observe trainer sticky overflow.
+    let training_status_for_bwd = match &training_status {
+        Some((_, status)) => status.clone(),
+        None => crate::training::engine::DeviceTrainingStatus::<B>::new(&device, 0)
+            .buffer()
+            .clone(),
+    };
     let fwd_out = forward::render_forward_with_active_sh::<B>(
         &inner_splats,
         active_sh_degree,
@@ -243,6 +255,7 @@ where
                 tile_offsets: fwd_out.tile_offsets,
                 logical_visible: fwd_out.logical_visible.clone(),
                 visible_dispatch: fwd_out.visible_dispatch,
+                training_status: training_status_for_bwd,
                 num_visible: fwd_out.num_visible,
             };
 

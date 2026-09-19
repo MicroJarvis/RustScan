@@ -47,5 +47,8 @@ fn main() {
             atomicStore(&status[2], intersections);
             atomicStore(&status[3], params.intersection_capacity);
         }
+        // Same-step device gate: block loss/backward/Adam/topology before any
+        // host safety-point readback. prepare_optimizer_step reaffirms this.
+        atomicStore(&status[5], 0u);
     }
 }

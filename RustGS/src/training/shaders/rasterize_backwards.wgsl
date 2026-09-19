@@ -8,10 +8,14 @@
 @group(0) @binding(5) var<storage, read_write> v_splats: array<atomic<f32>>;
 @group(0) @binding(6) var<storage, read_write> screen_grad_splats: array<atomic<f32>>;
 @group(0) @binding(7) var<storage, read> uniforms: helpers::RasterizeUniforms;
+@group(0) @binding(8) var<storage, read> status: array<u32>;
 
 var<workgroup> range_uniform: vec2<u32>;
 var<workgroup> local_batch: array<helpers::ProjectedSplat, helpers::TILE_SIZE>;
 var<workgroup> local_gid: array<u32, helpers::TILE_SIZE>;
+
+const STATUS_FORWARD_OVERFLOW: u32 = 1u;
+const STATUS_NON_FINITE_LOSS: u32 = 2u;
 
 fn write_grads_atomic(id: u32, grads: f32) {
     atomicAdd(&v_splats[id], grads);
@@ -27,6 +31,15 @@ fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_index) local_idx: u32,
 ) {
+    // Device gate from write_dispatch / mark_non_finite sticky flags: skip all
+    // persistent gradient writes when this step is already marked unhealthy.
+    // Do not consult mutation_gate (word 5): that bit is owned by prepare_optimizer
+    // and stays 0 until after backward on healthy steps.
+    let flags = status[0];
+    if ((flags & (STATUS_FORWARD_OVERFLOW | STATUS_NON_FINITE_LOSS)) != 0u) {
+        return;
+    }
+
     let num_tiles = uniforms.tile_bounds.x * uniforms.tile_bounds.y;
     let tile_id = wg_id.x;
     if tile_id >= num_tiles {

@@ -289,6 +289,7 @@ mod tests {
         run_dispatch_status(1_025, 1_024, 2, &status).await;
         let snap = status.read().await.expect("read status");
         assert!(snap.has_forward_overflow());
+        assert_eq!(snap.mutation_gate, 0, "overflow must clear same-step mutation_gate");
         assert_eq!(snap.first_invalid_iteration, 2);
         assert_eq!(snap.requested_intersections, 1_025);
         assert_eq!(snap.intersection_capacity, 1_024);
@@ -302,8 +303,28 @@ mod tests {
         run_dispatch_status(6_000, 4_000, 4, &status).await;
         let snap = status.read().await.expect("read status");
         assert!(snap.has_forward_overflow());
+        assert_eq!(snap.mutation_gate, 0);
         assert_eq!(snap.first_invalid_iteration, 3);
         assert_eq!(snap.requested_intersections, 5_000);
         assert_eq!(snap.intersection_capacity, 4_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_full_capacity_leaves_mutation_gate_untouched() {
+        let device = GsDevice::default();
+        let status = DeviceTrainingStatus::<GsBackendBase>::new(&device, 0);
+        // Seed a prior healthy prepare-style gate so we can prove exact-full
+        // write_dispatch does not clear it.
+        let mut seeded = status.host_snapshot();
+        seeded.mutation_gate = 1;
+        let mut status = status;
+        status.set_host_snapshot(seeded);
+        run_dispatch_status(1_024, 1_024, 3, &status).await;
+        let snap = status.read().await.expect("read status");
+        assert!(!snap.has_forward_overflow(), "{snap:?}");
+        assert_eq!(
+            snap.mutation_gate, 1,
+            "healthy dispatch must not clear mutation_gate"
+        );
     }
 }

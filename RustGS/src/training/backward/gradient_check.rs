@@ -311,6 +311,9 @@ mod gpu_tests {
             visible,
             v_splats,
             screen,
+            crate::training::engine::DeviceTrainingStatus::<GsBackendBase>::new(device, 0)
+                .buffer()
+                .clone(),
             CubeCount::Static(1, 1, 1),
             &camera,
             (case.width, case.height),

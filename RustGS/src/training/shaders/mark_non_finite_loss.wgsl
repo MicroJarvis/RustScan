@@ -25,5 +25,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (non_finite) {
         atomicOr(&status[0], STATUS_NON_FINITE_LOSS);
         atomicMin(&status[1], max(params.iteration, 1u));
+        // Gate before backward so rasterize/project bwd and Adam see the block
+        // without a mid-step host status mirror.
+        atomicStore(&status[5], 0u);
     }
 }

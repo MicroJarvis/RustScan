@@ -46,6 +46,7 @@ pub(crate) trait RasterizeBwdBackend: Backend {
         projected_splats: Self::FloatTensorPrimitive,
         out_img: Self::FloatTensorPrimitive,
         v_output: Self::FloatTensorPrimitive,
+        training_status: Self::IntTensorPrimitive,
         num_visible: usize,
         img_size: (u32, u32),
         tile_bounds: (u32, u32),
@@ -75,6 +76,7 @@ where
         projected_splats: Self::FloatTensorPrimitive,
         out_img: Self::FloatTensorPrimitive,
         v_output: Self::FloatTensorPrimitive,
+        training_status: Self::IntTensorPrimitive,
         num_visible: usize,
         img_size: (u32, u32),
         tile_bounds: (u32, u32),
@@ -85,6 +87,7 @@ where
         let projected_splats = into_contiguous(projected_splats);
         let out_img = into_contiguous(out_img);
         let v_output = into_contiguous(v_output);
+        let training_status = into_contiguous(training_status);
         let device = projected_splats.device.clone();
         let client = projected_splats.client.clone();
 
@@ -125,6 +128,7 @@ where
                         v_splats.handle.clone().binding(),
                         screen_grad_splats.handle.clone().binding(),
                         uniforms_handle.binding(),
+                        training_status.handle.binding(),
                     ]),
                 );
             }
@@ -144,6 +148,7 @@ pub(crate) fn rasterize_bwd<B: RasterizeBwdBackend>(
     projected_splats: Tensor<B, 2>,
     out_img: Tensor<B, 3>,
     v_output: Tensor<B, 3>,
+    training_status: Tensor<B, 1, Int>,
     num_visible: usize,
     img_size: (u32, u32),
     tile_bounds: (u32, u32),
@@ -156,6 +161,7 @@ pub(crate) fn rasterize_bwd<B: RasterizeBwdBackend>(
         projected_splats.into_primitive().tensor(),
         out_img.into_primitive().tensor(),
         v_output.into_primitive().tensor(),
+        training_status.into_primitive(),
         num_visible,
         img_size,
         tile_bounds,

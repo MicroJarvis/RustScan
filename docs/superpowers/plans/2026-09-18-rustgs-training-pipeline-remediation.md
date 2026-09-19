@@ -1,318 +1,280 @@
 # RustGS 训练 Pipeline 修复与验证实施计划
 
-> **供自动化开发工具执行：** 建议使用 `superpowers:subagent-driven-development` 或 `superpowers:executing-plans`，严格按任务顺序实施。每个任务都要完成失败测试、最小实现、回归验证和独立提交。
+> 供自动化开发工具执行：使用 superpowers:subagent-driven-development 或 superpowers:executing-plans，按优先级逐项实施。每个任务先写失败测试，再做最小实现，独立验证后提交。
 
-**目标：** 修复 `3686466` 之后仍存在的训练状态污染、逐步 GPU→CPU 同步和断点恢复不连续问题，并建立真实评价 GPU 效率和独立视角质量的验收闭环。
+**目标：** 在已完成的训练状态屏障、checkpoint 连续性和 exact/bounded parity 基础上，补齐异常 step 的硬停止、GPU 资源复用证据、真实性能测量、独立视角质量验证和跨场景实验闭环。
 
-**架构：** 训练器持有一个贯穿 forward、loss、topology 和 optimizer 的 device-resident sticky status。GPU kernel 在状态异常时禁止所有持久状态写入，host 只在 loss cadence、topology、checkpoint、暂停/取消和训练结束等安全点读取。正确性闭环后，再引入 scan workspace 复用、真实 profiling、固定 train/eval split 和跨场景实验。
+**架构：** 训练器继续使用贯穿 forward、loss、backward、topology 和 optimizer 的 device-resident sticky status。异常状态必须在 device 上阻止后续计算和持久写入；host 只在安全点读回状态。scan workspace、profiling、split manifest 和实验 comparator 都必须有明确的所有权、版本和可追溯字段。
 
 **技术栈：** Rust 2021、Burn、burn-wgpu、CubeCL/WGSL、wgpu、serde JSON、现有 RustGS CLI 与 evaluation pipeline。
 
-**代码基线：** `3686466 fix(rustgs): close training correctness review and R08–R12 gates`
+**代码基线：** device status、checkpoint v2、resume parity、bounded parity、scan workspace、experiment identity 的已有提交视为历史基线；本计划只列当前仍真实需要完成的工作。
 
-**审查依据：** [2026-09-18 RustGS 审核记录](../../reviews/2026-09-18-rustgs-training-review-and-home-evidence.md)
+**审查依据：** docs/reviews/2026-09-18-rustgs-training-review-and-home-evidence.md 及最近提交的 pipeline review。
+
+## 当前状态与结论
+
+阶段 1、阶段 2，以及阶段 3 的 exact/bounded parity 已实现并通过对应 GPU 测试；阶段 4.1 的实验身份 comparator 已实现。整个 remediation 计划尚未完成，最近 review 仍发现：
+
+- **P0/P1 forward hard-stop 缺口：** RustGS/src/training/engine/trainer.rs:1379 的 ensure_forward_capacity_before_update() 只检查 forward 之后的 host 状态镜像。GPU overflow 发生后，read_loss=false 的 step 仍可能进入 loss/backward，随后才在安全点读回；Adam/topology gate 能阻止持久 mutation，但不能满足异常 step 立即停止，也浪费 backward 计算。
+- **P1 scan 所有权缺口：** RustGS/src/training/gpu_primitives/prefix_sum.rs:371 的训练路径每次仍调用 empty_tensor 创建输出。workspace 只复用递归 scratch，step_fresh_allocations 没有统计该输出分配；prefix_sum.rs:291 与 trainer.rs:720 的 TLS raw pointer 绑定跨越 await，在多线程异步 runtime 下不安全。
+- **P1 阶段 4.2–6 不完整：** 尚无完整 training/reporting/gpu_profiler.rs、GPU completion timing、adapter/driver metadata、runtime device memory、unsupported reason、可复现实验 split manifest、完整 gradient boundary suite、显式 SH schedule 和 TUM 阶梯包。
+- **P2 格式门禁失败：** cargo fmt --package rustgs --check 当前仍报告 RustGS/src/lib.rs、RustGS/src/training/engine/trainer.rs、RustGS/src/training/forward/parity.rs、RustGS/src/training/forward/sorting.rs 差异。
+
+已验证结果：GPU bounded parity 通过；GPU checkpoint resume 通过（53 tests）；GPU library 通过（130 tests）；ignored GPU integration 通过；CPU library 通过（29 tests）；git diff --check 通过。上述结果不能替代 fmt、profiling、holdout 和跨场景门禁。
+
+## 已完成且冻结的基线
+
+- device sticky status 已覆盖 forward overflow、non-finite loss、首次异常 iteration、requested/capacity 和 committed optimizer step；host 只在 loss cadence、topology、checkpoint、暂停/取消和训练结束等安全点读取。
+- overflow/non-finite 状态已在 GPU 标记；Adam、topology accumulator 和 topology host mutation 均受同一 mutation gate 保护，异常时不写参数、moment、step 或 accumulator。
+- checkpoint v2 保存 visibility baselines；v1 恢复显式执行迁移并记录原因；mid-window topology resume 与 uninterrupted training 做过事件和状态 parity。
+- exact/bounded forward parity 已覆盖边界 intersection、容量和稳定 equal-depth 排序；实验 identity comparator 已能拒绝 revision、dataset、seed、帧选择、分辨率、迭代数、loss/topology/SH 配置不一致的报告。
 
 ## 全局约束
 
 - 异常 step 不得修改 Gaussian 参数、Adam moment、Adam step、topology accumulator、visibility history 或 topology host vectors。
-- overflow 与 non-finite 状态必须 sticky，首次异常信息不得被后续健康 step 清掉。
-- 正常训练 step 不允许为判断 overflow 或 finite 而做 host readback。
+- overflow 与 non-finite 必须 sticky；首次异常信息不得被健康 step 清除。
+- 正常 step 不得为判断 overflow 或 finite 而做 host readback。
 - 所有 host topology mutation、checkpoint、暂停、取消和成功结束之前必须读取并验证 status。
-- 不可测指标写 `null` 并记录原因；不能把 CPU submit `Instant` 标成 GPU 执行时间。
-- checkpoint 升级必须能读取 v1；v1 恢复要显式记录兼容迁移。
-- baseline/candidate 固定 revision、数据 fingerprint、训练帧、评估帧、seed、分辨率、迭代数、loss、topology 和 SH schedule。
-- Home/flowers2 只做 smoke；质量结论必须包含独立 holdout 与 TUM 或同等级场景。
-- 每个 Task 单独提交，不混入当前 RustSFM/RustViewer 未提交修改。
+- 不可测指标写 null 并记录结构化原因；CPU submit 时间不能伪装成 GPU 执行时间。
+- 只修改 RustGS 相关文件和本计划；不得带入 RustSFM/RustViewer 未提交修改。
 
-## 阶段依赖
+## 优先级与依赖
 
-```text
-1 device 状态屏障 → 2 checkpoint/topology 连续性 → 3 bounded parity/scan 复用
-→ 4 真实性能测量 → 5 holdout/gradient 质量 → 6 跨场景实验与收口
-```
-
-阶段 1、2 通过前，不接受新的默认性能算法。
+1. **P0：异常 forward 的 device-side hard-stop。** 依赖已完成的 status buffer；完成前不得宣称训练错误路径闭环。
+2. **P1：scan workspace/output 所有权与分配证据。** 依赖 P0 的 step 生命周期约束；完成前不做 fused loss 或大规模 topology cache。
+3. **P1：GPU profiler、pipeline timing、split manifest。** 可与 scan 并行，但必须使用稳定的 step/safety-point 语义。
+4. **P2：gradient boundary suite、显式 SH schedule。** 依赖 split/config identity 定义。
+5. **P2：TUM/跨场景实验包、格式修复和最终收口。** 依赖前四项全部通过。
 
 ---
 
-# 阶段 1：统一 Device 状态屏障
+# P0：Forward hard-stop
 
-## Task 1.1：新增共享 device training status
+## Task P0.1：把 forward overflow 变成同一 step 的 device gate
 
-**文件：**
+**文件：** 修改 RustGS/src/training/forward/dispatch.rs、forward/mod.rs、forward/shaders/write_dispatch.wgsl、engine/trainer.rs、engine/loss.rs、backward/autodiff.rs；测试 RustGS/tests/bounded_forward_parity.rs、RustGS/tests/checkpoint_resume.rs 及 engine GPU fixtures。
 
-- Create: `RustGS/src/training/engine/device_status.rs`
-- Create: `RustGS/src/training/shaders/update_training_status.wgsl`
-- Modify: `RustGS/src/training/engine/mod.rs`
-- Modify: `RustGS/src/training/engine/trainer.rs`
-- Modify: `RustGS/src/training/reporting/telemetry.rs`
-- Test: `RustGS/src/training/engine/device_status.rs`
+**接口与不变量：**
 
-**接口：**
+    pub(crate) struct ForwardDispatchResult<B: Backend> {
+        pub logical_intersections: Tensor<B, 1, Int>,
+        pub mutation_gate: Tensor<B, 1, Int>,
+    }
 
-```rust
-pub(crate) const STATUS_FORWARD_OVERFLOW: u32 = 1 << 0;
-pub(crate) const STATUS_NON_FINITE_LOSS: u32 = 1 << 1;
+    pub(crate) async fn dispatch_forward(
+        num_visible: Tensor<B, 1, Int>,
+        num_intersections: Tensor<B, 1, Int>,
+        intersection_capacity: usize,
+        status: &DeviceTrainingStatus<B>,
+        iteration: u32,
+    ) -> Result<ForwardDispatchResult<B>, TrainingError>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TrainingStatusSnapshot {
-    pub flags: u32,
-    pub first_invalid_iteration: u32,
-    pub requested_intersections: u32,
-    pub intersection_capacity: u32,
-    pub committed_optimizer_steps: u32,
-}
+shader 在写 dispatch 前用 atomicOr/atomicMin 记录 overflow，随后写入 device scalar gate。gate=0 时 loss kernel、backward launch、topology accumulation 和 Adam kernels 直接 return，且不得读取或写入持久状态。不能依赖 stale host mirror，也不能把“稍后安全点读回”当作当前 step 的停止条件。
 
-pub(crate) struct DeviceTrainingStatus<B: Backend> { /* one u32[8] buffer */ }
-impl<B: Backend> DeviceTrainingStatus<B> {
-    pub(crate) fn new(device: &B::Device, restored_step: u32) -> Self;
-    pub(crate) async fn read(&self) -> Result<TrainingStatusSnapshot, TrainingError>;
-}
-```
+- [x] 写 capacity 少 1、连续 overflow、read_loss=false 三个失败 fixture；断言 backward dispatch 不发生，所有参数/moment/step/accumulator 与 step 前 bitwise 相同。
+- [x] 在 forward dispatch 后增加 device gate producer；把 gate 作为 loss/backward/topology/Adam 的显式输入，删除当前 step 对 host mirror 的分支判断。
+- [x] 保留 host safety-point readback，错误中同时携带首次 iteration、requested 和 capacity。
+- [x] 为 evaluation exact path 传入独立 dummy status，确保训练 gate 不污染评估。
+- [x] 运行 GPU library、bounded parity、integration ignored 和 checkpoint resume；检查正常 step 的 status readback 仍为零。
 
-word 0 为 sticky flags；word 1 为首次异常 iteration（初始 `u32::MAX`）；word 2/3 为首次 overflow requested/capacity；word 4 为 committed Adam step；word 5 为当前 mutation gate；word 6/7 保留。状态 buffer 必须是连续资源，避免 Rust/WGSL 对齐差异。
+**验收标准：** overflow step 不提交 loss/backward/optimizer/topology 命令；异常后下一步不能清除 sticky flag；capacity 恢复前训练直接返回结构化错误；正常 step 仍保持零逐步 host readback。
 
-- [x] 写无异常、overflow、non-finite、双 flag、首次 iteration 保留五个 host 解码测试。
-- [x] 运行 `cargo test -p rustgs --lib --features gpu-wgpu engine::device_status -- --test-threads=1`，先确认测试失败。
-- [x] 实现状态初始化、解码和错误转换；non-finite 与 capacity 错误必须能区分。
-- [x] 把 trainer 的 `non_finite_loss_steps` 与 host-only overflow 状态替换为共享 status。
-- [x] 运行 CPU/GPU library tests，提交 `refactor(rustgs): centralize device training status`。
+**P0.1 落地说明（2026-09-19）：** `write_dispatch` 在 overflow 时立刻 `atomicStore(status[5], 0)`；`mark_non_finite_loss` 同样清 gate；`rasterize_backwards` / `project_backwards` 读取 sticky flags 后 early-return；`RenderCheckpoint` 携带训练 status（评估路径用独立 dummy）；删除 `ensure_forward_capacity_before_update` 中途 host mirror 分支。连续 overflow / read_loss=false / capacity−1 fixture 与 GPU library + bounded parity 已通过。
 
-## Task 1.2：Forward overflow 只写 device sticky flag
+## Task P0.2：修复安全点错误传播与状态镜像
 
-**文件：** `forward/dispatch.rs`、`forward/mod.rs`、`shaders/write_dispatch.wgsl`、`backward/autodiff.rs`、`engine/trainer.rs`；测试同名模块。
+**文件：** RustGS/src/training/engine/trainer.rs、engine/runtime.rs、reporting/telemetry.rs。
 
-把 `WriteDispatchBackend::write_forward_dispatch` 增加 `iteration` 和 status buffer 参数。shader 仍将 logical intersections clamp 到 capacity，但在 `requested > capacity` 时 `atomicOr(flags, STATUS_FORWARD_OVERFLOW)`、`atomicMin(first_iteration, iteration)`，并只在首次异常写 requested/capacity。
+- [ ] 为 StatusReadbackReason 增加 ForwardAbort，仅用于 gate 已判定异常后的诊断读回，不在健康 step 调用。
+- [ ] 将失败 step 的命令计数、backward skipped、optimizer skipped、topology skipped 写入 telemetry；区分 GPU gate skip 和 host safety-point abort。
+- [ ] 增加训练 API 测试：forward overflow、loss NaN、取消和 checkpoint 错误都返回唯一错误类别，且不会被后续 healthy step 覆盖。
+- [ ] 验证错误路径不会把部分写入的 transient tensor 当作可恢复 checkpoint 状态。
 
-- [x] 覆盖 `requested == capacity`、`capacity + 1`、连续 overflow 三个边界测试。
-- [x] training forward 传入共享 status；evaluation exact path 使用独立 dummy status。
-- [x] 删除 `note_sticky_forward_overflow()` 中每 step 的 `into_scalar_async()`。
-- [x] telemetry 分开记录 `status_readbacks`、`capacity_telemetry_readbacks`、`loss_value_readbacks`、`checkpoint_tensor_readbacks`。
-- [x] 运行 forward/GPU integration tests，提交 `perf(rustgs): keep overflow detection on device`。
-
-## Task 1.3：Non-finite loss 在 GPU 上先标记
-
-**文件：** 新建 `shaders/mark_non_finite_loss.wgsl`；修改 `engine/loss.rs`、`engine/trainer.rs`；测试 `loss.rs`。
-
-增加 `LossStatusBackend::mark_non_finite_loss(loss, status, iteration)`。命令顺序必须是 `loss → mark status → backward → mutation gate → topology/Adam`。finite、NaN、+Inf、-Inf 都要覆盖；采样 loss scalar readback 仍保留用于报错数值，但不再承担安全职责。
-
-- [x] 写四个 GPU fixture 并确认旧实现无法提前阻断。
-- [x] 实现 kernel/backend trait 和首次 iteration 记录。
-- [x] 删除 `non_finite_loss_steps` 的累加路径。
-- [x] 运行 loss/trainer tests，提交 `fix(rustgs): mark non-finite loss before state mutation`。
-
-## Task 1.4：Topology 与 Adam 消费同一个 mutation gate
-
-**文件：** `shaders/accumulate_topology_stats.wgsl`、`engine/topology_accum.rs`、`shaders/adam_update.wgsl`、`engine/optimizer.rs`、`engine/trainer.rs`；测试 optimizer/trainer。
-
-新增 `prepare_optimizer_step.wgsl`：读取 status flags，健康时将 word 5 设为 1 并把 word 4 加一；异常时设为 0 且不加 step。Adam 三组参数 kernel 都读取 word 5/4；gate=0 立即 return，不写 param/moment，gate=1 使用同一 committed step 做 bias correction。无 scaling 的路径也必须走 gated kernel。Topology accumulator 在每个写入前检查 flags。
-
-- [x] 用非零 param/moment、step=7 写异常 gate 测试，验证参数、moment、step 全不变。
-- [x] 用非零哨兵 accumulator 写 topology gate 测试。
-- [x] 增加真实 `train_step` 故障注入：第 2 step、`read_loss=false` 注入 NaN，checkpoint 前后比较全部 state。
-- [x] 增加小 capacity overflow 故障注入，断言同样不变。
-- [x] 运行 GPU library、integration、checkpoint tests，提交 `fix(rustgs): gate optimizer and topology mutations on device`。
-
-## Task 1.5：集中 host 安全点
-
-**文件：** `engine/trainer.rs`、`engine/runtime.rs`、`reporting/metrics.rs`、`reporting/optimization_report.rs`。
-
-新增：
-
-```rust
-enum StatusReadbackReason { LossCadence, TopologyBoundary, Checkpoint, Pause, Cancel, TrainingEnd }
-async fn ensure_device_status_healthy(&mut self, reason: StatusReadbackReason)
-    -> Result<TrainingStatusSnapshot, TrainingError>;
-```
-
-普通 step 不读；loss cadence、topology snapshot 前、checkpoint、pause/cancel、training end 才读。删除分散的 status readback，并在 report 写出各 reason 计数。
-
-- [x] 覆盖 checkpoint 不在 loss cadence 的测试。
-- [x] 100-step 正常训练断言 readback 数量等于安全点数量而不是 step 数。
-- [x] 阶段门禁：`cargo fmt --package rustgs --check`、CPU/GPU library、integration ignored、checkpoint_resume、`git diff --check`。
-- [x] 提交 `fix(rustgs): validate device status at training safety points`。
-
-**阶段 1 验收：** 正常 step 零 status/overflow/finite readback；异常 step 零参数、moment、step、topology mutation；首次异常信息准确；checkpoint 和成功结束都不能越过异常。
+**验收标准：** 每种失败都能从 error、status snapshot 和 telemetry 三处定位；错误发生后不会继续完成一个逻辑 iteration。
 
 ---
 
-# 阶段 2：Checkpoint 与 Topology 连续性
+# P1：Scan workspace 与分配证据
 
-## Task 2.1：Checkpoint v2 保存 visibility baselines
+## Task P1.1：取消 TLS raw pointer，改为显式 workspace 所有权
 
-**文件：** `training/checkpoint.rs`、`engine/topology_accum.rs`、`engine/trainer.rs`、`engine/runtime.rs`；测试 checkpoint_resume。
+**文件：** RustGS/src/training/gpu_primitives/prefix_sum.rs、forward/tile_mapping.rs、forward/mod.rs、engine/trainer.rs。
 
-将 `TRAINING_CHECKPOINT_VERSION` 升为 2，`TopologyCheckpoint` 增加：
+    pub(crate) struct PrefixSumWorkspace<B: Backend> {
+        capacity: usize,
+        levels: Vec<PrefixSumLevel<B>>,
+        output: Option<Tensor<B, 1, Int>>,
+    }
 
-```rust
-pub visibility_window_baseline: Vec<f32>;
-pub actual_visibility_window_baseline: Vec<f32>;
-```
+    impl<B: Backend> PrefixSumWorkspace<B> {
+        pub(crate) fn reserve(&mut self, capacity: usize, device: &B::Device);
+        pub(crate) fn inclusive_scan_into(
+            &mut self, input: Tensor<B, 1, Int>, len: usize,
+        ) -> Result<Tensor<B, 1, Int>, String>;
+    }
 
-v2 要求长度等于 splat count、值 finite 且非负；v1 用旧累计 visibility 构造 baseline，并返回 `CheckpointMigration::V1BaselineReset`，日志和 report 必须记录迁移；不能用 `serde(default)` 静默接受损坏的空数组。
+workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWorkspace 传入；不得再通过 thread-local raw pointer 绑定。inclusive_scan_into 返回 workspace-owned output，调用方在 backward 完成前不能触发下一次 scan 或 reserve。
 
-- [x] 增加 v2 round-trip、长度/NaN 校验和固定 v1 JSON fixture。
-- [x] restore 直接使用 checkpoint baseline，禁止再由累计 tensor 覆盖。
-- [x] 运行 checkpoint tests，提交 `fix(rustgs): preserve topology visibility windows in checkpoints`。
+- [ ] 先添加多线程 tokio/wgpu fixture，证明旧 TLS 绑定可被不同 task 交错覆盖；测试当前实现失败。
+- [ ] 删除 TLS pointer 和 bind/unbind API，改为显式 &mut 传递；把 workspace 生命周期覆盖 forward 到 backward 的最后一个 consumer。
+- [ ] 明确 input/output alias 规则：输入不能与 output 共享 storage；reserve 增长时不得使当前 step 仍在使用的 tensor 失效。
+- [ ] 对训练路径使用 inclusive_scan_into；公共 convenience inclusive_scan 保持独立 allocation 语义。
+- [ ] 运行 prefix/radix/parity 和单线程、多线程 GPU tests。
 
-## Task 2.2：Topology window 中途 resume parity
+**验收标准：** 无 unsafe TLS pointer；并发测试无数据竞争；scan output 在 backward 完成前稳定；短→长→短容量复用结果正确。
 
-在 `RustGS/tests/checkpoint_resume.rs` 增加 topology interval=4、iteration 2 checkpoint 的双路径测试：A 直训到 8，B 从 checkpoint 训到 8。比较 topology event fingerprint（iteration、disposition、origins、增密/剪枝数、两个 visibility delta、invisible windows）、HostSplats、三组 Adam state、committed step 和 accumulator，浮点误差 `1e-6`。
+## Task P1.2：消除每次 scan 的 output allocation 并建立计数
 
-- [x] 先让旧 baseline reset 使测试失败，再实现后使其通过。
-- [x] 覆盖 checkpoint 不在 topology 边界和 checkpoint 不在 loss cadence 两种位置。
-- [x] 提交 `test(rustgs): prove mid-window topology resume parity`。
+**文件：** RustGS/src/training/gpu_primitives/prefix_sum.rs、training/reporting/telemetry.rs、engine/trainer.rs。
 
-## Task 2.3：Densify/prune/opacity reset 后 Adam continuity
+- [ ] 为每个递归 level 和最终 output 预留 capacity；只在 len > capacity 时增长，并记录 old/new bytes、growth count。
+- [ ] 把 output allocation 纳入 step_fresh_allocations，区分 workspace growth allocation 与稳态 allocation；不能只统计 scratch。
+- [ ] 在连续 100 step 的固定 shape smoke 中断言：第一次允许增长，之后 output/scratch fresh allocation 为 0；capacity 变化时增长次数单调且 bytes 可复算。
+- [ ] 加入 alias/shape 检查，防止调用方传入错误 len 导致越界或静默截断。
 
-**文件：** `engine/optimizer.rs`、`topology/apply.rs` 或实际 apply 文件、`tests/checkpoint_resume.rs`。
-
-用可识别 row 值覆盖：非连续大量 prune、多个 `None` densify、混合 origins、opacity reset、全部候选 prune 的保护逻辑。survivor 的 param/moment/age/baseline 必须同源；new row moment 为 0；opacity reset 时只清对应 opacity moment，transform/SH moment 保留；step 不回退。增加 apply→checkpoint→restore→next-step parity，提交 `fix(rustgs): preserve optimizer continuity across topology changes`。
-
-- [x] opacity reset 只清 opacity moment；混合 prune/densify remap 保留 survivor、新行为零；step 不回退。
-- [x] 提交 `fix(rustgs): preserve optimizer continuity across topology changes`。
-
-**阶段 2 验收：** v2 严格验证、v1 显式迁移；mid-window resume 与 uninterrupted 事件相同；大规模 mutation 后所有 tensor/vector shape 和来源一致。
-
----
-
-# 阶段 3：Bounded Forward Parity 与 Scan Workspace
-
-## Task 3.1：Exact/bounded 完整 parity
-
-新建 `RustGS/tests/bounded_forward_parity.rs`，覆盖 zero visible、zero intersections、1/255/256/257 intersections、恰好满容量、capacity 少 1、partial tile、duplicate depth key、low alpha、near-plane。容量足够时比较 logical/requested count、排序 key/value、tile offsets、RGB/depth/visibility 和三组 gradient；整数完全相等，浮点默认 `1e-5`，只有能解释归约顺序时才局部放宽到 `1e-4`。capacity 少 1 必须复用阶段 1 的状态不变断言。
-
-- [x] 先写 fixture 并确认没有 parity 入口。
-- [x] 实现 exact/bounded 双跑 helper 和测试所需最小入口暴露。
-- [x] 修复差异，不得用整体放宽容差绕过。
-- [x] 提交 `test(rustgs): cover bounded forward pipeline parity`。
-
-## Task 3.2：PrefixSum workspace 复用
-
-**文件：** `gpu_primitives/prefix_sum.rs`、`forward/tile_mapping.rs`、`forward/mod.rs`、`engine/trainer.rs`。
-
-实现：
-
-```rust
-struct PrefixSumWorkspace<B: Backend> { capacity: usize, levels: Vec<PrefixSumLevel<B>> }
-struct PrefixSumLevel<B: Backend> { block_sums: Tensor<B,1,Int>, block_prefix: Tensor<B,1,Int> }
-fn reserve(&mut self, capacity: usize, device: &B::Device);
-fn inclusive_scan_into(&mut self, input: Tensor<B,1,Int>, len: usize,
-    output: Tensor<B,1,Int>) -> Result<Tensor<B,1,Int>, String>;
-```
-
-公共 `inclusive_scan()` 继续返回独立 allocation；训练路径使用 caller-owned output。每个递归层独立 buffer，workspace 生命周期覆盖当前 step backward，下一 step 才复用。
-
-- [x] 保留连续同长度、短→长→短旧结果测试。
-- [x] 增加 capacity 不增长、capacity 增长、fresh allocation count 和 output 生命周期测试。
-- [x] telemetry 记录实际 reserved bytes、growth count、per-step fresh allocations。
-- [x] 运行 prefix/radix/parity tests，提交 `perf(rustgs): reuse owned prefix scan workspaces`。
-
-**阶段 3 验收：** exact/bounded parity、overflow hard-stop、scan 无 alias、稳态递归 scratch 不再逐 step 分配。
+**验收标准：** JSON 中能看到 workspace current/peak bytes、growth count、per-step fresh allocations；稳态 allocation 证据为零；parity 不回退。
 
 ---
 
-# 阶段 4：真实性能测量
+# P1：GPU Profiling、Pipeline Timing 与实验可比性
 
-## Task 4.1：补齐实验身份
+## Task P1.3：实现 GPU profiler 数据模型
 
-修改 `OptimizationCommand` 增加 `train_frame_ids`、`effective_max_frames`、`loss_config_fingerprint`、`topology_config_fingerprint`、`sh_schedule_fingerprint`、`training_config_fingerprint`。`effective_max_frames` 必须是真正进入 loader 的 pose 数量。comparator 对这些字段以及已有 dataset/seed/scale/eval IDs/resolution 全部做 mismatch reject。
+**文件：** 新建 RustGS/src/training/reporting/gpu_profiler.rs；修改 training/reporting/mod.rs、telemetry.rs、optimization_report.rs、engine/runtime.rs；测试 gpu_profiler.rs 单元测试和 report JSON fixtures。
 
-- [x] 每个字段写 mismatch test。
-- [x] 用 canonical JSON 生成 fingerprint，排除路径和日志级别。
-- [x] report 使用实际 train/eval selection。
-- [x] 提交 `fix(rustgs): reject incomparable training reports`。
+    #[derive(Serialize, Deserialize)]
+    pub struct GpuProfilerReport {
+        pub supported: bool,
+        pub unsupported_reason: Option<String>,
+        pub backend: String,
+        pub adapter: Option<String>,
+        pub driver: Option<String>,
+        pub gpu_step_p50_ms: Option<f64>,
+        pub gpu_step_p95_ms: Option<f64>,
+        pub sample_count: u64,
+        pub workspace_current_bytes: u64,
+        pub workspace_peak_bytes: u64,
+        pub workspace_growth_count: u64,
+        pub fresh_step_allocations: u64,
+        pub runtime_peak_device_bytes: Option<u64>,
+        pub runtime_peak_device_bytes_reason: Option<String>,
+    }
 
-## Task 4.2：GPU timing 和 allocation evidence
+- [ ] 写 capability matrix、unsupported/null/reason、自洽性和 percentile 单元测试；要求 p95>=p50，unsupported 时 GPU percentile 为 null。
+- [ ] 接入 wgpu timestamp query；只有 query resolve/readback 完成后才计算 GPU completion interval；无 query 时保留明确命名的 cpu_submit_instant，不得映射到 GPU 字段。
+- [ ] 接入 adapter/backend/driver metadata、workspace tracker 和 runtime device memory；拿不到 runtime peak 时写 null+reason。
+- [ ] 在 100-step smoke 中验证 sample_count、p50/p95、growth 和 fresh allocation 计数单调。
 
-新建 `training/reporting/gpu_profiler.rs`。报告至少包含 `supported`、`unsupported_reason`、GPU step p50/p95、sample count、adapter/backend/driver、workspace current/peak bytes、growth count、fresh-step allocations、runtime peak device bytes（拿不到则 null+reason）。有 timestamp query 才使用 GPU completion；否则保留清晰命名的 `cpu_submit_instant`。
+**验收标准：** report 能区分 CPU submit 与 GPU completion；unsupported 字段自洽；所有不可测指标有机器可读原因。
 
-- [ ] 写 capability 与 null/reason 序列化测试。
-- [ ] 接入 adapter metadata、workspace tracker 和可选 timestamp。
-- [ ] 100-step smoke 验证计数单调、p95≥p50、unsupported 字段自洽。
-- [ ] 提交 `feat(rustgs): report gpu timing and workspace allocation evidence`。
+## Task P1.4：补齐完整 pipeline timing
 
-## Task 4.3：先测量再决定 topology/cache/fused loss
+**文件：** training/reporting/telemetry.rs、engine/trainer.rs、io/loader.rs、optimization_report.rs。
 
-记录 frame wait、decode、resize、upload、forward、backward、optimizer、topology snapshot/plan/apply/upload/remap。只有同一瓶颈在至少两个场景重复出现才新建后续优化任务；建议门槛为 topology pause <5%、frame wait p95 <总 step p95 的10%、loss <GPU step的10%时不改对应模块。
+- [ ] 为 frame wait、decode、resize、upload、forward、backward、optimizer、topology snapshot/plan/apply/upload/remap 建立统一 span 名称和 sample counter。
+- [ ] 使用同一 warmup/drop policy 计算 p50/p95；报告总 step 与子阶段不能重复累计。
+- [ ] 在 Home 500/1500 生成基线报告，确认 topology pause <5%、frame wait p95 <总 step p95 的 10%、loss < GPU step 的 10% 等门槛；未达门槛才创建后续优化任务。
+- [ ] 禁止仅凭 CPU wall clock 宣称 GPU kernel 加速。
 
-- [ ] 添加 percentile tests 和无行为变化的 timing points。
-- [ ] 生成 Home 500/1500 报告，提交 `perf(rustgs): measure topology and input stalls`。
+**验收标准：** JSON 足以归因同步、workspace、输入 stall、topology 或 kernel 时间；同一 revision 的重复运行字段可比较。
 
-**阶段 4 验收：** comparator 可拒绝不可比报告；CPU/GPU timing 分离；readback、workspace、topology pause、frame stall 可从 JSON 判断；不可测指标带原因。
+## Task P1.5：固定 train/in-view/holdout split manifest
+
+**文件：** 新建 RustGS/src/training/evaluation/split.rs；修改 RustGS/src/bin/rustgs/train_command.rs、training/evaluation/mod.rs、optimization_report.rs、comparator；测试 split manifest unit/integration tests。
+
+    pub enum EvaluationSplitKind { InView, Holdout }
+    pub struct FrameSplitManifest {
+        pub dataset_fingerprint: String,
+        pub train_ids: Vec<String>,
+        pub in_view_ids: Vec<String>,
+        pub holdout_ids: Vec<String>,
+    }
+
+- [ ] CLI 增加 --frame-split-manifest 与 --eval-split in-view|holdout；使用 ScenePose.frame_id，不能依赖 vector index。
+- [ ] 校验重复 ID、train/holdout 交叉、未知 ID、dataset fingerprint mismatch；要求 holdout 时缺少 manifest 直接报错。
+- [ ] report 保存 split kind、完整 ID 和 manifest fingerprint；comparator 比较这些字段。
+- [ ] 用固定 fixture 覆盖空 split、单帧 split、重复和未知 ID 错误。
+
+**验收标准：** 同一 manifest 在重复运行中产生相同 eval selection；holdout 与 train 不重叠；报告明确说明 in-view/holdout。
 
 ---
 
-# 阶段 5：独立视角与梯度质量
+# P2：质量边界、配置可复现与实验收口
 
-## Task 5.1：显式 train/in-view/holdout split
+## Task P2.1：Gradient boundary suite
 
-新建 `training/evaluation/split.rs`，定义 `EvaluationSplitKind::{InView,Holdout}` 和带 dataset fingerprint、train IDs、in-view IDs、holdout IDs 的 `FrameSplitManifest`。CLI 增加 `--frame-split-manifest`、`--eval-split in-view|holdout`。
+**文件：** RustGS/src/training/backward/gradient_check.rs、RustGS/tests/gradient_boundary.rs。
 
-- [ ] 校验重复、train/holdout 交叉、未知 ID、fingerprint mismatch。
-- [ ] 使用 `ScenePose.frame_id`，不能依赖 vector index。
-- [ ] report 保存 split kind 和完整 ID；comparator 比较它们。
-- [ ] 未提供 holdout 却要求 holdout 时直接报错。
-- [ ] 提交 `feat(rustgs): add reproducible holdout evaluation splits`。
+- [ ] 覆盖 near-plane 内外、clip 边界、low alpha 阈值两侧、covariance blur boundary、SH degree 2/3、off-axis camera、depth-sensitive scale。
+- [ ] 平滑强信号使用 relative <= 3e-2 或 absolute <= 1e-3；弱信号仅在双方均 <5e-3 时通过；不连续点两侧至少 4*epsilon，不得在不连续点做 centered FD。
+- [ ] Quaternion 主门禁使用切空间 perturbation；旧未归一化分量检查保留为诊断。输出每参数 analytic/numeric/error 表。
+- [ ] 只修对应数学链路，不放宽全局容差；CPU 与 GPU fixture 都要能定位具体边界。
 
-## Task 5.2：Gradient boundary suite
+**验收标准：** boundary suite 全通过；失败信息包含 case、参数、analytic、numeric、relative/absolute error。
 
-在 `backward/gradient_check.rs` 增加 near-plane 内外、clip 边界、low alpha 阈值两侧、covariance blur boundary、SH degree 2/3、off-axis camera、depth-sensitive scale。平滑强信号使用 `relative<=3e-2 || absolute<=1e-3`；弱信号只在双方均 `<5e-3` 通过；不连续阈值两侧至少 `4*epsilon`，不得在不连续点做 centered FD。Quaternion 主门禁改用切空间 perturbation，旧未归一化分量检查保留为诊断。
+## Task P2.2：显式 SH schedule 与 identity
 
-- [ ] 写 case builder 和分层 tolerance。
-- [ ] 输出每参数 analytic/numeric/error 表。
-- [ ] 只修对应数学链路，不放宽全局容差。
-- [ ] 提交 `test(rustgs): harden gradient checks at render boundaries`。
+**文件：** RustGS/src/training/config.rs、engine/trainer.rs、training/checkpoint.rs、comparator。
 
-## Task 5.3：显式 SH schedule
+    pub struct ShScheduleConfig {
+        pub initial_degree: u8,
+        pub increment_every: u32,
+        pub max_degree: u8,
+    }
 
-在 `TrainingConfig` 增加 `ShScheduleConfig { initial_degree, increment_every, max_degree }`，默认保持当前每 1000 iteration 升一级。 `active_sh_degree_at()` 改为纯函数；checkpoint identity、active degree validation 和 optimization fingerprint 都包含完整 schedule。
+    pub fn active_sh_degree_at(cfg: ShScheduleConfig, iteration: u32) -> u8;
 
-- [ ] 测试 iteration 0/1/999/1000/1001 和 resume 边界。
-- [ ] validate `increment_every>=1`、degree≤3。
-- [ ] 提交 `feat(rustgs): make sh training schedule reproducible`。
+- [ ] 保持当前默认语义：每 1000 iteration 升一级；测试 0/1/999/1000/1001 和 resume 边界。
+- [ ] validate increment_every >= 1、degree <= 3、initial <= max；非法配置在 CLI 解析阶段失败。
+- [ ] checkpoint 保存 schedule；optimization fingerprint 使用 canonical JSON；恢复时拒绝 schedule mismatch。
 
-**阶段 5 验收：** train/holdout 不重叠，report 明确 split；gradient boundary suite 通过；SH schedule 在 config/checkpoint/report 一致。
+**验收标准：** 同一 config 在 uninterrupted/resume 下 active degree 完全一致；报告可追溯完整 schedule。
+
+## Task P2.3：冻结跨场景实验包并执行阶梯
+
+**目录与产物：** output/rustgs-optimization/2026-09-18-remediation/{bin,manifests,home,flowers2,tum}；每次保存 command、git revision、binary sha256、split manifest、optimization JSON、evaluation JSON、stdout/stderr、PLY 和环境元数据。
+
+- [ ] 一次构建 release binary；baseline/candidate 实验期间禁止重建。
+- [ ] 执行 Home 500 → flowers2 500 → TUM 500 → TUM 3k → 10k → 30k；正式 baseline/candidate 各至少 3 次，首轮 warmup 不计入统计，报告 mean/stddev/p50/p95。
+- [ ] 拒绝条件：overflow/non-finite/invalid dispatch/checkpoint failure；resume fingerprint mismatch；普通 step status readback；workspace 持续增长；holdout mean 下降超过 0.10 dB；worst frame 下降超过 0.20 dB；出现新 fog/ghosting/floaters。
+- [ ] 接受条件：先通过 correctness/quality，再在同 GPU/driver 下证明稳定 steps/s 提升且 p95 不恶化，并能从 JSON 归因到同步、workspace 或 kernel 时间。
+
+**验收标准：** 每个场景都能由 manifest、report 和 binary hash 完整复现；质量和效率门槛均有数字证据。
+
+## Task P2.4：修复格式门禁并更新文档
+
+**文件：** RustGS/src/lib.rs、RustGS/src/training/engine/trainer.rs、RustGS/src/training/forward/parity.rs、RustGS/src/training/forward/sorting.rs，以及本计划和对应 review 记录。
+
+- [ ] 运行 cargo fmt --package rustgs，只接受 rustfmt 产生的格式变更，不顺手改行为。
+- [ ] 用 git diff --check 检查空白；确认 git status 不含 RustSFM/RustViewer 变更的 staged/committed 混入。
+- [ ] 将本计划中的 checkbox 仅在对应代码、测试和 artifact 已验收后勾选；删除过时事项，不保留“已完成但无证据”的任务。
+
+**验收标准：** fmt check、CPU/GPU library、ignored integration、checkpoint resume、bounded parity、gradient boundary、split/comparator 和实验报告全部通过。
 
 ---
 
-# 阶段 6：跨场景实验与收口
+## 最终验证命令
 
-## Task 6.1：冻结实验包
+在 P0–P2 任务完成后执行：
 
-目录：`output/rustgs-optimization/2026-09-18-remediation/{bin,manifests,home,flowers2,tum}`。每次保存 command、revision、binary sha256、split manifest、optimization JSON、evaluation JSON、stdout、PLY。一次构建 release binary，baseline/candidate 不在实验中途重建。
+    cargo fmt --package rustgs --check
+    cargo test -p rustgs --lib --no-default-features --no-fail-fast
+    cargo test -p rustgs --lib --features gpu-wgpu --no-fail-fast -- --test-threads=1
+    cargo test -p rustgs --test integration_test --features gpu-wgpu -- --ignored --test-threads=1
+    cargo test -p rustgs --test checkpoint_resume --features gpu-wgpu -- --test-threads=1
+    git diff --check
 
-## Task 6.2：执行阶梯
-
-Home 500 → flowers2 500 → TUM 500 → TUM 3k → 10k → 30k。正式阶段 baseline/candidate 各至少 3 次，首轮 warmup 不计入统计，报告 mean/stddev/p50/p95。
-
-拒绝条件：任意 overflow/non-finite/invalid dispatch/checkpoint failure；resume fingerprint 不一致；普通 step status readback；workspace 持续增长；holdout mean 下降超过 0.10 dB；worst frame 下降超过 0.20 dB；出现新 fog/ghosting/floaters。
-
-接受条件：先通过 correctness/quality，再证明同 GPU/driver 下稳定 steps/s 提升，p95 不恶化，并能从报告归因到同步、workspace 或 kernel 时间。
-
-## Task 6.3：更新 TODO 与最终门禁
-
-修改 TODO、审核记录和 `docs/index.md`。只在代码和实验门禁通过后删除事项；记录 revision、命令、报告路径和数字；修复审核文档 EOF 空行。
-
-```bash
-cargo fmt --package rustgs --check
-cargo test -p rustgs --lib --no-default-features --no-fail-fast
-cargo test -p rustgs --lib --features gpu-wgpu --no-fail-fast -- --test-threads=1
-cargo test -p rustgs --test integration_test --features gpu-wgpu -- --ignored --test-threads=1
-cargo test -p rustgs --test checkpoint_resume --features gpu-wgpu -- --test-threads=1
-git diff --check
-```
+此外必须运行 bounded parity、gradient boundary、split manifest/comparator 单测，并在最终实验包中保存命令输出、revision、binary hash、报告路径和关键数字。
 
 ## 完成定义
 
-只有同时满足以下条件才算完成：device status 覆盖 overflow、non-finite、optimizer、topology、checkpoint 和成功结束；v2 checkpoint 与 mid-window resume parity 通过；bounded/exact parity 和 fault injection 通过；scan 无 alias 且稳态复用有实测；report 能拒绝不可比实验并区分 CPU/GPU；holdout split 固化；gradient boundary suite 通过；Home、flowers2、TUM 阶梯达到门禁；TODO 只保留真实未完成事项；`git diff --check` 通过。
+只有同时满足以下条件才算完成：forward overflow 和 non-finite 在 device 上阻止当前 step 后续计算；异常 step 零持久 mutation；checkpoint v2 与 mid-window resume parity 通过；scan 无 TLS alias 且稳态 output/scratch allocation 有实测为零；GPU profiler 能区分 completion/submit 并记录 unsupported reason；split manifest 固化 holdout；gradient boundary 和 SH schedule 可复现；Home、flowers2、TUM 阶梯达到 correctness、quality、efficiency 门禁；fmt 和 diff check 通过；本文只保留真实未完成事项。
 
-## 开发工具执行规则
+## 执行规则
 
-1. 每次只执行一个 Task，先写失败测试再实现。
-2. 发现接口冲突时，优先保证“异常 step 零持久 mutation”和“正常 step 零 status readback”。
-3. 不得用放宽全局容差、减少测试覆盖或删除 telemetry 通过门禁。
-4. 阶段 1/2 失败时停止性能阶段。
-5. 没有 profiling 证据，不实现 GPU-native topology、fused loss 或大规模 cache 重构。
-6. 提交前检查 `git status --short`，不得带入 RustSFM/RustViewer 修改。
-
+1. 每次只执行一个 Task，先写失败测试，再实现最小改动，独立运行该 Task 的验证命令。
+2. P0 未通过前停止性能算法；没有 profiling 证据，不实现 GPU-native topology、fused loss 或大规模 cache 重构。
+3. 不得用放宽全局容差、减少测试覆盖、删除 telemetry 或跳过 holdout 来通过门禁。
+4. 每个 Task 单独提交，提交前检查 git status --short；不得带入当前 RustSFM/RustViewer 未提交修改。
+5. 发现接口冲突时，优先保证“异常 step 零持久 mutation”和“正常 step 零 status readback”。
