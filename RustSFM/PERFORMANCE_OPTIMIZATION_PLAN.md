@@ -364,7 +364,7 @@ arm64 构建禁用 SSE2/AVX，优化前 `vl_imconvcol_vf` 使用标量路径。2
 
 - `src/native/vlfeat_sift.c`：恢复 covdet 成功路径的 `free(patch_xy)`，每次非空 covdet 提取原本漏掉 `2 * 31 * 31 * sizeof(float) = 7,688` 字节。审查确认 patch 分配失败和 `vl_sift_new` 失败分支已有释放；更早的错误尚未分配 patch，输出分配失败发生在 patch 释放之后，patch extraction 的 `continue` 最终经过统一释放。
 - `src/feature/sift.rs`：固定优化前 hash/count 门（上表），保留逐字段序列化和重复/计时对照。
-- `build.rs`：对解析后的完整 VLFeat 源目录发出 `rerun-if-changed`，覆盖所有使用的 C、头文件和递归模板，以及外部 `VLFEAT_ROOT`。有意允许无关 VLFeat 文件触发保守重编译。实际 `touch third_party/vlfeat/float.h` 后 Cargo 报告源目录 Dirty、重新执行 native build，固定哈希仍通过；见 [`output/imconv_header_rebuild_20260906.log`](output/imconv_header_rebuild_20260906.log)。头文件内容未改动。
+- `build.rs`：对解析后的完整 VLFeat 源目录发出 `rerun-if-changed`，覆盖所有使用的 C、头文件和递归模板，以及外部 `VLFEAT_ROOT`。有意允许无关 VLFeat 文件触发保守重编译。实际 `touch third_party/native/vlfeat/float.h` 后 Cargo 报告源目录 Dirty、重新执行 native build，固定哈希仍通过；见 [`output/imconv_header_rebuild_20260906.log`](output/imconv_header_rebuild_20260906.log)。头文件内容未改动。
 - `tools/vlfeat_imconv_scalar.c`：从候选前实现冻结的独立标量 oracle，单独编译，不从当前生产内核运行时生成。
 - `tools/vlfeat_imconv_test.c`：14,976 个逐位案例，覆盖宽度 1–193、所有四 lane 尾数、高度 1–157、宽于图像和非对称/负向偏移 filter、step 1/2/3、zero/continuity padding、transpose、src/dst stride padding、非对齐读取和输出 guard。数据为固定 PRNG 有限浮点，不声称覆盖所有 NaN/Inf 或任意编译器浮点模式。
 - `tools/vlfeat_covdet_alloc_test.c` 和 `tools/test_vlfeat_native.py`：不改生产 API 的 bridge allocation instrumentation。计时开/关分别验证成功、8 个 bridge malloc 失败点及 `vl_sift_new` 失败后 live allocations 为零。临时副本删除此 free 的负向对照准确报 `live=1`。不注入 VLFeat 内部每个分配点。
@@ -378,7 +378,7 @@ FAIL w=4 h=1 support=[-7,-2] step=1 transpose=0 pad=1 stride_pad=0
 index=0 scalar=00000000 actual=3fc35278
 ```
 
-原始标量先将 `v=0`，仅在 top/interior chunk 中更新它；上述所有 taps 均在图像后方，故 bottom chunk 仍累加零。候选直接 clamp 到最后一行，结果非零。即使标准 SIFT 的中心 Gaussian 不触发此案例，也不满足本轮通用 `vl_imconvcol_vf` 精确保持门。没有顺便修改上游语义、增加 fallback 或试第二候选。实验 patch 留存于 [`output/imconv_neon_rejected_20260906.patch`](output/imconv_neon_rejected_20260906.patch)，生产 `third_party/vlfeat/imopv.c` 与任务开始时完全一致（`git diff --exit-code` 通过）。
+原始标量先将 `v=0`，仅在 top/interior chunk 中更新它；上述所有 taps 均在图像后方，故 bottom chunk 仍累加零。候选直接 clamp 到最后一行，结果非零。即使标准 SIFT 的中心 Gaussian 不触发此案例，也不满足本轮通用 `vl_imconvcol_vf` 精确保持门。没有顺便修改上游语义、增加 fallback 或试第二候选。实验 patch 留存于 [`output/imconv_neon_rejected_20260906.patch`](output/imconv_neon_rejected_20260906.patch)，生产 `third_party/native/vlfeat/imopv.c` 与任务开始时完全一致（`git diff --exit-code` 通过）。
 
 依照批准的 first-semantic-failure 停止条件，本轮**未运行 Flowers24 baseline/candidate 三轮对照**，未测 candidate feature wall/scale-space/total/RSS、24/24、186 pairs 或 pair-quality，不提出性能改善结论。既有 Flowers 数据不当成本候选结果。未重试 descriptor 量化/重排融合，未改 max_features、阈值、matching、BA、Taskflow DAG、Viewer。
 
@@ -393,7 +393,7 @@ cargo test -p rustsfm --release --offline --lib sift::tests:: -- --nocapture
 cargo test -p rustsfm --release --offline --lib -- --skip gpu::
 cargo check -p rustsfm --release --offline --no-default-features --all-targets
 # Header-only dirty/rebuild proof; full log linked above:
-touch third_party/vlfeat/float.h
+touch third_party/native/vlfeat/float.h
 cargo test -p rustsfm --release --offline --lib sift::tests::vlfeat_profiling_preserves_feature_bits -vv -- --nocapture
 ```
 
@@ -404,7 +404,7 @@ python3 RustSFM/tools/test_vlfeat_native.py
 python3 RustSFM/tools/test_vlfeat_native.py --sanitize
 rustfmt --check --edition 2021 RustSFM/build.rs RustSFM/src/feature/sift.rs
 git diff --check
-git diff --exit-code -- third_party/vlfeat/imopv.c
+git diff --exit-code -- third_party/native/vlfeat/imopv.c
 ```
 
 Standalone runner 设置相同三个线程限制，以 `-O3 -DNDEBUG -DVL_DISABLE_AVX -DVL_DISABLE_SSE2 -DVL_DISABLE_OPENMP` 编译原生源，每个子进程 timeout 90 秒，整轮 180 秒。普通 release 与 AddressSanitizer 均通过 14,976 cases、allocation gates 和负向对照；rustfmt（直接运行以避免不适用的 Cargo release/offline fmt 参数）、diff check 通过。
@@ -415,7 +415,7 @@ Standalone runner 设置相同三个线程限制，以 `-O3 -DNDEBUG -DVL_DISABL
 
 **范围与实现**
 
-- 本次仅改 `third_party/vlfeat/imopv.c`、`tools/vlfeat_imconv_test.c` 和本计划；实验输出使用独立 `output/neon_corrected_*` 名称。未改已有 `free(patch_xy)`、固定 feature hashes、build tracking、冻结 scalar oracle、算法/阈值/max_features/matching/BA/Taskflow/Viewer；没有 commit、branch 或 reset。
+- 本次仅改 `third_party/native/vlfeat/imopv.c`、`tools/vlfeat_imconv_test.c` 和本计划；实验输出使用独立 `output/neon_corrected_*` 名称。未改已有 `free(patch_xy)`、固定 feature hashes、build tracking、冻结 scalar oracle、算法/阈值/max_features/matching/BA/Taskflow/Viewer；没有 commit、branch 或 reset。
 - 唯一修正候选每次计算四个独立列，逐像素按原始 descending tap 顺序 `vfmaq_n_f32` 累加。严格复现 top/interior/bottom 三段状态：bottom continuity 使用最后的 `v`，若前两段均未加载，仍使用初始零；不是 clamp 到最后一行。`4x1 [-7,-2]` 的原始失败已通过。不改上游边界行为。
 - 只在 `__aarch64__` float 且 `vl_get_simd_enabled()` 时启用；double、其他架构、scalar tails 与原始 scalar loop 不变。`vl_set_simd_enabled(0)` 保留原始路径且已测。transpose、step、src/dst padding 和非对齐输入均经过 bitwise gate。标准 SIFT 仍走 `_vl_sift_smooth/f->temp`，无 workspace API。
 - 当前 macOS arm64 / Apple clang 21.0.0 (`clang-2100.1.1.101`) / rustc 1.97.0 (`2d8144b78`)；`VLFEAT_ROOT` 未设置，使用 vendored source。`build.rs` 没有新配置要求，外部 `VLFEAT_ROOT` 仍照原逻辑编译其源，不会自动注入 vendored 优化。未做其他架构/外部源构建实测；不声称非当前浮点编译模式也逐位一致。
@@ -461,8 +461,8 @@ shasum -a 256 target/release/rustsfm RustSFM/output/neon_corrected_candidate_bin
 python3 RustSFM/tools/test_vlfeat_native.py
 python3 RustSFM/tools/test_vlfeat_native.py --sanitize
 python3 RustSFM/tools/test_vlfeat_native.py --ubsan
-clang -O3 -DNDEBUG -DVL_DISABLE_AVX -DVL_DISABLE_SSE2 -DVL_DISABLE_OPENMP -I third_party/vlfeat -S RustSFM/tools/vlfeat_imconv_scalar.c -o RustSFM/output/neon_corrected_scalar.s
-clang -O3 -DNDEBUG -DVL_DISABLE_AVX -DVL_DISABLE_SSE2 -DVL_DISABLE_OPENMP -I third_party/vlfeat -S third_party/vlfeat/imopv.c -o RustSFM/output/neon_corrected_candidate.s
+clang -O3 -DNDEBUG -DVL_DISABLE_AVX -DVL_DISABLE_SSE2 -DVL_DISABLE_OPENMP -I third_party/native/vlfeat -S RustSFM/tools/vlfeat_imconv_scalar.c -o RustSFM/output/neon_corrected_scalar.s
+clang -O3 -DNDEBUG -DVL_DISABLE_AVX -DVL_DISABLE_SSE2 -DVL_DISABLE_OPENMP -I third_party/native/vlfeat -S third_party/native/vlfeat/imopv.c -o RustSFM/output/neon_corrected_candidate.s
 grep -n -E 'fmadd|fmla' RustSFM/output/neon_corrected_scalar.s RustSFM/output/neon_corrected_candidate.s
 rustfmt --check --edition 2021 RustSFM/build.rs RustSFM/src/feature/sift.rs
 git diff --check

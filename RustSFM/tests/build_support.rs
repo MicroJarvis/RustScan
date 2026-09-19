@@ -10,16 +10,16 @@ const MANIFEST_PROBE_ENV: &str = "RUSTSFM_BUILD_SUPPORT_MANIFEST_PROBE";
 fn source_root_candidates_follow_the_current_manifest_directory() {
     let manifest = Path::new("/repo/.worktrees/runtime-fix/RustSFM");
     let candidates =
-        build_support::source_root_candidates(manifest, Path::new("third_party/PoseLib"));
+        build_support::source_root_candidates(manifest, Path::new("third_party/native/PoseLib"));
 
-    assert_eq!(candidates[0], Path::new("third_party/PoseLib"));
+    assert_eq!(candidates[0], Path::new("third_party/native/PoseLib"));
     assert_eq!(
         candidates[1],
-        Path::new("/repo/.worktrees/runtime-fix/RustSFM/third_party/PoseLib")
+        Path::new("/repo/.worktrees/runtime-fix/RustSFM/third_party/native/PoseLib")
     );
     assert_eq!(
         candidates[2],
-        Path::new("/repo/.worktrees/runtime-fix/RustSFM/../third_party/PoseLib")
+        Path::new("/repo/.worktrees/runtime-fix/RustSFM/../third_party/native/PoseLib")
     );
     assert!(candidates
         .iter()

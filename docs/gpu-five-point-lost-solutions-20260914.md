@@ -258,7 +258,7 @@ epipolar points and rejects the identity matrix; bucket edges.
 ## Reproduction
 
 ```
-POSELIB_ROOT=<main-checkout>/third_party/PoseLib \
+POSELIB_ROOT=<main-checkout>/third_party/native/PoseLib \
   cargo build --release --target-dir target -p rustsfm \
   --example five_point_gpu_lost_solutions
 

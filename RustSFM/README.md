@@ -307,7 +307,7 @@ branches and uses PoseLib's GR6P/GP3P minimal solvers plus a COLMAP-derived
 GR8P local refit bridge for non-panoramic rigs in default builds, with
 BA-backed pose-only generalized absolute-pose refinement for rig frames and
 COLMAP-style fallback to central PnP when a rig camera still needs focal-length
-estimation. PoseLib v2.0.5 is pinned as the `third_party/PoseLib` submodule.
+estimation. PoseLib v2.0.5 is pinned as the `third_party/native/PoseLib` submodule.
 Bundle adjustment exclusively uses Ceres; the hand-written Native BA backend
 has been removed. Initialize native dependencies and run the default solver
 tests with:

@@ -67,8 +67,8 @@ CPU f64 signature:         9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b
 
 所有 harness 启动时先校验 digest；漂移即失败，不产出可比数字。
 
-构建注意：本 worktree 的 `third_party/PoseLib` 是空的 submodule 目录，编译需
-`POSELIB_ROOT=<主 checkout>/third_party/PoseLib`；所有构建显式 `--target-dir target`
+构建注意：本 worktree 的 `third_party/native/PoseLib` 是空的 submodule 目录，编译需
+`POSELIB_ROOT=<主 checkout>/third_party/native/PoseLib`；所有构建显式 `--target-dir target`
 （环境里 `CARGO_TARGET_DIR` 指向临时缓存）。poselib bridge 不在 GPU 五点路径上。
 
 **计时原则：** GPU pass 时间与 CPU wait 重叠，不能相加；不同模式/运行的中位数不是严格可相减的时间账单。完整诊断接口与紧凑候选接口必须分别比较。

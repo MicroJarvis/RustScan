@@ -34,7 +34,7 @@ def main():
         parser.error("--cold-runs must be positive")
     tools = Path(__file__).resolve().parent
     root = tools.parents[1]
-    vlfeat = Path(os.environ.get("VLFEAT_ROOT", root / "third_party/vlfeat")).resolve()
+    vlfeat = Path(os.environ.get("VLFEAT_ROOT", root / "third_party/native/vlfeat")).resolve()
     report = args.report.resolve()
     report.mkdir(parents=False, exist_ok=False)
     baseline = report / "baseline.bin" if args.capture_baseline else args.baseline.resolve()

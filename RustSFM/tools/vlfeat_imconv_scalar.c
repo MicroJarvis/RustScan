@@ -1,6 +1,6 @@
 /* Frozen pre-SIMD VLFeat imopv.c scalar convolution, 2026-09-06.
  * Copyright (C) 2007-12 Andrea Vedaldi and Brian Fulkerson.
- * BSD license: ../../third_party/vlfeat/LICENSE.
+ * BSD license: ../../third_party/native/vlfeat/LICENSE.
  * Compile with the SAME toolchain/flags as production; never regenerate
  * this oracle from an optimized candidate. */
 #include "imopv.h"

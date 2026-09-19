@@ -42,7 +42,7 @@ Two findings change the roadmap and are stated up front:
 - GPU signature `1f6f3f8d…39` and CPU f64 signature `9e6764b4…3a` both asserted
   equal to their historical values, so this round is comparing the same objects
   as P1.
-- Build note: this worktree's `third_party/PoseLib` is an empty submodule
+- Build note: this worktree's `third_party/native/PoseLib` is an empty submodule
   directory, so the build needs `POSELIB_ROOT` pointed at the main checkout.
   The poselib bridge is not on the GPU five-point path and cannot affect these
   numbers, but the flag is required to reproduce.
@@ -355,7 +355,7 @@ relative value of the remaining items.
 ## Reproduction
 
 ```
-POSELIB_ROOT=<main-checkout>/third_party/PoseLib \
+POSELIB_ROOT=<main-checkout>/third_party/native/PoseLib \
   cargo build --release --target-dir target -p rustsfm \
   --example five_point_gpu_roots_attribution
 

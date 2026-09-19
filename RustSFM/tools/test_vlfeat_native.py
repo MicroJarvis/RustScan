@@ -20,7 +20,7 @@ def main():
     args = parser.parse_args()
     tools = Path(__file__).resolve().parent
     root = tools.parents[1]
-    vlfeat = Path(os.environ.get("VLFEAT_ROOT", root / "third_party/vlfeat")).resolve()
+    vlfeat = Path(os.environ.get("VLFEAT_ROOT", root / "third_party/native/vlfeat")).resolve()
     cc = shlex.split(os.environ.get("CC", "clang"))
     flags = ["-O3", "-DNDEBUG", "-DVL_DISABLE_AVX", "-DVL_DISABLE_SSE2",
              "-DVL_DISABLE_OPENMP", "-I", str(vlfeat)]

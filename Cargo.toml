@@ -15,9 +15,9 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 
 [patch.crates-io]
-ceres-solver = { path = "vendor/ceres-solver" }
-ceres-solver-sys = { path = "vendor/ceres-solver-sys" }
-cubecl-common = { path = "vendor/cubecl-common" }
+ceres-solver = { path = "third_party/rust/ceres-solver" }
+ceres-solver-sys = { path = "third_party/rust/ceres-solver-sys" }
+cubecl-common = { path = "third_party/rust/cubecl-common" }
 
 [dependencies]
 anyhow = "1"

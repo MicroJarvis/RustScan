@@ -106,6 +106,6 @@ claim. The subsequent real DB replay exposes material errors and missing models;
 other adapters and broader ill-conditioned sample distributions remain unvalidated.
 
 The main workspace has PoseLib at
-`/Users/tfjiang/Projects/RustScan/third_party/PoseLib`, and Eigen is discoverable
+`/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`, and Eigen is discoverable
 via `pkg-config eigen3`. The commands above deliberately avoid default PoseLib,
 VLFeat and Ceres features; no native dependency setup was changed.

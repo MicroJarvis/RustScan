@@ -10,7 +10,7 @@ if [[ ! -f /opt/homebrew/opt/freeimage/include/FreeImage.h ]] \
   echo "Note: install FreeImage for COLMAP-parity JPEG loading (e.g. brew install freeimage)"
 fi
 
-POSELIB_DIR="${POSELIB_ROOT:-$ROOT/third_party/PoseLib}"
+POSELIB_DIR="${POSELIB_ROOT:-$ROOT/third_party/native/PoseLib}"
 POSELIB_TAG="${POSELIB_TAG:-v2.0.5}"
 
 if [[ -f "$POSELIB_DIR/PoseLib/solvers/gen_relpose_6pt.cc" ]]; then

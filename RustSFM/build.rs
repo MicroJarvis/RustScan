@@ -27,7 +27,7 @@ fn main() {
 fn build_vlfeat_sift() {
     let vlfeat_root = resolve_vlfeat_root().unwrap_or_else(|| {
         panic!(
-            "RustSFM vlfeat-sift feature requires VLFeat source. Run scripts/setup_vlfeat.sh, set VLFEAT_ROOT=/path/to/VLFeat, or place it at third_party/vlfeat"
+            "RustSFM vlfeat-sift feature requires VLFeat source. Run scripts/setup_vlfeat.sh, set VLFEAT_ROOT=/path/to/VLFeat, or place it at third_party/native/vlfeat"
         )
     });
 
@@ -95,7 +95,7 @@ fn vlfeat_sift_sources(target_arch: &str) -> Vec<&'static str> {
 fn build_poselib_bridge() {
     let poselib_root = resolve_poselib_root().unwrap_or_else(|| {
         panic!(
-            "RustSFM poselib feature requires PoseLib v2.0.5 source. Set POSELIB_ROOT=/path/to/PoseLib-2.0.5, place it at RustSFM/third_party/PoseLib, or at the workspace root third_party/PoseLib"
+            "RustSFM poselib feature requires PoseLib v2.0.5 source. Set POSELIB_ROOT=/path/to/PoseLib-2.0.5, place it at RustSFM/third_party/native/PoseLib, or at the workspace root third_party/native/PoseLib"
         )
     });
 
@@ -146,7 +146,7 @@ fn resolve_vlfeat_root() -> Option<PathBuf> {
         .into_iter()
         .chain(build_support::source_root_candidates(
             &build_support::manifest_dir_from_env(),
-            Path::new("third_party/vlfeat"),
+            Path::new("third_party/native/vlfeat"),
         ));
     candidates
         .map(|path| path.canonicalize().unwrap_or(path))
@@ -160,7 +160,7 @@ fn resolve_poselib_root() -> Option<PathBuf> {
         .into_iter()
         .chain(build_support::source_root_candidates(
             &build_support::manifest_dir_from_env(),
-            Path::new("third_party/PoseLib"),
+            Path::new("third_party/native/PoseLib"),
         ));
     candidates
         .map(|path| path.canonicalize().unwrap_or(path))

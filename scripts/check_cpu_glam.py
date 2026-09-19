@@ -6,7 +6,7 @@ Scans controlled Rust sources and crate Cargo.toml files for:
   - fully-qualified glam::{Vec,DVec,Mat,DMat,Quat,DQuat}*
   - glam dependencies in Cargo.toml
 
-Skips vendor/, target/, output/, and .worktrees/. Line and doc comments are
+Skips third_party/rust/, target/, output/, and .worktrees/. Line and doc comments are
 ignored so historical prose does not false-positive.
 """
 
@@ -22,7 +22,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST_PATH = Path(__file__).resolve().parent / "cpu-glam-allowlist.txt"
 
-SKIP_DIRS = {"vendor", "target", "output", ".worktrees", ".git"}
+SKIP_DIRS = {"target", "output", ".worktrees", ".git"}
+SKIP_PATHS = {"third_party/rust"}
 
 USE_GLAM_RE = re.compile(
     r"\b(?:pub\s+)?use\s+glam(?:\s+as\s+\w+|\s*::|\s*\{)"
@@ -119,7 +120,13 @@ def strip_block_comments(text: str) -> str:
 def iter_controlled_files(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune skipped directories in-place so os.walk does not descend.
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        current = Path(dirpath).relative_to(root).as_posix()
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in SKIP_DIRS
+            and (d if current == "." else f"{current}/{d}") not in SKIP_PATHS
+        ]
         for name in filenames:
             if name.endswith(".rs") or name == "Cargo.toml":
                 yield Path(dirpath) / name

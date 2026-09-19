@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VLFEAT_DIR="${VLFEAT_ROOT:-$ROOT/third_party/vlfeat}"
+VLFEAT_DIR="${VLFEAT_ROOT:-$ROOT/third_party/native/vlfeat}"
 COLMAP_TAG="${COLMAP_TAG:-3.13.0}"
 
 if [[ -f "$VLFEAT_DIR/sift.c" ]]; then

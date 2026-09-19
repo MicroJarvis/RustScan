@@ -27,7 +27,7 @@ The focused structureless solver test and mapper integration test both pass when
 with `--features poselib`. The failed full run used a default build, and `poselib` is absent from
 the default feature list.
 
-Dependency delivery is also incomplete. `third_party/PoseLib` is recorded as gitlink commit
+Dependency delivery is also incomplete. `third_party/native/PoseLib` is recorded as gitlink commit
 `7e9f5f53372e43f89655040d4dfc4a00e5ace11c` (PoseLib v2.0.5), but the root repository has no
 `.gitmodules` entry. A fresh worktree therefore contains an empty directory, while the primary
 workspace succeeds only because it already has a manually initialized PoseLib checkout.
@@ -73,7 +73,7 @@ telemetry to determine whether structureless registration helps real data.
 
 ### Dependency Delivery
 
-The root `.gitmodules` will map `third_party/PoseLib` to
+The root `.gitmodules` will map `third_party/native/PoseLib` to
 `https://github.com/PoseLib/PoseLib.git`. The existing gitlink remains pinned to the v2.0.5 commit.
 CI checkout will initialize submodules before any RustSFM build.
 
