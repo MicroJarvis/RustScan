@@ -86,6 +86,11 @@ pub(crate) fn ordered_frame_indices(
         .collect()
 }
 
+/// Public helper for optimization-report identity: shuffled training pose indices.
+pub fn training_frame_order(frame_count: usize, seed: u64) -> Vec<usize> {
+    ordered_frame_indices(frame_count, 1, seed)
+}
+
 impl Iterator for DeterministicFrameBatchIter {
     type Item = Vec<usize>;
 

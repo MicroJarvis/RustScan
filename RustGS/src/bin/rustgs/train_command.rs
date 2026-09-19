@@ -2171,9 +2171,28 @@ fn maybe_write_optimization_report(
             render_scale: Some(config.raster.render_scale),
             eval_render_scale: args.eval_after_train.then_some(args.eval_render_scale),
             eval_frame_ids,
+            train_frame_ids: rustgs::training_frame_order(
+                dataset.poses.len(),
+                config.data.frame_shuffle_seed,
+            )
+            .into_iter()
+            .filter_map(|idx| dataset.poses.get(idx).map(|pose| pose.frame_id as u32))
+            .collect(),
+            effective_max_frames: Some(dataset.poses.len()),
             eval_resolution,
             iterations: Some(config.iterations),
             max_frames: Some(dataset.poses.len()),
+            loss_config_fingerprint: rustgs::canonical_config_fingerprint(&config.loss).ok(),
+            topology_config_fingerprint: rustgs::canonical_config_fingerprint(
+                &config.litegs.topology,
+            )
+            .ok(),
+            sh_schedule_fingerprint: rustgs::sh_schedule_fingerprint(
+                config.litegs.rendering.sh_degree as u32,
+                1000,
+            )
+            .ok(),
+            training_config_fingerprint: rustgs::canonical_config_fingerprint(&config).ok(),
         },
         rustgs::OptimizationTrainMetrics {
             wall_clock_seconds: Some(training_report.elapsed.as_secs_f64()),

@@ -69,9 +69,10 @@ pub use reporting::metrics::{
     ParityTopologyMetrics, ParityTopologyStepSample, StickyForwardOverflow,
 };
 pub use reporting::optimization_report::{
-    build_optimization_report, compare_optimization_reports, current_peak_rss_bytes,
-    default_optimization_report_path, duration_millis, load_optimization_report, percentile_f64,
-    percentile_usize, write_optimization_report, OptimizationCommand, OptimizationCompareDecision,
+    build_optimization_report, canonical_config_fingerprint, compare_optimization_reports,
+    current_peak_rss_bytes, default_optimization_report_path, duration_millis,
+    load_optimization_report, percentile_f64, percentile_usize, sh_schedule_fingerprint,
+    write_optimization_report, OptimizationCommand, OptimizationCompareDecision,
     OptimizationCompareResult, OptimizationEnvironment, OptimizationEvalFrame,
     OptimizationEvaluationMetrics, OptimizationMemoryMetrics, OptimizationMetricDelta,
     OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics,
@@ -90,6 +91,8 @@ pub use reporting::telemetry::{
     last_training_telemetry, LiteGsOptimizerLrs, LiteGsTrainingTelemetry,
 };
 
+#[cfg(feature = "gpu")]
+pub use data::frame_loader::training_frame_order;
 #[cfg(feature = "gpu")]
 pub use forward::parity::run_bounded_forward_parity_suite;
 

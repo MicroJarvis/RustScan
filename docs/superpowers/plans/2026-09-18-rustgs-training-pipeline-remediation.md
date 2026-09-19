@@ -218,10 +218,10 @@ fn inclusive_scan_into(&mut self, input: Tensor<B,1,Int>, len: usize,
 
 修改 `OptimizationCommand` 增加 `train_frame_ids`、`effective_max_frames`、`loss_config_fingerprint`、`topology_config_fingerprint`、`sh_schedule_fingerprint`、`training_config_fingerprint`。`effective_max_frames` 必须是真正进入 loader 的 pose 数量。comparator 对这些字段以及已有 dataset/seed/scale/eval IDs/resolution 全部做 mismatch reject。
 
-- [ ] 每个字段写 mismatch test。
-- [ ] 用 canonical JSON 生成 fingerprint，排除路径和日志级别。
-- [ ] report 使用实际 train/eval selection。
-- [ ] 提交 `fix(rustgs): reject incomparable training reports`。
+- [x] 每个字段写 mismatch test。
+- [x] 用 canonical JSON 生成 fingerprint，排除路径和日志级别。
+- [x] report 使用实际 train/eval selection。
+- [x] 提交 `fix(rustgs): reject incomparable training reports`。
 
 ## Task 4.2：GPU timing 和 allocation evidence
 

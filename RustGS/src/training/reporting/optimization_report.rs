@@ -38,9 +38,16 @@ pub struct OptimizationCommand {
     pub render_scale: Option<f32>,
     pub eval_render_scale: Option<f32>,
     pub eval_frame_ids: Vec<u32>,
+    pub train_frame_ids: Vec<u32>,
+    /// Pose count that actually entered the training loader after filtering.
+    pub effective_max_frames: Option<usize>,
     pub eval_resolution: Option<[usize; 2]>,
     pub iterations: Option<usize>,
     pub max_frames: Option<usize>,
+    pub loss_config_fingerprint: Option<String>,
+    pub topology_config_fingerprint: Option<String>,
+    pub sh_schedule_fingerprint: Option<String>,
+    pub training_config_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -235,6 +242,54 @@ pub fn compare_optimization_reports(
             baseline.command.eval_frame_ids, candidate.command.eval_frame_ids
         ));
     }
+    if baseline.command.train_frame_ids != candidate.command.train_frame_ids {
+        reasons.push(format!(
+            "train_frame_ids mismatch: {:?} vs {:?}",
+            baseline.command.train_frame_ids, candidate.command.train_frame_ids
+        ));
+    }
+    compare_opt_eq(
+        &mut reasons,
+        "effective_max_frames",
+        baseline.command.effective_max_frames,
+        candidate.command.effective_max_frames,
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "iterations",
+        baseline.command.iterations,
+        candidate.command.iterations,
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "max_frames",
+        baseline.command.max_frames,
+        candidate.command.max_frames,
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "loss_config_fingerprint",
+        baseline.command.loss_config_fingerprint.as_deref(),
+        candidate.command.loss_config_fingerprint.as_deref(),
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "topology_config_fingerprint",
+        baseline.command.topology_config_fingerprint.as_deref(),
+        candidate.command.topology_config_fingerprint.as_deref(),
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "sh_schedule_fingerprint",
+        baseline.command.sh_schedule_fingerprint.as_deref(),
+        candidate.command.sh_schedule_fingerprint.as_deref(),
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "training_config_fingerprint",
+        baseline.command.training_config_fingerprint.as_deref(),
+        candidate.command.training_config_fingerprint.as_deref(),
+    );
 
     let deltas = vec![
         metric_delta(
@@ -362,6 +417,80 @@ pub fn build_optimization_report(
     }
 }
 
+/// Canonical JSON fingerprint: sorted object keys, paths/log levels stripped.
+pub fn canonical_config_fingerprint<T: Serialize>(value: &T) -> Result<String, String> {
+    let raw = serde_json::to_value(value).map_err(|err| err.to_string())?;
+    let scrubbed = scrub_fingerprint_value(raw);
+    let canonical = canonicalize_json(scrubbed);
+    let bytes = serde_json::to_vec(&canonical).map_err(|err| err.to_string())?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Implicit SH schedule until Task 5.3 introduces an explicit config struct.
+pub fn sh_schedule_fingerprint(max_degree: u32, increment_every: usize) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct ShScheduleFingerprint {
+        initial_degree: u32,
+        increment_every: usize,
+        max_degree: u32,
+    }
+    canonical_config_fingerprint(&ShScheduleFingerprint {
+        initial_degree: 0,
+        increment_every: increment_every.max(1),
+        max_degree,
+    })
+}
+
+fn scrub_fingerprint_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, child) in map {
+                if should_omit_fingerprint_key(&key) {
+                    continue;
+                }
+                out.insert(key, scrub_fingerprint_value(child));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(scrub_fingerprint_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn should_omit_fingerprint_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower == "log_level"
+        || lower == "argv"
+        || lower.ends_with("_path")
+        || lower.ends_with("_dir")
+        || lower == "path"
+        || lower == "input"
+        || lower == "output"
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                if let Some(child) = map.get(&key) {
+                    out.insert(key, canonicalize_json(child.clone()));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonicalize_json).collect())
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,9 +513,15 @@ mod tests {
                 render_scale: Some(0.25),
                 eval_render_scale: Some(0.25),
                 eval_frame_ids: vec![0, 1],
+                train_frame_ids: vec![10, 11, 12],
+                effective_max_frames: Some(12),
                 eval_resolution: Some([160, 90]),
                 iterations: Some(500),
                 max_frames: Some(12),
+                loss_config_fingerprint: Some("loss-fp".into()),
+                topology_config_fingerprint: Some("topo-fp".into()),
+                sh_schedule_fingerprint: Some("sh-fp".into()),
+                training_config_fingerprint: Some("train-fp".into()),
             },
             train: OptimizationTrainMetrics {
                 wall_clock_seconds: Some(12.0),
@@ -507,6 +642,132 @@ mod tests {
         candidate.train.training_loop_seconds = Some(9.0);
         let result = compare_optimization_reports(&baseline, &candidate);
         assert_eq!(result.decision, OptimizationCompareDecision::Compatible);
+    }
+
+    #[test]
+    fn comparator_rejects_each_identity_field_mismatch() {
+        let cases: Vec<(&str, Box<dyn FnMut(&mut OptimizationCommand)>)> = vec![
+            (
+                "train_frame_ids",
+                Box::new(|cmd| cmd.train_frame_ids = vec![99]),
+            ),
+            (
+                "effective_max_frames",
+                Box::new(|cmd| cmd.effective_max_frames = Some(99)),
+            ),
+            (
+                "loss_config_fingerprint",
+                Box::new(|cmd| cmd.loss_config_fingerprint = Some("x".into())),
+            ),
+            (
+                "topology_config_fingerprint",
+                Box::new(|cmd| cmd.topology_config_fingerprint = Some("x".into())),
+            ),
+            (
+                "sh_schedule_fingerprint",
+                Box::new(|cmd| cmd.sh_schedule_fingerprint = Some("x".into())),
+            ),
+            (
+                "training_config_fingerprint",
+                Box::new(|cmd| cmd.training_config_fingerprint = Some("x".into())),
+            ),
+            ("iterations", Box::new(|cmd| cmd.iterations = Some(1))),
+            ("max_frames", Box::new(|cmd| cmd.max_frames = Some(1))),
+            (
+                "dataset_fingerprint",
+                Box::new(|cmd| cmd.dataset_fingerprint = Some("other".into())),
+            ),
+            (
+                "frame_shuffle_seed",
+                Box::new(|cmd| cmd.frame_shuffle_seed = Some(9)),
+            ),
+            ("render_scale", Box::new(|cmd| cmd.render_scale = Some(0.5))),
+            (
+                "eval_render_scale",
+                Box::new(|cmd| cmd.eval_render_scale = Some(0.5)),
+            ),
+            (
+                "eval_resolution",
+                Box::new(|cmd| cmd.eval_resolution = Some([1, 1])),
+            ),
+        ];
+
+        for (needle, mut mutate) in cases {
+            let baseline = sample_report();
+            let mut candidate = sample_report();
+            mutate(&mut candidate.command);
+            let result = compare_optimization_reports(&baseline, &candidate);
+            match result.decision {
+                OptimizationCompareDecision::Rejected { reasons } => {
+                    assert!(
+                        reasons.iter().any(|reason| reason.contains(needle)),
+                        "expected {needle} rejection, got {reasons:?}"
+                    );
+                }
+                OptimizationCompareDecision::Compatible => {
+                    panic!("expected rejection for {needle}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_ignores_paths_and_log_level() {
+        #[derive(Serialize)]
+        struct Sample {
+            loss_l1_weight: f32,
+            input_path: String,
+            log_level: String,
+            nested: Nested,
+        }
+        #[derive(Serialize)]
+        struct Nested {
+            output_dir: String,
+            refine_every: usize,
+        }
+        let a = Sample {
+            loss_l1_weight: 0.8,
+            input_path: "/tmp/a".into(),
+            log_level: "debug".into(),
+            nested: Nested {
+                output_dir: "/tmp/out-a".into(),
+                refine_every: 100,
+            },
+        };
+        let b = Sample {
+            loss_l1_weight: 0.8,
+            input_path: "/other/b".into(),
+            log_level: "info".into(),
+            nested: Nested {
+                output_dir: "/other/out-b".into(),
+                refine_every: 100,
+            },
+        };
+        let fa = canonical_config_fingerprint(&a).expect("fp a");
+        let fb = canonical_config_fingerprint(&b).expect("fp b");
+        assert_eq!(fa, fb);
+        assert_ne!(
+            fa,
+            canonical_config_fingerprint(&Sample {
+                loss_l1_weight: 0.9,
+                input_path: "/tmp/a".into(),
+                log_level: "debug".into(),
+                nested: Nested {
+                    output_dir: "/tmp/out-a".into(),
+                    refine_every: 100,
+                },
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn sh_schedule_fingerprint_encodes_increment_and_max_degree() {
+        let a = sh_schedule_fingerprint(3, 1000).unwrap();
+        let b = sh_schedule_fingerprint(3, 1000).unwrap();
+        let c = sh_schedule_fingerprint(2, 1000).unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
