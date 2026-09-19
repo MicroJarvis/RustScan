@@ -63,8 +63,8 @@ EOF
 $out_of_scope
 EOF
 done < <(
-  git diff --name-only "$base_commit" --
-  git ls-files --others --exclude-standard
+  git -c core.quotePath=false diff --name-only "$base_commit" --
+  git -c core.quotePath=false ls-files --others --exclude-standard
 )
 
 if [[ $failed -ne 0 ]]; then

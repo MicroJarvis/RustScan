@@ -74,7 +74,7 @@ scripts/agent/
 - [ ] 删除 Git 跟踪的 `.codex/skills/` 文件；删除前先在迁移文档中记录其仍有价值的流程内容。
 - [ ] 不把 `.codex/`、`.claude/`、`.superpowers/` 或 `.agents/skills/` 作为仓库规范入口。
 - [ ] 从当前有效文档中移除“必须使用 `superpowers:*`”“必须使用 `/opsx:*`”等工具专用指令，改写成普通的实现、验证和交接要求。
-- [ ] 将 `docs/superpowers/plans/` 和 `docs/superpowers/specs/` 标记为历史记录；仍然有效的任务迁移到 `docs/agent/tasks/` 或 `docs/agent/changes/`。
+- [x] 将 `docs/superpowers/plans/` 和 `docs/superpowers/specs/` 标记为历史记录；已完成或被替代的计划删除，仍然有效的 RustGS remediation 已迁移到 `docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/`。
 - [ ] 检查 worktree 中的旧 `CLAUDE.md`；将有效规则合并到 `AGENTS.md`，其余文件标记过期或删除，避免不同 worktree 读取不同项目结构。
 - [ ] 审查 `.gitignore`：不再用忽略规则掩盖误生成的 `.codex/` 或 `.superpowers/`；个人机器缓存如需忽略，改用用户级全局 ignore。
 - [ ] 不自动删除个人本地未跟踪缓存；只删除仓库跟踪的工具文件，个人目录由其 owner 单独清理。

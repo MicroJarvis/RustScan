@@ -6,7 +6,7 @@
 
 **使用方式：** 按下列顺序执行；编号为本次重排后的新编号。这里仅保留未完成工作，每项通过验收后从清单移除，证据写入独立实验记录。
 
-[审核与 Home 实验记录](reviews/2026-09-18-rustgs-training-review-and-home-evidence.md)保留已有结果。旧[技术方案](superpowers/plans/2026-09-17-rustgs-training-quality-efficiency.md)仅供参考；当前范围、优先级及纠错要求以本文为准，不能按旧编号重复实施。
+[审核与 Home 实验记录](reviews/2026-09-18-rustgs-training-review-and-home-evidence.md)保留已有结果。旧技术方案已在计划审计中删除；当前范围、优先级及纠错要求以本文为准，不能按旧编号重复实施。仍在执行的 pipeline remediation 见 [RS-2026-002](agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/)。
 
 ## 残留：跨场景验收缺口
 

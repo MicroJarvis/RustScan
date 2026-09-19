@@ -1,6 +1,6 @@
-# RustGS 训练 Pipeline 修复与验证实施计划
+# RustGS 训练 Pipeline 修复与验证任务
 
-> 供自动化开发工具执行：使用 superpowers:subagent-driven-development 或 superpowers:executing-plans，按优先级逐项实施。每个任务先写失败测试，再做最小实现，独立验证后提交。
+> 当前 active change：按 P0→P1→P2 顺序执行，每个任务先写失败测试，再做最小实现，独立验证后提交。执行只依赖 `AGENTS.md`、本变更包和标准 Git/Cargo 命令。
 
 **目标：** 在已完成的训练状态屏障、checkpoint 连续性和 exact/bounded parity 基础上，补齐异常 step 的硬停止、GPU 资源复用证据、真实性能测量、独立视角质量验证和跨场景实验闭环。
 

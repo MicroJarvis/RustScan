@@ -26,11 +26,17 @@
 | [../RustSFM/PARITY_ROADMAP.md](../RustSFM/PARITY_ROADMAP.md) | COLMAP parity status and remaining numerical work |
 | [../RustSFM/COLMAP_COMPAT_TODO.md](../RustSFM/COLMAP_COMPAT_TODO.md) | COLMAP compatibility backlog |
 
-## Historical RustSFM Records
+## Active Changes
 
 | Document | Purpose |
 |---|---|
-| [superpowers/plans/2026-08-14-rustsfm-review-hardening.md](superpowers/plans/2026-08-14-rustsfm-review-hardening.md) | Completed build, output, CI, and GPU error-handling hardening record |
+| [agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/](agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/) | RustGS training pipeline remediation still in progress |
+
+## Historical Records
+
+Completed and superseded execution plans were removed after audit. Their
+implementation evidence remains in Git history and the current status/review
+documents. The cleanup record is [agent/changes/RS-2026-001/plan-cleanup.md](agent/changes/RS-2026-001/plan-cleanup.md).
 
 The `docs/superpowers/` directory is historical context only. Its old
 tool-specific instructions are not required; current Agent work follows

@@ -1,0 +1,21 @@
+id: RS-2026-002
+status: active
+owner: unassigned
+source_history: docs/superpowers/plans/2026-09-18-rustgs-training-pipeline-remediation.md
+task_list: tasks.md
+scope:
+  - RustGS/src/training
+  - RustGS/tests
+  - RustGS/src/bin/rustgs
+  - docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation
+out_of_scope:
+  - RustSFM
+  - RustViewer
+acceptance:
+  - "All completion gates in tasks.md have code, test, and artifact evidence."
+  - "No unchecked task is described as complete without evidence."
+verification:
+  - "cargo fmt --package rustgs --check"
+  - "cargo test -p rustgs --lib --no-default-features --no-fail-fast"
+  - "cargo test -p rustgs --lib --features gpu-wgpu --no-fail-fast -- --test-threads=1"
+  - "git diff --check"

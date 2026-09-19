@@ -6,13 +6,12 @@ base_commit: f78c3f0
 branch: agent/RS-2026-001/universal-agent-migration
 worktree: /Users/tfjiang/.codex/worktrees/universal-agent-migration/RustScan
 
-goal: "Introduce the tool-neutral Agent protocol without deleting existing tool files yet."
+goal: "Introduce the tool-neutral Agent protocol and classify or remove obsolete tool-specific records."
 
 scope:
   - AGENTS.md
   - README.md
-  - docs/agent/
-  - docs/index.md
+  - docs/
   - .gitignore
   - .codex/
   - docs/superpowers/
@@ -41,5 +40,5 @@ artifacts:
   - docs/agent/review-template.md
 
 known_limitations:
-  - "Historical Superpowers plans still contain old tool-specific wording and require classification before any selective rewrite."
-next_action: "Review the protocol and classify historical plans before the next cleanup checkpoint."
+  - "Historical design specs remain under docs/superpowers/specs/ as non-authoritative engineering history."
+next_action: "Continue RS-2026-002 from its first unchecked task."
