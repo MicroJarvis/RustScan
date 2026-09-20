@@ -40,7 +40,7 @@ missing image, not a panic. Acceptance conditions were not changed.
 
 Owner: `cursor-agent`  
 Base commit: `d2cdb8de7d63e448022f02e69e622c90a501a591`  
-Final commit: the T0 commit on `agent/RS-2026-004/rustscan-sfm-correctness-remediation`  
+Final commit: `c88bca19f216f5c5e213255464afa4422b8f2be4`  
 Branch: `agent/RS-2026-004/rustscan-sfm-correctness-remediation`  
 Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness`
 
