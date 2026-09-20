@@ -6,7 +6,7 @@ description = "Workspace-level orchestration CLI for RustScan reconstruction wor
 authors = ["RustScan Developers"]
 
 [workspace]
-members = ["rustscan-taskflow", "rustscan-types", "rustmesh", "rustslam", "rustgs", "rust-viewer", "rustff", "rustsfm"]
+members = ["rustscan-taskflow", "rustscan-types", "rustscan-mesh", "rustscan-slam", "rustscan-gs", "rustscan-viewer", "rustscan-ff", "rustscan-sfm"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -25,7 +25,7 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 nalgebra = { workspace = true }
 log = "0.4"
-rustgs = { path = "rustgs" }
-rustmesh = { path = "rustmesh" }
+rustscan-gs = { path = "rustscan-gs" }
+rustscan-mesh = { path = "rustscan-mesh" }
 rustscan-types = { path = "rustscan-types" }
-rustslam = { path = "rustslam", default-features = false }
+rustscan-slam = { path = "rustscan-slam", default-features = false }

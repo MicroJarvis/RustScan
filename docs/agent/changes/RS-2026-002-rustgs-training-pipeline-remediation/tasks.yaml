@@ -4,9 +4,9 @@ owner: unassigned
 source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 scope:
-  - rustgs/src/training
-  - rustgs/tests
-  - rustgs/src/bin/rustgs
+  - rustscan-gs/src/training
+  - rustscan-gs/tests
+  - rustscan-gs/src/bin/rustgs
   - docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation
 out_of_scope:
   - rustsfm
@@ -15,7 +15,7 @@ acceptance:
   - "All completion gates in tasks.md have code, test, and artifact evidence."
   - "No unchecked task is described as complete without evidence."
 verification:
-  - "cargo fmt --package rustgs --check"
-  - "cargo test -p rustgs --lib --no-default-features --no-fail-fast"
-  - "cargo test -p rustgs --lib --features gpu-wgpu --no-fail-fast -- --test-threads=1"
+  - "cargo fmt --package rustscan-gs --check"
+  - "cargo test -p rustscan-gs --lib --no-default-features --no-fail-fast"
+  - "cargo test -p rustscan-gs --lib --features gpu-wgpu --no-fail-fast -- --test-threads=1"
   - "git diff --check"

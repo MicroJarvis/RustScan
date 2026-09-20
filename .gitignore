@@ -49,8 +49,8 @@ Mirror/
 
 # Generated run artifacts
 /artifacts/runs/
-/rustgs/output/
-/rustsfm/output/
+/rustscan-gs/output/
+/rustscan-sfm/output/
 /.ua/
 
 # GPU five-point local sidecars (regenerable; keep summary JSON only)

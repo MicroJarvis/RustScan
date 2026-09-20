@@ -1,0 +1,40 @@
+[package]
+name = "rustscan-mesh"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of OpenMesh - A versatile geometric data structure"
+authors = ["RustMesh Developers"]
+
+[dependencies]
+# CPU geometry uses nalgebra (see AGENTS.md). Arrays remain only at IO boundaries.
+nalgebra = { workspace = true }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# IO 工具
+byteorder = "1"
+
+# 迭代器工具
+itertools = "0.13"
+
+# 测试工具
+rand = "0.8"
+
+[features]
+default = []
+parallel = []
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "bench"
+harness = false
+path = "benches/bench.rs"
+
+[[bench]]
+name = "quadric_bench"
+harness = false

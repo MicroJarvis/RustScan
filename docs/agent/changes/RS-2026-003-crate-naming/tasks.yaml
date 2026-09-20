@@ -1,0 +1,26 @@
+id: RS-2026-003
+status: completed_with_known_baseline_failures
+owner: current-agent
+base_commit: 41d5b08bf0cc36731e8d5c574b0d3edbfdd76c96
+branch: codex/unify-crate-names
+worktree: /Users/tfjiang/.codex/worktrees/crate-naming/RustScan
+goal: Unify workspace component packages, directories and imports under rustscan.
+scope: [Cargo.toml, Cargo.lock, AGENTS.md, src/, rustff/, rustgs/, rustmesh/, rustsfm/, rustslam/, rust-viewer/, rustscan-ff/, rustscan-gs/, rustscan-mesh/, rustscan-sfm/, rustscan-slam/, rustscan-viewer/, docs/, scripts/, .github/, .gitignore]
+out_of_scope: [third_party/, artifacts/, algorithms, CLI names, persisted formats]
+acceptance:
+  - All component package names and directories use rustscan-<component>.
+  - Library import names use rustscan_<component> without legacy dependency aliases.
+  - CLI binary names and persisted artifact conventions remain compatible.
+  - Existing staged documentation cleanup is preserved during integration.
+verification:
+  - cargo metadata --no-deps --format-version 1
+  - cargo fmt --all -- --check
+  - cargo check --workspace --all-targets
+  - cargo clippy --workspace --all-targets --all-features -- -D warnings
+  - cargo test --workspace --lib --bins --tests --no-fail-fast -- --test-threads=1
+  - cargo test --workspace --doc --no-fail-fast
+  - python3 scripts/generate_five_point_wgsl.py --check
+  - python3 scripts/test_generate_five_point_wgsl.py
+  - python3 scripts/check_cpu_glam.py
+handoff: docs/agent/changes/RS-2026-003-crate-naming/verification.md
+integration_checkout: /Users/tfjiang/Projects/RustScan

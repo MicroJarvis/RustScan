@@ -5,7 +5,7 @@
 # flowers2 subset (frame_0001.jpg .. frame_0024.jpg) that the ignored
 # `real_colmap_sparse_*` RustSFM tests read from
 # `artifacts/inputs/flowers2_colmap/sparse/text`. It is intentionally not
-# distributed through Git or submodules (see rustsfm/README.md).
+# distributed through Git or submodules (see rustscan-sfm/README.md).
 #
 # Provenance: generated 2026-06-30 and archived as the committed fixture
 # `artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630` (historical copies also
@@ -65,4 +65,4 @@ cp "$SRC_DIR/cameras.txt" "$SRC_DIR/frames.txt" "$SRC_DIR/images.txt" \
    "$SRC_DIR/points3D.txt" "$SRC_DIR/rigs.txt" "$ROOT/$DEST/"
 
 echo "provisioned: $ROOT/$DEST"
-echo "run parity tests with: cargo test -p rustsfm --lib -- --ignored"
+echo "run parity tests with: cargo test -p rustscan-sfm --lib -- --ignored"

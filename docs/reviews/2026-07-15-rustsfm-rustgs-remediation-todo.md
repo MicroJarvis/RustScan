@@ -63,18 +63,18 @@ and the listed verification gate all pass.
 
 ## Required Gates
 
-- [x] `cargo fmt -p rustsfm -p rustgs -- --check`
-- [x] `cargo test -p rustsfm --lib --no-fail-fast`
-- [x] `cargo test -p rustgs --all-targets --no-fail-fast`
-- [x] `cargo test -p rustgs --no-default-features --all-targets --no-fail-fast`
-- [x] `cargo clippy -p rustgs --all-targets -- -D warnings`
+- [x] `cargo fmt -p rustscan-sfm -p rustscan-gs -- --check`
+- [x] `cargo test -p rustscan-sfm --lib --no-fail-fast`
+- [x] `cargo test -p rustscan-gs --all-targets --no-fail-fast`
+- [x] `cargo test -p rustscan-gs --no-default-features --all-targets --no-fail-fast`
+- [x] `cargo clippy -p rustscan-gs --all-targets -- -D warnings`
 - [x] RustGS executes non-zero unit and integration test counts.
 
 Additional executed gates:
 
 - [x] RustSFM writer to RustGS loader contract test with `rustsfm-contract-tests`.
 - [x] Ignored-by-default tiny wgpu integration test executed on a working adapter.
-- [x] `cargo check -p rust-viewer` after adding the terminal training-failure event.
+- [x] `cargo check -p rustscan-viewer` after adding the terminal training-failure event.
 
 ## Completion Definition
 

@@ -27,9 +27,10 @@ artifacts/runs/legacy/flowers2/
 
 ## `artifacts/evidence/`
 
-只保留体积较小、需要版本化并被文档引用的实验证据，例如 JSON、日志和复现脚本。
-大型二进制快照、数据库和中间文件放到 `artifacts/runs/`，不要复制到这里。可再生的 GPU
-sidecar 文件继续按 `.gitignore` 规则忽略。
+放需要版本化并被文档引用的实验证据，包括 JSON、日志、复现脚本和按主题归档的实验报告。
+当前 GPU 五点法报告集中在 `artifacts/evidence/gpu-five-point/`。大型二进制快照、数据库和
+中间文件放到 `artifacts/runs/`，不要复制到这里。可再生的 GPU sidecar 文件继续按
+`.gitignore` 规则忽略。
 
 ## 去重规则
 

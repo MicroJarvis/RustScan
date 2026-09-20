@@ -95,7 +95,7 @@ target/release/rustgs train \
 ### Comparable Evaluation Gate
 
 ```bash
-cargo run --manifest-path rustgs/Cargo.toml --example evaluate_psnr -- \
+cargo run --manifest-path rustscan-gs/Cargo.toml --example evaluate_psnr -- \
   --scene /tmp/rustgs-tum-freeze-study/tum_litegs_720_baseline_release.ply \
   --dataset /Users/tfjiang/Projects/RustScan/artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz \
   --render-scale 0.25 \

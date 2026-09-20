@@ -37,18 +37,18 @@ jobs:
       - name: rustscan-types tests
         run: cargo test -p rustscan-types --lib
       - name: RustFF tests
-        run: cargo test -p rustff --lib
+        run: cargo test -p rustscan-ff --lib
       - name: RustGS tests
-        run: cargo test -p rustgs --all-targets
+        run: cargo test -p rustscan-gs --all-targets
       - name: RustViewer tests
-        run: cargo test -p rust-viewer --all-targets
+        run: cargo test -p rustscan-viewer --all-targets
       - name: RustScan CLI tests
         run: cargo test -p rustscan --all-targets
       - name: RustMesh tests
-        working-directory: rustmesh
+        working-directory: rustscan-mesh
         run: cargo test
       - name: RustSLAM tests (including E2E)
-        working-directory: rustslam
+        working-directory: rustscan-slam
         env:
           RUSTSCAN_E2E: "1"
         run: cargo test
@@ -71,19 +71,19 @@ jobs:
             libvulkan1 \
             mesa-vulkan-drivers
       - name: RustSFM format
-        run: cargo fmt --package rustsfm --check
+        run: cargo fmt --package rustscan-sfm --check
       - name: RustSFM no-default compile gate
-        run: cargo check -p rustsfm --no-default-features --all-targets
+        run: cargo check -p rustscan-sfm --no-default-features --all-targets
       - name: RustSFM library tests
         run: >-
-          cargo test -p rustsfm --lib
+          cargo test -p rustscan-sfm --lib
           --features gpu-wgpu,vlfeat-sift
           -- --test-threads=1
       - name: RustSFM GPU integration tests
         env:
           WGPU_BACKEND: vulkan
         run: >-
-          cargo test -p rustsfm
+          cargo test -p rustscan-sfm
           --test adaptive_keyframes
           --test build_support
           --test sequence_registration
@@ -117,7 +117,7 @@ jobs:
         run: ./scripts/provision_flowers2_colmap_fixture.sh
       - name: RustSFM ignored flowers2 parity suite
         run: >-
-          cargo test -p rustsfm --lib
+          cargo test -p rustscan-sfm --lib
           --features gpu-wgpu,vlfeat-sift
           -- --ignored --test-threads=1
 
@@ -130,5 +130,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: RustSFM filesystem publication tests
         run: >-
-          cargo test -p rustsfm --lib --no-default-features
+          cargo test -p rustscan-sfm --lib --no-default-features
           sequence_registration::task6_tests

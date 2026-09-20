@@ -52,7 +52,7 @@ python3 scripts/prepare_rustgs_benchmark_pack.py \
 ## Run A Quick Benchmark
 
 ```sh
-cargo run -p rustgs --release --bin rustgs -- train \
+cargo run -p rustscan-gs --release --bin rustgs -- train \
   --input artifacts/runs/rustgs_benchmark_pack/tum_freiburg1_xyz_colmap \
   --output artifacts/runs/rustgs_benchmark_pack/runs/tum_freiburg1_xyz_colmap_500.ply \
   --iterations 500 \

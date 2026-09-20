@@ -1,6 +1,6 @@
 # rustscan-taskflow
 
-独立的、进程内资源感知 CPU/GPU DAG 调度 crate。多个 workflow 共用一个 `Runtime`，而不是各自创建不受约束的执行器。当前提供可运行的调度核心、异构执行示例和测试；RustSFM 已提供显式启用的 CPU 特征提取/数据库写入和 Ceres BA 接入（见 `rustsfm/README.md`）。**尚未接管 RustViewer 或整个 SfM pipeline，也不代表已经提升了 SfM 性能**。
+独立的、进程内资源感知 CPU/GPU DAG 调度 crate。多个 workflow 共用一个 `Runtime`，而不是各自创建不受约束的执行器。当前提供可运行的调度核心、异构执行示例和测试；RustSFM 已提供显式启用的 CPU 特征提取/数据库写入和 Ceres BA 接入（见 `rustscan-sfm/README.md`）。**尚未接管 RustViewer 或整个 SfM pipeline，也不代表已经提升了 SfM 性能**。
 
 ## 快速使用
 

@@ -152,7 +152,7 @@ def benchmark_scenes(output_root: Path) -> list[BenchmarkScene]:
 def train_command(scene: BenchmarkScene, output_root: Path, iterations: int) -> str:
     scene_out = output_root / "runs" / f"{scene.scene_id}_{iterations}.ply"
     return (
-        "cargo run -p rustgs --release --bin rustgs -- train "
+        "cargo run -p rustscan-gs --release --bin rustgs -- train "
         f"--input {scene.prepared_input} "
         f"--output {scene_out} "
         f"--iterations {iterations} "

@@ -1,0 +1,72 @@
+[package]
+name = "rustscan-slam"
+version = "0.1.0"
+edition = "2021"
+description = "A pure Rust Visual SLAM library"
+authors = ["RustScan Team"]
+license = "MIT"
+
+[dependencies]
+# 图像处理 (可选)
+opencv = { version = "0.98", optional = true, features = ["videoio", "imgproc"] }
+
+# Bundle Adjustment (apex-solver)
+apex-solver = "1.0"
+
+# 深度学习 (可选，用于 SuperPoint)
+tch = { version = "0.5", optional = true }
+
+# 并发
+rayon = "1.8"
+
+# 线程间通信 (用于实时管道)
+crossbeam-channel = "0.5"
+
+# 序列化
+serde = { workspace = true }
+serde_yaml = "0.9"
+toml = "0.8"
+
+# CLI & JSON
+clap = { version = "4.5", features = ["derive"] }
+serde_json = "1.0"
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# 错误处理
+thiserror = { workspace = true }
+
+# 图像处理
+image = { version = "0.25", optional = true }
+
+# KD-Tree for KNN matching
+kiddo = "5.2.1"
+
+# Linear algebra (required for apex-solver)
+nalgebra = { workspace = true }
+rustscan-types = { path = "../rustscan-types" }
+
+# Video decoding
+ffmpeg-next = { version = "8.0", optional = true }
+lru = { version = "0.12", optional = true }
+sysinfo = { version = "0.30", optional = true }
+
+[features]
+default = ["slam-pipeline"]
+slam-pipeline = ["dep:ffmpeg-next", "dep:lru", "dep:sysinfo"]
+viewer-types = []
+opencv = ["dep:opencv"]
+deep-learning = ["dep:tch"]
+image = ["dep:image"]
+
+[dev-dependencies]
+tempfile = "3.3"
+
+[build-dependencies]
+bindgen = "0.69"
+
+[[bin]]
+name = "rustslam"
+path = "src/main.rs"

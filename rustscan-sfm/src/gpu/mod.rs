@@ -1,0 +1,1661 @@
+//! GPU backends for COLMAP-parity feature extraction and matching.
+//!
+//! Platform strategy: **wgpu** only (Vulkan / Metal / DX12). CUDA and SiftGPU are
+//! intentionally out of scope.
+
+use crate::sift::{SiftExtractionOptions, SiftFeatures};
+#[cfg(feature = "gpu-wgpu")]
+use anyhow::Context;
+use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+use std::ops::AddAssign;
+
+#[cfg(feature = "gpu-wgpu")]
+mod context;
+#[cfg(feature = "gpu-wgpu")]
+mod five_point_f32;
+#[cfg(feature = "gpu-wgpu")]
+mod matcher;
+#[cfg(feature = "gpu-wgpu")]
+mod pnp_focal;
+#[cfg(feature = "gpu-wgpu")]
+mod pnp_scorer;
+#[cfg(feature = "gpu-wgpu")]
+mod scorer;
+#[cfg(feature = "gpu-wgpu")]
+mod sift;
+
+#[cfg(feature = "gpu-wgpu")]
+pub use context::WgpuContext;
+#[cfg(feature = "gpu-wgpu")]
+pub use matcher::{WgpuSiftMatcher, WgpuSiftMatcherTiming};
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) use pnp_focal::WgpuPnPFocalSolver;
+#[cfg(all(feature = "gpu-wgpu", test))]
+pub(crate) use pnp_focal::{
+    GpuPnpFocalCandidate, GpuPnpFocalModel, GpuPnpFocalResult, WgpuPnPFocalCandidateGenerator,
+    WgpuPnPFocalSampler, WgpuPnPFocalScorer,
+};
+#[cfg(all(feature = "gpu-wgpu", test))]
+pub(crate) fn is_known_macos_agx_pipeline_failure(error: &anyhow::Error) -> bool {
+    pnp_focal::is_known_macos_agx_pipeline_failure(error)
+}
+#[cfg(feature = "gpu-wgpu")]
+pub use five_point_f32::{
+    FivePointAlgebraResult, FivePointConstraintMatrix, FivePointModelSlot, FivePointNullspaceBasis,
+    FivePointNullspaceResult, FivePointProfile, FivePointSession, FivePointSlotStatus,
+    FivePointStatus, FivePointTrialResult, WgpuFivePointF32, FIVE_POINT_PASS_NAMES,
+};
+#[cfg(feature = "gpu-wgpu")]
+pub use pnp_scorer::WgpuPnpModelScorer;
+#[cfg(all(feature = "gpu-wgpu", test))]
+pub(crate) use pnp_scorer::{GpuPnpImagePoint, GpuPnpModel, GpuPnpObjectPoint};
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) use scorer::WgpuModelScoringSession;
+#[cfg(feature = "gpu-wgpu")]
+pub use scorer::{GpuModelSupport, GpuPackedMasks, TwoViewModelKind, WgpuModelScorer};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WgpuModelScorerTiming {
+    pub buffer_prepare_seconds: f64,
+    pub submit_seconds: f64,
+    pub readback_total_seconds: f64,
+    pub readback_copy_submit_seconds: f64,
+    pub readback_wait_seconds: f64,
+    pub readback_map_decode_seconds: f64,
+    pub score_calls: usize,
+    pub mask_calls: usize,
+    pub models_scored: usize,
+    pub readback_calls: usize,
+    pub readback_bytes: u64,
+}
+
+impl AddAssign for WgpuModelScorerTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.buffer_prepare_seconds += rhs.buffer_prepare_seconds;
+        self.submit_seconds += rhs.submit_seconds;
+        self.readback_total_seconds += rhs.readback_total_seconds;
+        self.readback_copy_submit_seconds += rhs.readback_copy_submit_seconds;
+        self.readback_wait_seconds += rhs.readback_wait_seconds;
+        self.readback_map_decode_seconds += rhs.readback_map_decode_seconds;
+        self.score_calls = self.score_calls.saturating_add(rhs.score_calls);
+        self.mask_calls = self.mask_calls.saturating_add(rhs.mask_calls);
+        self.models_scored = self.models_scored.saturating_add(rhs.models_scored);
+        self.readback_calls = self.readback_calls.saturating_add(rhs.readback_calls);
+        self.readback_bytes = self.readback_bytes.saturating_add(rhs.readback_bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WgpuRansacStageTiming {
+    pub session_prepare_seconds: f64,
+    pub candidate_generation_seconds: f64,
+    pub cpu_refinement_seconds: f64,
+    pub scorer: WgpuModelScorerTiming,
+}
+
+impl AddAssign for WgpuRansacStageTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.session_prepare_seconds += rhs.session_prepare_seconds;
+        self.candidate_generation_seconds += rhs.candidate_generation_seconds;
+        self.cpu_refinement_seconds += rhs.cpu_refinement_seconds;
+        self.scorer += rhs.scorer;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WgpuGeometryTiming {
+    pub essential: WgpuRansacStageTiming,
+    pub fundamental: WgpuRansacStageTiming,
+    pub homography: WgpuRansacStageTiming,
+}
+
+impl AddAssign for WgpuGeometryTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.essential += rhs.essential;
+        self.fundamental += rhs.fundamental;
+        self.homography += rhs.homography;
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+use self::sift::{SiftDescriptorComputer, SiftDetector, SiftOrientationAssigner, SiftPyramid};
+#[cfg(feature = "gpu-wgpu")]
+use crate::database::ColmapKeypoint;
+#[cfg(feature = "gpu-wgpu")]
+use crate::sift::SiftDescriptorNormalization;
+#[cfg(feature = "gpu-wgpu")]
+use lowe_sift::Descriptor;
+#[cfg(feature = "gpu-wgpu")]
+use rustscan_slam::KeyPoint;
+#[cfg(feature = "gpu-wgpu")]
+use std::cmp::Ordering;
+#[cfg(feature = "gpu-wgpu")]
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackendKind {
+    Wgpu,
+    Vulkan,
+}
+
+#[derive(Debug, Clone)]
+pub struct GpuSiftCapabilities {
+    pub backend: GpuBackendKind,
+    pub device_name: String,
+}
+
+pub trait GpuSiftExtractor {
+    fn capabilities(&self) -> &GpuSiftCapabilities;
+
+    fn extract_sift(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures>;
+}
+
+pub fn validate_gpu_sift_options(options: &SiftExtractionOptions) -> Result<()> {
+    if options.estimate_affine_shape {
+        bail!("wgpu SIFT does not support affine shape estimation");
+    }
+    if options.domain_size_pooling {
+        bail!("wgpu SIFT does not support domain-size pooling");
+    }
+    if options.force_covariant_extractor {
+        bail!("wgpu SIFT does not support the covariant extractor");
+    }
+    if options.first_octave < -1 {
+        bail!("wgpu SIFT first_octave must be >= -1");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+struct GpuFeatureRecord {
+    keypoint: sift::GpuKeypoint,
+    descriptor: [f32; lowe_sift::DESCRIPTOR_LEN],
+}
+
+#[cfg(feature = "gpu-wgpu")]
+pub struct WgpuSiftExtractor {
+    pyramid: SiftPyramid,
+    detector: SiftDetector,
+    orientation: SiftOrientationAssigner,
+    descriptor: SiftDescriptorComputer,
+    capabilities: GpuSiftCapabilities,
+}
+
+#[cfg(not(feature = "gpu-wgpu"))]
+pub struct WgpuSiftExtractor;
+
+#[cfg(feature = "gpu-wgpu")]
+impl WgpuSiftExtractor {
+    pub fn try_new() -> Result<Self> {
+        Self::from_context(WgpuContext::try_new()?)
+    }
+
+    pub fn from_context(context: Arc<WgpuContext>) -> Result<Self> {
+        Ok(Self {
+            capabilities: context.capabilities().clone(),
+            pyramid: SiftPyramid::new(context.clone())?,
+            detector: SiftDetector::new(context.clone())?,
+            orientation: SiftOrientationAssigner::new(context.clone())?,
+            descriptor: SiftDescriptorComputer::new(context.clone())?,
+        })
+    }
+
+    pub fn extract_grayscale(
+        &self,
+        gray: &[u8],
+        width: u32,
+        height: u32,
+        options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures> {
+        validate_gpu_sift_options(options)?;
+        validate_gray_buffer(gray, width, height)?;
+        let (gray, width, height) = crate::sift::prepare_grayscale_for_extraction(
+            gray,
+            width,
+            height,
+            options.max_image_size,
+        )?;
+        let plan = sift::SiftPlan::new(width, height, options)?;
+        let Some(first_octave) = plan.octaves.first() else {
+            return Ok(SiftFeatures::default());
+        };
+        let base = gray
+            .iter()
+            .map(|&value| f32::from(value) / 255.0)
+            .collect::<Vec<_>>();
+        let mut octave_base = resize_f32(
+            &base,
+            width,
+            height,
+            first_octave.width,
+            first_octave.height,
+        )?;
+        let mut records = Vec::new();
+        let intervals = options.octave_resolution;
+        let sigma0 = 1.6f32;
+        let root_sift = matches!(options.normalization, SiftDescriptorNormalization::L1Root);
+
+        for (ordinal, octave) in plan.octaves.iter().enumerate() {
+            let (octave_width, octave_height) = octave.dimensions();
+            if octave_base.len() != octave.pixel_count()? {
+                bail!(
+                    "GPU SIFT octave base has {} pixels, expected {}",
+                    octave_base.len(),
+                    octave.pixel_count()?
+                );
+            }
+
+            let mut gaussians = Vec::with_capacity(octave.gaussian_levels);
+            let first = self
+                .pyramid
+                .gaussian(&octave_base, octave_width, octave_height, sigma0)?;
+            gaussians.push(first);
+            for level in 1..octave.gaussian_levels {
+                let previous_sigma = sigma0 * 2.0f32.powf((level - 1) as f32 / intervals as f32);
+                let sigma = sigma0 * 2.0f32.powf(level as f32 / intervals as f32);
+                let incremental_sigma = (sigma * sigma - previous_sigma * previous_sigma)
+                    .max(1.0e-6)
+                    .sqrt();
+                let next = self.pyramid.gaussian(
+                    gaussians
+                        .last()
+                        .context("GPU SIFT Gaussian level missing")?,
+                    octave_width,
+                    octave_height,
+                    incremental_sigma,
+                )?;
+                gaussians.push(next);
+            }
+
+            let mut dogs = Vec::with_capacity(octave.dog_levels);
+            for level in 0..octave.dog_levels {
+                dogs.push(self.pyramid.dog(
+                    &gaussians[level],
+                    &gaussians[level + 1],
+                    octave_width,
+                    octave_height,
+                )?);
+            }
+            let pixels = octave.pixel_count()?;
+            let mut dog_volume = Vec::with_capacity(pixels * dogs.len());
+            for dog in &dogs {
+                dog_volume.extend_from_slice(dog);
+            }
+            let max_capacity = plan
+                .candidate_capacity
+                .saturating_mul(8)
+                .max(plan.candidate_capacity);
+            let candidates = self.detector.detect_volume_with_retry(
+                &dog_volume,
+                sift::DetectorParams {
+                    width: octave_width,
+                    height: octave_height,
+                    levels: octave.dog_levels as u32,
+                    capacity: plan.candidate_capacity,
+                    peak_threshold: options.peak_threshold as f32,
+                    edge_threshold: options.edge_threshold as f32,
+                    sigma0,
+                    octave_scale: 1.0,
+                    octave: octave.octave,
+                    octave_resolution: intervals as u32,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                max_capacity,
+            )?;
+
+            for level in 1..octave.dog_levels.saturating_sub(1) {
+                let level_points = candidates
+                    .iter()
+                    .filter(|point| point.level == level as i32)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if level_points.is_empty() {
+                    continue;
+                }
+                let level_image = &gaussians[level];
+                let oriented = self.orientation.assign(
+                    level_image,
+                    octave_width,
+                    octave_height,
+                    &level_points,
+                    options.max_num_orientations as u32,
+                    options.upright,
+                )?;
+                let descriptors = self.descriptor.compute(
+                    level_image,
+                    octave_width,
+                    octave_height,
+                    &oriented,
+                    root_sift,
+                )?;
+                records.extend(oriented.into_iter().zip(descriptors).map(
+                    |(keypoint, descriptor)| GpuFeatureRecord {
+                        keypoint,
+                        descriptor,
+                    },
+                ));
+            }
+
+            if ordinal + 1 < plan.octaves.len() {
+                octave_base =
+                    self.pyramid
+                        .downsample(&gaussians[intervals], octave_width, octave_height)?;
+            }
+        }
+
+        records.sort_by(gpu_feature_order);
+        records.truncate(options.max_num_features);
+        Ok(records_to_sift_features(records))
+    }
+}
+
+#[cfg(not(feature = "gpu-wgpu"))]
+impl WgpuSiftExtractor {
+    pub fn try_new() -> Result<Self> {
+        bail!("RustSFM was built without gpu-wgpu support")
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl GpuSiftExtractor for WgpuSiftExtractor {
+    fn capabilities(&self) -> &GpuSiftCapabilities {
+        &self.capabilities
+    }
+
+    fn extract_sift(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures> {
+        let gray = crate::sift::rgb_to_colmap_gray_u8(rgb, width, height)?;
+        self.extract_grayscale(&gray, width, height, options)
+    }
+}
+
+#[cfg(not(feature = "gpu-wgpu"))]
+impl GpuSiftExtractor for WgpuSiftExtractor {
+    fn capabilities(&self) -> &GpuSiftCapabilities {
+        static CAPS: std::sync::OnceLock<GpuSiftCapabilities> = std::sync::OnceLock::new();
+        CAPS.get_or_init(|| GpuSiftCapabilities {
+            backend: GpuBackendKind::Wgpu,
+            device_name: "unavailable".to_string(),
+        })
+    }
+
+    fn extract_sift(
+        &self,
+        _rgb: &[u8],
+        _width: u32,
+        _height: u32,
+        _options: &SiftExtractionOptions,
+    ) -> Result<SiftFeatures> {
+        bail!("RustSFM was built without gpu-wgpu support")
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn validate_gray_buffer(gray: &[u8], width: u32, height: u32) -> Result<()> {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|count| usize::try_from(count).ok())
+        .context("GPU SIFT grayscale image size overflow")?;
+    if gray.len() != expected {
+        bail!(
+            "GPU SIFT grayscale buffer length {} does not match {}x{}",
+            gray.len(),
+            width,
+            height
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn resize_f32(
+    input: &[f32],
+    input_width: u32,
+    input_height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Result<Vec<f32>> {
+    if input_width == output_width && input_height == output_height {
+        return Ok(input.to_vec());
+    }
+    if input_width == 0 || input_height == 0 || output_width == 0 || output_height == 0 {
+        bail!("GPU SIFT resize dimensions must be non-zero");
+    }
+    let output_count = u64::from(output_width)
+        .checked_mul(u64::from(output_height))
+        .and_then(|count| usize::try_from(count).ok())
+        .context("GPU SIFT resized image size overflow")?;
+    let mut output = vec![0.0; output_count];
+    let x_scale = input_width as f32 / output_width as f32;
+    let y_scale = input_height as f32 / output_height as f32;
+    for y in 0..output_height {
+        let source_y = ((y as f32 + 0.5) * y_scale - 0.5).clamp(0.0, (input_height - 1) as f32);
+        let y0 = source_y.floor() as u32;
+        let y1 = (y0 + 1).min(input_height - 1);
+        let fy = source_y - y0 as f32;
+        for x in 0..output_width {
+            let source_x = ((x as f32 + 0.5) * x_scale - 0.5).clamp(0.0, (input_width - 1) as f32);
+            let x0 = source_x.floor() as u32;
+            let x1 = (x0 + 1).min(input_width - 1);
+            let fx = source_x - x0 as f32;
+            let top = input[(y0 * input_width + x0) as usize] * (1.0 - fx)
+                + input[(y0 * input_width + x1) as usize] * fx;
+            let bottom = input[(y1 * input_width + x0) as usize] * (1.0 - fx)
+                + input[(y1 * input_width + x1) as usize] * fx;
+            output[(y * output_width + x) as usize] = top * (1.0 - fy) + bottom * fy;
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn gpu_feature_order(left: &GpuFeatureRecord, right: &GpuFeatureRecord) -> Ordering {
+    let left_scale = left.keypoint.sigma * 2.0f32.powi(left.keypoint.octave);
+    let right_scale = right.keypoint.sigma * 2.0f32.powi(right.keypoint.octave);
+    right_scale
+        .total_cmp(&left_scale)
+        .then_with(|| right.keypoint.response.total_cmp(&left.keypoint.response))
+        .then_with(|| left.keypoint.octave.cmp(&right.keypoint.octave))
+        .then_with(|| left.keypoint.level.cmp(&right.keypoint.level))
+        .then_with(|| left.keypoint.y.total_cmp(&right.keypoint.y))
+        .then_with(|| left.keypoint.x.total_cmp(&right.keypoint.x))
+        .then_with(|| left.keypoint.angle.total_cmp(&right.keypoint.angle))
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn records_to_sift_features(records: Vec<GpuFeatureRecord>) -> SiftFeatures {
+    let mut output = SiftFeatures {
+        keypoints: Vec::with_capacity(records.len()),
+        descriptors: Vec::with_capacity(records.len()),
+        colmap_keypoints: Vec::with_capacity(records.len()),
+        descriptors_u8: Vec::with_capacity(records.len()),
+    };
+    for record in records {
+        let factor = 2.0f32.powi(record.keypoint.octave);
+        let x = record.keypoint.x * factor;
+        let y = record.keypoint.y * factor;
+        let scale = record.keypoint.sigma * factor;
+        let size = 2.0 * scale;
+        let angle = record.keypoint.angle;
+        output.keypoints.push(KeyPoint {
+            pt: (x, y),
+            size,
+            angle,
+            response: record.keypoint.response,
+            octave: record.keypoint.octave,
+        });
+        output
+            .colmap_keypoints
+            .push(ColmapKeypoint::from_scale_orientation(x, y, size, angle));
+        output.descriptors.push(Descriptor::new(record.descriptor));
+        output
+            .descriptors_u8
+            .push(sift::quantize_gpu_descriptor(&record.descriptor));
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "gpu-wgpu")]
+    use wgpu::util::DeviceExt;
+
+    #[test]
+    fn gpu_geometry_timing_accumulates_model_scorer_work() {
+        let mut total = WgpuModelScorerTiming {
+            buffer_prepare_seconds: 0.2,
+            submit_seconds: 0.3,
+            readback_total_seconds: 0.4,
+            readback_copy_submit_seconds: 0.05,
+            readback_wait_seconds: 0.25,
+            readback_map_decode_seconds: 0.3,
+            score_calls: 1,
+            mask_calls: 0,
+            models_scored: 64,
+            readback_calls: 1,
+            readback_bytes: 512,
+        };
+        total += WgpuModelScorerTiming {
+            buffer_prepare_seconds: 1.0,
+            submit_seconds: 2.0,
+            readback_total_seconds: 3.0,
+            readback_copy_submit_seconds: 0.5,
+            readback_wait_seconds: 2.0,
+            readback_map_decode_seconds: 2.5,
+            score_calls: 0,
+            mask_calls: 1,
+            models_scored: 0,
+            readback_calls: 1,
+            readback_bytes: 1024,
+        };
+
+        assert_eq!(total.score_calls, 1);
+        assert_eq!(total.mask_calls, 1);
+        assert_eq!(total.models_scored, 64);
+        assert_eq!(total.readback_calls, 2);
+        assert_eq!(total.readback_bytes, 1536);
+        assert!((total.buffer_prepare_seconds - 1.2).abs() < 1.0e-12);
+        assert!((total.readback_wait_seconds - 2.25).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn gpu_geometry_timing_preserves_ransac_stage_attribution() {
+        let mut total = WgpuGeometryTiming {
+            essential: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            fundamental: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 10,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            homography: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 100,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        total += WgpuGeometryTiming {
+            essential: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            fundamental: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 20,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            homography: WgpuRansacStageTiming {
+                scorer: WgpuModelScorerTiming {
+                    score_calls: 200,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(total.essential.scorer.score_calls, 3);
+        assert_eq!(total.fundamental.scorer.score_calls, 30);
+        assert_eq!(total.homography.scorer.score_calls, 300);
+    }
+
+    #[cfg(all(feature = "gpu-wgpu", not(feature = "gpu-vulkan")))]
+    #[test]
+    fn wgpu_context_reports_a_real_adapter_when_available() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU smoke test: no compatible adapter");
+            return Ok(());
+        };
+        assert!(!context.capabilities().device_name.trim().is_empty());
+        assert_eq!(context.capabilities().backend, GpuBackendKind::Wgpu);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-vulkan")]
+    #[test]
+    fn wgpu_context_requires_vulkan_adapter() -> Result<()> {
+        let context = WgpuContext::try_new()?;
+
+        assert_eq!(context.backend(), wgpu::Backend::Vulkan);
+        assert_eq!(context.capabilities().backend, GpuBackendKind::Vulkan);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_context_reads_back_a_storage_buffer() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU readback test: no compatible adapter");
+            return Ok(());
+        };
+        let expected = [3u32, 5, 8, 13];
+        let buffer = context
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rustsfm readback test input"),
+                contents: bytemuck::cast_slice(&expected),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+        let actual = context.read_buffer::<u32>(&buffer, expected.len())?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_sift_rejects_covariant_modes_before_device_creation() {
+        let options = SiftExtractionOptions {
+            use_gpu: true,
+            estimate_affine_shape: true,
+            ..SiftExtractionOptions::default()
+        };
+        let error = validate_gpu_sift_options(&options).unwrap_err();
+        assert!(error.to_string().contains("affine shape"));
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_sift_checkerboard_produces_aligned_colmap_outputs() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU extractor test: no compatible adapter");
+            return Ok(());
+        };
+        let extractor = WgpuSiftExtractor::from_context(context)?;
+        let gray = checkerboard_u8(256, 256, 16);
+        let options = SiftExtractionOptions {
+            use_gpu: true,
+            max_num_features: 512,
+            ..SiftExtractionOptions::default()
+        };
+        let features = extractor.extract_grayscale(&gray, 256, 256, &options)?;
+        assert!(!features.keypoints.is_empty());
+        assert!(features.keypoints.len() <= 512);
+        assert_eq!(features.keypoints.len(), features.descriptors.len());
+        assert_eq!(features.keypoints.len(), features.colmap_keypoints.len());
+        assert_eq!(features.keypoints.len(), features.descriptors_u8.len());
+        assert!(features
+            .keypoints
+            .iter()
+            .all(|point| { point.x().is_finite() && point.y().is_finite() && point.size > 0.0 }));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_sift_constant_image_returns_no_features() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU extractor test: no compatible adapter");
+            return Ok(());
+        };
+        let extractor = WgpuSiftExtractor::from_context(context)?;
+        let features = extractor.extract_grayscale(
+            &vec![127; 128 * 96],
+            128,
+            96,
+            &SiftExtractionOptions {
+                use_gpu: true,
+                ..SiftExtractionOptions::default()
+            },
+        )?;
+        assert!(features.keypoints.is_empty());
+        assert!(features.descriptors.is_empty());
+        assert!(features.colmap_keypoints.is_empty());
+        assert!(features.descriptors_u8.is_empty());
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_sift_matcher_applies_ratio_distance_and_cross_check() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU matcher test: no compatible adapter");
+            return Ok(());
+        };
+        let mut zero = [0u8; 128];
+        let mut full = [255u8; 128];
+        let mut middle = [128u8; 128];
+        zero[0] = 1;
+        full[0] = 254;
+        middle[0] = 127;
+        let left = [zero, full];
+        let right = [zero, full, middle];
+        let options = crate::sift::SiftMatchingOptions {
+            max_ratio: 0.8,
+            max_distance: 0.7,
+            cross_check: true,
+            max_num_matches: 16,
+            ..Default::default()
+        };
+        let matches =
+            WgpuSiftMatcher::from_context(context)?.match_descriptors(&left, &right, &options)?;
+        assert_eq!(
+            matches
+                .iter()
+                .map(|value| (value.query_idx, value.train_idx))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 1)]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_match_timing_accumulates_durations_bytes_and_calls() {
+        let mut total = WgpuSiftMatcherTiming {
+            descriptor_pack_seconds: 0.1,
+            buffer_prepare_seconds: 0.2,
+            submit_seconds: 0.3,
+            readback_total_seconds: 0.4,
+            readback_copy_submit_seconds: 0.05,
+            readback_wait_seconds: 0.25,
+            readback_map_decode_seconds: 0.1,
+            cpu_postprocess_seconds: 0.6,
+            direction_calls: 1,
+            readback_calls: 1,
+            readback_bytes: 64,
+        };
+        total += WgpuSiftMatcherTiming {
+            descriptor_pack_seconds: 1.0,
+            buffer_prepare_seconds: 2.0,
+            submit_seconds: 3.0,
+            readback_total_seconds: 4.0,
+            readback_copy_submit_seconds: 0.5,
+            readback_wait_seconds: 2.5,
+            readback_map_decode_seconds: 1.0,
+            cpu_postprocess_seconds: 6.0,
+            direction_calls: 1,
+            readback_calls: 1,
+            readback_bytes: 128,
+        };
+
+        assert_eq!(total.direction_calls, 2);
+        assert_eq!(total.readback_calls, 2);
+        assert_eq!(total.readback_bytes, 192);
+        assert!((total.descriptor_pack_seconds - 1.1).abs() < 1.0e-12);
+        assert!((total.readback_wait_seconds - 2.75).abs() < 1.0e-12);
+        assert!((total.cpu_postprocess_seconds - 6.6).abs() < 1.0e-12);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn gpu_match_timing_profiled_matcher_reports_cross_check_work() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping profiled GPU matcher test: no compatible adapter");
+            return Ok(());
+        };
+        let left = [[0u8; 128], [255u8; 128]];
+        let right = [[0u8; 128], [255u8; 128], [127u8; 128]];
+        let options = crate::sift::SiftMatchingOptions {
+            cross_check: true,
+            ..Default::default()
+        };
+
+        let (_matches, timing) = WgpuSiftMatcher::from_context(context)?
+            .match_descriptors_profiled(&left, &right, &options)?;
+
+        assert_eq!(timing.direction_calls, 2);
+        assert_eq!(timing.readback_calls, 2);
+        assert!(timing.readback_bytes > 0);
+        assert!(timing.readback_map_decode_seconds >= timing.readback_wait_seconds);
+        for seconds in [
+            timing.descriptor_pack_seconds,
+            timing.buffer_prepare_seconds,
+            timing.submit_seconds,
+            timing.readback_total_seconds,
+            timing.readback_copy_submit_seconds,
+            timing.readback_wait_seconds,
+            timing.readback_map_decode_seconds,
+            timing.cpu_postprocess_seconds,
+        ] {
+            assert!(seconds.is_finite());
+            assert!(seconds >= 0.0);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_scores_homographies_and_reads_mask() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let points1 = [[0.0, 0.0], [1.0, 2.0], [-3.0, 4.0]];
+        let points2 = points1;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let translated = [1.0, 0.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let summaries = scorer.score_two_view_models(
+            &[identity, translated],
+            &points1,
+            &points2,
+            0.1,
+            TwoViewModelKind::HomographyForward,
+        )?;
+        assert_eq!(summaries[0].inliers, 3);
+        assert!(summaries[0].residual_sum.abs() < 1.0e-6);
+        assert_eq!(summaries[1].inliers, 0);
+        assert_eq!(
+            scorer.inlier_mask(
+                &identity,
+                &points1,
+                &points2,
+                0.1,
+                TwoViewModelKind::HomographyForward,
+            )?,
+            vec![true, true, true]
+        );
+        Ok(())
+    }
+
+    /// The session reuses its model, summary and mask buffers across dispatches,
+    /// so shrinking batches must never observe values left by a larger one.
+    /// The fused score+mask dispatch must reproduce the separate kernels bit for
+    /// bit (summaries and masks) across observation counts that exercise the
+    /// 32-bit word boundaries and multiple 64-lane passes, with one readback.
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_scored_masks_match_separate_kernels() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU scored mask test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let models: Vec<[f32; 9]> = vec![
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.3, 0.0, 1.0, -0.2, 0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.02, 0.0, -0.01, 1.0, 0.0, 0.0, 0.0, 1.0],
+        ];
+        for observation_count in [1usize, 31, 32, 33, 63, 64, 65, 127, 128, 129, 713] {
+            let points1: Vec<[f32; 3]> = (0..observation_count)
+                .map(|i| {
+                    let t = i as f32 * 0.37;
+                    [t.sin() * 3.0, (t * 1.7).cos() * 2.0, 1.0]
+                })
+                .collect();
+            let points2: Vec<[f32; 3]> = points1
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let jitter = if i % 3 == 0 { 0.4 } else { 0.01 };
+                    [p[0] + jitter, p[1] - jitter * 0.5, 1.0]
+                })
+                .collect();
+            let session = scorer.prepare_homogeneous_session(&points1, &points2)?;
+            for kind in [
+                TwoViewModelKind::HomographyForward,
+                TwoViewModelKind::Sampson,
+            ] {
+                let (plain_supports, _) =
+                    session.score_two_view_models_profiled(&models, 0.25, kind)?;
+                let (plain_masks, _) = session.inlier_masks_profiled(&models, 0.25, kind)?;
+                let (fused_supports, fused_masks, timing) =
+                    session.score_two_view_models_with_masks_profiled(&models, 0.25, kind)?;
+                assert_eq!(
+                    fused_supports, plain_supports,
+                    "n={observation_count} {kind:?}"
+                );
+                assert_eq!(fused_masks.model_count(), models.len());
+                for (index, plain_mask) in plain_masks.iter().enumerate() {
+                    let fused_mask = fused_masks.mask(index).expect("mask");
+                    assert_eq!(
+                        &fused_mask, plain_mask,
+                        "n={observation_count} model {index}"
+                    );
+                    assert_eq!(
+                        fused_mask.iter().filter(|&&b| b).count() as u32,
+                        plain_supports[index].inliers
+                    );
+                }
+                assert_eq!(timing.score_calls, 1);
+                assert_eq!(timing.mask_calls, 0);
+                assert_eq!(timing.readback_calls, 1);
+                let words_per_model = observation_count.div_ceil(32);
+                assert_eq!(
+                    timing.readback_bytes,
+                    (models.len() * std::mem::size_of::<GpuModelSupport>()
+                        + models.len() * words_per_model * std::mem::size_of::<u32>())
+                        as u64
+                );
+            }
+            assert!(session.max_two_view_models_per_score_with_masks() >= models.len());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_reused_buffers_match_isolated_sessions() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer buffer reuse test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let points1 = [
+            [0.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0],
+            [-3.0, 4.0, 1.0],
+            [5.0, -1.0, 1.0],
+            [2.0, 7.0, 1.0],
+        ];
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let scaled = [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0];
+        let translated = [1.0, 0.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let sheared = [1.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let batches: [&[[f32; 9]]; 5] = [
+            &[identity, scaled, translated, sheared],
+            &[identity],
+            &[translated, sheared],
+            &[scaled],
+            &[identity, scaled, translated, sheared],
+        ];
+
+        // Descending then ascending batch sizes exercise both reuse and growth.
+        let shared = scorer.prepare_homogeneous_session(&points1, &points1)?;
+        for models in batches {
+            let isolated = scorer.prepare_homogeneous_session(&points1, &points1)?;
+            for kind in [
+                TwoViewModelKind::HomographyForward,
+                TwoViewModelKind::Sampson,
+            ] {
+                let (shared_supports, _) =
+                    shared.score_two_view_models_profiled(models, 0.5, kind)?;
+                let (isolated_supports, _) =
+                    isolated.score_two_view_models_profiled(models, 0.5, kind)?;
+                assert_eq!(shared_supports, isolated_supports);
+
+                let (shared_masks, shared_timing) =
+                    shared.inlier_masks_profiled(models, 0.5, kind)?;
+                let (isolated_masks, _) = isolated.inlier_masks_profiled(models, 0.5, kind)?;
+                assert_eq!(shared_masks, isolated_masks);
+                assert_eq!(shared_masks.len(), models.len());
+                for mask in &shared_masks {
+                    assert_eq!(mask.len(), points1.len());
+                }
+                assert_eq!(shared_timing.mask_calls, 1);
+                assert_eq!(shared_timing.readback_calls, 1);
+                assert_eq!(
+                    shared_timing.readback_bytes,
+                    (models.len() * points1.len() * std::mem::size_of::<u32>()) as u64
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_profiled_reports_support_and_mask_work() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping profiled GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let points = [[0.0, 0.0, 1.0], [1.0, 2.0, 1.0], [-3.0, 4.0, 1.0]];
+        let session = scorer.prepare_homogeneous_session(&points, &points)?;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let translated = [1.0, 0.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let models = [identity, translated];
+
+        let (supports, score_timing) = session.score_two_view_models_profiled(
+            &models,
+            0.1,
+            TwoViewModelKind::HomographyForward,
+        )?;
+        let (mask, mask_timing) =
+            session.inlier_mask_profiled(&identity, 0.1, TwoViewModelKind::HomographyForward)?;
+        let (batched_masks, batched_mask_timing) =
+            session.inlier_masks_profiled(&models, 0.1, TwoViewModelKind::HomographyForward)?;
+        let (empty_supports, empty_timing) = session.score_two_view_models_profiled(
+            &[],
+            0.1,
+            TwoViewModelKind::HomographyForward,
+        )?;
+
+        assert_eq!(supports[0].inliers, 3);
+        assert!(supports[0].residual_sum.abs() < 1.0e-6);
+        assert_eq!(supports[1].inliers, 0);
+        assert_eq!(mask, vec![true, true, true]);
+        assert_eq!(
+            batched_masks,
+            vec![vec![true, true, true], vec![false, false, false]]
+        );
+        assert_eq!(score_timing.score_calls, 1);
+        assert_eq!(score_timing.mask_calls, 0);
+        assert_eq!(score_timing.models_scored, models.len());
+        assert_eq!(score_timing.readback_calls, 1);
+        assert_eq!(mask_timing.score_calls, 0);
+        assert_eq!(mask_timing.mask_calls, 1);
+        assert_eq!(mask_timing.models_scored, 0);
+        assert_eq!(mask_timing.readback_calls, 1);
+        assert_eq!(batched_mask_timing.mask_calls, 1);
+        assert_eq!(batched_mask_timing.readback_calls, 1);
+        assert_eq!(
+            batched_mask_timing.readback_bytes,
+            mask_timing.readback_bytes * models.len() as u64
+        );
+        assert!(score_timing.readback_bytes > 0);
+        assert!(mask_timing.readback_bytes > 0);
+        assert!(score_timing.readback_map_decode_seconds >= score_timing.readback_wait_seconds);
+        assert!(empty_supports.is_empty());
+        assert_eq!(empty_timing, WgpuModelScorerTiming::default());
+        for seconds in [
+            score_timing.buffer_prepare_seconds,
+            score_timing.submit_seconds,
+            score_timing.readback_total_seconds,
+            score_timing.readback_copy_submit_seconds,
+            score_timing.readback_wait_seconds,
+            score_timing.readback_map_decode_seconds,
+            mask_timing.buffer_prepare_seconds,
+            mask_timing.submit_seconds,
+            mask_timing.readback_total_seconds,
+            mask_timing.readback_copy_submit_seconds,
+            mask_timing.readback_wait_seconds,
+            mask_timing.readback_map_decode_seconds,
+        ] {
+            assert!(seconds.is_finite());
+            assert!(seconds >= 0.0);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_matches_sampson_support() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let model = [0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0];
+        let points1 = [[0.0, 0.0], [1.0, 2.0], [-3.0, 4.0]];
+        let points2 = [[5.0, 0.0], [2.0, 2.0], [1.0, 5.0]];
+        let summaries = scorer.score_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            0.1,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(summaries[0].inliers, 2);
+        assert!(summaries[0].residual_sum.abs() < 1.0e-6);
+        assert_eq!(
+            scorer.inlier_mask(&model, &points1, &points2, 0.1, TwoViewModelKind::Sampson,)?,
+            vec![true, true, false]
+        );
+        let boundary = scorer.score_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            1.0,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(boundary[0].inliers, 3);
+        assert!((boundary[0].residual_sum - 0.5).abs() < 1.0e-6);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_preserves_homogeneous_sampson_scaling() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let model = [0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0];
+        let points1 = [[1.0, 4.0, 2.0]];
+        let points2 = [[3.0, 6.0, 2.0]];
+        let rejected = scorer.score_homogeneous_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            1.0,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(rejected[0].inliers, 0);
+        let accepted = scorer.score_homogeneous_two_view_models(
+            &[model],
+            &points1,
+            &points2,
+            2.0,
+            TwoViewModelKind::Sampson,
+        )?;
+        assert_eq!(accepted[0].inliers, 1);
+        assert!((accepted[0].residual_sum - 2.0).abs() < 1.0e-6);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_keeps_degenerate_models_outliers() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let support = scorer.score_two_view_models(
+            &[[0.0; 9]],
+            &[[1.0, 2.0]],
+            &[[1.0, 2.0]],
+            f32::MAX,
+            TwoViewModelKind::HomographyForward,
+        )?;
+        assert_eq!(support[0].inliers, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_model_scorer_validates_inputs_and_handles_empty_observations() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU model scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let scorer = WgpuModelScorer::from_context(context)?;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(
+            scorer.score_two_view_models(
+                &[identity],
+                &[],
+                &[],
+                1.0,
+                TwoViewModelKind::HomographyForward,
+            )?,
+            vec![GpuModelSupport::default()]
+        );
+        assert!(scorer
+            .inlier_mask(
+                &identity,
+                &[],
+                &[],
+                1.0,
+                TwoViewModelKind::HomographyForward,
+            )?
+            .is_empty());
+        assert!(scorer
+            .score_two_view_models(
+                &[identity],
+                &[[0.0, 0.0]],
+                &[],
+                1.0,
+                TwoViewModelKind::HomographyForward,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("point count mismatch"));
+        assert!(scorer
+            .score_two_view_models(
+                &[identity],
+                &[],
+                &[],
+                -1.0,
+                TwoViewModelKind::HomographyForward,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("finite and non-negative"));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_abi_records_are_wgsl_aligned() {
+        assert_eq!(std::mem::size_of::<GpuPnpImagePoint>(), 16);
+        assert_eq!(std::mem::size_of::<GpuPnpObjectPoint>(), 16);
+        assert_eq!(std::mem::size_of::<GpuPnpModel>(), 48);
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_abi_records_are_wgsl_aligned() {
+        assert_eq!(std::mem::size_of::<GpuPnpFocalModel>(), 64);
+        assert_eq!(std::mem::size_of::<GpuPnpFocalResult>(), 32);
+        assert_eq!(
+            std::mem::size_of::<super::pnp_focal::GpuPnpFocalSupport>(),
+            16
+        );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_scorer_uses_candidate_focal_length() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            return Ok(());
+        };
+        let points = [[0.0, 0.0], [70.0, 0.0], [0.0, 70.0], [-70.0, 35.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [0.0, 0.2, 2.0],
+            [-0.2, 0.1, 2.0],
+        ];
+        let mut scorer = WgpuPnPFocalScorer::from_context(context)?;
+        scorer.prepare(&points, &world, 1.0)?;
+        let correct = scorer.score(GpuPnpFocalCandidate {
+            pose: rustscan_slam::SE3::identity(),
+            focal: 700.0,
+        })?;
+        let wrong = scorer.score(GpuPnpFocalCandidate {
+            pose: rustscan_slam::SE3::identity(),
+            focal: 350.0,
+        })?;
+        assert_eq!(correct.inliers, 4);
+        assert!(wrong.inliers < correct.inliers);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_sampling_is_deterministic_and_unique() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal sampler test: no compatible adapter");
+            return Ok(());
+        };
+        let sampler = WgpuPnPFocalSampler::from_context(context)?;
+        let first = sampler.sample_indices(7, 64, 19)?;
+        let second = sampler.sample_indices(7, 64, 19)?;
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        for indices in first {
+            assert!(indices.iter().all(|&index| index < 19));
+            let unique = indices
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique.len(), 4, "sample has duplicate indices: {indices:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_recovers_synthetic_pose_and_focal() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal solver test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = (0usize..32)
+            .map(|index| {
+                let x = (index % 8) as f32 * 0.25 - 0.875;
+                let y = (index / 8) as f32 * 0.25 - 0.375;
+                [x, y, 3.0 + (index % 5) as f32 * 0.15]
+            })
+            .collect::<Vec<_>>();
+        let mut image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+        for point in image.iter_mut().take(6) {
+            point[0] += 500.0;
+            point[1] -= 400.0;
+        }
+
+        let Some(solver) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalSolver::from_context(context),
+            "GPU PnP-focal solver test",
+        )?
+        else {
+            return Ok(());
+        };
+        let result = solver
+            .solve(&image, &world, 2.0, 7, 512, 150.0, 1_400.0)?
+            .expect("valid synthetic PnP-focal solution");
+
+        assert!(result.inliers >= 24);
+        assert!((result.focal - focal).abs() / focal < 0.05);
+        let matrix = result.pose.to_matrix();
+        assert!((matrix[0][0] - 1.0).abs() < 0.05);
+        assert!((matrix[1][1] - 1.0).abs() < 0.05);
+        assert!((matrix[2][2] - 1.0).abs() < 0.05);
+        assert!(matrix[0][3].abs() < 0.05);
+        assert!(matrix[1][3].abs() < 0.05);
+        assert!(matrix[2][3].abs() < 0.05);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_search_grid_spans_configured_bounds() {
+        let focal_grid = super::pnp_focal::focal_search_grid(150.0, 1_400.0, 8).unwrap();
+
+        assert_eq!(focal_grid.len(), 8);
+        assert!((focal_grid[0] - 150.0).abs() < 1.0e-4);
+        assert!((focal_grid[7] - 1_400.0).abs() < 1.0e-3);
+        assert!(focal_grid.windows(2).all(|pair| pair[0] < pair[1]));
+        let ratios = focal_grid
+            .windows(2)
+            .map(|pair| pair[1] / pair[0])
+            .collect::<Vec<_>>();
+        assert!(ratios
+            .windows(2)
+            .all(|pair| (pair[0] - pair[1]).abs() < 1.0e-5));
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_selection_prefers_support_then_residual_then_index() {
+        use rustscan_slam::tracker::PnPModelSupport;
+
+        let supports = [
+            PnPModelSupport {
+                inliers: 10,
+                residual_sum: 3.0,
+            },
+            PnPModelSupport {
+                inliers: 11,
+                residual_sum: 100.0,
+            },
+            PnPModelSupport {
+                inliers: 11,
+                residual_sum: 2.0,
+            },
+            PnPModelSupport {
+                inliers: 11,
+                residual_sum: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            super::pnp_focal::select_best_focal_support(&supports),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_mask_matches_gpu_support() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal mask test: no compatible adapter");
+            return Ok(());
+        };
+        let points = [[0.0, 0.0], [70.0, 0.0], [0.0, 70.0], [500.0, 500.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [0.0, 0.2, 2.0],
+            [-0.2, 0.1, 2.0],
+        ];
+        let candidate = GpuPnpFocalCandidate {
+            pose: rustscan_slam::SE3::identity(),
+            focal: 700.0,
+        };
+        let mut scorer = WgpuPnPFocalScorer::from_context(context)?;
+        scorer.prepare(&points, &world, 1.0)?;
+
+        let support = scorer.score(candidate)?;
+        let mask = scorer.inlier_mask(candidate)?;
+        assert_eq!(
+            mask.iter().filter(|&&inlier| inlier).count(),
+            support.inliers
+        );
+        assert_eq!(mask, vec![true, true, true, false]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_noisy_refinement_does_not_reduce_support() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal refinement test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = (0usize..32)
+            .map(|index| {
+                let x = (index % 8) as f32 * 0.25 - 0.875;
+                let y = (index / 8) as f32 * 0.25 - 0.375;
+                [x, y, 3.0 + (index % 5) as f32 * 0.15]
+            })
+            .collect::<Vec<_>>();
+        let image = world
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let noise_x = (index % 3) as f32 * 0.15 - 0.15;
+                let noise_y = (index % 5) as f32 * 0.10 - 0.20;
+                [
+                    focal * point[0] / point[2] + noise_x,
+                    focal * point[1] / point[2] + noise_y,
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let Some(solver) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalSolver::from_context(context),
+            "GPU PnP-focal refinement test",
+        )?
+        else {
+            return Ok(());
+        };
+        let result = solver
+            .solve(&image, &world, 2.0, 7, 512, 150.0, 1_400.0)?
+            .expect("noisy synthetic PnP-focal solution");
+
+        assert!(result.inliers >= result.initial_inliers);
+        assert_eq!(
+            result.inlier_mask.iter().filter(|&&inlier| inlier).count(),
+            result.inliers
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_out_of_bounds_focal_returns_none() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal bounds test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = (0usize..32)
+            .map(|index| {
+                [
+                    (index.wrapping_mul(17) % 29) as f32 * 0.13 - 1.75,
+                    (index.wrapping_mul(11) % 31) as f32 * 0.11 - 1.65,
+                    1.5 + (index.wrapping_mul(7) % 23) as f32 * 0.23,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+
+        let Some(solver) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalSolver::from_context(context),
+            "GPU PnP-focal bounds test",
+        )?
+        else {
+            return Ok(());
+        };
+        assert!(solver
+            .solve(&image, &world, 0.01, 7, 256, 0.5, 1.0)?
+            .is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_p3p_candidate_projects_its_sample() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal P3P candidate test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = [
+            [-0.6, -0.3, 3.0],
+            [0.5, -0.2, 3.4],
+            [-0.2, 0.6, 3.2],
+            [0.4, 0.5, 3.8],
+        ];
+        let image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+        let Some(generator) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalCandidateGenerator::from_context(context),
+            "GPU PnP-focal P3P candidate test",
+        )?
+        else {
+            return Ok(());
+        };
+        let candidates = generator.generate_p3p(&image, &world, [0, 1, 2, 3], focal, 0)?;
+
+        assert!(candidates
+            .iter()
+            .any(|model| { model_reprojects_points(model, &image, &world, focal, 1.0e-2) }));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_focal_p3p_batch_candidate_projects_its_sample() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP-focal P3P batch candidate test: no compatible adapter");
+            return Ok(());
+        };
+        let focal = 700.0f32;
+        let world = [
+            [-0.6, -0.3, 3.0],
+            [0.5, -0.2, 3.4],
+            [-0.2, 0.6, 3.2],
+            [0.4, 0.5, 3.8],
+        ];
+        let image = world
+            .iter()
+            .map(|point| [focal * point[0] / point[2], focal * point[1] / point[2]])
+            .collect::<Vec<_>>();
+        let Some(generator) = super::pnp_focal::skip_known_macos_agx_pipeline_failure(
+            WgpuPnPFocalCandidateGenerator::from_context(context),
+            "GPU PnP-focal P3P batch candidate test",
+        )?
+        else {
+            return Ok(());
+        };
+        let candidates =
+            generator.generate_p3p_batch(&image, &world, &[([0, 1, 2, 3], focal, 0)])?;
+
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates
+            .iter()
+            .any(|model| { model_reprojects_points(model, &image, &world, focal, 1.0e-2) }));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_scorer_matches_cpu_projection_and_mask() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let mut scorer = WgpuPnpModelScorer::from_context(context)?;
+        let image = [[0.0, 0.0], [0.1, 0.0], [-0.2, 0.2], [0.0, 0.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [-0.4, 0.4, 2.0],
+            [0.0, 0.0, -1.0],
+        ];
+        scorer.prepare(&image, &world, 0.01)?;
+        let supports = scorer.score_models(&[rustscan_slam::SE3::identity()])?;
+        let mask = scorer.inlier_mask(&rustscan_slam::SE3::identity())?;
+        assert_eq!(supports[0].inliers, 4);
+        assert_eq!(mask, vec![true, true, true, true]);
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    fn wgpu_pnp_mask_requires_model_from_latest_scoring_batch() -> Result<()> {
+        let Some(context) = WgpuContext::try_new_optional()? else {
+            eprintln!("skipping GPU PnP scorer test: no compatible adapter");
+            return Ok(());
+        };
+        let mut scorer = WgpuPnpModelScorer::from_context(context)?;
+        let image = [[0.0, 0.0], [0.1, 0.0], [0.0, 0.1], [-0.1, 0.0]];
+        let world = [
+            [0.0, 0.0, 2.0],
+            [0.2, 0.0, 2.0],
+            [0.0, 0.2, 2.0],
+            [-0.2, 0.0, 2.0],
+        ];
+        let model = rustscan_slam::SE3::identity();
+        scorer.prepare(&image, &world, 0.01)?;
+
+        let error = scorer
+            .inlier_mask(&model)
+            .expect_err("mask lookup must not rescore an unscored model");
+        assert!(error.to_string().contains("latest scoring batch"));
+
+        scorer.score_models(&[model])?;
+        assert_eq!(scorer.inlier_mask(&model)?, vec![true; 4]);
+        scorer.prepare(&image, &world, 0.01)?;
+        let error = scorer
+            .inlier_mask(&model)
+            .expect_err("prepare must invalidate the previous scoring batch");
+        assert!(error.to_string().contains("latest scoring batch"));
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn model_reprojects_points(
+        model: &GpuPnpFocalModel,
+        image: &[[f32; 2]],
+        world: &[[f32; 3]],
+        expected_focal: f32,
+        max_error_px: f32,
+    ) -> bool {
+        let focal = model.log_focal_and_padding[0].exp();
+        if !focal.is_finite() || (focal - expected_focal).abs() / expected_focal > 1.0e-3 {
+            return false;
+        }
+        image.iter().zip(world).all(|(image, world)| {
+            let x = model.row0[0] * world[0]
+                + model.row0[1] * world[1]
+                + model.row0[2] * world[2]
+                + model.row0[3];
+            let y = model.row1[0] * world[0]
+                + model.row1[1] * world[1]
+                + model.row1[2] * world[2]
+                + model.row1[3];
+            let z = model.row2[0] * world[0]
+                + model.row2[1] * world[1]
+                + model.row2[2] * world[2]
+                + model.row2[3];
+            z > 0.0
+                && ((focal * x / z - image[0]).powi(2) + (focal * y / z - image[1]).powi(2)).sqrt()
+                    <= max_error_px
+        })
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    fn checkerboard_u8(width: u32, height: u32, tile: u32) -> Vec<u8> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    if ((x / tile) + (y / tile)) % 2 == 0 {
+                        240
+                    } else {
+                        20
+                    }
+                })
+            })
+            .collect()
+    }
+}

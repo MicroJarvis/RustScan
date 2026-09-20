@@ -9,20 +9,20 @@ RustScan 是一个多 crate 的 3D 重建工作区。RustSFM、RustViewer 和 Ru
 ## Workspace Crates
 
 - `rustscan-types`: 跨 crate 共享的数据结构。
-- `rustslam`: 视觉 SLAM、稀疏地图、回环与数据摄取。
-- `rustgs`: 3D Gaussian Splatting 训练、评估、parity 与 chunked training。
-- `rustmesh`: 网格处理与 OpenMesh 对齐算法。
-- `rust-viewer`: 结果检查与可视化。
-- `rustff`: 前馈式推理实验工具。
-- `rustsfm`: COLMAP-style 特征、匹配、两视图验证、增量 SfM 与序列注册。
+- `rustscan-slam`: 视觉 SLAM、稀疏地图、回环与数据摄取。
+- `rustscan-gs`: 3D Gaussian Splatting 训练、评估、parity 与 chunked training。
+- `rustscan-mesh`: 网格处理与 OpenMesh 对齐算法。
+- `rustscan-viewer`: 结果检查与可视化。
+- `rustscan-ff`: 前馈式推理实验工具。
+- `rustscan-sfm`: COLMAP-style 特征、匹配、两视图验证、增量 SfM 与序列注册。
 
 ## Cross-Crate Flow
 
-1. 外部图像、视频或 `rustslam` 提供图像、位姿和可选稀疏点。
-2. `rustsfm` 可从图像生成 COLMAP-compatible sparse reconstruction；`rust-viewer` 负责其项目级编排。
-3. `rustgs` 将 COLMAP sparse reconstruction 解析为 `TrainingDataset`，训练 splats 并导出 PLY、checkpoint 与评估摘要。
-4. `rust-viewer` 或其他工具消费重建与训练产物。
-5. `rustmesh` 只在需要网格后处理时介入，不参与 RustGS 核心训练状态设计。
+1. 外部图像、视频或 `rustscan-slam` 提供图像、位姿和可选稀疏点。
+2. `rustscan-sfm` 可从图像生成 COLMAP-compatible sparse reconstruction；`rustscan-viewer` 负责其项目级编排。
+3. `rustscan-gs` 将 COLMAP sparse reconstruction 解析为 `TrainingDataset`，训练 splats 并导出 PLY、checkpoint 与评估摘要。
+4. `rustscan-viewer` 或其他工具消费重建与训练产物。
+5. `rustscan-mesh` 只在需要网格后处理时介入，不参与 RustGS 核心训练状态设计。
 
 ## Current RustGS Training Architecture
 
@@ -30,15 +30,15 @@ RustScan 是一个多 crate 的 3D 重建工作区。RustSFM、RustViewer 和 Ru
 
 当前 RustGS 保留的训练主入口是 splat-first 的：
 
-- `rustgs::load_colmap_training_dataset_with_source`
-- `rustgs::load_colmap_training_dataset`
-- `rustgs::train_splats`
-- `rustgs::evaluate_splats`
-- `rustgs::runtime_from_splats`
-- `rustgs::save_splats_ply`
-- `rustgs::load_splats_ply`
-- `rustgs::gpu_available`
-- `rustgs::TrainingCheckpoint` and `rustgs::SharedWgpuContext`
+- `rustscan_gs::load_colmap_training_dataset_with_source`
+- `rustscan_gs::load_colmap_training_dataset`
+- `rustscan_gs::train_splats`
+- `rustscan_gs::evaluate_splats`
+- `rustscan_gs::runtime_from_splats`
+- `rustscan_gs::save_splats_ply`
+- `rustscan_gs::load_splats_ply`
+- `rustscan_gs::gpu_available`
+- `rustscan_gs::TrainingCheckpoint` and `rustscan_gs::SharedWgpuContext`
 - CLI `rustgs train`
 
 已经删除的 legacy public surface 不再属于架构契约：
@@ -73,7 +73,7 @@ RustGS 当前的 splat 表示是分层但单向的：
 
 ### Execution Planning
 
-`rustgs/src/training/mod.rs` 负责 public re-export 与训练入口；实际执行由
+`rustscan-gs/src/training/mod.rs` 负责 public re-export 与训练入口；实际执行由
 `training/engine` 装配：
 
 - `config.rs`: `TrainingConfig`、`TrainingBackend::Wgpu` 和 LiteGS 配置。
@@ -103,11 +103,11 @@ GPU 渲染与梯度路径按前向/反向阶段拆分：
 
 下列结构已经不再存在于当前源码主路径：
 
-- `rustgs/src/legacy/*`
-- `rustgs/src/training/training_pipeline.rs`
-- `rustgs/src/io/dataset_loader.rs`
-- `rustgs/src/io/scene_io/scene_import.rs`
-- `rustgs/src/io/scene_io/scene_export.rs`
+- `rustscan-gs/src/legacy/*`
+- `rustscan-gs/src/training/training_pipeline.rs`
+- `rustscan-gs/src/io/dataset_loader.rs`
+- `rustscan-gs/src/io/scene_io/scene_import.rs`
+- `rustscan-gs/src/io/scene_io/scene_export.rs`
 
 ## Current Architectural Constraints
 
@@ -120,9 +120,9 @@ GPU 渲染与梯度路径按前向/反向阶段拆分：
 ## Companion Docs
 
 - [current-project-status.md](current-project-status.md)
-- [../rustgs/README.md](../rustgs/README.md)
-- [../rustsfm/README.md](../rustsfm/README.md)
-- [../rustsfm/PARITY_ROADMAP.md](../rustsfm/PARITY_ROADMAP.md)
+- [../rustscan-gs/README.md](../rustscan-gs/README.md)
+- [../rustscan-sfm/README.md](../rustscan-sfm/README.md)
+- [../rustscan-sfm/PARITY_ROADMAP.md](../rustscan-sfm/PARITY_ROADMAP.md)
 
 The dated RustGS design and benchmark documents listed in `docs/index.md` are
 historical evidence. They do not define the current module layout or public API.

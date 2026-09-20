@@ -1,10 +1,10 @@
 use anyhow::{bail, Context};
 use clap::Args;
 use nalgebra::{Matrix4, Point3, Vector3};
-use rustgs::{EvaluationDevice, GaussianCamera, HostSplats, SplatEvaluationRenderer};
-use rustmesh::RustMesh;
+use rustscan_gs::{EvaluationDevice, GaussianCamera, HostSplats, SplatEvaluationRenderer};
+use rustscan_mesh::RustMesh;
+use rustscan_slam::fusion::{Mesh, MeshExtractionConfig, MeshExtractor, TsdfConfig};
 use rustscan_types::{Intrinsics, ScenePose, TrainingDataset, SE3};
-use rustslam::fusion::{Mesh, MeshExtractionConfig, MeshExtractor, TsdfConfig};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Args)]
@@ -80,15 +80,15 @@ pub fn run_mesh_from_gs(args: MeshFromGsArgs) -> anyhow::Result<()> {
         .try_init();
     validate_args(&args)?;
 
-    let (splats, metadata) = rustgs::load_splats(&args.scene)
+    let (splats, metadata) = rustscan_gs::load_splats(&args.scene)
         .with_context(|| format!("failed to load RustGS scene {}", args.scene.display()))?;
     if splats.is_empty() {
         bail!("scene {} contains no Gaussians", args.scene.display());
     }
 
-    let (dataset, source) = rustgs::load_colmap_training_dataset_with_source(
+    let (dataset, source) = rustscan_gs::load_colmap_training_dataset_with_source(
         &args.input,
-        &rustgs::ColmapConfig {
+        &rustscan_gs::ColmapConfig {
             max_frames: 0,
             frame_stride: 1,
             ..Default::default()
@@ -129,7 +129,7 @@ pub fn run_mesh_from_gs(args: MeshFromGsArgs) -> anyhow::Result<()> {
     };
     let mut extractor = MeshExtractor::new(config);
 
-    let (render_width, render_height) = rustgs::scaled_dimensions(
+    let (render_width, render_height) = rustscan_gs::scaled_dimensions(
         dataset.intrinsics.width as usize,
         dataset.intrinsics.height as usize,
         args.render_scale,
@@ -143,7 +143,7 @@ pub fn run_mesh_from_gs(args: MeshFromGsArgs) -> anyhow::Result<()> {
         render_width,
         render_height,
         EvaluationDevice::Gpu,
-        rustgs::DEFAULT_RASTER_COV_BLUR,
+        rustscan_gs::DEFAULT_RASTER_COV_BLUR,
     )
     .map_err(anyhow::Error::from)?;
     let selected_poses = selected_poses(&dataset, args.view_stride, args.max_views);
@@ -356,9 +356,9 @@ fn export_with_rustmesh(mesh: &Mesh, output_dir: &Path) -> anyhow::Result<()> {
         RustMesh::from_triangle_mesh(&vertices, &triangles, Some(&normals), Some(&colors));
     let obj_path = output_dir.join("rustmesh.obj");
     let ply_path = output_dir.join("rustmesh.ply");
-    rustmesh::io::write_obj(&rustmesh, &obj_path)
+    rustscan_mesh::io::write_obj(&rustmesh, &obj_path)
         .with_context(|| format!("failed to write {}", obj_path.display()))?;
-    rustmesh::io::write_ply(&rustmesh, &ply_path, rustmesh::io::PlyFormat::Ascii)
+    rustscan_mesh::io::write_ply(&rustmesh, &ply_path, rustscan_mesh::io::PlyFormat::Ascii)
         .with_context(|| format!("failed to write {}", ply_path.display()))?;
     Ok(())
 }

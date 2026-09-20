@@ -22,9 +22,9 @@
 
 | Document | Purpose |
 |---|---|
-| [../rustsfm/README.md](../rustsfm/README.md) | RustSFM build, test, optional parity-fixture, and CLI entry points |
-| [../rustsfm/PARITY_ROADMAP.md](../rustsfm/PARITY_ROADMAP.md) | COLMAP parity status and remaining numerical work |
-| [../rustsfm/COLMAP_COMPAT_TODO.md](../rustsfm/COLMAP_COMPAT_TODO.md) | COLMAP compatibility backlog |
+| [../rustscan-sfm/README.md](../rustscan-sfm/README.md) | RustSFM build, test, optional parity-fixture, and CLI entry points |
+| [../rustscan-sfm/PARITY_ROADMAP.md](../rustscan-sfm/PARITY_ROADMAP.md) | COLMAP parity status and remaining numerical work |
+| [../rustscan-sfm/COLMAP_COMPAT_TODO.md](../rustscan-sfm/COLMAP_COMPAT_TODO.md) | COLMAP compatibility backlog |
 
 ## Active Changes
 
@@ -38,11 +38,15 @@ Completed and superseded execution plans were removed after audit. Their
 implementation evidence remains in Git history and the current status/review
 documents. The cleanup record is [agent/changes/RS-2026-001/plan-cleanup.md](agent/changes/RS-2026-001/plan-cleanup.md).
 
+The frozen GPU f32 five-point experiment is summarized in
+[`artifacts/evidence/gpu-five-point/gpu-five-point-summary-20260915.md`](../artifacts/evidence/gpu-five-point/gpu-five-point-summary-20260915.md).
+The raw run data remains under `artifacts/runs/`.
+
 ## Current RustGS Docs
 
 | Document | Purpose |
 |---|---|
-| [../rustgs/README.md](../rustgs/README.md) | build、test、CLI 与 artifact contract |
+| [../rustscan-gs/README.md](../rustscan-gs/README.md) | build、test、CLI 与 artifact contract |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前 wgpu training module layout、public surface 和 ownership boundary |
 | [RustGS-TODO-训练效果与效率优化-2026-09-17.md](RustGS-TODO-训练效果与效率优化-2026-09-17.md) | 残留 R09b（TUM 阶梯）；R01～R12 其余项已落地 |
 

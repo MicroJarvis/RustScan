@@ -1,0 +1,2925 @@
+use rustscan_sfm::colmap::{
+    export_colmap_sparse_snapshot, read_colmap_sparse_files, read_colmap_sparse_model,
+    write_colmap_sparse_binary, ColmapCamera,
+};
+use rustscan_sfm::correspondence_graph::FeatureMatch;
+use rustscan_sfm::database::{
+    ColmapDatabase, ColmapDatabaseCamera, ColmapDatabaseImage, ColmapDescriptors, ColmapKeypoint,
+    ColmapTwoViewGeometry, COLMAP_FEATURE_SIFT, COLMAP_TWO_VIEW_CALIBRATED,
+};
+use rustscan_sfm::geometry::{UnitQuatNormalize, Vec3GlamExt};
+use rustscan_sfm::types::{CameraModel, Point3D, Reconstruction, TrackObservation, COLMAP_PINHOLE};
+use rustscan_sfm::{
+    register_remaining_sequence_frames, require_complete_pose_coverage,
+    run_keyframe_reconstruction, run_sequence_registration, FrameRegistrationDiagnostic,
+    FrameRegistrationStatus, KeyframeReconstructionResult, MapperConfig, RegistrationRound,
+    SequenceFrame, SequenceRegistrationConfig, SequenceRegistrationError, SequenceRegistrationPlan,
+    SequenceRegistrationResult, SfmTaskContext, SfmTaskControl, MAX_DYNAMIC_SUPPORT_CANDIDATES,
+    MAX_SEQUENCE_NEIGHBORS, MAX_SEQUENCE_PLAN_FRAMES, MAX_TIMESTAMP_PLATEAU,
+    MAX_TOTAL_SUPPORT_ENTRIES,
+};
+use serde::{de::DeserializeOwned, Serialize};
+use std::collections::BTreeMap;
+use std::fmt::Debug;
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
+
+const SYNTHETIC_KEYFRAME_INDICES: [usize; 4] = [0, 2, 4, 5];
+
+fn synthetic_descriptor_rows(inverted: bool) -> Vec<[u8; 128]> {
+    (0..64)
+        .map(|feature| {
+            let mut descriptor = [0u8; 128];
+            for (offset, value) in descriptor.iter_mut().enumerate() {
+                let original = ((feature * 37 + offset * 17 + feature * offset * 3) % 251) as u8;
+                *value = if inverted { 255 - original } else { original };
+            }
+            descriptor
+        })
+        .collect()
+}
+
+fn write_synthetic_descriptors(
+    database: &ColmapDatabase,
+    image_id: u32,
+    inverted: bool,
+) -> anyhow::Result<()> {
+    let data = synthetic_descriptor_rows(inverted)
+        .into_iter()
+        .flatten()
+        .collect();
+    database.write_descriptors(
+        image_id,
+        &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 64, 128, data)?,
+    )
+}
+
+fn rewrite_synthetic_descriptor_variants(
+    database: &ColmapDatabase,
+    inverted_image_ids: &[u32],
+) -> anyhow::Result<()> {
+    database.clear_descriptors()?;
+    for image_id in 1..=6 {
+        write_synthetic_descriptors(database, image_id, inverted_image_ids.contains(&image_id))?;
+    }
+    Ok(())
+}
+
+fn snapshot_flat_directory(root: &Path) -> anyhow::Result<BTreeMap<PathBuf, Vec<u8>>> {
+    std::fs::read_dir(root)?
+        .map(|entry| {
+            let path = entry?.path();
+            Ok((path.file_name().unwrap().into(), std::fs::read(&path)?))
+        })
+        .collect()
+}
+
+fn overwrite_sparse_binary(
+    destination: &Path,
+    reconstruction: &Reconstruction,
+) -> anyhow::Result<()> {
+    let temporary = tempdir()?;
+    export_colmap_sparse_snapshot(temporary.path(), reconstruction)?;
+    let files = read_colmap_sparse_files(temporary.path())?;
+    write_colmap_sparse_binary(destination, &files)
+}
+
+fn remaining_stage_error(
+    frames: &[SequenceFrame],
+    keyframes: &KeyframeReconstructionResult,
+    mapper_config: &MapperConfig,
+    output: &Path,
+) -> anyhow::Error {
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+    register_remaining_sequence_frames(
+        frames,
+        &keyframes.keyframe_ids,
+        keyframes,
+        mapper_config,
+        &synthetic_sequence_config(),
+        output,
+        &mut task,
+    )
+    .unwrap_err()
+}
+
+fn synthetic_sequence_fixture(
+    blank_frame: Option<usize>,
+) -> anyhow::Result<(
+    tempfile::TempDir,
+    PathBuf,
+    Vec<SequenceFrame>,
+    KeyframeReconstructionResult,
+    MapperConfig,
+)> {
+    let temp = tempdir()?;
+    let source = temp.path().join("source");
+    let output = temp.path().join("output");
+    std::fs::create_dir_all(&source)?;
+    std::fs::create_dir_all(output.join("Cache"))?;
+    let frame_ids = [101, 202, 303, 404, 505, 606];
+    let frames = frame_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| {
+            let path = source.join(format!("frame-{index:04}.png"));
+            image::GrayImage::new(320, 240).save(&path).unwrap();
+            SequenceFrame {
+                id,
+                image_path: path,
+                timestamp_us: Some(index as i64 * 1_000),
+            }
+        })
+        .collect::<Vec<_>>();
+    let camera = CameraModel::new_pinhole(320, 240, 220.0, 220.0, 160.0, 120.0);
+    let poses = (0..6)
+        .map(|index| {
+            rustscan_slam::SE3::from_quat_translation(
+                rustscan_sfm::geometry::quat_from_rotation_y((index as f32 - 2.5) * 0.012),
+                nalgebra::Vector3::new(index as f32 * -0.11, (index % 2) as f32 * 0.01, 0.0),
+            )
+        })
+        .collect::<Vec<_>>();
+    let points = (0..64)
+        .map(|index| {
+            let column = (index % 8) as f32;
+            let row = (index / 8) as f32;
+            [
+                -0.75 + column * 0.21,
+                -0.55 + row * 0.16,
+                3.0 + (index % 7) as f32 * 0.11,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let projected = poses
+        .iter()
+        .map(|pose| {
+            points
+                .iter()
+                .map(|point| {
+                    let camera_point = pose.transform_point(point);
+                    ColmapKeypoint::new(
+                        camera.fx * camera_point[0] / camera_point[2] + camera.cx,
+                        camera.fy * camera_point[1] / camera_point[2] + camera.cy,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let database_path = output.join("Cache/database.db");
+    let database = ColmapDatabase::open(&database_path)?;
+    database.write_camera(
+        &ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 1,
+                model_id: COLMAP_PINHOLE,
+                width: 320,
+                height: 240,
+                params: vec![220.0, 220.0, 160.0, 120.0],
+            },
+            has_prior_focal_length: true,
+        },
+        true,
+    )?;
+    let descriptor_rows = synthetic_descriptor_rows(false);
+    for (index, frame) in frames.iter().enumerate() {
+        database.write_image(
+            &ColmapDatabaseImage {
+                image_id: index as u32 + 1,
+                name: frame
+                    .image_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                camera_id: 1,
+                frame_id: None,
+            },
+            true,
+        )?;
+        let keypoints = if blank_frame == Some(index) {
+            Vec::new()
+        } else {
+            projected[index].clone()
+        };
+        database.write_keypoints(index as u32 + 1, &keypoints)?;
+        let descriptor_data = if blank_frame == Some(index) {
+            Vec::new()
+        } else {
+            descriptor_rows
+                .iter()
+                .flat_map(|row| row.iter().copied())
+                .collect()
+        };
+        database.write_descriptors(
+            index as u32 + 1,
+            &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, keypoints.len(), 128, descriptor_data)?,
+        )?;
+    }
+    drop(database);
+
+    let keyframe_keypoints = SYNTHETIC_KEYFRAME_INDICES
+        .iter()
+        .map(|&index| {
+            projected[index]
+                .iter()
+                .map(|keypoint| rustscan_slam::KeyPoint::new(keypoint.x, keypoint.y))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut observations = vec![vec![None; points.len()]; SYNTHETIC_KEYFRAME_INDICES.len()];
+    for image in 0..observations.len() {
+        for point in 0..points.len() {
+            observations[image][point] = Some(point);
+        }
+    }
+    let sparse_points = points
+        .iter()
+        .enumerate()
+        .map(|(point, &xyz)| Point3D {
+            xyz,
+            color: [point as u8, 10, 20],
+            error: 0.0,
+            track: (0..SYNTHETIC_KEYFRAME_INDICES.len())
+                .map(|image| TrackObservation {
+                    image,
+                    feature: point,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let reconstruction = Reconstruction {
+        camera,
+        cameras: vec![camera],
+        camera_ids: vec![1],
+        rigs: Vec::new(),
+        frames: Vec::new(),
+        image_names: SYNTHETIC_KEYFRAME_INDICES
+            .iter()
+            .map(|&index| {
+                frames[index]
+                    .image_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect(),
+        image_paths: SYNTHETIC_KEYFRAME_INDICES
+            .iter()
+            .map(|&index| frames[index].image_path.clone())
+            .collect(),
+        image_ids: SYNTHETIC_KEYFRAME_INDICES
+            .iter()
+            .map(|&index| index as u32 + 1)
+            .collect(),
+        image_camera_indices: vec![0; SYNTHETIC_KEYFRAME_INDICES.len()],
+        image_frame_indices: vec![None; SYNTHETIC_KEYFRAME_INDICES.len()],
+        poses: SYNTHETIC_KEYFRAME_INDICES
+            .iter()
+            .map(|&index| Some(poses[index]))
+            .collect(),
+        observations,
+        keypoints: keyframe_keypoints,
+        point_ids: (0..points.len())
+            .map(|index| index as u64 + 1_000)
+            .collect(),
+        points: sparse_points,
+    };
+    let sparse_model = output.join("Cache/keyframe-sparse/0");
+    export_colmap_sparse_snapshot(&sparse_model, &reconstruction)?;
+    let sparse_files = read_colmap_sparse_files(&sparse_model)?;
+    write_colmap_sparse_binary(&sparse_model, &sparse_files)?;
+
+    let keyframe_result = KeyframeReconstructionResult {
+        imported_frames: frames.len(),
+        keyframe_ids: SYNTHETIC_KEYFRAME_INDICES
+            .iter()
+            .map(|&index| frames[index].id)
+            .collect(),
+        registered_keyframes: SYNTHETIC_KEYFRAME_INDICES.len(),
+        database: database_path,
+        sparse_model,
+    };
+    let mut mapper_config = MapperConfig {
+        fx: Some(220.0),
+        fy: Some(220.0),
+        cx: Some(160.0),
+        cy: Some(120.0),
+        min_matches: 8,
+        min_inliers: 8,
+        min_triangulated: 4,
+        essential_threshold_px: 2.0,
+        essential_iterations: 2_000,
+        pnp_threshold_px: 2.0,
+        pnp_iterations: 5_000,
+        abs_pose_min_num_inliers: 8,
+        abs_pose_min_inlier_ratio: 0.2,
+        random_seed: 0,
+        local_ba: false,
+        global_ba: false,
+        extract_colors: false,
+        ..MapperConfig::default()
+    };
+    Ok((temp, output, frames, keyframe_result, mapper_config))
+}
+
+fn sequence_memory_executor() -> anyhow::Result<rustscan_sfm::SfmTaskflow> {
+    let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(
+        rustscan_taskflow::RuntimeConfig {
+            budget: rustscan_taskflow::Budget {
+                cpu_threads: 2,
+                memory_bytes: 512 * 1024 * 1024,
+                io_slots: 2,
+            },
+            ..Default::default()
+        },
+    )?);
+    rustscan_sfm::SfmTaskflow::new(runtime, 128 * 1024 * 1024)
+}
+
+#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+#[test]
+fn sequence_memory_missing_entries_use_fixed_plans_and_typed_pause() -> anyhow::Result<()> {
+    for entry in ["keyframe", "adaptive", "remaining", "chain"] {
+        let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+        config.sift_extraction.use_gpu = false;
+        config.use_gpu_pnp = false;
+        config.threads = Some(1);
+        config.max_features = 8;
+        let db = ColmapDatabase::open(&keyframes.database)?;
+        db.clear_descriptors()?;
+        drop(db);
+        let control = SfmTaskControl::new();
+        let mut sink = |event: rustscan_sfm::SfmTaskEvent| {
+            if event.operation == rustscan_sfm::SfmTaskOperation::ExtractImage
+                && event.completed == Some(1)
+            {
+                control.request_pause();
+            }
+        };
+        let mut task =
+            SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+        let error = match entry {
+            "keyframe" => run_keyframe_reconstruction(
+                &frames,
+                &keyframes.keyframe_ids,
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            "adaptive" => rustscan_sfm::run_adaptive_keyframe_selection(
+                &frames,
+                &Default::default(),
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            "remaining" => register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            _ => run_sequence_registration(
+                &frames,
+                &keyframes.keyframe_ids,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+        };
+        assert_eq!(
+            error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+            Some(&rustscan_sfm::SfmTaskStop::Paused),
+            "{entry}: {error:#}"
+        );
+        let reports = task.stage_reports();
+        let extraction = reports
+            .iter()
+            .find(|r| r.stage_name == "selected feature extraction")
+            .expect(entry);
+        assert!(extraction.requested_memory > 128 * 1024 * 1024, "{entry}");
+        assert!(
+            extraction.requested_memory <= extraction.granted_memory,
+            "{entry}"
+        );
+        let db = ColmapDatabase::open_read_only(&keyframes.database)?;
+        // Remaining starts at index 1, not a keyframe. No eager extraction of
+        // later targets, and a larger parent does not regroup the fixed chunks.
+        let first_id = if entry == "remaining" { 2 } else { 1 };
+        for id in 1..=6 {
+            assert_eq!(
+                db.exists_descriptors(id)?,
+                id == first_id,
+                "{entry}: image {id}"
+            );
+        }
+        if entry == "chain" {
+            assert!(!reports.iter().any(|r| r.stage_name
+                == "remaining registration and final export"
+                && r.granted_memory > 0));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "vlfeat-sift", not(feature = "lowe-sift-backend")))]
+#[test]
+fn sequence_memory_chain_plans_missing_remaining_before_first_node() -> anyhow::Result<()> {
+    let (_temp, output, mut frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(1);
+    config.max_features = 8;
+    let source = frames[1].image_path.with_extension("bmp");
+    image::GrayImage::new(1, 1).save(&source)?;
+    let mut header = std::fs::read(&source)?;
+    // Header-only estimate: no large pixel buffer or real large-image decode.
+    header[18..22].copy_from_slice(&4096i32.to_le_bytes());
+    header[22..26].copy_from_slice(&3072i32.to_le_bytes());
+    std::fs::write(&source, header)?;
+    frames[1].image_path = source;
+    let db = ColmapDatabase::open(&keyframes.database)?;
+    let mut target = db.read_image(2)?.unwrap();
+    target.name = frames[1]
+        .image_path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    db.update_image(&target)?;
+    db.clear_descriptors()?;
+    for id in [1, 3, 4, 5, 6] {
+        write_synthetic_descriptors(&db, id, false)?;
+    }
+    drop(db);
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let error = run_sequence_registration(
+        &frames,
+        &keyframes.keyframe_ids,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<rustscan_taskflow::Error>(),
+            Some(rustscan_taskflow::Error::Unschedulable(_))
+        ),
+        "{error:#}"
+    );
+    assert!(!output.join("Cache/keyframes.lock").exists());
+    assert!(!output.join("Cache/sequence").exists());
+    assert!(task.stage_reports().iter().all(|r| r.granted_memory == 0));
+    drop(task);
+    drop(sink);
+    assert!(events.is_empty());
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn sequence_memory_cached_independent_entries_keep_floor_and_typed_pause() -> anyhow::Result<()> {
+    for entry in ["keyframe", "adaptive", "remaining"] {
+        let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+        config.sift_extraction.use_gpu = false;
+        config.use_gpu_pnp = false;
+        config.threads = Some(1);
+        let control = SfmTaskControl::new();
+        let mut sink = |_: rustscan_sfm::SfmTaskEvent| control.request_pause();
+        let mut task =
+            SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+        let error = match entry {
+            "keyframe" => run_keyframe_reconstruction(
+                &frames,
+                &keyframes.keyframe_ids,
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            "adaptive" => rustscan_sfm::run_adaptive_keyframe_selection(
+                &frames,
+                &Default::default(),
+                &config,
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+            _ => register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+            .map(|_| ())
+            .unwrap_err(),
+        };
+        assert_eq!(
+            error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+            Some(&rustscan_sfm::SfmTaskStop::Paused),
+            "{entry}: {error:#}"
+        );
+        let reports = task.stage_reports();
+        assert!(reports.iter().any(|r| r.granted_memory > 0), "{entry}");
+        assert!(
+            reports
+                .iter()
+                .all(|r| r.requested_memory == 128 * 1024 * 1024),
+            "{entry}"
+        );
+        assert!(
+            !reports
+                .iter()
+                .any(|r| r.stage_name == "selected feature extraction"),
+            "{entry}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn sequence_memory_pause_precedes_heavy_resume_artifact_validation() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, config) = synthetic_sequence_fixture(None)?;
+    keyframes.registered_keyframes += 1;
+    let control = SfmTaskControl::new();
+    control.request_pause();
+    let mut sink = |_| {};
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+        Some(&rustscan_sfm::SfmTaskStop::Paused),
+        "{error:#}"
+    );
+    assert!(task.stage_reports().is_empty());
+    Ok(())
+}
+
+#[test]
+fn sequence_memory_queued_cancellation_precedes_sparse_model_load() -> anyhow::Result<()> {
+    use rustscan_taskflow::{Budget, Runtime, RuntimeConfig};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(1);
+    let runtime = Arc::new(Runtime::new(RuntimeConfig {
+        budget: Budget {
+            cpu_threads: 1,
+            memory_bytes: 512 * 1024 * 1024,
+            io_slots: 1,
+        },
+        ..Default::default()
+    })?);
+    let executor = rustscan_sfm::SfmTaskflow::new(runtime.clone(), 128 * 1024 * 1024)?;
+    let mut paused = runtime.snapshot()?.budget;
+    paused.cpu_threads = 0;
+    runtime.set_budget(paused)?;
+
+    let control = SfmTaskControl::new();
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let worker = scope.spawn(|| {
+            let mut sink = |_| {};
+            let mut task = SfmTaskContext::new(&control, &mut sink).with_taskflow(executor);
+            register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.snapshot()?.pending_tasks == 0 {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "remaining registration did not reach admission queue"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        control.request_cancel();
+        let error = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("remaining registration worker panicked"))?
+            .expect_err("queued remaining registration must be cancelled");
+        assert_eq!(
+            error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+            Some(&rustscan_sfm::SfmTaskStop::Cancelled),
+            "{error:#}"
+        );
+        let snapshot = runtime.snapshot()?;
+        assert_eq!(snapshot.pending_tasks, 0);
+        assert_eq!(snapshot.cpu_threads, 0);
+        assert_eq!(snapshot.memory_bytes, 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn sequence_memory_missing_sparse_model_after_queue_fails_closed() -> anyhow::Result<()> {
+    use rustscan_taskflow::{Budget, Runtime, RuntimeConfig};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(1);
+    let runtime = Arc::new(Runtime::new(RuntimeConfig {
+        budget: Budget {
+            cpu_threads: 1,
+            memory_bytes: 512 * 1024 * 1024,
+            io_slots: 1,
+        },
+        ..Default::default()
+    })?);
+    let executor = rustscan_sfm::SfmTaskflow::new(runtime.clone(), 128 * 1024 * 1024)?;
+    let ceiling = runtime.snapshot()?.budget;
+    let mut paused = ceiling;
+    paused.cpu_threads = 0;
+    runtime.set_budget(paused)?;
+
+    let control = SfmTaskControl::new();
+    let sparse = keyframes.sparse_model.clone();
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let worker = scope.spawn(|| {
+            let mut sink = |_| {};
+            let mut task = SfmTaskContext::new(&control, &mut sink).with_taskflow(executor);
+            register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.snapshot()?.pending_tasks == 0 {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "remaining registration did not reach admission queue"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::remove_dir_all(&sparse)?;
+        runtime.set_budget(ceiling)?;
+        let error = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("remaining registration worker panicked"))?
+            .expect_err("missing queued sparse model must fail after admission");
+        assert!(
+            error.to_string().contains("missing keyframe sparse model"),
+            "{error:#}"
+        );
+        let snapshot = runtime.snapshot()?;
+        assert_eq!(snapshot.pending_tasks, 0);
+        assert_eq!(snapshot.cpu_threads, 0);
+        assert_eq!(snapshot.memory_bytes, 0);
+        Ok(())
+    })
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn sequence_memory_cached_chain_keeps_two_nodes_and_final_ba_order() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(2);
+    config.multiple_models = false;
+    config.copy_images = false;
+    config.init_num_trials = 1;
+    config.init_min_num_inliers = 16;
+    config.init_min_tri_angle_deg = 0.5;
+    config.abs_pose_min_num_inliers = 16;
+    config.ignore_two_view_tracks = false;
+    // No-default builds have no BA solver; still exercise the complete cached
+    // chain and assert that the disabled operation emits no BA events.
+    config.global_ba = cfg!(feature = "ceres-ba");
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let result = run_sequence_registration(
+        &frames,
+        &keyframes.keyframe_ids,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert_eq!(result.registered_frames, frames.len());
+    let reports = task.stage_reports();
+    let first = reports
+        .iter()
+        .filter(|r| r.stage_name == "keyframe reconstruction")
+        .collect::<Vec<_>>();
+    assert_eq!(first.len(), 1);
+    let remaining = reports
+        .iter()
+        .filter(|r| r.stage_name == "remaining registration and final export")
+        .collect::<Vec<_>>();
+    // One chain node plus the existing inline borrowed remaining-stage report;
+    // no enclosing keyframe/sequence admission is introduced.
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(first[0].requested_memory, 128 * 1024 * 1024);
+    assert!(remaining
+        .iter()
+        .all(|r| r.requested_memory == first[0].requested_memory));
+    assert!(!reports
+        .iter()
+        .any(|r| r.stage_name == "keyframe reconstruction and export"
+            || r.stage_name == "selected feature extraction"));
+    drop(task);
+    drop(sink);
+    assert!(!events
+        .iter()
+        .any(|e| e.operation == rustscan_sfm::SfmTaskOperation::ExtractImage));
+    let ba = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.operation == rustscan_sfm::SfmTaskOperation::GlobalBundleAdjustment)
+        .collect::<Vec<_>>();
+    let last_attempt = events
+        .iter()
+        .rposition(|e| e.operation == rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt)
+        .unwrap();
+    let publish = events
+        .iter()
+        .position(|e| {
+            e.stage == rustscan_sfm::SfmTaskStage::Export
+                && e.operation == rustscan_sfm::SfmTaskOperation::ValidateArtifacts
+                && e.kind == rustscan_sfm::SfmTaskEventKind::Progress
+        })
+        .unwrap();
+    assert!(last_attempt < publish);
+    if config.global_ba {
+        assert_eq!(ba.len(), 2);
+        assert_eq!(ba[0].1.kind, rustscan_sfm::SfmTaskEventKind::Started);
+        assert_eq!(ba[1].1.kind, rustscan_sfm::SfmTaskEventKind::Completed);
+        assert!(last_attempt < ba[0].0);
+        assert!(ba[1].0 < publish);
+    } else {
+        assert!(ba.is_empty());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn sequence_memory_no_pending_uses_only_caller_floor() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, mut config) = synthetic_sequence_fixture(None)?;
+    config.sift_extraction.use_gpu = false;
+    config.use_gpu_pnp = false;
+    config.threads = Some(2);
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert_eq!(result.registered_frames, frames.len());
+    let model = read_colmap_sparse_model(&result.sparse_model)?;
+    export_colmap_sparse_snapshot(&keyframes.sparse_model, &model.reconstruction)?;
+    write_colmap_sparse_binary(
+        &keyframes.sparse_model,
+        &rustscan_sfm::colmap::read_colmap_sparse_files_with_format(
+            &keyframes.sparse_model,
+            rustscan_sfm::colmap::ColmapSparseFormat::Text,
+        )?,
+    )?;
+    keyframes.keyframe_ids = frames.iter().map(|frame| frame.id).collect();
+    keyframes.registered_keyframes = frames.len();
+    drop(task);
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task =
+        SfmTaskContext::new(&control, &mut sink).with_taskflow(sequence_memory_executor()?);
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert!(result
+        .diagnostics
+        .iter()
+        .all(|d| d.status == FrameRegistrationStatus::Keyframe && d.attempts == 0));
+    let reports = task.stage_reports();
+    let outer = reports
+        .iter()
+        .find(|r| r.stage_name == "remaining registration and final export")
+        .unwrap();
+    assert_eq!(outer.requested_memory, 128 * 1024 * 1024);
+    drop(task);
+    drop(sink);
+    assert!(!events.iter().any(|e| matches!(
+        e.operation,
+        rustscan_sfm::SfmTaskOperation::ExtractImage
+            | rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt
+    )));
+    Ok(())
+}
+
+fn synthetic_sequence_config() -> SequenceRegistrationConfig {
+    SequenceRegistrationConfig {
+        narrow_neighbors_each_side: 2,
+        wide_neighbors_each_side: 4,
+        min_inliers: 16,
+        min_inlier_ratio: 0.5,
+        max_reprojection_error: 2.0,
+        use_gpu_pnp: false,
+    }
+}
+
+fn assert_json_round_trip<T>(value: &T)
+where
+    T: Debug + DeserializeOwned + PartialEq + Serialize,
+{
+    let json = serde_json::to_string(value).unwrap();
+    assert_eq!(&serde_json::from_str::<T>(&json).unwrap(), value);
+}
+
+#[test]
+fn keyframe_reconstruction_result_round_trips_through_json() {
+    let result = KeyframeReconstructionResult {
+        imported_frames: 6,
+        keyframe_ids: vec![101, 700, 42, u32::MAX],
+        registered_keyframes: 4,
+        database: PathBuf::from("artifacts/runs/Cache/database.db"),
+        sparse_model: PathBuf::from("artifacts/runs/Cache/keyframe-sparse/0"),
+    };
+
+    assert_json_round_trip(&result);
+}
+
+#[test]
+fn task6_stage_api_is_public_and_uses_u32_keyframe_ids() {
+    let _ = run_keyframe_reconstruction;
+    let _ = register_remaining_sequence_frames;
+    let _ = run_sequence_registration;
+}
+
+#[test]
+fn strict_pose_coverage_reports_unresolved_frames() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 1,
+        frame_ids: vec![101, 9001],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(101, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(9001, FrameRegistrationStatus::Unresolved),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    let error = require_complete_pose_coverage(&result).unwrap_err();
+    assert_eq!(error.to_string(), "1 frames could not be registered");
+}
+
+#[test]
+fn keyframe_stage_rejects_duplicate_arbitrary_frame_ids_before_io() {
+    let frames = vec![
+        SequenceFrame {
+            id: 77,
+            image_path: PathBuf::from("missing-a.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 77,
+            image_path: PathBuf::from("missing-b.jpg"),
+            timestamp_us: Some(1),
+        },
+    ];
+    let output = tempdir().unwrap();
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = run_keyframe_reconstruction(
+        &frames,
+        &[77],
+        &MapperConfig::default(),
+        output.path(),
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("duplicate frame id 77"));
+    assert!(!output.path().join("Cache").exists());
+}
+
+#[test]
+fn keyframe_stage_rejects_unknown_u32_keyframe_id_before_io() {
+    let frames = vec![SequenceFrame {
+        id: u32::MAX,
+        image_path: PathBuf::from("missing.jpg"),
+        timestamp_us: Some(0),
+    }];
+    let output = tempdir().unwrap();
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = run_keyframe_reconstruction(
+        &frames,
+        &[42],
+        &MapperConfig::default(),
+        output.path(),
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("unknown keyframe id 42"));
+    assert!(!output.path().join("Cache").exists());
+}
+
+#[test]
+fn keyframe_stage_rejects_vocab_tree_before_touching_the_database() {
+    let frames = vec![SequenceFrame {
+        id: 42,
+        image_path: PathBuf::from("missing.png"),
+        timestamp_us: Some(0),
+    }];
+    let output = tempdir().unwrap();
+    let mut mapper_config = MapperConfig::default();
+    mapper_config.matching_pair_strategy =
+        rustscan_sfm::MatchingPairStrategy::VocabTree { num_images: 8 };
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error =
+        run_keyframe_reconstruction(&frames, &[42], &mapper_config, output.path(), &mut task)
+            .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "keyframe-only vocabulary-tree matching is unsupported"
+    );
+    assert!(!output.path().join("Cache").exists());
+}
+
+#[test]
+fn keyframe_stage_prepares_fixed_database_and_cleans_failed_private_snapshot() {
+    let input = tempdir().unwrap();
+    let output = tempdir().unwrap();
+    let first = input.path().join("capture-A.png");
+    let second = input.path().join("capture-Z.png");
+    image::GrayImage::new(64, 64).save(&first).unwrap();
+    image::GrayImage::new(64, 64).save(&second).unwrap();
+    let frames = vec![
+        SequenceFrame {
+            id: 9001,
+            image_path: first,
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 42,
+            image_path: second,
+            timestamp_us: Some(1),
+        },
+    ];
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = run_keyframe_reconstruction(
+        &frames,
+        &[9001, 42],
+        &MapperConfig::default(),
+        output.path(),
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert!(!error.to_string().contains("not implemented"));
+    assert!(output.path().join("Cache/database.db").is_file());
+    assert!(!output.path().join("Cache/keyframes").exists());
+    assert!(std::fs::read_dir(output.path().join("Cache"))
+        .unwrap()
+        .all(|entry| {
+            !entry
+                .map(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".keyframe-input-")
+                })
+                .unwrap_or(false)
+        }));
+}
+
+#[test]
+fn remaining_stage_rejects_mismatched_keyframe_artifacts_before_io() {
+    let frames = vec![
+        SequenceFrame {
+            id: 101,
+            image_path: PathBuf::from("missing-a.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 9001,
+            image_path: PathBuf::from("missing-b.jpg"),
+            timestamp_us: Some(1),
+        },
+    ];
+    let keyframe_result = KeyframeReconstructionResult {
+        imported_frames: 2,
+        keyframe_ids: vec![101],
+        registered_keyframes: 1,
+        database: PathBuf::from("missing.db"),
+        sparse_model: PathBuf::from("missing-sparse"),
+    };
+    let output = tempdir().unwrap();
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+    let config = SequenceRegistrationConfig {
+        use_gpu_pnp: false,
+        ..Default::default()
+    };
+
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &[9001],
+        &keyframe_result,
+        &MapperConfig::default(),
+        &config,
+        output.path(),
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("keyframe artifacts do not match"));
+    assert!(!output.path().join("registration.json").exists());
+}
+
+#[test]
+fn remaining_stage_requires_the_fixed_keyframe_sparse_path() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let reconstruction = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+    let relocated = output.join("Cache/relocated-keyframes");
+    export_colmap_sparse_snapshot(&relocated, &reconstruction)?;
+    let relocated_files = read_colmap_sparse_files(&relocated)?;
+    write_colmap_sparse_binary(&relocated, &relocated_files)?;
+    keyframes.sparse_model = relocated;
+
+    let error = remaining_stage_error(&frames, &keyframes, &mapper_config, &output);
+
+    assert!(error
+        .to_string()
+        .contains("keyframe sparse model must remain at"));
+    Ok(())
+}
+
+#[test]
+fn remaining_stage_rejects_stale_binary_names_ids_and_extra_images() -> anyhow::Result<()> {
+    for mutation in ["name", "id", "extra"] {
+        let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+        let mut reconstruction = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+        match mutation {
+            "name" => reconstruction.image_names[0] = "stale-name.png".to_owned(),
+            "id" => reconstruction.image_ids[0] = 999_999,
+            "extra" => {
+                reconstruction.image_names.push("frame-0001.png".to_owned());
+                reconstruction
+                    .image_paths
+                    .push(frames[1].image_path.clone());
+                reconstruction.image_ids.push(2);
+                reconstruction.image_camera_indices.push(0);
+                reconstruction.image_frame_indices.push(None);
+                reconstruction.poses.push(reconstruction.poses[0]);
+                reconstruction.observations.push(Vec::new());
+                reconstruction.keypoints.push(Vec::new());
+            }
+            _ => unreachable!(),
+        }
+        overwrite_sparse_binary(&keyframes.sparse_model, &reconstruction)?;
+
+        let error = remaining_stage_error(&frames, &keyframes, &mapper_config, &output);
+
+        assert!(
+            error
+                .to_string()
+                .contains("keyframe sparse image names/IDs do not match database"),
+            "mutation={mutation} error={error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn remaining_stage_rejects_mismatched_keyframe_database_camera() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let connection = rusqlite::Connection::open(&keyframes.database)?;
+    connection.execute(
+        "UPDATE cameras SET width = width + 1 WHERE camera_id = 1",
+        [],
+    )?;
+    drop(connection);
+
+    let error = remaining_stage_error(&frames, &keyframes, &mapper_config, &output);
+
+    assert!(error
+        .to_string()
+        .contains("keyframe database camera metadata does not match frame"));
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn partial_keyframe_model_retries_missing_selected_keyframe() -> anyhow::Result<()> {
+    let (_temp, output, frames, mut keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let mut reconstruction = read_colmap_sparse_model(&keyframes.sparse_model)?.reconstruction;
+    let removed_image = reconstruction.image_names.len() - 1;
+    assert_eq!(reconstruction.image_names[removed_image], "frame-0005.png");
+    reconstruction.image_names.remove(removed_image);
+    reconstruction.image_paths.remove(removed_image);
+    reconstruction.image_ids.remove(removed_image);
+    reconstruction.image_camera_indices.remove(removed_image);
+    reconstruction.image_frame_indices.remove(removed_image);
+    reconstruction.poses.remove(removed_image);
+    reconstruction.observations.remove(removed_image);
+    reconstruction.keypoints.remove(removed_image);
+    for point in &mut reconstruction.points {
+        point
+            .track
+            .retain(|observation| observation.image != removed_image);
+    }
+    overwrite_sparse_binary(&keyframes.sparse_model, &reconstruction)?;
+    keyframes.registered_keyframes = 3;
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+
+    assert!(result.has_complete_coverage(), "{:#?}", result.diagnostics);
+    assert_eq!(result.registered_frames, 6);
+    let recovered = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 606)
+        .unwrap();
+    assert_eq!(recovered.status, FrameRegistrationStatus::Registered);
+    assert!(recovered.attempts > 0);
+    assert!(recovered.message.is_some());
+    require_complete_pose_coverage(&result)?;
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn complete_sequence_registers_all_six_arbitrary_frame_ids_on_cpu() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    std::fs::write(keyframes.sparse_model.join("obsolete.bin"), b"stale")?;
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+
+    assert!(result.has_complete_coverage(), "{:#?}", result.diagnostics);
+    assert_eq!(result.registered_frames, 6);
+    assert_eq!(result.frame_ids, vec![101, 202, 303, 404, 505, 606]);
+    assert_eq!(result.diagnostics.len(), 6);
+    assert!(output.join("sparse/0/images.bin").is_file());
+    assert!(!output.join("sparse/0/obsolete.bin").exists());
+    assert!(keyframes.sparse_model.join("obsolete.bin").exists());
+    assert!(output.join("registration.json").is_file());
+    assert!(!output.join("registration.json.tmp").exists());
+    assert!(!output.join("sparse/0.tmp").exists());
+    assert!(!output.join("sparse/0.backup").exists());
+    let attempts = events
+        .iter()
+        .filter(|event| event.operation == rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt)
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|event| {
+        event.stage == rustscan_sfm::SfmTaskStage::FullFrameRegistration
+            && event.kind == rustscan_sfm::SfmTaskEventKind::Progress
+    }));
+    assert!(events
+        .windows(2)
+        .all(|window| window[0].sequence < window[1].sequence));
+    let merged = read_colmap_sparse_model(&result.sparse_model)?.reconstruction;
+    assert_eq!(merged.poses.iter().flatten().count(), 6);
+    assert_eq!(
+        merged
+            .image_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        6
+    );
+    Ok(())
+}
+
+#[cfg(feature = "ceres-ba")]
+#[test]
+fn taskflow_sequence_preserves_typed_pause_before_final_ba() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mut mapper_config) = synthetic_sequence_fixture(None)?;
+    mapper_config.global_ba = true;
+    let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(Default::default())?);
+    let ba = rustscan_sfm::CeresBaTaskflow::new(runtime.clone(), 2, 128 * 1024 * 1024)?;
+    let control = SfmTaskControl::new();
+    let mut sink = |event: rustscan_sfm::SfmTaskEvent| {
+        if event.operation == rustscan_sfm::SfmTaskOperation::GlobalBundleAdjustment
+            && event.kind == rustscan_sfm::SfmTaskEventKind::Started
+        {
+            control.request_pause();
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink).with_ceres_ba_taskflow(&ba);
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+        Some(&rustscan_sfm::SfmTaskStop::Paused)
+    );
+    assert_eq!(runtime.snapshot()?.pending_tasks, 0);
+    assert!(!output.join("sparse/0").exists());
+    Ok(())
+}
+
+#[cfg(feature = "ceres-ba")]
+#[test]
+fn taskflow_sequence_waits_for_budget_and_runs_final_global_ba_once() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mut mapper_config) = synthetic_sequence_fixture(None)?;
+    mapper_config.global_ba = true;
+    let runtime = std::sync::Arc::new(rustscan_taskflow::Runtime::new(
+        rustscan_taskflow::RuntimeConfig {
+            budget: rustscan_taskflow::Budget {
+                cpu_threads: 2,
+                memory_bytes: 256 * 1024 * 1024,
+                io_slots: 2,
+            },
+            ..Default::default()
+        },
+    )?);
+    let ceiling = runtime.snapshot()?.budget;
+    let mut paused = ceiling;
+    paused.cpu_threads = 0;
+    runtime.set_budget(paused)?;
+    let ba = rustscan_sfm::CeresBaTaskflow::new(runtime.clone(), 2, 128 * 1024 * 1024)?;
+    let (result, events) = std::thread::scope(|scope| -> anyhow::Result<_> {
+        let workflow = scope.spawn(|| -> anyhow::Result<_> {
+            let control = SfmTaskControl::new();
+            let mut events = Vec::new();
+            let mut sink = |event| events.push(event);
+            let mut task = SfmTaskContext::new(&control, &mut sink).with_ceres_ba_taskflow(&ba);
+            let result = register_remaining_sequence_frames(
+                &frames,
+                &keyframes.keyframe_ids,
+                &keyframes,
+                &mapper_config,
+                &synthetic_sequence_config(),
+                &output,
+                &mut task,
+            )?;
+            Ok((result, events))
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runtime.snapshot()?.pending_tasks == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let queued = runtime.snapshot()?.pending_tasks;
+        // Always unblock the worker before asserting, even on regression.
+        runtime.set_budget(ceiling)?;
+        let result = workflow.join().unwrap()?;
+        assert_eq!(
+            queued, 1,
+            "sequence computation bypassed the shared admission controller"
+        );
+        Ok(result)
+    })?;
+    assert!(result.has_complete_coverage());
+    let global: Vec<_> = events
+        .iter()
+        .filter(|event| event.operation == rustscan_sfm::SfmTaskOperation::GlobalBundleAdjustment)
+        .collect();
+    assert_eq!(global.len(), 2);
+    assert_eq!(global[0].kind, rustscan_sfm::SfmTaskEventKind::Started);
+    assert_eq!(global[1].kind, rustscan_sfm::SfmTaskEventKind::Completed);
+    assert_eq!(global[0].registered_images, Some(6));
+    let last_registration = events
+        .iter()
+        .filter(|event| event.operation == rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt)
+        .map(|event| event.sequence)
+        .max()
+        .unwrap();
+    assert!(global[0].sequence > last_registration);
+    let used = runtime.snapshot()?;
+    assert_eq!(used.cpu_threads, 0);
+    assert_eq!(used.memory_bytes, 0);
+    assert_eq!(used.pending_tasks, 0);
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn pause_before_sparse_publish_preserves_old_model_byte_for_byte() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    std::fs::write(keyframes.sparse_model.join("old.marker"), b"keyframe-model")?;
+    let before = snapshot_flat_directory(&keyframes.sparse_model)?;
+    let control = SfmTaskControl::new();
+    let pause_control = control.clone();
+    let mut sink = move |event: rustscan_sfm::SfmTaskEvent| {
+        if event.stage == rustscan_sfm::SfmTaskStage::Export
+            && event.operation == rustscan_sfm::SfmTaskOperation::ValidateArtifacts
+        {
+            pause_control.request_pause();
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+        Some(&rustscan_sfm::SfmTaskStop::Paused)
+    );
+    assert_eq!(snapshot_flat_directory(&keyframes.sparse_model)?, before);
+    assert!(!output.join("registration.json").exists());
+    assert!(!output.join("sparse/0.tmp").exists());
+    assert!(!output.join("sparse/0.backup").exists());
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn pause_after_sparse_publish_resumes_from_immutable_keyframes() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    std::fs::write(keyframes.sparse_model.join("old.marker"), b"keyframe-model")?;
+    let keyframe_snapshot = snapshot_flat_directory(&keyframes.sparse_model)?;
+    let control = SfmTaskControl::new();
+    let pause_control = control.clone();
+    let mut sink = move |event: rustscan_sfm::SfmTaskEvent| {
+        if event.stage == rustscan_sfm::SfmTaskStage::Export
+            && event.operation == rustscan_sfm::SfmTaskOperation::WriteArtifacts
+        {
+            pause_control.request_pause();
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+        Some(&rustscan_sfm::SfmTaskStop::Paused)
+    );
+    let published = read_colmap_sparse_model(&output.join("sparse/0"))?.reconstruction;
+    assert_eq!(published.poses.iter().flatten().count(), 6);
+    assert_eq!(
+        snapshot_flat_directory(&keyframes.sparse_model)?,
+        keyframe_snapshot
+    );
+    assert!(!output.join("registration.json").exists());
+    assert!(!output.join("sparse/0.tmp").exists());
+    assert!(!output.join("sparse/0.backup").exists());
+
+    drop(task);
+    drop(sink);
+    let resume_control = SfmTaskControl::new();
+    let mut resume_events = Vec::new();
+    let mut resume_sink = |event| resume_events.push(event);
+    let mut resume_task = SfmTaskContext::new(&resume_control, &mut resume_sink);
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut resume_task,
+    )?;
+
+    assert!(result.has_complete_coverage());
+    assert!(output.join("registration.json").is_file());
+    assert_eq!(
+        snapshot_flat_directory(&keyframes.sparse_model)?,
+        keyframe_snapshot
+    );
+    assert!(resume_events.iter().all(|event| {
+        event.stage != rustscan_sfm::SfmTaskStage::IncrementalMapping
+            || event.operation != rustscan_sfm::SfmTaskOperation::Begin
+    }));
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn narrow_round_does_not_publish_same_round_registrations_as_support() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    assert!(result.has_complete_coverage());
+
+    let second_target_attempt = events
+        .iter()
+        .find(|event| {
+            event.operation == rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt
+                && event.image_id == Some(404)
+        })
+        .expect("second target attempt event");
+    assert!(second_target_attempt
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("round=Narrow")));
+    assert!(
+        !second_target_attempt
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("202")),
+        "same-round frame leaked into support: {:?}",
+        second_target_attempt.message
+    );
+    let database = ColmapDatabase::open_read_only(&keyframes.database)?;
+    assert!(!database.exists_matches(2, 4)?);
+    assert!(!database.exists_two_view_geometry(2, 4)?);
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn wide_round_can_use_tracks_committed_by_narrow_non_keyframe() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let database = ColmapDatabase::open(&keyframes.database)?;
+    rewrite_synthetic_descriptor_variants(&database, &[4])?;
+    drop(database);
+
+    let control = SfmTaskControl::new();
+    let database_path = keyframes.database.clone();
+    let mut switched_narrow_support = false;
+    let mut sink = |event: rustscan_sfm::SfmTaskEvent| {
+        if !switched_narrow_support
+            && event.operation == rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt
+            && event.image_id == Some(404)
+            && event
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("round=Narrow"))
+        {
+            let database = ColmapDatabase::open(&database_path).unwrap();
+            rewrite_synthetic_descriptor_variants(&database, &[2, 4]).unwrap();
+            switched_narrow_support = true;
+        }
+    };
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+
+    assert!(switched_narrow_support);
+    let dynamic_target = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 404)
+        .expect("dynamic-support target diagnostic");
+    assert_eq!(dynamic_target.status, FrameRegistrationStatus::Registered);
+    assert_eq!(dynamic_target.attempts, 2);
+    assert_eq!(
+        dynamic_target.message.as_deref(),
+        Some("registered in Wide round")
+    );
+    assert!(dynamic_target.support_frame_ids.contains(&202));
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn default_pnp_seed_is_stable_across_intervening_registration_calls() -> anyhow::Result<()> {
+    let (_temp_a, output_a, frames_a, keyframes_a, mut mapper_a) =
+        synthetic_sequence_fixture(None)?;
+    mapper_a.random_seed = -1;
+    let control_a = SfmTaskControl::new();
+    let mut events_a = Vec::new();
+    let mut sink_a = |event| events_a.push(event);
+    let mut task_a = SfmTaskContext::new(&control_a, &mut sink_a);
+    let result_a = register_remaining_sequence_frames(
+        &frames_a,
+        &keyframes_a.keyframe_ids,
+        &keyframes_a,
+        &mapper_a,
+        &synthetic_sequence_config(),
+        &output_a,
+        &mut task_a,
+    )?;
+
+    let (_temp_perturb, output_perturb, frames_perturb, keyframes_perturb, mut mapper_perturb) =
+        synthetic_sequence_fixture(None)?;
+    mapper_perturb.random_seed = -1;
+    let control_perturb = SfmTaskControl::new();
+    let mut sink_perturb = |_| {};
+    let mut task_perturb = SfmTaskContext::new(&control_perturb, &mut sink_perturb);
+    register_remaining_sequence_frames(
+        &frames_perturb,
+        &keyframes_perturb.keyframe_ids,
+        &keyframes_perturb,
+        &mapper_perturb,
+        &synthetic_sequence_config(),
+        &output_perturb,
+        &mut task_perturb,
+    )?;
+
+    let (_temp_b, output_b, frames_b, keyframes_b, mut mapper_b) =
+        synthetic_sequence_fixture(None)?;
+    mapper_b.random_seed = -1;
+    let control_b = SfmTaskControl::new();
+    let mut events_b = Vec::new();
+    let mut sink_b = |event| events_b.push(event);
+    let mut task_b = SfmTaskContext::new(&control_b, &mut sink_b);
+    let result_b = register_remaining_sequence_frames(
+        &frames_b,
+        &keyframes_b.keyframe_ids,
+        &keyframes_b,
+        &mapper_b,
+        &synthetic_sequence_config(),
+        &output_b,
+        &mut task_b,
+    )?;
+
+    let seed_from_events = |events: &[rustscan_sfm::SfmTaskEvent]| -> anyhow::Result<i32> {
+        let event = events
+            .iter()
+            .find(|event| {
+                event.operation == rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt
+                    && event.image_id == Some(404)
+            })
+            .expect("target attempt event");
+        event
+            .message
+            .as_deref()
+            .and_then(|message| {
+                message
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix("seed="))
+            })
+            .ok_or_else(|| anyhow::anyhow!("attempt event has no deterministic seed"))?
+            .parse()
+            .map_err(Into::into)
+    };
+    let seed_a = seed_from_events(&events_a)?;
+    let seed_b = seed_from_events(&events_b)?;
+    assert!(seed_a >= 0);
+    assert_eq!(seed_a, seed_b);
+
+    let diagnostic_a = result_a
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 404)
+        .unwrap();
+    let diagnostic_b = result_b
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 404)
+        .unwrap();
+    assert_eq!(diagnostic_a, diagnostic_b);
+    let model_a = read_colmap_sparse_model(&result_a.sparse_model)?.reconstruction;
+    let model_b = read_colmap_sparse_model(&result_b.sparse_model)?.reconstruction;
+    let pose_for_target = |model: &Reconstruction| {
+        let index = model
+            .image_names
+            .iter()
+            .position(|name| name == "frame-0003.png")
+            .unwrap();
+        model.poses[index].unwrap()
+    };
+    let pose_a = pose_for_target(&model_a);
+    let pose_b = pose_for_target(&model_b);
+    assert_eq!(pose_a.translation(), pose_b.translation());
+    assert_eq!(pose_a.quaternion(), pose_b.quaternion());
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn blank_sequence_frame_returns_unresolved_incomplete_coverage() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(Some(3))?;
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+
+    assert!(!result.has_complete_coverage());
+    assert_eq!(result.registered_frames, 5);
+    let blank = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.frame_id == 404)
+        .unwrap();
+    assert_eq!(blank.status, FrameRegistrationStatus::Unresolved);
+    assert_eq!(blank.attempts, 2);
+    assert!(require_complete_pose_coverage(&result).is_err());
+    assert!(output.join("registration.json").is_file());
+    Ok(())
+}
+
+#[test]
+fn pause_between_stages_does_not_repeat_or_modify_keyframe_work() -> anyhow::Result<()> {
+    let (_temp, output, frames, keyframes, mapper_config) = synthetic_sequence_fixture(None)?;
+    let database = ColmapDatabase::open_read_only(&keyframes.database)?;
+    let keypoints_before = database.read_keypoints(1)?;
+    let sparse_before = std::fs::read(keyframes.sparse_model.join("images.bin"))?;
+    drop(database);
+    let control = SfmTaskControl::new();
+    control.request_pause();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let error = register_remaining_sequence_frames(
+        &frames,
+        &keyframes.keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<rustscan_sfm::SfmTaskStop>(),
+        Some(&rustscan_sfm::SfmTaskStop::Paused)
+    );
+    let database = ColmapDatabase::open_read_only(&keyframes.database)?;
+    assert_eq!(database.read_keypoints(1)?, keypoints_before);
+    assert_eq!(
+        std::fs::read(keyframes.sparse_model.join("images.bin"))?,
+        sparse_before
+    );
+    assert!(!output.join("sparse/0").exists());
+    assert!(events.is_empty());
+    Ok(())
+}
+
+#[cfg(feature = "ceres-ba")]
+#[test]
+fn preseeded_keyframe_stage_and_remaining_stage_compose_to_complete_sequence() -> anyhow::Result<()>
+{
+    let (_temp, output, frames, old_keyframes, mut mapper_config) =
+        synthetic_sequence_fixture(None)?;
+    let database = ColmapDatabase::open(&old_keyframes.database)?;
+    let pending_rows_before = [2u32, 4u32]
+        .into_iter()
+        .map(|image_id| {
+            Ok((
+                database.read_image(image_id)?.unwrap(),
+                database.read_keypoints(image_id)?,
+                database.read_descriptors(image_id)?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let sentinel_matches = vec![FeatureMatch::new(7, 11), FeatureMatch::new(13, 17)];
+    let sentinel_geometry = ColmapTwoViewGeometry {
+        config: COLMAP_TWO_VIEW_CALIBRATED,
+        inlier_matches: sentinel_matches.clone(),
+        e_matrix: Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]),
+        qvec: Some([1.0, 0.0, 0.0, 0.0]),
+        tvec: Some([0.25, -0.5, 0.75]),
+        ..ColmapTwoViewGeometry::default()
+    };
+    database.write_matches(2, 4, &sentinel_matches)?;
+    database.write_two_view_geometry(2, 4, &sentinel_geometry)?;
+    let matches_before = database.read_matches_blob(2, 4)?;
+    let geometry_before = database.read_two_view_geometry(2, 4)?;
+    drop(database);
+    if output.join("sparse").exists() {
+        std::fs::remove_dir_all(output.join("sparse"))?;
+    }
+
+    mapper_config.multiple_models = false;
+    mapper_config.copy_images = false;
+    mapper_config.init_num_trials = 1;
+    mapper_config.init_min_num_inliers = 16;
+    mapper_config.init_min_tri_angle_deg = 0.5;
+    mapper_config.abs_pose_min_num_inliers = 16;
+    mapper_config.ignore_two_view_tracks = false;
+    mapper_config.local_ba = true;
+    mapper_config.local_ba_iterations = 2;
+    mapper_config.global_ba = true;
+    mapper_config.global_ba_iterations = 2;
+    let control = SfmTaskControl::new();
+    let mut events = Vec::new();
+    let mut sink = |event| events.push(event);
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+    let keyframe_ids = SYNTHETIC_KEYFRAME_INDICES
+        .iter()
+        .map(|&index| frames[index].id)
+        .collect::<Vec<_>>();
+
+    let keyframes =
+        run_keyframe_reconstruction(&frames, &keyframe_ids, &mapper_config, &output, &mut task)?;
+    drop(task);
+    drop(sink);
+
+    assert_eq!(keyframes.registered_keyframes, 4);
+    assert_eq!(keyframes.database, output.join("Cache/database.db"));
+    assert_eq!(
+        keyframes.sparse_model,
+        output.join("Cache/keyframe-sparse/0")
+    );
+    for file in [
+        "cameras.txt",
+        "images.txt",
+        "points3D.txt",
+        "cameras.bin",
+        "images.bin",
+        "points3D.bin",
+    ] {
+        assert!(
+            keyframes.sparse_model.join(file).is_file(),
+            "missing {file}"
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.operation == rustscan_sfm::SfmTaskOperation::ExtractImage)
+            .count(),
+        0,
+        "preseeded keyframe features must be reused"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.operation == rustscan_sfm::SfmTaskOperation::GlobalBundleAdjustment
+            })
+            .count(),
+        0,
+        "keyframe mapping must defer global BA until all sequence frames are loaded"
+    );
+    assert!(events
+        .iter()
+        .any(|event| { event.operation == rustscan_sfm::SfmTaskOperation::LocalBundleAdjustment }));
+    let keyframe_database_ids = [1u32, 3, 5, 6]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let pair_events = events
+        .iter()
+        .filter(|event| event.operation == rustscan_sfm::SfmTaskOperation::MatchPairBatch)
+        .collect::<Vec<_>>();
+    assert_eq!(pair_events.len(), 6, "one event per keyframe-only pair");
+    assert!(pair_events.iter().all(|event| event
+        .pair
+        .is_some_and(|(left, right)| keyframe_database_ids.contains(&left)
+            && keyframe_database_ids.contains(&right))));
+    let database = ColmapDatabase::open_read_only(&keyframes.database)?;
+    let pending_rows_after = [2u32, 4u32]
+        .into_iter()
+        .map(|image_id| {
+            Ok((
+                database.read_image(image_id)?.unwrap(),
+                database.read_keypoints(image_id)?,
+                database.read_descriptors(image_id)?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(pending_rows_after, pending_rows_before);
+    assert_eq!(database.read_matches_blob(2, 4)?, matches_before);
+    assert_eq!(database.read_two_view_geometry(2, 4)?, geometry_before);
+    for image_id in [2u32, 4u32] {
+        assert!(database.read_image(image_id)?.is_some());
+    }
+    drop(database);
+
+    let mut remaining_events = Vec::new();
+    let mut sink = |event| remaining_events.push(event);
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result = register_remaining_sequence_frames(
+        &frames,
+        &keyframe_ids,
+        &keyframes,
+        &mapper_config,
+        &synthetic_sequence_config(),
+        &output,
+        &mut task,
+    )?;
+    drop(task);
+    drop(sink);
+
+    assert!(result.has_complete_coverage(), "{:#?}", result.diagnostics);
+    assert_eq!(result.registered_frames, 6);
+    let global_ba_events = remaining_events
+        .iter()
+        .filter(|event| event.operation == rustscan_sfm::SfmTaskOperation::GlobalBundleAdjustment)
+        .collect::<Vec<_>>();
+    assert_eq!(global_ba_events.len(), 2);
+    let last_registration_sequence = remaining_events
+        .iter()
+        .filter(|event| event.operation == rustscan_sfm::SfmTaskOperation::RegisterFrameAttempt)
+        .map(|event| event.sequence)
+        .max()
+        .unwrap();
+    assert!(last_registration_sequence < global_ba_events[0].sequence);
+    assert_eq!(
+        global_ba_events[0].kind,
+        rustscan_sfm::SfmTaskEventKind::Started
+    );
+    assert_eq!(
+        global_ba_events[1].kind,
+        rustscan_sfm::SfmTaskEventKind::Completed
+    );
+    Ok(())
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn keyframe_stage_uses_private_snapshot_and_removes_legacy_shared_directory() -> anyhow::Result<()>
+{
+    let (_temp, output, frames, _old_keyframes, mut mapper_config) =
+        synthetic_sequence_fixture(None)?;
+    if output.join("sparse").exists() {
+        std::fs::remove_dir_all(output.join("sparse"))?;
+    }
+    let keyframe_input = output.join("Cache/keyframes");
+    std::fs::create_dir_all(&keyframe_input)?;
+    let stale_image = keyframe_input.join("obsolete.png");
+    image::GrayImage::new(32, 32).save(&stale_image)?;
+
+    mapper_config.multiple_models = false;
+    mapper_config.copy_images = false;
+    mapper_config.init_num_trials = 1;
+    mapper_config.init_min_num_inliers = 16;
+    mapper_config.init_min_tri_angle_deg = 0.5;
+    mapper_config.abs_pose_min_num_inliers = 16;
+    mapper_config.ignore_two_view_tracks = false;
+    let keyframe_ids = SYNTHETIC_KEYFRAME_INDICES
+        .iter()
+        .map(|&index| frames[index].id)
+        .collect::<Vec<_>>();
+    let control = SfmTaskControl::new();
+    let mut sink = |_| {};
+    let mut task = SfmTaskContext::new(&control, &mut sink);
+
+    let result =
+        run_keyframe_reconstruction(&frames, &keyframe_ids, &mapper_config, &output, &mut task)?;
+
+    assert_eq!(result.keyframe_ids, keyframe_ids);
+    assert!(!stale_image.exists());
+    assert!(!keyframe_input.exists());
+    assert!(output.join("Cache/keyframes.lock").is_file());
+    assert!(std::fs::read_dir(output.join("Cache"))?.all(|entry| {
+        !entry
+            .map(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".keyframe-input-")
+            })
+            .unwrap_or(false)
+    }));
+    Ok(())
+}
+
+#[test]
+fn keyframe_database_metadata_uses_private_snapshot_after_source_replacement() -> anyhow::Result<()>
+{
+    let input = tempdir()?;
+    let output = tempdir()?;
+    let source = input.path().join("frame.png");
+    image::GrayImage::new(64, 48).save(&source)?;
+    let frames = vec![SequenceFrame {
+        id: 42,
+        image_path: source.clone(),
+        timestamp_us: Some(0),
+    }];
+
+    let cache = output.path().join("Cache");
+    std::fs::create_dir_all(&cache)?;
+    let database_path = cache.join("database.db");
+    drop(ColmapDatabase::open(&database_path)?);
+    let database_lock = rusqlite::Connection::open(&database_path)?;
+    database_lock.execute_batch("BEGIN EXCLUSIVE TRANSACTION;")?;
+
+    let runner_frames = frames.clone();
+    let runner_output = output.path().to_path_buf();
+    let control = SfmTaskControl::new();
+    let runner_control = control.clone();
+    let runner = std::thread::spawn(move || {
+        let mut sink = |_| {};
+        let mut task = SfmTaskContext::new(&runner_control, &mut sink);
+        run_keyframe_reconstruction(
+            &runner_frames,
+            &[42],
+            &MapperConfig::default(),
+            &runner_output,
+            &mut task,
+        )
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let staged_image = std::fs::read_dir(&cache)?
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".keyframe-input-")
+                    .then(|| entry.path().join("frame.png"))
+            });
+        let snapshot_is_complete = staged_image.is_some_and(|path| {
+            std::fs::metadata(&path).ok().map(|metadata| metadata.len())
+                == std::fs::metadata(&source)
+                    .ok()
+                    .map(|metadata| metadata.len())
+                && matches!(image::image_dimensions(path), Ok((64, 48)))
+        });
+        if snapshot_is_complete {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            database_lock.execute_batch("ROLLBACK;")?;
+            let _ = runner.join();
+            anyhow::bail!("timed out waiting for the private keyframe snapshot");
+        }
+        std::thread::yield_now();
+    }
+
+    image::GrayImage::new(7, 5).save(&source)?;
+    control.request_cancel();
+    database_lock.execute_batch("ROLLBACK;")?;
+
+    let result = runner
+        .join()
+        .map_err(|_| anyhow::anyhow!("keyframe reconstruction thread panicked"))?;
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    let database = ColmapDatabase::open_read_only(&database_path)?;
+    let camera = database.read_camera(1)?.expect("keyframe camera");
+    assert_eq!((camera.camera.width, camera.camera.height), (64, 48));
+    Ok(())
+}
+
+#[test]
+fn temporal_sample_plan_uses_nearest_keyframes_in_deterministic_order() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+
+    assert_eq!(
+        plan.attempts_for(4, RegistrationRound::Narrow),
+        &[3, 6, 0, 9]
+    );
+    assert_eq!(
+        plan.attempts_for(4, RegistrationRound::Wide),
+        &[3, 6, 0, 9, 11]
+    );
+    assert_eq!(plan.pending_frames(), &[1, 2, 4, 5, 7, 8, 10]);
+}
+
+#[test]
+fn temporal_plan_json_round_trip_rebuilds_equivalent_attempts() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+
+    let json = serde_json::to_string(&plan).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 6);
+    assert!(value.get("pending").is_none());
+    assert!(value.get("narrow_support").is_none());
+    assert!(value.get("wide_support").is_none());
+    let restored: SequenceRegistrationPlan = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(restored, plan);
+    assert_eq!(
+        restored.attempts_for(4, RegistrationRound::Narrow),
+        &[3, 6, 0, 9]
+    );
+    assert_eq!(
+        restored.attempts_for(4, RegistrationRound::Wide),
+        &[3, 6, 0, 9, 11]
+    );
+    assert_eq!(restored.pending_frames(), &[1, 2, 4, 5, 7, 8, 10]);
+}
+
+#[test]
+fn temporal_plan_json_rejects_invalid_keyframe_inputs() {
+    let invalid = serde_json::json!({
+        "frame_count": 4,
+        "keyframes": [0, 2, 1],
+        "narrow_neighbors_each_side": 2,
+        "wide_neighbors_each_side": 4,
+        "frame_ids": [10, 20, 30, 40],
+        "timestamps_us": null,
+    });
+
+    assert!(serde_json::from_value::<SequenceRegistrationPlan>(invalid).is_err());
+}
+
+#[test]
+fn temporal_rounds_limit_each_side_then_sort_by_distance_and_frame_id() {
+    let first = SequenceRegistrationPlan::build(10, &[0, 2, 7, 9], 1, 3).unwrap();
+    let second = SequenceRegistrationPlan::build(10, &[0, 2, 7, 9], 1, 3).unwrap();
+
+    assert_eq!(first.attempts_for(5, RegistrationRound::Narrow), &[7, 2]);
+    assert_eq!(
+        first.attempts_for(5, RegistrationRound::Wide),
+        &[7, 2, 9, 0]
+    );
+    assert_eq!(first, second);
+}
+
+#[test]
+fn temporal_later_round_can_add_only_explicit_registered_support() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+
+    assert_eq!(
+        plan.attempts_for_with_support(4, RegistrationRound::Wide, &[]),
+        vec![3, 6, 0, 9, 11]
+    );
+    assert_eq!(
+        plan.attempts_for_with_support(4, RegistrationRound::Wide, &[7, 5, 2, 5, 4, usize::MAX],),
+        vec![3, 5, 2, 6, 7, 0, 9]
+    );
+}
+
+#[test]
+fn temporal_sorted_dynamic_support_reuses_bounded_keyframe_attempts() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+    let registered_support = [2, 5, 7];
+    let expected = vec![3, 5, 2, 6, 7, 0, 9];
+
+    for _ in 0..1_000 {
+        assert_eq!(
+            plan.attempts_for_with_sorted_support(4, RegistrationRound::Wide, &registered_support,)
+                .unwrap(),
+            expected
+        );
+    }
+
+    assert!(matches!(
+        plan.attempts_for_with_sorted_support(4, RegistrationRound::Wide, &[2, 2]),
+        Err(SequenceRegistrationError::DynamicSupportNotSortedUnique)
+    ));
+}
+
+#[test]
+fn temporal_sorted_dynamic_support_rejects_oversized_input() {
+    let plan = SequenceRegistrationPlan::build(12, &[0, 3, 6, 9, 11], 2, 4).unwrap();
+    let oversized = vec![0; MAX_DYNAMIC_SUPPORT_CANDIDATES + 1];
+
+    assert!(matches!(
+        plan.attempts_for_with_sorted_support(4, RegistrationRound::Wide, &oversized),
+        Err(SequenceRegistrationError::DynamicSupportLimitExceeded {
+            candidate_count,
+            max_candidates: MAX_DYNAMIC_SUPPORT_CANDIDATES,
+        }) if candidate_count == oversized.len()
+    ));
+    assert_eq!(
+        plan.attempts_for_with_support(4, RegistrationRound::Wide, &oversized),
+        plan.attempts_for(4, RegistrationRound::Wide)
+    );
+}
+
+#[test]
+fn temporal_dynamic_support_remains_bounded_for_large_merged_inputs() {
+    let frame_count = 20_000;
+    let frames: Vec<_> = (0..frame_count)
+        .map(|frame| SequenceFrame {
+            id: (frame_count - frame) as u32,
+            image_path: PathBuf::new(),
+            timestamp_us: Some((frame / 64) as i64),
+        })
+        .collect();
+    let keyframes: Vec<_> = (0..frame_count).step_by(2).collect();
+    let plan = SequenceRegistrationPlan::build_from_frames(&frames, &keyframes, 4, 8).unwrap();
+    let registered_support: Vec<_> = (1..frame_count).step_by(2).collect();
+
+    let support = plan
+        .attempts_for_with_sorted_support(10_001, RegistrationRound::Narrow, &registered_support)
+        .unwrap();
+
+    assert!(support.len() <= 8);
+    assert!(!support.contains(&10_001));
+}
+
+#[test]
+fn temporal_frame_plan_orders_support_by_timestamp_distance_then_frame_id() {
+    let frames = [
+        SequenceFrame {
+            id: 100,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 90,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(999),
+        },
+        SequenceFrame {
+            id: 50,
+            image_path: PathBuf::from("002.jpg"),
+            timestamp_us: Some(1_000),
+        },
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("003.jpg"),
+            timestamp_us: Some(1_001),
+        },
+        SequenceFrame {
+            id: 30,
+            image_path: PathBuf::from("004.jpg"),
+            timestamp_us: Some(2_000),
+        },
+    ];
+
+    let plan = SequenceRegistrationPlan::build_from_frames(&frames, &[0, 1, 3, 4], 2, 4).unwrap();
+
+    assert_eq!(
+        plan.attempts_for(2, RegistrationRound::Narrow),
+        &[3, 1, 4, 0]
+    );
+
+    let restored: SequenceRegistrationPlan =
+        serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+    assert_eq!(restored, plan);
+    assert_eq!(
+        restored.attempts_for(2, RegistrationRound::Narrow),
+        &[3, 1, 4, 0]
+    );
+}
+
+#[test]
+fn temporal_frame_plan_selects_each_side_by_timestamp_distance_and_frame_id() {
+    let frames = [
+        SequenceFrame {
+            id: 1,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 2,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 50,
+            image_path: PathBuf::from("002.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 40,
+            image_path: PathBuf::from("003.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 30,
+            image_path: PathBuf::from("004.jpg"),
+            timestamp_us: Some(90),
+        },
+        SequenceFrame {
+            id: 60,
+            image_path: PathBuf::from("005.jpg"),
+            timestamp_us: Some(100),
+        },
+        SequenceFrame {
+            id: 3,
+            image_path: PathBuf::from("006.jpg"),
+            timestamp_us: Some(200),
+        },
+    ];
+    let plan =
+        SequenceRegistrationPlan::build_from_frames(&frames, &[0, 1, 2, 3, 4, 6], 2, 4).unwrap();
+
+    assert_eq!(plan.attempts_for(5, RegistrationRound::Narrow), &[0, 1, 6]);
+}
+
+#[test]
+fn temporal_frame_plan_rejects_unsorted_timestamps() {
+    let frames = [
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 20,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(200),
+        },
+        SequenceFrame {
+            id: 30,
+            image_path: PathBuf::from("002.jpg"),
+            timestamp_us: Some(100),
+        },
+    ];
+
+    assert!(matches!(
+        SequenceRegistrationPlan::build_from_frames(&frames, &[0, 2], 2, 4),
+        Err(SequenceRegistrationError::UnsortedTimestamps {
+            previous_frame: 1,
+            current_frame: 2,
+        })
+    ));
+}
+
+#[test]
+fn temporal_frame_plan_rejects_oversized_timestamp_plateau() {
+    let frames: Vec<_> = (0..=MAX_TIMESTAMP_PLATEAU)
+        .map(|frame| SequenceFrame {
+            id: frame as u32,
+            image_path: PathBuf::new(),
+            timestamp_us: Some(42),
+        })
+        .collect();
+
+    assert!(matches!(
+        SequenceRegistrationPlan::build_from_frames(
+            &frames,
+            &[0, MAX_TIMESTAMP_PLATEAU],
+            2,
+            4,
+        ),
+        Err(SequenceRegistrationError::TimestampPlateauTooLarge {
+            timestamp_us: 42,
+            plateau_size,
+            max_plateau_size: MAX_TIMESTAMP_PLATEAU,
+        }) if plateau_size == frames.len()
+    ));
+}
+
+#[test]
+fn temporal_frame_plan_rejects_duplicate_frame_ids() {
+    let frames = [
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("000.jpg"),
+            timestamp_us: Some(0),
+        },
+        SequenceFrame {
+            id: 10,
+            image_path: PathBuf::from("001.jpg"),
+            timestamp_us: Some(100),
+        },
+    ];
+
+    assert!(matches!(
+        SequenceRegistrationPlan::build_from_frames(&frames, &[0, 1], 2, 4),
+        Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: 2,
+            frame_id_count: 2,
+            duplicate_frame_ids,
+        }) if duplicate_frame_ids == vec![10]
+    ));
+}
+
+#[test]
+fn temporal_plan_support_lists_only_contain_keyframes() {
+    let plan = SequenceRegistrationPlan::build(8, &[0, 4, 7], 2, 4).unwrap();
+
+    for frame in plan.pending_frames() {
+        for round in [RegistrationRound::Narrow, RegistrationRound::Wide] {
+            assert!(plan
+                .attempts_for(*frame, round)
+                .iter()
+                .all(|support| [0, 4, 7].contains(support)));
+        }
+    }
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_empty_sequences_and_keyframes() {
+    assert!(SequenceRegistrationPlan::build(0, &[], 2, 4).is_err());
+    assert!(SequenceRegistrationPlan::build(4, &[], 2, 4).is_err());
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_duplicate_keyframes() {
+    assert!(SequenceRegistrationPlan::build(4, &[0, 1, 1], 2, 4).is_err());
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_out_of_range_keyframes() {
+    assert!(SequenceRegistrationPlan::build(4, &[0, 4], 2, 4).is_err());
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_unsorted_keyframes() {
+    assert!(SequenceRegistrationPlan::build(4, &[0, 2, 1], 2, 4).is_err());
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_more_keyframes_than_frames() {
+    assert!(matches!(
+        SequenceRegistrationPlan::build(2, &[0, 1, 1], 2, 4),
+        Err(SequenceRegistrationError::TooManyKeyframes {
+            frame_count: 2,
+            keyframe_count: 3,
+        })
+    ));
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_oversized_neighbor_rounds() {
+    for (narrow, wide, round) in [
+        (MAX_SEQUENCE_NEIGHBORS + 1, 4, RegistrationRound::Narrow),
+        (2, MAX_SEQUENCE_NEIGHBORS + 1, RegistrationRound::Wide),
+    ] {
+        assert!(matches!(
+            SequenceRegistrationPlan::build(4, &[0, 3], narrow, wide),
+            Err(SequenceRegistrationError::SequenceNeighborLimitExceeded {
+                round: rejected_round,
+                requested,
+                max_neighbors: MAX_SEQUENCE_NEIGHBORS,
+            }) if rejected_round == round && requested == MAX_SEQUENCE_NEIGHBORS + 1
+        ));
+    }
+
+    let json = serde_json::json!({
+        "frame_count": 4,
+        "keyframes": [0, 3],
+        "narrow_neighbors_each_side": MAX_SEQUENCE_NEIGHBORS + 1,
+        "wide_neighbors_each_side": 4,
+        "frame_ids": [0, 1, 2, 3],
+        "timestamps_us": null,
+    });
+    assert!(serde_json::from_value::<SequenceRegistrationPlan>(json).is_err());
+}
+
+#[test]
+fn invalid_temporal_plan_rejects_total_support_budget_before_allocating() {
+    let narrow = MAX_SEQUENCE_NEIGHBORS;
+    let wide = MAX_SEQUENCE_NEIGHBORS;
+    let entries_per_frame = 2 * (narrow + wide);
+    let frame_count = MAX_TOTAL_SUPPORT_ENTRIES / entries_per_frame + 1;
+
+    assert!(frame_count <= MAX_SEQUENCE_PLAN_FRAMES);
+    assert!(matches!(
+        SequenceRegistrationPlan::build(frame_count, &[0], narrow, wide),
+        Err(SequenceRegistrationError::SequenceSupportBudgetExceeded {
+            frame_count: rejected_frames,
+            estimated_support_entries,
+            max_support_entries: MAX_TOTAL_SUPPORT_ENTRIES,
+        }) if rejected_frames == frame_count
+            && estimated_support_entries
+                == (frame_count as u128 * entries_per_frame as u128)
+    ));
+
+    let json = serde_json::json!({
+        "frame_count": frame_count,
+        "keyframes": [0],
+        "narrow_neighbors_each_side": narrow,
+        "wide_neighbors_each_side": wide,
+        "frame_ids": (0..frame_count as u32).collect::<Vec<_>>(),
+        "timestamps_us": null,
+    });
+    assert!(serde_json::from_value::<SequenceRegistrationPlan>(json).is_err());
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn invalid_temporal_plan_rejects_unrepresentable_frame_count_before_allocating() {
+    for frame_count in [MAX_SEQUENCE_PLAN_FRAMES + 1, u32::MAX as usize + 1] {
+        assert!(matches!(
+            SequenceRegistrationPlan::build(frame_count, &[0], 2, 4),
+            Err(SequenceRegistrationError::SequencePlanTooLarge {
+                frame_count: rejected,
+                max_frame_count: MAX_SEQUENCE_PLAN_FRAMES,
+            }) if rejected == frame_count
+        ));
+    }
+
+    let json = serde_json::json!({
+        "frame_count": u32::MAX as usize + 1,
+        "keyframes": [0],
+        "narrow_neighbors_each_side": 2,
+        "wide_neighbors_each_side": 4,
+        "frame_ids": [0],
+        "timestamps_us": null,
+    });
+    assert!(serde_json::from_value::<SequenceRegistrationPlan>(json).is_err());
+}
+
+#[test]
+fn registration_status_identifies_pose_coverage() {
+    assert!(FrameRegistrationStatus::Keyframe.is_registered());
+    assert!(FrameRegistrationStatus::Registered.is_registered());
+    assert!(!FrameRegistrationStatus::Unresolved.is_registered());
+    assert!(!FrameRegistrationStatus::Excluded.is_registered());
+}
+
+#[test]
+fn sequence_config_defaults_match_registration_policy() {
+    let config = SequenceRegistrationConfig::default();
+
+    assert_eq!(config.narrow_neighbors_each_side, 2);
+    assert_eq!(config.wide_neighbors_each_side, 4);
+    assert_eq!(config.min_inliers, 24);
+    assert_eq!(config.min_inlier_ratio, 0.20);
+    assert_eq!(config.max_reprojection_error, 4.0);
+    assert!(config.use_gpu_pnp);
+    assert_json_round_trip(&config);
+}
+
+#[test]
+fn sequence_config_validation_rejects_non_finite_metrics() {
+    let config = SequenceRegistrationConfig {
+        min_inlier_ratio: f64::NAN,
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(SequenceRegistrationError::InvalidConfigMetric {
+            field: "min_inlier_ratio"
+        })
+    ));
+
+    let config = SequenceRegistrationConfig {
+        max_reprojection_error: f64::INFINITY,
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(SequenceRegistrationError::InvalidConfigMetric {
+            field: "max_reprojection_error"
+        })
+    ));
+}
+
+#[test]
+fn sequence_frame_and_round_round_trip_through_json() {
+    let frame = SequenceFrame {
+        id: 42,
+        image_path: PathBuf::from("images/000042.jpg"),
+        timestamp_us: Some(1_234_567),
+    };
+
+    assert_json_round_trip(&frame);
+    assert_json_round_trip(&RegistrationRound::Narrow);
+    assert_json_round_trip(&RegistrationRound::Wide);
+    assert_eq!(
+        serde_json::to_value(RegistrationRound::Narrow).unwrap(),
+        "narrow"
+    );
+}
+
+#[test]
+fn diagnostic_update_preserves_attempt_state_and_metrics_in_json() {
+    let mut diagnostic = FrameRegistrationDiagnostic::new(4, FrameRegistrationStatus::Unresolved);
+
+    diagnostic.record_attempt(
+        FrameRegistrationStatus::Unresolved,
+        vec![3, 6],
+        18,
+        0.36,
+        Some(3.25),
+        Some("narrow support was insufficient".to_owned()),
+    );
+    diagnostic.record_attempt(
+        FrameRegistrationStatus::Registered,
+        vec![3, 6, 0, 9, 11],
+        31,
+        0.62,
+        Some(1.5),
+        Some("registered in wide round".to_owned()),
+    );
+
+    assert_eq!(diagnostic.frame_id, 4);
+    assert_eq!(diagnostic.status, FrameRegistrationStatus::Registered);
+    assert_eq!(diagnostic.attempts, 2);
+    assert_eq!(diagnostic.support_frame_ids, vec![3, 6, 0, 9, 11]);
+    assert_eq!(diagnostic.inlier_count, 31);
+    assert_eq!(diagnostic.inlier_ratio, 0.62);
+    assert_eq!(diagnostic.mean_reprojection_error, Some(1.5));
+    assert_eq!(
+        diagnostic.message.as_deref(),
+        Some("registered in wide round")
+    );
+    assert_json_round_trip(&diagnostic);
+}
+
+#[test]
+fn sequence_result_round_trip_preserves_diagnostics() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 1,
+        frame_ids: vec![0, 1],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic {
+                frame_id: 1,
+                status: FrameRegistrationStatus::Unresolved,
+                attempts: 2,
+                support_frame_ids: vec![0],
+                inlier_count: 11,
+                inlier_ratio: 0.15,
+                mean_reprojection_error: Some(4.5),
+                message: Some("inlier threshold not met".to_owned()),
+            },
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert_json_round_trip(&result);
+
+    let mut json = serde_json::to_value(&result).unwrap();
+    json.as_object_mut().unwrap().remove("frame_ids");
+    assert!(serde_json::from_value::<SequenceRegistrationResult>(json).is_err());
+}
+
+#[test]
+fn complete_coverage_accepts_keyframes_and_registered_frames() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 2,
+        frame_ids: vec![10, 20],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(20, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(result.has_complete_coverage());
+    assert_eq!(result.validate_complete_coverage(), Ok(()));
+}
+
+#[test]
+fn incomplete_frame_count_returns_an_explicit_error() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 3,
+        registered_frames: 2,
+        frame_ids: vec![0, 1, 2],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+            FrameRegistrationDiagnostic::new(2, FrameRegistrationStatus::Unresolved),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(!result.has_complete_coverage());
+    let error = result.validate_complete_coverage().unwrap_err();
+    assert!(error.to_string().contains("2 of 3"));
+    assert!(matches!(
+        error,
+        SequenceRegistrationError::IncompleteCoverage {
+            imported_frames: 3,
+            registered_frames: 2,
+            unresolved_frame_ids,
+        } if unresolved_frame_ids == vec![2]
+    ));
+}
+
+#[test]
+fn unresolved_diagnostic_fails_coverage_even_when_counts_match() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 3,
+        registered_frames: 3,
+        frame_ids: vec![0, 1, 2],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+            FrameRegistrationDiagnostic::new(2, FrameRegistrationStatus::Unresolved),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(!result.has_complete_coverage());
+    let error = result.validate_complete_coverage().unwrap_err();
+    assert!(error.to_string().contains("frame 2"));
+    assert!(matches!(
+        error,
+        SequenceRegistrationError::RegistrationStatusCountMismatch {
+            registered_frames: 3,
+            diagnostic_registered_frames: 2,
+            unresolved_frame_ids,
+        } if unresolved_frame_ids == vec![2]
+    ));
+}
+
+#[test]
+fn complete_counts_with_missing_diagnostic_fail_coverage() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 3,
+        registered_frames: 3,
+        frame_ids: vec![0, 1, 2],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(!result.has_complete_coverage());
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::DiagnosticCountMismatch {
+            imported_frames: 3,
+            diagnostic_count: 2,
+        })
+    ));
+}
+
+#[test]
+fn complete_counts_with_duplicate_diagnostic_fail_coverage() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 3,
+        registered_frames: 3,
+        frame_ids: vec![0, 1, 2],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(!result.has_complete_coverage());
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidDiagnostics {
+            imported_frames: 3,
+            diagnostic_count: 3,
+            missing_frame_ids,
+            duplicate_frame_ids,
+            unexpected_frame_ids,
+        }) if missing_frame_ids == vec![2]
+            && duplicate_frame_ids == vec![1]
+            && unexpected_frame_ids.is_empty()
+    ));
+}
+
+#[test]
+fn arbitrary_expected_frame_ids_reject_fabricated_contiguous_diagnostics() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 2,
+        frame_ids: vec![10, 20],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(0, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(1, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidDiagnostics {
+            imported_frames: 2,
+            diagnostic_count: 2,
+            missing_frame_ids,
+            duplicate_frame_ids,
+            unexpected_frame_ids,
+        }) if missing_frame_ids == vec![10, 20]
+            && duplicate_frame_ids.is_empty()
+            && unexpected_frame_ids == vec![0, 1]
+    ));
+}
+
+#[test]
+fn duplicate_expected_frame_ids_fail_coverage() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 2,
+        frame_ids: vec![10, 10],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(20, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: 2,
+            frame_id_count: 2,
+            duplicate_frame_ids,
+        }) if duplicate_frame_ids == vec![10]
+    ));
+}
+
+#[test]
+fn expected_frame_id_count_must_match_imported_frames() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 2,
+        registered_frames: 2,
+        frame_ids: vec![10],
+        diagnostics: vec![
+            FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Keyframe),
+            FrameRegistrationDiagnostic::new(20, FrameRegistrationStatus::Registered),
+        ],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidFrameIds {
+            imported_frames: 2,
+            frame_id_count: 1,
+            duplicate_frame_ids,
+        }) if duplicate_frame_ids.is_empty()
+    ));
+}
+
+#[test]
+fn empty_sequence_result_fails_coverage() {
+    let result = SequenceRegistrationResult {
+        imported_frames: 0,
+        registered_frames: 0,
+        frame_ids: Vec::new(),
+        diagnostics: Vec::new(),
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert_eq!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::EmptySequence)
+    );
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn huge_sequence_result_rejects_diagnostic_count_without_allocating() {
+    let result = SequenceRegistrationResult {
+        imported_frames: usize::MAX,
+        registered_frames: 0,
+        frame_ids: Vec::new(),
+        diagnostics: Vec::new(),
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::DiagnosticCountMismatch {
+            imported_frames: usize::MAX,
+            diagnostic_count: 0,
+        })
+    ));
+}
+
+#[test]
+fn non_finite_diagnostic_metrics_fail_coverage() {
+    let mut diagnostic = FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Registered);
+    diagnostic.inlier_ratio = f64::NAN;
+    let result = SequenceRegistrationResult {
+        imported_frames: 1,
+        registered_frames: 1,
+        frame_ids: vec![10],
+        diagnostics: vec![diagnostic],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidDiagnosticMetric {
+            frame_id: 10,
+            field: "inlier_ratio",
+        })
+    ));
+
+    let mut diagnostic = FrameRegistrationDiagnostic::new(10, FrameRegistrationStatus::Registered);
+    diagnostic.mean_reprojection_error = Some(f64::INFINITY);
+    let result = SequenceRegistrationResult {
+        imported_frames: 1,
+        registered_frames: 1,
+        frame_ids: vec![10],
+        diagnostics: vec![diagnostic],
+        sparse_model: PathBuf::from("sparse/0"),
+    };
+    assert!(matches!(
+        result.validate_complete_coverage(),
+        Err(SequenceRegistrationError::InvalidDiagnosticMetric {
+            frame_id: 10,
+            field: "mean_reprojection_error",
+        })
+    ));
+}

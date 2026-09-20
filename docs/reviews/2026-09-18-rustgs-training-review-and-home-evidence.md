@@ -8,7 +8,7 @@
 
 - 发现 4 项问题：非采样步 overflow 丢失、scan 输出缓存覆盖存活结果、保留累计可见性导致不可见窗口无法推进、Threshold 在非增密剪枝步骤关闭 opacity 判定。
 - scan 生命周期问题已在 GPU 上复现：第二次同长度 scan 将第一次结果从 `[1,3,6]` 改成 `[10,30,60]`。
-- 2026-09-18 审核运行结果：无 GPU 特性库测试 17/17、GPU 库测试 76/76、显式启用的 GPU integration 1/1 通过；scan 补充复现失败；`cargo fmt --package rustgs --check` 未通过。
+- 2026-09-18 审核运行结果：无 GPU 特性库测试 17/17、GPU 库测试 76/76、显式启用的 GPU integration 1/1 通过；scan 补充复现失败；`cargo fmt --package rustscan-gs --check` 未通过。
 - 下方为当时实验记录。其“通过”仅指已记录的 Home 短跑指标，不代表本次提交已通过正确性或跨场景验收。
 - overflow 检测存在漏报，所以“没有报错”不能证明所有步骤均未溢出；prune 数量变化也不能单独归因于预期的可见性改进。
 - 提交已经改变默认路径的实现行为。“默认配置仍不改”不能解释为默认训练行为未变；尚缺的是变更后的质量验收。
@@ -19,15 +19,15 @@
 - 代码：`StickyForwardOverflow` + `accumulate_sticky_forward_overflow`（`reporting/metrics.rs`）；`train_step` 在 forward 后、loss/Adam/topology 前消费 sticky；`checkpoint()` 拒绝 sticky 状态下的成功导出；`ForwardCapacityExceeded` 增加 `first_iteration`。
 - 语义：恰好满容量（`requested == capacity`）不失败；首次异常信息保留；后续健康步不能清掉 sticky。
 - 验证：
-  - `cargo test -p rustgs --lib --no-default-features reporting::metrics` → 6 passed（含非采样溢出策略、连续溢出、exact-full）
-  - `cargo test -p rustgs --lib --features gpu-wgpu sticky_overflow_rejects` → checkpoint 拒绝通过
+  - `cargo test -p rustscan-gs --lib --no-default-features reporting::metrics` → 6 passed（含非采样溢出策略、连续溢出、exact-full）
+  - `cargo test -p rustscan-gs --lib --features gpu-wgpu sticky_overflow_rejects` → checkpoint 拒绝通过
 - 说明：健康步仍探测 1×u32 overflow 标志以在更新前硬失败；loss / 完整 intersection 计数仍按原 cadence 延迟读回。未做自动扩容重试。
 
 ## R02 修复证据（2026-09-18）
 
 - 问题：`scratch_output` 按 len/device/dtype 复用同一 output handle；第二次同长度 scan 覆盖第一次仍持有的结果。
 - 修复：`inclusive_scan` 每次分配独立 `output` 与 `block_sums`（去掉返回值池化），避免跨调用别名和递归帧互相覆盖。
-- 验证：`cargo test -p rustgs --lib --features gpu-wgpu prefix_sum`
+- 验证：`cargo test -p rustscan-gs --lib --features gpu-wgpu prefix_sum`
   - `consecutive_same_length_scans_keep_independent_results`：先扫 `[1,2,3]` 再扫 `[10,20,30]`，后读前者仍为 `[1,3,6]`
   - `scan_results_survive_length_changes_and_reuse`：短→长→短，旧结果不变
   - 原有 CPU reference / dispatch-count 用例仍通过
@@ -48,7 +48,7 @@
 
 ## R05 修复证据（2026-09-18）
 
-- `cargo fmt --package rustgs` 已整理并通过 `--check`。
+- `cargo fmt --package rustscan-gs` 已整理并通过 `--check`。
 - Adam remap 补强：
   - `optimizer_remap_keeps_surviving_moments_and_step`：三组参数 × moment1/moment2，`step=7`，新行为零，`origins=[Some(1),None,Some(0)]`
   - `optimizer_remap_checkpoint_restore_preserves_next_step_update`：remap → checkpoint → restore → 下一步后 `step=8`，参数与 twin 一致，新行 moments 非零
@@ -56,11 +56,11 @@
 
 | 命令 | 结果 |
 |---|---|
-| `cargo fmt --package rustgs --check` | pass |
-| `cargo test -p rustgs --lib --no-default-features --no-fail-fast` | **22 passed** / 0 failed / 0 ignored |
-| `cargo test -p rustgs --lib --features gpu-wgpu --no-fail-fast` | **90 passed** / 0 failed / 0 ignored |
-| `cargo test -p rustgs --test integration_test --features gpu-wgpu -- --ignored --test-threads=1` | **1 passed**（显式跑 ignored GPU adapter 用例） |
-| `cargo test -p rustgs --test checkpoint_resume --features gpu-wgpu` | **49 passed** / 0 failed / 0 ignored（无 ignore 项） |
+| `cargo fmt --package rustscan-gs --check` | pass |
+| `cargo test -p rustscan-gs --lib --no-default-features --no-fail-fast` | **22 passed** / 0 failed / 0 ignored |
+| `cargo test -p rustscan-gs --lib --features gpu-wgpu --no-fail-fast` | **90 passed** / 0 failed / 0 ignored |
+| `cargo test -p rustscan-gs --test integration_test --features gpu-wgpu -- --ignored --test-threads=1` | **1 passed**（显式跑 ignored GPU adapter 用例） |
+| `cargo test -p rustscan-gs --test checkpoint_resume --features gpu-wgpu` | **49 passed** / 0 failed / 0 ignored（无 ignore 项） |
 
 - 说明：integration / checkpoint_resume 需 `--features gpu-wgpu` 才能编译/覆盖真实训练路径；未用无 GPU 特性测试代替 GPU 验证。
 
@@ -70,7 +70,7 @@
 - Trainer 采样闭环：每步 `Instant` loop duration → p50/p95（`loop_timing_kind=cpu_submit_instant`）；loss/count readback 计数；按 splat 规模估计 sort/scan dispatch 与 workspace bytes；topology snapshot/plan/apply `Instant` 与 accumulator readback bytes（有 topology 步时才有值）。
 - CLI：`--optimization-report`（`--eval-json` 时默认写到输出旁 `.optimization.json`）；`compare-optimization-reports` 拒绝 fingerprint / seed / scale / eval frames / resolution 不一致。
 - 验证：
-  - `cargo test -p rustgs --lib reporting::optimization_report --no-default-features` → 4 passed
+  - `cargo test -p rustscan-gs --lib reporting::optimization_report --no-default-features` → 4 passed
   - Home 50-step smoke：`artifacts/runs/rustgs-optimization/2026-09-18/r06-smoke/`
     - `gpu_completion_seconds` / `peak_device_bytes` / `driver` = `null`
     - `loop_duration_p50_ms≈22.9`，`loss_readback_count=4`，`count_readback_count=12`，12 帧 evaluation
@@ -82,7 +82,7 @@
 - Shader 修正：
   - `compensate_cov2d_vjp`：把 `filter_comp` 对 raw covariance 的导数并入 `v_cov2d`
   - `sh_to_color_viewdir_vjp` + `normalize3_vjp`：SH viewdir → position；`project_bwd` 增加 `sh_coeffs` 读绑定
-- 门禁：`cargo test -p rustgs --lib gradient_check --features gpu -- --test-threads=1` → **6 passed**
+- 门禁：`cargo test -p rustscan-gs --lib gradient_check --features gpu -- --test-threads=1` → **6 passed**
   - cases：`baseline_degree0`、`off_center_fx_fy`、`small_covariance`、`anisotropic_rotated`、`degree1_viewdir`
   - 常规相对容差 `<= 8e-2` 或绝对 `<= 2e-3`；弱方向 / 未归一化 quat FD 另有条件放宽并记入结果表
 - 说明：强信号轴（position xy、opacity、主要 log-scale、SH DC）与 FD 对齐；光学轴 depth-scale / 小 quat 分量仍受 float FD 条件数限制，不作为放宽默认拓扑策略的依据。
@@ -141,12 +141,12 @@ Home-1500 同口径 A/B 见下一节。
 
 - `DynamicMaskGradient::{StopGradient,Coupled}`；默认 `StopGradient`；mask 在 `mean(loss*w)/mean(w)` 前 `.detach()`。
 - Host 复现：`coupled_dynamic_mask_can_reward_larger_residuals`；detach 固定权重 FD：`detached_dynamic_mask_keeps_non_negative_residual_derivative`。
-- 验证：`cargo test -p rustgs --lib loss::tests --features gpu` → 3 passed。未启用 mask（默认阈值关闭）路径不变。
+- 验证：`cargo test -p rustscan-gs --lib loss::tests --features gpu` → 3 passed。未启用 mask（默认阈值关闭）路径不变。
 
 ## R11 修复证据（2026-09-18）
 
 - `select_initial_points`：预算足够时保持输入顺序；截断时 voxel 每格取首点，再按原序填满预算；`init_voxel_cell_size<=0` 时按包围盒自动 cell。
-- 验证：`cargo test -p rustgs --lib data::init_map --features gpu` → 3 passed（含聚集边界保留与确定性）。
+- 验证：`cargo test -p rustscan-gs --lib data::init_map --features gpu` → 3 passed（含聚集边界保留与确定性）。
 
 ## R09 验收证据（2026-09-18，工作树 atop `938fa8d`）
 

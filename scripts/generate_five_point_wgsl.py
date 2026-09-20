@@ -16,8 +16,8 @@ if not __debug__:
     raise RuntimeError("run without -O: generator validation assertions are required")
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "rustsfm/src/geometry/five_point_generated.rs"
-OUTPUT = ROOT / "rustsfm/src/gpu/shaders/five_point_generated.wgsl"
+SOURCE = ROOT / "rustscan-sfm/src/geometry/five_point_generated.rs"
+OUTPUT = ROOT / "rustscan-sfm/src/gpu/shaders/five_point_generated.wgsl"
 
 
 def expression(text, arrays):

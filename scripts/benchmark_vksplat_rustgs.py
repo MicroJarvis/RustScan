@@ -185,7 +185,7 @@ def run_rustgs(args: argparse.Namespace, dataset: Path, run_root: Path) -> dict[
             "cargo",
             "run",
             "-p",
-            "rustgs",
+            "rustscan-gs",
             "--release",
             "--bin",
             "rustgs",

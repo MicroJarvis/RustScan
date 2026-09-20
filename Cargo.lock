@@ -6891,37 +6891,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-viewer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bytemuck",
- "crossbeam-channel",
- "eframe",
- "egui",
- "fs2",
- "image",
- "nalgebra",
- "objc2 0.6.4",
- "objc2-av-foundation",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation 0.3.2",
- "rfd",
- "rustgs",
- "rustix 1.1.4",
- "rustscan-types",
- "rustsfm",
- "rustslam",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6946,58 +6915,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
-]
-
-[[package]]
-name = "rustff"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-onnx",
- "clap",
- "env_logger",
- "image",
- "log",
- "nalgebra",
- "ort",
- "serde",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "rustgs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode 1.3.3",
- "blake3",
- "burn",
- "burn-cubecl",
- "burn-fusion",
- "burn-ir",
- "burn-wgpu",
- "bytemuck",
- "bytes",
- "clap",
- "env_logger",
- "image",
- "kiddo",
- "libc",
- "log",
- "naga_oil",
- "nalgebra",
- "rand 0.8.5",
- "rayon",
- "rustscan-types",
- "rustsfm",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "wgpu",
 ]
 
 [[package]]
@@ -7062,7 +6979,74 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustmesh"
+name = "rustscan"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "log",
+ "nalgebra",
+ "rustscan-gs",
+ "rustscan-mesh",
+ "rustscan-slam",
+ "rustscan-types",
+]
+
+[[package]]
+name = "rustscan-ff"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-onnx",
+ "clap",
+ "env_logger",
+ "image",
+ "log",
+ "nalgebra",
+ "ort",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rustscan-gs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode 1.3.3",
+ "blake3",
+ "burn",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "burn-wgpu",
+ "bytemuck",
+ "bytes",
+ "clap",
+ "env_logger",
+ "image",
+ "kiddo",
+ "libc",
+ "log",
+ "naga_oil",
+ "nalgebra",
+ "rand 0.8.5",
+ "rayon",
+ "rustscan-sfm",
+ "rustscan-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "wgpu",
+]
+
+[[package]]
+name = "rustscan-mesh"
 version = "0.1.0"
 dependencies = [
  "byteorder",
@@ -7076,42 +7060,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustscan"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "env_logger",
- "log",
- "nalgebra",
- "rustgs",
- "rustmesh",
- "rustscan-types",
- "rustslam",
-]
-
-[[package]]
-name = "rustscan-taskflow"
-version = "0.1.0"
-dependencies = [
- "pollster 0.3.0",
- "rayon",
- "sysinfo 0.30.13",
- "thiserror 1.0.69",
- "wgpu",
-]
-
-[[package]]
-name = "rustscan-types"
-version = "0.1.0"
-dependencies = [
- "nalgebra",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rustsfm"
+name = "rustscan-sfm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -7129,9 +7078,9 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "rusqlite",
+ "rustscan-slam",
  "rustscan-taskflow",
  "rustscan-types",
- "rustslam",
  "serde",
  "serde_json",
  "tempfile",
@@ -7140,7 +7089,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustslam"
+name = "rustscan-slam"
 version = "0.1.0"
 dependencies = [
  "apex-solver",
@@ -7165,6 +7114,57 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "rustscan-taskflow"
+version = "0.1.0"
+dependencies = [
+ "pollster 0.3.0",
+ "rayon",
+ "sysinfo 0.30.13",
+ "thiserror 1.0.69",
+ "wgpu",
+]
+
+[[package]]
+name = "rustscan-types"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rustscan-viewer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytemuck",
+ "crossbeam-channel",
+ "eframe",
+ "egui",
+ "fs2",
+ "image",
+ "nalgebra",
+ "objc2 0.6.4",
+ "objc2-av-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation 0.3.2",
+ "rfd",
+ "rustix 1.1.4",
+ "rustscan-gs",
+ "rustscan-sfm",
+ "rustscan-slam",
+ "rustscan-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

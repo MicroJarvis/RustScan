@@ -54,7 +54,7 @@ row-major/column-major、四元数分量顺序和位姿方向。
 
 - [x] 将 `rustscan-types/src/pose.rs` 的内部字段改为
       `UnitQuaternion<f32>` + `Vector3<f32>`。
-- [x] 将 `rustslam/src/core/pose.rs` 删除或改为对共享 `SE3` 的 re-export。
+- [x] 将 `rustscan-slam/src/core/pose.rs` 删除或改为对共享 `SE3` 的 re-export。
 - [x] 统一 `new`、`from_rotation_translation`、`to_matrix`、旋转矩阵和
       平移访问器的语义。
 - [x] 增加明确命名的转换函数：

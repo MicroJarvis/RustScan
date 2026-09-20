@@ -13,17 +13,17 @@
 - [ ] 记录 `HEAD`、未提交 diff 指纹、平台、Rust 版本和启用的 features。
 - [ ] 运行 no-default 编译门禁。
 - [ ] 运行 GPU library、sequence 和 ignored sparse fixture 测试。
-- [ ] 将同一次运行的结果同步到 `docs/current-project-status.md` 和 `rustsfm/PARITY_ROADMAP.md`，删除互相冲突的旧测试数字。
+- [ ] 将同一次运行的结果同步到 `docs/current-project-status.md` 和 `rustscan-sfm/PARITY_ROADMAP.md`，删除互相冲突的旧测试数字。
 
 ### 验收命令
 
 ```bash
-cargo fmt --package rustsfm --check
-cargo check -p rustsfm --release --no-default-features --all-targets
-cargo test -p rustsfm --lib --features gpu-wgpu,vlfeat-sift -- --test-threads=1
-cargo test -p rustsfm --test sequence_registration --features gpu-wgpu,vlfeat-sift -- --test-threads=1
+cargo fmt --package rustscan-sfm --check
+cargo check -p rustscan-sfm --release --no-default-features --all-targets
+cargo test -p rustscan-sfm --lib --features gpu-wgpu,vlfeat-sift -- --test-threads=1
+cargo test -p rustscan-sfm --test sequence_registration --features gpu-wgpu,vlfeat-sift -- --test-threads=1
 ./scripts/provision_flowers2_colmap_fixture.sh
-cargo test -p rustsfm --lib --features gpu-wgpu,vlfeat-sift -- --ignored --test-threads=1
+cargo test -p rustscan-sfm --lib --features gpu-wgpu,vlfeat-sift -- --ignored --test-threads=1
 ```
 
 ### 完成标准
@@ -83,7 +83,7 @@ P1 完成后，用最终代码重新生成一次可引用的 24 图报告。此�
 - [ ] 运行 P0 的全部测试门禁。
 - [ ] 运行固定 24 图 replay，并保存机器可读 parity 报告。
 - [ ] 记录 registration order、models、points、observations、track histogram、平均重投影误差、BA 事件和总耗时。
-- [ ] 更新 `docs/current-project-status.md` 与 `rustsfm/PARITY_ROADMAP.md`，两处引用同一个报告和同一组数字。
+- [ ] 更新 `docs/current-project-status.md` 与 `rustscan-sfm/PARITY_ROADMAP.md`，两处引用同一个报告和同一组数字。
 
 ### 完成标准
 
