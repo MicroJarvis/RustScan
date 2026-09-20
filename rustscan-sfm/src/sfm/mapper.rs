@@ -13639,6 +13639,133 @@ mod tests {
         Ok(())
     }
 
+    /// Database filtering currently drops an image and then indexes the original
+    /// name list. The post-fix contract is a contextual error that names the
+    /// missing image. A panic is not that contract.
+    fn filtered_single_target_registration(
+        registered: &[(&str, u32)],
+        connected: &[(&str, u32)],
+        target_name: &str,
+        support_names: &[&str],
+    ) -> Result<SingleTargetRegistrationAttempt> {
+        let dir = tempdir()?;
+        let input = dir.path().join("images");
+        let reference = dir.path().join("reference");
+        let sparse = reference.join("sparse/0");
+        fs::create_dir_all(&input)?;
+        fs::create_dir_all(&sparse)?;
+        let mut names = registered.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        names.push(target_name);
+        for name in &names {
+            image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])).save(input.join(name))?;
+        }
+        fs::write(sparse.join("cameras.txt"), "1 PINHOLE 8 8 4 4 4 4\n")?;
+        let mut images_txt = String::new();
+        for (name, image_id) in registered {
+            images_txt.push_str(&format!("{image_id} 1 0 0 0 0 0 0 1 {name}\n\n"));
+        }
+        fs::write(sparse.join("images.txt"), images_txt)?;
+        fs::write(sparse.join("points3D.txt"), "# points\n")?;
+
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 8,
+                    height: 8,
+                    params: vec![4.0, 4.0, 4.0, 4.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (name, image_id) in connected {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id: *image_id,
+                    name: (*name).to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(*image_id, &[ColmapKeypoint::new(1.0, 1.0)])?;
+        }
+        db.write_two_view_geometry(
+            connected[0].1,
+            connected[1].1,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![FeatureMatch::new(0, 0)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+
+        let config = MapperConfig {
+            min_matches: 1,
+            ..MapperConfig::default()
+        };
+        register_single_target_from_database_with_pnp_scorer(
+            &input,
+            &db_path,
+            &reference,
+            target_name,
+            &support_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+            &config,
+            None,
+        )
+    }
+
+    fn assert_missing_image_error(error: &anyhow::Error, image_name: &str) {
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(image_name),
+            "expected the missing image '{image_name}' in the error, got {message}"
+        );
+    }
+
+    #[test]
+    fn filtered_leading_support_reports_image_name_instead_of_panicking() {
+        let error = filtered_single_target_registration(
+            &[("a.png", 1), ("b.png", 2)],
+            &[("b.png", 2), ("c.png", 3)],
+            "c.png",
+            &["a.png", "b.png"],
+        )
+        .expect_err("a filtered leading support must be a contextual error");
+        assert_missing_image_error(&error, "a.png");
+    }
+
+    #[test]
+    fn filtered_middle_support_reports_image_name_instead_of_panicking() {
+        let error = filtered_single_target_registration(
+            &[("a.png", 1), ("m.png", 2)],
+            &[("a.png", 1), ("z.png", 3)],
+            "z.png",
+            &["a.png", "m.png"],
+        )
+        .expect_err("a filtered middle support must be a contextual error");
+        assert_missing_image_error(&error, "m.png");
+    }
+
+    #[test]
+    fn disconnected_target_reports_image_name_instead_of_panicking() {
+        let error = filtered_single_target_registration(
+            &[("a.png", 1), ("b.png", 2)],
+            &[("a.png", 1), ("b.png", 2)],
+            "c.png",
+            &["a.png", "b.png"],
+        )
+        .expect_err("a disconnected target must be a contextual error");
+        assert_missing_image_error(&error, "c.png");
+    }
+
     #[test]
     fn database_camera_setup_preserves_prior_focal_flags() -> Result<()> {
         let dir = tempdir()?;

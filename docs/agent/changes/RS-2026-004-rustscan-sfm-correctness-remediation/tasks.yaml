@@ -1,0 +1,113 @@
+id: RS-2026-004
+status: active
+owner: cursor-agent
+base_commit: d2cdb8de7d63e448022f02e69e622c90a501a591
+branch: agent/RS-2026-004/rustscan-sfm-correctness-remediation
+worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
+
+goal: "Remove the reviewed RustSFM correctness, persistence, and CPU math invariant violations with regression evidence."
+
+scope:
+  - rustscan-sfm/src
+  - rustscan-sfm/tests
+  - rustscan-types/src
+  - rustscan-viewer/tests/loader_integration_test.rs
+  - scripts/check_cpu_glam.py
+  - scripts/cpu-glam-allowlist.txt
+  - scripts/check_cpu_math_types.py
+  - scripts/cpu-math-allowlist.txt
+  - .github/workflows/ci.yml
+  - docs/nalgebra-unification-todo.md
+  - docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation
+
+out_of_scope:
+  - third_party
+  - rustscan-sfm/src/gpu/shaders
+  - unrelated reconstruction-quality or performance tuning
+  - rustsfm compatibility binary rename
+  - README.md
+  - ROADMAP.md
+  - docs/current-project-status.md
+  - docs/index.md
+
+dependencies:
+  - RS-2026-003
+
+task_list: docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md
+design: docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/design.md
+verification_record: docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md
+
+acceptance:
+  - "Database-backed mapper filtering preserves image, camera, ID, frame, target, support, and seed identity without panics or silent rebinding."
+  - "Reconstruction validation rejects duplicate IDs, mismatched metadata, invalid references, non-finite values, and observation/track disagreement."
+  - "Every public COLMAP export validates before writing and never fabricates a missing persistent ID or camera."
+  - "COLMAP text and binary imports reject duplicate IDs, invalid numerics, and inconsistent bidirectional references with contextual errors."
+  - "View-graph focal refinement scores canonical camera parameters and returns internally consistent intrinsics."
+  - "Unusable or cancelled bundle adjustment does not mutate reconstruction state and is not reported as success."
+  - "Local database population, pair-geometry batches, and database merge are transactional."
+  - "RustSFM general CPU matrices, vectors, points, quaternions, and poses use nalgebra/shared pose owners; arrays remain only at documented boundaries."
+  - "No unresolved P1/P2 review findings remain and all verification results are recorded."
+
+verification:
+  - "cargo fmt --all -- --check"
+  - "cargo check --workspace --all-targets"
+  - "cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings"
+  - "cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1"
+  - "cargo test -p rustscan-sfm --all-features --lib -- --test-threads=1"
+  - "cargo test -p rustscan-sfm --all-features --test sequence_registration -- --test-threads=1"
+  - "cargo test -p rustscan-sfm --all-features --lib gpu:: -- --test-threads=1"
+  - "cargo test -p rustscan-viewer --test loader_integration_test loads_rustsfm_export_with_one_shared_camera"
+  - "python3 scripts/check_cpu_glam.py --self-test"
+  - "python3 scripts/check_cpu_glam.py"
+  - "git diff --check"
+
+artifacts:
+  - docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md
+
+known_limitations:
+  - "GPU PnP tests skipped for the known macOS AGX/XPC shader compiler failure do not constitute GPU execution evidence and require a working adapter run."
+  - "T0 regressions filtered_leading_support_reports_image_name_instead_of_panicking, filtered_middle_support_reports_image_name_instead_of_panicking, and disconnected_target_reports_image_name_instead_of_panicking fail until T1 replaces the mapper index panic with a contextual error."
+
+later_tasks:
+  - id: T1
+    owner: cursor-agent
+    branch: agent/RS-2026-004/t1-mapper-identity
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t1-mapper-identity
+    scope: rustscan-sfm/src/sfm/mapper.rs, rustscan-sfm/src/sfm/mapper/reconstruction_input.rs, and mapper/sequence tests
+  - id: T2
+    owner: cursor-agent
+    branch: agent/RS-2026-004/t2-reconstruction-validation
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t2-reconstruction-validation
+    scope: rustscan-sfm/src/core and reconstruction construction helpers
+  - id: T3
+    owner: cursor-agent
+    branch: agent/RS-2026-004/t3-colmap-io
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t3-colmap-io
+    scope: rustscan-sfm/src/io/colmap.rs and COLMAP IO tests
+  - id: T4
+    owner: cursor-agent
+    branch: agent/RS-2026-004/t4-camera-invariants
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t4-camera-invariants
+    scope: rustscan-sfm/src/core/types.rs, rustscan-sfm/src/sfm/view_graph_calibration.rs, and direct camera callers
+  - id: T5
+    owner: cursor-agent
+    branch: agent/RS-2026-004/t5-atomic-ba
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t5-atomic-ba
+    scope: rustscan-sfm/src/ba, rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs, and rustscan-sfm/src/sfm/global_mapper.rs
+  - id: T6
+    owner: cursor-agent
+    branch: agent/RS-2026-004/t6-database-transactions
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t6-database-transactions
+    scope: rustscan-sfm/src/io/database.rs and rustscan-sfm/src/sfm/mapper/database_io.rs
+  - id: T7
+    owner: cursor-agent
+    branch: agent/RS-2026-004/t7-nalgebra-ownership
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t7-nalgebra-ownership
+    scope: RustSFM CPU math, required rustscan-types pose work, affected RustViewer tests, and the CPU math check
+  - id: T8
+    owner: cursor-agent
+    branch: agent/RS-2026-004/rustscan-sfm-correctness-remediation
+    worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
+    scope: integration fixes and this change package
+
+next_action: "T0 is complete. Start T1 on branch agent/RS-2026-004/t1-mapper-identity. The three new mapper regressions must become contextual errors, and the ten sequence panics must become passing tests or the same class of error. Do not weaken acceptance."

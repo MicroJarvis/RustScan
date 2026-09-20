@@ -1,0 +1,224 @@
+# RS-2026-004 Detailed Execution Plan
+
+Unchecked boxes describe required work. A task is checked only after its code,
+focused tests, commit, and verification evidence are recorded in
+`verification.md`.
+
+## Execution Waves
+
+- **Wave 0:** T0 only.
+- **Wave 1, parallel-capable:** T1, T2, T5, and T6 in separate worktrees.
+- **Wave 2:** T4 after T2; T3 after T2 and T4.
+- **Wave 3:** T7 after T1 through T6 are integrated.
+- **Wave 4:** T8 integration, full verification, independent review, handoff.
+
+Do not assign two Agents to the same task or let parallel tasks edit files
+outside their declared scope without updating `tasks.yaml` first.
+
+## T0 — Isolate Work And Freeze The Baseline
+
+**Dependencies:** none  
+**Primary scope:** this change package and test commands only
+
+- [x] Create branch `agent/RS-2026-004/rustscan-sfm-correctness-remediation`
+      and the worktree declared in `tasks.yaml` from the recorded base commit.
+- [x] Confirm the implementation worktree does not contain the unrelated dirty
+      documentation changes listed in `proposal.md`.
+- [x] Re-run the baseline sequence, no-default-feature, COLMAP IO, view-graph,
+      BA, and GPU-focused commands. Record exact command, commit, OS, native
+      dependencies, adapter, result, duration, and skipped tests.
+- [x] Add focused failing regression tests before implementation when the
+      trigger is deterministic. A panic is not the expected post-fix error.
+- [x] Record any baseline drift. Do not rewrite acceptance conditions to match
+      new failures.
+
+**Exit condition:** baseline evidence is reproducible and each later task has a
+named owner, branch/worktree, and file scope.
+
+## T1 — Replace Filtered Parallel Indices With Stable Image Identity
+
+**Dependencies:** T0  
+**Primary scope:**
+`rustscan-sfm/src/sfm/mapper.rs`,
+`rustscan-sfm/src/sfm/mapper/reconstruction_input.rs`, and mapper/sequence tests
+
+- [ ] Introduce the resolved retained-image record described in `design.md`.
+- [ ] Make database frame loading return retained identity and source mapping,
+      rather than a frame-only vector whose index is ambiguous.
+- [ ] Build reference/database camera setup and seed reconstruction from the
+      retained images in their final mapper order.
+- [ ] Locate single-registration target and support images by stable name/ID.
+      Return a contextual missing/disconnected-target error.
+- [ ] Validate all per-image setup lengths before starting pair estimation or
+      constructing a `Reconstruction`.
+- [ ] Add regressions for a dropped leading image, dropped middle image,
+      disconnected target, filtered support image, multi-camera metadata, and
+      reference seed alignment.
+- [ ] Re-run every sequence test that previously panicked and the complete
+      `sequence_registration` integration test serially.
+
+**Exit condition:** no retained frame can inherit metadata from a different
+source path, and the ten mapper index panics become passing tests or intentional
+contextual errors.
+
+## T2 — Centralize Reconstruction Validation And ID Allocation
+
+**Dependencies:** T0  
+**Primary scope:** `rustscan-sfm/src/core/`, reconstruction construction helpers,
+and focused unit tests
+
+- [ ] Add a structured `ReconstructionValidationError` and the structural and
+      export validators specified in `design.md`.
+- [ ] Add strict camera/image/point ID and camera lookup APIs. Migrate internal
+      persistence callers away from fabricated fallback IDs and cameras.
+- [ ] Add a checked occupied-ID allocator for reference/database/new images and
+      points, including overflow and COLMAP-domain limits.
+- [ ] Validate uniqueness, parallel metadata lengths, camera indices,
+      observation/track agreement, feature bounds, and rig/frame references.
+- [ ] Add table-driven tests covering every invariant and error payload.
+- [ ] Preserve compatibility wrappers only when necessary; mark them deprecated
+      and ensure no RustSFM persistence path uses them.
+
+**Exit condition:** an inconsistent `Reconstruction` cannot pass strict export
+validation, and ID allocation is collision-free for sparse and non-contiguous
+existing IDs.
+
+## T3 — Make COLMAP Import And Export Strict
+
+**Dependencies:** T2 and T4  
+**Primary scope:** `rustscan-sfm/src/io/colmap.rs` and COLMAP IO tests
+
+- [ ] Validate complete raw text and binary models before internal conversion.
+- [ ] Reject duplicate camera, image, point, rig, and frame IDs instead of
+      allowing map collection to overwrite an earlier record.
+- [ ] Reject missing camera/point/image/feature references and conflicting
+      image-side versus point-track observations. Remove the implicit
+      `ensure_*` repair behavior from normal import.
+- [ ] Reject zero/non-finite quaternions, non-finite translations/points/errors,
+      zero dimensions, and invalid/non-finite focal parameters with record IDs.
+- [ ] Call strict reconstruction/export validation from every public COLMAP
+      export and sparse snapshot writer before creating or truncating files.
+- [ ] Add equivalent malformed text and binary fixtures for duplicate IDs,
+      unknown references, conflicting tracks, zero quaternion, NaN/Inf, and
+      feature-index overflow.
+- [ ] Add a non-symmetric rotation, non-zero translation, multiple-camera,
+      non-contiguous-ID round-trip test.
+
+**Exit condition:** valid models round-trip with stable IDs and geometry;
+invalid models fail before producing a partial internal reconstruction or
+truncating an export file.
+
+## T4 — Remove CameraModel's Split State And Fix Focal Refinement
+
+**Dependencies:** T2  
+**Primary scope:** `rustscan-sfm/src/core/types.rs`,
+`rustscan-sfm/src/sfm/view_graph_calibration.rs`, direct camera callers, and tests
+
+- [ ] Make COLMAP parameters the canonical camera state and provide checked
+      derived accessors/mutators.
+- [ ] Migrate every direct write to `params`, `fx`, `fy`, `cx`, or `cy` to an
+      invariant-preserving API.
+- [ ] Preserve a required serialized schema through an explicit validated
+      proxy; do not retain two mutable runtime sources of truth.
+- [ ] Change focal refinement so each candidate changes canonical projection
+      parameters before scoring.
+- [ ] Reject a non-finite scale and invalid resulting focal length.
+- [ ] Add a synthetic focal-search test with an optimum away from the first
+      grid element, plus projection/export consistency assertions.
+- [ ] Add constructor and deserialization tests for zero, negative, NaN, and
+      infinite focal parameters.
+
+**Exit condition:** camera accessors, projection, BA, calibration, and export
+cannot observe different intrinsics for the same `CameraModel`.
+
+## T5 — Make Bundle Adjustment State Updates Atomic
+
+**Dependencies:** T0  
+**Primary scope:** `rustscan-sfm/src/ba/`,
+`rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs`,
+`rustscan-sfm/src/sfm/global_mapper.rs`, and BA/global-mapper tests
+
+- [ ] Inspect the Ceres summary and all solution parameters before write-back.
+- [ ] Commit camera, pose, point, and point-error changes only for a usable,
+      finite solution.
+- [ ] Ensure cancellation and all failure termination types leave the caller's
+      state unchanged.
+- [ ] Make `global_mapper` derive success from `is_solution_usable()` and stop
+      the affected refinement round after an unusable result.
+- [ ] Keep mapper camera-plausibility rollback as a separate post-success gate.
+- [ ] Add deterministic convergence, no-convergence, failure, user-failure,
+      cancellation, and non-finite-solution tests. Compare the complete mutable
+      BA state before and after rejected solutions.
+
+**Exit condition:** every rejected BA result is observationally atomic and is
+never reported as a successful global BA round.
+
+## T6 — Add Transactions Around Logical Database Batches
+
+**Dependencies:** T0  
+**Primary scope:** `rustscan-sfm/src/io/database.rs`,
+`rustscan-sfm/src/sfm/mapper/database_io.rs`, and database tests
+
+- [ ] Wrap local database population in one transaction.
+- [ ] Wrap each pair-geometry batch in one transaction.
+- [ ] Wrap complete target database merge in one transaction.
+- [ ] Preserve and restore deletion/vacuum bookkeeping on rollback.
+- [ ] Add deterministic mid-batch failure tests for population and merge.
+- [ ] Assert pre-existing target rows and counts are unchanged after rollback,
+      and successful retry commits exactly once.
+
+**Exit condition:** each public logical operation either commits all related
+rows or leaves the target database unchanged.
+
+## T7 — Complete RustSFM nalgebra Ownership
+
+**Dependencies:** T1 through T6 integrated  
+**Primary scope:** RustSFM CPU math, required `rustscan-types` shared pose work,
+affected RustViewer tests, math-check script, and CI
+
+- [ ] Replace `generalized_pose` hand-written `Mat3d`/`Vec3d` with
+      `Matrix3<f64>`/`Vector3<f64>` and preserve PoseLib FFI flat buffers only
+      inside the adapter.
+- [ ] Migrate `Point3D.xyz` to `Point3<f32>` and audit rays, positions,
+      translations, rotations, and matrices for the correct nalgebra owner.
+- [ ] Remove the CPU pose role of `Rigid3`; use the shared pose internally and
+      keep raw COLMAP component arrays in IO/database records.
+- [ ] Convert internal `PairGeometry` matrices/vectors to nalgebra where they
+      are used numerically; convert to flat arrays only in the database/COLMAP
+      adapter with named row-major/component-order helpers.
+- [ ] Audit every remaining floating-point `[T; 2/3/4/9/16]` and `[[T; N]; M]`
+      in RustSFM. Document and allowlist only real GPU, FFI, serialization, or
+      wire-format boundaries.
+- [ ] Extend the CPU-math check and CI so known hand-written owning types and
+      unapproved public/internal array owners fail the check.
+- [ ] Add non-symmetric rotation, translation, point-versus-vector, matrix
+      layout, quaternion order, and FFI/COLMAP round-trip tests.
+
+**Exit condition:** general CPU RustSFM ownership uses nalgebra, boundary arrays
+are explicit and tested, and the automated repository check enforces the rule.
+
+## T8 — Integrate, Verify, Review, And Hand Off
+
+**Dependencies:** T1 through T7  
+**Primary scope:** integration fixes, this change package, and no unrelated work
+
+- [ ] Rebase or merge task commits in dependency order and resolve conflicts
+      without weakening tests or adding silent fallback behavior.
+- [ ] Run focused checks after each task integration, then the complete matrix
+      from `tasks.yaml`.
+- [ ] Remove RustSFM warnings in changed/default/all-feature targets or add only
+      narrow, documented boundary allowances permitted by `rust-style.md`.
+- [ ] Record native Ceres/PoseLib and GPU environment details. A known macOS
+      AGX skip remains an unavailable result until run on a working adapter.
+- [ ] Have a reviewer independently inspect mapper identity, reconstruction
+      invariants, public API compatibility, numerical conventions, rollback,
+      transaction coverage, and the final diff.
+- [ ] Update `verification.md` with commits, exact outputs, limitations, and
+      next action. Use the repository handoff template.
+- [ ] Correct the completion status in `docs/nalgebra-unification-todo.md` if
+      T7 proves any previously checked assertion was incomplete.
+
+**Exit condition:** all acceptance conditions have evidence, the reviewer has
+no unresolved P1/P2 findings, and integration does not include the unrelated
+dirty documentation changes.
+
