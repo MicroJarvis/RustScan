@@ -2,7 +2,7 @@
 
 **更新日期：** 2026-09-18
 
-**代码依据：** 本轮在 `938fa8d` 工作树之上完成 R01～R12（证据见实验记录）。二进制归档：`output/rustgs-optimization/2026-09-18/bin/rustgs-r09-current`。
+**代码依据：** 本轮在 `938fa8d` 工作树之上完成 R01～R12（证据见实验记录）。二进制归档：`artifacts/runs/rustgs-optimization/2026-09-18/bin/rustgs-r09-current`。
 
 **使用方式：** 按下列顺序执行；编号为本次重排后的新编号。这里仅保留未完成工作，每项通过验收后从清单移除，证据写入独立实验记录。
 
@@ -12,7 +12,7 @@
 
 ### [ ] R09b 补齐 TUM 全视图与留出视图阶梯
 
-**阻塞：** 本机无 `test_data/tum/rgbd_dataset_freiburg1_xyz`；`output/vksplat_rustgs_benchmark/datasets/tum_freiburg1_xyz_colmap/images` 仅含失效 symlink；官方与 mirror 下载返回 403/401/超时。
+**阻塞：** 本机无 `artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz`；`artifacts/runs/vksplat_rustgs_benchmark/datasets/tum_freiburg1_xyz_colmap/images` 仅含失效 symlink；官方与 mirror 下载返回 403/401/超时。
 
 **要做：** 取得可复现 TUM COLMAP pack 后，按 500 → 3k → 10k → 30k 跑全视图与独立留出视图；对照 `09f9254` 与当前 revision；最差帧下降 >0.2 dB 或 fog/ghosting 即拒绝。Home 与 flowers2-24v 外部短跑已通过（见实验记录），不替代本项。
 

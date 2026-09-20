@@ -6,7 +6,7 @@
 
 **明确决策：**
 
-- 不再把 Superpowers 作为仓库流程、文档或执行前提。
+- 不再把厂商专用 Agent 工具作为仓库流程、文档或执行前提。
 - 不再把 `.codex/` 作为仓库配置或任务入口。
 - OpenSpec 不作为必需运行时；可以借鉴其 change/spec/design/tasks 结构，但仓库流程必须在没有 OpenSpec CLI 的情况下仍然可执行。
 - `AGENTS.md` 是稳定规则入口；`docs/agent/` 是协作流程入口。
@@ -43,7 +43,7 @@ scripts/agent/
 - [ ] 在独立分支或独立 worktree 中执行本迁移；不要在当前已有大量 dirty 修改的 `main` 工作树上删除工具文件。
 - [ ] 记录迁移开始时的 base commit、工作树路径、分支和现有 dirty 文件清单。
 - [ ] 为当前未提交文件标注 owner；迁移工作不得覆盖这些文件。
-- [ ] 盘点以下目录和文件的实际来源：`.codex/`、`.superpowers/`、`.claude/`、`.agents/`、`openspec/`、`docs/superpowers/`、所有 `CLAUDE.md` 和 `AGENTS.md`。
+- [ ] 盘点以下目录和文件的实际来源：`.codex/`、`.claude/`、`.agents/`、`openspec/`、所有 `CLAUDE.md` 和 `AGENTS.md`。
 - [ ] 将盘点结果写入迁移分支的验证记录，区分 Git 跟踪文件、个人本地文件和历史文档。
 
 **阶段验收：** 能够说明每个待处理目录是否被 Git 跟踪、是否属于当前任务、是否允许删除；没有执行 `git reset --hard`、`git clean` 或覆盖用户 dirty 修改。
@@ -54,7 +54,7 @@ scripts/agent/
 
 - [ ] 在 [AGENTS.md](../../AGENTS.md) 增加“Tool-neutral Agent protocol”章节。
 - [ ] 明确规则优先级：用户请求 > 根/最近的 `AGENTS.md` > 当前 task 文件 > 历史文档 > 工具本地配置。
-- [ ] 明确仓库不要求 Codex、Claude Code、OpenSpec、Superpowers、Spec Kit 或其他厂商插件。
+- [ ] 明确仓库不要求 Codex、Claude Code、OpenSpec、Spec Kit 或其他厂商插件。
 - [ ] 明确 Agent 不得覆盖其他任务的 dirty 修改，不得在共享 `main` 工作树直接实现任务。
 - [ ] 明确每个任务必须声明 task ID、owner、base commit、branch、worktree、scope、out-of-scope、验收条件和验证命令。
 - [ ] 保留现有 `nalgebra`、CPU/GPU 边界、共享 pose 类型和测试要求，不把稳定编码规则复制到多个工具文件。
@@ -69,17 +69,17 @@ scripts/agent/
 
 **阶段验收：** 一个没有安装任何 Agent 插件的模型，只读取 `AGENTS.md`、`docs/agent/README.md` 和一个 task 文件，就能知道允许修改什么、如何验证和如何交接。
 
-## 阶段 2：移除 Superpowers 和 Codex 依赖
+## 阶段 2：移除厂商专用 Agent 和 Codex 依赖
 
 - [ ] 删除 Git 跟踪的 `.codex/skills/` 文件；删除前先在迁移文档中记录其仍有价值的流程内容。
-- [ ] 不把 `.codex/`、`.claude/`、`.superpowers/` 或 `.agents/skills/` 作为仓库规范入口。
-- [ ] 从当前有效文档中移除“必须使用 `superpowers:*`”“必须使用 `/opsx:*`”等工具专用指令，改写成普通的实现、验证和交接要求。
-- [x] 将 `docs/superpowers/plans/` 和 `docs/superpowers/specs/` 标记为历史记录；已完成或被替代的计划删除，仍然有效的 RustGS remediation 已迁移到 `docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/`。
+- [ ] 不把 `.codex/`、`.claude/` 或 `.agents/skills/` 作为仓库规范入口。
+- [ ] 从当前有效文档中移除工具专用指令，改写成普通的实现、验证和交接要求。
+- [x] 历史计划已完成审查；已完成或被替代的计划删除，仍然有效的 RustGS remediation 已迁移到 `docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/`，其历史目录已删除。
 - [ ] 检查 worktree 中的旧 `CLAUDE.md`；将有效规则合并到 `AGENTS.md`，其余文件标记过期或删除，避免不同 worktree 读取不同项目结构。
-- [ ] 审查 `.gitignore`：不再用忽略规则掩盖误生成的 `.codex/` 或 `.superpowers/`；个人机器缓存如需忽略，改用用户级全局 ignore。
+- [ ] 审查 `.gitignore`：不使用项目规则掩盖误生成的厂商专用目录；个人机器缓存如需忽略，改用用户级全局 ignore。
 - [ ] 不自动删除个人本地未跟踪缓存；只删除仓库跟踪的工具文件，个人目录由其 owner 单独清理。
 
-**阶段验收：** `git ls-files` 不再返回 `.codex/` 或项目级 Superpowers 文件；当前有效文档不要求安装这些工具；搜索结果中的工具名只出现在迁移记录或历史说明中。
+**阶段验收：** `git ls-files` 不再返回 `.codex/` 或项目级厂商专用文件；当前有效文档不要求安装这些工具；仓库搜索结果中不再出现已移除工具名称。
 
 ## 阶段 3：决定 OpenSpec 的位置
 
@@ -132,14 +132,14 @@ scripts/agent/
 - [ ] 检查 verifier 能否只根据 task、diff 和验证命令完成独立检查。
 - [ ] 记录遗漏的字段、重复读取的文档和不必要的 token 消耗，回写到 `docs/agent/README.md`。
 
-**最终验收：** 更换模型后，不需要迁移 `.codex`、`.claude`、Superpowers 或 OpenSpec 技能文件，仍可以从 active task 继续开发并完成验证。
+**最终验收：** 更换模型后，不需要迁移 `.codex`、`.claude` 或 OpenSpec 技能文件，仍可以从 active task 继续开发并完成验证。
 
 ## 推荐执行顺序
 
 ```text
 阶段 0 基线保护
   → 阶段 1 通用协议
-  → 阶段 2 移除 Codex/Superpowers 依赖
+  → 阶段 2 移除厂商专用 Agent/Codex 依赖
   → 阶段 3 OpenSpec 可选化
   → 阶段 4 worktree 生命周期
   → 阶段 5 标准门禁

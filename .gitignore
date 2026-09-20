@@ -5,7 +5,6 @@ target/
 
 # Local development worktrees and Python caches
 .worktrees/
-.superpowers/
 __pycache__/
 *.py[cod]
 
@@ -25,37 +24,37 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Large test data (optional - keep small test files)
-test_data/*
-!test_data/tum_freiburg1_xyz_colmap/
-test_data/tum_freiburg1_xyz_colmap/*
-!test_data/tum_freiburg1_xyz_colmap/rustgs-train.json
-!test_data/large/
-test_data/large/*
-!test_data/large/*.obj
-test_data/video/
-!test_data/fixtures/
-!test_data/fixtures/litegs/
-!test_data/fixtures/litegs/colmap-small/
-!test_data/fixtures/litegs/colmap-small/README.md
-!test_data/fixtures/litegs/colmap-small/parity-reference.json
-!test_data/fixtures/flowers2_colmap_ref_text_20260630/
-!test_data/fixtures/flowers2_colmap_ref_text_20260630/*.txt
-!test_data/fixtures/flowers2_colmap_ref_text_20260630/README.md
+# Artifact inputs (ignore large local datasets; keep small fixtures)
+artifacts/inputs/*
+!artifacts/inputs/tum_freiburg1_xyz_colmap/
+artifacts/inputs/tum_freiburg1_xyz_colmap/*
+!artifacts/inputs/tum_freiburg1_xyz_colmap/rustgs-train.json
+!artifacts/inputs/large/
+artifacts/inputs/large/*
+!artifacts/inputs/large/*.obj
+artifacts/inputs/video/
+!artifacts/inputs/fixtures/
+!artifacts/inputs/fixtures/litegs/
+!artifacts/inputs/fixtures/litegs/colmap-small/
+!artifacts/inputs/fixtures/litegs/colmap-small/README.md
+!artifacts/inputs/fixtures/litegs/colmap-small/parity-reference.json
+!artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630/
+!artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630/*.txt
+!artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630/README.md
 
 # OpenMesh source (external dependency)
 Mirror/
 
 .github/
 
-# Generated outputs
-/output/
-/RustGS/output/
-/RustSFM/output/
+# Generated run artifacts
+/artifacts/runs/
+/rustgs/output/
+/rustsfm/output/
 /.ua/
 
 # GPU five-point local sidecars (regenerable; keep summary JSON only)
-experiments/**/*.bits.json
-experiments/**/*.stages.bin
-experiments/**/*.trials.json
-experiments/q4-baseline-20260915/
+artifacts/evidence/**/*.bits.json
+artifacts/evidence/**/*.stages.bin
+artifacts/evidence/**/*.trials.json
+artifacts/evidence/q4-baseline-20260915/

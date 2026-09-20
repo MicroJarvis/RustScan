@@ -26,20 +26,20 @@ were made in this continuation.
 ### Already present at entry
 
 - `scripts/generate_five_point_wgsl.py` and generated
-  `RustSFM/src/gpu/shaders/five_point_generated.wgsl`: f32 polynomial-only
+  `rustsfm/src/gpu/shaders/five_point_generated.wgsl`: f32 polynomial-only
   compensation. Each signed triple product carries FMA product residuals;
   magnitude-ordered sum compensation uses explicit FMA subtraction, followed by
   `value + correction`. Term packing/order and upstream arithmetic are retained.
-- `RustSFM/examples/five_point_gpu_q4_coefficients.rs`,
-  `RustSFM/examples/q4/attribution.rs`, `polynomial-fixtures.json`: offline
+- `rustsfm/examples/five_point_gpu_q4_coefficients.rs`,
+  `rustsfm/examples/q4/attribution.rs`, `polynomial-fixtures.json`: offline
   same-basis/same-A/same-solve/same-B attribution, fixed baseline loss cohort,
   binary stage readback, quality sidecars, signature repeats and timings.
-- `RustSFM/src/gpu/five_point_q4_tests.rs`, its test-module registration and
+- `rustsfm/src/gpu/five_point_q4_tests.rs`, its test-module registration and
   generator checks: required-device arithmetic probe and 12 real B fixtures
   under six signed/power-of-two scales, each dispatched twice.
-- `experiments/q4-baseline-20260915/`: saved pre-Q4 patch, old-file hashes,
+- `artifacts/evidence/q4-baseline-20260915/`: saved pre-Q4 patch, old-file hashes,
   generator/shader/test snapshots, baseline runs at both tolerances.
-- `experiments/q4-candidate-tol1e{3,2}-20260915.*`: completed candidate runs.
+- `artifacts/evidence/q4-candidate-tol1e{3,2}-20260915.*`: completed candidate runs.
 - Earlier failed probes/tests are preserved: ordinary subtraction compensation
   was defeated by measured Metal reassociation. Later FMA-sum tests passed.
   This is empirical compiler behavior, not a portable WGSL guarantee.
@@ -49,17 +49,17 @@ were made in this continuation.
 ### New in this continuation
 
 - Preserved the incomplete script verbatim as
-  `experiments/q4-summary-incomplete-preserved-20260915.py`; completed only its
+  `artifacts/evidence/q4-summary-incomplete-preserved-20260915.py`; completed only its
   aggregation/output tail. It retains existing gates, adds timing/quality
   summaries and artifact SHA256, and refuses to overwrite its output.
 - Rebuilt the existing candidate and reran actual-device focused tests.
 - Two fresh full replays:
-  `experiments/q4-verified-tol1e3-20260915.*` and
-  `experiments/q4-verified-tol1e2-20260915.*` (report, bits, trials, stages,
+  `artifacts/evidence/q4-verified-tol1e3-20260915.*` and
+  `artifacts/evidence/q4-verified-tol1e2-20260915.*` (report, bits, trials, stages,
   quality). Old candidate/baseline artifacts were not overwritten.
-- `experiments/q4-verified-summary-20260915.json`,
-  `experiments/q4-verified-focused-20260915.log`,
-  `experiments/q4-verified-source-manifest-20260915.json`, and this report.
+- `artifacts/evidence/q4-verified-summary-20260915.json`,
+  `artifacts/evidence/q4-verified-focused-20260915.log`,
+  `artifacts/evidence/q4-verified-source-manifest-20260915.json`, and this report.
 - No Rust/shader/solver changes were necessary.
 
 ## Preservation and single-variable evidence
@@ -215,11 +215,11 @@ cargo test -p rustsfm --release --lib --no-default-features --features gpu-wgpu 
 cargo build -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_q4_coefficients
 python3 -m unittest discover -s scripts -p test_generate_five_point_wgsl.py
 
-target/release/examples/five_point_gpu_q4_coefficients --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --candidate --match-tol 0.001 --baseline-trials experiments/q4-baseline-20260915/tol1e3.trials.json --output experiments/q4-verified-tol1e3-20260915.json
+target/release/examples/five_point_gpu_q4_coefficients --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --candidate --match-tol 0.001 --baseline-trials artifacts/evidence/q4-baseline-20260915/tol1e3.trials.json --output artifacts/evidence/q4-verified-tol1e3-20260915.json
 
-target/release/examples/five_point_gpu_q4_coefficients --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --candidate --match-tol 0.01 --baseline-trials experiments/q4-baseline-20260915/tol1e2.trials.json --output experiments/q4-verified-tol1e2-20260915.json
+target/release/examples/five_point_gpu_q4_coefficients --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --candidate --match-tol 0.01 --baseline-trials artifacts/evidence/q4-baseline-20260915/tol1e2.trials.json --output artifacts/evidence/q4-verified-tol1e2-20260915.json
 
-python3 scripts/summarize_five_point_q4.py --baseline-dir experiments/q4-baseline-20260915 --candidate-1e3 experiments/q4-verified-tol1e3-20260915.json --candidate-1e2 experiments/q4-verified-tol1e2-20260915.json --output experiments/q4-verified-summary-20260915.json
+python3 scripts/summarize_five_point_q4.py --baseline-dir artifacts/evidence/q4-baseline-20260915 --candidate-1e3 artifacts/evidence/q4-verified-tol1e3-20260915.json --candidate-1e2 artifacts/evidence/q4-verified-tol1e2-20260915.json --output artifacts/evidence/q4-verified-summary-20260915.json
 ```
 
 - Focused tests: **11 passed, 0 failed, 0 ignored**, twice (0.89 s / 0.84 s

@@ -16,15 +16,15 @@
 | Document | Purpose |
 |---|---|
 | [agent/README.md](agent/README.md) | 工具无关的 Agent 任务、worktree、验证和交接协议 |
-| [agent/universal-agent-migration-todo.md](agent/universal-agent-migration-todo.md) | 从 Codex/Superpowers 依赖迁移到通用协议的执行清单 |
+| [agent/universal-agent-migration-todo.md](agent/universal-agent-migration-todo.md) | 从厂商专用 Agent 依赖迁移到通用协议的执行清单 |
 
 ## Active RustSFM Docs
 
 | Document | Purpose |
 |---|---|
-| [../RustSFM/README.md](../RustSFM/README.md) | RustSFM build, test, optional parity-fixture, and CLI entry points |
-| [../RustSFM/PARITY_ROADMAP.md](../RustSFM/PARITY_ROADMAP.md) | COLMAP parity status and remaining numerical work |
-| [../RustSFM/COLMAP_COMPAT_TODO.md](../RustSFM/COLMAP_COMPAT_TODO.md) | COLMAP compatibility backlog |
+| [../rustsfm/README.md](../rustsfm/README.md) | RustSFM build, test, optional parity-fixture, and CLI entry points |
+| [../rustsfm/PARITY_ROADMAP.md](../rustsfm/PARITY_ROADMAP.md) | COLMAP parity status and remaining numerical work |
+| [../rustsfm/COLMAP_COMPAT_TODO.md](../rustsfm/COLMAP_COMPAT_TODO.md) | COLMAP compatibility backlog |
 
 ## Active Changes
 
@@ -38,15 +38,11 @@ Completed and superseded execution plans were removed after audit. Their
 implementation evidence remains in Git history and the current status/review
 documents. The cleanup record is [agent/changes/RS-2026-001/plan-cleanup.md](agent/changes/RS-2026-001/plan-cleanup.md).
 
-The `docs/superpowers/` directory is historical context only. Its old
-tool-specific instructions are not required; current Agent work follows
-[the tool-neutral protocol](agent/README.md).
-
 ## Current RustGS Docs
 
 | Document | Purpose |
 |---|---|
-| [../RustGS/README.md](../RustGS/README.md) | build、test、CLI 与 artifact contract |
+| [../rustgs/README.md](../rustgs/README.md) | build、test、CLI 与 artifact contract |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前 wgpu training module layout、public surface 和 ownership boundary |
 | [RustGS-TODO-训练效果与效率优化-2026-09-17.md](RustGS-TODO-训练效果与效率优化-2026-09-17.md) | 残留 R09b（TUM 阶梯）；R01～R12 其余项已落地 |
 
@@ -60,5 +56,5 @@ command against the current RustGS CLI.
 
 - 当前文档必须明确命令前提、外部夹具和验证日期。
 - 历史设计记录不构成当前 API、测试或 workspace 状态的权威来源。
-- `docs/plans/`、`docs/reviews/`、`docs/superpowers/` 中的日期文档只有在仍有
-  审计价值时保留；完成或被后续设计取代的文档不再作为入口引用。
+- `docs/plans/`、`docs/reviews/` 中的日期文档只有在仍有审计价值时保留；
+  完成或被后续设计取代的文档不再作为入口引用。

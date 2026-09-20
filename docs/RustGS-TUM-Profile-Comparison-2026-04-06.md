@@ -13,7 +13,7 @@
 
 ### Dataset
 
-- Input: `test_data/tum/rgbd_dataset_freiburg1_xyz`
+- Input: `artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz`
 - Training subset:
   - `max_frames=180`
   - `frame_stride=30`
@@ -53,7 +53,7 @@
 
 ```bash
 target/release/rustgs train \
-  --input /Users/tfjiang/Projects/RustScan/test_data/tum/rgbd_dataset_freiburg1_xyz \
+  --input /Users/tfjiang/Projects/RustScan/artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz \
   --output /tmp/rustgs-tum-freeze-study/tum_litegs_720_baseline_release.ply \
   --training-profile litegs-mac-v1 \
   --iterations 720 \
@@ -73,7 +73,7 @@ target/release/rustgs train \
 
 ```bash
 target/release/rustgs train \
-  --input /Users/tfjiang/Projects/RustScan/test_data/tum/rgbd_dataset_freiburg1_xyz \
+  --input /Users/tfjiang/Projects/RustScan/artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz \
   --output /tmp/rustgs-tum-freeze-study/tum_litegs_720_freeze80_release.ply \
   --training-profile litegs-mac-v1 \
   --iterations 720 \
@@ -95,9 +95,9 @@ target/release/rustgs train \
 ### Comparable Evaluation Gate
 
 ```bash
-cargo run --manifest-path RustGS/Cargo.toml --example evaluate_psnr -- \
+cargo run --manifest-path rustgs/Cargo.toml --example evaluate_psnr -- \
   --scene /tmp/rustgs-tum-freeze-study/tum_litegs_720_baseline_release.ply \
-  --dataset /Users/tfjiang/Projects/RustScan/test_data/tum/rgbd_dataset_freiburg1_xyz \
+  --dataset /Users/tfjiang/Projects/RustScan/artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz \
   --render-scale 0.25 \
   --max-frames 180 \
   --frame-stride 30 \

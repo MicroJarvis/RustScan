@@ -9,7 +9,7 @@ signatures switch from Q4 → Q5b.
 
 ## Offline characterization (no shader yet)
 
-Tool: `RustSFM/examples/five_point_gpu_q5b_recovery_measure.rs` over Q4 verified
+Tool: `rustsfm/examples/five_point_gpu_q5b_recovery_measure.rs` over Q4 verified
 `stages.bin` + `bits.json` + `trials.json`. Good-B threshold = no-loss
 `B_gpu_vs_f64_same_basis` p90 ≈ **1.494e-5** (Q5 premeasure).
 
@@ -33,7 +33,7 @@ Gate residuals on recovery-fail slots (good-B):
   `essential_residual > 2e-2` (p50 ≈ 0.097).
 
 Stop rule (≥500 good-B matched RF): **do not stop** — proceed to 3×3 recovery.
-Artifacts: `experiments/q5b-offline-measure-tol1e{3,2}-20260915.json`.
+Artifacts: `artifacts/evidence/q5b-offline-measure-tol1e{3,2}-20260915.json`.
 
 ## Single variable
 
@@ -49,7 +49,7 @@ Roots / algebra / gates / accept thresholds untouched. First probe with a
 ## End-to-end (Q4 harness `--candidate`)
 
 Device: Apple M5 Max / wgpu. Fixed loss cohort:
-`experiments/q4-verified-tol1e3-20260915.trials.json`.
+`artifacts/evidence/q4-verified-tol1e3-20260915.trials.json`.
 
 | Metric | Q4 | Q5b | Δ |
 |---|---:|---:|---:|
@@ -92,15 +92,15 @@ Active harnesses (`p2_session`, `p3_submit`, `p3_double`,
 
 `cargo test -p rustsfm --release --lib --no-default-features --features gpu-wgpu
 --target-dir target five_point -- --nocapture --test-threads=1` — **11/11 pass**.
-Log: `experiments/q5b-focused-tests.log`.
+Log: `artifacts/evidence/q5b-focused-tests.log`.
 
 ## Artifacts
 
-- Offline: `experiments/q5b-offline-measure-tol1e{3,2}-20260915.json`
-- Candidate: `experiments/q5b-candidate-tol1e{3,2}-20260915.*`
-- Good-B remeasure on candidate: `experiments/q5b-candidate-goodb-measure-tol1e3-20260915.json`
-- Pre-change shader copy: `experiments/q5b-recovery-shader-before.wgsl`
-- Measure example: `RustSFM/examples/five_point_gpu_q5b_recovery_measure.rs`
+- Offline: `artifacts/evidence/q5b-offline-measure-tol1e{3,2}-20260915.json`
+- Candidate: `artifacts/evidence/q5b-candidate-tol1e{3,2}-20260915.*`
+- Good-B remeasure on candidate: `artifacts/evidence/q5b-candidate-goodb-measure-tol1e3-20260915.json`
+- Pre-change shader copy: `artifacts/evidence/q5b-recovery-shader-before.wgsl`
+- Measure example: `rustsfm/examples/five_point_gpu_q5b_recovery_measure.rs`
 
 ## Follow-up
 

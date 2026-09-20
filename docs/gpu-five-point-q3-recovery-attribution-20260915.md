@@ -24,9 +24,9 @@ scored with Sampson inliers against the pair's GPU best (Q2 methodology).
 - Lib change (behavior-preserving refactor, CPU f64 signature gate passed):
   `geometry::five_point::essential_reference_from_basis` exposes the
   post-nullspace f64 chain; `estimate_five_point_essential` now calls it.
-- Harness: `RustSFM/examples/five_point_gpu_recovery_attribution.rs`
-- Results: `experiments/q3-recovery-attribution-20260915.json` (tol 1e-3),
-  `experiments/q3-recovery-attribution-tol1e2-20260915.json` (tol 1e-2
+- Harness: `rustsfm/examples/five_point_gpu_recovery_attribution.rs`
+- Results: `artifacts/evidence/q3-recovery-attribution-20260915.json` (tol 1e-3),
+  `artifacts/evidence/q3-recovery-attribution-tol1e2-20260915.json` (tol 1e-2
   sensitivity).
 - Gates all passed: input digest, Q2 model + diagnostic signatures, CPU f64
   signature. No shader or solver changes. Device: Apple M5 Max.

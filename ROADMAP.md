@@ -18,7 +18,7 @@ crate-specific READMEs; this file only tracks forward work.
 ### 1. RustSFM COLMAP parity
 
 - Provision the external `flowers2_colmap` runtime tree from the committed
-  reference text (`test_data/fixtures/flowers2_colmap_ref_text_20260630`) via
+  reference text (`artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630`) via
   `scripts/provision_flowers2_colmap_fixture.sh`; use opt-in CI job
   `rustsfm-flowers2-parity-opt-in` when needed.
 - Close the remaining numerical and bundle-adjustment parity gaps against COLMAP.

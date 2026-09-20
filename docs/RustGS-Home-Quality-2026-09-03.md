@@ -4,13 +4,13 @@
 
 This is a local quality smoke test for the current RustGS wgpu training and
 GPU evaluation path. It is not a replacement for the TUM/LiteGS acceptance
-record: the COLMAP input below was generated locally under `output/` and is
+record: the COLMAP input below was generated locally under `artifacts/runs/` and is
 not a versioned fixture.
 
 ## Local Input
 
-- Sparse model: `output/profile_home/colmap60/0`
-- Images: `test_data/home/images`
+- Sparse model: `artifacts/runs/profile_home/colmap60/0`
+- Images: `artifacts/inputs/home/images`
 - Frames: first 12 frames selected by `--max-frames 12`
 - Initialization: 26,518 sparse COLMAP points
 - Training/evaluation render scale: 0.25
@@ -22,9 +22,9 @@ not a versioned fixture.
 ```sh
 # Baseline
 ./target/release/rustgs train \
-  --input output/profile_home/colmap60/0 \
-  --image-root test_data/home/images \
-  --output output/profile_home/rustgs_home_baseline_1500.ply \
+  --input artifacts/runs/profile_home/colmap60/0 \
+  --image-root artifacts/inputs/home/images \
+  --output artifacts/runs/profile_home/rustgs_home_baseline_1500.ply \
   --iterations 1500 \
   --max-frames 12 \
   --render-scale 0.25 \
@@ -38,9 +38,9 @@ not a versioned fixture.
 
 # Freeze topology after epoch 80
 ./target/release/rustgs train \
-  --input output/profile_home/colmap60/0 \
-  --image-root test_data/home/images \
-  --output output/profile_home/rustgs_home_freeze80_1500.ply \
+  --input artifacts/runs/profile_home/colmap60/0 \
+  --image-root artifacts/inputs/home/images \
+  --output artifacts/runs/profile_home/rustgs_home_freeze80_1500.ply \
   --iterations 1500 \
   --max-frames 12 \
   --render-scale 0.25 \

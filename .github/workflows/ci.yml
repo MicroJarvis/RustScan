@@ -45,10 +45,10 @@ jobs:
       - name: RustScan CLI tests
         run: cargo test -p rustscan --all-targets
       - name: RustMesh tests
-        working-directory: RustMesh
+        working-directory: rustmesh
         run: cargo test
       - name: RustSLAM tests (including E2E)
-        working-directory: RustSLAM
+        working-directory: rustslam
         env:
           RUSTSCAN_E2E: "1"
         run: cargo test

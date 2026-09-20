@@ -36,7 +36,7 @@ basis as “had basis” when roots mirrors algebra status into `upstream`
 - DB: `flowers2_960_settlement_20260913/matching.db`
 - Input digest: `af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5`
 - Harness: `five_point_gpu_q4_coefficients --candidate --match-tol 0.001`
-- Fixed loss cohort: `experiments/q4-verified-tol1e3-20260915.trials.json`
+- Fixed loss cohort: `artifacts/evidence/q4-verified-tol1e3-20260915.trials.json`
 
 ## Stage isolation (tol 1e-3 stages.bin)
 
@@ -106,10 +106,10 @@ on the FMA candidate build. Algebra shader restored to Q4 afterward.
 
 ## Artifacts
 
-- `experiments/q5a-b-fma-tol1e3-20260915` (+ `.trials.json`, `.bits.json`,
+- `artifacts/evidence/q5a-b-fma-tol1e3-20260915` (+ `.trials.json`, `.bits.json`,
   `.stages.bin`, `.quality.json`)
-- `experiments/q5a-b-fma-tol1e2-20260915` (+ sidecars)
-- Focused test log: `experiments/q5a-b-fma-focused-tests.log`
+- `artifacts/evidence/q5a-b-fma-tol1e2-20260915` (+ sidecars)
+- Focused test log: `artifacts/evidence/q5a-b-fma-focused-tests.log`
 
 Harness consistency fix for algebra-mirrored `upstream` is retained (measurement
 correctness; does not change Q4 solver output).

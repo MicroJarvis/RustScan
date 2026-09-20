@@ -40,9 +40,9 @@ Dispatch-count–bounded entry points (`main`, `pack`, `elimination`,
   - model `472124c8…d6ea`
   - diagnostic `3d04bb3e…c050`
   - CPU f64 `9e6764b4…3a`
-- Harness: `RustSFM/examples/five_point_gpu_p2_session.rs`
-- Results: `experiments/p2-session-20260914.json` (first timing shape),
-  `experiments/p2-session-final-20260914.json` (final).
+- Harness: `rustsfm/examples/five_point_gpu_p2_session.rs`
+- Results: `artifacts/evidence/p2-session-20260914.json` (first timing shape),
+  `artifacts/evidence/p2-session-final-20260914.json` (final).
 
 ## Acceptance
 

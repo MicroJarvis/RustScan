@@ -13,7 +13,7 @@
 - [ ] 记录 `HEAD`、未提交 diff 指纹、平台、Rust 版本和启用的 features。
 - [ ] 运行 no-default 编译门禁。
 - [ ] 运行 GPU library、sequence 和 ignored sparse fixture 测试。
-- [ ] 将同一次运行的结果同步到 `docs/current-project-status.md` 和 `RustSFM/PARITY_ROADMAP.md`，删除互相冲突的旧测试数字。
+- [ ] 将同一次运行的结果同步到 `docs/current-project-status.md` 和 `rustsfm/PARITY_ROADMAP.md`，删除互相冲突的旧测试数字。
 
 ### 验收命令
 
@@ -83,7 +83,7 @@ P1 完成后，用最终代码重新生成一次可引用的 24 图报告。此�
 - [ ] 运行 P0 的全部测试门禁。
 - [ ] 运行固定 24 图 replay，并保存机器可读 parity 报告。
 - [ ] 记录 registration order、models、points、observations、track histogram、平均重投影误差、BA 事件和总耗时。
-- [ ] 更新 `docs/current-project-status.md` 与 `RustSFM/PARITY_ROADMAP.md`，两处引用同一个报告和同一组数字。
+- [ ] 更新 `docs/current-project-status.md` 与 `rustsfm/PARITY_ROADMAP.md`，两处引用同一个报告和同一组数字。
 
 ### 完成标准
 
@@ -97,7 +97,7 @@ P1 完成后，用最终代码重新生成一次可引用的 24 图报告。此�
 
 ### 固定输入与运行方式
 
-- 输入图像：`test_data/flowers2/images` 的 960 张 `frame_*.jpg`。
+- 输入图像：`artifacts/inputs/flowers2/images` 的 960 张 `frame_*.jpg`。
 - 使用冻结的 matching database；报告记录数据库路径和 SHA-256。
 - release 构建，固定 seed、线程数、feature 和 mapper 配置。
 - 使用 `/usr/bin/time` 或等价工具记录 wall time 与峰值 RSS；summary 记录 GPU wait 和 BA solve time。

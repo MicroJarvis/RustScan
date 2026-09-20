@@ -12,7 +12,7 @@ The source checkout was on `main`. It had no modified tracked files and two
 untracked paths:
 
 ```text
-docs/RustSFM-TODO-技术方案-2026-09-17.md
+docs/rustsfm-TODO-技术方案-2026-09-17.md
 docs/agent/
 ```
 
@@ -25,8 +25,8 @@ cleaned by migration agents.
 - `.codex/skills/openspec-archive-change/SKILL.md` (tracked)
 - `.codex/skills/openspec-explore/SKILL.md` (tracked)
 - `.codex/skills/openspec-propose/SKILL.md` (tracked)
-- `docs/superpowers/plans/` and `docs/superpowers/specs/` (tracked historical records)
-- `.superpowers/` (ignored local directory when present)
+- historical execution plans and design specs (tracked historical records)
+- a legacy local Agent-plugin directory (ignored when present)
 - `.worktrees/retry-state-sync/CLAUDE.md` and `.worktrees/rustscan-macos-app/CLAUDE.md` (worktree-local rules)
 
 No active `openspec/` directory was present. The installed OpenSpec CLI was

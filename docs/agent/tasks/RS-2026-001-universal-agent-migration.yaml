@@ -14,7 +14,6 @@ scope:
   - docs/
   - .gitignore
   - .codex/
-  - docs/superpowers/
   - scripts/agent/
 out_of_scope:
   - RustScan business and numerical code
@@ -24,7 +23,7 @@ out_of_scope:
 acceptance:
   - "A model can execute a task using only AGENTS.md, docs/agent files, Git, shell, and Cargo."
   - "The main worktree is not modified by this migration."
-  - "Existing .codex and historical Superpowers files are classified before removal."
+  - "Existing vendor-specific Agent files and historical records are classified before removal."
 
 verification:
   - "git status --short"
@@ -40,5 +39,5 @@ artifacts:
   - docs/agent/review-template.md
 
 known_limitations:
-  - "Historical design specs remain under docs/superpowers/specs/ as non-authoritative engineering history."
+  - "Historical design specs are non-authoritative engineering history and are removed after audit."
 next_action: "Continue RS-2026-002 from its first unchecked task."

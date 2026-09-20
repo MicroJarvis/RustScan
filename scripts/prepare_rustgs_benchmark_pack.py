@@ -38,12 +38,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-root",
-        default="output/rustgs_benchmark_pack",
+        default="artifacts/runs/rustgs_benchmark_pack",
         help="Directory for generated manifests and local prepared datasets.",
     )
     parser.add_argument(
         "--tum-root",
-        default="test_data/tum/rgbd_dataset_freiburg1_xyz",
+        default="artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz",
         help="Local TUM RGB-D sequence root to convert when present.",
     )
     parser.add_argument(

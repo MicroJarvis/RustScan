@@ -2,11 +2,11 @@
 
 **Date:** 2026-09-19
 
-The 35 files formerly under `docs/superpowers/plans/` were audited against
+The 35 historical execution plans were audited against
 implementation commits, current source, and `docs/current-project-status.md`.
 All plans except the 2026-09-18 RustGS remediation were complete, superseded,
 or obsolete as an execution plan. The active remediation was migrated to
-`docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/` and its
+`docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation/`; its
 historical source was removed.
 
 ## Deleted completed or superseded plans
@@ -24,7 +24,7 @@ historical source was removed.
 - 2026-08-08/09 observability plans (`f6e7adc`, `e4db884`)
 - 2026-08-10 RANSAC 512 experiment and 2026-08-11 decision batching (`16c27ac`, `99d5ecb`); the later full-parity result superseded the early bounded-only NO MERGE note
 - 2026-08-14 RustSFM review hardening (`273a40a`, `bbac4e2`)
-- 2026-09-17 RustGS quality/efficiency plan, superseded by `docs/RustGS-TODO-训练效果与效率优化-2026-09-17.md`
+- 2026-09-17 RustGS quality/efficiency plan, superseded by `docs/rustgs-TODO-训练效果与效率优化-2026-09-17.md`
 - 2026-09-19 nalgebra review fixes (`f78c3f0`)
 
 The deleted files are historical source material only; their implementation

@@ -28,8 +28,8 @@ Folding the copy into the same command encoder yields **127 submits + 127 waits*
 Stop rule applied: wall time improved; submit-count reduction alone would not
 have been enough.
 
-- Harness: `RustSFM/examples/five_point_gpu_p3_submit.rs`
-- Results: `experiments/p3-submit-merge-20260914.json`
+- Harness: `rustsfm/examples/five_point_gpu_p3_submit.rs`
+- Results: `artifacts/evidence/p3-submit-merge-20260914.json`
 - Counters: `submit_count` / `wait_count` / `reset_sync_counters`
 
 ## Candidate B — bounded double-buffer
@@ -43,8 +43,8 @@ submit(N+1)  while  finish/map/decode(N)
 At most two in flight; `busy` backpressure; trial indices remapped in input
 order. Timestamp resolve stays off the result path.
 
-- Harness: `RustSFM/examples/five_point_gpu_p3_double.rs`
-- Results: `experiments/p3-double-buffer-20260914.json`
+- Harness: `rustsfm/examples/five_point_gpu_p3_double.rs`
+- Results: `artifacts/evidence/p3-double-buffer-20260914.json`
 - Unit coverage extended in `five_point_session_reuses_buffers_without_stale_state`
 
 ### Timing (same input, Apple M5 Max, 2 warm + 5 measure)
@@ -85,7 +85,7 @@ Submits/waits still 127 per pass (overlap hides latency; count is unchanged).
   preserves submit/wait counters and the busy flag. Regression: mid-pipeline
   growth case in `five_point_session_reuses_buffers_without_stale_state`.
   Re-run after fix: double-buffer median 0.709 s, signatures Q2
-  (`experiments/p3-double-buffer-growfix-20260915.json`).
+  (`artifacts/evidence/p3-double-buffer-growfix-20260915.json`).
 - Bind groups still rebuilt per pass.
 - Offline batch-512 throughput only; not production RANSAC admission.
 

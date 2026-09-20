@@ -3,7 +3,7 @@
 ## Decision and scope
 
 Measurement-only. No solver, shader or protected harness source changed; one new
-harness `RustSFM/examples/five_point_gpu_lost_solutions.rs`. There is no
+harness `rustsfm/examples/five_point_gpu_lost_solutions.rs`. There is no
 candidate to retain or roll back. This round names the cause of the 11,967 lost
 trials with proof, and weighs them by model quality so the loss is a number
 rather than a count.
@@ -34,14 +34,14 @@ Findings, up front:
 ## Provenance
 
 - Worktree `.worktrees/gpu-five-point-f32`, source commit `3ab9c09`.
-- New file `RustSFM/examples/five_point_gpu_lost_solutions.rs`, sha256
+- New file `rustsfm/examples/five_point_gpu_lost_solutions.rs`, sha256
   `1f5bfb1785336bd6cfaede7a3a3ab7da2e0c722d9c1242cb886b996b07713299`; binary
   `73a5108180fce60cd890ffa3f39deef145889772104d308c83a34ef597fc72a8`.
 - Device `Apple M5 Max`. Fixed input unchanged: 127 pairs, 65,024 trials,
   digest `af07459d…c5`. GPU signature `1f6f3f8d…39` and CPU f64 signature
   `9e6764b4…3a` asserted equal to history before any analysis.
-- `experiments/lost-solutions-20260914.json` (first build) and
-  `experiments/lost-solutions-20260914-final.json` (final binary) agree on every
+- `artifacts/evidence/lost-solutions-20260914.json` (first build) and
+  `artifacts/evidence/lost-solutions-20260914-final.json` (final binary) agree on every
   attribution and quality field.
 - Build requires `POSELIB_ROOT` pointing at the main checkout, as in the
   previous round; not on the measured path.
@@ -264,7 +264,7 @@ POSELIB_ROOT=<main-checkout>/third_party/native/PoseLib \
 
 ./target/release/examples/five_point_gpu_lost_solutions \
   --database <fixed matching.db> \
-  --output experiments/lost-solutions-<date>.json
+  --output artifacts/evidence/lost-solutions-<date>.json
 ```
 
 The run refuses to overwrite and asserts the input digest and both solver

@@ -4,7 +4,7 @@
 
 - Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32`, starting HEAD `4cedae2`; initially no uncommitted changes.
 - Only the replay example and its tests changed; no shader or production algorithm changes, no commit. Historical output retained.
-- Actual database: `/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db`.
+- Actual database: `/Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db`.
 - Same deterministic 12 pairs × 512 trials = 6144 inputs; fingerprint `3049eeb4981ff41bed23a9cab5adc59ce6c1e642d9b4360144d8aef2d221510c`, matching the historical final replay.
 - Apple M5 Max, Wgpu. Release build, `--no-default-features --features gpu-wgpu`; existing Rust CPU five-point solver (not PoseLib).
 - Each batch: one warmup for each path, then three measured rounds with rotating execution order. Serial and dedicated Rayon 4-thread pool compared with GPU.
@@ -50,7 +50,7 @@ Larger batches improve throughput but do not resolve the existing f32 quality de
 
 ```sh
 cargo test -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_replay
-cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_replay -- --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --pairs 12 --trials 512 --rounds 3 --output output/five_point_gpu_batch_sweep_20260914.json
+cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_replay -- --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --pairs 12 --trials 512 --rounds 3 --output artifacts/runs/five_point_gpu_batch_sweep_20260914.json
 ```
 
 Seven example tests passed, including new coverage for all seven batch sizes, per-pass call counts, partial/empty input counts, and global chunk index coverage. Existing tests cover deterministic sampling, ordered CPU replay and coefficient bits, sign-invariant matching, and masks.
@@ -58,9 +58,9 @@ Seven example tests passed, including new coverage for all seven batch sizes, pe
 The initial test attempt with `gpu-wgpu,poselib` failed because that optional feature could not locate PoseLib source. The successful build uses only `gpu-wgpu`, sufficient for this example. Existing unrelated dead-code warnings remain.
 
 Artifacts (relative to worktree):
-- `output/five_point_gpu_batch_sweep_20260914.json`: compact 21,638-byte report, all raw timing rounds/warmups plus aggregate quality; per-trial diagnostics omitted.
-- `output/five_point_gpu_batch_sweep_20260914.log`: benchmark build/run log.
-- `output/batch_sweep_tests_gpu_20260914.log`: passing tests.
-- `output/batch_sweep_tests_20260914.log`: initial optional-feature failure.
+- `artifacts/runs/five_point_gpu_batch_sweep_20260914.json`: compact 21,638-byte report, all raw timing rounds/warmups plus aggregate quality; per-trial diagnostics omitted.
+- `artifacts/runs/five_point_gpu_batch_sweep_20260914.log`: benchmark build/run log.
+- `artifacts/runs/batch_sweep_tests_gpu_20260914.log`: passing tests.
+- `artifacts/runs/batch_sweep_tests_20260914.log`: initial optional-feature failure.
 
 Historical 20+ MB JSON files were parsed by Python for selected summaries only, never printed/read into the agent context in full. Existing history was not overwritten.

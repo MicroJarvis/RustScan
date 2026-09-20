@@ -10,19 +10,19 @@ Retain both single-variable changes in the independent GPU f32 experiment. Nulls
 
 - Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32`.
 - Actual adapter: wgpu, **Apple M5 Max**.
-- Database: `/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db`.
-- Same loader and workset as `RustSFM/examples/five_point_gpu_cpu_threads.rs`: 127 pairs × 512 trials = **65,024** real inputs.
+- Database: `/Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db`.
+- Same loader and workset as `rustsfm/examples/five_point_gpu_cpu_threads.rs`: 127 pairs × 512 trials = **65,024** real inputs.
 - Input digest: `af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5`.
 - Complete historical GPU signature: `1f6f3f8d88a17e4e1c42abfc85aad44a66c4b864091805594e086ca80bf9b339`.
 - Final CPU8 reference signature: `9e6764b41602d0005710187d2558d046f1a843c5f873b9542dd7b4f6c29c563a`.
-- New independent harness: `RustSFM/examples/five_point_gpu_p1_layout.rs`, reusing existing loader/replay/complete-signature helpers, not editing them.
+- New independent harness: `rustsfm/examples/five_point_gpu_p1_layout.rs`, reusing existing loader/replay/complete-signature helpers, not editing them.
 
-Unique local artifact directory: `output/five-point-p1-20260914-uxspnwdh/`. Created with `mkdtemp`; experiment JSON files refuse overwrite. Before solver edits, preserved exact GPU source, five-point examples, manifests/lockfile, generator and existing CPU comparison document in `source/`, with `source-sha256.json`. Preserved the existing CPU-thread executable as `baseline-cpu-threads`, then built and preserved `baseline-p1` before changing nullspace. `null-p1`/`null-source/` capture the accepted first stage; `lu-p1`/`final-source/` capture the second. `harness.rs` is the final formatted harness; its formatting-only pass occurred after measurements. `artifact-sha256.json` hashes the saved artifacts, sources, binaries and logs present at snapshot time.
+Unique local artifact directory: `artifacts/runs/five-point-p1-20260914-uxspnwdh/`. Created with `mkdtemp`; experiment JSON files refuse overwrite. Before solver edits, preserved exact GPU source, five-point examples, manifests/lockfile, generator and existing CPU comparison document in `source/`, with `source-sha256.json`. Preserved the existing CPU-thread executable as `baseline-cpu-threads`, then built and preserved `baseline-p1` before changing nullspace. `null-p1`/`null-source/` capture the accepted first stage; `lu-p1`/`final-source/` capture the second. `harness.rs` is the final formatted harness; its formatting-only pass occurred after measurements. `artifact-sha256.json` hashes the saved artifacts, sources, binaries and logs present at snapshot time.
 
 SHA-256 checks against the initial snapshot confirmed these pre-existing uncommitted files unchanged:
 
-- `RustSFM/examples/five_point_gpu_capacity_replay.rs`
-- `RustSFM/examples/five_point_gpu_cpu_threads.rs`
+- `rustsfm/examples/five_point_gpu_capacity_replay.rs`
+- `rustsfm/examples/five_point_gpu_cpu_threads.rs`
 - `docs/gpu-five-point-cpu-threads-comparison-20260914.md`
 
 ## Shader and dispatch audit

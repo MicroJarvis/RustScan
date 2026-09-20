@@ -27,8 +27,8 @@ Extracted `ge_solve10()` helper to share LU/back-sub between passes. No changes 
 - DB: `flowers2_960_settlement_20260913/matching.db`
 - Input digest: `af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5`
 - Harness: `five_point_gpu_q4_coefficients --candidate`
-- Fixed loss cohort: `experiments/q4-verified-tol1e3-20260915.trials.json` `loss` flags
-- Baseline: Q4 verified (`experiments/q4-verified-tol1e{3,2}-20260915.*`)
+- Fixed loss cohort: `artifacts/evidence/q4-verified-tol1e3-20260915.trials.json` `loss` flags
+- Baseline: Q4 verified (`artifacts/evidence/q4-verified-tol1e{3,2}-20260915.*`)
 
 ## Stage isolation (candidate run, tol 1e-3)
 
@@ -104,9 +104,9 @@ on candidate build; reverted shader matches Q4.
 
 ## Artifacts
 
-- `experiments/q5a-candidate-tol1e3-20260915` (+ `.trials.json`, `.bits.json`,
+- `artifacts/evidence/q5a-candidate-tol1e3-20260915` (+ `.trials.json`, `.bits.json`,
   `.stages.bin`, `.quality.json`)
-- `experiments/q5a-candidate-tol1e2-20260915` (+ sidecars)
+- `artifacts/evidence/q5a-candidate-tol1e2-20260915` (+ sidecars)
 
 ## Follow-up
 

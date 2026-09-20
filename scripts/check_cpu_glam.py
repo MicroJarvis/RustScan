@@ -6,7 +6,7 @@ Scans controlled Rust sources and crate Cargo.toml files for:
   - fully-qualified glam::{Vec,DVec,Mat,DMat,Quat,DQuat}*
   - glam dependencies in Cargo.toml
 
-Skips third_party/rust/, target/, output/, and .worktrees/. Line and doc comments are
+Skips third_party/rust/, target/, artifacts/runs/, and .worktrees/. Line and doc comments are
 ignored so historical prose does not false-positive.
 """
 
@@ -22,7 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST_PATH = Path(__file__).resolve().parent / "cpu-glam-allowlist.txt"
 
-SKIP_DIRS = {"target", "output", ".worktrees", ".git"}
+SKIP_DIRS = {"target", "artifacts", "output", ".worktrees", ".git"}
 SKIP_PATHS = {"third_party/rust"}
 
 USE_GLAM_RE = re.compile(

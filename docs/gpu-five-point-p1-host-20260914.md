@@ -30,11 +30,11 @@ full RANSAC, and not a 960-image pipeline result.
 - Hardware: `Mac17,7`, **Apple M5 Max**, 18 logical CPUs, 64 GiB, macOS 26.5.2.
   Adapter reported by the solver: `Wgpu / "Apple M5 Max"`. wgpu 29.0.1.
 - Database:
-  `/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db`.
+  `/Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db`.
 - Fixed input: 127 pairs × 512 trials = **65,024** real inputs, seed 1 per pair,
   **231 unique image IDs** (recorded in every report). Input digest
   `af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5`.
-- Unique local artifact directory: `output/five-point-p1host-20260914-ThcNbcf6/`,
+- Unique local artifact directory: `artifacts/runs/five-point-p1host-20260914-ThcNbcf6/`,
   created with `mktemp -d`. Experiment JSON files refuse to overwrite. Preserved:
   full pre-change source snapshot with `source-sha256.txt`, the `baseline-p1host`,
   `p11-p1host`, `p12-p1host` and `final-p1host` executables, the rebuilt but
@@ -46,7 +46,7 @@ full RANSAC, and not a 960-image pipeline result.
   `five_point_gpu_p1_layout.rs`, `five_point_replay_probe.rs`, `gpu/context.rs`,
   `gpu/five_point_f32.rs`, all four five-point WGSL shaders, and both existing
   five-point reports.
-- New file: `RustSFM/examples/five_point_gpu_p1_host.rs`, reusing the existing
+- New file: `rustsfm/examples/five_point_gpu_p1_host.rs`, reusing the existing
   loader, replay and signature helpers without editing them.
 - Changed files: `gpu/five_point_f32_complete.rs` and `gpu/five_point_f32_tests.rs`
   only. `cargo fmt` left the solver file byte-identical to the measured source

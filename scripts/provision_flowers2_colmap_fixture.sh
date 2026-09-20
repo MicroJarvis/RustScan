@@ -4,13 +4,13 @@
 # The fixture is the official-COLMAP sparse text export of the 24-image
 # flowers2 subset (frame_0001.jpg .. frame_0024.jpg) that the ignored
 # `real_colmap_sparse_*` RustSFM tests read from
-# `test_data/flowers2_colmap/sparse/text`. It is intentionally not
-# distributed through Git or submodules (see RustSFM/README.md).
+# `artifacts/inputs/flowers2_colmap/sparse/text`. It is intentionally not
+# distributed through Git or submodules (see rustsfm/README.md).
 #
 # Provenance: generated 2026-06-30 and archived as the committed fixture
-# `test_data/fixtures/flowers2_colmap_ref_text_20260630` (historical copies also
-# exist under `output/flowers2_colmap_ref_text_20260630` /
-# `output/flowers2_colmap_txt_20260630`).
+# `artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630` (historical copies also
+# exist under `artifacts/runs/flowers2_colmap_ref_text_20260630` /
+# `artifacts/runs/flowers2_colmap_txt_20260630`).
 #
 # The fixture content is pinned by SHA-256 so a mismatched source is refused
 # instead of silently changing the parity reference.
@@ -19,14 +19,14 @@
 #   ./scripts/provision_flowers2_colmap_fixture.sh [SOURCE_DIR]
 #
 # SOURCE_DIR defaults to the committed pinned fixture under
-# test_data/fixtures/flowers2_colmap_ref_text_20260630 (also archived historically
-# under output/flowers2_colmap_ref_text_20260630). The directory must contain the
+# artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630 (also archived historically
+# under artifacts/runs/flowers2_colmap_ref_text_20260630). The directory must contain the
 # five text files whose digests match the pinned values below.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SOURCE="${1:-test_data/fixtures/flowers2_colmap_ref_text_20260630}"
-DEST="test_data/flowers2_colmap/sparse/text"
+SOURCE="${1:-artifacts/inputs/fixtures/flowers2_colmap_ref_text_20260630}"
+DEST="artifacts/inputs/flowers2_colmap/sparse/text"
 
 case "$SOURCE" in
   /*) SRC_DIR="$SOURCE" ;;

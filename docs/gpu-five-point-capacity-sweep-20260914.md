@@ -4,13 +4,13 @@
 
 Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/gpu-five-point-f32`, HEAD `4cedae22f8cfc0d7d3f36931db883a7d4b7a4252`.
 
-At entry, `RustSFM/examples/five_point_gpu_replay.rs` had the uncommitted 37-line batch-sweep diff (+33/-4), and `docs/gpu-five-point-batch-sweep-20260914.md` was untracked. Both were left untouched. This experiment adds the independent `RustSFM/examples/five_point_gpu_capacity_replay.rs`, derived from that replay, and changes only the shared CPU example loader's CLI pair bound and related tests. No shader, production solver, RANSAC, commit, push, or branch change. Historical artifacts were not overwritten; no historical large JSON was read.
+At entry, `rustsfm/examples/five_point_gpu_replay.rs` had the uncommitted 37-line batch-sweep diff (+33/-4), and `docs/gpu-five-point-batch-sweep-20260914.md` was untracked. Both were left untouched. This experiment adds the independent `rustsfm/examples/five_point_gpu_capacity_replay.rs`, derived from that replay, and changes only the shared CPU example loader's CLI pair bound and related tests. No shader, production solver, RANSAC, commit, push, or branch change. Historical artifacts were not overwritten; no historical large JSON was read.
 
-Database: `/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db`, opened through the existing `ColmapDatabase::open_read_only` loader. Raw matches only, not verified inliers. No synthetic or replicated input expansion.
+Database: `/Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db`, opened through the existing `ColmapDatabase::open_read_only` loader. Raw matches only, not verified inliers. No synthetic or replicated input expansion.
 
 ## Actual adapter and complete-solve capacity
 
-Runtime adapter query: **Apple M5 Max, Metal, IntegratedGpu**, 64 GiB system memory (`hw.memsize=68719476736`). The independent query uses the same default instance / HighPerformance / no fallback selection as `WgpuContext`; the solver adapter name and backend are checked. `WgpuContext` requests `required_limits: adapter.limits()` (`RustSFM/src/gpu/context.rs:64–73`). Its private device limits are not separately exposed or queried by this example; the report records the actual adapter limits and this device-request contract rather than inventing device measurements.
+Runtime adapter query: **Apple M5 Max, Metal, IntegratedGpu**, 64 GiB system memory (`hw.memsize=68719476736`). The independent query uses the same default instance / HighPerformance / no fallback selection as `WgpuContext`; the solver adapter name and backend are checked. `WgpuContext` requests `required_limits: adapter.limits()` (`rustsfm/src/gpu/context.rs:64–73`). Its private device limits are not separately exposed or queried by this example; the report records the actual adapter limits and this device-request contract rather than inventing device measurements.
 
 Relevant actual limits:
 
@@ -31,7 +31,7 @@ All adapter limits, including unrelated texture/mesh limits, are retained compac
 
 ### All stages in `solve_essential`
 
-Source: `RustSFM/src/gpu/five_point_f32_complete.rs:120–162,210–281`; generated shader confirms the two-dimensional mapping at `shaders/five_point_generated.wgsl:16–24`.
+Source: `rustsfm/src/gpu/five_point_f32_complete.rs:120–162,210–281`; generated shader confirms the two-dimensional mapping at `shaders/five_point_generated.wgsl:16–24`.
 
 | Stage | Dispatch (X,Y,Z) | Bound storage buffers |
 |---|---|---|
@@ -157,8 +157,8 @@ Run each command with a maximum runtime of **180 seconds**:
 
 ```sh
 cargo test -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_capacity_replay --example five_point_gpu_replay --example five_point_replay_probe
-cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_capacity_replay -- --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --inspect-only --output output/five_point_gpu_capacity_inspect_recheck.json
-cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_capacity_replay -- --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --pairs 127 --trials 512 --rounds 3 --output output/five_point_gpu_capacity_127x512_recheck.json
+cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_capacity_replay -- --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --inspect-only --output artifacts/runs/five_point_gpu_capacity_inspect_recheck.json
+cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_capacity_replay -- --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --pairs 127 --trials 512 --rounds 3 --output artifacts/runs/five_point_gpu_capacity_127x512_recheck.json
 ```
 
 All actual terminal calls used `head_lines=15`, `tail_lines=20`, timeout≤180s. **No command timed out.** An initial build exposed that wgpu 29's storage-binding limit is u64, not u32; the example calculation was corrected, then inspection, tests and the complete sweep succeeded. Existing unrelated dead-code warnings remain.
@@ -167,11 +167,11 @@ Tests: **8 + 7 + 4 passed** across the new GPU example, preserved GPU example, a
 
 Artifacts, relative to this worktree:
 
-- `output/five_point_gpu_capacity_127x512_20260914.json`: **65,339 bytes**, full compact provenance/timings/signatures/aggregate and sampled quality; no per-trial diagnostic JSON. Serialization refuses summaries ≥100,000 bytes.
-- `output/five_point_gpu_capacity_127x512_20260914.log`: successful release build/run.
-- `output/five_point_gpu_capacity_inspect_20260914.json`: first successful actual adapter/original-pair inspection (before aggregate original digest was added; final run JSON includes that digest).
-- `output/five_point_gpu_capacity_inspect_20260914.log`: retained initial u64 type-error attempt.
-- `output/five_point_gpu_capacity_inspect_run_20260914.log`: successful inspection.
-- `output/five_point_gpu_capacity_tests_20260914.log`: passing focused tests.
+- `artifacts/runs/five_point_gpu_capacity_127x512_20260914.json`: **65,339 bytes**, full compact provenance/timings/signatures/aggregate and sampled quality; no per-trial diagnostic JSON. Serialization refuses summaries ≥100,000 bytes.
+- `artifacts/runs/five_point_gpu_capacity_127x512_20260914.log`: successful release build/run.
+- `artifacts/runs/five_point_gpu_capacity_inspect_20260914.json`: first successful actual adapter/original-pair inspection (before aggregate original digest was added; final run JSON includes that digest).
+- `artifacts/runs/five_point_gpu_capacity_inspect_20260914.log`: retained initial u64 type-error attempt.
+- `artifacts/runs/five_point_gpu_capacity_inspect_run_20260914.log`: successful inspection.
+- `artifacts/runs/five_point_gpu_capacity_tests_20260914.log`: passing focused tests.
 
 Output artifacts are locally present under the existing ignored output directory; source and this report remain uncommitted.

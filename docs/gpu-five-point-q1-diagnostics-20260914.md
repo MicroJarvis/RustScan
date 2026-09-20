@@ -117,7 +117,7 @@ component for *real* roots is still entangled with complex roots inside
 
 ### Regression fixtures
 
-`experiments/q1-fixtures-20260914.json`: 23 trials.
+`artifacts/evidence/q1-fixtures-20260914.json`: 23 trials.
 
 - 18 nullspace `RankDeficient` samples, three each from the σ₅/σ₁ buckets
   `[1e-3,1e-2)`, `[1e-4,1e-3)`, `[1e-5,1e-4)`, `(1e-7,1e-5)`, `≤1e-7`, `≤0`.
@@ -165,8 +165,8 @@ POSELIB_ROOT=<main-checkout>/third_party/native/PoseLib \
 
 ./target/release/examples/five_point_gpu_q1_diagnostics \
   --database <fixed matching.db> \
-  --output experiments/q1-diagnostics-<date>.json \
-  --fixtures experiments/q1-fixtures-<date>.json
+  --output artifacts/evidence/q1-diagnostics-<date>.json \
+  --fixtures artifacts/evidence/q1-fixtures-<date>.json
 ```
 
 The harness refuses to overwrite, asserts the input digest, the model

@@ -19,8 +19,8 @@ back-projecting depth samples into world coordinates.
 
 Example:
   python3 scripts/tum_to_colmap.py \
-    --tum test_data/tum/rgbd_dataset_freiburg1_xyz \
-    --output output/tum_freiburg1_xyz_colmap \
+    --tum artifacts/inputs/tum/rgbd_dataset_freiburg1_xyz \
+    --output artifacts/runs/tum_freiburg1_xyz_colmap \
     --overwrite
 """
 

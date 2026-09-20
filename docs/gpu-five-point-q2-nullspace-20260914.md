@@ -29,10 +29,10 @@ Why not QR this round: column-pivoted Householder QR of `Aᵀ` produced
 `A*N≈0` bases but broke a synthetic algebra fixture (isolated polynomial
 error ~1e-2 vs f64 five-point determinant identity). Parked as 对照.
 
-`1e-6` on `AAᵀ` was measured first (`experiments/q2-nullspace-20260914.json`);
+`1e-6` on `AAᵀ` was measured first (`artifacts/evidence/q2-nullspace-20260914.json`);
 outcomes were nearly identical to `1e-5`, which matches the bottom of the
 written rescue band and is the retained constant
-(`experiments/q2-nullspace-gate1e5-20260914.json`).
+(`artifacts/evidence/q2-nullspace-gate1e5-20260914.json`).
 
 ## Provenance
 
@@ -46,7 +46,7 @@ written rescue band and is the retained constant
   `030f4306…12df` → `472124c8f1a9c6299d659e2f835dc11c682ff8a593757f0b145f73454f51d6ea`.
 - Diagnostic signature v2 → Q2:
   `3cd8091d…17cb` → `3d04bb3edaef183049e07d6c3841e296f963da3b279bcbd99d878e1dc090c050`.
-- Harness: `RustSFM/examples/five_point_gpu_q2_nullspace.rs`.
+- Harness: `rustsfm/examples/five_point_gpu_q2_nullspace.rs`.
 
 ## Acceptance table (f64 `σ₅/σ₁` buckets × GPU retain)
 

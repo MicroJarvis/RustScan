@@ -7,22 +7,22 @@ No shader, solver algorithm, threshold, production matching/RANSAC routing, CPU 
 
 Added optional `WgpuContext::try_new_experimental_timestamps()` (requests only adapter-supported `TIMESTAMP_QUERY`), `timestamp_queries_enabled()`, and experimental `solve_essential_profiled()`. Default constructors still request **empty features**. Both solver APIs share the same nine dispatches, buffers and decoding; profile off allocates no query set. The experimental solver's shared host path now also takes a few `Instant` measurements; it does not change production matching.
 
-New independent example: `RustSFM/examples/five_point_gpu_profile_replay.rs`. It imports the existing CPU read-only loader and generated f64 algebra reference, without editing them. The five pre-existing dirty/untracked capacity/batch-sweep files were SHA-256 checked before/after and are unchanged:
+New independent example: `rustsfm/examples/five_point_gpu_profile_replay.rs`. It imports the existing CPU read-only loader and generated f64 algebra reference, without editing them. The five pre-existing dirty/untracked capacity/batch-sweep files were SHA-256 checked before/after and are unchanged:
 
-- `RustSFM/examples/five_point_gpu_replay.rs`
-- `RustSFM/examples/five_point_replay_probe.rs`
-- `RustSFM/examples/five_point_gpu_capacity_replay.rs`
+- `rustsfm/examples/five_point_gpu_replay.rs`
+- `rustsfm/examples/five_point_replay_probe.rs`
+- `rustsfm/examples/five_point_gpu_capacity_replay.rs`
 - `docs/gpu-five-point-batch-sweep-20260914.md`
 - `docs/gpu-five-point-capacity-sweep-20260914.md`
 
-Preservation manifest: `output/five_point_profile_preserved.sha256`.
+Preservation manifest: `artifacts/runs/five_point_profile_preserved.sha256`.
 
 ## Input and measurement contract
 
 Actual adapter: **Apple M5 Max / Metal**, timestamp queries supported. Default and experimental contexts were checked for matching adapter name/backend; the default was checked not to enable timestamp queries.
 
 Database, opened read-only:
-`/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db`.
+`/Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db`.
 
 Same **127 pairs × 512 = 65,024** real sampled trials, from 14,045 eligible raw-match pairs; no replication or synthetic workload expansion. Loader selection, filtering, per-pair seed 1 and stateful sampler are unchanged. All pair provenance and sample input digest remain in the independent JSON. Both batch sizes replay the entire ordered workset, including the final partial chunk at 32,768.
 
@@ -59,7 +59,7 @@ Raw ticks and timestamp period are retained. Equal boundary ticks become `null`,
 ## Final actual timings
 
 Authoritative artifact:
-`output/five_point_gpu_profile_127x512_20260914_separate_resolve.json` (**76,628 bytes**).
+`artifacts/runs/five_point_gpu_profile_127x512_20260914_separate_resolve.json` (**76,628 bytes**).
 
 Milliseconds, median of three complete-workset rounds:
 
@@ -169,14 +169,14 @@ All actual commands used timeout **≤180 seconds**, `head_lines=15`, `tail_line
 ```sh
 cargo test -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_profile_replay --example five_point_gpu_capacity_replay --example five_point_gpu_replay --example five_point_replay_probe
 cargo test -p rustsfm --release --no-default-features --features gpu-wgpu --lib five_point_f32_actual_gpu_stages -- --test-threads=1
-cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_profile_replay -- --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --output output/five_point_gpu_profile_127x512_recheck.json
-shasum -a 256 -c output/five_point_profile_preserved.sha256
+cargo run -p rustsfm --release --no-default-features --features gpu-wgpu --example five_point_gpu_profile_replay -- --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --output artifacts/runs/five_point_gpu_profile_127x512_recheck.json
+shasum -a 256 -c artifacts/runs/five_point_profile_preserved.sha256
 git --no-pager diff --check
 ```
 
 Focused example tests: **8 + 6 + 7 + 4 passed**. Library actual-stage test: **1 passed**. New profile example's actual-GPU test requires adapter creation (no skip), checks default feature behavior, both optional-query paths, result signature invariance, timestamp validity semantics, empty/invalid inputs, and rank/algebra overlap versus candidate counts. Existing library stage test covers valid synthetic/random full solves, same-basis f64 references, roots, failure slots and input bounds. No full production suite or full RANSAC was run. Existing unrelated dead-code warnings remain.
 
-Artifacts (ignored `output/`, locally present):
+Artifacts (ignored `artifacts/runs/`, locally present):
 
 - `five_point_gpu_profile_127x512_20260914_separate_resolve.json`: authoritative final measurement.
 - `five_point_profile_measurement_separate_resolve.log`: final release run.

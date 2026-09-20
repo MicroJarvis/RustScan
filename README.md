@@ -13,12 +13,12 @@ This README is intentionally brief. Current status lives in a small set of canon
 ## Workspace
 
 - `rustscan-types`: shared data structures used across crates.
-- `RustSLAM`: visual SLAM, sparse mapping, loop closing, video IO, and mesh extraction.
-- `RustGS`: Gaussian splatting training and rendering.
-- `RustMesh`: mesh connectivity, IO, processing algorithms, OpenMesh comparison tooling.
-- `RustViewer`: visualization and inspection UI.
-- `RustFF`: feed-forward reconstruction experiments.
-- `RustSFM`: COLMAP-style incremental structure-from-motion.
+- `rustslam`: visual SLAM, sparse mapping, loop closing, video IO, and mesh extraction.
+- `rustgs`: Gaussian splatting training and rendering.
+- `rustmesh`: mesh connectivity, IO, processing algorithms, OpenMesh comparison tooling.
+- `rust-viewer`: visualization and inspection UI.
+- `rustff`: feed-forward reconstruction experiments.
+- `rustsfm`: COLMAP-style incremental structure-from-motion.
 
 ## Current Verification
 
@@ -32,13 +32,13 @@ README intentionally does not duplicate dated test counts.
 - Workspace overview: [`docs/index.md`](./docs/index.md)
 - Current project status: [`docs/current-project-status.md`](./docs/current-project-status.md)
 - Workspace architecture: [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)
-- RustMesh crate overview: [`RustMesh/README.md`](./RustMesh/README.md)
-- RustSLAM crate overview: [`RustSLAM/README.md`](./RustSLAM/README.md)
-- RustSFM crate overview: [`RustSFM/README.md`](./RustSFM/README.md)
-- RustSFM COLMAP parity roadmap: [`RustSFM/PARITY_ROADMAP.md`](./RustSFM/PARITY_ROADMAP.md)
-- RustGS crate overview: [`RustGS/README.md`](./RustGS/README.md)
-- RustViewer crate overview: [`RustViewer/README.md`](./RustViewer/README.md)
-- RustFF experiment overview: [`RustFF/README.md`](./RustFF/README.md)
+- RustMesh crate overview: [`rustmesh/README.md`](./rustmesh/README.md)
+- RustSLAM crate overview: [`rustslam/README.md`](./rustslam/README.md)
+- RustSFM crate overview: [`rustsfm/README.md`](./rustsfm/README.md)
+- RustSFM COLMAP parity roadmap: [`rustsfm/PARITY_ROADMAP.md`](./rustsfm/PARITY_ROADMAP.md)
+- RustGS crate overview: [`rustgs/README.md`](./rustgs/README.md)
+- RustViewer crate overview: [`rust-viewer/README.md`](./rust-viewer/README.md)
+- RustFF experiment overview: [`rustff/README.md`](./rustff/README.md)
 - Forward roadmap: [`ROADMAP.md`](./ROADMAP.md)
 
 ## Getting Started
@@ -48,10 +48,10 @@ README intentionally does not duplicate dated test counts.
 cargo build --release
 
 # RustMesh
-cargo test --manifest-path RustMesh/Cargo.toml --lib
+cargo test --manifest-path rustmesh/Cargo.toml --lib
 
 # RustSLAM
-cargo test --manifest-path RustSLAM/Cargo.toml --lib
+cargo test --manifest-path rustslam/Cargo.toml --lib
 
 # RustSFM. --no-default-features is a compile gate, not a matching pipeline test.
 cargo test -p rustsfm --lib --features gpu-wgpu,vlfeat-sift
@@ -61,5 +61,5 @@ cargo check -p rustsfm --no-default-features --all-targets
 ## Notes
 
 - The documents above are the maintained entry points. Dated plans and review records
-  under `docs/plans/`, `docs/reviews/`, and `docs/superpowers/` are historical context,
-  not current API or status contracts.
+  under `docs/plans/` and `docs/reviews/` are historical context, not current API or
+  status contracts.

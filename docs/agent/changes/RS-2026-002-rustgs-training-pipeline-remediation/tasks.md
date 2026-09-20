@@ -17,9 +17,9 @@
 阶段 1、阶段 2，以及阶段 3 的 exact/bounded parity 已实现并通过对应 GPU 测试；阶段 4.1 的实验身份 comparator 已实现。整个 remediation 计划尚未完成，最近 review 仍发现：
 
 - **P0 forward hard-stop：** 同 step device gate（P0.1）与安全点 ForwardAbort / skip telemetry（P0.2）已落地；异常 step 不再依赖 mid-step host mirror。
-- **P1 scan 所有权缺口：** RustGS/src/training/gpu_primitives/prefix_sum.rs:371 的训练路径每次仍调用 empty_tensor 创建输出。workspace 只复用递归 scratch，step_fresh_allocations 没有统计该输出分配；prefix_sum.rs:291 与 trainer.rs:720 的 TLS raw pointer 绑定跨越 await，在多线程异步 runtime 下不安全。
+- **P1 scan 所有权缺口：** rustgs/src/training/gpu_primitives/prefix_sum.rs:371 的训练路径每次仍调用 empty_tensor 创建输出。workspace 只复用递归 scratch，step_fresh_allocations 没有统计该输出分配；prefix_sum.rs:291 与 trainer.rs:720 的 TLS raw pointer 绑定跨越 await，在多线程异步 runtime 下不安全。
 - **P1 阶段 4.2–6 不完整：** 尚无完整 training/reporting/gpu_profiler.rs、GPU completion timing、adapter/driver metadata、runtime device memory、unsupported reason、可复现实验 split manifest、完整 gradient boundary suite、显式 SH schedule 和 TUM 阶梯包。
-- **P2 格式门禁失败：** cargo fmt --package rustgs --check 当前仍报告 RustGS/src/lib.rs、RustGS/src/training/engine/trainer.rs、RustGS/src/training/forward/parity.rs、RustGS/src/training/forward/sorting.rs 差异。
+- **P2 格式门禁失败：** cargo fmt --package rustgs --check 当前仍报告 rustgs/src/lib.rs、rustgs/src/training/engine/trainer.rs、rustgs/src/training/forward/parity.rs、rustgs/src/training/forward/sorting.rs 差异。
 
 已验证结果：GPU bounded parity 通过；GPU checkpoint resume 通过（53 tests）；GPU library 通过（130 tests）；ignored GPU integration 通过；CPU library 通过（29 tests）；git diff --check 通过。上述结果不能替代 fmt、profiling、holdout 和跨场景门禁。
 
@@ -37,7 +37,7 @@
 - 正常 step 不得为判断 overflow 或 finite 而做 host readback。
 - 所有 host topology mutation、checkpoint、暂停、取消和成功结束之前必须读取并验证 status。
 - 不可测指标写 null 并记录结构化原因；CPU submit 时间不能伪装成 GPU 执行时间。
-- 只修改 RustGS 相关文件和本计划；不得带入 RustSFM/RustViewer 未提交修改。
+- 只修改 RustGS 相关文件和本计划；不得带入 rustsfm/rust-viewer 未提交修改。
 
 ## 优先级与依赖
 
@@ -53,7 +53,7 @@
 
 ## Task P0.1：把 forward overflow 变成同一 step 的 device gate
 
-**文件：** 修改 RustGS/src/training/forward/dispatch.rs、forward/mod.rs、forward/shaders/write_dispatch.wgsl、engine/trainer.rs、engine/loss.rs、backward/autodiff.rs；测试 RustGS/tests/bounded_forward_parity.rs、RustGS/tests/checkpoint_resume.rs 及 engine GPU fixtures。
+**文件：** 修改 rustgs/src/training/forward/dispatch.rs、forward/mod.rs、forward/shaders/write_dispatch.wgsl、engine/trainer.rs、engine/loss.rs、backward/autodiff.rs；测试 rustgs/tests/bounded_forward_parity.rs、rustgs/tests/checkpoint_resume.rs 及 engine GPU fixtures。
 
 **接口与不变量：**
 
@@ -84,7 +84,7 @@ shader 在写 dispatch 前用 atomicOr/atomicMin 记录 overflow，随后写入 
 
 ## Task P0.2：修复安全点错误传播与状态镜像
 
-**文件：** RustGS/src/training/engine/trainer.rs、engine/runtime.rs、reporting/telemetry.rs。
+**文件：** rustgs/src/training/engine/trainer.rs、engine/runtime.rs、reporting/telemetry.rs。
 
 - [x] 为 StatusReadbackReason 增加 ForwardAbort，仅用于 gate 已判定异常后的诊断读回，不在健康 step 调用。
 - [x] 将失败 step 的命令计数、backward skipped、optimizer skipped、topology skipped 写入 telemetry；区分 GPU gate skip 和 host safety-point abort。
@@ -100,7 +100,7 @@ shader 在写 dispatch 前用 atomicOr/atomicMin 记录 overflow，随后写入 
 
 ## Task P1.1：取消 TLS raw pointer，改为显式 workspace 所有权
 
-**文件：** RustGS/src/training/gpu_primitives/prefix_sum.rs、forward/tile_mapping.rs、forward/mod.rs、engine/trainer.rs。
+**文件：** rustgs/src/training/gpu_primitives/prefix_sum.rs、forward/tile_mapping.rs、forward/mod.rs、engine/trainer.rs。
 
     pub(crate) struct PrefixSumWorkspace<B: Backend> {
         capacity: usize,
@@ -128,7 +128,7 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 **P1.1 落地说明（2026-09-19）：** 删除 `thread_local` raw pointer bind/unbind；trainer 经 `render_splats` → `tile_mapping` 显式传入 `&mut PrefixSumWorkspace`；`PrefixSumBackend::prefix_sum_u32_with_workspace` 走 `inclusive_scan_into`，无 workspace 的 eval 路径仍用独立 `inclusive_scan_fresh`。并发双 workspace fixture 与 GPU library/parity/checkpoint 已通过。输出 buffer 复用见 P1.2。
 ## Task P1.2：消除每次 scan 的 output allocation 并建立计数
 
-**文件：** RustGS/src/training/gpu_primitives/prefix_sum.rs、training/reporting/telemetry.rs、engine/trainer.rs。
+**文件：** rustgs/src/training/gpu_primitives/prefix_sum.rs、training/reporting/telemetry.rs、engine/trainer.rs。
 
 - [ ] 为每个递归 level 和最终 output 预留 capacity；只在 len > capacity 时增长，并记录 old/new bytes、growth count。
 - [ ] 把 output allocation 纳入 step_fresh_allocations，区分 workspace growth allocation 与稳态 allocation；不能只统计 scratch。
@@ -143,7 +143,7 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 
 ## Task P1.3：实现 GPU profiler 数据模型
 
-**文件：** 新建 RustGS/src/training/reporting/gpu_profiler.rs；修改 training/reporting/mod.rs、telemetry.rs、optimization_report.rs、engine/runtime.rs；测试 gpu_profiler.rs 单元测试和 report JSON fixtures。
+**文件：** 新建 rustgs/src/training/reporting/gpu_profiler.rs；修改 training/reporting/mod.rs、telemetry.rs、optimization_report.rs、engine/runtime.rs；测试 gpu_profiler.rs 单元测试和 report JSON fixtures。
 
     #[derive(Serialize, Deserialize)]
     pub struct GpuProfilerReport {
@@ -183,7 +183,7 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 
 ## Task P1.5：固定 train/in-view/holdout split manifest
 
-**文件：** 新建 RustGS/src/training/evaluation/split.rs；修改 RustGS/src/bin/rustgs/train_command.rs、training/evaluation/mod.rs、optimization_report.rs、comparator；测试 split manifest unit/integration tests。
+**文件：** 新建 rustgs/src/training/evaluation/split.rs；修改 rustgs/src/bin/rustgs/train_command.rs、training/evaluation/mod.rs、optimization_report.rs、comparator；测试 split manifest unit/integration tests。
 
     pub enum EvaluationSplitKind { InView, Holdout }
     pub struct FrameSplitManifest {
@@ -206,7 +206,7 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 
 ## Task P2.1：Gradient boundary suite
 
-**文件：** RustGS/src/training/backward/gradient_check.rs、RustGS/tests/gradient_boundary.rs。
+**文件：** rustgs/src/training/backward/gradient_check.rs、rustgs/tests/gradient_boundary.rs。
 
 - [ ] 覆盖 near-plane 内外、clip 边界、low alpha 阈值两侧、covariance blur boundary、SH degree 2/3、off-axis camera、depth-sensitive scale。
 - [ ] 平滑强信号使用 relative <= 3e-2 或 absolute <= 1e-3；弱信号仅在双方均 <5e-3 时通过；不连续点两侧至少 4*epsilon，不得在不连续点做 centered FD。
@@ -217,7 +217,7 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 
 ## Task P2.2：显式 SH schedule 与 identity
 
-**文件：** RustGS/src/training/config.rs、engine/trainer.rs、training/checkpoint.rs、comparator。
+**文件：** rustgs/src/training/config.rs、engine/trainer.rs、training/checkpoint.rs、comparator。
 
     pub struct ShScheduleConfig {
         pub initial_degree: u8,
@@ -235,7 +235,7 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 
 ## Task P2.3：冻结跨场景实验包并执行阶梯
 
-**目录与产物：** output/rustgs-optimization/2026-09-18-remediation/{bin,manifests,home,flowers2,tum}；每次保存 command、git revision、binary sha256、split manifest、optimization JSON、evaluation JSON、stdout/stderr、PLY 和环境元数据。
+**目录与产物：** artifacts/runs/rustgs-optimization/2026-09-18-remediation/{bin,manifests,home,flowers2,tum}；每次保存 command、git revision、binary sha256、split manifest、optimization JSON、evaluation JSON、stdout/stderr、PLY 和环境元数据。
 
 - [ ] 一次构建 release binary；baseline/candidate 实验期间禁止重建。
 - [ ] 执行 Home 500 → flowers2 500 → TUM 500 → TUM 3k → 10k → 30k；正式 baseline/candidate 各至少 3 次，首轮 warmup 不计入统计，报告 mean/stddev/p50/p95。
@@ -246,10 +246,10 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 
 ## Task P2.4：修复格式门禁并更新文档
 
-**文件：** RustGS/src/lib.rs、RustGS/src/training/engine/trainer.rs、RustGS/src/training/forward/parity.rs、RustGS/src/training/forward/sorting.rs，以及本计划和对应 review 记录。
+**文件：** rustgs/src/lib.rs、rustgs/src/training/engine/trainer.rs、rustgs/src/training/forward/parity.rs、rustgs/src/training/forward/sorting.rs，以及本计划和对应 review 记录。
 
 - [ ] 运行 cargo fmt --package rustgs，只接受 rustfmt 产生的格式变更，不顺手改行为。
-- [ ] 用 git diff --check 检查空白；确认 git status 不含 RustSFM/RustViewer 变更的 staged/committed 混入。
+- [ ] 用 git diff --check 检查空白；确认 git status 不含 rustsfm/rust-viewer 变更的 staged/committed 混入。
 - [ ] 将本计划中的 checkbox 仅在对应代码、测试和 artifact 已验收后勾选；删除过时事项，不保留“已完成但无证据”的任务。
 
 **验收标准：** fmt check、CPU/GPU library、ignored integration、checkpoint resume、bounded parity、gradient boundary、split/comparator 和实验报告全部通过。
@@ -278,5 +278,5 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 1. 每次只执行一个 Task，先写失败测试，再实现最小改动，独立运行该 Task 的验证命令。
 2. P0 未通过前停止性能算法；没有 profiling 证据，不实现 GPU-native topology、fused loss 或大规模 cache 重构。
 3. 不得用放宽全局容差、减少测试覆盖、删除 telemetry 或跳过 holdout 来通过门禁。
-4. 每个 Task 单独提交，提交前检查 git status --short；不得带入当前 RustSFM/RustViewer 未提交修改。
+4. 每个 Task 单独提交，提交前检查 git status --short；不得带入当前 rustsfm/rust-viewer 未提交修改。
 5. 发现接口冲突时，优先保证“异常 step 零持久 mutation”和“正常 step 零 status readback”。

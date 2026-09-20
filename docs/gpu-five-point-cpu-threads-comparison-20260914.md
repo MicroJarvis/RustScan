@@ -7,9 +7,9 @@ Current GPU layout beats CPU four threads in all eight measured paired rounds at
 ## Provenance and protocol
 
 - Worktree branch: `gpu-five-point-f32`, solver commit `3ab9c09`.
-- Harness: `RustSFM/examples/five_point_gpu_cpu_threads.rs`; reuses the capacity replay's loader, GPU replay and signature helpers (visibility-only edits to that existing example).
+- Harness: `rustsfm/examples/five_point_gpu_cpu_threads.rs`; reuses the capacity replay's loader, GPU replay and signature helpers (visibility-only edits to that existing example).
 - Apple M5 Max, Metal; host reports 18 physical / 18 logical CPUs. Dedicated Rayon pools of exactly 4 or 8 workers, not affinity-pinned. OS placement on heterogeneous cores is uncontrolled.
-- Read-only DB: `/Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db`.
+- Read-only DB: `/Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db`.
 - 127 distinct real pairs, **231 unique images**, 512 sampler-prefix trials per pair, seed 1. Same **65,024 trials** for every measurement. Not the entire 960-image dataset, no repeated-input padding.
 - Input digest: `af07459d637b5b8c2b20c76d3ef103f058505fe0e8307578ee7e8750f3e230c5`.
 - GPU: current roots group size 32, elimination group size (1,32,1); timestamp queries disabled.
@@ -60,9 +60,9 @@ From the worktree root (output paths must not already exist):
 cargo test -p rustsfm --no-default-features --features gpu-wgpu --example five_point_gpu_cpu_threads
 cargo build --release -p rustsfm --no-default-features --features gpu-wgpu --example five_point_gpu_cpu_threads
 
-target/release/examples/five_point_gpu_cpu_threads --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --cpu-threads 4 --output output/five_point_cpu4_gpu_layout_comparison.json
+target/release/examples/five_point_gpu_cpu_threads --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --cpu-threads 4 --output artifacts/runs/five_point_cpu4_gpu_layout_comparison.json
 # Run the eight-thread comparison after checking the four-thread local win gate.
-target/release/examples/five_point_gpu_cpu_threads --database /Users/tfjiang/Projects/RustScan/output/flowers2_960_settlement_20260913/matching.db --cpu-threads 8 --output output/five_point_cpu8_gpu_layout_comparison.json
+target/release/examples/five_point_gpu_cpu_threads --database /Users/tfjiang/Projects/RustScan/artifacts/runs/flowers2_960_settlement_20260913/matching.db --cpu-threads 8 --output artifacts/runs/five_point_cpu8_gpu_layout_comparison.json
 
 cargo fmt --all -- --check
 git diff --check

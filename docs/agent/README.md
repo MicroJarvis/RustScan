@@ -1,6 +1,6 @@
 # RustScan 通用 Agent 协作协议
 
-本目录是 RustScan 的模型和工具无关协作入口。它只依赖 Markdown、YAML、Git、shell、Cargo 和 CI；不要求 Codex、Claude Code、OpenSpec、Superpowers、Spec Kit 或其他插件。
+本目录是 RustScan 的模型和工具无关协作入口。它只依赖 Markdown、YAML、Git、shell、Cargo 和 CI；不要求 Codex、Claude Code、OpenSpec、Spec Kit 或其他插件。
 
 ## 任务入口
 
@@ -43,4 +43,4 @@ planner → implementer → verifier → reviewer → integrator
 
 ## 工具适配规则
 
-`.codex/`、`.claude/`、`.superpowers/`、`.agents/skills/` 和其他工具目录不是项目事实来源。工具可以读取本协议，也可以在本地提供适配命令，但不能修改任务范围、验收条件或仓库规则。
+`.codex/`、`.claude/`、`.agents/skills/` 和其他工具目录不是项目事实来源。工具可以读取本协议，也可以在本地提供适配命令，但不能修改任务范围、验收条件或仓库规则。

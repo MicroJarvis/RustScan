@@ -30,7 +30,7 @@ Two findings change the roadmap and are stated up front:
 
 - Worktree `.worktrees/gpu-five-point-f32`, source commit `3ab9c09`, unchanged
   solver and shaders.
-- New file only: `RustSFM/examples/five_point_gpu_roots_attribution.rs`,
+- New file only: `rustsfm/examples/five_point_gpu_roots_attribution.rs`,
   sha256 `1c838e511f4058471f1c40b4847717b30db519288a5c40f5d6b48c7c17a51a32`;
   release binary sha256
   `8aab2082f352a5a0aa27ac35a543459ba93a104971132ee23ba59343bd6597c5`.
@@ -51,9 +51,9 @@ Artifacts, all three runs kept:
 
 | file | source | purpose |
 | --- | --- | --- |
-| `experiments/roots-attribution-20260914.json` | first version | timings, before the `NotConverged` split existed |
-| `experiments/roots-attribution-20260914b.json` | + `NotConverged` split | second timing sample |
-| `experiments/roots-attribution-20260914-final.json` | + clippy `contains` rewrite | reported run, final binary |
+| `artifacts/evidence/roots-attribution-20260914.json` | first version | timings, before the `NotConverged` split existed |
+| `artifacts/evidence/roots-attribution-20260914b.json` | + `NotConverged` split | second timing sample |
+| `artifacts/evidence/roots-attribution-20260914-final.json` | + clippy `contains` rewrite | reported run, final binary |
 
 Every distribution and classification field is bit-identical across all three
 runs; only the kernel timings differ. That is the reproducibility evidence for
@@ -361,7 +361,7 @@ POSELIB_ROOT=<main-checkout>/third_party/native/PoseLib \
 
 ./target/release/examples/five_point_gpu_roots_attribution \
   --database <fixed matching.db> \
-  --output experiments/roots-attribution-<date>.json
+  --output artifacts/evidence/roots-attribution-<date>.json
 ```
 
 The harness refuses to overwrite an existing output and asserts the input

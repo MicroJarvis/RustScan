@@ -14,9 +14,9 @@ No GPU/shader changes in this round. Artifacts only.
 
 Q4 verified sidecars (tol is offline matching only; GPU bits identical):
 
-- `experiments/q4-verified-tol1e{3,2}-20260915.{trials,bits,json}`
+- `artifacts/evidence/q4-verified-tol1e{3,2}-20260915.{trials,bits,json}`
 - Script: `scripts/summarize_five_point_q5_premeasure.py`
-- Outputs: `experiments/q5-premeasure-tol1e{3,2}-20260915.json`
+- Outputs: `artifacts/evidence/q5-premeasure-tol1e{3,2}-20260915.json`
 
 Also completed in the same disposition session (not part of this measurement):
 
@@ -24,7 +24,7 @@ Also completed in the same disposition session (not part of this measurement):
 - Active harnesses (`p2_session`, `p3_submit`, `p3_double`,
   `recovery_attribution`) now gate on Q4 model/diagnostic.
 - P3 double-buffer re-run under Q4 shader:
-  `experiments/p3-double-buffer-q4shader-20260915.json` — median **0.674 s**,
+  `artifacts/evidence/p3-double-buffer-q4shader-20260915.json` — median **0.674 s**,
   signature OK.
 
 ## B error as discriminator

@@ -24,8 +24,14 @@ from PIL import Image
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "output" / "vksplat_rustgs_benchmark"
-DEFAULT_TUM_ROOT = WORKSPACE_ROOT / "test_data" / "tum" / "rgbd_dataset_freiburg1_xyz"
+DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "artifacts" / "runs" / "vksplat_rustgs_benchmark"
+DEFAULT_TUM_ROOT = (
+    WORKSPACE_ROOT
+    / "artifacts"
+    / "inputs"
+    / "tum"
+    / "rgbd_dataset_freiburg1_xyz"
+)
 DEFAULT_VKSPLAT_ROOT = Path("/tmp/vksplat-analysis")
 
 

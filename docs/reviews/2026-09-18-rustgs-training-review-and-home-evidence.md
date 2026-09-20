@@ -2,7 +2,7 @@
 
 **审核版本：** `938fa8d`；对照版本：`09f9254`。
 
-本文件保存原 TODO 的实验记录，不作为待办清单。当前执行顺序见 [RustGS TODO](../RustGS-TODO-训练效果与效率优化-2026-09-17.md)。
+本文件保存原 TODO 的实验记录，不作为待办清单。当前执行顺序见 [RustGS TODO](../rustgs-TODO-训练效果与效率优化-2026-09-17.md)。
 
 ## 审核结论与记录限制
 
@@ -52,7 +52,7 @@
 - Adam remap 补强：
   - `optimizer_remap_keeps_surviving_moments_and_step`：三组参数 × moment1/moment2，`step=7`，新行为零，`origins=[Some(1),None,Some(0)]`
   - `optimizer_remap_checkpoint_restore_preserves_next_step_update`：remap → checkpoint → restore → 下一步后 `step=8`，参数与 twin 一致，新行 moments 非零
-- 门禁（日志：`output/rustgs-optimization/2026-09-18/r05-gates/`）：
+- 门禁（日志：`artifacts/runs/rustgs-optimization/2026-09-18/r05-gates/`）：
 
 | 命令 | 结果 |
 |---|---|
@@ -71,7 +71,7 @@
 - CLI：`--optimization-report`（`--eval-json` 时默认写到输出旁 `.optimization.json`）；`compare-optimization-reports` 拒绝 fingerprint / seed / scale / eval frames / resolution 不一致。
 - 验证：
   - `cargo test -p rustgs --lib reporting::optimization_report --no-default-features` → 4 passed
-  - Home 50-step smoke：`output/rustgs-optimization/2026-09-18/r06-smoke/`
+  - Home 50-step smoke：`artifacts/runs/rustgs-optimization/2026-09-18/r06-smoke/`
     - `gpu_completion_seconds` / `peak_device_bytes` / `driver` = `null`
     - `loop_duration_p50_ms≈22.9`，`loss_readback_count=4`，`count_readback_count=12`，12 帧 evaluation
     - self-compare → compatible；改 `eval_frame_ids` → rejected
@@ -91,9 +91,9 @@
 
 ### 2026-09-18 Home COLMAP 500-step A/B（替代缺失的 TUM pack）
 
-本机无 `output/rustgs_benchmark_pack/tum_freiburg1_xyz_colmap`，改用已有 Home 稀疏模型做 Task 1 短跑 filter。
+本机无 `artifacts/runs/rustgs_benchmark_pack/tum_freiburg1_xyz_colmap`，改用已有 Home 稀疏模型做 Task 1 短跑 filter。
 
-- 数据集：`output/profile_home/colmap60/0` + `test_data/home/images`
+- 数据集：`artifacts/runs/profile_home/colmap60/0` + `artifacts/inputs/home/images`
 - 共同参数：`--iterations 500 --max-frames 12 --render-scale 0.25 --frame-shuffle-seed 0 --eval-after-train --eval-render-scale 0.25 --eval-max-frames 12 --eval-frame-stride 1 --eval-device gpu --eval-json --eval-worst-frames 10`
 - binary：`09f9254` baseline vs `938fa8d` candidate（显式路径，避免误用仓库旧 `target/release/rustgs`）
 - GPU：Apple M5 Max（wgpu）
@@ -108,7 +108,7 @@
 | peak RSS | 1.47 GB | 1.48 GB | ≈ |
 | gate / nan / oom | Passed | Passed | OK |
 
-- 产物：`output/rustgs-optimization/2026-09-18/home-500-{baseline,candidate}/`
+- 产物：`artifacts/runs/rustgs-optimization/2026-09-18/home-500-{baseline,candidate}/`
 - 无 `ForwardCapacityExceeded` / 非有限 loss；loss 日志仅在 100 步倍数出现（与延迟读回一致）
 - 判定：短跑 filter **通过**（更快且 PSNR 不掉）。历史 Home 1500 smoke mean PSNR 约 20.44 dB，不可与 500-step 直接比质量。
 - 早先一次「candidate」单跑曾误用 Jul 20 旧 binary，已移至 `home-500-candidate-ambiguous-old-bin/`，不作数。
@@ -133,7 +133,7 @@ Home-1500 同口径 A/B 见下一节。
 | peak RSS | 1.52 GB | 1.49 GB | ≈ |
 | gate / nan / oom | Passed | Passed | OK |
 
-- 产物：`output/rustgs-optimization/2026-09-18/home-1500-{baseline,candidate}/`
+- 产物：`artifacts/runs/rustgs-optimization/2026-09-18/home-1500-{baseline,candidate}/`
 - 停止条件（最差帧下降 >0.2 dB）：**未触发**
 - 判定：Home smoke **通过**（更快且质量更好）。topology prune 路径相对 baseline 行为变化明显，需在外部场景再确认；默认配置仍不改（缺 TUM 全视图 + 外部场景）。
 
@@ -150,7 +150,7 @@ Home-1500 同口径 A/B 见下一节。
 
 ## R09 验收证据（2026-09-18，工作树 atop `938fa8d`）
 
-- 二进制：`output/rustgs-optimization/2026-09-18/bin/rustgs-r09-current`；对照 `rustgs-baseline-09f9254`。
+- 二进制：`artifacts/runs/rustgs-optimization/2026-09-18/bin/rustgs-r09-current`；对照 `rustgs-baseline-09f9254`。
 - Home 同口径（12 帧，scale 0.25，seed 0）：
 
 | | baseline `09f9254` 500 | current 500 | current 1500 | baseline 1500（历史） |
@@ -162,7 +162,7 @@ Home-1500 同口径 A/B 见下一节。
 | gate | Passed | Passed | Passed | Passed |
 
 - 最差帧相对 `09f9254`：**上升**（500：+0.18 dB；1500：+0.33 dB），未触发拒绝门禁。
-- 外部 flowers2-24v（`output/flowers2_colmap_ref_text_20260630` + `test_data/flowers2/images`，1500 step）：mean 26.283 / min 24.240 dB；6449→6555 Gaussians；topology densify/prune 有事件；gate Passed。产物：`r09-flowers2-24v-1500/`。
+- 外部 flowers2-24v（`artifacts/runs/flowers2_colmap_ref_text_20260630` + `artifacts/inputs/flowers2/images`，1500 step）：mean 26.283 / min 24.240 dB；6449→6555 Gaussians；topology densify/prune 有事件；gate Passed。产物：`r09-flowers2-24v-1500/`。
 - **TUM：** 本地 RGB 缺失；现有 pack symlink 失效；下载 403/401/超时 → **未跑**。残留见 TODO `R09b`。不据此改默认训练配置为“已全场景验收”。
 
 ## R10 瓶颈排名（2026-09-18）

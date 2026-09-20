@@ -36,9 +36,9 @@ python3 scripts/prepare_rustgs_benchmark_pack.py
 
 This writes:
 
-- `output/rustgs_benchmark_pack/manifest.json`
-- `output/rustgs_benchmark_pack/README.md`
-- `output/rustgs_benchmark_pack/tum_freiburg1_xyz_colmap/` when local TUM data is present
+- `artifacts/runs/rustgs_benchmark_pack/manifest.json`
+- `artifacts/runs/rustgs_benchmark_pack/README.md`
+- `artifacts/runs/rustgs_benchmark_pack/tum_freiburg1_xyz_colmap/` when local TUM data is present
 
 For a smaller local TUM smoke pack:
 
@@ -53,8 +53,8 @@ python3 scripts/prepare_rustgs_benchmark_pack.py \
 
 ```sh
 cargo run -p rustgs --release --bin rustgs -- train \
-  --input output/rustgs_benchmark_pack/tum_freiburg1_xyz_colmap \
-  --output output/rustgs_benchmark_pack/runs/tum_freiburg1_xyz_colmap_500.ply \
+  --input artifacts/runs/rustgs_benchmark_pack/tum_freiburg1_xyz_colmap \
+  --output artifacts/runs/rustgs_benchmark_pack/runs/tum_freiburg1_xyz_colmap_500.ply \
   --iterations 500 \
   --render-scale 1.0 \
   --eval-after-train \

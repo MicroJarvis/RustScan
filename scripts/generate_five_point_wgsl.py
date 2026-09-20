@@ -16,8 +16,8 @@ if not __debug__:
     raise RuntimeError("run without -O: generator validation assertions are required")
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "RustSFM/src/geometry/five_point_generated.rs"
-OUTPUT = ROOT / "RustSFM/src/gpu/shaders/five_point_generated.wgsl"
+SOURCE = ROOT / "rustsfm/src/geometry/five_point_generated.rs"
+OUTPUT = ROOT / "rustsfm/src/gpu/shaders/five_point_generated.wgsl"
 
 
 def expression(text, arrays):
@@ -182,7 +182,7 @@ def generate():
             + "// coeffs[0..11]: descending z^10 through z^0, unnormalized.\n"
             + "// Dispatch: elimination (samples, ceil(200/32), 1), global row id; polynomial (samples, 11, 1).\n\n"
             + translate(source, "build_elimination_matrix", "e", 36, "a", 200, True)
-            + "\n\n" + polynomial_table(source) + "\n")
+            + "\n\n" + polynomial_table(source))
 
 
 if __name__ == "__main__":
