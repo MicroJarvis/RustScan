@@ -1604,11 +1604,27 @@ fn wide_round_can_use_tracks_committed_by_narrow_non_keyframe() -> anyhow::Resul
         .expect("dynamic-support target diagnostic");
     assert_eq!(dynamic_target.status, FrameRegistrationStatus::Registered);
     assert_eq!(dynamic_target.attempts, 2);
-    assert_eq!(
-        dynamic_target.message.as_deref(),
-        Some("registered in Wide round")
+    let message = dynamic_target
+        .message
+        .as_deref()
+        .expect("registered target must keep a diagnostic message");
+    assert!(
+        message.contains("registered in Wide round"),
+        "expected a Wide registration note, got {message}"
+    );
+    assert!(
+        message.contains("controlled support degradation"),
+        "partial unconnected support must be diagnosed, got {message}"
+    );
+    assert!(
+        message.contains("frame-0005.png") && message.contains("not match-connected"),
+        "removed support must be named, got {message}"
     );
     assert!(dynamic_target.support_frame_ids.contains(&202));
+    assert!(
+        dynamic_target.support_frame_ids.contains(&505),
+        "original support list must retain the removed support frame id"
+    );
     Ok(())
 }
 

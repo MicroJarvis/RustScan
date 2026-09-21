@@ -189,9 +189,7 @@ Owner: `cursor-agent`
 
 Base commit: `b01cd442eba0ff0e2716c67473e819c365ec5bf2`
 
-Final commit: this T1 commit. The hash is the commit that adds this record on
-`agent/RS-2026-004/t1-mapper-identity`. It is not written into the file, because
-that would require a second commit. The handoff reports the hash.
+Final commit: `bbedfbc519987177429c080becb762fef41760bb`
 
 Branch: `agent/RS-2026-004/t1-mapper-identity`
 
@@ -292,8 +290,8 @@ commit recorded below. Do not merge this branch to `main`.
 
 #### T1 review remediation
 
-Status: complete. Three review blockers on `bbedfbc` are fixed without deleting,
-ignoring, or weakening existing tests.
+Status: complete for the `bbedfbc` identity blockers. Follow-up P1s on
+`a33ef4a` are recorded in the next subsection.
 
 - A retained image that is not in the reference, when a database cache is also
   present, keeps the database image id and camera id. It is not assigned
@@ -306,16 +304,11 @@ ignoring, or weakening existing tests.
   but is absent from the match-connected cache returns an error that names the
   support. The mapper does not skip it.
 
-The sequence caller retries an attempt after dropping only the support named by
-that error, so a temporal list that also contains a match-connected support can
-still register. If no requested support remains, the mapper error is returned.
-
 Owner: `cursor-agent`
 
 Base commit: `bbedfbc519987177429c080becb762fef41760bb`
 
-Final commit: the commit that adds this record on
-`agent/RS-2026-004/t1-mapper-identity`. The hash is reported in the handoff.
+Final commit: `a33ef4a5ae4c5a70b603be44b7a98ce3febad67f`
 
 Branch: `agent/RS-2026-004/t1-mapper-identity`
 
@@ -345,37 +338,88 @@ Durations are `/usr/bin/time -p` real time and include compilation.
 | --- | --- |
 | `cargo fmt --all -- --check` | **PASS**, exit 0, real 1.19s. |
 | `cargo check --workspace --all-targets` | **PASS**, exit 0, real 4.85s. |
-| `cargo test -p rustscan-sfm --lib -- --test-threads=1 reference_database` | **PASS**, 2 passed. Database image id 77 and camera id 55 are kept for `new.png`. Frame id 21 is appended instead of reusing database index 0, which still points at reference frame 100. A conflicting frame id names `new.png`. |
-| `cargo test -p rustscan-sfm --lib -- --test-threads=1 support_present_in_database reports_image_name_instead_of_panicking retained_reference_setup_keeps_camera database_frames_skip_paths` | **PASS**, 6 passed. `support.png` is named in a not-match-connected error. The three earlier missing-image regressions still name `a.png`, `m.png`, and `c.png`. |
-| `cargo test -p rustscan-sfm --test sequence_registration -- --test-threads=1` | **PASS**, exit 0, real 69.90s, test time 63.78s. 72 passed, 0 failed, 0 ignored. |
-| `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1` | **PASS**, exit 0, real 62.94s, test time 55.74s. 622 passed, 0 failed, 19 ignored. The three new regressions are included. |
+| `cargo test -p rustscan-sfm --lib -- --test-threads=1 reference_database` | **PASS**, 2 passed. |
+| `cargo test -p rustscan-sfm --lib -- --test-threads=1 support_present_in_database reports_image_name_instead_of_panicking retained_reference_setup_keeps_camera database_frames_skip_paths` | **PASS**, 6 passed. |
+| `cargo test -p rustscan-sfm --test sequence_registration -- --test-threads=1` | **PASS**, exit 0, real 69.90s, test time 63.78s. 72 passed. |
+| `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1` | **PASS**, exit 0, real 62.94s, test time 55.74s. 622 passed, 19 ignored. |
 | `git diff --check` | **PASS**, exit 0. |
-
-The first full sequence run, before the sequence caller retried a named
-unconnected support, failed one test:
-`wide_round_can_use_tracks_committed_by_narrow_non_keyframe` returned
-`support image 'frame-0005.png' is in the database and registered in the reference model but is not match-connected`.
-That assertion was not changed. The caller now drops only that named support
-and retries the same attempt. The rerun passed 72 tests.
 
 #### Known limitations
 
 - Reference-only setup, with no database cache, still assigns `idx + 1` and
-  camera 0 to an image that is not in the reference. That path has no database
-  row to preserve.
-- A target that is stored in the database but is not match-connected still
-  returns `Ok(candidate: None)` and names the target in the debug log. A
-  support in that same situation is an error.
-- If every requested support is unconnected, the sequence caller propagates
-  the mapper error instead of recording an unresolved attempt.
+  camera 0 to an image that is not in the reference.
+- A disconnected target still returns `Ok(candidate: None)`. A requested
+  support in that situation is an error; see the review P1 remediation below.
 - `cargo test -p rustscan-sfm --all-targets` and targeted Clippy were not
-  re-run. The earlier T1 record still applies: parallel GPU initialization
-  deadlocked, and Clippy stops in pre-existing `rustscan-slam` warnings.
-- GPU PnP execution on this Mac remains unproved, as in T0.
+  re-run in this subsection.
+
+#### T1 review P1 remediation
+
+Status: complete. Two P1 findings on `a33ef4a5ae4c5a70b603be44b7a98ce3febad67f`
+are fixed without deleting, ignoring, or weakening existing acceptance.
+
+1. Sequence registration no longer silently drops an unconnected support.
+   Controlled degradation is explicit: the attempt diagnostic records
+   `controlled support degradation`, names the removed support, keeps the
+   original `support_frame_ids`, and continues only when at least one
+   match-connected support remains. A lone or fully disconnected support set
+   returns an error that names the target, the support, and
+   `not match-connected`. Registration success after degradation still carries
+   that diagnostic; insufficient remainder cannot report success.
+2. Overlapping same-name reference/database images validate `image_id`,
+   `camera_id`, and frame/rig identity when both sides provide frame/rig data.
+   Any mismatch fails before setup construction and names the image plus both
+   ID sets. Non-overlapping images keep the previous identity rules.
+
+Owner: `cursor-agent`
+
+Base commit: `a33ef4a5ae4c5a70b603be44b7a98ce3febad67f`
+
+Final commit: `PENDING_AFTER_COMMIT`
+
+Branch: `agent/RS-2026-004/t1-mapper-identity`
+
+Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t1-mapper-identity`
+
+Changed files:
+
+- `rustscan-sfm/src/sfm/mapper.rs`
+- `rustscan-sfm/src/sfm/mapper/reconstruction_input.rs`
+- `rustscan-sfm/src/sequence_registration.rs`
+- `rustscan-sfm/tests/sequence_registration.rs`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
+
+#### Commands and results
+
+Logs: `artifacts/runs/rs-2026-004-t1-review-p1/` in this worktree.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | **PASS**, exit 0, real 1.18s. |
+| `cargo check --workspace --all-targets` | **PASS**, exit 0, real 4.85s. |
+| `cargo test -p rustscan-sfm --all-features --lib -- --test-threads=1` | **FAIL**, exit 101, real 253.53s, test time 245.51s. 802 passed, 2 failed, 19 ignored. All T1 identity and support-degradation regressions passed. The two failures are outside T1: `gpu::five_point_f32::tests::five_point_f32_actual_gpu_stages` and `gpu::pnp_focal::tests::wgpu_pnp_focal_p3p_reorders_adverse_baseline_before_solving`. Treat those GPU numerical cases as unavailable on this host. |
+| `cargo test -p rustscan-sfm --all-features --test sequence_registration -- --test-threads=1` | **PASS**, exit 0, real 67.97s, test time 60.54s. 70 passed, 0 failed, 0 ignored. `wide_round_can_use_tracks_committed_by_narrow_non_keyframe` requires the controlled-degradation diagnostic and still keeps frame id 505 in `support_frame_ids`. |
+| `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1` | **PASS**, exit 0, real 62.15s, test time 55.45s. 631 passed, 0 failed, 19 ignored. |
+| `git diff --check` | **PASS**, exit 0. |
+
+#### Known limitations
+
+- Reference-only setup still assigns `idx + 1` / camera 0 when no database cache
+  is present.
+- Controlled degradation requires at least one remaining match-connected
+  support. Empty remainder fails closed and does not report registration
+  success.
+- `--all-features --lib` GPU numerical failures above are outside T1 and do not
+  clear the AGX/XPC adapter limitation recorded in T0.
+- Targeted Clippy with `-D warnings` was not re-run; pre-existing
+  `rustscan-slam` failures remain outside T1.
 
 #### Next action
 
-Start T2 from this review commit. Do not merge this branch to `main`.
+Start T2 from final commit `PENDING_AFTER_COMMIT`. Do not merge this branch to
+`main`.
 
 ### T2 — Reconstruction Validation And IDs
 

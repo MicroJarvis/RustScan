@@ -1301,10 +1301,11 @@ fn register_remaining_sequence_frames_planned(
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     let mut attempt_mapper_config = target_mapper_config.clone();
                     attempt_mapper_config.random_seed = attempt_seed;
+                    let original_supports = support_names.clone();
                     let mut active_supports = support_names;
-                    // A support that is registered and stored but not match-connected is a
-                    // mapper error. Drop that named support and retry so other supports in
-                    // the same attempt can still register. An empty remainder still fails.
+                    let mut degradation_notes = Vec::new();
+                    // Controlled degradation only: never drop a support without recording
+                    // why, and never continue with fewer than one match-connected support.
                     let attempt = loop {
                         match register_single_target_from_database_with_pnp_scorer(
                             &sequence_input,
@@ -1323,15 +1324,13 @@ fn register_remaining_sequence_frames_planned(
                                 else {
                                     return Err(error);
                                 };
-                                let remaining = active_supports
-                                    .iter()
-                                    .filter(|name| name.as_str() != disconnected)
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                if remaining.len() == active_supports.len() || remaining.is_empty()
-                                {
-                                    return Err(error);
-                                }
+                                let (remaining, note) = plan_controlled_support_degradation(
+                                    target_name,
+                                    &original_supports,
+                                    &active_supports,
+                                    disconnected,
+                                )?;
+                                degradation_notes.push(note);
                                 active_supports = remaining;
                             }
                         }
@@ -1353,16 +1352,20 @@ fn register_remaining_sequence_frames_planned(
                         inlier_count,
                         inlier_ratio,
                         mean_error,
-                        append_registration_diagnostic_message(
-                            candidate
-                                .is_none()
-                                .then(|| "PnP did not produce a finite pose".to_owned()),
-                            &attempt.debug_log,
+                        merge_diagnostic_notes(
+                            append_registration_diagnostic_message(
+                                candidate
+                                    .is_none()
+                                    .then(|| "PnP did not produce a finite pose".to_owned()),
+                                &attempt.debug_log,
+                            ),
+                            &degradation_notes,
                         ),
                     );
-                    if let Some(message) =
-                        append_registration_diagnostic_message(None, &attempt.debug_log)
-                    {
+                    if let Some(message) = merge_diagnostic_notes(
+                        append_registration_diagnostic_message(None, &attempt.debug_log),
+                        &degradation_notes,
+                    ) {
                         task.emit(SfmTaskEvent {
                             sequence: 0,
                             elapsed_ms: 0,
@@ -1412,9 +1415,12 @@ fn register_remaining_sequence_frames_planned(
                     current_reconstruction = candidate.reconstruction;
                     current_reference = accepted_sparse;
                     diagnostics[target].status = FrameRegistrationStatus::Registered;
-                    diagnostics[target].message = append_registration_diagnostic_message(
-                        Some(format!("registered in {round:?} round")),
-                        &attempt.debug_log,
+                    diagnostics[target].message = merge_diagnostic_notes(
+                        append_registration_diagnostic_message(
+                            Some(format!("registered in {round:?} round")),
+                            &attempt.debug_log,
+                        ),
+                        &degradation_notes,
                     );
                     match accepted_this_round.binary_search(&target) {
                         Ok(_) => {}
@@ -1856,6 +1862,54 @@ fn unconnected_registered_support_name(message: &str) -> Option<&str> {
         "' is in the database and registered in the reference model but is not match-connected",
     )?;
     Some(&rest[..end])
+}
+
+/// Minimum match-connected supports required after controlled degradation.
+const MIN_MATCH_CONNECTED_SUPPORTS: usize = 1;
+
+/// Drop one named unconnected support only when the remainder still satisfies
+/// the minimum. The returned note must be recorded on the attempt diagnostic.
+fn plan_controlled_support_degradation(
+    target_name: &str,
+    original_supports: &[String],
+    active_supports: &[String],
+    disconnected_support: &str,
+) -> anyhow::Result<(Vec<String>, String)> {
+    let remaining = active_supports
+        .iter()
+        .filter(|name| name.as_str() != disconnected_support)
+        .cloned()
+        .collect::<Vec<_>>();
+    if remaining.len() == active_supports.len() {
+        anyhow::bail!(
+            "target image '{target_name}' reported unconnected support '{disconnected_support}' \
+             that was not in the active support list {active_supports:?}"
+        );
+    }
+    if remaining.len() < MIN_MATCH_CONNECTED_SUPPORTS {
+        anyhow::bail!(
+            "target image '{target_name}' cannot register: support image '{disconnected_support}' \
+             is not match-connected; requested supports {original_supports:?}; \
+             remaining supports {remaining:?}"
+        );
+    }
+    let note = format!(
+        "controlled support degradation: removed support image '{disconnected_support}' \
+         because it is not match-connected; remaining supports {remaining:?}; \
+         original supports {original_supports:?}"
+    );
+    Ok((remaining, note))
+}
+
+fn merge_diagnostic_notes(base: Option<String>, notes: &[String]) -> Option<String> {
+    if notes.is_empty() {
+        return base;
+    }
+    let joined = notes.join("; ");
+    match base {
+        Some(base) => Some(format!("{base}; {joined}")),
+        None => Some(joined),
+    }
 }
 
 fn stable_image_name(frame: &SequenceFrame) -> anyhow::Result<&str> {
@@ -2866,6 +2920,93 @@ where
         return timestamp_plateau_error(timestamp, timestamp_count.saturating_sub(plateau_start));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod support_degradation_tests {
+    use super::{
+        plan_controlled_support_degradation, unconnected_registered_support_name,
+        MIN_MATCH_CONNECTED_SUPPORTS,
+    };
+
+    #[test]
+    fn single_disconnected_support_returns_contextual_error_without_silent_drop() {
+        let original = vec!["support.png".to_owned()];
+        let error =
+            plan_controlled_support_degradation("target.png", &original, &original, "support.png")
+                .expect_err("a lone unconnected support must not be dropped silently");
+        let message = format!("{error:#}");
+        assert!(message.contains("target.png"), "{message}");
+        assert!(message.contains("support.png"), "{message}");
+        assert!(message.contains("not match-connected"), "{message}");
+        assert!(
+            !message.contains("controlled support degradation"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn all_supports_disconnected_returns_contextual_error() {
+        let original = vec!["a.png".to_owned(), "b.png".to_owned()];
+        let after_first =
+            plan_controlled_support_degradation("target.png", &original, &original, "a.png")
+                .expect("one remaining support still meets the minimum");
+        assert_eq!(after_first.0, vec!["b.png".to_owned()]);
+        assert!(after_first.1.contains("controlled support degradation"));
+
+        let error =
+            plan_controlled_support_degradation("target.png", &original, &after_first.0, "b.png")
+                .expect_err("removing the last support must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("target.png"), "{message}");
+        assert!(message.contains("b.png"), "{message}");
+        assert!(message.contains("not match-connected"), "{message}");
+        assert!(message.contains("remaining supports []"), "{message}");
+    }
+
+    #[test]
+    fn partial_disconnected_support_records_controlled_degradation() {
+        let original = vec![
+            "keep.png".to_owned(),
+            "drop.png".to_owned(),
+            "also_keep.png".to_owned(),
+        ];
+        let (remaining, note) =
+            plan_controlled_support_degradation("target.png", &original, &original, "drop.png")
+                .expect("remaining supports meet the minimum");
+        assert_eq!(
+            remaining,
+            vec!["keep.png".to_owned(), "also_keep.png".to_owned()]
+        );
+        assert!(remaining.len() >= MIN_MATCH_CONNECTED_SUPPORTS);
+        assert!(note.contains("controlled support degradation"), "{note}");
+        assert!(note.contains("drop.png"), "{note}");
+        assert!(note.contains("not match-connected"), "{note}");
+        assert!(note.contains("original supports"), "{note}");
+    }
+
+    #[test]
+    fn controlled_degradation_does_not_claim_registration_success() {
+        let note_error = plan_controlled_support_degradation(
+            "target.png",
+            &["only.png".to_owned()],
+            &["only.png".to_owned()],
+            "only.png",
+        )
+        .expect_err("insufficient remaining supports");
+        let message = format!("{note_error:#}");
+        assert!(!message.to_lowercase().contains("registered"), "{message}");
+        assert!(message.contains("cannot register"), "{message}");
+    }
+
+    #[test]
+    fn unconnected_support_parser_reads_support_name() {
+        let message = "support image 'frame-0005.png' is in the database and registered in the reference model but is not match-connected";
+        assert_eq!(
+            unconnected_registered_support_name(message),
+            Some("frame-0005.png")
+        );
+    }
 }
 
 #[cfg(test)]

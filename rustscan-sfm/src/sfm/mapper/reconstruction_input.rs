@@ -214,6 +214,21 @@ pub(super) fn reference_camera_setup_for_retained(
     for (idx, image) in retained.iter().enumerate() {
         if let Some(pose) = pose_by_name.get(image.name.as_str()) {
             present_in_reference.push(true);
+            if let Some(cache) = database {
+                let reference_frame = image_frame_by_id
+                    .get(&pose.image_id)
+                    .copied()
+                    .flatten()
+                    .and_then(|frame_index| frames.get(frame_index));
+                validate_overlapping_reference_database_identity(
+                    &image.name,
+                    pose.image_id,
+                    pose.camera_id,
+                    reference_frame.map(|frame| frame.frame_id),
+                    reference_frame.map(|frame| frame.rig_id),
+                    cache,
+                )?;
+            }
             image_ids.push(pose.image_id);
             image_camera_indices.push(*camera_index_by_id.get(&pose.camera_id).with_context(
                 || {
@@ -305,6 +320,67 @@ struct AssignedDatabaseIdentity {
     image_id: u32,
     camera_index: usize,
     frame_index: Option<usize>,
+}
+
+/// Reject a same-named reference/database pair whose stable identity disagrees.
+/// Images present on only one side keep that side's identity.
+fn validate_overlapping_reference_database_identity(
+    image_name: &str,
+    reference_image_id: u32,
+    reference_camera_id: u32,
+    reference_frame_id: Option<u32>,
+    reference_rig_id: Option<u32>,
+    cache: &DatabaseCache,
+) -> Result<()> {
+    let mut matched = None;
+    for image in cache.images.values() {
+        if image.name != image_name {
+            continue;
+        }
+        if matched.is_some() {
+            bail!("retained image '{image_name}' database id is ambiguous");
+        }
+        matched = Some(image);
+    }
+    let Some(db_image) = matched else {
+        return Ok(());
+    };
+    if db_image.image_id != reference_image_id {
+        bail!(
+            "retained image '{image_name}' image_id conflict: reference={reference_image_id} \
+             database={}",
+            db_image.image_id
+        );
+    }
+    if db_image.camera_id != reference_camera_id {
+        bail!(
+            "retained image '{image_name}' camera_id conflict: reference={reference_camera_id} \
+             database={}",
+            db_image.camera_id
+        );
+    }
+    if let (Some(reference_frame_id), Some(database_frame_id)) =
+        (reference_frame_id, db_image.frame_id)
+    {
+        if reference_frame_id != database_frame_id {
+            bail!(
+                "retained image '{image_name}' frame_id conflict: reference={reference_frame_id} \
+                 database={database_frame_id}"
+            );
+        }
+        if let (Some(reference_rig_id), Some(db_frame)) =
+            (reference_rig_id, cache.frames.get(&database_frame_id))
+        {
+            if reference_rig_id != db_frame.rig_id {
+                bail!(
+                    "retained image '{image_name}' rig_id conflict: reference={reference_rig_id} \
+                     database={}",
+                    db_frame.rig_id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Keep the database image, camera, and frame for an image that is not in the

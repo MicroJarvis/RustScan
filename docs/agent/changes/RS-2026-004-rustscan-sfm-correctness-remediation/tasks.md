@@ -62,6 +62,11 @@ named owner, branch/worktree, and file scope.
       are not copied into the reference frame list. A support that is in the
       database and the registered reference but absent from the match-connected
       cache returns an error that names the support.
+- [x] Review P1: sequence registration must not silently drop an unconnected
+      support. Controlled degradation requires a diagnostic note, at least one
+      remaining match-connected support, and a contextual error otherwise.
+- [x] Review P1: overlapping reference/database same-name images must agree on
+      image_id, camera_id, and frame/rig identity when both sides provide them.
 
 **Exit condition:** no retained frame can inherit metadata from a different
 source path, and the ten mapper index panics become passing tests or intentional

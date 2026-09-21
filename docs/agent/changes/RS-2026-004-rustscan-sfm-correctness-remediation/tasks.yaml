@@ -68,13 +68,16 @@ known_limitations:
   - "GPU PnP tests skipped for the known macOS AGX/XPC shader compiler failure do not constitute GPU execution evidence and require a working adapter run."
   - "T1 cargo test -p rustscan-sfm --all-targets deadlocked in parallel GPU context initialization and was stopped; it is not a passing or failing assertion result."
   - "T1 cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings fails on pre-existing rustscan-slam warnings before it checks rustscan-sfm. Those warnings are outside T1."
+  - "T1 cargo test -p rustscan-sfm --all-features --lib reported two unrelated GPU numerical failures on this host (five_point_f32_actual_gpu_stages, wgpu_pnp_focal_p3p_reorders_adverse_baseline_before_solving). They are outside T1 mapper identity scope."
 
 later_tasks:
   - id: T1
     owner: cursor-agent
     branch: agent/RS-2026-004/t1-mapper-identity
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t1-mapper-identity
-    scope: rustscan-sfm/src/sfm/mapper.rs, rustscan-sfm/src/sfm/mapper/reconstruction_input.rs, and mapper/sequence tests
+    scope: rustscan-sfm/src/sfm/mapper.rs, rustscan-sfm/src/sfm/mapper/reconstruction_input.rs, rustscan-sfm/src/sequence_registration.rs, and mapper/sequence tests
+    status: review_p1_fixed
+    tip_commit: PENDING_AFTER_COMMIT
   - id: T2
     owner: cursor-agent
     branch: agent/RS-2026-004/t2-reconstruction-validation
@@ -111,4 +114,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T1 review blockers are fixed on branch agent/RS-2026-004/t1-mapper-identity. Do not merge it to main. Start T2 on branch agent/RS-2026-004/t2-reconstruction-validation from the T1 review commit, in its own worktree. Do not weaken acceptance."
+next_action: "T1 review P1 fixes are on branch agent/RS-2026-004/t1-mapper-identity. Do not merge it to main. Start T2 on branch agent/RS-2026-004/t2-reconstruction-validation from the T1 tip commit recorded in verification.md, in its own worktree. Do not weaken acceptance."

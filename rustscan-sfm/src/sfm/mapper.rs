@@ -14036,6 +14036,115 @@ mod tests {
     }
 
     #[test]
+    fn reference_database_rejects_overlapping_image_id_conflict() {
+        let error = reference_database_retained_setup(
+            "7 1 0 0 0 0 0 0 11 a.png\n\n",
+            None,
+            None,
+            &[(55, 9.0)],
+            &[(99, "a.png", 11, None), (77, "new.png", 55, None)],
+            &[],
+            &[],
+            &["a.png", "new.png"],
+        )
+        .expect_err("overlapping image_id conflict must fail before setup");
+        let message = format!("{error:#}");
+        assert!(message.contains("a.png"), "{message}");
+        assert!(message.contains("image_id conflict"), "{message}");
+        assert!(message.contains("reference=7"), "{message}");
+        assert!(message.contains("database=99"), "{message}");
+    }
+
+    #[test]
+    fn reference_database_rejects_overlapping_camera_id_conflict() {
+        let error = reference_database_retained_setup(
+            "7 1 0 0 0 0 0 0 11 a.png\n\n",
+            None,
+            None,
+            &[(55, 9.0)],
+            &[(7, "a.png", 55, None), (77, "new.png", 55, None)],
+            &[],
+            &[],
+            &["a.png", "new.png"],
+        )
+        .expect_err("overlapping camera_id conflict must fail before setup");
+        let message = format!("{error:#}");
+        assert!(message.contains("a.png"), "{message}");
+        assert!(message.contains("camera_id conflict"), "{message}");
+        assert!(message.contains("reference=11"), "{message}");
+        assert!(message.contains("database=55"), "{message}");
+    }
+
+    #[test]
+    fn reference_database_rejects_overlapping_frame_and_rig_conflicts() {
+        let frame_error = reference_database_retained_setup(
+            "7 1 0 0 0 0 0 0 11 a.png\n\n",
+            Some("3 1 CAMERA 11\n"),
+            Some("100 3 1 0 0 0 0 0 0 1 CAMERA 11 7\n"),
+            &[(55, 9.0)],
+            &[(7, "a.png", 11, Some(21)), (77, "new.png", 55, Some(22))],
+            &[(3, 11), (4, 55)],
+            &[(21, 3, 11, 7), (22, 4, 55, 77)],
+            &["a.png", "new.png"],
+        )
+        .expect_err("overlapping frame_id conflict must fail before setup");
+        let frame_message = format!("{frame_error:#}");
+        assert!(frame_message.contains("a.png"), "{frame_message}");
+        assert!(
+            frame_message.contains("frame_id conflict"),
+            "{frame_message}"
+        );
+        assert!(frame_message.contains("reference=100"), "{frame_message}");
+        assert!(frame_message.contains("database=21"), "{frame_message}");
+
+        let rig_error = reference_database_retained_setup(
+            "7 1 0 0 0 0 0 0 11 a.png\n\n",
+            Some("3 1 CAMERA 11\n"),
+            Some("100 3 1 0 0 0 0 0 0 1 CAMERA 11 7\n"),
+            &[(55, 9.0)],
+            &[(7, "a.png", 11, Some(100)), (77, "new.png", 55, Some(21))],
+            &[(9, 11), (4, 55)],
+            &[(100, 9, 11, 7), (21, 4, 55, 77)],
+            &["a.png", "new.png"],
+        )
+        .expect_err("overlapping rig_id conflict must fail before setup");
+        let rig_message = format!("{rig_error:#}");
+        assert!(rig_message.contains("a.png"), "{rig_message}");
+        assert!(rig_message.contains("rig_id conflict"), "{rig_message}");
+        assert!(rig_message.contains("reference=3"), "{rig_message}");
+        assert!(rig_message.contains("database=9"), "{rig_message}");
+    }
+
+    #[test]
+    fn reference_database_accepts_consistent_overlapping_identity() -> Result<()> {
+        let (_dir, retained, setup, _database) = reference_database_retained_setup(
+            "7 1 0 0 0 0 0 0 11 a.png\n\n",
+            Some("3 1 CAMERA 11\n"),
+            Some("100 3 1 0 0 0 0 0 0 1 CAMERA 11 7\n"),
+            &[(55, 9.0)],
+            &[(7, "a.png", 11, Some(100)), (77, "new.png", 55, Some(21))],
+            &[(3, 11), (4, 55)],
+            &[(100, 3, 11, 7), (21, 4, 55, 77)],
+            &["a.png", "new.png"],
+        )?;
+        assert_eq!(setup.image_ids[0], 7);
+        assert_eq!(setup.camera_ids[setup.image_camera_indices[0]], 11);
+        assert_eq!(
+            setup.frames[setup.image_frame_indices[0].expect("a.png frame")].frame_id,
+            100
+        );
+        let new_index = retained
+            .iter()
+            .find(|image| image.name == "new.png")
+            .expect("new.png")
+            .frame
+            .id;
+        assert_eq!(setup.image_ids[new_index], 77);
+        assert_eq!(setup.camera_ids[setup.image_camera_indices[new_index]], 55);
+        Ok(())
+    }
+
+    #[test]
     fn reference_database_remaps_frames_by_stable_frame_id() -> Result<()> {
         let (_dir, retained, setup, database) = reference_database_retained_setup(
             "7 1 0 0 0 0 0 0 11 a.png\n\n",
@@ -14071,9 +14180,11 @@ mod tests {
             Some("3 1 CAMERA 11\n"),
             Some("21 3 1 0 0 0 0 0 0 1 CAMERA 11 7\n"),
             &[(55, 9.0)],
-            &[(7, "a.png", 11, Some(100)), (77, "new.png", 55, Some(21))],
+            // a.png omits a database frame so overlapping frame validation does not fire;
+            // new.png then tries to map frame 21 onto the distinct reference frame 21.
+            &[(7, "a.png", 11, None), (77, "new.png", 55, Some(21))],
             &[(3, 11), (9, 55)],
-            &[(100, 3, 11, 7), (21, 9, 55, 77)],
+            &[(21, 9, 55, 77)],
             &["a.png", "new.png"],
         )
         .expect_err("a conflicting frame id must name the image");
