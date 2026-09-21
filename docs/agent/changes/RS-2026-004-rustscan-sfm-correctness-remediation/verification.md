@@ -423,7 +423,123 @@ Start T2 from final commit `90f05093fb014bf76a3a96afff76adb84d7158c2`. Do not me
 
 ### T2 — Reconstruction Validation And IDs
 
-Status: pending.
+Status: implemented.
+
+Owner: `cursor-agent`
+
+Base commit: `059dc5736bd2a27ffe523e192b9f8f75cbde0922`
+
+Implementation commit: `7546a82a2e26349821b83fcb7e36dd1450fef7cf`
+
+Branch: `agent/RS-2026-004/t2-reconstruction-validation`
+
+Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t2-reconstruction-validation`
+
+Changed files:
+
+- `rustscan-sfm/src/core/reconstruction_validation.rs`
+- `rustscan-sfm/src/core/types.rs`
+- `rustscan-sfm/src/lib.rs`
+- `rustscan-sfm/src/sequence_registration.rs`
+- `rustscan-sfm/src/sfm/mapper.rs`
+- `rustscan-sfm/src/sfm/mapper/reconstruction_input.rs`
+- `rustscan-sfm/src/sfm/observation_manager.rs`
+
+Scope notes: `sequence_registration.rs` only calls `validate_structure` before
+the existing sequence minimum-count checks. `reconstruction_input.rs` uses the
+occupied-id allocator for new local image/camera ids and `try_point3d_id` when
+seeding points. `mapper.rs` routes pre-export validation through
+`validate_for_colmap_export`. `observation_manager.rs` allocates point ids from
+the shared occupied-id allocator. Those call sites are the construction and
+export gates required by the design; T1 identity behavior was not changed.
+`rustscan-sfm/src/io/colmap.rs` is unchanged and remains T3.
+
+Validation rules, in order:
+
+- Parallel image metadata lengths match (`image_names`, `image_paths`,
+  `image_ids`, `image_camera_indices`, `image_frame_indices`, `poses`,
+  `observations`, `keypoints`). Camera ids match cameras. Point ids match
+  points.
+- Camera, image, point, rig, and frame ids are unique. Image, camera, rig, and
+  frame ids are in `1..2147483647`. Point ids are non-zero `u64`.
+- Each image camera index references a camera.
+- Each image has the same number of observations and keypoints.
+- Every observation references an existing point.
+- Every track image and feature index is in range, and each `(image, feature)`
+  belongs to at most one track.
+- Observations and tracks agree in both directions.
+- Frame rig ids, sensor ids, and camera data ids resolve, and image/frame
+  links are bidirectional.
+- Legacy camera, per-image cameras, registered poses, keypoints, point
+  positions, point errors, and frame `rig_from_world` values are finite.
+- `validate_for_colmap_export` runs the structural validator first, then
+  rejects a track that references an image without a pose.
+
+ID allocator:
+
+- `OccupiedIdAllocator` stores the occupied set and a lower bound that only
+  increases. The next id is `max(lower_bound, max(occupied)+1)` using checked
+  arithmetic, not a vector index.
+- Fresh COLMAP record ids start at 1. Sparse occupied ids such as `{2, 4, 9}`
+  allocate `10`, then `11`.
+- Replacing the occupied set with a smaller set does not reuse a previously
+  issued or observed id. Deleted point id `41` is followed by `42`.
+- Id `0` and duplicate occupied ids are errors. A COLMAP record id at
+  `2147483646` cannot allocate another id. A point id of `u64::MAX` cannot
+  allocate another id.
+- `try_image_id`, `try_camera_id_for_image`, `try_camera_for_image`, and
+  `try_point3d_id` return errors instead of inventing ids or cameras.
+  `image_id`, `camera_id_for_image`, `camera_for_image`, and `point3d_id`
+  remain as deprecated compatibility wrappers. Core validation, frame-sensor
+  lookup, local setup, seed point ids, and new point allocation do not call
+  them. `lib.rs` allows the deprecated lint so existing mapper, BA, and COLMAP
+  export call sites keep compiling until T3 and later numerical migrations.
+
+Commands and results, from
+`/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t2-reconstruction-validation`,
+with `POSELIB_ROOT` pointed at the T1 worktree PoseLib checkout because this
+worktree does not initialize that submodule:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail. Clippy stops in `rustscan-slam` and does not produce a rustscan-sfm
+  result. Final compiler line: `error: could not compile rustscan-slam (lib)
+  due to 84 previous errors`. The first error is `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5` (`pub mod config`). The other 83 are
+  pre-existing slam lints (`derivable_impls`, `clone_on_copy`,
+  `too_many_arguments`, `manual_is_multiple_of`, and similar). They are outside
+  T2.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `638 passed; 0 failed; 19 ignored; finished in 54.15s`.
+- `cargo test -p rustscan-sfm --all-features --lib -- --test-threads=1`:
+  `809 passed; 2 failed; 19 ignored; finished in 244.20s`. This run was on the
+  tree immediately before the final seed/test lookup switch from deprecated
+  `point3d_id`/`image_id` to `try_point3d_id`/`try_image_id`. That switch
+  returns the stored id when one exists; the no-default suite above was
+  re-run after it. The two failures are the pre-existing macOS GPU numerical
+  tests, not T2, and were not deleted or ignored:
+  `gpu::five_point_f32::tests::five_point_f32_actual_gpu_stages` failed
+  `sample 0: pivot=0`, left `SingularElimination`, right `Success`.
+  `gpu::pnp_focal::tests::wgpu_pnp_focal_p3p_reorders_adverse_baseline_before_solving`
+  failed its positive-depth reprojection assertion.
+- `git diff --check`: pass.
+
+Known limitations:
+
+- COLMAP import and the export writer in `rustscan-sfm/src/io/colmap.rs` still
+  call deprecated id accessors. T3 owns that migration and should call
+  `validate_for_colmap_export`.
+- Mapper and BA numerical code still call the deprecated camera/id wrappers.
+  The crate allows `deprecated` so those existing call sites are not rewritten
+  in T2. New core paths do not call them.
+- The allocator does not fill gaps below the high-water mark. That is
+  intentional: deleted ids are not reused.
+- The two GPU failures above are host numerical failures, not an AGX/XPC
+  deadlock. Tests were not removed or ignored.
+
+Next action: start T4 from `7546a82a2e26349821b83fcb7e36dd1450fef7cf`. Do not
+merge this branch to `main`. T3 still waits for T4.
 
 ### T3 — Strict COLMAP IO
 

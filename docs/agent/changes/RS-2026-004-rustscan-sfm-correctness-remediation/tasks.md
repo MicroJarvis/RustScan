@@ -78,16 +78,16 @@ contextual errors.
 **Primary scope:** `rustscan-sfm/src/core/`, reconstruction construction helpers,
 and focused unit tests
 
-- [ ] Add a structured `ReconstructionValidationError` and the structural and
+- [x] Add a structured `ReconstructionValidationError` and the structural and
       export validators specified in `design.md`.
-- [ ] Add strict camera/image/point ID and camera lookup APIs. Migrate internal
+- [x] Add strict camera/image/point ID and camera lookup APIs. Migrate internal
       persistence callers away from fabricated fallback IDs and cameras.
-- [ ] Add a checked occupied-ID allocator for reference/database/new images and
+- [x] Add a checked occupied-ID allocator for reference/database/new images and
       points, including overflow and COLMAP-domain limits.
-- [ ] Validate uniqueness, parallel metadata lengths, camera indices,
+- [x] Validate uniqueness, parallel metadata lengths, camera indices,
       observation/track agreement, feature bounds, and rig/frame references.
-- [ ] Add table-driven tests covering every invariant and error payload.
-- [ ] Preserve compatibility wrappers only when necessary; mark them deprecated
+- [x] Add table-driven tests covering every invariant and error payload.
+- [x] Preserve compatibility wrappers only when necessary; mark them deprecated
       and ensure no RustSFM persistence path uses them.
 
 **Exit condition:** an inconsistent `Reconstruction` cannot pass strict export

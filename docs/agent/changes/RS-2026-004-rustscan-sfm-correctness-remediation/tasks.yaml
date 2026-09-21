@@ -83,6 +83,8 @@ later_tasks:
     branch: agent/RS-2026-004/t2-reconstruction-validation
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t2-reconstruction-validation
     scope: rustscan-sfm/src/core and reconstruction construction helpers
+    status: implemented
+    tip_commit: 7546a82a2e26349821b83fcb7e36dd1450fef7cf
   - id: T3
     owner: cursor-agent
     branch: agent/RS-2026-004/t3-colmap-io
@@ -114,4 +116,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T1 review P1 fixes are on branch agent/RS-2026-004/t1-mapper-identity. Do not merge it to main. Start T2 on branch agent/RS-2026-004/t2-reconstruction-validation from the T1 tip commit recorded in verification.md, in its own worktree. Do not weaken acceptance."
+next_action: "T2 is on branch agent/RS-2026-004/t2-reconstruction-validation at implementation commit 7546a82a2e26349821b83fcb7e36dd1450fef7cf. Do not merge it to main. T4 may start from that commit. T3 waits for T2 and T4. COLMAP text/binary import remains T3."
