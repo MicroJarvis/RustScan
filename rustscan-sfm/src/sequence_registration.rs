@@ -1301,15 +1301,41 @@ fn register_remaining_sequence_frames_planned(
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     let mut attempt_mapper_config = target_mapper_config.clone();
                     attempt_mapper_config.random_seed = attempt_seed;
-                    let attempt = register_single_target_from_database_with_pnp_scorer(
-                        &sequence_input,
-                        &keyframe_result.database,
-                        &current_reference,
-                        target_name,
-                        &support_names,
-                        &attempt_mapper_config,
-                        pnp_scorer.as_deref_mut(),
-                    )?;
+                    let mut active_supports = support_names;
+                    // A support that is registered and stored but not match-connected is a
+                    // mapper error. Drop that named support and retry so other supports in
+                    // the same attempt can still register. An empty remainder still fails.
+                    let attempt = loop {
+                        match register_single_target_from_database_with_pnp_scorer(
+                            &sequence_input,
+                            &keyframe_result.database,
+                            &current_reference,
+                            target_name,
+                            &active_supports,
+                            &attempt_mapper_config,
+                            pnp_scorer.as_deref_mut(),
+                        ) {
+                            Ok(attempt) => break attempt,
+                            Err(error) => {
+                                let message = format!("{error:#}");
+                                let Some(disconnected) =
+                                    unconnected_registered_support_name(&message)
+                                else {
+                                    return Err(error);
+                                };
+                                let remaining = active_supports
+                                    .iter()
+                                    .filter(|name| name.as_str() != disconnected)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                if remaining.len() == active_supports.len() || remaining.is_empty()
+                                {
+                                    return Err(error);
+                                }
+                                active_supports = remaining;
+                            }
+                        }
+                    };
                     let candidate = attempt.candidate;
                     let (inlier_count, inlier_ratio, mean_error) = candidate
                         .as_ref()
@@ -1820,6 +1846,16 @@ pub fn run_sequence_registration(
         },
     )?;
     result.ok_or_else(|| anyhow::anyhow!("sequence graph completed without a reconstruction"))
+}
+
+fn unconnected_registered_support_name(message: &str) -> Option<&str> {
+    let marker = "support image '";
+    let start = message.find(marker)? + marker.len();
+    let rest = message.get(start..)?;
+    let end = rest.find(
+        "' is in the database and registered in the reference model but is not match-connected",
+    )?;
+    Some(&rest[..end])
 }
 
 fn stable_image_name(frame: &SequenceFrame) -> anyhow::Result<&str> {

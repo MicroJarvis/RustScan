@@ -56,6 +56,12 @@ named owner, branch/worktree, and file scope.
       reference seed alignment.
 - [x] Re-run every sequence test that previously panicked and the complete
       `sequence_registration` integration test serially.
+- [x] Review follow-up: when both a reference model and a database are present,
+      retained images that are not in the reference keep their database image,
+      camera, and frame identity, merged by stable ID. Database frame indexes
+      are not copied into the reference frame list. A support that is in the
+      database and the registered reference but absent from the match-connected
+      cache returns an error that names the support.
 
 **Exit condition:** no retained frame can inherit metadata from a different
 source path, and the ten mapper index panics become passing tests or intentional

@@ -111,4 +111,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T1 is complete on branch agent/RS-2026-004/t1-mapper-identity. Do not merge it to main. Start T2 on branch agent/RS-2026-004/t2-reconstruction-validation from the T1 commit, in its own worktree. Do not weaken acceptance."
+next_action: "T1 review blockers are fixed on branch agent/RS-2026-004/t1-mapper-identity. Do not merge it to main. Start T2 on branch agent/RS-2026-004/t2-reconstruction-validation from the T1 review commit, in its own worktree. Do not weaken acceptance."

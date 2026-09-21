@@ -125,25 +125,27 @@ pub fn reference_camera_setup(
     image_paths: &[PathBuf],
 ) -> Result<ReferenceCameraSetup> {
     let mut retained = retained_images_for_paths(image_paths)?;
-    reference_camera_setup_for_retained(reference, &mut retained)
+    reference_camera_setup_for_retained(reference, &mut retained, None)
 }
 
 pub(super) fn reference_camera_setup_for_retained(
     reference: &Path,
     retained: &mut [RetainedMapperImage],
+    database: Option<&DatabaseCache>,
 ) -> Result<ReferenceCameraSetup> {
     let cameras_with_ids = read_colmap_cameras(reference)?;
     if cameras_with_ids.is_empty() {
         bail!("reference model has no cameras");
     }
-    let camera_ids = cameras_with_ids
+    let mut camera_ids = cameras_with_ids
         .iter()
         .map(|(camera_id, _)| *camera_id)
         .collect::<Vec<_>>();
-    let cameras = cameras_with_ids
+    let mut cameras = cameras_with_ids
         .iter()
         .map(|(_, camera)| *camera)
         .collect::<Vec<_>>();
+    let mut camera_has_prior_focal_length = vec![true; cameras.len()];
     let camera_index_by_id = camera_ids
         .iter()
         .enumerate()
@@ -167,11 +169,11 @@ pub(super) fn reference_camera_setup_for_retained(
     } else {
         None
     };
-    let rigs = sparse_model
+    let mut rigs = sparse_model
         .as_ref()
         .map(|model| model.reconstruction.rigs.clone())
         .unwrap_or_default();
-    let frames = sparse_model
+    let mut frames = sparse_model
         .as_ref()
         .map(|model| model.reconstruction.frames.clone())
         .unwrap_or_default();
@@ -208,8 +210,10 @@ pub(super) fn reference_camera_setup_for_retained(
     let mut image_ids = Vec::with_capacity(retained.len());
     let mut image_camera_indices = Vec::with_capacity(retained.len());
     let mut image_frame_indices = Vec::with_capacity(retained.len());
+    let mut present_in_reference = Vec::with_capacity(retained.len());
     for (idx, image) in retained.iter().enumerate() {
         if let Some(pose) = pose_by_name.get(image.name.as_str()) {
+            present_in_reference.push(true);
             image_ids.push(pose.image_id);
             image_camera_indices.push(*camera_index_by_id.get(&pose.camera_id).with_context(
                 || {
@@ -220,10 +224,39 @@ pub(super) fn reference_camera_setup_for_retained(
                 },
             )?);
             image_frame_indices.push(*image_frame_by_id.get(&pose.image_id).unwrap_or(&None));
+        } else if let Some(cache) = database {
+            // A database row is the identity. Do not invent idx+1 or camera 0.
+            present_in_reference.push(false);
+            let assigned = assign_database_identity_for_unreferenced_image(
+                &image.name,
+                cache,
+                &image_ids,
+                &mut camera_ids,
+                &mut cameras,
+                &mut camera_has_prior_focal_length,
+                &mut rigs,
+                &mut frames,
+            )?;
+            image_ids.push(assigned.image_id);
+            image_camera_indices.push(assigned.camera_index);
+            image_frame_indices.push(assigned.frame_index);
         } else {
+            // Reference-only inputs have no database metadata to preserve.
+            present_in_reference.push(false);
             image_ids.push(idx as u32 + 1);
             image_camera_indices.push(0);
             image_frame_indices.push(None);
+        }
+    }
+    if database.is_some() {
+        let mut seen_ids = HashSet::new();
+        for (index, &image_id) in image_ids.iter().enumerate() {
+            if !seen_ids.insert(image_id) {
+                bail!(
+                    "retained image '{}' database id {image_id} collides with another image",
+                    retained[index].name
+                );
+            }
         }
     }
 
@@ -234,7 +267,7 @@ pub(super) fn reference_camera_setup_for_retained(
     let setup = ReferenceCameraSetup {
         cameras,
         camera_ids,
-        camera_has_prior_focal_length: vec![true; cameras_with_ids.len()],
+        camera_has_prior_focal_length,
         rigs,
         frames,
         image_ids,
@@ -245,7 +278,8 @@ pub(super) fn reference_camera_setup_for_retained(
     anyhow::ensure!(
         setup.image_camera_indices.len() == retained.len()
             && setup.image_frame_indices.len() == retained.len()
-            && setup.camera_ids.len() == setup.cameras.len(),
+            && setup.camera_ids.len() == setup.cameras.len()
+            && setup.camera_has_prior_focal_length.len() == setup.cameras.len(),
         "reference camera setup did not produce one entry per retained image"
     );
     for (index, image) in retained.iter_mut().enumerate() {
@@ -258,9 +292,142 @@ pub(super) fn reference_camera_setup_for_retained(
         );
         image.camera_index = camera_index;
         image.rig_frame_index = setup.image_frame_indices[index];
+        if database.is_some() && !present_in_reference[index] {
+            image.database_image_id = setup.image_ids[index];
+            image.database_camera_id = setup.camera_ids[camera_index];
+        }
     }
     validate_retained_image_setup(&setup, retained)?;
     Ok(setup)
+}
+
+struct AssignedDatabaseIdentity {
+    image_id: u32,
+    camera_index: usize,
+    frame_index: Option<usize>,
+}
+
+/// Keep the database image, camera, and frame for an image that is not in the
+/// reference model. Cameras and frames are merged by stable ID. A database
+/// frame index is never reused as an index into the reference frame list.
+fn assign_database_identity_for_unreferenced_image(
+    image_name: &str,
+    cache: &DatabaseCache,
+    assigned_image_ids: &[u32],
+    camera_ids: &mut Vec<u32>,
+    cameras: &mut Vec<CameraModel>,
+    camera_has_prior_focal_length: &mut Vec<bool>,
+    rigs: &mut Vec<Rig>,
+    frames: &mut Vec<Frame>,
+) -> Result<AssignedDatabaseIdentity> {
+    let mut matched = None;
+    for image in cache.images.values() {
+        if image.name != image_name {
+            continue;
+        }
+        if matched.is_some() {
+            bail!("retained image '{image_name}' database id is ambiguous");
+        }
+        matched = Some((image.image_id, image.camera_id, image.frame_id));
+    }
+    let Some((image_id, camera_id, frame_id)) = matched else {
+        bail!("retained image '{image_name}' is missing from the database");
+    };
+    if assigned_image_ids.contains(&image_id) {
+        bail!("retained image '{image_name}' database id {image_id} collides with another image");
+    }
+    let camera_index = if let Some(index) = camera_ids.iter().position(|&id| id == camera_id) {
+        index
+    } else {
+        let db_camera = cache.cameras.get(&camera_id).with_context(|| {
+            format!("retained image '{image_name}' is missing camera_id={camera_id}")
+        })?;
+        let camera = CameraModel::from_colmap(
+            db_camera.camera.model_id,
+            db_camera.camera.width,
+            db_camera.camera.height,
+            &db_camera.camera.params,
+        )
+        .with_context(|| {
+            format!("retained image '{image_name}' has unsupported camera_id={camera_id}")
+        })?;
+        camera_ids.push(camera_id);
+        cameras.push(camera);
+        camera_has_prior_focal_length.push(db_camera.has_prior_focal_length);
+        cameras.len() - 1
+    };
+    let frame_index = match frame_id {
+        Some(frame_id) => Some(merge_database_frame_by_id(
+            frame_id, image_name, cache, rigs, frames,
+        )?),
+        None => None,
+    };
+    Ok(AssignedDatabaseIdentity {
+        image_id,
+        camera_index,
+        frame_index,
+    })
+}
+
+fn merge_database_frame_by_id(
+    frame_id: u32,
+    image_name: &str,
+    cache: &DatabaseCache,
+    rigs: &mut Vec<Rig>,
+    frames: &mut Vec<Frame>,
+) -> Result<usize> {
+    let db_frame = cache.frames.get(&frame_id).with_context(|| {
+        format!("retained image '{image_name}' frame id {frame_id} cannot be mapped")
+    })?;
+    merge_database_rig_by_id(db_frame.rig_id, image_name, cache, rigs)?;
+    let incoming = database_frame_to_frame(db_frame);
+    let mut matched = None;
+    for (index, existing) in frames.iter().enumerate() {
+        if existing.frame_id != frame_id {
+            continue;
+        }
+        if matched.is_some() || !frame_identity_matches(existing, &incoming) {
+            bail!("retained image '{image_name}' frame id {frame_id} cannot be mapped");
+        }
+        matched = Some(index);
+    }
+    if let Some(index) = matched {
+        return Ok(index);
+    }
+    frames.push(incoming);
+    Ok(frames.len() - 1)
+}
+
+fn frame_identity_matches(existing: &Frame, incoming: &Frame) -> bool {
+    existing.frame_id == incoming.frame_id
+        && existing.rig_id == incoming.rig_id
+        && existing.data_ids == incoming.data_ids
+}
+
+fn merge_database_rig_by_id(
+    rig_id: u32,
+    image_name: &str,
+    cache: &DatabaseCache,
+    rigs: &mut Vec<Rig>,
+) -> Result<()> {
+    let db_rig = cache.rigs.get(&rig_id).with_context(|| {
+        format!("retained image '{image_name}' frame rig id {rig_id} cannot be mapped")
+    })?;
+    let incoming = rig_from_colmap(db_rig);
+    let mut matched = false;
+    for existing in rigs.iter() {
+        if existing.rig_id != rig_id {
+            continue;
+        }
+        if matched || existing != &incoming {
+            bail!("retained image '{image_name}' frame rig id {rig_id} cannot be mapped");
+        }
+        matched = true;
+    }
+    if !matched {
+        rigs.push(incoming);
+    }
+    Ok(())
 }
 
 pub(super) fn seed_reconstruction_from_reference(

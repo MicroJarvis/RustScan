@@ -274,21 +274,108 @@ translation stays 3 rather than the dropped middle image's 5.
   pass evidence.
 - Targeted Clippy with `-D warnings` fails in `rustscan-slam` on pre-existing
   diagnostics. T1 did not clear unrelated RustSFM warnings.
-- A database image that exists but is not match-connected returns
-  `Ok(candidate: None)` instead of a hard error, so sequence registration can
-  record an unresolved attempt. A name missing from the database entirely is
-  still a contextual error. That split is what keeps the T0 fixtures failing
-  closed and the blank-frame sequence test unresolved rather than aborted.
-- Registered reference images omitted by the match cache are copied back from
-  the reference by name so an existing pose is not dropped or assigned to
-  another path. They are not given another image's database id.
+- A target image that exists in the database but is not match-connected still
+  returns `Ok(candidate: None)` and names the target in the debug log, so
+  sequence registration can record an unresolved attempt. A requested support
+  in that situation is an error; see the review remediation below.
+- Registered reference images that are not requested supports and are omitted
+  by the match cache are still copied back from the reference by name. They
+  are not given another image's database id. Requested supports are not
+  skipped this way.
 - GPU PnP execution on this Mac remains unproved, as in T0.
 
 #### Next action
 
 Start T2 on `agent/RS-2026-004/t2-reconstruction-validation` in
-`.worktrees/rs-2026-004-t2-reconstruction-validation`, based on this T1 commit.
-Do not merge this branch to `main`.
+`.worktrees/rs-2026-004-t2-reconstruction-validation`, based on the T1 review
+commit recorded below. Do not merge this branch to `main`.
+
+#### T1 review remediation
+
+Status: complete. Three review blockers on `bbedfbc` are fixed without deleting,
+ignoring, or weakening existing tests.
+
+- A retained image that is not in the reference, when a database cache is also
+  present, keeps the database image id and camera id. It is not assigned
+  `idx + 1` or camera index 0.
+- Frame membership is merged by stable frame id into the reference frame list.
+  A database frame index is not written into that list. A frame id that cannot
+  be mapped uniquely, including a conflicting rig, returns an error that names
+  the image.
+- A requested support that exists in the database and the registered reference
+  but is absent from the match-connected cache returns an error that names the
+  support. The mapper does not skip it.
+
+The sequence caller retries an attempt after dropping only the support named by
+that error, so a temporal list that also contains a match-connected support can
+still register. If no requested support remains, the mapper error is returned.
+
+Owner: `cursor-agent`
+
+Base commit: `bbedfbc519987177429c080becb762fef41760bb`
+
+Final commit: the commit that adds this record on
+`agent/RS-2026-004/t1-mapper-identity`. The hash is reported in the handoff.
+
+Branch: `agent/RS-2026-004/t1-mapper-identity`
+
+Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t1-mapper-identity`
+
+Changed files:
+
+- `rustscan-sfm/src/sfm/mapper.rs`
+- `rustscan-sfm/src/sfm/mapper/reconstruction_input.rs`
+- `rustscan-sfm/src/sequence_registration.rs`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
+
+`main` and the other RS-2026-004 worktrees were not modified.
+
+#### Environment
+
+Same host as the T1 record above: macOS 27.0, Darwin 27.0.0 arm64, Apple M5
+Max, rustc 1.98.1, cargo 1.98.1. Default features except the no-default run:
+`ceres-ba`, `vlfeat-sift`, `gpu-wgpu`, `poselib`. `CARGO_TERM_COLOR=never`.
+Durations are `/usr/bin/time -p` real time and include compilation.
+
+#### Commands and results
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | **PASS**, exit 0, real 1.19s. |
+| `cargo check --workspace --all-targets` | **PASS**, exit 0, real 4.85s. |
+| `cargo test -p rustscan-sfm --lib -- --test-threads=1 reference_database` | **PASS**, 2 passed. Database image id 77 and camera id 55 are kept for `new.png`. Frame id 21 is appended instead of reusing database index 0, which still points at reference frame 100. A conflicting frame id names `new.png`. |
+| `cargo test -p rustscan-sfm --lib -- --test-threads=1 support_present_in_database reports_image_name_instead_of_panicking retained_reference_setup_keeps_camera database_frames_skip_paths` | **PASS**, 6 passed. `support.png` is named in a not-match-connected error. The three earlier missing-image regressions still name `a.png`, `m.png`, and `c.png`. |
+| `cargo test -p rustscan-sfm --test sequence_registration -- --test-threads=1` | **PASS**, exit 0, real 69.90s, test time 63.78s. 72 passed, 0 failed, 0 ignored. |
+| `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1` | **PASS**, exit 0, real 62.94s, test time 55.74s. 622 passed, 0 failed, 19 ignored. The three new regressions are included. |
+| `git diff --check` | **PASS**, exit 0. |
+
+The first full sequence run, before the sequence caller retried a named
+unconnected support, failed one test:
+`wide_round_can_use_tracks_committed_by_narrow_non_keyframe` returned
+`support image 'frame-0005.png' is in the database and registered in the reference model but is not match-connected`.
+That assertion was not changed. The caller now drops only that named support
+and retries the same attempt. The rerun passed 72 tests.
+
+#### Known limitations
+
+- Reference-only setup, with no database cache, still assigns `idx + 1` and
+  camera 0 to an image that is not in the reference. That path has no database
+  row to preserve.
+- A target that is stored in the database but is not match-connected still
+  returns `Ok(candidate: None)` and names the target in the debug log. A
+  support in that same situation is an error.
+- If every requested support is unconnected, the sequence caller propagates
+  the mapper error instead of recording an unresolved attempt.
+- `cargo test -p rustscan-sfm --all-targets` and targeted Clippy were not
+  re-run. The earlier T1 record still applies: parallel GPU initialization
+  deadlocked, and Clippy stops in pre-existing `rustscan-slam` warnings.
+- GPU PnP execution on this Mac remains unproved, as in T0.
+
+#### Next action
+
+Start T2 from this review commit. Do not merge this branch to `main`.
 
 ### T2 — Reconstruction Validation And IDs
 
