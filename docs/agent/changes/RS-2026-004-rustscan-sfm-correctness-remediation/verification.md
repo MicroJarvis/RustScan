@@ -631,7 +631,72 @@ branch to `main`.
 
 ### T3 — Strict COLMAP IO
 
-Status: pending.
+Status: implemented. Not reviewed.
+
+Owner: cursor-agent. Branch `agent/RS-2026-004/t3-colmap-io`. Worktree
+`/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t3-colmap-io`. Base
+`ad1c6c6847fa60b74caebf5f6d35f3af8bd79bd1`. Implementation commit
+`77327ce3ec55a48b22d966f377fbb5764c893c06`.
+
+Import validates the complete raw text or binary model before
+`Reconstruction` or `ColmapSparseModel` construction. Errors use
+`source=<file> record=<type> id=<id> referenced=<id> feature=<index> reason=<reason>`.
+`referenced` and `feature` are `-` when they do not apply. Quaternion norms at
+or below `1e-8` are rejected. A finite norm above that epsilon is normalized
+only after validation.
+
+Text and binary fixtures reject the same cases: duplicate camera, image,
+point, rig, and frame IDs; unknown camera, image, and point references;
+conflicting observation/track; zero quaternion; non-finite translation;
+feature index 50 past the feature list; zero width; non-positive focal.
+
+`export_colmap`, `export_colmap_with_sparse_index`,
+`export_colmap_sparse_snapshot`, and `export_colmap_sparse_model` call
+`validate_for_colmap_export` before creating directories or files.
+`write_colmap_sparse_model`, `write_colmap_sparse_text`, and
+`write_colmap_sparse_binary` validate the raw model before `create_dir_all`.
+Export ID reads use `try_image_id`, `try_camera_id_for_image`,
+`try_camera_for_image`, and `try_point3d_id`.
+
+Removed from the normal import and export path: `ensure_point_tracks_have_observations`,
+`ensure_observations_have_point_tracks`, HashMap last-write-wins for camera,
+image, point, and frame-data IDs, `idx + 1` camera IDs, the empty-camera
+fallback to the legacy `camera` field, and the deprecated reconstruction
+accessors in `colmap.rs`. There is no compatibility repair API. COLMAP stores
+the reference sensor outside `sensors`; import copies that existing sensor
+into `Rig.sensors` so T2 export validation can see it, and export omits an
+unposed copy so the wire format is not duplicated.
+
+The mapper rig-seed fixture repeated camera 11 inside `sensors` and referenced
+camera 12, which is not in `cameras.txt`, while image 205 still used camera
+11. That fixture now keeps one camera-11 reference sensor and assigns both
+seed images to it. This is a fixture correction for strict import, not a T4
+camera-model change.
+
+Unposed images are still omitted from export after validation. Mapper, BA,
+and triangulation still call the deprecated ID and camera fallbacks; those
+remain T4 and T5 work.
+
+Commands on macOS, rustc 1.98.1, `POSELIB_ROOT` set to the T1 PoseLib v2.0.5
+checkout:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail. Clippy stops in `rustscan-slam` before linting `rustscan-sfm`.
+  First error: `module_inception` at `rustscan-slam/src/config/mod.rs:5`
+  (`pub mod config`). Final line: `error: could not compile rustscan-slam (lib) due to 84 previous errors`.
+  `rustscan-slam` was not modified.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `643 passed; 0 failed; 19 ignored; finished in 56.65s`.
+- `cargo test -p rustscan-sfm --all-features --lib colmap -- --test-threads=1`:
+  pass. `172 passed; 0 failed; 19 ignored; finished in 0.65s`.
+- `cargo test -p rustscan-sfm --all-features --lib reconstruction_validation -- --test-threads=1`:
+  pass. `8 passed; 0 failed; 0 ignored; finished in 0.02s`.
+- `git diff --check`: pass.
+
+GPU tests were not required and were not deleted or ignored. Next action: do
+not mark T3 reviewed and do not start T4, T5, or T6. Do not merge to `main`.
 
 ### T4 — Camera Invariants
 

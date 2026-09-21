@@ -83,13 +83,15 @@ later_tasks:
     branch: agent/RS-2026-004/t2-reconstruction-validation
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t2-reconstruction-validation
     scope: rustscan-sfm/src/core and reconstruction construction helpers
-    status: review_fix
-    tip_commit: a8ff5059a3795441d751830c5f98b0083ed51ade
+    status: reviewed
+    tip_commit: ad1c6c6847fa60b74caebf5f6d35f3af8bd79bd1
   - id: T3
     owner: cursor-agent
     branch: agent/RS-2026-004/t3-colmap-io
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t3-colmap-io
     scope: rustscan-sfm/src/io/colmap.rs and COLMAP IO tests
+    status: implemented
+    tip_commit: 77327ce3ec55a48b22d966f377fbb5764c893c06
   - id: T4
     owner: cursor-agent
     branch: agent/RS-2026-004/t4-camera-invariants
@@ -116,4 +118,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T2 review fixes are on branch agent/RS-2026-004/t2-reconstruction-validation at a8ff5059a3795441d751830c5f98b0083ed51ade. Do not mark T2 reviewed. Do not start T3. Do not merge to main."
+next_action: "T3 strict COLMAP IO is implemented on agent/RS-2026-004/t3-colmap-io. Do not mark T3 reviewed. Do not start T4, T5, or T6. Do not merge to main."

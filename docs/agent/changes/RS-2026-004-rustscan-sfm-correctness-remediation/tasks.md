@@ -101,20 +101,20 @@ existing IDs.
 **Dependencies:** T2 and T4  
 **Primary scope:** `rustscan-sfm/src/io/colmap.rs` and COLMAP IO tests
 
-- [ ] Validate complete raw text and binary models before internal conversion.
-- [ ] Reject duplicate camera, image, point, rig, and frame IDs instead of
+- [x] Validate complete raw text and binary models before internal conversion.
+- [x] Reject duplicate camera, image, point, rig, and frame IDs instead of
       allowing map collection to overwrite an earlier record.
-- [ ] Reject missing camera/point/image/feature references and conflicting
+- [x] Reject missing camera/point/image/feature references and conflicting
       image-side versus point-track observations. Remove the implicit
       `ensure_*` repair behavior from normal import.
-- [ ] Reject zero/non-finite quaternions, non-finite translations/points/errors,
+- [x] Reject zero/non-finite quaternions, non-finite translations/points/errors,
       zero dimensions, and invalid/non-finite focal parameters with record IDs.
-- [ ] Call strict reconstruction/export validation from every public COLMAP
+- [x] Call strict reconstruction/export validation from every public COLMAP
       export and sparse snapshot writer before creating or truncating files.
-- [ ] Add equivalent malformed text and binary fixtures for duplicate IDs,
+- [x] Add equivalent malformed text and binary fixtures for duplicate IDs,
       unknown references, conflicting tracks, zero quaternion, NaN/Inf, and
       feature-index overflow.
-- [ ] Add a non-symmetric rotation, non-zero translation, multiple-camera,
+- [x] Add a non-symmetric rotation, non-zero translation, multiple-camera,
       non-contiguous-ID round-trip test.
 
 **Exit condition:** valid models round-trip with stable IDs and geometry;
