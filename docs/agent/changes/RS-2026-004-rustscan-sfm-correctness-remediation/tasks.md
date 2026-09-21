@@ -87,8 +87,10 @@ and focused unit tests
 - [x] Validate uniqueness, parallel metadata lengths, camera indices,
       observation/track agreement, feature bounds, and rig/frame references.
 - [x] Add table-driven tests covering every invariant and error payload.
-- [x] Preserve compatibility wrappers only when necessary; mark them deprecated
-      and ensure no RustSFM persistence path uses them.
+- [x] Preserve compatibility wrappers only when necessary and mark them
+      deprecated. T2-owned construction and the mapper pre-export gate do not
+      call them. Remaining production fallback calls are listed in
+      `verification.md` for T3, T4, and T5; they are not removed in T2.
 
 **Exit condition:** an inconsistent `Reconstruction` cannot pass strict export
 validation, and ID allocation is collision-free for sparse and non-contiguous

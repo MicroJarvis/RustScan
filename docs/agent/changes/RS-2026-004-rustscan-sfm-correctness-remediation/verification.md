@@ -423,7 +423,7 @@ Start T2 from final commit `90f05093fb014bf76a3a96afff76adb84d7158c2`. Do not me
 
 ### T2 — Reconstruction Validation And IDs
 
-Status: implemented.
+Status: review_fix. Not reviewed.
 
 Owner: `cursor-agent`
 
@@ -492,8 +492,9 @@ ID allocator:
   `image_id`, `camera_id_for_image`, `camera_for_image`, and `point3d_id`
   remain as deprecated compatibility wrappers. Core validation, frame-sensor
   lookup, local setup, seed point ids, and new point allocation do not call
-  them. `lib.rs` allows the deprecated lint so existing mapper, BA, and COLMAP
-  export call sites keep compiling until T3 and later numerical migrations.
+  them. The crate-level `#![allow(deprecated)]` was removed. Remaining
+  production calls are listed in the review remediation below. This record
+  does not claim that every persistence fallback has been removed.
 
 Commands and results, from
 `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t2-reconstruction-validation`,
@@ -527,19 +528,106 @@ worktree does not initialize that submodule:
 
 Known limitations:
 
-- COLMAP import and the export writer in `rustscan-sfm/src/io/colmap.rs` still
-  call deprecated id accessors. T3 owns that migration and should call
-  `validate_for_colmap_export`.
-- Mapper and BA numerical code still call the deprecated camera/id wrappers.
-  The crate allows `deprecated` so those existing call sites are not rewritten
-  in T2. New core paths do not call them.
+- Production code still calls the deprecated fallbacks listed in the review
+  remediation. Those calls are not T2-owned construction paths.
 - The allocator does not fill gaps below the high-water mark. That is
   intentional: deleted ids are not reused.
-- The two GPU failures above are host numerical failures, not an AGX/XPC
-  deadlock. Tests were not removed or ignored.
+- The earlier all-features lib run, before this review fix, had two
+  pre-existing GPU numerical failures
+  (`five_point_f32_actual_gpu_stages`,
+  `wgpu_pnp_focal_p3p_reorders_adverse_baseline_before_solving`). This review
+  fix did not delete or ignore them. The review commands below did not rerun
+  that full lib suite.
 
-Next action: start T4 from `7546a82a2e26349821b83fcb7e36dd1450fef7cf`. Do not
-merge this branch to `main`. T3 still waits for T4.
+#### T2 review remediation
+
+Status: fixed, not reviewed.
+
+Review-fix commit: `a8ff5059a3795441d751830c5f98b0083ed51ade`
+
+1. `seed_reconstruction_from_reference` returns
+   `Result<Option<ReconstructionSeed>>`. A missing point id returns an anyhow
+   error containing `reference point index <n>` and `point_id`. It is not
+   converted to `None`. `Ok(None)` remains only when no reference image name
+   matches the input paths, or when a matched reference has neither a
+   registered pose nor a seeded point. Regression:
+   `missing_reference_point_id_fails_instead_of_dropping_the_seed`.
+2. `validate_structure` now checks each rig before frame links:
+   `ref_sensor_id` must name a sensor in that rig; sensor ids are unique and
+   in `1..2147483647`; a camera sensor id must be in `camera_ids`; frame data
+   sensors must belong to the frame's rig; camera `data_id`s must name an
+   image; image/frame links stay bidirectional; `sensor_from_rig` rotation and
+   translation must be finite. Regression:
+   `rig_sensor_errors_name_the_failing_field`.
+3. Deprecated fallback calls that remain in production. Each fires only when
+   the corresponding metadata vector is missing or short: `image_id` uses
+   `index + 1`, `camera_id_for_image` uses `1`, `camera_for_image` uses the
+   legacy `reconstruction.camera`, and `point3d_id` uses `index + 1`.
+
+T3, `rustscan-sfm/src/io/colmap.rs`. These build the COLMAP export records.
+T3 replaces them with `try_*` after `validate_for_colmap_export`, so a missing
+id is an export error instead of a fabricated one. `cameras_from_reconstruction`
+at line 850 uses the same `idx + 1` fabrication without calling the deprecated
+method.
+
+- `image_id`: lines 892, 917
+- `camera_id_for_image`: line 893
+- `point3d_id`: lines 884, 909
+
+T4, camera identity during registration and triangulation. These functions
+return cameras or ids into numerical code that does not currently return
+`Result`. T4 makes the camera index mandatory, then switches the reads to
+`try_*`.
+
+- `rustscan-sfm/src/sfm/mapper/state.rs`: `camera_id_for_image` at 46 and 64;
+  `image_id` at 405, 421, 429, 449, and 505
+- `rustscan-sfm/src/sfm/incremental_triangulator.rs`: `camera_for_image` at
+  638, 749, 852, 1035, and 1115
+- `rustscan-sfm/src/sfm/track_triangulation.rs`: `camera_for_image` at 132 and
+  213
+- `rustscan-sfm/src/sfm/global_mapper.rs`: `camera_for_image` at 739
+- `rustscan-sfm/src/sfm/mapper.rs` production calls below the test module:
+  `camera_for_image` at 1348, 5781, 6601, 6940, 7165, 7740, 7741, 7761, 7831,
+  8163, 8271, 8607, 8642, 8702, 8970, 9193, 9533, 9728, 9776, 10903, 10967,
+  11198, 11412, 11465, 11496, 11522, 11903, 11946, 12073, 12118, 12152, 12314,
+  12371, 12487, 12581, 12587, 12613, and 12614; `image_id` at 7557, 7558, 7577,
+  7578, 7595, 7596, 7958, and 7959; `point3d_id` at 8446
+
+T5, bundle adjustment. Projection and rig matching assume a camera is always
+available. T5 switches these to `try_*` after T4, and leaves BA state unchanged
+when the lookup fails.
+
+- `rustscan-sfm/src/ba/shared.rs`: `camera_for_image` at 138 and 164
+- `rustscan-sfm/src/ba/ceres_problem.rs`: `camera_for_image` at 236
+- `rustscan-sfm/src/ba/ceres_support.rs`: `camera_for_image` at 833, 855, and
+  869
+- `rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs`: `image_id` at 332;
+  `camera_id_for_image` at 345
+
+Test-only calls of the deprecated wrappers remain in `ba/ceres.rs` and in
+`mapper.rs` below the `#[cfg(test)]` module at line 12642. The compatibility
+test in `reconstruction_validation.rs` calls them under a local
+`#[allow(deprecated)]` to prove the wrappers still fabricate ids. That allow is
+not a crate-wide exemption.
+
+Review commands, same worktree and `POSELIB_ROOT`:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail before rustscan-sfm is linted. `error: could not compile rustscan-slam
+  (lib) due to 84 previous errors`. First error remains `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `640 passed; 0 failed; 19 ignored; finished in 58.28s`.
+- `cargo test -p rustscan-sfm --all-features --lib reconstruction_validation -- --test-threads=1`:
+  pass. `8 passed; 0 failed; 0 ignored; finished in 0.00s`.
+- `cargo test -p rustscan-sfm --all-features --test sequence_registration -- --test-threads=1`:
+  pass. `70 passed; 0 failed; 0 ignored; finished in 64.05s`.
+- `git diff --check`: pass.
+
+Next action: do not mark T2 reviewed and do not start T3. Do not merge this
+branch to `main`.
 
 ### T3 — Strict COLMAP IO
 
