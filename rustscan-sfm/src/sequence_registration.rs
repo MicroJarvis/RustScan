@@ -940,6 +940,7 @@ fn validate_keyframe_artifacts(
 }
 
 fn validate_sparse_reconstruction(reconstruction: &Reconstruction) -> anyhow::Result<()> {
+    crate::reconstruction_validation::validate_structure(reconstruction)?;
     if reconstruction.points.is_empty() {
         anyhow::bail!("keyframe reconstruction contains no sparse points");
     }

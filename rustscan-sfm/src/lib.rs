@@ -1,3 +1,7 @@
+// Deprecated reconstruction accessors remain callable until export and
+// numerical paths move to the strict lookups. New core paths must not use them.
+#![allow(deprecated)]
+
 pub mod ba;
 mod execution;
 pub mod sequence_registration;
@@ -35,6 +39,8 @@ pub mod database;
 // Core shared data structures.
 #[path = "core/correspondence_graph.rs"]
 pub mod correspondence_graph;
+#[path = "core/reconstruction_validation.rs"]
+pub mod reconstruction_validation;
 #[path = "core/types.rs"]
 pub mod types;
 

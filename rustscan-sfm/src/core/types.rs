@@ -1153,6 +1153,97 @@ pub struct Reconstruction {
 }
 
 impl Reconstruction {
+    /// Returns the camera selected by `image_camera_indices`.
+    ///
+    /// Missing metadata is an error. The deprecated [`Self::camera_for_image`]
+    /// wrapper still falls back to the legacy camera.
+    pub fn try_camera_for_image(
+        &self,
+        image: usize,
+    ) -> Result<CameraModel, crate::reconstruction_validation::ReconstructionValidationError> {
+        let camera_index = self
+            .image_camera_indices
+            .get(image)
+            .copied()
+            .ok_or_else(|| {
+                crate::reconstruction_validation::lookup_error(
+                    "image",
+                    format!("image_index={image}"),
+                    "camera",
+                    "image has no camera index",
+                )
+            })?;
+        self.cameras.get(camera_index).copied().ok_or_else(|| {
+            crate::reconstruction_validation::lookup_error(
+                "image",
+                format!("image_index={image},camera_index={camera_index}"),
+                "camera",
+                "camera index does not reference a camera",
+            )
+        })
+    }
+
+    /// Returns the persistent camera id for `image`.
+    pub fn try_camera_id_for_image(
+        &self,
+        image: usize,
+    ) -> Result<u32, crate::reconstruction_validation::ReconstructionValidationError> {
+        let camera_index = self
+            .image_camera_indices
+            .get(image)
+            .copied()
+            .ok_or_else(|| {
+                crate::reconstruction_validation::lookup_error(
+                    "image",
+                    format!("image_index={image}"),
+                    "camera_id",
+                    "image has no camera index",
+                )
+            })?;
+        self.camera_ids.get(camera_index).copied().ok_or_else(|| {
+            crate::reconstruction_validation::lookup_error(
+                "image",
+                format!("image_index={image},camera_index={camera_index}"),
+                "camera_id",
+                "camera index does not reference a camera id",
+            )
+        })
+    }
+
+    /// Returns the persistent image id stored for `image`.
+    pub fn try_image_id(
+        &self,
+        image: usize,
+    ) -> Result<u32, crate::reconstruction_validation::ReconstructionValidationError> {
+        self.image_ids.get(image).copied().ok_or_else(|| {
+            crate::reconstruction_validation::lookup_error(
+                "image",
+                format!("image_index={image}"),
+                "image_id",
+                "image has no persistent id",
+            )
+        })
+    }
+
+    /// Returns the persistent point id stored for `point`.
+    pub fn try_point3d_id(
+        &self,
+        point: usize,
+    ) -> Result<u64, crate::reconstruction_validation::ReconstructionValidationError> {
+        self.point_ids.get(point).copied().ok_or_else(|| {
+            crate::reconstruction_validation::lookup_error(
+                "point",
+                format!("point_index={point}"),
+                "point_id",
+                "point has no persistent id",
+            )
+        })
+    }
+
+    /// Deprecated: missing metadata fabricates the legacy camera.
+    #[deprecated(
+        note = "fabricates the legacy camera when metadata is missing; use try_camera_for_image"
+    )]
     pub fn camera_for_image(&self, image: usize) -> CameraModel {
         self.image_camera_indices
             .get(image)
@@ -1161,6 +1252,10 @@ impl Reconstruction {
             .unwrap_or(self.camera)
     }
 
+    /// Deprecated: missing metadata fabricates camera id 1.
+    #[deprecated(
+        note = "fabricates camera id 1 when metadata is missing; use try_camera_id_for_image"
+    )]
     pub fn camera_id_for_image(&self, image: usize) -> u32 {
         self.image_camera_indices
             .get(image)
@@ -1169,6 +1264,8 @@ impl Reconstruction {
             .unwrap_or(1)
     }
 
+    /// Deprecated: missing metadata fabricates `image_index + 1`.
+    #[deprecated(note = "fabricates an image id from the vector index; use try_image_id")]
     pub fn image_id(&self, image: usize) -> u32 {
         self.image_ids
             .get(image)
@@ -1246,7 +1343,7 @@ impl Reconstruction {
     }
 
     pub fn frame_sensor_id_for_image(&self, frame_idx: usize, image: usize) -> Option<&SensorId> {
-        let image_id = self.image_id(image) as u64;
+        let image_id = self.try_image_id(image).ok()? as u64;
         self.frames
             .get(frame_idx)?
             .data_ids
@@ -1278,6 +1375,8 @@ impl Reconstruction {
             })
     }
 
+    /// Deprecated: missing metadata fabricates `point_index + 1`.
+    #[deprecated(note = "fabricates a point id from the vector index; use try_point3d_id")]
     pub fn point3d_id(&self, point: usize) -> u64 {
         self.point_ids
             .get(point)

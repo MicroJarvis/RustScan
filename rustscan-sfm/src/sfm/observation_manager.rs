@@ -1,5 +1,8 @@
 use crate::correspondence_graph::{build_correspondence_graph_from_pairs, CorrespondenceGraph};
 use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
+use crate::reconstruction_validation::{
+    OccupiedIdAllocator, PersistentIdDomain, ReconstructionValidationError,
+};
 use crate::types::{ImageFrame, PairGeometry, Point3D, Reconstruction, TrackObservation};
 use crate::visibility_pyramid::VisibilityPyramid;
 use rustscan_slam::SE3;
@@ -52,36 +55,33 @@ impl ImageStat {
 
 #[derive(Debug, Clone)]
 struct Point3DIdAllocator {
-    next: Option<u64>,
+    inner: OccupiedIdAllocator,
 }
 
 impl Default for Point3DIdAllocator {
     fn default() -> Self {
-        Self { next: Some(1) }
+        Self {
+            inner: OccupiedIdAllocator::new(PersistentIdDomain::Point3D),
+        }
     }
 }
 
 impl Point3DIdAllocator {
-    fn observe_reconstruction(&mut self, reconstruction: &Reconstruction) {
-        if let Some(max_id) = reconstruction.point_ids.iter().copied().max() {
-            self.observe(max_id);
+    fn sync_reconstruction(
+        &mut self,
+        reconstruction: &Reconstruction,
+    ) -> Result<(), ReconstructionValidationError> {
+        let synced = self
+            .inner
+            .replace_occupied(reconstruction.point_ids.iter().copied());
+        if synced.is_err() {
+            self.inner.mark_exhausted();
         }
-    }
-
-    fn observe(&mut self, point3d_id: u64) {
-        let Some(observed_next) = point3d_id.checked_add(1) else {
-            self.next = None;
-            return;
-        };
-        if let Some(next) = self.next.as_mut() {
-            *next = (*next).max(observed_next);
-        }
+        synced
     }
 
     fn allocate(&mut self) -> Option<u64> {
-        let point3d_id = self.next?;
-        self.next = point3d_id.checked_add(1);
-        Some(point3d_id)
+        self.inner.allocate().ok()
     }
 }
 
@@ -146,9 +146,14 @@ impl ObservationManager {
         reconstruction: &Reconstruction,
     ) -> Self {
         let mut manager = Self::default();
-        manager
+        if manager
             .point3d_id_allocator
-            .observe_reconstruction(reconstruction);
+            .sync_reconstruction(reconstruction)
+            .is_err()
+        {
+            // `sync_reconstruction` exhausts the allocator. Point insertion then
+            // fails instead of inventing an id from a vector index.
+        }
         manager.install_correspondence_graph(build_correspondence_graph_from_pairs(frames, pairs));
         manager.rebuild(frames, pairs, reconstruction);
         manager
@@ -168,8 +173,13 @@ impl ObservationManager {
         pairs: &[PairGeometry],
         reconstruction: &Reconstruction,
     ) {
-        self.point3d_id_allocator
-            .observe_reconstruction(reconstruction);
+        if self
+            .point3d_id_allocator
+            .sync_reconstruction(reconstruction)
+            .is_err()
+        {
+            // See `ObservationManager::new`: illegal occupied ids block allocation.
+        }
         let modified_point3d_ids = std::mem::take(&mut self.modified_point3d_ids);
         let mut image_stats = frames
             .iter()
@@ -451,6 +461,13 @@ impl ObservationManager {
         }
 
         if !repair_point_id_table(reconstruction, &mut self.point3d_id_allocator) {
+            return None;
+        }
+        if self
+            .point3d_id_allocator
+            .sync_reconstruction(reconstruction)
+            .is_err()
+        {
             return None;
         }
         let external_point3d_id = self.point3d_id_allocator.allocate()?;
@@ -1096,7 +1113,9 @@ fn repair_point_id_table(
     if reconstruction.point_ids.len() >= reconstruction.points.len() {
         return true;
     }
-    allocator.observe_reconstruction(reconstruction);
+    if allocator.sync_reconstruction(reconstruction).is_err() {
+        return false;
+    }
     while reconstruction.point_ids.len() < reconstruction.points.len() {
         let Some(point3d_id) = allocator.allocate() else {
             return false;
@@ -1991,11 +2010,11 @@ mod tests {
             data_ids: vec![
                 DataId {
                     sensor_id: ref_sensor,
-                    data_id: reconstruction.image_id(left) as u64,
+                    data_id: u64::from(reconstruction.try_image_id(left).expect("left image id")),
                 },
                 DataId {
                     sensor_id: right_sensor,
-                    data_id: reconstruction.image_id(right) as u64,
+                    data_id: u64::from(reconstruction.try_image_id(right).expect("right image id")),
                 },
             ],
         }];

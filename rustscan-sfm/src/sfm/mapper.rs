@@ -1279,39 +1279,8 @@ fn run_reconstruction_prepared(
 }
 
 fn validate_reconstruction_for_export(reconstruction: &Reconstruction) -> Result<()> {
-    let num_images = reconstruction.image_names.len();
-    if reconstruction.poses.len() != num_images
-        || reconstruction.observations.len() != num_images
-        || reconstruction.keypoints.len() != num_images
-    {
-        bail!(
-            "image metadata lengths differ: names={} poses={} observations={} keypoints={}",
-            num_images,
-            reconstruction.poses.len(),
-            reconstruction.observations.len(),
-            reconstruction.keypoints.len()
-        );
-    }
-    if reconstruction.point_ids.len() != reconstruction.points.len() {
-        bail!(
-            "point id count {} differs from sparse point count {}",
-            reconstruction.point_ids.len(),
-            reconstruction.points.len()
-        );
-    }
-    for (image, observations) in reconstruction.observations.iter().enumerate() {
-        if observations.len() != reconstruction.keypoints[image].len() {
-            bail!("observation count differs from keypoint count for image {image}");
-        }
-        if observations
-            .iter()
-            .flatten()
-            .any(|point| *point >= reconstruction.points.len())
-        {
-            bail!("observation references a missing sparse point for image {image}");
-        }
-    }
-    Ok(())
+    crate::reconstruction_validation::validate_for_colmap_export(reconstruction)
+        .map_err(anyhow::Error::from)
 }
 
 fn sort_reconstructions_for_colmap_output(reconstructions: &mut [Reconstruction]) {

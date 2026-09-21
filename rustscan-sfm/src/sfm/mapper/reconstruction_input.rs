@@ -572,7 +572,7 @@ pub(super) fn seed_reconstruction_from_reference(
         }
         let seed_point_idx = points.len();
         reference_point_to_seed.insert(reference_point_idx, seed_point_idx);
-        point_ids.push(reference.point3d_id(reference_point_idx));
+        point_ids.push(reference.try_point3d_id(reference_point_idx).ok()?);
         points.push(Point3D {
             xyz: reference_point.xyz,
             color: reference_point.color,
@@ -1186,11 +1186,11 @@ pub(super) fn local_image_camera_setup(
 
             return Ok(ReferenceCameraSetup {
                 cameras: vec![local_image_camera(first, config)],
-                camera_ids: vec![1],
+                camera_ids: fresh_local_colmap_ids(1)?,
                 camera_has_prior_focal_length: vec![true],
                 rigs: Vec::new(),
                 frames: Vec::new(),
-                image_ids: (1..=frames.len() as u32).collect(),
+                image_ids: fresh_local_colmap_ids(frames.len())?,
                 image_camera_indices: vec![0; frames.len()],
                 image_frame_indices: vec![None; frames.len()],
                 seed_reconstruction: None,
@@ -1198,15 +1198,13 @@ pub(super) fn local_image_camera_setup(
         }
     }
 
+    let camera_ids = fresh_local_colmap_ids(frames.len())?;
+    let image_ids = fresh_local_colmap_ids(frames.len())?;
     let mut cameras = Vec::with_capacity(frames.len());
-    let mut camera_ids = Vec::with_capacity(frames.len());
-    let mut image_ids = Vec::with_capacity(frames.len());
     let mut image_camera_indices = Vec::with_capacity(frames.len());
-    for (idx, frame) in frames.iter().enumerate() {
+    for frame in frames {
         cameras.push(local_image_camera(frame, config));
-        camera_ids.push(idx as u32 + 1);
-        image_ids.push(idx as u32 + 1);
-        image_camera_indices.push(idx);
+        image_camera_indices.push(cameras.len() - 1);
     }
     Ok(ReferenceCameraSetup {
         cameras,
@@ -1219,6 +1217,10 @@ pub(super) fn local_image_camera_setup(
         image_frame_indices: vec![None; frames.len()],
         seed_reconstruction: None,
     })
+}
+
+fn fresh_local_colmap_ids(count: usize) -> Result<Vec<u32>> {
+    crate::reconstruction_validation::fresh_colmap_record_ids(count).map_err(anyhow::Error::from)
 }
 
 fn local_image_camera(frame: &ImageFrame, config: &MapperConfig) -> CameraModel {
