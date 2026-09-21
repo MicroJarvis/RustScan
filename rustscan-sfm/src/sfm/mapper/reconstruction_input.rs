@@ -275,9 +275,10 @@ pub(super) fn reference_camera_setup_for_retained(
         }
     }
 
-    let seed_reconstruction = sparse_model.as_ref().and_then(|model| {
-        seed_reconstruction_from_reference(&model.reconstruction, &retained_paths)
-    });
+    let seed_reconstruction = match sparse_model.as_ref() {
+        Some(model) => seed_reconstruction_from_reference(&model.reconstruction, &retained_paths)?,
+        None => None,
+    };
 
     let setup = ReferenceCameraSetup {
         cameras,
@@ -509,7 +510,7 @@ fn merge_database_rig_by_id(
 pub(super) fn seed_reconstruction_from_reference(
     reference: &Reconstruction,
     image_paths: &[PathBuf],
-) -> Option<ReconstructionSeed> {
+) -> Result<Option<ReconstructionSeed>> {
     let reference_image_by_name = reference
         .image_names
         .iter()
@@ -529,7 +530,7 @@ pub(super) fn seed_reconstruction_from_reference(
         current_to_reference[current_idx] = Some(reference_idx);
     }
     if reference_to_current.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let poses = current_to_reference
@@ -572,7 +573,15 @@ pub(super) fn seed_reconstruction_from_reference(
         }
         let seed_point_idx = points.len();
         reference_point_to_seed.insert(reference_point_idx, seed_point_idx);
-        point_ids.push(reference.try_point3d_id(reference_point_idx).ok()?);
+        point_ids.push(
+            reference
+                .try_point3d_id(reference_point_idx)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "reference point index {reference_point_idx} field point_id: {error}"
+                    )
+                })?,
+        );
         points.push(Point3D {
             xyz: reference_point.xyz,
             color: reference_point.color,
@@ -614,12 +623,14 @@ pub(super) fn seed_reconstruction_from_reference(
     }
 
     let has_registered_pose = poses.iter().any(Option::is_some);
-    (has_registered_pose || !points.is_empty()).then_some(ReconstructionSeed {
-        poses,
-        observations,
-        point_ids,
-        points,
-    })
+    Ok(
+        (has_registered_pose || !points.is_empty()).then_some(ReconstructionSeed {
+            poses,
+            observations,
+            point_ids,
+            points,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -1375,4 +1386,65 @@ pub(super) fn fallback_camera(first_image: &Path) -> CameraModel {
         width as f32 * 0.5,
         height as f32 * 0.5,
     )
+}
+
+#[cfg(test)]
+mod seed_point_id_tests {
+    use super::*;
+
+    fn reference_with_point(point_ids: Vec<u64>) -> Reconstruction {
+        let camera = CameraModel::new_pinhole(64, 48, 40.0, 40.0, 32.0, 24.0);
+        Reconstruction {
+            camera,
+            cameras: vec![camera],
+            camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_names: vec!["a.png".to_owned()],
+            image_paths: vec![PathBuf::from("a.png")],
+            image_ids: vec![1],
+            image_camera_indices: vec![0],
+            image_frame_indices: vec![None],
+            poses: vec![Some(SE3::identity())],
+            observations: vec![vec![Some(0)]],
+            keypoints: vec![vec![rustscan_slam::KeyPoint::new(1.0, 1.0)]],
+            point_ids,
+            points: vec![Point3D {
+                xyz: [0.0, 0.0, 1.0],
+                color: [0, 0, 0],
+                error: 0.1,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: 0,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn missing_reference_point_id_fails_instead_of_dropping_the_seed() {
+        let error = seed_reconstruction_from_reference(
+            &reference_with_point(Vec::new()),
+            &[PathBuf::from("images/a.png")],
+        )
+        .expect_err("missing point id must be an error");
+        let message = error.to_string();
+        assert!(message.contains("reference point index 0"), "{message}");
+        assert!(message.contains("point_id"), "{message}");
+
+        let seed = seed_reconstruction_from_reference(
+            &reference_with_point(vec![41]),
+            &[PathBuf::from("images/a.png")],
+        )
+        .expect("stored point id")
+        .expect("seed");
+        assert_eq!(seed.point_ids, vec![41]);
+
+        assert!(seed_reconstruction_from_reference(
+            &reference_with_point(Vec::new()),
+            &[PathBuf::from("images/other.png")],
+        )
+        .expect("an unmatched image is not a point-id failure")
+        .is_none());
+    }
 }

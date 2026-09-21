@@ -1,7 +1,3 @@
-// Deprecated reconstruction accessors remain callable until export and
-// numerical paths move to the strict lookups. New core paths must not use them.
-#![allow(deprecated)]
-
 pub mod ba;
 mod execution;
 pub mod sequence_registration;

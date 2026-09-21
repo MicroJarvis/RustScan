@@ -402,6 +402,7 @@ fn validate_observation_track_agreement(
 fn validate_rig_frame_references(
     reconstruction: &Reconstruction,
 ) -> Result<(), ReconstructionValidationError> {
+    validate_rigs(reconstruction)?;
     for (frame_index, frame) in reconstruction.frames.iter().enumerate() {
         let Some(rig) = reconstruction
             .rigs
@@ -512,6 +513,85 @@ fn validate_frame_data(
                 "data_id",
                 "camera data id does not point back at this frame",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rigs(reconstruction: &Reconstruction) -> Result<(), ReconstructionValidationError> {
+    for (rig_index, rig) in reconstruction.rigs.iter().enumerate() {
+        let mut seen_sensors = HashSet::new();
+        for sensor in &rig.sensors {
+            ensure_id_legal(
+                PersistentIdDomain::ColmapRecord,
+                u64::from(sensor.sensor_id.sensor_id),
+                "rig",
+                "sensor_id",
+            )?;
+            if !seen_sensors.insert(sensor.sensor_id.clone()) {
+                return Err(validation_error(
+                    "rig",
+                    format!(
+                        "rig_index={rig_index},rig_id={},sensor_id={},sensor_type={:?}",
+                        rig.rig_id, sensor.sensor_id.sensor_id, sensor.sensor_id.sensor_type
+                    ),
+                    "sensor_id",
+                    "rig sensor id is duplicated",
+                ));
+            }
+            if sensor.sensor_id.sensor_type == SensorType::Camera
+                && !reconstruction
+                    .camera_ids
+                    .contains(&sensor.sensor_id.sensor_id)
+            {
+                return Err(validation_error(
+                    "rig",
+                    format!(
+                        "rig_index={rig_index},rig_id={},sensor_id={}",
+                        rig.rig_id, sensor.sensor_id.sensor_id
+                    ),
+                    "sensor_id",
+                    "camera sensor id does not reference a camera",
+                ));
+            }
+            if let Some(sensor_from_rig) = &sensor.sensor_from_rig {
+                if !sensor_from_rig.qvec.iter().all(|value| value.is_finite())
+                    || !sensor_from_rig.tvec.iter().all(|value| value.is_finite())
+                {
+                    return Err(validation_error(
+                        "rig",
+                        format!(
+                            "rig_index={rig_index},rig_id={},sensor_id={}",
+                            rig.rig_id, sensor.sensor_id.sensor_id
+                        ),
+                        "sensor_from_rig",
+                        "sensor_from_rig rotation or translation is non-finite",
+                    ));
+                }
+            }
+        }
+        if let Some(reference) = &rig.ref_sensor_id {
+            ensure_id_legal(
+                PersistentIdDomain::ColmapRecord,
+                u64::from(reference.sensor_id),
+                "rig",
+                "ref_sensor_id",
+            )?;
+            if !rig
+                .sensors
+                .iter()
+                .any(|sensor| &sensor.sensor_id == reference)
+            {
+                return Err(validation_error(
+                    "rig",
+                    format!(
+                        "rig_index={rig_index},rig_id={},sensor_id={},sensor_type={:?}",
+                        rig.rig_id, reference.sensor_id, reference.sensor_type
+                    ),
+                    "ref_sensor_id",
+                    "rig reference sensor is not in the rig sensor list",
+                ));
+            }
         }
     }
     Ok(())
@@ -829,7 +909,7 @@ pub fn fresh_colmap_record_ids(count: usize) -> Result<Vec<u32>, ReconstructionV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Rigid3, SensorId, SensorType, TrackObservation};
+    use crate::types::{RigSensor, Rigid3, SensorId, SensorType, TrackObservation};
     use std::path::PathBuf;
 
     fn camera() -> CameraModel {
@@ -1005,7 +1085,10 @@ mod tests {
         base.rigs.push(Rig {
             rig_id: 1,
             ref_sensor_id: Some(sensor.clone()),
-            sensors: Vec::new(),
+            sensors: vec![RigSensor {
+                sensor_id: sensor.clone(),
+                sensor_from_rig: None,
+            }],
         });
         base.frames.push(Frame {
             frame_id: 1,
@@ -1072,6 +1155,80 @@ mod tests {
         let mut non_finite_frame = base;
         non_finite_frame.frames[0].rig_from_world.tvec[0] = f64::NAN;
         cases.push(("rig_from_world", non_finite_frame));
+
+        for (field, reconstruction) in cases {
+            assert_error(validate_structure(&reconstruction), field);
+        }
+    }
+
+    #[test]
+    fn rig_sensor_errors_name_the_failing_field() {
+        let camera_sensor = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 1,
+        };
+        let mut legal = two_images();
+        legal.rigs.push(Rig {
+            rig_id: 1,
+            ref_sensor_id: Some(camera_sensor.clone()),
+            sensors: vec![RigSensor {
+                sensor_id: camera_sensor.clone(),
+                sensor_from_rig: Some(Rigid3::identity()),
+            }],
+        });
+        validate_structure(&legal).expect("legal rig without frames");
+
+        let mut cases: Vec<(&str, Reconstruction)> = Vec::new();
+
+        let mut missing_ref = legal.clone();
+        missing_ref.rigs[0].sensors.clear();
+        cases.push(("ref_sensor_id", missing_ref));
+
+        let mut duplicate_sensor = legal.clone();
+        duplicate_sensor.rigs[0].sensors.push(RigSensor {
+            sensor_id: camera_sensor,
+            sensor_from_rig: None,
+        });
+        cases.push(("sensor_id", duplicate_sensor));
+
+        let mut missing_camera = legal.clone();
+        let unknown_camera = SensorId {
+            sensor_type: SensorType::Camera,
+            sensor_id: 99,
+        };
+        missing_camera.rigs[0].sensors[0].sensor_id = unknown_camera.clone();
+        missing_camera.rigs[0].ref_sensor_id = Some(unknown_camera);
+        cases.push(("sensor_id", missing_camera));
+
+        let mut foreign_sensor = legal.clone();
+        foreign_sensor.frames.push(Frame {
+            frame_id: 1,
+            rig_id: 1,
+            rig_from_world: Rigid3::identity(),
+            data_ids: vec![DataId {
+                sensor_id: SensorId {
+                    sensor_type: SensorType::Camera,
+                    sensor_id: 8,
+                },
+                data_id: 1,
+            }],
+        });
+        foreign_sensor.image_frame_indices[0] = Some(0);
+        cases.push(("sensor_id", foreign_sensor));
+
+        let mut non_finite_translation = legal.clone();
+        non_finite_translation.rigs[0].sensors[0].sensor_from_rig = Some(Rigid3 {
+            qvec: [1.0, 0.0, 0.0, 0.0],
+            tvec: [f64::NAN, 0.0, 0.0],
+        });
+        cases.push(("sensor_from_rig", non_finite_translation));
+
+        let mut non_finite_rotation = legal;
+        non_finite_rotation.rigs[0].sensors[0].sensor_from_rig = Some(Rigid3 {
+            qvec: [f64::INFINITY, 0.0, 0.0, 0.0],
+            tvec: [0.0, 0.0, 0.0],
+        });
+        cases.push(("sensor_from_rig", non_finite_rotation));
 
         for (field, reconstruction) in cases {
             assert_error(validate_structure(&reconstruction), field);
