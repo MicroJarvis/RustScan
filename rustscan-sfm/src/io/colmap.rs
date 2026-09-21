@@ -1,17 +1,56 @@
 use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
+use crate::reconstruction_validation::{validate_for_colmap_export, COLMAP_ID_EXCLUSIVE_LIMIT};
 use crate::types::{
-    colmap_camera_model_id, colmap_camera_model_name, colmap_camera_model_num_params, CameraModel,
-    DataId, Frame, Point3D, Reconstruction, Rig, RigSensor, Rigid3, SensorId, SensorType,
-    TrackObservation,
+    colmap_camera_model_focal_idxs, colmap_camera_model_id, colmap_camera_model_name,
+    colmap_camera_model_num_params, CameraModel, DataId, Frame, Point3D, Reconstruction, Rig,
+    RigSensor, Rigid3, SensorId, SensorType, TrackObservation,
 };
 use anyhow::{bail, Context, Result};
 use nalgebra::{Matrix3, Quaternion, UnitQuaternion, Vector3};
 use rustscan_slam::SE3;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+
+/// Quaternions at or below this Euclidean norm are rejected.
+///
+/// A finite norm above the epsilon may be normalized after validation. A zero
+/// quaternion is never replaced with the identity.
+const QUATERNION_NORM_EPSILON: f64 = 1e-8;
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "source={data_source} record={record_type} id={record_id} referenced={referenced_id} feature={feature_index} reason={reason}"
+)]
+struct ColmapIoError {
+    data_source: String,
+    record_type: &'static str,
+    record_id: String,
+    referenced_id: String,
+    feature_index: String,
+    reason: String,
+}
+
+fn colmap_io_error(
+    source: &Path,
+    record_type: &'static str,
+    record_id: impl Display,
+    referenced_id: impl Display,
+    feature_index: impl Display,
+    reason: impl Display,
+) -> ColmapIoError {
+    ColmapIoError {
+        data_source: source.display().to_string(),
+        record_type,
+        record_id: record_id.to_string(),
+        referenced_id: referenced_id.to_string(),
+        feature_index: feature_index.to_string(),
+        reason: reason.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColmapPose {
@@ -279,19 +318,57 @@ pub fn read_colmap_sparse_files_with_format(
     })
 }
 
+struct LocatedSparseFiles {
+    files: ColmapSparseFiles,
+    directory: PathBuf,
+    format: ColmapSparseFormat,
+}
+
+fn read_located_sparse_files(root: &Path) -> Result<LocatedSparseFiles> {
+    let directory = resolve_sparse_dir(root)?;
+    let has_required_bin = directory.join("cameras.bin").exists()
+        && directory.join("images.bin").exists()
+        && directory.join("points3D.bin").exists();
+    let has_required_txt = directory.join("cameras.txt").exists()
+        && directory.join("images.txt").exists()
+        && directory.join("points3D.txt").exists();
+    let format = if has_required_bin {
+        ColmapSparseFormat::Binary
+    } else if has_required_txt {
+        ColmapSparseFormat::Text
+    } else {
+        bail!(
+            "missing COLMAP cameras/images/points3D sparse model files under {}",
+            directory.display()
+        )
+    };
+    let files = read_colmap_sparse_files_with_format(&directory, format)?;
+    Ok(LocatedSparseFiles {
+        files,
+        directory,
+        format,
+    })
+}
+
 pub fn read_colmap_reconstruction(root: &Path) -> Result<Reconstruction> {
-    let sparse = read_colmap_sparse_files(root)?;
-    reconstruction_from_colmap_files(&sparse)
+    let located = read_located_sparse_files(root)?;
+    reconstruction_from_colmap_files(&located.files, &located.directory, located.format)
 }
 
 pub fn read_colmap_sparse_model(root: &Path) -> Result<ColmapSparseModel> {
-    let sparse = read_colmap_sparse_files(root)?;
-    let mut reconstruction = reconstruction_from_colmap_files(&sparse)?;
-    apply_rig_frame_metadata_to_reconstruction(&mut reconstruction, &sparse.rigs, &sparse.frames);
+    let located = read_located_sparse_files(root)?;
+    let mut reconstruction =
+        reconstruction_from_colmap_files(&located.files, &located.directory, located.format)?;
+    apply_rig_frame_metadata_to_reconstruction(
+        &mut reconstruction,
+        &located.files.rigs,
+        &located.files.frames,
+        &sparse_record_path(&located.directory, "frames", located.format),
+    )?;
     Ok(ColmapSparseModel {
         reconstruction,
-        rigs: sparse.rigs,
-        frames: sparse.frames,
+        rigs: located.files.rigs,
+        frames: located.files.frames,
     })
 }
 
@@ -405,40 +482,761 @@ pub fn world_to_camera_rotation(pose: &ColmapPose) -> Matrix3<f64> {
     .into_inner()
 }
 
+fn sparse_record_path(directory: &Path, stem: &str, format: ColmapSparseFormat) -> PathBuf {
+    let extension = match format {
+        ColmapSparseFormat::Text => "txt",
+        ColmapSparseFormat::Binary => "bin",
+    };
+    directory.join(format!("{stem}.{extension}"))
+}
+
+fn validate_colmap_sparse_files(
+    sparse: &ColmapSparseFiles,
+    directory: &Path,
+    format: ColmapSparseFormat,
+) -> Result<()> {
+    let camera_ids = validate_cameras(
+        &sparse.cameras,
+        &sparse_record_path(directory, "cameras", format),
+    )?;
+    let images = validate_images(
+        &sparse.images,
+        &camera_ids,
+        &sparse_record_path(directory, "images", format),
+    )?;
+    validate_points_and_tracks(
+        &sparse.points3d,
+        &images,
+        &sparse_record_path(directory, "points3D", format),
+        &sparse_record_path(directory, "images", format),
+    )?;
+    validate_rigs_and_frames(
+        &sparse.rigs,
+        &sparse.frames,
+        &camera_ids,
+        &images.keys().copied().collect(),
+        &sparse_record_path(directory, "rigs", format),
+        &sparse_record_path(directory, "frames", format),
+        Some(&images),
+    )?;
+    Ok(())
+}
+
+fn validate_cameras(cameras: &[ColmapCamera], source: &Path) -> Result<HashSet<u32>> {
+    let mut camera_ids = HashSet::new();
+    for camera in cameras {
+        if !camera_ids.insert(camera.camera_id) {
+            return Err(colmap_io_error(
+                source,
+                "camera",
+                camera.camera_id,
+                "-",
+                "-",
+                "duplicate camera id",
+            )
+            .into());
+        }
+        ensure_colmap_record_id(
+            u64::from(camera.camera_id),
+            source,
+            "camera",
+            camera.camera_id,
+        )?;
+        if camera.width == 0 || camera.height == 0 {
+            return Err(colmap_io_error(
+                source,
+                "camera",
+                camera.camera_id,
+                "-",
+                "-",
+                format!(
+                    "image dimensions are illegal (width={}, height={})",
+                    camera.width, camera.height
+                ),
+            )
+            .into());
+        }
+        let Some(expected) = colmap_camera_model_num_params(camera.model_id) else {
+            return Err(colmap_io_error(
+                source,
+                "camera",
+                camera.camera_id,
+                camera.model_id,
+                "-",
+                "unknown camera model",
+            )
+            .into());
+        };
+        if camera.params.len() != expected {
+            return Err(colmap_io_error(
+                source,
+                "camera",
+                camera.camera_id,
+                camera.model_id,
+                "-",
+                format!(
+                    "camera parameter count is {} but model {expected} parameters are required",
+                    camera.params.len()
+                ),
+            )
+            .into());
+        }
+        if camera.params.iter().any(|value| !value.is_finite()) {
+            return Err(colmap_io_error(
+                source,
+                "camera",
+                camera.camera_id,
+                "-",
+                "-",
+                "camera parameter is non-finite",
+            )
+            .into());
+        }
+        let Some(focal_idxs) = colmap_camera_model_focal_idxs(camera.model_id) else {
+            return Err(colmap_io_error(
+                source,
+                "camera",
+                camera.camera_id,
+                camera.model_id,
+                "-",
+                "camera model has no focal parameters",
+            )
+            .into());
+        };
+        for focal_index in focal_idxs {
+            let focal = camera.params[*focal_index];
+            if !focal.is_finite() || focal <= 0.0 {
+                return Err(colmap_io_error(
+                    source,
+                    "camera",
+                    camera.camera_id,
+                    "-",
+                    "-",
+                    format!("focal parameter at index {focal_index} is illegal ({focal})"),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(camera_ids)
+}
+
+fn validate_images<'a>(
+    images: &'a [ColmapImage],
+    camera_ids: &HashSet<u32>,
+    source: &Path,
+) -> Result<HashMap<u32, &'a ColmapImage>> {
+    let mut by_id = HashMap::new();
+    for image in images {
+        if by_id.contains_key(&image.image_id) {
+            return Err(colmap_io_error(
+                source,
+                "image",
+                image.image_id,
+                "-",
+                "-",
+                "duplicate image id",
+            )
+            .into());
+        }
+        ensure_colmap_record_id(u64::from(image.image_id), source, "image", image.image_id)?;
+        if !camera_ids.contains(&image.camera_id) {
+            return Err(colmap_io_error(
+                source,
+                "image",
+                image.image_id,
+                image.camera_id,
+                "-",
+                "image references a missing camera",
+            )
+            .into());
+        }
+        validate_quaternion(image.qvec, source, "image", image.image_id, "-")?;
+        if image.tvec.iter().any(|value| !value.is_finite()) {
+            return Err(colmap_io_error(
+                source,
+                "image",
+                image.image_id,
+                "-",
+                "-",
+                "translation is non-finite",
+            )
+            .into());
+        }
+        for (feature_index, point) in image.points2d.iter().enumerate() {
+            if point.xy.iter().any(|value| !value.is_finite()) {
+                return Err(colmap_io_error(
+                    source,
+                    "image",
+                    image.image_id,
+                    "-",
+                    feature_index,
+                    "observation coordinate is non-finite",
+                )
+                .into());
+            }
+        }
+        by_id.insert(image.image_id, image);
+    }
+    Ok(by_id)
+}
+
+fn validate_points_and_tracks(
+    points: &[ColmapPoint3D],
+    images: &HashMap<u32, &ColmapImage>,
+    points_source: &Path,
+    images_source: &Path,
+) -> Result<()> {
+    let mut point_ids = HashSet::new();
+    let mut points_by_id = HashMap::new();
+    for point in points {
+        if !point_ids.insert(point.point3d_id) {
+            return Err(colmap_io_error(
+                points_source,
+                "point",
+                point.point3d_id,
+                "-",
+                "-",
+                "duplicate point id",
+            )
+            .into());
+        }
+        if point.point3d_id == 0 {
+            return Err(colmap_io_error(
+                points_source,
+                "point",
+                point.point3d_id,
+                "-",
+                "-",
+                "point id 0 is illegal",
+            )
+            .into());
+        }
+        if point.xyz.iter().any(|value| !value.is_finite()) {
+            return Err(colmap_io_error(
+                points_source,
+                "point",
+                point.point3d_id,
+                "-",
+                "-",
+                "point coordinate is non-finite",
+            )
+            .into());
+        }
+        if !point.error.is_finite() {
+            return Err(colmap_io_error(
+                points_source,
+                "point",
+                point.point3d_id,
+                "-",
+                "-",
+                "reprojection error is non-finite",
+            )
+            .into());
+        }
+        points_by_id.insert(point.point3d_id, point);
+    }
+
+    let mut listed_observations = HashSet::new();
+    for point in points {
+        for element in &point.track {
+            let feature_index = match usize::try_from(element.point2d_idx) {
+                Ok(index) => index,
+                Err(_) => {
+                    return Err(colmap_io_error(
+                        points_source,
+                        "point",
+                        point.point3d_id,
+                        element.image_id,
+                        element.point2d_idx,
+                        "feature index overflows usize",
+                    )
+                    .into());
+                }
+            };
+            if !listed_observations.insert((element.image_id, element.point2d_idx)) {
+                return Err(colmap_io_error(
+                    points_source,
+                    "point",
+                    point.point3d_id,
+                    element.image_id,
+                    element.point2d_idx,
+                    "duplicate track observation",
+                )
+                .into());
+            }
+            let Some(image) = images.get(&element.image_id) else {
+                return Err(colmap_io_error(
+                    points_source,
+                    "point",
+                    point.point3d_id,
+                    element.image_id,
+                    element.point2d_idx,
+                    "track references a missing image",
+                )
+                .into());
+            };
+            if feature_index >= image.points2d.len() {
+                return Err(colmap_io_error(
+                    points_source,
+                    "point",
+                    point.point3d_id,
+                    element.image_id,
+                    element.point2d_idx,
+                    "feature index is out of range",
+                )
+                .into());
+            }
+            match image.points2d[feature_index].point3d_id {
+                Some(point3d_id) if point3d_id == point.point3d_id => {}
+                other => {
+                    return Err(colmap_io_error(
+                        points_source,
+                        "point",
+                        point.point3d_id,
+                        other
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        element.point2d_idx,
+                        "point track does not match the image observation",
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    for image in images.values() {
+        for (feature_index, point2d) in image.points2d.iter().enumerate() {
+            let Some(point3d_id) = point2d.point3d_id else {
+                continue;
+            };
+            let Some(point) = points_by_id.get(&point3d_id) else {
+                return Err(colmap_io_error(
+                    images_source,
+                    "image",
+                    image.image_id,
+                    point3d_id,
+                    feature_index,
+                    "observation references a missing point",
+                )
+                .into());
+            };
+            let listed = point.track.iter().any(|element| {
+                element.image_id == image.image_id && element.point2d_idx == feature_index as u64
+            });
+            if !listed {
+                return Err(colmap_io_error(
+                    images_source,
+                    "image",
+                    image.image_id,
+                    point3d_id,
+                    feature_index,
+                    "image observation does not match the point track",
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rigs_and_frames(
+    rigs: &[ColmapRig],
+    frames: &[ColmapFrame],
+    camera_ids: &HashSet<u32>,
+    image_ids: &HashSet<u32>,
+    rigs_source: &Path,
+    frames_source: &Path,
+    images: Option<&HashMap<u32, &ColmapImage>>,
+) -> Result<()> {
+    let mut rig_ids = HashSet::new();
+    let mut sensors_by_rig: HashMap<u32, HashSet<(String, u32)>> = HashMap::new();
+    for rig in rigs {
+        if !rig_ids.insert(rig.rig_id) {
+            return Err(colmap_io_error(
+                rigs_source,
+                "rig",
+                rig.rig_id,
+                "-",
+                "-",
+                "duplicate rig id",
+            )
+            .into());
+        }
+        ensure_colmap_record_id(u64::from(rig.rig_id), rigs_source, "rig", rig.rig_id)?;
+        let mut sensors = HashSet::new();
+        if let Some(reference) = &rig.ref_sensor_id {
+            validate_sensor_reference(
+                reference,
+                camera_ids,
+                rigs_source,
+                "rig",
+                rig.rig_id,
+                "reference sensor",
+            )?;
+            if !sensors.insert(sensor_key(reference)) {
+                return Err(colmap_io_error(
+                    rigs_source,
+                    "rig",
+                    rig.rig_id,
+                    reference.sensor_id,
+                    "-",
+                    "duplicate rig sensor id",
+                )
+                .into());
+            }
+        } else if !rig.sensors.is_empty() {
+            return Err(colmap_io_error(
+                rigs_source,
+                "rig",
+                rig.rig_id,
+                "-",
+                "-",
+                "rig has sensors but no reference sensor",
+            )
+            .into());
+        }
+        for sensor in &rig.sensors {
+            validate_sensor_reference(
+                &sensor.sensor_id,
+                camera_ids,
+                rigs_source,
+                "rig",
+                rig.rig_id,
+                "rig sensor",
+            )?;
+            if !sensors.insert(sensor_key(&sensor.sensor_id)) {
+                return Err(colmap_io_error(
+                    rigs_source,
+                    "rig",
+                    rig.rig_id,
+                    sensor.sensor_id.sensor_id,
+                    "-",
+                    "duplicate rig sensor id",
+                )
+                .into());
+            }
+            if let Some(sensor_from_rig) = &sensor.sensor_from_rig {
+                validate_quaternion(
+                    sensor_from_rig.qvec,
+                    rigs_source,
+                    "rig",
+                    rig.rig_id,
+                    sensor.sensor_id.sensor_id,
+                )?;
+                if sensor_from_rig.tvec.iter().any(|value| !value.is_finite()) {
+                    return Err(colmap_io_error(
+                        rigs_source,
+                        "rig",
+                        rig.rig_id,
+                        sensor.sensor_id.sensor_id,
+                        "-",
+                        "sensor translation is non-finite",
+                    )
+                    .into());
+                }
+            }
+        }
+        sensors_by_rig.insert(rig.rig_id, sensors);
+    }
+
+    let mut frame_ids = HashSet::new();
+    let mut image_frame = HashMap::new();
+    for frame in frames {
+        if !frame_ids.insert(frame.frame_id) {
+            return Err(colmap_io_error(
+                frames_source,
+                "frame",
+                frame.frame_id,
+                "-",
+                "-",
+                "duplicate frame id",
+            )
+            .into());
+        }
+        ensure_colmap_record_id(
+            u64::from(frame.frame_id),
+            frames_source,
+            "frame",
+            frame.frame_id,
+        )?;
+        let Some(sensors) = sensors_by_rig.get(&frame.rig_id) else {
+            return Err(colmap_io_error(
+                frames_source,
+                "frame",
+                frame.frame_id,
+                frame.rig_id,
+                "-",
+                "frame references a missing rig",
+            )
+            .into());
+        };
+        validate_quaternion(
+            frame.rig_from_world.qvec,
+            frames_source,
+            "frame",
+            frame.frame_id,
+            "-",
+        )?;
+        if frame
+            .rig_from_world
+            .tvec
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(colmap_io_error(
+                frames_source,
+                "frame",
+                frame.frame_id,
+                "-",
+                "-",
+                "frame translation is non-finite",
+            )
+            .into());
+        }
+        for data_id in &frame.data_ids {
+            if !sensors.contains(&sensor_key(&data_id.sensor_id)) {
+                return Err(colmap_io_error(
+                    frames_source,
+                    "frame",
+                    frame.frame_id,
+                    data_id.sensor_id.sensor_id,
+                    "-",
+                    "frame sensor is not on the referenced rig",
+                )
+                .into());
+            }
+            if data_id.data_id == 0 {
+                return Err(colmap_io_error(
+                    frames_source,
+                    "frame",
+                    frame.frame_id,
+                    data_id.sensor_id.sensor_id,
+                    "-",
+                    "data id 0 is illegal",
+                )
+                .into());
+            }
+            if data_id.sensor_id.sensor_type != ColmapSensorType::Camera {
+                continue;
+            }
+            let Ok(image_id) = u32::try_from(data_id.data_id) else {
+                return Err(colmap_io_error(
+                    frames_source,
+                    "frame",
+                    frame.frame_id,
+                    data_id.data_id,
+                    "-",
+                    "camera data id does not fit an image id",
+                )
+                .into());
+            };
+            if !image_ids.contains(&image_id) {
+                return Err(colmap_io_error(
+                    frames_source,
+                    "frame",
+                    frame.frame_id,
+                    image_id,
+                    "-",
+                    "camera data id references a missing image",
+                )
+                .into());
+            }
+            if let Some(images) = images {
+                if let Some(image) = images.get(&image_id) {
+                    if image.camera_id != data_id.sensor_id.sensor_id {
+                        return Err(colmap_io_error(
+                            frames_source,
+                            "frame",
+                            frame.frame_id,
+                            image_id,
+                            "-",
+                            format!(
+                                "camera data sensor {} does not match image camera {}",
+                                data_id.sensor_id.sensor_id, image.camera_id
+                            ),
+                        )
+                        .into());
+                    }
+                }
+            }
+            if image_frame.contains_key(&image_id) {
+                return Err(colmap_io_error(
+                    frames_source,
+                    "frame",
+                    frame.frame_id,
+                    image_id,
+                    "-",
+                    "image is assigned to more than one frame",
+                )
+                .into());
+            }
+            image_frame.insert(image_id, frame.frame_id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_sensor_reference(
+    sensor: &ColmapSensorId,
+    camera_ids: &HashSet<u32>,
+    source: &Path,
+    record_type: &'static str,
+    record_id: u32,
+    role: &str,
+) -> Result<()> {
+    ensure_colmap_record_id(u64::from(sensor.sensor_id), source, record_type, record_id)?;
+    if sensor.sensor_type == ColmapSensorType::Invalid {
+        return Err(colmap_io_error(
+            source,
+            record_type,
+            record_id,
+            sensor.sensor_id,
+            "-",
+            format!("{role} type is invalid"),
+        )
+        .into());
+    }
+    if sensor.sensor_type == ColmapSensorType::Camera && !camera_ids.contains(&sensor.sensor_id) {
+        return Err(colmap_io_error(
+            source,
+            record_type,
+            record_id,
+            sensor.sensor_id,
+            "-",
+            format!("{role} references a missing camera"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_quaternion(
+    qvec: [f64; 4],
+    source: &Path,
+    record_type: &'static str,
+    record_id: impl Display,
+    referenced_id: impl Display,
+) -> Result<()> {
+    if qvec.iter().any(|value| !value.is_finite()) {
+        return Err(colmap_io_error(
+            source,
+            record_type,
+            record_id,
+            referenced_id,
+            "-",
+            "quaternion is non-finite",
+        )
+        .into());
+    }
+    let norm = qvec.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if norm <= QUATERNION_NORM_EPSILON {
+        return Err(colmap_io_error(
+            source,
+            record_type,
+            record_id,
+            referenced_id,
+            "-",
+            "quaternion norm is zero",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn ensure_colmap_record_id(
+    id: u64,
+    source: &Path,
+    record_type: &'static str,
+    record_id: impl Display,
+) -> Result<()> {
+    if id == 0 || id >= COLMAP_ID_EXCLUSIVE_LIMIT {
+        return Err(colmap_io_error(
+            source,
+            record_type,
+            record_id,
+            id,
+            "-",
+            format!("id is outside 1..{COLMAP_ID_EXCLUSIVE_LIMIT}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn sensor_key(sensor: &ColmapSensorId) -> (String, u32) {
+    (
+        sensor_type_name(&sensor.sensor_type).to_string(),
+        sensor.sensor_id,
+    )
+}
+
+fn insert_new<K, V>(map: &mut HashMap<K, V>, key: K, value: V) -> bool
+where
+    K: Eq + std::hash::Hash,
+{
+    if map.contains_key(&key) {
+        return false;
+    }
+    map.insert(key, value);
+    true
+}
+
 fn reconstruction_from_colmap_parts(
     colmap_cameras: Vec<(u32, CameraModel)>,
     images: Vec<ColmapImage>,
     points3d: Vec<ColmapPoint3D>,
+    source: &Path,
 ) -> Result<Reconstruction> {
     if colmap_cameras.is_empty() {
         bail!("COLMAP reconstruction has no cameras");
     }
     let (camera_ids, cameras): (Vec<_>, Vec<_>) = colmap_cameras.into_iter().unzip();
-    let camera_index_by_id = camera_ids
-        .iter()
-        .enumerate()
-        .map(|(idx, &camera_id)| (camera_id, idx))
-        .collect::<HashMap<_, _>>();
-    let image_index_by_id = images
-        .iter()
-        .enumerate()
-        .map(|(idx, image)| (image.image_id, idx))
-        .collect::<HashMap<_, _>>();
+    let mut camera_index_by_id = HashMap::new();
+    for (idx, &camera_id) in camera_ids.iter().enumerate() {
+        if !insert_new(&mut camera_index_by_id, camera_id, idx) {
+            return Err(colmap_io_error(
+                source,
+                "camera",
+                camera_id,
+                "-",
+                "-",
+                "duplicate camera id",
+            )
+            .into());
+        }
+    }
+    let mut image_index_by_id = HashMap::new();
+    for (idx, image) in images.iter().enumerate() {
+        if !insert_new(&mut image_index_by_id, image.image_id, idx) {
+            return Err(colmap_io_error(
+                source,
+                "image",
+                image.image_id,
+                "-",
+                "-",
+                "duplicate image id",
+            )
+            .into());
+        }
+    }
 
-    let image_camera_indices = images
-        .iter()
-        .map(|image| {
-            camera_index_by_id
-                .get(&image.camera_id)
-                .copied()
-                .with_context(|| {
-                    format!(
-                        "image_id={} references missing camera_id={}",
-                        image.image_id, image.camera_id
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut image_camera_indices = Vec::with_capacity(images.len());
+    for image in &images {
+        let Some(camera_index) = camera_index_by_id.get(&image.camera_id).copied() else {
+            return Err(colmap_io_error(
+                source,
+                "image",
+                image.image_id,
+                image.camera_id,
+                "-",
+                "image references a missing camera",
+            )
+            .into());
+        };
+        image_camera_indices.push(camera_index);
+    }
     let (rigs, frames, image_frame_indices) = Reconstruction::empty_metadata(images.len());
     let keypoints = images
         .iter()
@@ -446,66 +1244,111 @@ fn reconstruction_from_colmap_parts(
             image
                 .points2d
                 .iter()
-                .map(|point| keypoint_from_colmap_point2d(point))
+                .map(keypoint_from_colmap_point2d)
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let mut point_index_by_id = BTreeMap::new();
+    for (idx, point) in points3d.iter().enumerate() {
+        if point_index_by_id.contains_key(&point.point3d_id) {
+            return Err(colmap_io_error(
+                source,
+                "point",
+                point.point3d_id,
+                "-",
+                "-",
+                "duplicate point id",
+            )
+            .into());
+        }
+        point_index_by_id.insert(point.point3d_id, idx);
+    }
+
     let mut observations = keypoints
         .iter()
         .map(|points| vec![None; points.len()])
         .collect::<Vec<_>>();
-    let point_index_by_id = points3d
-        .iter()
-        .enumerate()
-        .map(|(idx, point)| (point.point3d_id, idx))
-        .collect::<BTreeMap<_, _>>();
-
     for (image_idx, image) in images.iter().enumerate() {
         for (point2d_idx, point2d) in image.points2d.iter().enumerate() {
             let Some(point3d_id) = point2d.point3d_id else {
                 continue;
             };
             let Some(&point_idx) = point_index_by_id.get(&point3d_id) else {
-                continue;
+                return Err(colmap_io_error(
+                    source,
+                    "image",
+                    image.image_id,
+                    point3d_id,
+                    point2d_idx,
+                    "observation references a missing point",
+                )
+                .into());
             };
             observations[image_idx][point2d_idx] = Some(point_idx);
         }
     }
 
-    let mut points = points3d
-        .iter()
-        .map(|point| {
-            let track = point
-                .track
-                .iter()
-                .filter_map(|elem| {
-                    let image = *image_index_by_id.get(&elem.image_id)?;
-                    let feature = elem.point2d_idx as usize;
-                    keypoints
-                        .get(image)
-                        .filter(|points| feature < points.len())
-                        .map(|_| TrackObservation { image, feature })
-                })
-                .collect::<Vec<_>>();
-            Point3D {
-                xyz: [
-                    point.xyz[0] as f32,
-                    point.xyz[1] as f32,
-                    point.xyz[2] as f32,
-                ],
-                color: point.color,
-                error: point.error as f32,
-                track,
+    let mut points = Vec::with_capacity(points3d.len());
+    for point in &points3d {
+        let mut track = Vec::with_capacity(point.track.len());
+        for element in &point.track {
+            let Some(&image) = image_index_by_id.get(&element.image_id) else {
+                return Err(colmap_io_error(
+                    source,
+                    "point",
+                    point.point3d_id,
+                    element.image_id,
+                    element.point2d_idx,
+                    "track references a missing image",
+                )
+                .into());
+            };
+            let feature = match usize::try_from(element.point2d_idx) {
+                Ok(feature) => feature,
+                Err(_) => {
+                    return Err(colmap_io_error(
+                        source,
+                        "point",
+                        point.point3d_id,
+                        element.image_id,
+                        element.point2d_idx,
+                        "feature index overflows usize",
+                    )
+                    .into());
+                }
+            };
+            if keypoints
+                .get(image)
+                .is_none_or(|points| feature >= points.len())
+            {
+                return Err(colmap_io_error(
+                    source,
+                    "point",
+                    point.point3d_id,
+                    element.image_id,
+                    element.point2d_idx,
+                    "feature index is out of range",
+                )
+                .into());
             }
-        })
-        .collect::<Vec<_>>();
-    ensure_observations_have_point_tracks(&observations, &mut points);
-    ensure_point_tracks_have_observations(&mut observations, &points);
+            track.push(TrackObservation { image, feature });
+        }
+        points.push(Point3D {
+            xyz: [
+                point.xyz[0] as f32,
+                point.xyz[1] as f32,
+                point.xyz[2] as f32,
+            ],
+            color: point.color,
+            error: point.error as f32,
+            track,
+        });
+    }
 
-    let poses = images
-        .iter()
-        .map(|image| Some(se3_from_colmap_pose(image.qvec, image.tvec)))
-        .collect::<Vec<_>>();
+    let mut poses = Vec::with_capacity(images.len());
+    for image in &images {
+        poses.push(Some(se3_from_colmap_pose(image.qvec, image.tvec)?));
+    }
     let image_names = images
         .iter()
         .map(|image| image.name.clone())
@@ -539,7 +1382,12 @@ fn reconstruction_from_colmap_parts(
     })
 }
 
-fn reconstruction_from_colmap_files(sparse: &ColmapSparseFiles) -> Result<Reconstruction> {
+fn reconstruction_from_colmap_files(
+    sparse: &ColmapSparseFiles,
+    directory: &Path,
+    format: ColmapSparseFormat,
+) -> Result<Reconstruction> {
+    validate_colmap_sparse_files(sparse, directory, format)?;
     let cameras = sparse
         .cameras
         .iter()
@@ -549,42 +1397,83 @@ fn reconstruction_from_colmap_files(sparse: &ColmapSparseFiles) -> Result<Recons
             Ok((camera_id, camera_model_from_colmap(camera)?))
         })
         .collect::<Result<Vec<_>>>()?;
-    reconstruction_from_colmap_parts(cameras, sparse.images.clone(), sparse.points3d.clone())
+    reconstruction_from_colmap_parts(
+        cameras,
+        sparse.images.clone(),
+        sparse.points3d.clone(),
+        &sparse_record_path(directory, "cameras", format),
+    )
 }
 
 fn apply_rig_frame_metadata_to_reconstruction(
     reconstruction: &mut Reconstruction,
     rigs: &[ColmapRig],
     frames: &[ColmapFrame],
-) {
+    source: &Path,
+) -> Result<()> {
     reconstruction.rigs = rigs.iter().map(rig_from_colmap).collect();
     reconstruction.frames = frames.iter().map(frame_from_colmap).collect();
-    let frame_index_by_camera_data_id = frames
-        .iter()
-        .enumerate()
-        .flat_map(|(frame_idx, frame)| {
-            frame
-                .data_ids
-                .iter()
-                .filter(|data_id| data_id.sensor_id.sensor_type == ColmapSensorType::Camera)
-                .map(move |data_id| (data_id.data_id as u32, frame_idx))
-        })
-        .collect::<HashMap<_, _>>();
+    let mut frame_index_by_camera_data_id = HashMap::new();
+    for (frame_idx, frame) in frames.iter().enumerate() {
+        for data_id in &frame.data_ids {
+            if data_id.sensor_id.sensor_type != ColmapSensorType::Camera {
+                continue;
+            }
+            let Ok(image_id) = u32::try_from(data_id.data_id) else {
+                return Err(colmap_io_error(
+                    source,
+                    "frame",
+                    frame.frame_id,
+                    data_id.data_id,
+                    "-",
+                    "camera data id does not fit an image id",
+                )
+                .into());
+            };
+            if !insert_new(&mut frame_index_by_camera_data_id, image_id, frame_idx) {
+                return Err(colmap_io_error(
+                    source,
+                    "frame",
+                    frame.frame_id,
+                    image_id,
+                    "-",
+                    "image is assigned to more than one frame",
+                )
+                .into());
+            }
+        }
+    }
     reconstruction.image_frame_indices = reconstruction
         .image_ids
         .iter()
         .map(|image_id| frame_index_by_camera_data_id.get(image_id).copied())
         .collect();
+    Ok(())
 }
 
 fn rig_from_colmap(rig: &ColmapRig) -> Rig {
+    let ref_sensor_id = rig.ref_sensor_id.as_ref().map(sensor_id_from_colmap);
+    let mut sensors: Vec<_> = rig.sensors.iter().map(rig_sensor_from_colmap).collect();
+    // COLMAP stores the reference sensor beside the non-reference sensor list.
+    // Reconstruction validation also requires that sensor inside `sensors`.
+    // Copy the existing reference; do not invent a missing rig.
+    if let Some(reference) = &ref_sensor_id {
+        if !sensors.iter().any(|sensor| &sensor.sensor_id == reference) {
+            sensors.insert(
+                0,
+                RigSensor {
+                    sensor_id: reference.clone(),
+                    sensor_from_rig: None,
+                },
+            );
+        }
+    }
     Rig {
         rig_id: rig.rig_id,
-        ref_sensor_id: rig.ref_sensor_id.as_ref().map(sensor_id_from_colmap),
-        sensors: rig.sensors.iter().map(rig_sensor_from_colmap).collect(),
+        ref_sensor_id,
+        sensors,
     }
 }
-
 fn rig_sensor_from_colmap(sensor: &ColmapRigSensor) -> RigSensor {
     RigSensor {
         sensor_id: sensor_id_from_colmap(&sensor.sensor_id),
@@ -641,7 +1530,19 @@ fn keypoint_from_colmap_point2d(point: &ColmapPoint2D) -> rustscan_slam::KeyPoin
     }
 }
 
-fn se3_from_colmap_pose(qvec: [f64; 4], tvec: [f64; 3]) -> SE3 {
+fn se3_from_colmap_pose(qvec: [f64; 4], tvec: [f64; 3]) -> Result<SE3> {
+    validate_quaternion(qvec, Path::new("colmap-pose"), "image", "-", "-")?;
+    if tvec.iter().any(|value| !value.is_finite()) {
+        return Err(colmap_io_error(
+            Path::new("colmap-pose"),
+            "image",
+            "-",
+            "-",
+            "-",
+            "translation is non-finite",
+        )
+        .into());
+    }
     let rotation = crate::geometry::quat_from_xyzw(
         qvec[1] as f32,
         qvec[2] as f32,
@@ -649,51 +1550,10 @@ fn se3_from_colmap_pose(qvec: [f64; 4], tvec: [f64; 3]) -> SE3 {
         qvec[0] as f32,
     )
     .normalize();
-    SE3::from_quat_translation(
+    Ok(SE3::from_quat_translation(
         rotation,
         nalgebra::Vector3::new(tvec[0] as f32, tvec[1] as f32, tvec[2] as f32),
-    )
-}
-
-fn ensure_point_tracks_have_observations(
-    observations: &mut [Vec<Option<usize>>],
-    points: &[Point3D],
-) {
-    for (point_idx, point) in points.iter().enumerate() {
-        for obs in &point.track {
-            if let Some(slot) = observations
-                .get_mut(obs.image)
-                .and_then(|image_obs| image_obs.get_mut(obs.feature))
-            {
-                if slot.is_none() {
-                    *slot = Some(point_idx);
-                }
-            }
-        }
-    }
-}
-
-fn ensure_observations_have_point_tracks(
-    observations: &[Vec<Option<usize>>],
-    points: &mut [Point3D],
-) {
-    for (image, image_observations) in observations.iter().enumerate() {
-        for (feature, point_idx) in image_observations.iter().enumerate() {
-            let Some(point_idx) = point_idx else {
-                continue;
-            };
-            let Some(point) = points.get_mut(*point_idx) else {
-                continue;
-            };
-            if !point
-                .track
-                .iter()
-                .any(|obs| obs.image == image && obs.feature == feature)
-            {
-                point.track.push(TrackObservation { image, feature });
-            }
-        }
-    }
+    ))
 }
 
 pub fn export_colmap(
@@ -704,12 +1564,22 @@ pub fn export_colmap(
     export_colmap_with_sparse_index(root, reconstruction, copy_images, 0)
 }
 
+fn reject_invalid_export(reconstruction: &Reconstruction) -> Result<()> {
+    validate_for_colmap_export(reconstruction).map_err(|error| {
+        anyhow::anyhow!(
+            "source=reconstruction-export record=reconstruction id=- referenced=- feature=- reason={error}"
+        )
+    })
+}
+
 pub fn export_colmap_with_sparse_index(
     root: &Path,
     reconstruction: &Reconstruction,
     copy_images: bool,
     sparse_index: usize,
 ) -> Result<()> {
+    reject_invalid_export(reconstruction)?;
+    let sparse = sparse_files_from_reconstruction(reconstruction)?;
     let images_dir = root.join("images");
     let sparse_dir = root.join("sparse").join(sparse_index.to_string());
     fs::create_dir_all(&images_dir)?;
@@ -725,44 +1595,26 @@ pub fn export_colmap_with_sparse_index(
             }
         }
     }
-    write_cameras_txt(&sparse_dir.join("cameras.txt"), reconstruction)?;
-    write_images_txt(&sparse_dir.join("images.txt"), reconstruction)?;
-    write_points3d_txt(&sparse_dir.join("points3D.txt"), reconstruction)?;
-    if !reconstruction.rigs.is_empty() || !reconstruction.frames.is_empty() {
-        let rigs = reconstruction
-            .rigs
-            .iter()
-            .map(rig_to_colmap)
-            .collect::<Vec<_>>();
-        let frames = reconstruction
-            .frames
-            .iter()
-            .map(frame_to_colmap)
-            .collect::<Vec<_>>();
-        write_rigs_txt(&sparse_dir.join("rigs.txt"), &rigs)?;
-        write_frames_txt(&sparse_dir.join("frames.txt"), &frames)?;
+    write_raw_cameras_txt(&sparse_dir.join("cameras.txt"), &sparse.cameras)?;
+    write_raw_images_txt(&sparse_dir.join("images.txt"), &sparse)?;
+    write_raw_points3d_txt(&sparse_dir.join("points3D.txt"), &sparse.points3d)?;
+    if !sparse.rigs.is_empty() || !sparse.frames.is_empty() {
+        write_raw_rigs_txt(&sparse_dir.join("rigs.txt"), &sparse.rigs)?;
+        write_raw_frames_txt(&sparse_dir.join("frames.txt"), &sparse.frames)?;
     }
     Ok(())
 }
 
 pub fn export_colmap_sparse_snapshot(root: &Path, reconstruction: &Reconstruction) -> Result<()> {
+    reject_invalid_export(reconstruction)?;
+    let sparse = sparse_files_from_reconstruction(reconstruction)?;
     fs::create_dir_all(root)?;
-    write_cameras_txt(&root.join("cameras.txt"), reconstruction)?;
-    write_images_txt(&root.join("images.txt"), reconstruction)?;
-    write_points3d_txt(&root.join("points3D.txt"), reconstruction)?;
-    if !reconstruction.rigs.is_empty() || !reconstruction.frames.is_empty() {
-        let rigs = reconstruction
-            .rigs
-            .iter()
-            .map(rig_to_colmap)
-            .collect::<Vec<_>>();
-        let frames = reconstruction
-            .frames
-            .iter()
-            .map(frame_to_colmap)
-            .collect::<Vec<_>>();
-        write_rigs_txt(&root.join("rigs.txt"), &rigs)?;
-        write_frames_txt(&root.join("frames.txt"), &frames)?;
+    write_raw_cameras_txt(&root.join("cameras.txt"), &sparse.cameras)?;
+    write_raw_images_txt(&root.join("images.txt"), &sparse)?;
+    write_raw_points3d_txt(&root.join("points3D.txt"), &sparse.points3d)?;
+    if !sparse.rigs.is_empty() || !sparse.frames.is_empty() {
+        write_raw_rigs_txt(&root.join("rigs.txt"), &sparse.rigs)?;
+        write_raw_frames_txt(&root.join("frames.txt"), &sparse.frames)?;
     }
     Ok(())
 }
@@ -772,14 +1624,57 @@ pub fn export_colmap_sparse_model(
     model: &ColmapSparseModel,
     copy_images: bool,
 ) -> Result<()> {
-    export_colmap(root, &model.reconstruction, copy_images)?;
+    reject_invalid_export(&model.reconstruction)?;
+    let camera_ids = model.reconstruction.camera_ids.iter().copied().collect();
+    let image_ids = model.reconstruction.image_ids.iter().copied().collect();
     let sparse_dir = root.join("sparse").join("0");
+    validate_rigs_and_frames(
+        &model.rigs,
+        &model.frames,
+        &camera_ids,
+        &image_ids,
+        &sparse_dir.join("rigs.txt"),
+        &sparse_dir.join("frames.txt"),
+        None,
+    )?;
+    for frame in &model.frames {
+        for data_id in &frame.data_ids {
+            if data_id.sensor_id.sensor_type != ColmapSensorType::Camera {
+                continue;
+            }
+            let Some(image_index) = model
+                .reconstruction
+                .image_ids
+                .iter()
+                .position(|image_id| u64::from(*image_id) == data_id.data_id)
+            else {
+                continue;
+            };
+            let camera_id = model.reconstruction.try_camera_id_for_image(image_index)?;
+            if camera_id != data_id.sensor_id.sensor_id {
+                return Err(colmap_io_error(
+                    &sparse_dir.join("frames.txt"),
+                    "frame",
+                    frame.frame_id,
+                    data_id.data_id,
+                    "-",
+                    format!(
+                        "camera data sensor {} does not match image camera {camera_id}",
+                        data_id.sensor_id.sensor_id
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+    export_colmap(root, &model.reconstruction, copy_images)?;
     write_rigs_txt(&sparse_dir.join("rigs.txt"), &model.rigs)?;
     write_frames_txt(&sparse_dir.join("frames.txt"), &model.frames)?;
     Ok(())
 }
 
 pub fn write_colmap_sparse_text(root: &Path, sparse: &ColmapSparseFiles) -> Result<()> {
+    validate_colmap_sparse_files(sparse, root, ColmapSparseFormat::Text)?;
     fs::create_dir_all(root)?;
     write_raw_rigs_txt(&root.join("rigs.txt"), &sparse.rigs)?;
     write_raw_cameras_txt(&root.join("cameras.txt"), &sparse.cameras)?;
@@ -790,6 +1685,7 @@ pub fn write_colmap_sparse_text(root: &Path, sparse: &ColmapSparseFiles) -> Resu
 }
 
 pub fn write_colmap_sparse_binary(root: &Path, sparse: &ColmapSparseFiles) -> Result<()> {
+    validate_colmap_sparse_files(sparse, root, ColmapSparseFormat::Binary)?;
     fs::create_dir_all(root)?;
     write_raw_rigs_bin(&root.join("rigs.bin"), &sparse.rigs)?;
     write_raw_cameras_bin(&root.join("cameras.bin"), &sparse.cameras)?;
@@ -810,18 +1706,21 @@ pub fn write_colmap_sparse_model(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_cameras_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()> {
     let cameras = cameras_from_reconstruction(reconstruction)?;
     write_raw_cameras_txt(path, &cameras)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_images_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()> {
     let sparse = sparse_files_from_reconstruction(reconstruction)?;
     write_raw_images_txt(path, &sparse)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_points3d_txt(path: &Path, reconstruction: &Reconstruction) -> Result<()> {
-    let points = points3d_from_reconstruction(reconstruction);
+    let points = points3d_from_reconstruction(reconstruction)?;
     write_raw_points3d_txt(path, &points)
 }
 
@@ -834,101 +1733,105 @@ fn write_frames_txt(path: &Path, frames: &[ColmapFrame]) -> Result<()> {
 }
 
 fn cameras_from_reconstruction(reconstruction: &Reconstruction) -> Result<Vec<ColmapCamera>> {
-    let cameras = if reconstruction.cameras.is_empty() {
-        vec![reconstruction.camera]
-    } else {
-        reconstruction.cameras.clone()
-    };
-    cameras
+    if reconstruction.cameras.len() != reconstruction.camera_ids.len() {
+        bail!(
+            "source=reconstruction-export record=camera id=- referenced=- feature=- reason=camera_ids length {} does not match cameras length {}",
+            reconstruction.camera_ids.len(),
+            reconstruction.cameras.len()
+        );
+    }
+    Ok(reconstruction
+        .cameras
         .iter()
-        .enumerate()
-        .map(|(idx, camera)| {
-            let camera_id = reconstruction
-                .camera_ids
-                .get(idx)
-                .copied()
-                .unwrap_or_else(|| idx as u32 + 1);
-            Ok(ColmapCamera {
-                camera_id,
-                model_id: camera.model_id,
-                width: camera.width,
-                height: camera.height,
-                params: camera.params_slice().to_vec(),
-            })
+        .zip(reconstruction.camera_ids.iter())
+        .map(|(camera, &camera_id)| ColmapCamera {
+            camera_id,
+            model_id: camera.model_id,
+            width: camera.width,
+            height: camera.height,
+            params: camera.params_slice().to_vec(),
         })
-        .collect()
+        .collect())
 }
 
-fn images_from_reconstruction(reconstruction: &Reconstruction) -> Vec<ColmapImage> {
-    reconstruction
-        .image_names
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, name)| {
-            let pose = reconstruction.poses.get(idx).copied().flatten()?;
-            let q = pose.quaternion();
-            let t = pose.translation();
-            let points2d = reconstruction
-                .keypoints
-                .get(idx)
-                .into_iter()
-                .flatten()
-                .enumerate()
-                .map(|(feature_idx, kp)| {
-                    let point3d_id = reconstruction
-                        .observations
-                        .get(idx)
-                        .and_then(|obs| obs.get(feature_idx))
-                        .copied()
-                        .flatten()
-                        .map(|id| reconstruction.point3d_id(id));
-                    ColmapPoint2D {
-                        xy: [kp.x() as f64, kp.y() as f64],
-                        point3d_id,
-                    }
-                })
-                .collect();
-            Some(ColmapImage {
-                image_id: reconstruction.image_id(idx),
-                camera_id: reconstruction.camera_id_for_image(idx),
-                name: name.clone(),
-                qvec: [q[3] as f64, q[0] as f64, q[1] as f64, q[2] as f64],
-                tvec: [t[0] as f64, t[1] as f64, t[2] as f64],
-                points2d,
-            })
-        })
-        .collect()
+fn images_from_reconstruction(reconstruction: &Reconstruction) -> Result<Vec<ColmapImage>> {
+    let mut images = Vec::new();
+    for (idx, name) in reconstruction.image_names.iter().enumerate() {
+        let Some(pose) = reconstruction.poses.get(idx).copied().flatten() else {
+            continue;
+        };
+        let image_id = reconstruction.try_image_id(idx)?;
+        let camera_id = reconstruction.try_camera_id_for_image(idx)?;
+        reconstruction.try_camera_for_image(idx)?;
+        let q = pose.quaternion();
+        let t = pose.translation();
+        let mut points2d = Vec::new();
+        if let Some(keypoints) = reconstruction.keypoints.get(idx) {
+            for (feature_idx, kp) in keypoints.iter().enumerate() {
+                let point3d_id = match reconstruction
+                    .observations
+                    .get(idx)
+                    .and_then(|obs| obs.get(feature_idx))
+                    .copied()
+                    .flatten()
+                {
+                    Some(point_index) => Some(reconstruction.try_point3d_id(point_index)?),
+                    None => None,
+                };
+                points2d.push(ColmapPoint2D {
+                    xy: [kp.x() as f64, kp.y() as f64],
+                    point3d_id,
+                });
+            }
+        }
+        images.push(ColmapImage {
+            image_id,
+            camera_id,
+            name: name.clone(),
+            qvec: [q[3] as f64, q[0] as f64, q[1] as f64, q[2] as f64],
+            tvec: [t[0] as f64, t[1] as f64, t[2] as f64],
+            points2d,
+        });
+    }
+    Ok(images)
 }
 
-fn points3d_from_reconstruction(reconstruction: &Reconstruction) -> Vec<ColmapPoint3D> {
-    reconstruction
-        .points
-        .iter()
-        .enumerate()
-        .map(|(idx, p)| ColmapPoint3D {
-            point3d_id: reconstruction.point3d_id(idx),
-            xyz: [p.xyz[0] as f64, p.xyz[1] as f64, p.xyz[2] as f64],
-            color: p.color,
-            error: p.error as f64,
-            track: p
-                .track
-                .iter()
-                .map(|TrackObservation { image, feature }| ColmapTrackElement {
-                    image_id: reconstruction.image_id(*image),
-                    point2d_idx: *feature as u64,
-                })
-                .collect(),
-        })
-        .collect()
+fn points3d_from_reconstruction(reconstruction: &Reconstruction) -> Result<Vec<ColmapPoint3D>> {
+    let mut points = Vec::with_capacity(reconstruction.points.len());
+    for (idx, point) in reconstruction.points.iter().enumerate() {
+        let mut track = Vec::with_capacity(point.track.len());
+        for TrackObservation { image, feature } in &point.track {
+            track.push(ColmapTrackElement {
+                image_id: reconstruction.try_image_id(*image)?,
+                point2d_idx: *feature as u64,
+            });
+        }
+        points.push(ColmapPoint3D {
+            point3d_id: reconstruction.try_point3d_id(idx)?,
+            xyz: [
+                point.xyz[0] as f64,
+                point.xyz[1] as f64,
+                point.xyz[2] as f64,
+            ],
+            color: point.color,
+            error: point.error as f64,
+            track,
+        });
+    }
+    Ok(points)
 }
 
 fn sparse_files_from_reconstruction(reconstruction: &Reconstruction) -> Result<ColmapSparseFiles> {
+    let mut rigs = Vec::with_capacity(reconstruction.rigs.len());
+    for rig in &reconstruction.rigs {
+        rigs.push(rig_to_colmap(rig)?);
+    }
     Ok(ColmapSparseFiles {
         cameras: cameras_from_reconstruction(reconstruction)?,
-        rigs: reconstruction.rigs.iter().map(rig_to_colmap).collect(),
+        rigs,
         frames: reconstruction.frames.iter().map(frame_to_colmap).collect(),
-        images: images_from_reconstruction(reconstruction),
-        points3d: points3d_from_reconstruction(reconstruction),
+        images: images_from_reconstruction(reconstruction)?,
+        points3d: points3d_from_reconstruction(reconstruction)?,
     })
 }
 
@@ -1325,14 +2228,9 @@ fn sensor_id_sort_key(sensor_id: &ColmapSensorId) -> (i32, u32, String) {
     )
 }
 
-fn ordered_images_for_write<'a>(sparse: &'a ColmapSparseFiles) -> Vec<&'a ColmapImage> {
-    let image_by_id = sparse
-        .images
-        .iter()
-        .map(|image| (image.image_id, image))
-        .collect::<HashMap<_, _>>();
+fn ordered_images_for_write(sparse: &ColmapSparseFiles) -> Vec<&ColmapImage> {
     let mut ordered = Vec::new();
-    let mut seen = BTreeMap::<u32, ()>::new();
+    let mut used = vec![false; sparse.images.len()];
     for frame in sorted_frames(&sparse.frames) {
         for data_id in sorted_data_ids(&frame.data_ids) {
             if data_id.sensor_id.sensor_type != ColmapSensorType::Camera {
@@ -1341,16 +2239,23 @@ fn ordered_images_for_write<'a>(sparse: &'a ColmapSparseFiles) -> Vec<&'a Colmap
             let Ok(image_id) = u32::try_from(data_id.data_id) else {
                 continue;
             };
-            if let Some(image) = image_by_id.get(&image_id) {
-                ordered.push(*image);
-                seen.insert(image_id, ());
+            if let Some((idx, image)) = sparse
+                .images
+                .iter()
+                .enumerate()
+                .find(|(idx, image)| !used[*idx] && image.image_id == image_id)
+            {
+                ordered.push(image);
+                used[idx] = true;
             }
         }
     }
     let mut rest = sparse
         .images
         .iter()
-        .filter(|image| !seen.contains_key(&image.image_id))
+        .enumerate()
+        .filter(|(idx, _)| !used[*idx])
+        .map(|(_, image)| image)
         .collect::<Vec<_>>();
     rest.sort_by_key(|image| image.image_id);
     ordered.extend(rest);
@@ -1386,12 +2291,28 @@ fn sensor_type_to_colmap_i32(sensor_type: &ColmapSensorType) -> i32 {
     }
 }
 
-fn rig_to_colmap(rig: &Rig) -> ColmapRig {
-    ColmapRig {
-        rig_id: rig.rig_id,
-        ref_sensor_id: rig.ref_sensor_id.as_ref().map(sensor_id_to_colmap),
-        sensors: rig.sensors.iter().map(rig_sensor_to_colmap).collect(),
+fn rig_to_colmap(rig: &Rig) -> Result<ColmapRig> {
+    let ref_sensor_id = rig.ref_sensor_id.as_ref().map(sensor_id_to_colmap);
+    let mut sensors = Vec::new();
+    for sensor in &rig.sensors {
+        let sensor_id = sensor_id_to_colmap(&sensor.sensor_id);
+        if ref_sensor_id.as_ref() == Some(&sensor_id) {
+            if sensor.sensor_from_rig.is_some() {
+                bail!(
+                    "source=reconstruction-export record=rig id={} referenced={} feature=- reason=posed reference sensor is not representable in COLMAP",
+                    rig.rig_id,
+                    sensor.sensor_id.sensor_id
+                );
+            }
+            continue;
+        }
+        sensors.push(rig_sensor_to_colmap(sensor));
     }
+    Ok(ColmapRig {
+        rig_id: rig.rig_id,
+        ref_sensor_id,
+        sensors,
+    })
 }
 
 fn rig_sensor_to_colmap(sensor: &RigSensor) -> ColmapRigSensor {
@@ -2367,7 +3288,7 @@ mod tests {
             "real COLMAP tracks should be mostly consistent with the registered pose"
         );
 
-        let reference = se3_from_colmap_pose(image.qvec, image.tvec);
+        let reference = se3_from_colmap_pose(image.qvec, image.tvec)?;
         let rotation_error = rotation_error_deg(&reference, &estimated);
         let translation_error = translation_error(&reference, &estimated);
 
@@ -2718,7 +3639,7 @@ mod tests {
         fs::create_dir_all(&sparse)?;
         fs::write(
             sparse.join("cameras.txt"),
-            "# cameras\n11 PINHOLE 640 480 500 501 320 240\n",
+            "# cameras\n11 PINHOLE 640 480 500 501 320 240\n12 PINHOLE 640 480 500 501 320 240\n",
         )?;
         fs::write(
             sparse.join("images.txt"),
@@ -3130,5 +4051,434 @@ mod tests {
         sparse.images.sort_by_key(|image| image.image_id);
         sparse.points3d.sort_by_key(|point| point.point3d_id);
         sparse
+    }
+
+    type MalformedImportCase = (
+        &'static str,
+        fn(&mut ColmapSparseFiles),
+        &'static str,
+        &'static [&'static str],
+    );
+
+    #[test]
+    fn strict_text_and_binary_import_reject_the_same_malformed_models() -> Result<()> {
+        let cases: Vec<MalformedImportCase> = vec![
+            (
+                "duplicate-camera",
+                duplicate_camera,
+                "cameras",
+                &["record=camera", "id=1", "duplicate camera id"],
+            ),
+            (
+                "duplicate-image",
+                duplicate_image,
+                "images",
+                &["record=image", "id=1", "duplicate image id"],
+            ),
+            (
+                "duplicate-point",
+                duplicate_point,
+                "points3D",
+                &["record=point", "id=5", "duplicate point id"],
+            ),
+            (
+                "unknown-camera",
+                unknown_camera,
+                "images",
+                &["record=image", "id=1", "referenced=99", "missing camera"],
+            ),
+            (
+                "unknown-image",
+                unknown_image,
+                "points3D",
+                &[
+                    "record=point",
+                    "id=5",
+                    "referenced=9",
+                    "feature=0",
+                    "missing image",
+                ],
+            ),
+            (
+                "unknown-point",
+                unknown_point,
+                "images",
+                &[
+                    "record=image",
+                    "id=1",
+                    "referenced=99",
+                    "feature=0",
+                    "missing point",
+                ],
+            ),
+            (
+                "conflicting-track",
+                conflicting_track,
+                "images",
+                &[
+                    "record=image",
+                    "id=1",
+                    "referenced=5",
+                    "feature=0",
+                    "does not match",
+                ],
+            ),
+            (
+                "zero-quaternion",
+                zero_quaternion,
+                "images",
+                &["record=image", "id=1", "quaternion norm is zero"],
+            ),
+            (
+                "non-finite",
+                non_finite_translation,
+                "images",
+                &["record=image", "id=1", "non-finite"],
+            ),
+            (
+                "feature-index",
+                feature_index_overflow,
+                "points3D",
+                &[
+                    "record=point",
+                    "id=5",
+                    "referenced=1",
+                    "feature=50",
+                    "feature index is out of range",
+                ],
+            ),
+            (
+                "invalid-dimensions",
+                invalid_dimensions,
+                "cameras",
+                &["record=camera", "id=1", "dimensions are illegal"],
+            ),
+            (
+                "invalid-focal",
+                invalid_focal,
+                "cameras",
+                &["record=camera", "id=1", "focal parameter"],
+            ),
+            (
+                "duplicate-rig",
+                duplicate_rig,
+                "rigs",
+                &["record=rig", "id=3", "duplicate rig id"],
+            ),
+            (
+                "duplicate-frame",
+                duplicate_frame,
+                "frames",
+                &["record=frame", "id=9", "duplicate frame id"],
+            ),
+        ];
+
+        for (name, mutate, file_stem, expected) in cases {
+            for format in [ColmapSparseFormat::Text, ColmapSparseFormat::Binary] {
+                let dir = tempdir()?;
+                let mut sparse = minimal_valid_sparse();
+                mutate(&mut sparse);
+                write_unvalidated_sparse(dir.path(), &sparse, format)?;
+                let error = read_colmap_reconstruction(dir.path()).expect_err(name);
+                let message = format!("{error:#}");
+                let extension = match format {
+                    ColmapSparseFormat::Text => "txt",
+                    ColmapSparseFormat::Binary => "bin",
+                };
+                assert!(
+                    message.contains(&format!("{file_stem}.{extension}")),
+                    "{name} {format:?} missing source file in {message}"
+                );
+                for fragment in expected {
+                    assert!(
+                        message.contains(fragment),
+                        "{name} {format:?} missing {fragment} in {message}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_roundtrip_preserves_asymmetric_pose_ids_and_tracks() -> Result<()> {
+        let reconstruction = asymmetric_reconstruction();
+        let dir = tempdir()?;
+        let text_root = dir.path().join("text");
+        export_colmap(&text_root, &reconstruction, false)?;
+        assert_roundtrip(&reconstruction, &read_colmap_reconstruction(&text_root)?);
+
+        let binary_root = dir.path().join("binary");
+        let sparse = sparse_files_from_reconstruction(&reconstruction)?;
+        write_colmap_sparse_binary(&binary_root, &sparse)?;
+        assert_roundtrip(&reconstruction, &read_colmap_reconstruction(&binary_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_export_does_not_create_or_truncate_target_files() -> Result<()> {
+        let dir = tempdir()?;
+        let mut invalid = asymmetric_reconstruction();
+        invalid.camera_ids[0] = 0;
+
+        let fresh = dir.path().join("fresh");
+        let error = export_colmap(&fresh, &invalid, false).expect_err("invalid export");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("source=reconstruction-export"),
+            "{message}"
+        );
+        assert!(message.contains("record=reconstruction"), "{message}");
+        assert!(!fresh.exists(), "validation created {}", fresh.display());
+
+        let existing = dir.path().join("existing");
+        let sparse = existing.join("sparse").join("0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(sparse.join("cameras.txt"), b"ORIGINAL")?;
+        let error = export_colmap_sparse_snapshot(&sparse, &invalid).expect_err("snapshot");
+        assert!(format!("{error:#}").contains("source=reconstruction-export"));
+        assert_eq!(fs::read(sparse.join("cameras.txt"))?, b"ORIGINAL");
+        assert!(!sparse.join("images.txt").exists());
+
+        let raw_dest = dir.path().join("raw-new");
+        let mut raw = minimal_valid_sparse();
+        raw.cameras.push(raw.cameras[0].clone());
+        let error = write_colmap_sparse_model(&raw_dest, &raw, ColmapSparseFormat::Text)
+            .expect_err("raw text");
+        let message = format!("{error:#}");
+        assert!(message.contains("cameras.txt"), "{message}");
+        assert!(message.contains("duplicate camera id"), "{message}");
+        assert!(!raw_dest.exists());
+
+        let raw_existing = dir.path().join("raw-existing");
+        fs::create_dir_all(&raw_existing)?;
+        fs::write(raw_existing.join("points3D.bin"), b"ORIGINAL")?;
+        let error = write_colmap_sparse_model(&raw_existing, &raw, ColmapSparseFormat::Binary)
+            .expect_err("raw binary");
+        assert!(format!("{error:#}").contains("cameras.bin"));
+        assert_eq!(fs::read(raw_existing.join("points3D.bin"))?, b"ORIGINAL");
+        assert!(!raw_existing.join("cameras.bin").exists());
+        Ok(())
+    }
+
+    fn assert_roundtrip(original: &Reconstruction, loaded: &Reconstruction) {
+        assert_eq!(loaded.camera_ids, original.camera_ids);
+        assert_eq!(loaded.image_ids, original.image_ids);
+        assert_eq!(loaded.image_camera_indices, original.image_camera_indices);
+        assert_eq!(loaded.point_ids, original.point_ids);
+        assert_eq!(loaded.observations, original.observations);
+        assert_eq!(loaded.points[0].track, original.points[0].track);
+        for (loaded_pose, original_pose) in loaded.poses.iter().zip(original.poses.iter()) {
+            let loaded_pose = loaded_pose.expect("round-trip pose");
+            let original_pose = original_pose.expect("original pose");
+            assert!(
+                rotation_error_deg(&loaded_pose, &original_pose) < 1e-3,
+                "rotation drifted"
+            );
+            assert!(
+                translation_error(&loaded_pose, &original_pose) < 1e-4,
+                "translation drifted"
+            );
+        }
+    }
+
+    fn asymmetric_reconstruction() -> Reconstruction {
+        let camera_a =
+            CameraModel::from_colmap(COLMAP_PINHOLE, 640, 480, &[500.0, 510.0, 320.0, 240.0])
+                .unwrap();
+        let camera_b =
+            CameraModel::from_colmap(COLMAP_SIMPLE_RADIAL, 800, 600, &[700.0, 401.0, 299.0, 0.01])
+                .unwrap();
+        let mut reconstruction =
+            test_reconstruction_with_cameras(vec![(11, camera_a), (42, camera_b)], vec![0, 1]);
+        reconstruction.image_ids = vec![7, 8];
+        let axis = nalgebra::Unit::new_normalize(nalgebra::Vector3::new(0.2, 0.5, 0.8));
+        reconstruction.poses = vec![
+            Some(SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::from_axis_angle(&axis, 0.7),
+                nalgebra::Vector3::new(1.25, -0.5, 2.0),
+            )),
+            Some(SE3::from_quat_translation(
+                nalgebra::UnitQuaternion::from_axis_angle(&nalgebra::Vector3::y_axis(), -0.35),
+                nalgebra::Vector3::new(-0.4, 0.8, 1.1),
+            )),
+        ];
+        reconstruction.keypoints = vec![
+            vec![test_keypoint(12.0, 24.0), test_keypoint(40.0, 50.0)],
+            vec![test_keypoint(18.0, 22.0)],
+        ];
+        reconstruction.observations = vec![vec![Some(0), None], vec![Some(0)]];
+        reconstruction.point_ids = vec![99];
+        reconstruction.points = vec![Point3D {
+            xyz: [1.0, 2.0, 3.5],
+            color: [9, 8, 7],
+            error: 0.2,
+            track: vec![
+                TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        }];
+        reconstruction
+    }
+
+    fn minimal_valid_sparse() -> ColmapSparseFiles {
+        ColmapSparseFiles {
+            cameras: vec![ColmapCamera {
+                camera_id: 1,
+                model_id: COLMAP_PINHOLE,
+                width: 640,
+                height: 480,
+                params: vec![500.0, 500.0, 320.0, 240.0],
+            }],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            images: vec![ColmapImage {
+                image_id: 1,
+                camera_id: 1,
+                name: "a.jpg".to_string(),
+                qvec: [1.0, 0.0, 0.0, 0.0],
+                tvec: [0.1, 0.2, 0.3],
+                points2d: vec![ColmapPoint2D {
+                    xy: [10.0, 20.0],
+                    point3d_id: Some(5),
+                }],
+            }],
+            points3d: vec![ColmapPoint3D {
+                point3d_id: 5,
+                xyz: [1.0, 2.0, 3.0],
+                color: [1, 2, 3],
+                error: 0.1,
+                track: vec![ColmapTrackElement {
+                    image_id: 1,
+                    point2d_idx: 0,
+                }],
+            }],
+        }
+    }
+
+    fn duplicate_camera(sparse: &mut ColmapSparseFiles) {
+        sparse.cameras.push(sparse.cameras[0].clone());
+    }
+
+    fn duplicate_image(sparse: &mut ColmapSparseFiles) {
+        sparse.images.push(sparse.images[0].clone());
+    }
+
+    fn duplicate_point(sparse: &mut ColmapSparseFiles) {
+        sparse.points3d.push(sparse.points3d[0].clone());
+    }
+
+    fn unknown_camera(sparse: &mut ColmapSparseFiles) {
+        sparse.images[0].camera_id = 99;
+    }
+
+    fn unknown_image(sparse: &mut ColmapSparseFiles) {
+        sparse.points3d[0].track[0].image_id = 9;
+    }
+
+    fn unknown_point(sparse: &mut ColmapSparseFiles) {
+        sparse.images[0].points2d[0].point3d_id = Some(99);
+        sparse.points3d[0].track.clear();
+    }
+
+    fn conflicting_track(sparse: &mut ColmapSparseFiles) {
+        sparse.points3d[0].track.clear();
+    }
+
+    fn zero_quaternion(sparse: &mut ColmapSparseFiles) {
+        sparse.images[0].qvec = [0.0, 0.0, 0.0, 0.0];
+    }
+
+    fn non_finite_translation(sparse: &mut ColmapSparseFiles) {
+        sparse.images[0].tvec[0] = f64::NAN;
+    }
+
+    fn feature_index_overflow(sparse: &mut ColmapSparseFiles) {
+        sparse.points3d[0].track[0].point2d_idx = 50;
+    }
+
+    fn invalid_dimensions(sparse: &mut ColmapSparseFiles) {
+        sparse.cameras[0].width = 0;
+    }
+
+    fn invalid_focal(sparse: &mut ColmapSparseFiles) {
+        sparse.cameras[0].params[0] = 0.0;
+    }
+
+    fn duplicate_rig(sparse: &mut ColmapSparseFiles) {
+        sparse.rigs = vec![camera_rig(3), camera_rig(3)];
+    }
+
+    fn duplicate_frame(sparse: &mut ColmapSparseFiles) {
+        sparse.rigs = vec![camera_rig(3)];
+        sparse.frames = vec![camera_frame(9), camera_frame(9)];
+    }
+
+    fn camera_rig(rig_id: u32) -> ColmapRig {
+        ColmapRig {
+            rig_id,
+            ref_sensor_id: Some(ColmapSensorId {
+                sensor_type: ColmapSensorType::Camera,
+                sensor_id: 1,
+            }),
+            sensors: Vec::new(),
+        }
+    }
+
+    fn camera_frame(frame_id: u32) -> ColmapFrame {
+        ColmapFrame {
+            frame_id,
+            rig_id: 3,
+            rig_from_world: ColmapRigid3 {
+                qvec: [1.0, 0.0, 0.0, 0.0],
+                tvec: [0.2, 0.0, 0.0],
+            },
+            data_ids: vec![ColmapDataId {
+                sensor_id: ColmapSensorId {
+                    sensor_type: ColmapSensorType::Camera,
+                    sensor_id: 1,
+                },
+                data_id: 1,
+            }],
+        }
+    }
+
+    fn write_unvalidated_sparse(
+        dir: &Path,
+        sparse: &ColmapSparseFiles,
+        format: ColmapSparseFormat,
+    ) -> Result<()> {
+        fs::create_dir_all(dir)?;
+        match format {
+            ColmapSparseFormat::Text => {
+                write_raw_cameras_txt(&dir.join("cameras.txt"), &sparse.cameras)?;
+                write_raw_images_txt(&dir.join("images.txt"), sparse)?;
+                write_raw_points3d_txt(&dir.join("points3D.txt"), &sparse.points3d)?;
+                if !sparse.rigs.is_empty() {
+                    write_raw_rigs_txt(&dir.join("rigs.txt"), &sparse.rigs)?;
+                }
+                if !sparse.frames.is_empty() {
+                    write_raw_frames_txt(&dir.join("frames.txt"), &sparse.frames)?;
+                }
+            }
+            ColmapSparseFormat::Binary => {
+                write_raw_cameras_bin(&dir.join("cameras.bin"), &sparse.cameras)?;
+                write_raw_images_bin(&dir.join("images.bin"), sparse)?;
+                write_raw_points3d_bin(&dir.join("points3D.bin"), &sparse.points3d)?;
+                if !sparse.rigs.is_empty() {
+                    write_raw_rigs_bin(&dir.join("rigs.bin"), &sparse.rigs)?;
+                }
+                if !sparse.frames.is_empty() {
+                    write_raw_frames_bin(&dir.join("frames.bin"), &sparse.frames)?;
+                }
+            }
+        }
+        Ok(())
     }
 }

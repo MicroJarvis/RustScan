@@ -26115,10 +26115,6 @@ mod tests {
             sensor_type: ColmapSensorType::Camera,
             sensor_id: 11,
         };
-        let aux_sensor = ColmapSensorId {
-            sensor_type: ColmapSensorType::Camera,
-            sensor_id: 12,
-        };
         let sparse_model = ColmapSparseFiles {
             cameras: vec![ColmapCamera {
                 camera_id: 11,
@@ -26130,19 +26126,7 @@ mod tests {
             rigs: vec![ColmapRig {
                 rig_id: 77,
                 ref_sensor_id: Some(ref_sensor.clone()),
-                sensors: vec![
-                    ColmapRigSensor {
-                        sensor_id: ref_sensor.clone(),
-                        sensor_from_rig: None,
-                    },
-                    ColmapRigSensor {
-                        sensor_id: aux_sensor.clone(),
-                        sensor_from_rig: Some(ColmapRigid3 {
-                            qvec: [1.0, 0.0, 0.0, 0.0],
-                            tvec: [0.35, 0.0, 0.0],
-                        }),
-                    },
-                ],
+                sensors: Vec::new(),
             }],
             frames: vec![ColmapFrame {
                 frame_id: 99,
@@ -26153,11 +26137,11 @@ mod tests {
                 },
                 data_ids: vec![
                     ColmapDataId {
-                        sensor_id: ref_sensor,
+                        sensor_id: ref_sensor.clone(),
                         data_id: 101,
                     },
                     ColmapDataId {
-                        sensor_id: aux_sensor,
+                        sensor_id: ref_sensor,
                         data_id: 205,
                     },
                 ],
