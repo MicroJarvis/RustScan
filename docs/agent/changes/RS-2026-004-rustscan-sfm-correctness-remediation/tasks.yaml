@@ -66,7 +66,8 @@ artifacts:
 
 known_limitations:
   - "GPU PnP tests skipped for the known macOS AGX/XPC shader compiler failure do not constitute GPU execution evidence and require a working adapter run."
-  - "T0 regressions filtered_leading_support_reports_image_name_instead_of_panicking, filtered_middle_support_reports_image_name_instead_of_panicking, and disconnected_target_reports_image_name_instead_of_panicking fail until T1 replaces the mapper index panic with a contextual error."
+  - "T1 cargo test -p rustscan-sfm --all-targets deadlocked in parallel GPU context initialization and was stopped; it is not a passing or failing assertion result."
+  - "T1 cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings fails on pre-existing rustscan-slam warnings before it checks rustscan-sfm. Those warnings are outside T1."
 
 later_tasks:
   - id: T1
@@ -110,4 +111,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T0 is complete. Start T1 on branch agent/RS-2026-004/t1-mapper-identity. The three new mapper regressions must become contextual errors, and the ten sequence panics must become passing tests or the same class of error. Do not weaken acceptance."
+next_action: "T1 is complete on branch agent/RS-2026-004/t1-mapper-identity. Do not merge it to main. Start T2 on branch agent/RS-2026-004/t2-reconstruction-validation from the T1 commit, in its own worktree. Do not weaken acceptance."

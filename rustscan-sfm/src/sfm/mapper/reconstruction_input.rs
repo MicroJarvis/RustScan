@@ -81,6 +81,27 @@ pub struct ReconstructionSeed {
     pub points: Vec<Point3D>,
 }
 
+/// One database-backed image that survived filtering, in final mapper order.
+///
+/// `source_index` is the position in the unfiltered input path list. `frame.id`
+/// is the index of this record in the retained collection. Later camera, seed,
+/// target, and pair lookups must use that retained index or the stable name /
+/// database image ID, never the unfiltered path position.
+#[derive(Debug, Clone)]
+pub(super) struct RetainedMapperImage {
+    pub source_index: usize,
+    pub name: String,
+    pub path: PathBuf,
+    pub frame: ImageFrame,
+    pub database_image_id: u32,
+    pub database_camera_id: u32,
+    /// Index into the aligned `ReferenceCameraSetup::cameras` list.
+    pub camera_index: usize,
+    pub rig_frame_index: Option<usize>,
+    /// Index into the reference reconstruction image list, when this image is present there.
+    pub reference_image_index: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct MapperDatabaseInput {
     pub(super) cache: DatabaseCache,
@@ -102,6 +123,14 @@ pub(super) fn setup_for_reconstruction_attempt(
 pub fn reference_camera_setup(
     reference: &Path,
     image_paths: &[PathBuf],
+) -> Result<ReferenceCameraSetup> {
+    let mut retained = retained_images_for_paths(image_paths)?;
+    reference_camera_setup_for_retained(reference, &mut retained)
+}
+
+pub(super) fn reference_camera_setup_for_retained(
+    reference: &Path,
+    retained: &mut [RetainedMapperImage],
 ) -> Result<ReferenceCameraSetup> {
     let cameras_with_ids = read_colmap_cameras(reference)?;
     if cameras_with_ids.is_empty() {
@@ -159,15 +188,28 @@ pub fn reference_camera_setup(
         })
         .unwrap_or_default();
 
-    let mut image_ids = Vec::with_capacity(image_paths.len());
-    let mut image_camera_indices = Vec::with_capacity(image_paths.len());
-    let mut image_frame_indices = Vec::with_capacity(image_paths.len());
-    for (idx, path) in image_paths.iter().enumerate() {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        if let Some(pose) = pose_by_name.get(name) {
+    let reference_index_by_name = sparse_model
+        .as_ref()
+        .map(|model| {
+            model
+                .reconstruction
+                .image_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (name.as_str(), index))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let retained_paths = retained
+        .iter()
+        .map(|image| image.path.clone())
+        .collect::<Vec<_>>();
+
+    let mut image_ids = Vec::with_capacity(retained.len());
+    let mut image_camera_indices = Vec::with_capacity(retained.len());
+    let mut image_frame_indices = Vec::with_capacity(retained.len());
+    for (idx, image) in retained.iter().enumerate() {
+        if let Some(pose) = pose_by_name.get(image.name.as_str()) {
             image_ids.push(pose.image_id);
             image_camera_indices.push(*camera_index_by_id.get(&pose.camera_id).with_context(
                 || {
@@ -185,11 +227,11 @@ pub fn reference_camera_setup(
         }
     }
 
-    let seed_reconstruction = sparse_model
-        .as_ref()
-        .and_then(|model| seed_reconstruction_from_reference(&model.reconstruction, image_paths));
+    let seed_reconstruction = sparse_model.as_ref().and_then(|model| {
+        seed_reconstruction_from_reference(&model.reconstruction, &retained_paths)
+    });
 
-    Ok(ReferenceCameraSetup {
+    let setup = ReferenceCameraSetup {
         cameras,
         camera_ids,
         camera_has_prior_focal_length: vec![true; cameras_with_ids.len()],
@@ -199,7 +241,26 @@ pub fn reference_camera_setup(
         image_camera_indices,
         image_frame_indices,
         seed_reconstruction,
-    })
+    };
+    anyhow::ensure!(
+        setup.image_camera_indices.len() == retained.len()
+            && setup.image_frame_indices.len() == retained.len()
+            && setup.camera_ids.len() == setup.cameras.len(),
+        "reference camera setup did not produce one entry per retained image"
+    );
+    for (index, image) in retained.iter_mut().enumerate() {
+        image.reference_image_index = reference_index_by_name.get(image.name.as_str()).copied();
+        let camera_index = setup.image_camera_indices[index];
+        anyhow::ensure!(
+            camera_index < setup.camera_ids.len(),
+            "retained image '{}' camera index {camera_index} is out of range",
+            image.name
+        );
+        image.camera_index = camera_index;
+        image.rig_frame_index = setup.image_frame_indices[index];
+    }
+    validate_retained_image_setup(&setup, retained)?;
+    Ok(setup)
 }
 
 pub(super) fn seed_reconstruction_from_reference(
@@ -380,22 +441,58 @@ fn load_mapper_database_for_names(
     }))
 }
 
+#[cfg(test)]
 pub(super) fn database_frames(
     paths: &[PathBuf],
     database: &MapperDatabaseInput,
 ) -> Result<Vec<ImageFrame>> {
+    Ok(retained_database_images(paths, database)?
+        .into_iter()
+        .map(|image| image.frame)
+        .collect())
+}
+
+pub(super) fn retained_database_images(
+    paths: &[PathBuf],
+    database: &MapperDatabaseInput,
+) -> Result<Vec<RetainedMapperImage>> {
     let images_by_name = database
         .cache
         .images
         .values()
         .map(|image| (image.name.as_str(), image))
         .collect::<HashMap<_, _>>();
+    let mut camera_ids = Vec::new();
+    for &camera_id in database.cache.cameras.keys() {
+        if !camera_ids.contains(&camera_id) {
+            camera_ids.push(camera_id);
+        }
+    }
+    camera_ids.sort_unstable();
+    let camera_index_by_id = camera_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &camera_id)| (camera_id, index))
+        .collect::<HashMap<_, _>>();
+    let mut rig_frame_ids = database
+        .cache
+        .frames
+        .values()
+        .map(|frame| frame.frame_id)
+        .collect::<Vec<_>>();
+    rig_frame_ids.sort_unstable();
+    rig_frame_ids.dedup();
+    let rig_frame_index_by_id = rig_frame_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &frame_id)| (frame_id, index))
+        .collect::<HashMap<_, _>>();
 
     // COLMAP's DatabaseCache only loads match-connected images. Skip files under
-    // image_path that are absent from the cache so frame count, min_model_size,
-    // and multi-model stop conditions stay tied to the database fixture.
-    let mut frames = Vec::new();
-    for path in paths {
+    // image_path that are absent from the cache. The retained index is the mapper
+    // index; source_index remembers the unfiltered path position.
+    let mut retained = Vec::new();
+    for (source_index, path) in paths.iter().enumerate() {
         let name = path
             .file_name()
             .with_context(|| format!("image path has no file name: {}", path.display()))?
@@ -415,18 +512,137 @@ pub(super) fn database_frames(
                     name, image.camera_id
                 )
             })?;
+        let camera_index = *camera_index_by_id.get(&image.camera_id).with_context(|| {
+            format!(
+                "database image '{}' is missing camera_id={}",
+                name, image.camera_id
+            )
+        })?;
         let keypoints = database
             .keypoints_by_name
             .get(name.as_str())
             .cloned()
             .unwrap_or_default();
-        let id = frames.len();
-        frames.push(ImageFrame {
-            id,
-            name,
+        let id = retained.len();
+        retained.push(RetainedMapperImage {
+            source_index,
+            name: name.clone(),
             path: path.clone(),
-            width,
-            height,
+            frame: ImageFrame {
+                id,
+                name,
+                path: path.clone(),
+                width,
+                height,
+                keypoints,
+                descriptors: rustscan_slam::Descriptors::new(),
+                sift: crate::sift::SiftFeatures::default(),
+                wide_descriptors: crate::wide::WideDescriptors {
+                    data: Vec::new(),
+                    dim: 0,
+                    count: 0,
+                },
+                strong_feature_indices: Vec::new(),
+                colors: Vec::new(),
+            },
+            database_image_id: image.image_id,
+            database_camera_id: image.camera_id,
+            camera_index,
+            rig_frame_index: image
+                .frame_id
+                .and_then(|frame_id| rig_frame_index_by_id.get(&frame_id).copied()),
+            reference_image_index: None,
+        });
+    }
+    anyhow::ensure!(
+        !retained.is_empty(),
+        "database contains no images that match files under the image path"
+    );
+    Ok(retained)
+}
+
+pub(super) fn merge_reference_registered_images(
+    reference: &Reconstruction,
+    ordered_names: &[String],
+    mut retained: Vec<RetainedMapperImage>,
+) -> Result<Vec<RetainedMapperImage>> {
+    let mut by_name = retained
+        .drain(..)
+        .map(|image| (image.name.clone(), image))
+        .collect::<HashMap<_, _>>();
+    let mut merged = Vec::with_capacity(ordered_names.len());
+    for (source_index, name) in ordered_names.iter().enumerate() {
+        let mut image = if let Some(image) = by_name.remove(name) {
+            image
+        } else {
+            retained_image_from_reference(reference, name, source_index).with_context(|| {
+                format!("registered image '{name}' is missing from database frames")
+            })?
+        };
+        let retained_index = merged.len();
+        image.frame.id = retained_index;
+        image.source_index = source_index;
+        merged.push(image);
+    }
+    Ok(merged)
+}
+
+fn retained_image_from_reference(
+    reference: &Reconstruction,
+    name: &str,
+    source_index: usize,
+) -> Result<RetainedMapperImage> {
+    let reference_index = reference
+        .image_names
+        .iter()
+        .position(|image_name| image_name == name)
+        .with_context(|| format!("reference model is missing registered image '{name}'"))?;
+    let pose_registered = reference
+        .poses
+        .get(reference_index)
+        .and_then(|pose| *pose)
+        .is_some();
+    anyhow::ensure!(
+        pose_registered,
+        "reference image '{name}' has no registered pose"
+    );
+    let camera_index = *reference
+        .image_camera_indices
+        .get(reference_index)
+        .with_context(|| format!("reference image '{name}' has no camera index"))?;
+    let camera = reference
+        .cameras
+        .get(camera_index)
+        .copied()
+        .with_context(|| format!("reference image '{name}' camera index is out of range"))?;
+    let camera_id = *reference
+        .camera_ids
+        .get(camera_index)
+        .with_context(|| format!("reference image '{name}' camera id is out of range"))?;
+    let image_id = *reference
+        .image_ids
+        .get(reference_index)
+        .with_context(|| format!("reference image '{name}' has no database id"))?;
+    let path = reference
+        .image_paths
+        .get(reference_index)
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(name));
+    let keypoints = reference
+        .keypoints
+        .get(reference_index)
+        .cloned()
+        .unwrap_or_default();
+    Ok(RetainedMapperImage {
+        source_index,
+        name: name.to_owned(),
+        path: path.clone(),
+        frame: ImageFrame {
+            id: reference_index,
+            name: name.to_owned(),
+            path,
+            width: camera.width,
+            height: camera.height,
             keypoints,
             descriptors: rustscan_slam::Descriptors::new(),
             sift: crate::sift::SiftFeatures::default(),
@@ -437,13 +653,153 @@ pub(super) fn database_frames(
             },
             strong_feature_indices: Vec::new(),
             colors: Vec::new(),
-        });
+        },
+        database_image_id: image_id,
+        database_camera_id: camera_id,
+        camera_index,
+        rig_frame_index: reference
+            .image_frame_indices
+            .get(reference_index)
+            .copied()
+            .flatten(),
+        reference_image_index: Some(reference_index),
+    })
+}
+
+pub(super) fn retained_image_index_by_name(
+    retained: &[RetainedMapperImage],
+    name: &str,
+) -> Option<usize> {
+    retained.iter().position(|image| image.name == name)
+}
+
+pub(super) fn retained_image_index_by_database_id(
+    retained: &[RetainedMapperImage],
+    database_image_id: u32,
+) -> Option<usize> {
+    retained
+        .iter()
+        .position(|image| image.database_image_id == database_image_id)
+}
+
+pub(super) fn retained_images_for_paths(paths: &[PathBuf]) -> Result<Vec<RetainedMapperImage>> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(source_index, path)| {
+            let name = path
+                .file_name()
+                .with_context(|| format!("image path has no file name: {}", path.display()))?
+                .to_string_lossy()
+                .into_owned();
+            Ok(RetainedMapperImage {
+                source_index,
+                name: name.clone(),
+                path: path.clone(),
+                frame: empty_retained_frame(source_index, &name, path),
+                database_image_id: 0,
+                database_camera_id: 0,
+                camera_index: 0,
+                rig_frame_index: None,
+                reference_image_index: None,
+            })
+        })
+        .collect()
+}
+
+fn empty_retained_frame(id: usize, name: &str, path: &Path) -> ImageFrame {
+    ImageFrame {
+        id,
+        name: name.to_string(),
+        path: path.to_path_buf(),
+        width: 0,
+        height: 0,
+        keypoints: Vec::new(),
+        descriptors: rustscan_slam::Descriptors::new(),
+        sift: crate::sift::SiftFeatures::default(),
+        wide_descriptors: crate::wide::WideDescriptors {
+            data: Vec::new(),
+            dim: 0,
+            count: 0,
+        },
+        strong_feature_indices: Vec::new(),
+        colors: Vec::new(),
     }
+}
+
+pub(super) fn validate_retained_image_setup(
+    setup: &ReferenceCameraSetup,
+    retained: &[RetainedMapperImage],
+) -> Result<()> {
+    let names = retained
+        .iter()
+        .map(|image| image.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     anyhow::ensure!(
-        !frames.is_empty(),
-        "database contains no images that match files under the image path"
+        setup.image_ids.len() == retained.len()
+            && setup.image_camera_indices.len() == retained.len()
+            && setup.image_frame_indices.len() == retained.len(),
+        "per-image camera setup does not match retained images [{names}]"
     );
-    Ok(frames)
+    if let Some(seed) = &setup.seed_reconstruction {
+        anyhow::ensure!(
+            seed.poses.len() == retained.len() && seed.observations.len() == retained.len(),
+            "reference seed does not match retained images [{names}]"
+        );
+    }
+    for (index, image) in retained.iter().enumerate() {
+        anyhow::ensure!(
+            image.frame.id == index && image.frame.name == image.name,
+            "retained image '{}' is not at mapper index {index}",
+            image.name
+        );
+        let camera_index = setup.image_camera_indices[index];
+        anyhow::ensure!(
+            camera_index < setup.cameras.len() && camera_index < setup.camera_ids.len(),
+            "retained image '{}' camera index {camera_index} is out of range",
+            image.name
+        );
+        anyhow::ensure!(
+            image.camera_index == camera_index
+                && image.rig_frame_index == setup.image_frame_indices[index],
+            "retained image '{}' identity does not match the camera setup",
+            image.name
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn validate_setup_matches_frames(
+    setup: &ReferenceCameraSetup,
+    frames: &[ImageFrame],
+) -> Result<()> {
+    let names = frames
+        .iter()
+        .map(|frame| frame.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::ensure!(
+        setup.image_ids.len() == frames.len()
+            && setup.image_camera_indices.len() == frames.len()
+            && setup.image_frame_indices.len() == frames.len(),
+        "per-image camera setup does not match retained frames [{names}]"
+    );
+    if let Some(seed) = &setup.seed_reconstruction {
+        anyhow::ensure!(
+            seed.poses.len() == frames.len() && seed.observations.len() == frames.len(),
+            "reference seed does not match retained frames [{names}]"
+        );
+    }
+    for (index, frame) in frames.iter().enumerate() {
+        let camera_index = setup.image_camera_indices[index];
+        anyhow::ensure!(
+            camera_index < setup.cameras.len(),
+            "retained frame '{}' camera index {camera_index} is out of range",
+            frame.name
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn database_camera_setup(
@@ -524,6 +880,43 @@ pub(super) fn database_camera_setup(
         image_frame_indices,
         seed_reconstruction: None,
     })
+}
+
+pub(super) fn database_camera_setup_for_retained(
+    cache: &DatabaseCache,
+    retained: &mut [RetainedMapperImage],
+) -> Result<ReferenceCameraSetup> {
+    let paths = retained
+        .iter()
+        .map(|image| image.path.clone())
+        .collect::<Vec<_>>();
+    let setup = database_camera_setup(cache, &paths)?;
+    anyhow::ensure!(
+        setup.image_ids.len() == retained.len()
+            && setup.image_camera_indices.len() == retained.len()
+            && setup.image_frame_indices.len() == retained.len(),
+        "database camera setup does not match retained images"
+    );
+    for (index, image) in retained.iter_mut().enumerate() {
+        anyhow::ensure!(
+            setup.image_ids[index] == image.database_image_id,
+            "database image '{}' id {} does not match retained id {}",
+            image.name,
+            setup.image_ids[index],
+            image.database_image_id
+        );
+        let camera_index = setup.image_camera_indices[index];
+        anyhow::ensure!(
+            camera_index < setup.camera_ids.len(),
+            "retained image '{}' camera index {camera_index} is out of range",
+            image.name
+        );
+        image.camera_index = camera_index;
+        image.database_camera_id = setup.camera_ids[camera_index];
+        image.rig_frame_index = setup.image_frame_indices[index];
+    }
+    validate_retained_image_setup(&setup, retained)?;
+    Ok(setup)
 }
 
 pub(super) fn local_image_camera_setup(

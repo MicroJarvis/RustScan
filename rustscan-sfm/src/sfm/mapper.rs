@@ -88,10 +88,12 @@ pub use pipeline_types::{
     IncrementalPipelineStatus, PipelineCallbackEvent, PipelineCallbackSink,
 };
 use reconstruction_input::{
-    apply_color_extraction_policy, collect_images, database_camera_setup, database_frames,
-    fallback_camera, load_mapper_database_for_paths, local_image_camera_setup,
-    resolve_mapper_database_path, sample_keypoint_colors, sensor_id_from_colmap,
-    setup_for_reconstruction_attempt,
+    apply_color_extraction_policy, collect_images, database_camera_setup,
+    database_camera_setup_for_retained, fallback_camera, load_mapper_database_for_paths,
+    local_image_camera_setup, merge_reference_registered_images,
+    reference_camera_setup_for_retained, resolve_mapper_database_path, retained_database_images,
+    retained_image_index_by_database_id, retained_image_index_by_name, sample_keypoint_colors,
+    sensor_id_from_colmap, setup_for_reconstruction_attempt, validate_setup_matches_frames,
 };
 #[cfg(test)]
 use reconstruction_input::{
@@ -219,8 +221,17 @@ pub(crate) fn register_single_target_from_seed(
         bail!("single-target registration requires fix_existing_frames=true");
     }
     if target_image >= frames.len() {
-        bail!("target image index {target_image} is out of range");
+        bail!(
+            "target image index {target_image} is out of range for {} retained frames",
+            frames.len()
+        );
     }
+    validate_setup_matches_frames(setup, frames).with_context(|| {
+        format!(
+            "single-target setup does not match retained image '{}'",
+            frames[target_image].name
+        )
+    })?;
     let camera = setup
         .cameras
         .first()
@@ -381,12 +392,69 @@ pub(crate) fn register_single_target_from_database_with_pnp_scorer(
     let database_input =
         load_mapper_database_for_paths(Some(database), &paths, config.min_matches)?
             .with_context(|| "single-target registration database was not loaded")?;
-    let frames = database_frames(&paths, &database_input)?;
-    let mut setup = reference_camera_setup(reference, &paths)?;
-    let database_setup = database_camera_setup(&database_input.cache, &paths)?;
-    let target_image = names.len() - 1;
+    let retained = retained_database_images(&paths, &database_input)?;
+    let database_rows = ColmapDatabase::open_read_only(database)?;
+    if retained_image_index_by_name(&retained, target_name).is_none() {
+        if database_rows.read_image_with_name(target_name)?.is_some() {
+            return Ok(SingleTargetRegistrationAttempt {
+                candidate: None,
+                debug_log: vec![format!(
+                    "target image '{target_name}' is not match-connected in the database"
+                )],
+            });
+        }
+        bail!("target image '{target_name}' is missing from database frames");
+    }
+    for support in support_names {
+        if retained_image_index_by_name(&retained, support).is_some() {
+            continue;
+        }
+        let in_database = database_rows.read_image_with_name(support)?.is_some();
+        let registered_in_reference = reference_model
+            .reconstruction
+            .image_names
+            .iter()
+            .zip(&reference_model.reconstruction.poses)
+            .any(|(name, pose)| name == support && pose.is_some());
+        if in_database && registered_in_reference {
+            continue;
+        }
+        bail!("support image '{support}' is missing from database frames");
+    }
+    drop(database_rows);
+    let mut retained =
+        merge_reference_registered_images(&reference_model.reconstruction, &names, retained)?;
+    let Some(target_image) = retained_image_index_by_name(&retained, target_name) else {
+        bail!("target image '{target_name}' is missing from database frames");
+    };
+    if retained_image_index_by_database_id(&retained, retained[target_image].database_image_id)
+        != Some(target_image)
+    {
+        bail!("target image '{target_name}' database id is ambiguous");
+    }
+    let mut setup = reference_camera_setup_for_retained(reference, &mut retained)?;
+    let retained_paths = retained
+        .iter()
+        .map(|image| image.path.clone())
+        .collect::<Vec<_>>();
+    let database_setup = database_camera_setup(&database_input.cache, &retained_paths)?;
+    anyhow::ensure!(
+        database_setup.image_ids.len() == retained.len()
+            && database_setup.image_camera_indices.len() == retained.len()
+            && database_setup.image_frame_indices.len() == retained.len(),
+        "database camera setup does not match retained images"
+    );
+    anyhow::ensure!(
+        database_setup.image_ids[target_image] == retained[target_image].database_image_id,
+        "target image '{target_name}' database id does not match the retained image"
+    );
     let database_camera_index = database_setup.image_camera_indices[target_image];
-    let database_camera_id = database_setup.camera_ids[database_camera_index];
+    let database_camera_id = *database_setup
+        .camera_ids
+        .get(database_camera_index)
+        .with_context(|| {
+            format!("target image '{target_name}' database camera index is out of range")
+        })?;
     let target_camera_index = if let Some(index) = setup
         .camera_ids
         .iter()
@@ -394,23 +462,46 @@ pub(crate) fn register_single_target_from_database_with_pnp_scorer(
     {
         index
     } else {
-        setup.camera_ids.push(database_camera_id);
-        setup
+        let database_camera = database_setup
             .cameras
-            .push(database_setup.cameras[database_camera_index]);
-        setup
+            .get(database_camera_index)
+            .copied()
+            .with_context(|| {
+                format!("target image '{target_name}' is missing its database camera")
+            })?;
+        let database_prior = *database_setup
             .camera_has_prior_focal_length
-            .push(database_setup.camera_has_prior_focal_length[database_camera_index]);
+            .get(database_camera_index)
+            .with_context(|| {
+                format!("target image '{target_name}' is missing its focal-length prior")
+            })?;
+        setup.camera_ids.push(database_camera_id);
+        setup.cameras.push(database_camera);
+        setup.camera_has_prior_focal_length.push(database_prior);
         setup.cameras.len() - 1
     };
-    setup.image_ids[target_image] = database_setup.image_ids[target_image];
+    setup.image_ids[target_image] = retained[target_image].database_image_id;
     setup.image_camera_indices[target_image] = target_camera_index;
     setup.image_frame_indices[target_image] = database_setup.image_frame_indices[target_image];
+    retained[target_image].camera_index = target_camera_index;
+    retained[target_image].database_camera_id = database_camera_id;
+    retained[target_image].rig_frame_index = setup.image_frame_indices[target_image];
+    let frames = retained
+        .iter()
+        .map(|image| image.frame.clone())
+        .collect::<Vec<_>>();
+    validate_setup_matches_frames(&setup, &frames).with_context(|| {
+        format!("single-target setup does not match retained image '{target_name}'")
+    })?;
     let camera = setup
         .cameras
         .first()
         .copied()
         .with_context(|| "reference setup has no cameras")?;
+    anyhow::ensure!(
+        frames[target_image].name == target_name,
+        "target image '{target_name}' is missing from database frames"
+    );
     let all_pairs = estimate_database_pair_geometries(
         &frames,
         &database_input.cache,
@@ -419,9 +510,6 @@ pub(crate) fn register_single_target_from_database_with_pnp_scorer(
         Some(&setup),
         config,
     )?;
-    if frames[target_image].name != target_name {
-        bail!("target image '{target_name}' is missing from database frames");
-    }
     let support_names = support_names
         .iter()
         .map(String::as_str)
@@ -846,7 +934,44 @@ fn run_reconstruction_prepared(
     let mut feature_profile: Option<FeatureProfile> = None;
     let mut debug_log = Vec::new();
     let mut frames = if let Some(database) = mapper_database.as_ref() {
-        database_frames(&paths, database)?
+        let mut retained = retained_database_images(&paths, database)?;
+        if let Some(reference) = config.reference.as_ref() {
+            reference_camera_setup = Some(
+                reference_camera_setup_for_retained(reference, &mut retained).with_context(
+                    || {
+                        format!(
+                            "failed to configure reference model {}",
+                            reference.display()
+                        )
+                    },
+                )?,
+            );
+        } else {
+            reference_camera_setup = Some(
+                database_camera_setup_for_retained(&database.cache, &mut retained)
+                    .with_context(|| "failed to configure database cameras for retained images")?,
+            );
+        }
+        if let Some(setup) = &mut reference_camera_setup {
+            for setup_camera in &mut setup.cameras {
+                if let Some(fx) = config.fx {
+                    setup_camera.set_fx(fx);
+                }
+                if let Some(fy) = config.fy {
+                    setup_camera.set_fy(fy);
+                }
+                if let Some(cx) = config.cx {
+                    setup_camera.set_cx(cx);
+                }
+                if let Some(cy) = config.cy {
+                    setup_camera.set_cy(cy);
+                }
+            }
+            if let Some(first) = setup.cameras.first().copied() {
+                camera = first;
+            }
+        }
+        retained.iter().map(|image| image.frame.clone()).collect()
     } else {
         let (frames, profile) = extract_frames(
             &paths,
@@ -864,34 +989,6 @@ fn run_reconstruction_prepared(
     };
     if let Some(database) = mapper_database.as_ref() {
         config.pose_priors = database.cache.pose_priors.clone();
-        if reference_camera_setup.is_none() {
-            // Align setup image order with database_frames, which drops paths
-            // that are not present in the match-connected database cache.
-            let frame_paths = frames
-                .iter()
-                .map(|frame| frame.path.clone())
-                .collect::<Vec<_>>();
-            reference_camera_setup = database_camera_setup(&database.cache, &frame_paths).ok();
-            if let Some(setup) = &mut reference_camera_setup {
-                for setup_camera in &mut setup.cameras {
-                    if let Some(fx) = config.fx {
-                        setup_camera.set_fx(fx);
-                    }
-                    if let Some(fy) = config.fy {
-                        setup_camera.set_fy(fy);
-                    }
-                    if let Some(cx) = config.cx {
-                        setup_camera.set_cx(cx);
-                    }
-                    if let Some(cy) = config.cy {
-                        setup_camera.set_cy(cy);
-                    }
-                }
-                if let Some(first) = setup.cameras.first().copied() {
-                    camera = first;
-                }
-            }
-        }
     }
     if reference_camera_setup.is_none() && mapper_database.is_none() {
         reference_camera_setup = Some(local_image_camera_setup(&frames, config)?);
@@ -914,6 +1011,9 @@ fn run_reconstruction_prepared(
     if reference_camera_setup.is_none() {
         camera.width = frames[0].width;
         camera.height = frames[0].height;
+    }
+    if let Some(setup) = reference_camera_setup.as_ref() {
+        validate_setup_matches_frames(setup, &frames)?;
     }
     let pair_start = Instant::now();
     let pairs = if let Some(database) = mapper_database.as_ref() {
@@ -3680,6 +3780,9 @@ fn incremental_map_single_attempt_with_pnp_scorer(
     events: &mut MapperEventBridge<'_, '_>,
     pnp_scorer: &mut Option<&mut DynPnPModelScorer>,
 ) -> Result<(Reconstruction, Vec<String>)> {
+    if let Some(setup) = reference_camera_setup {
+        validate_setup_matches_frames(setup, frames)?;
+    }
     let mut debug_log = Vec::new();
     let (
         cameras,
@@ -13636,6 +13739,14 @@ mod tests {
         );
         assert_eq!(setup.image_ids, vec![1, 2]);
         assert_eq!(setup.image_ids.len(), frames.len());
+        let retained = reconstruction_input::retained_database_images(&paths, &database)?;
+        assert_eq!(
+            retained
+                .iter()
+                .map(|image| (image.source_index, image.frame.id, image.database_image_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 1), (2, 1, 2)]
+        );
         Ok(())
     }
 
@@ -13764,6 +13875,148 @@ mod tests {
         )
         .expect_err("a disconnected target must be a contextual error");
         assert_missing_image_error(&error, "c.png");
+    }
+
+    #[test]
+    fn retained_reference_setup_keeps_camera_and_seed_after_dropping_middle_image() -> Result<()> {
+        let dir = tempdir()?;
+        let input = dir.path().join("images");
+        fs::create_dir_all(&input)?;
+        let names = ["a.png", "b.png", "c.png"];
+        for name in names {
+            image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])).save(input.join(name))?;
+        }
+        let reference = dir.path().join("reference");
+        let sparse = reference.join("sparse/0");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("cameras.txt"),
+            "11 PINHOLE 8 8 4 4 4 4\n99 PINHOLE 8 8 5 5 4 4\n42 SIMPLE_RADIAL 8 8 6 4 4 0\n",
+        )?;
+        fs::write(
+            sparse.join("images.txt"),
+            concat!(
+                "7 1 0 0 0 0 0 0 11 a.png\n",
+                "1 1 10\n",
+                "8 1 0 0 0 5 0 0 99 b.png\n",
+                "\n",
+                "9 1 0 0 0 3 0 0 42 c.png\n",
+                "2 2 10\n",
+            ),
+        )?;
+        fs::write(
+            sparse.join("points3D.txt"),
+            "10 0 0 2 12 34 56 0.5 7 0 9 0\n",
+        )?;
+
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 11,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 8,
+                    height: 8,
+                    params: vec![4.0, 4.0, 4.0, 4.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 42,
+                    model_id: crate::types::COLMAP_SIMPLE_RADIAL,
+                    width: 8,
+                    height: 8,
+                    params: vec![6.0, 4.0, 4.0, 0.0],
+                },
+                has_prior_focal_length: false,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(7, "a.png"), (9, "c.png")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: if name == "a.png" { 11 } else { 42 },
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(image_id, &[ColmapKeypoint::new(1.0, 1.0)])?;
+        }
+        db.write_two_view_geometry(
+            7,
+            9,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![FeatureMatch::new(0, 0)],
+                ..ColmapTwoViewGeometry::default()
+            },
+        )?;
+        let paths = names
+            .iter()
+            .map(|name| input.join(name))
+            .collect::<Vec<_>>();
+        let lookup_frames = paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| {
+                let mut frame = minimal_frame(id, path.file_name().unwrap().to_str().unwrap());
+                frame.path = path.clone();
+                frame
+            })
+            .collect::<Vec<_>>();
+        let database = load_mapper_database(Some(&db_path), &lookup_frames, 0)?.expect("database");
+        let mut retained = reconstruction_input::retained_database_images(&paths, &database)?;
+        let setup =
+            reconstruction_input::reference_camera_setup_for_retained(&reference, &mut retained)?;
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|image| {
+                    (
+                        image.source_index,
+                        image.frame.id,
+                        image.name.as_str(),
+                        image.database_image_id,
+                        image.reference_image_index,
+                        image.camera_index,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 0, "a.png", 7, Some(0), 0),
+                (2, 1, "c.png", 9, Some(2), 2),
+            ]
+        );
+        assert_eq!(setup.camera_ids, vec![11, 99, 42]);
+        assert_eq!(setup.image_ids, vec![7, 9]);
+        assert_eq!(setup.image_camera_indices, vec![0, 2]);
+        assert_eq!(setup.image_ids.len(), retained.len());
+        let seed = setup.seed_reconstruction.expect("seed");
+        assert_eq!(seed.poses.len(), 2);
+        let dropped_middle_translation = 5.0;
+        let retained_target_translation = 3.0;
+        let second = seed.poses[1].expect("c.png pose");
+        assert!((second.translation()[0] - retained_target_translation).abs() < 1.0e-4);
+        assert!((second.translation()[0] - dropped_middle_translation).abs() > 1.0);
+        assert_eq!(seed.observations.len(), 2);
+        assert_eq!(seed.points.len(), 1);
+        assert_eq!(
+            seed.points[0]
+                .track
+                .iter()
+                .map(|observation| observation.image)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        Ok(())
     }
 
     #[test]

@@ -479,7 +479,7 @@ fn composition_memory_mapper_cached_db_skips_invalid_image_headers() -> Result<(
         cfg.min_matches,
     )?
     .expect("database input");
-    let frames = super::super::database_frames(&prepared.paths, &database)?;
+    let frames = super::super::reconstruction_input::database_frames(&prepared.paths, &database)?;
     assert_eq!(frames.len(), 2);
     assert!(frames
         .iter()

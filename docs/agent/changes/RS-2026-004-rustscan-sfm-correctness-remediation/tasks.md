@@ -42,19 +42,19 @@ named owner, branch/worktree, and file scope.
 `rustscan-sfm/src/sfm/mapper.rs`,
 `rustscan-sfm/src/sfm/mapper/reconstruction_input.rs`, and mapper/sequence tests
 
-- [ ] Introduce the resolved retained-image record described in `design.md`.
-- [ ] Make database frame loading return retained identity and source mapping,
+- [x] Introduce the resolved retained-image record described in `design.md`.
+- [x] Make database frame loading return retained identity and source mapping,
       rather than a frame-only vector whose index is ambiguous.
-- [ ] Build reference/database camera setup and seed reconstruction from the
+- [x] Build reference/database camera setup and seed reconstruction from the
       retained images in their final mapper order.
-- [ ] Locate single-registration target and support images by stable name/ID.
+- [x] Locate single-registration target and support images by stable name/ID.
       Return a contextual missing/disconnected-target error.
-- [ ] Validate all per-image setup lengths before starting pair estimation or
+- [x] Validate all per-image setup lengths before starting pair estimation or
       constructing a `Reconstruction`.
-- [ ] Add regressions for a dropped leading image, dropped middle image,
+- [x] Add regressions for a dropped leading image, dropped middle image,
       disconnected target, filtered support image, multi-camera metadata, and
       reference seed alignment.
-- [ ] Re-run every sequence test that previously panicked and the complete
+- [x] Re-run every sequence test that previously panicked and the complete
       `sequence_registration` integration test serially.
 
 **Exit condition:** no retained frame can inherit metadata from a different
