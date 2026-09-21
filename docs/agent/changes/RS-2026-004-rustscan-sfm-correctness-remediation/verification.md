@@ -375,7 +375,7 @@ Owner: `cursor-agent`
 
 Base commit: `a33ef4a5ae4c5a70b603be44b7a98ce3febad67f`
 
-Final commit: `PENDING_AFTER_COMMIT`
+Final commit: `90f05093fb014bf76a3a96afff76adb84d7158c2`
 
 Branch: `agent/RS-2026-004/t1-mapper-identity`
 
@@ -418,7 +418,7 @@ Logs: `artifacts/runs/rs-2026-004-t1-review-p1/` in this worktree.
 
 #### Next action
 
-Start T2 from final commit `PENDING_AFTER_COMMIT`. Do not merge this branch to
+Start T2 from final commit `90f05093fb014bf76a3a96afff76adb84d7158c2`. Do not merge this branch to
 `main`.
 
 ### T2 — Reconstruction Validation And IDs

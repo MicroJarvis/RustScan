@@ -77,7 +77,7 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t1-mapper-identity
     scope: rustscan-sfm/src/sfm/mapper.rs, rustscan-sfm/src/sfm/mapper/reconstruction_input.rs, rustscan-sfm/src/sequence_registration.rs, and mapper/sequence tests
     status: review_p1_fixed
-    tip_commit: PENDING_AFTER_COMMIT
+    tip_commit: 90f05093fb014bf76a3a96afff76adb84d7158c2
   - id: T2
     owner: cursor-agent
     branch: agent/RS-2026-004/t2-reconstruction-validation
