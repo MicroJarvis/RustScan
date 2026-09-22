@@ -127,18 +127,18 @@ truncating an export file.
 **Primary scope:** `rustscan-sfm/src/core/types.rs`,
 `rustscan-sfm/src/sfm/view_graph_calibration.rs`, direct camera callers, and tests
 
-- [ ] Make COLMAP parameters the canonical camera state and provide checked
+- [x] Make COLMAP parameters the canonical camera state and provide checked
       derived accessors/mutators.
-- [ ] Migrate every direct write to `params`, `fx`, `fy`, `cx`, or `cy` to an
+- [x] Migrate every direct write to `params`, `fx`, `fy`, `cx`, or `cy` to an
       invariant-preserving API.
-- [ ] Preserve a required serialized schema through an explicit validated
+- [x] Preserve a required serialized schema through an explicit validated
       proxy; do not retain two mutable runtime sources of truth.
-- [ ] Change focal refinement so each candidate changes canonical projection
+- [x] Change focal refinement so each candidate changes canonical projection
       parameters before scoring.
-- [ ] Reject a non-finite scale and invalid resulting focal length.
-- [ ] Add a synthetic focal-search test with an optimum away from the first
+- [x] Reject a non-finite scale and invalid resulting focal length.
+- [x] Add a synthetic focal-search test with an optimum away from the first
       grid element, plus projection/export consistency assertions.
-- [ ] Add constructor and deserialization tests for zero, negative, NaN, and
+- [x] Add constructor and deserialization tests for zero, negative, NaN, and
       infinite focal parameters.
 
 **Exit condition:** camera accessors, projection, BA, calibration, and export

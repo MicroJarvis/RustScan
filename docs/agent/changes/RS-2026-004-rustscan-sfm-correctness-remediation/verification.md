@@ -813,7 +813,75 @@ allow. Do not merge this branch to `main` from this handoff.
 
 ### T4 — Camera Invariants
 
-Status: pending.
+Status: implemented. Not reviewed.
+
+Owner: `cursor-agent`
+
+Base commit: `ccfc1dab13bccb1c5b3f7f380255dee0485bb72e` (T3 reviewed tip)
+
+Branch: `agent/RS-2026-004/t4-camera-invariants`
+
+Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t4-camera-invariants`
+
+Implementation commit: `4de9ff7f832a4858a6cc7164fa1b6d9cba7dc56f`
+
+Changed files:
+
+- `rustscan-sfm/src/core/types.rs`
+- `rustscan-sfm/src/sfm/view_graph_calibration.rs`
+- `rustscan-sfm/src/ba/ceres_support.rs`
+- `rustscan-sfm/src/core/reconstruction_validation.rs`
+- `rustscan-sfm/src/geometry/two_view.rs`
+- `rustscan-sfm/src/io/colmap.rs`
+- `rustscan-sfm/src/sfm/mapper.rs`
+- `rustscan-sfm/tests/adaptive_keyframes.rs`
+- `rustscan-sfm/tests/sequence_registration.rs`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
+
+`CameraModel` now owns intrinsics only in COLMAP `params`. `fx`/`fy`/`cx`/`cy`
+are derived accessors. Checked mutators are `set_focal_lengths`,
+`set_principal_point`, `set_param`, and `scale_focal`. Compatibility
+`set_fx`/`set_fy`/`set_cx`/`set_cy` route through those mutators.
+`from_colmap` / `try_new_pinhole` reject non-finite or non-positive focals.
+Serde keeps legacy mirror fields on the wire but rejects disagreement with
+params-derived values.
+
+View-graph focal refinement scales canonical focal parameters before scoring
+and uses mean calibrated Sampson cost so grid candidates are distinguishable.
+Non-finite or non-positive scales are rejected. Synthetic optimum is scale
+`1.05` (not `0.9` or `1.0`).
+
+Commands with `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+and `CARGO_TERM_COLOR=never`:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error: `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`. Final line: `could not compile
+  rustscan-slam (lib) due to 84 previous errors`. Slam was not modified.
+- `cargo test -p rustscan-sfm --all-features --lib view_graph_calibration -- --test-threads=1`:
+  pass. `3 passed`.
+- `cargo test -p rustscan-sfm --all-features --lib types::tests -- --test-threads=1`:
+  pass. `12 passed`.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `652 passed; 0 failed; 19 ignored; finished in 56.66s`.
+- `git diff --check`: pass.
+
+Known limitations:
+
+- BA and mapper still write `params[i]` directly in finite-difference and
+  solve write-back paths, then call the no-op
+  `sync_intrinsics_from_params` seam. Accessors always read from params, so
+  observers cannot see a stale mirror, but those writers are not yet forced
+  through `set_param` (T5 may tighten BA write-back further).
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+
+Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
+handoff unless their dependencies and the task protocol allow. Do not merge
+to `main`.
 
 ### T5 — Atomic BA
 
