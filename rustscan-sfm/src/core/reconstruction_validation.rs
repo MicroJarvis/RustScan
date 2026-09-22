@@ -670,15 +670,6 @@ fn validate_camera_finite(
             "camera parameter count exceeds the fixed parameter array",
         ));
     }
-    let scalars = [camera.fx, camera.fy, camera.cx, camera.cy];
-    if scalars.iter().any(|value| !value.is_finite()) {
-        return Err(validation_error(
-            record_type,
-            ids,
-            "fx",
-            "camera intrinsics are non-finite",
-        ));
-    }
     if camera.params[..camera.num_params]
         .iter()
         .any(|value| !value.is_finite())
@@ -688,6 +679,15 @@ fn validate_camera_finite(
             ids,
             "params",
             "camera parameters are non-finite",
+        ));
+    }
+    let scalars = [camera.fx(), camera.fy(), camera.cx(), camera.cy()];
+    if scalars.iter().any(|value| !value.is_finite()) {
+        return Err(validation_error(
+            record_type,
+            ids,
+            "fx",
+            "camera intrinsics are non-finite",
         ));
     }
     Ok(())
@@ -1045,10 +1045,6 @@ mod tests {
         disagreement.observations[0][0] = Some(1);
         cases.push(("point_index", disagreement));
 
-        let mut non_finite_camera = two_images();
-        non_finite_camera.cameras[0].fx = f32::NAN;
-        cases.push(("fx", non_finite_camera));
-
         let mut non_finite_params = two_images();
         non_finite_params.cameras[0].params[0] = f64::INFINITY;
         cases.push(("params", non_finite_params));
@@ -1298,7 +1294,7 @@ mod tests {
             1
         );
         assert_eq!(
-            reconstruction.try_camera_for_image(0).expect("camera").fx,
+            reconstruction.try_camera_for_image(0).expect("camera").fx(),
             500.0
         );
         assert_eq!(reconstruction.try_point3d_id(1).expect("point"), 2);
@@ -1319,8 +1315,8 @@ mod tests {
             assert_eq!(reconstruction.camera_id_for_image(0), 1);
             assert_eq!(reconstruction.point3d_id(0), 1);
             assert_eq!(
-                reconstruction.camera_for_image(0).fx,
-                reconstruction.camera.fx
+                reconstruction.camera_for_image(0).fx(),
+                reconstruction.camera.fx()
             );
         }
     }

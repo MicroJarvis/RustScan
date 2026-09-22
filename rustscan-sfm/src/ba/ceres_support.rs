@@ -2523,25 +2523,9 @@ fn point_nonpoint_cross(j_point: Mat2x3, j_nonpoint: &DMatrix<f64>) -> DMatrix<f
 }
 
 pub(crate) fn sync_camera_intrinsics_from_params(camera: &mut CameraModel) {
-    if let Some(focal_idxs) = colmap_camera_model_focal_idxs(camera.model_id) {
-        match focal_idxs {
-            [idx] if *idx < camera.num_params => {
-                camera.fx = camera.params[*idx] as f32;
-                camera.fy = camera.params[*idx] as f32;
-            }
-            [idx_x, idx_y] if *idx_x < camera.num_params && *idx_y < camera.num_params => {
-                camera.fx = camera.params[*idx_x] as f32;
-                camera.fy = camera.params[*idx_y] as f32;
-            }
-            _ => {}
-        }
-    }
-    if let Some([idx_x, idx_y]) = colmap_camera_model_principal_point_idxs(camera.model_id) {
-        if idx_x < camera.num_params && idx_y < camera.num_params {
-            camera.cx = camera.params[idx_x] as f32;
-            camera.cy = camera.params[idx_y] as f32;
-        }
-    }
+    // Intrinsics are derived from params; keep the helper as a no-op call site
+    // seam for BA code that previously mirrored fields.
+    camera.sync_intrinsics_from_params();
 }
 
 pub(crate) fn apply_pose_delta_f64(pose: SE3, delta: Vec6) -> SE3 {

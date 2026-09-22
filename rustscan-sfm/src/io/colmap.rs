@@ -297,10 +297,10 @@ fn camera_model_from_colmap(camera: ColmapCamera, source: &Path) -> Result<Camer
                     camera.params.len()
                 )
             })?;
-    if !model.fx.is_finite()
-        || !model.fy.is_finite()
-        || !model.cx.is_finite()
-        || !model.cy.is_finite()
+    if !model.fx().is_finite()
+        || !model.fy().is_finite()
+        || !model.cx().is_finite()
+        || !model.cy().is_finite()
     {
         return Err(colmap_io_error(
             source,
@@ -312,7 +312,7 @@ fn camera_model_from_colmap(camera: ColmapCamera, source: &Path) -> Result<Camer
         )
         .into());
     }
-    if model.fx <= 0.0 || model.fy <= 0.0 {
+    if model.fx() <= 0.0 || model.fy() <= 0.0 {
         return Err(colmap_io_error(
             source,
             "camera",
@@ -3650,10 +3650,10 @@ mod tests {
         assert_eq!(camera.model_name(), "SIMPLE_PINHOLE");
         assert_eq!(camera.num_params, 3);
         assert_eq!(camera.params_slice(), &[500.0, 320.0, 240.0]);
-        assert_eq!(camera.fx, 500.0);
-        assert_eq!(camera.fy, 500.0);
-        assert_eq!(camera.cx, 320.0);
-        assert_eq!(camera.cy, 240.0);
+        assert_eq!(camera.fx(), 500.0);
+        assert_eq!(camera.fy(), 500.0);
+        assert_eq!(camera.cx(), 320.0);
+        assert_eq!(camera.cy(), 240.0);
         Ok(())
     }
 
@@ -3671,10 +3671,10 @@ mod tests {
 
         assert_eq!(camera.model_id, COLMAP_SIMPLE_RADIAL);
         assert_eq!(camera.params_slice(), &[700.0, 401.0, 299.0, -0.0125]);
-        assert_eq!(camera.fx, 700.0);
-        assert_eq!(camera.fy, 700.0);
-        assert_eq!(camera.cx, 401.0);
-        assert_eq!(camera.cy, 299.0);
+        assert_eq!(camera.fx(), 700.0);
+        assert_eq!(camera.fy(), 700.0);
+        assert_eq!(camera.cx(), 401.0);
+        assert_eq!(camera.cy(), 299.0);
         Ok(())
     }
 
@@ -3702,10 +3702,10 @@ mod tests {
         assert_eq!(camera.model_id, COLMAP_FULL_OPENCV);
         assert_eq!(camera.model_name(), "FULL_OPENCV");
         assert_eq!(camera.num_params, 12);
-        assert_eq!(camera.fx, 900.0);
-        assert_eq!(camera.fy, 901.0);
-        assert_eq!(camera.cx, 512.0);
-        assert_eq!(camera.cy, 384.0);
+        assert_eq!(camera.fx(), 900.0);
+        assert_eq!(camera.fy(), 901.0);
+        assert_eq!(camera.cx(), 512.0);
+        assert_eq!(camera.cy(), 384.0);
         assert_eq!(camera.params_slice()[11], 0.0);
         Ok(())
     }

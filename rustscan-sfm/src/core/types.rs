@@ -1,6 +1,9 @@
 use crate::geometry::{UnitQuatNormalize, Vec3GlamExt};
 use rustscan_slam::{Descriptors, KeyPoint, Match, SE3};
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 use std::path::PathBuf;
 
 use crate::sift::SiftFeatures;
@@ -13,37 +16,49 @@ pub use rustscan_types::colmap::{
     COLMAP_SIMPLE_RADIAL_FISHEYE, COLMAP_THIN_PRISM_FISHEYE,
 };
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// COLMAP camera state. `params` is the sole mutable intrinsics owner; focal
+/// length and principal point are derived accessors.
+#[derive(Debug, Clone, Copy)]
 pub struct CameraModel {
     pub model_id: i32,
     pub num_params: usize,
     pub params: [f64; COLMAP_MAX_CAMERA_PARAMS],
     pub width: u32,
     pub height: u32,
-    pub fx: f32,
-    pub fy: f32,
-    pub cx: f32,
-    pub cy: f32,
 }
 
 impl CameraModel {
     pub fn new_pinhole(width: u32, height: u32, fx: f32, fy: f32, cx: f32, cy: f32) -> Self {
+        Self::try_new_pinhole(width, height, fx, fy, cx, cy)
+            .expect("pinhole camera requires finite positive focals and finite principal point")
+    }
+
+    pub fn try_new_pinhole(
+        width: u32,
+        height: u32,
+        fx: f32,
+        fy: f32,
+        cx: f32,
+        cy: f32,
+    ) -> Option<Self> {
+        if !fx.is_finite() || !fy.is_finite() || fx <= 0.0 || fy <= 0.0 {
+            return None;
+        }
+        if !cx.is_finite() || !cy.is_finite() {
+            return None;
+        }
         let mut params = [0.0; COLMAP_MAX_CAMERA_PARAMS];
         params[0] = fx as f64;
         params[1] = fy as f64;
         params[2] = cx as f64;
         params[3] = cy as f64;
-        Self {
+        Some(Self {
             model_id: COLMAP_PINHOLE,
             num_params: 4,
             params,
             width,
             height,
-            fx,
-            fy,
-            cx,
-            cy,
-        }
+        })
     }
 
     pub fn from_colmap(
@@ -56,21 +71,26 @@ impl CameraModel {
         if input_params.len() != expected || expected > COLMAP_MAX_CAMERA_PARAMS {
             return None;
         }
+        if input_params.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
 
         let mut params = [0.0; COLMAP_MAX_CAMERA_PARAMS];
         params[..expected].copy_from_slice(input_params);
         let (fx, fy) = focal_lengths_from_params(model_id, &params)?;
         let (cx, cy) = principal_point_from_params(model_id, &params)?;
+        if !fx.is_finite() || !fy.is_finite() || fx <= 0.0 || fy <= 0.0 {
+            return None;
+        }
+        if !cx.is_finite() || !cy.is_finite() {
+            return None;
+        }
         Some(Self {
             model_id,
             num_params: expected,
             params,
             width,
             height,
-            fx: fx as f32,
-            fy: fy as f32,
-            cx: cx as f32,
-            cy: cy as f32,
         })
     }
 
@@ -322,7 +342,7 @@ impl CameraModel {
 
     pub fn cam_from_img_threshold(&self, threshold_px: f64) -> f64 {
         let Some(focal_idxs) = colmap_camera_model_focal_idxs(self.model_id) else {
-            return threshold_px / self.fx.max(self.fy).max(1.0) as f64;
+            return threshold_px / self.fx().max(self.fy()).max(1.0) as f64;
         };
         let mean_focal_length =
             focal_idxs.iter().map(|&idx| self.params[idx]).sum::<f64>() / focal_idxs.len() as f64;
@@ -337,54 +357,184 @@ impl CameraModel {
         &self.params[..self.num_params]
     }
 
-    pub fn set_fx(&mut self, fx: f32) {
-        self.fx = fx;
-        self.sync_params_from_intrinsics();
+    /// Focal length `fx` derived from canonical COLMAP parameters.
+    pub fn fx(&self) -> f32 {
+        focal_lengths_from_params(self.model_id, &self.params)
+            .map(|(fx, _)| fx as f32)
+            .unwrap_or(0.0)
     }
 
-    pub fn set_fy(&mut self, fy: f32) {
-        self.fy = fy;
-        self.sync_params_from_intrinsics();
+    /// Focal length `fy` derived from canonical COLMAP parameters.
+    pub fn fy(&self) -> f32 {
+        focal_lengths_from_params(self.model_id, &self.params)
+            .map(|(_, fy)| fy as f32)
+            .unwrap_or(0.0)
     }
 
-    pub fn set_cx(&mut self, cx: f32) {
-        self.cx = cx;
-        self.sync_params_from_intrinsics();
+    /// Principal-point `cx` derived from canonical COLMAP parameters.
+    pub fn cx(&self) -> f32 {
+        principal_point_from_params(self.model_id, &self.params)
+            .map(|(cx, _)| cx as f32)
+            .unwrap_or(0.0)
     }
 
-    pub fn set_cy(&mut self, cy: f32) {
-        self.cy = cy;
-        self.sync_params_from_intrinsics();
+    /// Principal-point `cy` derived from canonical COLMAP parameters.
+    pub fn cy(&self) -> f32 {
+        principal_point_from_params(self.model_id, &self.params)
+            .map(|(_, cy)| cy as f32)
+            .unwrap_or(0.0)
     }
 
-    pub fn sync_params_from_intrinsics(&mut self) {
-        if let Some(focal_idxs) = colmap_camera_model_focal_idxs(self.model_id) {
-            match focal_idxs {
-                [idx] => {
-                    self.params[*idx] = ((self.fx as f64) + (self.fy as f64)) * 0.5;
-                }
-                [idx_x, idx_y] => {
-                    self.params[*idx_x] = self.fx as f64;
-                    self.params[*idx_y] = self.fy as f64;
-                }
-                _ => {}
+    /// Updates both focal lengths in canonical parameters.
+    pub fn set_focal_lengths(&mut self, fx: f32, fy: f32) -> Result<(), String> {
+        if !fx.is_finite() || !fy.is_finite() || fx <= 0.0 || fy <= 0.0 {
+            return Err(format!(
+                "focal lengths must be finite and strictly positive (fx={fx}, fy={fy})"
+            ));
+        }
+        let Some(focal_idxs) = colmap_camera_model_focal_idxs(self.model_id) else {
+            return Err(format!(
+                "camera model {} has no focal parameters",
+                self.model_id
+            ));
+        };
+        match focal_idxs {
+            [idx] => {
+                self.params[*idx] = ((fx as f64) + (fy as f64)) * 0.5;
+            }
+            [idx_x, idx_y] => {
+                self.params[*idx_x] = fx as f64;
+                self.params[*idx_y] = fy as f64;
+            }
+            _ => {
+                return Err(format!(
+                    "camera model {} has unsupported focal layout",
+                    self.model_id
+                ));
             }
         }
-        if let Some([idx_x, idx_y]) = colmap_camera_model_principal_point_idxs(self.model_id) {
-            self.params[idx_x] = self.cx as f64;
-            self.params[idx_y] = self.cy as f64;
-        }
+        Ok(())
     }
 
-    pub fn sync_intrinsics_from_params(&mut self) {
-        if let Some((fx, fy)) = focal_lengths_from_params(self.model_id, &self.params) {
-            self.fx = fx as f32;
-            self.fy = fy as f32;
+    /// Updates the principal point in canonical parameters.
+    pub fn set_principal_point(&mut self, cx: f32, cy: f32) -> Result<(), String> {
+        if !cx.is_finite() || !cy.is_finite() {
+            return Err(format!("principal point must be finite (cx={cx}, cy={cy})"));
         }
-        if let Some((cx, cy)) = principal_point_from_params(self.model_id, &self.params) {
-            self.cx = cx as f32;
-            self.cy = cy as f32;
+        let Some([idx_x, idx_y]) = colmap_camera_model_principal_point_idxs(self.model_id) else {
+            return Err(format!(
+                "camera model {} has no principal-point parameters",
+                self.model_id
+            ));
+        };
+        self.params[idx_x] = cx as f64;
+        self.params[idx_y] = cy as f64;
+        Ok(())
+    }
+
+    /// Sets one canonical COLMAP parameter by index and validates derived focals.
+    pub fn set_param(&mut self, index: usize, value: f64) -> Result<(), String> {
+        if index >= self.num_params {
+            return Err(format!(
+                "camera parameter index {index} is out of range for num_params={}",
+                self.num_params
+            ));
         }
+        if !value.is_finite() {
+            return Err(format!("camera parameter[{index}] is non-finite ({value})"));
+        }
+        self.params[index] = value;
+        self.validate_derived_intrinsics()
+    }
+
+    /// Scales all focal parameters by `scale` in canonical storage.
+    pub fn scale_focal(&mut self, scale: f64) -> Result<(), String> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!(
+                "focal scale must be finite and strictly positive ({scale})"
+            ));
+        }
+        let Some(focal_idxs) = colmap_camera_model_focal_idxs(self.model_id) else {
+            return Err(format!(
+                "camera model {} has no focal parameters",
+                self.model_id
+            ));
+        };
+        for &idx in focal_idxs {
+            let scaled = self.params[idx] * scale;
+            if !scaled.is_finite() || scaled <= 0.0 {
+                return Err(format!(
+                    "scaled focal parameter[{idx}] is not positive and finite ({scaled})"
+                ));
+            }
+            self.params[idx] = scaled;
+        }
+        self.validate_derived_intrinsics()
+    }
+
+    /// Compatibility wrapper: updates `fx` through [`Self::set_focal_lengths`].
+    pub fn set_fx(&mut self, fx: f32) {
+        let fy = self.fy();
+        self.set_focal_lengths(fx, fy)
+            .expect("set_fx requires a finite positive focal length");
+    }
+
+    /// Compatibility wrapper: updates `fy` through [`Self::set_focal_lengths`].
+    pub fn set_fy(&mut self, fy: f32) {
+        let fx = self.fx();
+        self.set_focal_lengths(fx, fy)
+            .expect("set_fy requires a finite positive focal length");
+    }
+
+    /// Compatibility wrapper: updates `cx` through [`Self::set_principal_point`].
+    pub fn set_cx(&mut self, cx: f32) {
+        let cy = self.cy();
+        self.set_principal_point(cx, cy)
+            .expect("set_cx requires a finite principal point");
+    }
+
+    /// Compatibility wrapper: updates `cy` through [`Self::set_principal_point`].
+    pub fn set_cy(&mut self, cy: f32) {
+        let cx = self.cx();
+        self.set_principal_point(cx, cy)
+            .expect("set_cy requires a finite principal point");
+    }
+
+    /// No-op retained for call sites that previously mirrored params into
+    /// duplicated fx/fy/cx/cy fields. Intrinsics are always derived from params.
+    pub fn sync_intrinsics_from_params(&mut self) {}
+
+    /// Writes current derived intrinsics back into params. Prefer
+    /// [`Self::set_focal_lengths`] / [`Self::set_principal_point`].
+    pub fn sync_params_from_intrinsics(&mut self) {
+        let _ = self.set_focal_lengths(self.fx(), self.fy());
+        let _ = self.set_principal_point(self.cx(), self.cy());
+    }
+
+    fn validate_derived_intrinsics(&self) -> Result<(), String> {
+        let Some((fx, fy)) = focal_lengths_from_params(self.model_id, &self.params) else {
+            return Err(format!(
+                "camera model {} has no focal parameters",
+                self.model_id
+            ));
+        };
+        if !fx.is_finite() || !fy.is_finite() || fx <= 0.0 || fy <= 0.0 {
+            return Err(format!(
+                "derived focal lengths must be finite and strictly positive (fx={fx}, fy={fy})"
+            ));
+        }
+        let Some((cx, cy)) = principal_point_from_params(self.model_id, &self.params) else {
+            return Err(format!(
+                "camera model {} has no principal-point parameters",
+                self.model_id
+            ));
+        };
+        if !cx.is_finite() || !cy.is_finite() {
+            return Err(format!(
+                "derived principal point must be finite (cx={cx}, cy={cy})"
+            ));
+        }
+        Ok(())
     }
 
     pub fn has_bogus_params(
@@ -521,6 +671,146 @@ impl CameraModel {
                 })
             })
             .unwrap_or(true)
+    }
+}
+
+impl Serialize for CameraModel {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("CameraModel", 9)?;
+        state.serialize_field("model_id", &self.model_id)?;
+        state.serialize_field("num_params", &self.num_params)?;
+        state.serialize_field("params", &self.params)?;
+        state.serialize_field("width", &self.width)?;
+        state.serialize_field("height", &self.height)?;
+        // Legacy mirror fields stay in the wire format for compatibility, but
+        // they are always derived from params at serialize time.
+        state.serialize_field("fx", &self.fx())?;
+        state.serialize_field("fy", &self.fy())?;
+        state.serialize_field("cx", &self.cx())?;
+        state.serialize_field("cy", &self.cy())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CameraModel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Default)]
+        struct CameraModelDe {
+            model_id: Option<i32>,
+            num_params: Option<usize>,
+            params: Option<[f64; COLMAP_MAX_CAMERA_PARAMS]>,
+            width: Option<u32>,
+            height: Option<u32>,
+            fx: Option<f32>,
+            fy: Option<f32>,
+            cx: Option<f32>,
+            cy: Option<f32>,
+        }
+
+        struct CameraModelVisitor;
+
+        impl<'de> Visitor<'de> for CameraModelVisitor {
+            type Value = CameraModel;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("CameraModel with canonical COLMAP params")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut de = CameraModelDe::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "model_id" => de.model_id = Some(map.next_value()?),
+                        "num_params" => de.num_params = Some(map.next_value()?),
+                        "params" => de.params = Some(map.next_value()?),
+                        "width" => de.width = Some(map.next_value()?),
+                        "height" => de.height = Some(map.next_value()?),
+                        "fx" => de.fx = Some(map.next_value()?),
+                        "fy" => de.fy = Some(map.next_value()?),
+                        "cx" => de.cx = Some(map.next_value()?),
+                        "cy" => de.cy = Some(map.next_value()?),
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let model_id = de
+                    .model_id
+                    .ok_or_else(|| DeError::missing_field("model_id"))?;
+                let num_params = de
+                    .num_params
+                    .ok_or_else(|| DeError::missing_field("num_params"))?;
+                let params = de.params.ok_or_else(|| DeError::missing_field("params"))?;
+                let width = de.width.ok_or_else(|| DeError::missing_field("width"))?;
+                let height = de.height.ok_or_else(|| DeError::missing_field("height"))?;
+
+                let camera = CameraModel::from_colmap(
+                    model_id,
+                    width,
+                    height,
+                    &params[..num_params.min(COLMAP_MAX_CAMERA_PARAMS)],
+                )
+                .ok_or_else(|| {
+                    DeError::custom(
+                        "CameraModel params are not a valid COLMAP camera (finite positive focals required)",
+                    )
+                })?;
+
+                if camera.num_params != num_params {
+                    return Err(DeError::custom(format!(
+                        "num_params {num_params} disagrees with model_id {model_id}"
+                    )));
+                }
+
+                let agree = |label: &str,
+                             stored: Option<f32>,
+                             derived: f32|
+                 -> Result<(), A::Error> {
+                    if let Some(stored) = stored {
+                        if !stored.is_finite()
+                            || !derived.is_finite()
+                            || (stored - derived).abs() > 1.0e-3
+                        {
+                            return Err(DeError::custom(format!(
+                                "CameraModel.{label}={stored} disagrees with params-derived {derived}"
+                            )));
+                        }
+                    }
+                    Ok(())
+                };
+                agree("fx", de.fx, camera.fx())?;
+                agree("fy", de.fy, camera.fy())?;
+                agree("cx", de.cx, camera.cx())?;
+                agree("cy", de.cy, camera.cy())?;
+                Ok(camera)
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "CameraModel",
+            &[
+                "model_id",
+                "num_params",
+                "params",
+                "width",
+                "height",
+                "fx",
+                "fy",
+                "cx",
+                "cy",
+            ],
+            CameraModelVisitor,
+        )
     }
 }
 
@@ -1669,5 +1959,75 @@ mod tests {
             let camera = CameraModel::from_colmap(model_id, 800, 600, &params).unwrap();
             assert_roundtrip(camera, [0.08, -0.05]);
         }
+    }
+
+    #[test]
+    fn from_colmap_rejects_non_positive_or_non_finite_focals() {
+        assert!(
+            CameraModel::from_colmap(COLMAP_PINHOLE, 640, 480, &[0.0, 500.0, 320.0, 240.0])
+                .is_none()
+        );
+        assert!(
+            CameraModel::from_colmap(COLMAP_PINHOLE, 640, 480, &[-1.0, 500.0, 320.0, 240.0])
+                .is_none()
+        );
+        assert!(CameraModel::from_colmap(
+            COLMAP_PINHOLE,
+            640,
+            480,
+            &[f64::NAN, 500.0, 320.0, 240.0]
+        )
+        .is_none());
+        assert!(CameraModel::from_colmap(
+            COLMAP_PINHOLE,
+            640,
+            480,
+            &[f64::INFINITY, 500.0, 320.0, 240.0]
+        )
+        .is_none());
+        assert!(CameraModel::try_new_pinhole(640, 480, 0.0, 500.0, 320.0, 240.0).is_none());
+        assert!(CameraModel::try_new_pinhole(640, 480, f32::NAN, 500.0, 320.0, 240.0).is_none());
+    }
+
+    #[test]
+    fn scale_focal_updates_canonical_params_and_accessors() {
+        let mut camera = CameraModel::new_pinhole(640, 480, 500.0, 501.0, 320.0, 240.0);
+        camera.scale_focal(1.05).expect("scale");
+        assert!((camera.fx() - 525.0).abs() < 1.0e-3);
+        assert!((camera.fy() - 526.05).abs() < 1.0e-2);
+        assert!((camera.params[0] - 525.0).abs() < 1.0e-9);
+        assert!((camera.params[1] - 526.05).abs() < 1.0e-9);
+        let projected = camera.img_from_cam(0.1, -0.05, 1.0).unwrap();
+        assert!((projected[0] - (525.0 * 0.1 + 320.0)).abs() < 1.0e-4);
+        assert!(camera.scale_focal(0.0).is_err());
+        assert!(camera.scale_focal(f64::NAN).is_err());
+        assert!(camera.set_focal_lengths(-1.0, 500.0).is_err());
+        assert!(camera.set_param(0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn serde_proxy_rejects_disagreement_between_params_and_legacy_fx() {
+        let camera = CameraModel::new_pinhole(640, 480, 500.0, 501.0, 320.0, 240.0);
+        let ok = serde_json::to_value(camera).unwrap();
+        let roundtrip: CameraModel = serde_json::from_value(ok.clone()).unwrap();
+        assert_eq!(roundtrip.fx(), 500.0);
+        assert_eq!(roundtrip.params[0], 500.0);
+
+        let mut bad = ok;
+        bad["fx"] = serde_json::json!(600.0);
+        let err = serde_json::from_value::<CameraModel>(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees"),
+            "unexpected error: {err}"
+        );
+
+        let invalid = serde_json::json!({
+            "model_id": COLMAP_PINHOLE,
+            "num_params": 4,
+            "params": [0.0, 500.0, 320.0, 240.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "width": 640,
+            "height": 480,
+        });
+        assert!(serde_json::from_value::<CameraModel>(invalid).is_err());
     }
 }

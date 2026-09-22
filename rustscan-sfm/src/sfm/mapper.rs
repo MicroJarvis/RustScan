@@ -1379,10 +1379,10 @@ pub(super) fn bogus_registered_camera_audits(
                     camera.model_name(),
                     camera.width,
                     camera.height,
-                    camera.fx,
-                    camera.fy,
-                    camera.cx,
-                    camera.cy,
+                    camera.fx(),
+                    camera.fy(),
+                    camera.cx(),
+                    camera.cy(),
                     reasons.join("+")
                 ),
             }
@@ -7831,8 +7831,8 @@ fn initial_pair_camera_invalid(reconstruction: &Reconstruction, image: usize) ->
     let camera = reconstruction.camera_for_image(image);
     camera.width == 0
         || camera.height == 0
-        || !camera.fx.is_finite()
-        || !camera.fy.is_finite()
+        || !camera.fx().is_finite()
+        || !camera.fy().is_finite()
         || camera.params.iter().any(|param| !param.is_finite())
 }
 
@@ -10168,8 +10168,8 @@ fn solve_absolute_pose_with_gpu_focal_estimation(
         .iter()
         .map(|observation| {
             [
-                observation.xy[0] - initial_camera.cx,
-                observation.xy[1] - initial_camera.cy,
+                observation.xy[0] - initial_camera.cx(),
+                observation.xy[1] - initial_camera.cy(),
             ]
         })
         .collect::<Vec<_>>();
@@ -10240,8 +10240,8 @@ fn solve_absolute_pose_with_focal_estimation(
         ..PnPSolver::new(
             initial_focal,
             initial_focal,
-            initial_camera.cx,
-            initial_camera.cy,
+            initial_camera.cx(),
+            initial_camera.cy(),
         )
     };
     let mut problem = PnPProblem::new();
@@ -10336,7 +10336,7 @@ fn average_camera_focal(camera: CameraModel) -> f64 {
             return (sum / count as f64).max(1.0);
         }
     }
-    camera.fx.max(camera.fy).max(1.0) as f64
+    camera.fx().max(camera.fy()).max(1.0) as f64
 }
 
 fn absolute_pose_estimate_focal_length_enabled(
@@ -12848,8 +12848,8 @@ mod tests {
                     feature: index,
                     point_id: index,
                     xy: [
-                        expected_focal * point[0] / point[2] + camera.cx,
-                        expected_focal * point[1] / point[2] + camera.cy,
+                        expected_focal * point[0] / point[2] + camera.cx(),
+                        expected_focal * point[1] / point[2] + camera.cy(),
                     ],
                     xyz,
                 }
@@ -12878,8 +12878,8 @@ mod tests {
         .expect("CPU PnP-fallback result");
 
         assert!(gpu.1.iter().filter(|&&inlier| inlier).count() >= 24);
-        assert!((gpu.2.fx - expected_focal).abs() / expected_focal < 0.05);
-        assert!((gpu.2.fx - cpu.2.fx).abs() / cpu.2.fx < 0.05);
+        assert!((gpu.2.fx() - expected_focal).abs() / expected_focal < 0.05);
+        assert!((gpu.2.fx() - cpu.2.fx()).abs() / cpu.2.fx() < 0.05);
         assert!(!camera_has_bogus_params(gpu.2, &config));
         assert_eq!(telemetry.gpu_pnp_focal_fallbacks.len(), 1);
         assert!(telemetry.gpu_pnp_focal_fallbacks[0].contains("simulated focal GPU dispatch"));
@@ -12971,8 +12971,8 @@ mod tests {
                     feature: index,
                     point_id: index,
                     xy: [
-                        expected_focal * point[0] / point[2] + camera.cx,
-                        expected_focal * point[1] / point[2] + camera.cy,
+                        expected_focal * point[0] / point[2] + camera.cx(),
+                        expected_focal * point[1] / point[2] + camera.cy(),
                     ],
                     xyz,
                 }
@@ -13018,9 +13018,9 @@ mod tests {
 
         assert_eq!(mask.len(), observations.len());
         assert!(mask.iter().all(|&inlier| inlier));
-        assert!((solved_camera.fx - expected_focal).abs() / expected_focal < 0.05);
-        assert_eq!(solved_camera.params[0], solved_camera.fx as f64);
-        assert_eq!(solved_camera.params[1], solved_camera.fy as f64);
+        assert!((solved_camera.fx() - expected_focal).abs() / expected_focal < 0.05);
+        assert_eq!(solved_camera.params[0], solved_camera.fx() as f64);
+        assert_eq!(solved_camera.params[1], solved_camera.fy() as f64);
         assert!(!camera_has_bogus_params(solved_camera, &config));
         Ok(())
     }
@@ -13043,8 +13043,8 @@ mod tests {
                 ];
                 let point = expected_pose.transform_point(&xyz);
                 let mut xy = [
-                    camera.fx * point[0] / point[2] + camera.cx,
-                    camera.fy * point[1] / point[2] + camera.cy,
+                    camera.fx() * point[0] / point[2] + camera.cx(),
+                    camera.fy() * point[1] / point[2] + camera.cy(),
                 ];
                 if index >= 26 {
                     xy[0] += 80.0;
@@ -13443,7 +13443,7 @@ mod tests {
         assert_eq!(setup.image_ids, vec![11, 12]);
         assert_eq!(setup.image_camera_indices, vec![0, 0]);
         assert_eq!(setup.camera_has_prior_focal_length, vec![true]);
-        assert_eq!(setup.cameras[0].fx, 80.0);
+        assert_eq!(setup.cameras[0].fx(), 80.0);
         Ok(())
     }
 
@@ -13996,7 +13996,10 @@ mod tests {
         assert_ne!(setup.image_camera_indices[new_index], 0);
         assert_eq!(setup.image_ids[new_index], 77);
         assert_eq!(setup.camera_ids[setup.image_camera_indices[new_index]], 55);
-        assert_eq!(setup.cameras[setup.image_camera_indices[new_index]].fx, 9.0);
+        assert_eq!(
+            setup.cameras[setup.image_camera_indices[new_index]].fx(),
+            9.0
+        );
         assert_eq!(new_image.database_image_id, 77);
         assert_eq!(new_image.database_camera_id, 55);
         assert_eq!(setup.image_ids[0], 7);
@@ -16738,8 +16741,8 @@ mod tests {
             &registration_stats(&reconstruction),
         );
 
-        assert_eq!(camera.fx, prior.fx);
-        assert_eq!(camera.fy, prior.fy);
+        assert_eq!(camera.fx(), prior.fx());
+        assert_eq!(camera.fy(), prior.fy());
     }
 
     #[test]
@@ -16765,8 +16768,8 @@ mod tests {
             &registration_stats(&reconstruction),
         );
 
-        assert_eq!(camera.fx, refined.fx);
-        assert_eq!(camera.fy, refined.fy);
+        assert_eq!(camera.fx(), refined.fx());
+        assert_eq!(camera.fy(), refined.fy());
     }
 
     #[test]
@@ -16900,8 +16903,8 @@ mod tests {
             &camera_priors,
         );
 
-        assert_eq!(reconstruction.cameras[0].fx, good.fx);
-        assert_eq!(reconstruction.cameras[1].fx, good.fx);
+        assert_eq!(reconstruction.cameras[0].fx(), good.fx());
+        assert_eq!(reconstruction.cameras[1].fx(), good.fx());
     }
 
     #[test]
@@ -17081,11 +17084,11 @@ mod tests {
 
         assert!(inliers.iter().filter(|&&x| x).count() >= 20);
         assert!(
-            (estimated_camera.fx as f64 - true_camera.fx as f64).abs()
-                < (initial_camera.fx as f64 - true_camera.fx as f64).abs(),
+            (estimated_camera.fx() as f64 - true_camera.fx() as f64).abs()
+                < (initial_camera.fx() as f64 - true_camera.fx() as f64).abs(),
             "estimated_fx={} true_fx={}",
-            estimated_camera.fx,
-            true_camera.fx
+            estimated_camera.fx(),
+            true_camera.fx()
         );
     }
 
@@ -17179,7 +17182,7 @@ mod tests {
 
         let skip = report.expect_err("bogus cameras should skip commit");
         assert_eq!(skip.to_string(), "pre_bogus_cameras=[0]");
-        assert_eq!(reconstruction.cameras[0].fx, original_camera.fx);
+        assert_eq!(reconstruction.cameras[0].fx(), original_camera.fx());
         assert_eq!(
             reconstruction.poses[1].unwrap().translation(),
             [1.0, 0.0, 0.0]
@@ -17245,7 +17248,7 @@ mod tests {
 
         restore_bogus_cameras_from_snapshot(&mut reconstruction, healthy, &base_cameras, &[0]);
 
-        assert_eq!(reconstruction.cameras[0].fx, healthy.fx);
+        assert_eq!(reconstruction.cameras[0].fx(), healthy.fx());
         assert!(!camera_has_bogus_params(
             reconstruction.cameras[0],
             &MapperConfig::default()
@@ -17455,16 +17458,16 @@ mod tests {
 
         assert_eq!(choice.source, "pnp");
         assert!(
-            (choice.camera.fx - good_camera.fx).abs() < 1.0e-3,
+            (choice.camera.fx() - good_camera.fx()).abs() < 1.0e-3,
             "fx={} expected={}",
-            choice.camera.fx,
-            good_camera.fx
+            choice.camera.fx(),
+            good_camera.fx()
         );
         assert!(
-            (choice.camera.fy - good_camera.fy).abs() < 1.0e-3,
+            (choice.camera.fy() - good_camera.fy()).abs() < 1.0e-3,
             "fy={} expected={}",
-            choice.camera.fy,
-            good_camera.fy
+            choice.camera.fy(),
+            good_camera.fy()
         );
         assert!(crate::geometry::relative_rotation_deg(choice.pose, candidate_pose) < 5.0);
     }
@@ -18710,9 +18713,9 @@ mod tests {
 
         assert!(refined_cost < initial_cost);
         assert!(
-            (60.0 - refined.fx as f64).abs() < (60.0 - initial_camera.fx as f64).abs(),
+            (60.0 - refined.fx() as f64).abs() < (60.0 - initial_camera.fx() as f64).abs(),
             "refined_fx={}",
-            refined.fx
+            refined.fx()
         );
     }
 
@@ -19344,8 +19347,8 @@ mod tests {
         assert_eq!(setup.image_camera_indices, vec![0, 1]);
         assert_eq!(setup.cameras[0].width, 120);
         assert_eq!(setup.cameras[1].height, 150);
-        assert_eq!(setup.cameras[0].fx, 90.0);
-        assert_eq!(setup.cameras[1].cx, 100.0);
+        assert_eq!(setup.cameras[0].fx(), 90.0);
+        assert_eq!(setup.cameras[1].cx(), 100.0);
     }
 
     #[test]
@@ -19373,10 +19376,10 @@ mod tests {
         assert_eq!(setup.cameras.len(), 1);
         assert_eq!(setup.cameras[0].width, 120);
         assert_eq!(setup.cameras[0].height, 80);
-        assert_eq!(setup.cameras[0].fx, 90.0);
-        assert_eq!(setup.cameras[0].fy, 144.0);
-        assert_eq!(setup.cameras[0].cx, 60.0);
-        assert_eq!(setup.cameras[0].cy, 35.0);
+        assert_eq!(setup.cameras[0].fx(), 90.0);
+        assert_eq!(setup.cameras[0].fy(), 144.0);
+        assert_eq!(setup.cameras[0].cx(), 60.0);
+        assert_eq!(setup.cameras[0].cy(), 35.0);
     }
 
     #[test]
@@ -23681,7 +23684,7 @@ mod tests {
                 .push(project_test_point(camera, provider_pose, point));
             frames[1]
                 .keypoints
-                .push(rustscan_slam::KeyPoint::new(camera.cx, camera.cy));
+                .push(rustscan_slam::KeyPoint::new(camera.cx(), camera.cy()));
             frames[2]
                 .keypoints
                 .push(project_test_point(camera, good_pose, point));

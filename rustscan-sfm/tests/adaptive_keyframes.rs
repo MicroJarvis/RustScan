@@ -556,8 +556,8 @@ fn preseed_projected_sift_database(database_path: &Path, frames: &[SequenceFrame
             .map(|point| {
                 let camera_point = poses[index].transform_point(point);
                 ColmapKeypoint::new(
-                    camera.fx * camera_point[0] / camera_point[2] + camera.cx,
-                    camera.fy * camera_point[1] / camera_point[2] + camera.cy,
+                    camera.fx() * camera_point[0] / camera_point[2] + camera.cx(),
+                    camera.fy() * camera_point[1] / camera_point[2] + camera.cy(),
                 )
             })
             .collect::<Vec<_>>();

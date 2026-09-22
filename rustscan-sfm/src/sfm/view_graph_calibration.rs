@@ -430,26 +430,32 @@ fn refine_shared_focal_length(
     options: &ViewGraphCalibrationOptions,
 ) -> Option<CameraModel> {
     let mut best_scale = 1.0f64;
-    let mut best_cost = f64::INFINITY;
+    let mut best_camera = camera;
+    let mut best_cost =
+        mean_calibrated_sampson_cost(pairs, frames, camera, options.max_epipolar_error_px);
     for step in 0..21 {
         let scale = 0.9 + 0.01 * step as f64;
-        let trial = scaled_camera(camera, scale);
-        let cost = total_epipolar_cost(pairs, frames, trial, options.max_epipolar_error_px);
+        if (scale - 1.0).abs() < 1.0e-15 {
+            continue;
+        }
+        let trial = scaled_camera(camera, scale)?;
+        let cost =
+            mean_calibrated_sampson_cost(pairs, frames, trial, options.max_epipolar_error_px);
         if cost < best_cost {
             best_cost = cost;
             best_scale = scale;
+            best_camera = trial;
         }
     }
-    (best_scale != 1.0).then(|| scaled_camera(camera, best_scale))
+    (best_scale != 1.0 && best_cost.is_finite()).then_some(best_camera)
 }
 
-fn scaled_camera(mut camera: CameraModel, scale: f64) -> CameraModel {
-    camera.fx = (camera.fx as f64 * scale) as f32;
-    camera.fy = (camera.fy as f64 * scale) as f32;
-    camera
+fn scaled_camera(mut camera: CameraModel, scale: f64) -> Option<CameraModel> {
+    camera.scale_focal(scale).ok()?;
+    Some(camera)
 }
 
-fn total_epipolar_cost(
+fn mean_calibrated_sampson_cost(
     pairs: &[PairGeometry],
     frames: &[ImageFrame],
     camera: CameraModel,
@@ -457,6 +463,7 @@ fn total_epipolar_cost(
 ) -> f64 {
     let mut total = 0.0;
     let mut count = 0usize;
+    let cap = (max_error_px as f64).max(1.0);
     for pair in pairs {
         if !matches!(
             pair.two_view_config,
@@ -470,12 +477,32 @@ fn total_epipolar_cost(
         let Some(right) = frames.get(pair.right) else {
             continue;
         };
+        let Some(e) = pair.e_matrix.map(matrix3_from_row_array) else {
+            continue;
+        };
         for m in &pair.inlier_matches {
-            if geometry_consistent(pair, left, right, m, camera, max_error_px) {
+            let li = m.query_idx as usize;
+            let ri = m.train_idx as usize;
+            let Some(lk) = left.keypoints.get(li) else {
+                continue;
+            };
+            let Some(rk) = right.keypoints.get(ri) else {
+                continue;
+            };
+            let Some(x1) = normalized_point(camera, lk.x(), lk.y()) else {
+                total += cap;
                 count += 1;
-            } else {
-                total += 1.0;
-            }
+                continue;
+            };
+            let Some(x2) = normalized_point(camera, rk.x(), rk.y()) else {
+                total += cap;
+                count += 1;
+                continue;
+            };
+            total += squared_sampson_error_normalized(&x1, &x2, &e)
+                .sqrt()
+                .min(cap);
+            count += 1;
         }
     }
     if count == 0 {
@@ -732,5 +759,170 @@ mod tests {
         let filtered = filter_rotation_inconsistent_pairs(3, &pairs, 5.0);
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|p| !(p.left == 1 && p.right == 2)));
+    }
+
+    #[test]
+    fn focal_refinement_selects_interior_scale_and_keeps_params_in_sync() {
+        // Pure X-translation leaves Sampson error independent of focal length.
+        // Use a yaw + non-axis translation so the essential residual depends on
+        // the absolute ray directions produced by cam_from_img.
+        let seed = CameraModel::new_pinhole(640, 480, 500.0, 500.0, 320.0, 240.0);
+        let mut true_camera = seed;
+        true_camera.scale_focal(1.05).expect("true scale");
+
+        let relative = SE3::from_quat_translation(
+            crate::geometry::quat_from_axis_angle(Vec3::y(), 0.18),
+            Vec3::new(0.7, 0.15, 0.25),
+        );
+        let r = relative.rotation_matrix();
+        let t = relative.translation();
+        let r_mat = Matrix3::from_row_slice(&[
+            r[0][0] as f64,
+            r[0][1] as f64,
+            r[0][2] as f64,
+            r[1][0] as f64,
+            r[1][1] as f64,
+            r[1][2] as f64,
+            r[2][0] as f64,
+            r[2][1] as f64,
+            r[2][2] as f64,
+        ]);
+        let tx = t[0] as f64;
+        let ty = t[1] as f64;
+        let tz = t[2] as f64;
+        let skew = Matrix3::new(0.0, -tz, ty, tz, 0.0, -tx, -ty, tx, 0.0);
+        let e_mat = skew * r_mat;
+        let e = [
+            e_mat[(0, 0)],
+            e_mat[(0, 1)],
+            e_mat[(0, 2)],
+            e_mat[(1, 0)],
+            e_mat[(1, 1)],
+            e_mat[(1, 2)],
+            e_mat[(2, 0)],
+            e_mat[(2, 1)],
+            e_mat[(2, 2)],
+        ];
+
+        let world_points = [
+            [0.0f64, 0.0, 5.0],
+            [0.5, 0.3, 6.0],
+            [-0.4, -0.35, 5.5],
+            [0.25, -0.55, 7.0],
+            [-0.65, 0.45, 4.8],
+            [0.85, 0.15, 6.4],
+            [-0.25, 0.65, 5.3],
+            [0.35, -0.25, 5.9],
+        ];
+        let mut left_kps = Vec::new();
+        let mut right_kps = Vec::new();
+        let mut matches = Vec::new();
+        for (idx, p) in world_points.iter().enumerate() {
+            let p1 = Vector3::new(p[0], p[1], p[2]);
+            let p2 = r_mat * p1 + Vector3::new(tx, ty, tz);
+            let lp = true_camera
+                .img_from_cam(p1.x, p1.y, p1.z)
+                .expect("left projection");
+            let rp = true_camera
+                .img_from_cam(p2.x, p2.y, p2.z)
+                .expect("right projection");
+            left_kps.push(rustscan_slam::KeyPoint::new(lp[0] as f32, lp[1] as f32));
+            right_kps.push(rustscan_slam::KeyPoint::new(rp[0] as f32, rp[1] as f32));
+            matches.push(Match {
+                query_idx: idx as u32,
+                train_idx: idx as u32,
+                distance: 0.0,
+            });
+        }
+
+        let frames = vec![
+            ImageFrame {
+                id: 0,
+                name: "l.jpg".into(),
+                path: std::path::PathBuf::from("l.jpg"),
+                width: 640,
+                height: 480,
+                keypoints: left_kps,
+                descriptors: rustscan_slam::Descriptors::new(),
+                sift: crate::sift::SiftFeatures::default(),
+                wide_descriptors: crate::wide::WideDescriptors {
+                    data: Vec::new(),
+                    dim: 0,
+                    count: 0,
+                },
+                strong_feature_indices: Vec::new(),
+                colors: vec![[128, 128, 128]; world_points.len()],
+            },
+            ImageFrame {
+                id: 1,
+                name: "r.jpg".into(),
+                path: std::path::PathBuf::from("r.jpg"),
+                width: 640,
+                height: 480,
+                keypoints: right_kps,
+                descriptors: rustscan_slam::Descriptors::new(),
+                sift: crate::sift::SiftFeatures::default(),
+                wide_descriptors: crate::wide::WideDescriptors {
+                    data: Vec::new(),
+                    dim: 0,
+                    count: 0,
+                },
+                strong_feature_indices: Vec::new(),
+                colors: vec![[128, 128, 128]; world_points.len()],
+            },
+        ];
+        let pair = PairGeometry {
+            left: 0,
+            right: 1,
+            two_view_config: COLMAP_TWO_VIEW_CALIBRATED,
+            f_matrix: None,
+            e_matrix: Some(e),
+            h_matrix: None,
+            qvec: None,
+            tvec: None,
+            matches: matches.clone(),
+            inlier_matches: matches,
+            relative_pose: relative,
+            inliers: world_points.len(),
+            triangulated: world_points.len(),
+            mean_reprojection_error_px: 0.1,
+            rotation_deg: 0.0,
+            median_triangulation_angle_deg: 10.0,
+            pose_graph_only: false,
+        };
+
+        let options = ViewGraphCalibrationOptions {
+            refine_intrinsics: true,
+            refine_relative_poses: false,
+            min_inliers_per_pair: 1,
+            max_epipolar_error_px: 2.0,
+            min_triangulation_angle_deg: 0.0,
+            ..ViewGraphCalibrationOptions::default()
+        };
+
+        let cost_true = mean_calibrated_sampson_cost(&[pair.clone()], &frames, true_camera, 2.0);
+        let cost_seed = mean_calibrated_sampson_cost(&[pair.clone()], &frames, seed, 2.0);
+        assert!(
+            cost_true < cost_seed,
+            "true focal must score better than seed: true={cost_true} seed={cost_seed}"
+        );
+
+        let refined = refine_shared_focal_length(&[pair], &frames, seed, &options)
+            .expect("focal refinement must select a non-identity scale");
+        assert!(
+            (refined.fx() - 525.0).abs() < 2.5,
+            "expected ~525, got {}",
+            refined.fx()
+        );
+        assert!(
+            (refined.fx() - seed.fx() * 0.9).abs() > 5.0,
+            "must not lock onto the first grid scale 0.9"
+        );
+        assert!((refined.params[0] - refined.fx() as f64).abs() < 1.0e-6);
+        assert!((refined.params[1] - refined.fy() as f64).abs() < 1.0e-6);
+        let center = refined
+            .img_from_cam(0.0, 0.0, 1.0)
+            .expect("projection uses canonical params");
+        assert!((center[0] - refined.cx() as f64).abs() < 1.0e-6);
     }
 }

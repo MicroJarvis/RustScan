@@ -5525,12 +5525,12 @@ fn normalize_pixel_homography(
 
 fn camera_intrinsic_matrix(camera: CameraModel) -> Matrix3<f64> {
     Matrix3::new(
-        camera.fx as f64,
+        camera.fx() as f64,
         0.0,
-        camera.cx as f64,
+        camera.cx() as f64,
         0.0,
-        camera.fy as f64,
-        camera.cy as f64,
+        camera.fy() as f64,
+        camera.cy() as f64,
         0.0,
         0.0,
         1.0,
