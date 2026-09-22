@@ -312,6 +312,17 @@ fn camera_model_from_colmap(camera: ColmapCamera, source: &Path) -> Result<Camer
         )
         .into());
     }
+    if model.fx <= 0.0 || model.fy <= 0.0 {
+        return Err(colmap_io_error(
+            source,
+            "camera",
+            camera.camera_id,
+            "-",
+            "-",
+            "derived focal length is not positive after f32 conversion",
+        )
+        .into());
+    }
     Ok(model)
 }
 
@@ -356,13 +367,41 @@ pub fn read_colmap_images_raw(root: &Path) -> Result<Vec<ColmapImage>> {
 fn read_raw_images(sparse: &Path) -> Result<(Vec<ColmapImage>, PathBuf)> {
     let bin = sparse.join("images.bin");
     if bin.exists() {
-        return Ok((read_images_bin(&bin)?, bin));
+        return Ok((
+            read_images_bin(&bin).with_context(|| format!("failed to read {}", bin.display()))?,
+            bin,
+        ));
     }
     let txt = sparse.join("images.txt");
     if txt.exists() {
-        return Ok((read_images_txt(&txt)?, txt));
+        return Ok((
+            read_images_txt(&txt).with_context(|| format!("failed to read {}", txt.display()))?,
+            txt,
+        ));
     }
     bail!("missing images.bin/images.txt under {}", sparse.display())
+}
+
+/// Optional images for readers that do not require them.
+///
+/// Returns an empty list only when neither `images.bin` nor `images.txt`
+/// exists. A present but malformed file propagates the parse error.
+fn read_optional_raw_images(sparse: &Path) -> Result<(Vec<ColmapImage>, PathBuf)> {
+    let bin = sparse.join("images.bin");
+    let txt = sparse.join("images.txt");
+    if bin.exists() {
+        return Ok((
+            read_images_bin(&bin).with_context(|| format!("failed to read {}", bin.display()))?,
+            bin,
+        ));
+    }
+    if txt.exists() {
+        return Ok((
+            read_images_txt(&txt).with_context(|| format!("failed to read {}", txt.display()))?,
+            txt,
+        ));
+    }
+    Ok((Vec::new(), txt))
 }
 
 /// Reads and strictly validates COLMAP points3D against cameras and images.
@@ -582,10 +621,7 @@ pub fn read_colmap_rigs(root: &Path) -> Result<Vec<ColmapRig>> {
     let sparse = resolve_sparse_dir(root)?;
     let (cameras, cameras_source) = read_raw_cameras(&sparse)?;
     let camera_ids = validate_cameras(&cameras, &cameras_source)?;
-    let (images, images_source) = match read_raw_images(&sparse) {
-        Ok(images) => images,
-        Err(_) => (Vec::new(), sparse.join("images.txt")),
-    };
+    let (images, images_source) = read_optional_raw_images(&sparse)?;
     let image_ids = if images.is_empty() {
         HashSet::new()
     } else {
@@ -627,13 +663,41 @@ pub fn read_colmap_rigs_raw(root: &Path) -> Result<Vec<ColmapRig>> {
 fn read_raw_rigs(sparse: &Path) -> Result<(Vec<ColmapRig>, PathBuf)> {
     let bin = sparse.join("rigs.bin");
     if bin.exists() {
-        return Ok((read_rigs_bin(&bin)?, bin));
+        return Ok((
+            read_rigs_bin(&bin).with_context(|| format!("failed to read {}", bin.display()))?,
+            bin,
+        ));
     }
     let txt = sparse.join("rigs.txt");
     if txt.exists() {
-        return Ok((read_rigs_txt(&txt)?, txt));
+        return Ok((
+            read_rigs_txt(&txt).with_context(|| format!("failed to read {}", txt.display()))?,
+            txt,
+        ));
     }
     bail!("missing rigs.txt under {}", sparse.display())
+}
+
+/// Optional rigs for readers that do not require them.
+///
+/// Returns an empty list only when neither `rigs.bin` nor `rigs.txt` exists.
+/// A present but malformed file propagates the parse error.
+fn read_optional_raw_rigs(sparse: &Path) -> Result<(Vec<ColmapRig>, PathBuf)> {
+    let bin = sparse.join("rigs.bin");
+    let txt = sparse.join("rigs.txt");
+    if bin.exists() {
+        return Ok((
+            read_rigs_bin(&bin).with_context(|| format!("failed to read {}", bin.display()))?,
+            bin,
+        ));
+    }
+    if txt.exists() {
+        return Ok((
+            read_rigs_txt(&txt).with_context(|| format!("failed to read {}", txt.display()))?,
+            txt,
+        ));
+    }
+    Ok((Vec::new(), txt))
 }
 
 /// Reads and strictly validates COLMAP frames against cameras, images, and rigs.
@@ -644,10 +708,7 @@ pub fn read_colmap_frames(root: &Path) -> Result<Vec<ColmapFrame>> {
     let (images, images_source) = read_raw_images(&sparse)?;
     let images_by_id = validate_images(&images, &camera_ids, &images_source)?;
     let image_ids = images_by_id.keys().copied().collect();
-    let (rigs, rigs_source) = match read_raw_rigs(&sparse) {
-        Ok(rigs) => rigs,
-        Err(_) => (Vec::new(), sparse.join("rigs.txt")),
-    };
+    let (rigs, rigs_source) = read_optional_raw_rigs(&sparse)?;
     let (frames, frames_source) = read_raw_frames(&sparse)?;
     validate_rigs_and_frames(
         &rigs,
@@ -871,6 +932,20 @@ fn validate_cameras(cameras: &[ColmapCamera], source: &Path) -> Result<HashSet<u
                     "-",
                     "-",
                     format!("focal parameter at index {focal_index} is illegal ({focal})"),
+                )
+                .into());
+            }
+            let narrowed = focal as f32;
+            if !narrowed.is_finite() || narrowed <= 0.0 {
+                return Err(colmap_io_error(
+                    source,
+                    "camera",
+                    camera.camera_id,
+                    "-",
+                    "-",
+                    format!(
+                        "focal parameter at index {focal_index} is not positive after f32 conversion ({focal})"
+                    ),
                 )
                 .into());
             }
@@ -1395,15 +1470,6 @@ fn validate_quaternion(
             )
             .into());
         }
-        ensure_f64_fits_f32(
-            *value,
-            source,
-            record_type,
-            &record_id,
-            &referenced_id,
-            "-",
-            &format!("quaternion[{axis}]"),
-        )?;
     }
     let mut sum_sq = 0.0f64;
     for value in qvec {
@@ -1920,42 +1986,87 @@ fn se3_from_colmap_pose(
     image_id: u32,
 ) -> Result<SE3> {
     validate_quaternion(qvec, source, "image", image_id, "-")?;
+    // Normalize in f64 before narrowing. Components that each fit in f32 can
+    // still make the f32 squared-norm overflow (for example [1e30; 4]).
+    let mut sum_sq = 0.0f64;
+    for value in qvec {
+        sum_sq += value * value;
+    }
+    let norm = sum_sq.sqrt();
+    if !norm.is_finite() || norm <= QUATERNION_NORM_EPSILON {
+        return Err(colmap_io_error(
+            source,
+            "image",
+            image_id,
+            "-",
+            "-",
+            "quaternion norm is zero",
+        )
+        .into());
+    }
+    let mut normalized = [0.0f64; 4];
+    for (slot, value) in normalized.iter_mut().zip(qvec) {
+        *slot = value / norm;
+        if !slot.is_finite() {
+            return Err(colmap_io_error(
+                source,
+                "image",
+                image_id,
+                "-",
+                "-",
+                "normalized quaternion is non-finite",
+            )
+            .into());
+        }
+    }
     let qw = f64_to_f32(
-        qvec[0],
+        normalized[0],
         source,
         "image",
         image_id,
         "-",
         "-",
-        "quaternion[0]",
+        "normalized quaternion[0]",
     )?;
     let qx = f64_to_f32(
-        qvec[1],
+        normalized[1],
         source,
         "image",
         image_id,
         "-",
         "-",
-        "quaternion[1]",
+        "normalized quaternion[1]",
     )?;
     let qy = f64_to_f32(
-        qvec[2],
+        normalized[2],
         source,
         "image",
         image_id,
         "-",
         "-",
-        "quaternion[2]",
+        "normalized quaternion[2]",
     )?;
     let qz = f64_to_f32(
-        qvec[3],
+        normalized[3],
         source,
         "image",
         image_id,
         "-",
         "-",
-        "quaternion[3]",
+        "normalized quaternion[3]",
     )?;
+    let f32_norm_sq = qw * qw + qx * qx + qy * qy + qz * qz;
+    if !f32_norm_sq.is_finite() || f32_norm_sq <= 0.0 {
+        return Err(colmap_io_error(
+            source,
+            "image",
+            image_id,
+            "-",
+            "-",
+            "normalized quaternion overflows f32",
+        )
+        .into());
+    }
     let tx = f64_to_f32(
         tvec[0],
         source,
@@ -1984,6 +2095,33 @@ fn se3_from_colmap_pose(
         "translation[2]",
     )?;
     let rotation = crate::geometry::quat_from_xyzw(qx, qy, qz, qw).normalize();
+    if !rotation.is_finite() {
+        return Err(colmap_io_error(
+            source,
+            "image",
+            image_id,
+            "-",
+            "-",
+            "normalized quaternion is non-finite after f32 conversion",
+        )
+        .into());
+    }
+    let rotation_components = rotation.to_array();
+    let rotation_norm_sq = rotation_components
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>();
+    if !rotation_norm_sq.is_finite() || rotation_norm_sq <= 0.0 {
+        return Err(colmap_io_error(
+            source,
+            "image",
+            image_id,
+            "-",
+            "-",
+            "normalized quaternion has an invalid f32 norm",
+        )
+        .into());
+    }
     Ok(SE3::from_quat_translation(
         rotation,
         nalgebra::Vector3::new(tx, ty, tz),
@@ -5041,6 +5179,127 @@ mod tests {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn large_finite_quaternion_normalizes_in_f64_before_f32_for_text_and_binary() -> Result<()> {
+        for format in [ColmapSparseFormat::Text, ColmapSparseFormat::Binary] {
+            let dir = tempdir()?;
+            let mut sparse = minimal_valid_sparse();
+            sparse.images[0].qvec = [1e30, 1e30, 1e30, 1e30];
+            write_unvalidated_sparse(dir.path(), &sparse, format)?;
+            let reconstruction = read_colmap_reconstruction(dir.path())?;
+            let pose = reconstruction.poses[0].expect("pose must remain registered");
+            let q = pose.quaternion();
+            assert!(
+                q.iter().all(|value| value.is_finite()),
+                "{format:?} produced a non-finite quaternion: {q:?}"
+            );
+            let norm_sq = q.iter().map(|value| value * value).sum::<f32>();
+            assert!(
+                norm_sq.is_finite() && (norm_sq - 1.0).abs() < 1e-5,
+                "{format:?} expected a unit quaternion, got {q:?} norm_sq={norm_sq}"
+            );
+            // [1e30;4] / ||q|| = [0.5;4] in COLMAP wxyz, which is not identity.
+            assert!(
+                (q[3] - 0.5).abs() < 1e-5
+                    && (q[0] - 0.5).abs() < 1e-5
+                    && (q[1] - 0.5).abs() < 1e-5
+                    && (q[2] - 0.5).abs() < 1e-5,
+                "{format:?} unexpectedly became identity or another rotation: {q:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn positive_focal_that_underflows_f32_is_rejected_for_text_and_binary() -> Result<()> {
+        // Keep the exact subnormal-after-narrowing magnitude. The default
+        // text writer uses fixed decimals and would round 1e-50 to 0.
+        let underflowing_focal = 1e-50f64;
+        assert!(underflowing_focal > 0.0);
+        assert_eq!(underflowing_focal as f32, 0.0);
+
+        let dir = tempdir()?;
+        let sparse = dir.path().join("text");
+        fs::create_dir_all(&sparse)?;
+        fs::write(
+            sparse.join("cameras.txt"),
+            format!("1 PINHOLE 640 480 {underflowing_focal} 500.0 320.0 240.0\n"),
+        )?;
+        let error = read_colmap_cameras(&sparse).expect_err("text underflowing focal");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not positive after f32 conversion"),
+            "text {message}"
+        );
+
+        let dir = tempdir()?;
+        let mut model = minimal_valid_sparse();
+        model.cameras[0].params[0] = underflowing_focal;
+        write_unvalidated_sparse(dir.path(), &model, ColmapSparseFormat::Binary)?;
+        let error = read_colmap_cameras(dir.path()).expect_err("binary underflowing focal");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not positive after f32 conversion"),
+            "binary {message}"
+        );
+        assert!(message.contains("record=camera"), "{message}");
+        assert!(message.contains("id=1"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_optional_dependencies_are_not_treated_as_absent() -> Result<()> {
+        for format in [ColmapSparseFormat::Text, ColmapSparseFormat::Binary] {
+            let dir = tempdir()?;
+            let mut sparse = minimal_valid_sparse();
+            sparse.rigs = vec![camera_rig(3)];
+            sparse.points3d.clear();
+            sparse.images[0].points2d[0].point3d_id = None;
+            fs::create_dir_all(dir.path())?;
+            match format {
+                ColmapSparseFormat::Text => {
+                    write_raw_cameras_txt(&dir.path().join("cameras.txt"), &sparse.cameras)?;
+                    write_raw_rigs_txt(&dir.path().join("rigs.txt"), &sparse.rigs)?;
+                    fs::write(dir.path().join("images.txt"), b"not a valid COLMAP image\n")?;
+                }
+                ColmapSparseFormat::Binary => {
+                    write_raw_cameras_bin(&dir.path().join("cameras.bin"), &sparse.cameras)?;
+                    write_raw_rigs_bin(&dir.path().join("rigs.bin"), &sparse.rigs)?;
+                    fs::write(dir.path().join("images.bin"), b"short")?;
+                }
+            }
+            let error = read_colmap_rigs(dir.path()).expect_err("malformed images dependency");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("images."),
+                "{format:?} expected images dependency error, got {message}"
+            );
+
+            let dir = tempdir()?;
+            match format {
+                ColmapSparseFormat::Text => {
+                    write_raw_cameras_txt(&dir.path().join("cameras.txt"), &sparse.cameras)?;
+                    write_raw_images_txt(&dir.path().join("images.txt"), &sparse)?;
+                    write_raw_frames_txt(&dir.path().join("frames.txt"), &[camera_frame(9)])?;
+                    fs::write(dir.path().join("rigs.txt"), b"not a valid COLMAP rig\n")?;
+                }
+                ColmapSparseFormat::Binary => {
+                    write_raw_cameras_bin(&dir.path().join("cameras.bin"), &sparse.cameras)?;
+                    write_raw_images_bin(&dir.path().join("images.bin"), &sparse)?;
+                    write_raw_frames_bin(&dir.path().join("frames.bin"), &[camera_frame(9)])?;
+                    fs::write(dir.path().join("rigs.bin"), b"short")?;
+                }
+            }
+            let error = read_colmap_frames(dir.path()).expect_err("malformed rigs dependency");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("rigs."),
+                "{format:?} expected rigs dependency error, got {message}"
+            );
         }
         Ok(())
     }
