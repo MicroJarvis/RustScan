@@ -631,12 +631,13 @@ branch to `main`.
 
 ### T3 — Strict COLMAP IO
 
-Status: implemented. Not reviewed.
+Status: reviewed.
 
 Owner: cursor-agent. Branch `agent/RS-2026-004/t3-colmap-io`. Worktree
 `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t3-colmap-io`. Base
 `ad1c6c6847fa60b74caebf5f6d35f3af8bd79bd1`. Implementation commit
-`77327ce3ec55a48b22d966f377fbb5764c893c06`.
+`77327ce3ec55a48b22d966f377fbb5764c893c06`. Reviewed tip
+`03936f34c5707ed0e59c03a072f1b9aa25dfea87`.
 
 Import validates the complete raw text or binary model before
 `Reconstruction` or `ColmapSparseModel` construction. Errors use
@@ -744,7 +745,7 @@ not mark T3 reviewed and do not start T4, T5, or T6. Do not merge to `main`.
 
 #### T3 review P1 round 2
 
-Status: review_fix applied. Not reviewed.
+Status: reviewed.
 
 Code commit `03936f34c5707ed0e59c03a072f1b9aa25dfea87`.
 
@@ -787,8 +788,28 @@ and `CARGO_TERM_COLOR=never`:
   pass. `8 passed; 0 failed; 0 ignored; finished in 0.00s`.
 - `git diff --check`: pass, exit 0.
 
-Next action: do not mark T3 reviewed. Do not start T4, T5, or T6. Do not
-merge to `main`. Independent review of `03936f3` is the next gate.
+#### Independent review decision
+
+Independent code review accepted tip
+`03936f34c5707ed0e59c03a072f1b9aa25dfea87`. Confirmed:
+
+- Quaternions are normalized in `f64` before `f32` narrowing, so large
+  finite components cannot overflow the `f32` squared norm into a zero or
+  non-finite rotation.
+- Positive `f64` focals that underflow to `0.0` as `f32` are rejected.
+- Malformed present `images.*` / `rigs.*` are not treated as missing files;
+  only true absence of both candidates yields an empty optional list.
+- The new text and binary regressions for those cases pass.
+- `cargo fmt --all -- --check`, workspace `cargo check`, COLMAP lib tests,
+  reconstruction validation tests, and `git diff --check` pass.
+- Targeted Clippy with `-D warnings` remains blocked by pre-existing
+  unmodified `rustscan-slam` diagnostics. First error:
+  `module_inception` at `rustscan-slam/src/config/mod.rs:5`.
+
+Next action: start T4 in its own worktree and branch
+`agent/RS-2026-004/t4-camera-invariants`. Do not implement T4 in this T3
+worktree. Do not start T5 or T6 until dependencies and the task protocol
+allow. Do not merge this branch to `main` from this handoff.
 
 ### T4 — Camera Invariants
 
