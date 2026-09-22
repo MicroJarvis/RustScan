@@ -695,7 +695,51 @@ checkout:
   pass. `8 passed; 0 failed; 0 ignored; finished in 0.02s`.
 - `git diff --check`: pass.
 
-GPU tests were not required and were not deleted or ignored. Next action: do
+GPU tests were not required and were not deleted or ignored.
+
+#### T3 review P1 fixes
+
+Status: review_fix applied. Not reviewed.
+
+Code commit `a00b3613a83e68c50909aff9b14a14661bd8e385`.
+
+1. Checked `f64 -> f32` narrowing through `ensure_f64_fits_f32` /
+   `f64_to_f32`. Import rejects finite `f64` values that become non-finite
+   `f32` for quaternions, translations, 2D/3D coordinates, reprojection
+   error, camera parameters, and derived `fx`/`fy`/`cx`/`cy`.
+   `validate_quaternion` also rejects a non-finite quaternion norm. No
+   silent clamp, zero, or identity substitution.
+
+2. Public production readers now validate before returning:
+   `read_camera_model`, `read_colmap_cameras`, `read_colmap_images`,
+   `read_colmap_poses`, `read_colmap_points3d`, `read_colmap_rigs`,
+   `read_colmap_frames`, `read_colmap_sparse_files`, and
+   `read_colmap_sparse_files_with_format`. Camera-only models without
+   `points3D` still validate cameras and images, so
+   `reference_camera_setup_for_retained` cannot bypass duplicate-ID /
+   dimension / focal / pose checks via `read_colmap_cameras` and
+   `read_colmap_poses`. Explicit `*_raw` APIs remain for low-level decode
+   and parser unit tests only.
+
+Regression coverage: text and binary fixtures for `f32` overflow; camera-only
+text and binary fixtures for duplicate camera/image IDs, zero dimensions,
+invalid focal, missing camera reference, zero quaternion, and non-finite
+translation.
+
+Commands after the review fixes:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `645 passed; 0 failed; 19 ignored; finished in 56.74s`.
+- `cargo test -p rustscan-sfm --all-features --lib colmap -- --test-threads=1`:
+  pass. `174 passed; 0 failed; 19 ignored; finished in 0.72s`.
+- `cargo test -p rustscan-sfm --all-features --lib reconstruction_validation -- --test-threads=1`:
+  pass. `8 passed; 0 failed; 0 ignored; finished in 0.02s`.
+- `git diff --check`: pass.
+
+Clippy with `-D warnings` still stops in pre-existing `rustscan-slam`
+`module_inception` and was not re-run as a gate for this fix. Next action: do
 not mark T3 reviewed and do not start T4, T5, or T6. Do not merge to `main`.
 
 ### T4 — Camera Invariants
