@@ -742,6 +742,54 @@ Clippy with `-D warnings` still stops in pre-existing `rustscan-slam`
 `module_inception` and was not re-run as a gate for this fix. Next action: do
 not mark T3 reviewed and do not start T4, T5, or T6. Do not merge to `main`.
 
+#### T3 review P1 round 2
+
+Status: review_fix applied. Not reviewed.
+
+Code commit `03936f34c5707ed0e59c03a072f1b9aa25dfea87`.
+
+1. Quaternion unitization normalizes in `f64` first. Components such as
+   `[1e30; 4]` have a finite `f64` norm and finite per-component `f32`
+   conversions, but the `f32` squared norm overflows under
+   `UnitQuaternion::new_normalize`. Import divides in `f64`, narrows the
+   unit quaternion, checks the `f32` squared norm, then confirms the final
+   rotation is finite with a valid norm. No identity substitution.
+
+2. Focal parameters that remain positive in `f64` but become `0.0` after
+   `f32` narrowing (for example `1e-50`) are rejected in `validate_cameras`
+   and again in `camera_model_from_colmap` for derived `fx`/`fy`.
+
+3. Optional dependency reads no longer use `Err(_) => empty`.
+   `read_optional_raw_images` and `read_optional_raw_rigs` return empty only
+   when neither `.bin` nor `.txt` exists. A present but malformed file
+   propagates the parse error with the file path.
+
+Regressions: `large_finite_quaternion_normalizes_in_f64_before_f32_for_text_and_binary`,
+`positive_focal_that_underflows_f32_is_rejected_for_text_and_binary`,
+`malformed_optional_dependencies_are_not_treated_as_absent`.
+
+Commands on this worktree with
+`POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+and `CARGO_TERM_COLOR=never`:
+
+- `cargo fmt --all -- --check`: pass, exit 0.
+- `cargo check --workspace --all-targets`: pass, exit 0.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error remains `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5` (`pub mod config`). Final line:
+  `error: could not compile rustscan-slam (lib) due to 84 previous errors`.
+  `rustscan-slam` was not modified.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `648 passed; 0 failed; 19 ignored; finished in 57.70s`.
+- `cargo test -p rustscan-sfm --all-features --lib colmap -- --test-threads=1`:
+  pass. `177 passed; 0 failed; 19 ignored; finished in 0.83s`.
+- `cargo test -p rustscan-sfm --all-features --lib reconstruction_validation -- --test-threads=1`:
+  pass. `8 passed; 0 failed; 0 ignored; finished in 0.00s`.
+- `git diff --check`: pass, exit 0.
+
+Next action: do not mark T3 reviewed. Do not start T4, T5, or T6. Do not
+merge to `main`. Independent review of `03936f3` is the next gate.
+
 ### T4 — Camera Invariants
 
 Status: pending.
