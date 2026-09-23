@@ -1059,3 +1059,49 @@ Copy every command from `tasks.yaml` here with its exact result. Add platform
 specific Ceres, PoseLib, GPU adapter, and fixture evidence. Finish with the
 reviewer decision, known limitations, integration commit, and next action.
 
+
+## T1–T4 Integration — 2026-09-23
+
+Owner: Codex. Integration branch/worktree: `main`, repository root.
+User explicitly authorized merging T4 and removing the T1–T4 worktrees;
+this supersedes the earlier review handoff's instruction not to merge.
+
+- Base: `d2cdb8de7d63e448022f02e69e622c90a501a591`.
+- Integrated tip: `0919b73ba0555f2098e28e619540ae5c27f469f8`.
+- `git merge --ff-only agent/RS-2026-004/t4-camera-invariants`: PASS.
+  The verified ancestry chain is main → T1 → T2 → T3 → T4.
+- Integrated files: `git diff --name-status d2cdb8d 0919b73` (21 files).
+  This handoff additionally updates this verification record only.
+- `git diff --exit-code agent/RS-2026-004/t4-camera-invariants HEAD`
+  immediately after fast-forward: PASS; identical trees.
+- `cargo fmt --all -- --check`: PASS.
+- `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib CARGO_TERM_COLOR=never cargo check --workspace --all-targets`:
+  PASS, exit 0; existing warnings remain. Log:
+  `artifacts/runs/rs-2026-004-t4-integration-20260923/cargo-check.log`.
+- Tests and Clippy were not repeated: integration introduced no implementation
+  changes, and the difference from reviewed code tip `be27ce4` to `0919b73`
+  contains only task documentation. Prior independent review evidence above
+  applies. Full all-target tests remain incomplete and the existing Clippy
+  blocker remains; integration does not claim those gates passed.
+- `git diff --check d2cdb8d..0919b73`: reports existing Markdown hard-break
+  trailing spaces and extra EOF blank lines in the imported task documents.
+  No source-code whitespace errors were reported.
+
+Cleanup:
+
+- Verified all T1–T4 worktrees were clean (including untracked source and
+  submodule status), and all four branch tips were ancestors of main.
+- Removed `.worktrees/rs-2026-004-t1-mapper-identity`,
+  `.worktrees/rs-2026-004-t2-reconstruction-validation`,
+  `.worktrees/rs-2026-004-t3-colmap-io`, and
+  `.worktrees/rs-2026-004-t4-camera-invariants` using Git worktree removal.
+  Git required `--force` because of the submodule-bearing worktree;
+  no dirty source changes were discarded.
+- Preserved and SHA-256-verified 22 local T1 verification files under root
+  `artifacts/runs/rs-2026-004-t1/` and
+  `artifacts/runs/rs-2026-004-t1-review-p1/` before removal.
+- Retained the four task branch refs, other worktrees, and the separate
+  `codex/preserve-main-20260923` WIP snapshot.
+
+Next action: publish main when requested, then plan T5 from the integrated
+main. T5–T8 remain pending; this is not final RS-2026-004 acceptance.
