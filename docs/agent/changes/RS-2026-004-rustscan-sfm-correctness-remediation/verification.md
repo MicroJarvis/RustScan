@@ -813,7 +813,7 @@ allow. Do not merge this branch to `main` from this handoff.
 
 ### T4 — Camera Invariants
 
-Status: review_fix. Not reviewed.
+Status: reviewed.
 
 Owner: `cursor-agent`
 
@@ -824,6 +824,8 @@ Branch: `agent/RS-2026-004/t4-camera-invariants`
 Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t4-camera-invariants`
 
 Implementation commit: `4de9ff7f832a4858a6cc7164fa1b6d9cba7dc56f`
+
+Reviewed tip: `be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf`
 
 Changed files:
 
@@ -879,13 +881,13 @@ Known limitations:
   through `set_param` (T5 may tighten BA write-back further).
 - Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
 
-Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
-handoff unless their dependencies and the task protocol allow. Do not merge
-to `main`.
+Historical next action from the implementation handoff (superseded by the
+independent review decision below): do not start T5 or T6; do not merge to
+`main`.
 
 #### T4 review P1 remediation
 
-Status: review_fix applied. Not reviewed.
+Status: reviewed (included in tip `be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf`).
 
 Code commit: `99fe9c8e11130e3a23d248144ee2d96c72e6619d`
 
@@ -930,23 +932,22 @@ and `CARGO_TERM_COLOR=never`:
   pass. `3 passed`.
 - `cargo test -p rustscan-sfm --all-features --lib colmap -- --test-threads=1`:
   pass. `178 passed; 0 failed; 19 ignored`.
-- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`:
-  pass (lib `840 passed; 19 ignored`, plus integration targets; exit 0).
 - `git diff --check`: pass.
+
+The earlier all-targets claim from an interrupted run is not review evidence.
+Full `cargo test -p rustscan-sfm --all-targets` was not completed for the
+reviewed tip.
 
 Known limitations:
 
 - Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
 - Full Reconstruction/BA commit atomicity on unusable solutions remains T5.
 
-Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
-handoff. Do not merge to `main`.
-
 #### T4 review P1 remediation (apply_optional_intrinsics atomicity)
 
-Status: review_fix applied. Not reviewed.
+Status: reviewed.
 
-Code commit: tip of `agent/RS-2026-004/t4-camera-invariants` (this remediation commit).
+Code commit: `be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf`.
 
 `apply_optional_intrinsics` no longer calls `set_focal_lengths` then
 `set_principal_point` sequentially. It copies `params` to a candidate, writes
@@ -988,10 +989,53 @@ and `CARGO_TERM_COLOR=never`:
 Known limitations:
 
 - Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+  This is an existing repository issue outside T4, not a new T4 defect.
 - Full Reconstruction/BA commit atomicity on unusable solutions remains T5.
+- Full `cargo test -p rustscan-sfm --all-targets` was not completed for this
+  reviewed tip and is not cited as pass evidence.
 
-Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
-handoff. Do not merge to `main`.
+#### Independent review decision
+
+Independent code review accepted tip
+`be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf`. Confirmed:
+
+- `CameraModel` keeps COLMAP `params` as the sole mutable intrinsics store;
+  accessors and checked mutators stay consistent for projection and export.
+- Checked mutators and `apply_optional_intrinsics` build a candidate, validate
+  once, and commit once. Illegal principal-point updates cannot leave focals
+  partially applied, including on single-focal models.
+- Mapper / reconstruction-input config overrides use
+  `apply_optional_intrinsics`; single-focal mean semantics are order-
+  independent.
+- T4 acceptance is covered by the implementation and the focused gates below.
+  Targeted Clippy failure in unmodified `rustscan-slam` is a pre-existing
+  repository limitation, not a T4 finding.
+
+Verification recorded for the reviewed tip (`POSELIB_ROOT` set,
+`CARGO_TERM_COLOR=never`):
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo test -p rustscan-sfm --all-features --lib types::tests -- --test-threads=1`:
+  pass. `15 passed`.
+- `cargo test -p rustscan-sfm --all-features --lib view_graph_calibration -- --test-threads=1`:
+  pass. `3 passed`.
+- `cargo test -p rustscan-sfm --all-features --lib colmap -- --test-threads=1`:
+  pass. `178 passed; 19 ignored`.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `655 passed; 19 ignored`.
+- `git diff --check`: pass.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error: `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`. Final:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`.
+  `rustscan-slam` was not modified.
+
+Full `cargo test -p rustscan-sfm --all-targets` was not completed for this
+review round and is not used as pass evidence.
+
+Next action: do not start T5 or T6 from this handoff. Do not merge this
+branch to `main`.
 
 ### T5 — Atomic BA
 

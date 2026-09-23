@@ -69,6 +69,8 @@ known_limitations:
   - "T1 cargo test -p rustscan-sfm --all-targets deadlocked in parallel GPU context initialization and was stopped; it is not a passing or failing assertion result."
   - "T1 cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings fails on pre-existing rustscan-slam warnings before it checks rustscan-sfm. Those warnings are outside T1."
   - "T1 cargo test -p rustscan-sfm --all-features --lib reported two unrelated GPU numerical failures on this host (five_point_f32_actual_gpu_stages, wgpu_pnp_focal_p3p_reorders_adverse_baseline_before_solving). They are outside T1 mapper identity scope."
+  - "T4 cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings still fails on pre-existing unmodified rustscan-slam diagnostics (first error module_inception at rustscan-slam/src/config/mod.rs:5; 84 errors). This is an existing repository issue, not a T4 defect."
+  - "T4 full cargo test -p rustscan-sfm --all-targets was not completed for reviewed tip be27ce4 and is not cited as pass evidence."
 
 later_tasks:
   - id: T1
@@ -97,8 +99,8 @@ later_tasks:
     branch: agent/RS-2026-004/t4-camera-invariants
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t4-camera-invariants
     scope: rustscan-sfm/src/core/types.rs, rustscan-sfm/src/sfm/view_graph_calibration.rs, and direct camera callers
-    status: review_fix
-    tip_commit: 99fe9c8e11130e3a23d248144ee2d96c72e6619d
+    status: reviewed
+    tip_commit: be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf
   - id: T5
     owner: cursor-agent
     branch: agent/RS-2026-004/t5-atomic-ba
@@ -120,4 +122,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T4 review P1 fixes are on agent/RS-2026-004/t4-camera-invariants. Do not mark T4 reviewed. Do not start T5 or T6. Do not merge to main."
+next_action: "T4 is reviewed at tip_commit be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf. Do not start T5 or T6 from this handoff. Do not merge T4 to main from this handoff."

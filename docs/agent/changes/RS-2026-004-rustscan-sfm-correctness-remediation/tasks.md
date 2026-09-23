@@ -123,6 +123,9 @@ truncating an export file.
 
 ## T4 — Remove CameraModel's Split State And Fix Focal Refinement
 
+**Status:** reviewed at tip `be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf`
+(`agent/RS-2026-004/t4-camera-invariants`).
+
 **Dependencies:** T2  
 **Primary scope:** `rustscan-sfm/src/core/types.rs`,
 `rustscan-sfm/src/sfm/view_graph_calibration.rs`, direct camera callers, and tests
@@ -147,6 +150,13 @@ truncating an export file.
       return contextual errors instead of panicking.
 - [x] Review P1: production BA/mapper camera writes go through checked APIs;
       `params` is private.
+- [x] Review P1: `apply_optional_intrinsics` is fully atomic (candidate params,
+      one validation, one commit); illegal principal-point updates leave focals
+      unchanged.
+- [x] Independent review accepted tip `be27ce4` with focused fmt/check/types/
+      view-graph/colmap/no-default/`git diff --check` evidence. Full
+      `--all-targets` was not completed for that tip. Clippy remains blocked by
+      pre-existing `rustscan-slam` lints and is not a T4 defect.
 
 **Exit condition:** camera accessors, projection, BA, calibration, and export
 cannot observe different intrinsics for the same `CameraModel`.
