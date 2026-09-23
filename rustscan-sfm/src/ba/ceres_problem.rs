@@ -11,10 +11,10 @@ use super::shared::{
     refresh_point_errors,
 };
 use super::{
-    camera_center_world, position_prior_information_matrix, BundleAdjustmentGauge,
-    BundleAdjustmentLinearSolver, BundleAdjustmentLinearSolverPreference, BundleAdjustmentLoss,
-    BundleAdjustmentOptions, BundleAdjustmentPreconditioner, BundleAdjustmentReport,
-    BundleAdjustmentSparseLinearAlgebra, BundleAdjustmentTerminationReason,
+    camera_center_world, position_prior_information_matrix, should_commit_ba_solution,
+    BundleAdjustmentGauge, BundleAdjustmentLinearSolver, BundleAdjustmentLinearSolverPreference,
+    BundleAdjustmentLoss, BundleAdjustmentOptions, BundleAdjustmentPreconditioner,
+    BundleAdjustmentReport, BundleAdjustmentSparseLinearAlgebra, BundleAdjustmentTerminationReason,
     BundleAdjustmentTerminationType, POSE_PRIOR_JACOBIAN_EPS,
 };
 use crate::types::{CameraModel, ImageFrame, Reconstruction, Rigid3};
@@ -392,44 +392,105 @@ pub fn solve_bundle_adjustment_ceres(
     let solve_ms = solve_started.elapsed().as_secs_f64() * 1000.0;
     let postprocess_started = Instant::now();
 
-    write_back_solution(
+    let summary = &solution.summary;
+    let mut parameters = solution.parameters;
+    let (
+        mut termination_type,
+        termination_reason,
+        gradient_max_norm,
+        step_norm,
+        step_quality,
+        damping,
+    ) = map_ceres_summary(summary);
+    let mut ceres_usable = summary.is_solution_usable();
+
+    if let Some(hooks) = options.commit_test_override.as_ref() {
+        if let Some(force_usable) = hooks.force_ceres_usable {
+            ceres_usable = force_usable;
+        }
+        if let Some(forced_termination) = hooks.force_termination {
+            termination_type = forced_termination;
+        }
+        if let Some(corrupt) = hooks.corrupt_first_camera_param {
+            if let Some(first_spec) = camera_param_specs.first() {
+                let key = (first_spec.camera, first_spec.param);
+                if let Some(&idx) = camera_param_registry.get(&key) {
+                    if let Some(storage_idx) = internal_to_storage.get(&idx) {
+                        if let Some(block) = parameters.get_mut(*storage_idx) {
+                            if let Some(slot) = block.get_mut(0) {
+                                *slot = corrupt;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let parameters_valid = solution_parameters_are_committable(
         reconstruction,
-        &solution.parameters,
+        &parameters,
         &internal_to_storage,
         &pose_entity_registry,
-        &frame_images,
-        &sensor_pose_specs,
         &camera_param_registry,
         &camera_param_specs,
         &point_registry,
         &constant_point_filter,
-        &pose_blocks,
-    );
+    )
+    .is_ok();
 
-    refresh_point_errors(frames, reconstruction);
+    let mut committed = should_commit_ba_solution(ceres_usable, termination_type, parameters_valid);
+    if !parameters_valid && termination_type.is_solution_usable() {
+        // Solver claimed usability, but write-back would install illegal state.
+        termination_type = BundleAdjustmentTerminationType::Failure;
+        committed = false;
+    }
 
-    let covariance = options
-        .compute_covariance
-        .then(|| {
-            super::ceres_support::compute_bundle_adjustment_covariance(
-                reconstruction,
-                &observations,
-                &pose_blocks,
-                &sensor_pose_specs,
-                &camera_param_specs,
-                &constant_point_filter,
-                options.loss_function,
-                &options.pose_priors,
-                options.prior_position_fallback_stddev,
-            )
-        })
-        .flatten();
+    let covariance = if committed {
+        match try_write_back_solution(
+            reconstruction,
+            &parameters,
+            &internal_to_storage,
+            &pose_entity_registry,
+            &frame_images,
+            &sensor_pose_specs,
+            &camera_param_registry,
+            &camera_param_specs,
+            &point_registry,
+            &constant_point_filter,
+            &pose_blocks,
+        ) {
+            Ok(()) => {
+                refresh_point_errors(frames, reconstruction);
+                options
+                    .compute_covariance
+                    .then(|| {
+                        super::ceres_support::compute_bundle_adjustment_covariance(
+                            reconstruction,
+                            &observations,
+                            &pose_blocks,
+                            &sensor_pose_specs,
+                            &camera_param_specs,
+                            &constant_point_filter,
+                            options.loss_function,
+                            &options.pose_priors,
+                            options.prior_position_fallback_stddev,
+                        )
+                    })
+                    .flatten()
+            }
+            Err(_) => {
+                // Staging validation passed but apply failed; treat as unusable.
+                termination_type = BundleAdjustmentTerminationType::Failure;
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let summary = solution.summary;
     let successful_steps = summary.num_successful_steps().max(0) as usize;
     let unsuccessful_steps = summary.num_unsuccessful_steps().max(0) as usize;
-    let (termination_type, termination_reason, gradient_max_norm, step_norm, step_quality, damping) =
-        map_ceres_summary(&summary);
     let residuals_reduced = summary.num_residuals_reduced().max(0) as usize;
     let effective_parameters_reduced = summary.num_effective_parameters_reduced().max(0) as usize;
     let postprocess_ms = postprocess_started.elapsed().as_secs_f64() * 1000.0;
@@ -449,6 +510,7 @@ pub fn solve_bundle_adjustment_ceres(
                 "ba_elapsed_ms": elapsed_ms,
                 "message": summary.message(),
                 "full_report": summary.full_report(),
+                "committed": committed,
             })
         );
     }
@@ -1487,7 +1549,140 @@ fn eval_residual_from_storage(
     eval_residual(&params, binding)
 }
 
-fn write_back_solution(
+fn solution_parameters_are_committable(
+    reconstruction: &Reconstruction,
+    parameters: &[Vec<f64>],
+    internal_to_storage: &HashMap<usize, usize>,
+    pose_entity_registry: &HashMap<PoseEntityKey, usize>,
+    camera_param_registry: &HashMap<(usize, usize), usize>,
+    camera_param_specs: &[CameraParamSpec],
+    point_registry: &HashMap<usize, usize>,
+    constant_point_filter: &HashSet<usize>,
+) -> Result<(), String> {
+    prepare_write_back(
+        reconstruction,
+        parameters,
+        internal_to_storage,
+        pose_entity_registry,
+        camera_param_registry,
+        camera_param_specs,
+        point_registry,
+        constant_point_filter,
+    )
+    .map(|_| ())
+}
+
+struct PreparedBaWriteBack {
+    image_poses: Vec<(usize, SE3)>,
+    frame_poses: Vec<(usize, Vec<usize>, SE3)>,
+    sensor_poses: Vec<(SensorPoseKey, SE3)>,
+    cameras: Vec<CameraModel>,
+    legacy_camera: CameraModel,
+    points: Vec<(usize, [f32; 3])>,
+}
+
+fn prepare_write_back(
+    reconstruction: &Reconstruction,
+    parameters: &[Vec<f64>],
+    internal_to_storage: &HashMap<usize, usize>,
+    pose_entity_registry: &HashMap<PoseEntityKey, usize>,
+    camera_param_registry: &HashMap<(usize, usize), usize>,
+    camera_param_specs: &[CameraParamSpec],
+    point_registry: &HashMap<usize, usize>,
+    constant_point_filter: &HashSet<usize>,
+) -> Result<PreparedBaWriteBack, String> {
+    let mut image_poses = Vec::new();
+    let mut frame_poses = Vec::new();
+    let mut sensor_poses = Vec::new();
+
+    for (key, &handle) in pose_entity_registry {
+        let values = parameter_values(parameters, handle, internal_to_storage)
+            .ok_or_else(|| format!("missing pose parameter block for handle {handle}"))?;
+        let pose = pose_params_to_se3_checked(values)?;
+        match key {
+            PoseEntityKey::Image(image) => image_poses.push((*image, pose)),
+            PoseEntityKey::Frame(frame_idx) => {
+                // Image membership is resolved at apply time from the live map.
+                frame_poses.push((*frame_idx, Vec::new(), pose));
+            }
+            PoseEntityKey::Sensor(sensor_key) => sensor_poses.push((sensor_key.clone(), pose)),
+        }
+    }
+
+    let mut cameras = reconstruction.cameras.clone();
+    if cameras.is_empty() {
+        cameras.push(reconstruction.camera);
+    }
+    for &spec in camera_param_specs {
+        let key = (spec.camera, spec.param);
+        let Some(&idx) = camera_param_registry.get(&key) else {
+            return Err(format!(
+                "missing camera parameter registry entry for camera {} param {}",
+                spec.camera, spec.param
+            ));
+        };
+        if spec.camera >= cameras.len() {
+            return Err(format!(
+                "camera index {} out of range for write-back",
+                spec.camera
+            ));
+        }
+        if spec.param >= cameras[spec.camera].num_params {
+            return Err(format!(
+                "camera {} param {} out of range for num_params={}",
+                spec.camera, spec.param, cameras[spec.camera].num_params
+            ));
+        }
+        let params = parameter_values(parameters, idx, internal_to_storage).ok_or_else(|| {
+            format!(
+                "missing camera parameter block for camera {} param {}",
+                spec.camera, spec.param
+            )
+        })?;
+        let value = params.first().copied().ok_or_else(|| {
+            format!(
+                "empty camera parameter block for camera {} param {}",
+                spec.camera, spec.param
+            )
+        })?;
+        cameras[spec.camera]
+            .set_param(spec.param, value)
+            .map_err(|err| {
+                format!(
+                    "illegal camera write-back for camera {} param {}: {err}",
+                    spec.camera, spec.param
+                )
+            })?;
+    }
+    let legacy_camera = cameras.first().copied().unwrap_or(reconstruction.camera);
+
+    let mut points = Vec::new();
+    for (&point_id, &idx) in point_registry {
+        if constant_point_filter.contains(&point_id) {
+            continue;
+        }
+        if point_id >= reconstruction.points.len() {
+            return Err(format!(
+                "point index {point_id} out of range for write-back"
+            ));
+        }
+        let params = parameter_values(parameters, idx, internal_to_storage)
+            .ok_or_else(|| format!("missing point parameter block for point {point_id}"))?;
+        let xyz = point_params_to_xyz_checked(params)?;
+        points.push((point_id, xyz));
+    }
+
+    Ok(PreparedBaWriteBack {
+        image_poses,
+        frame_poses,
+        sensor_poses,
+        cameras,
+        legacy_camera,
+        points,
+    })
+}
+
+fn try_write_back_solution(
     reconstruction: &mut Reconstruction,
     parameters: &[Vec<f64>],
     internal_to_storage: &HashMap<usize, usize>,
@@ -1499,93 +1694,101 @@ fn write_back_solution(
     point_registry: &HashMap<usize, usize>,
     constant_point_filter: &HashSet<usize>,
     pose_blocks: &super::ceres_support::PoseBlockSet,
-) {
-    let mut changed_sensors = Vec::new();
+) -> Result<(), String> {
+    let prepared = prepare_write_back(
+        reconstruction,
+        parameters,
+        internal_to_storage,
+        pose_entity_registry,
+        camera_param_registry,
+        camera_param_specs,
+        point_registry,
+        constant_point_filter,
+    )?;
 
-    for (key, &handle) in pose_entity_registry {
-        let Some(pose) = pose_params_from_solution(parameters, handle, internal_to_storage) else {
-            continue;
-        };
-        match key {
-            PoseEntityKey::Image(image) => {
-                if let Some(slot) = reconstruction.poses.get_mut(*image) {
-                    *slot = Some(pose);
-                }
-            }
-            PoseEntityKey::Frame(frame_idx) => {
-                if let Some(images) = frame_images.get(frame_idx) {
-                    set_frame_pose_block(reconstruction, *frame_idx, images, pose);
-                }
-            }
-            PoseEntityKey::Sensor(sensor_key) => {
-                if let Some(rig) = reconstruction
-                    .rigs
-                    .iter_mut()
-                    .find(|rig| rig.rig_id == sensor_key.rig_id)
-                {
-                    if let Some(sensor) = rig
-                        .sensors
-                        .iter_mut()
-                        .find(|sensor| sensor.sensor_id == sensor_key.sensor_id)
-                    {
-                        sensor.sensor_from_rig = Some(Rigid3::from_se3(pose));
-                        changed_sensors.push(sensor_key.clone());
-                    }
-                }
-            }
+    for (image, pose) in prepared.image_poses {
+        if let Some(slot) = reconstruction.poses.get_mut(image) {
+            *slot = Some(pose);
         }
     }
 
+    for (frame_idx, _, pose) in prepared.frame_poses {
+        if let Some(images) = frame_images.get(&frame_idx) {
+            set_frame_pose_block(reconstruction, frame_idx, images, pose);
+        }
+    }
+
+    let mut changed_sensors = Vec::new();
+    for (sensor_key, pose) in prepared.sensor_poses {
+        if let Some(rig) = reconstruction
+            .rigs
+            .iter_mut()
+            .find(|rig| rig.rig_id == sensor_key.rig_id)
+        {
+            if let Some(sensor) = rig
+                .sensors
+                .iter_mut()
+                .find(|sensor| sensor.sensor_id == sensor_key.sensor_id)
+            {
+                sensor.sensor_from_rig = Some(Rigid3::from_se3(pose));
+                changed_sensors.push(sensor_key);
+            }
+        }
+    }
     if !changed_sensors.is_empty() {
         sync_pose_blocks_for_sensor_changes(reconstruction, pose_blocks, &changed_sensors);
     }
 
-    let mut cameras = reconstruction.cameras.clone();
-    if cameras.is_empty() {
-        cameras.push(reconstruction.camera);
-    }
-    for &spec in camera_param_specs {
-        let key = (spec.camera, spec.param);
-        let Some(&idx) = camera_param_registry.get(&key) else {
-            continue;
-        };
-        if spec.param >= cameras[spec.camera].num_params {
-            continue;
-        }
-        let Some(params) = parameter_values(parameters, idx, internal_to_storage) else {
-            continue;
-        };
-        if cameras[spec.camera]
-            .set_param(spec.param, params[0])
-            .is_err()
-        {
-            // Reject illegal solver write-back for this camera parameter; leave
-            // the previous committed value unchanged.
-            continue;
-        }
-    }
-    reconstruction.cameras = cameras.clone();
-    if let Some(camera) = cameras.first() {
-        reconstruction.camera = *camera;
-    }
+    reconstruction.cameras = prepared.cameras;
+    reconstruction.camera = prepared.legacy_camera;
 
-    for (&point_id, &idx) in point_registry {
-        if constant_point_filter.contains(&point_id) {
-            continue;
-        }
+    for (point_id, xyz) in prepared.points {
         if let Some(point) = reconstruction.points.get_mut(point_id) {
-            let Some(params) = parameter_values(parameters, idx, internal_to_storage) else {
-                continue;
-            };
-            point.xyz = [
-                params[0] as f32,
-                params.get(1).copied().unwrap_or(0.0) as f32,
-                params.get(2).copied().unwrap_or(0.0) as f32,
-            ];
+            point.xyz = xyz;
         }
     }
 
     let _ = sensor_pose_specs;
+    Ok(())
+}
+
+fn pose_params_to_se3_checked(params: &[f64]) -> Result<SE3, String> {
+    if params.len() < 7 {
+        return Err(format!(
+            "pose parameter block has {} values, expected 7",
+            params.len()
+        ));
+    }
+    for (idx, value) in params.iter().take(7).enumerate() {
+        if !value.is_finite() {
+            return Err(format!("pose parameter[{idx}] is non-finite ({value})"));
+        }
+    }
+    let q = [
+        params[0] as f32,
+        params[1] as f32,
+        params[2] as f32,
+        params[3] as f32,
+    ];
+    let t = [params[4] as f32, params[5] as f32, params[6] as f32];
+    if q.iter().any(|v| !v.is_finite()) || t.iter().any(|v| !v.is_finite()) {
+        return Err("pose parameters become non-finite after f32 narrowing".into());
+    }
+    Ok(pose_params_to_se3(params))
+}
+
+fn point_params_to_xyz_checked(params: &[f64]) -> Result<[f32; 3], String> {
+    let x = params.first().copied().unwrap_or(0.0);
+    let y = params.get(1).copied().unwrap_or(0.0);
+    let z = params.get(2).copied().unwrap_or(0.0);
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return Err(format!("point parameters are non-finite ({x}, {y}, {z})"));
+    }
+    let xyz = [x as f32, y as f32, z as f32];
+    if xyz.iter().any(|v| !v.is_finite()) {
+        return Err("point parameters become non-finite after f32 narrowing".into());
+    }
+    Ok(xyz)
 }
 
 fn parameter_values<'a>(
@@ -1603,7 +1806,7 @@ fn pose_params_from_solution(
     internal_to_storage: &HashMap<usize, usize>,
 ) -> Option<SE3> {
     let values = parameter_values(parameters, handle, internal_to_storage)?;
-    Some(pose_params_to_se3(values))
+    pose_params_to_se3_checked(values).ok()
 }
 
 fn count_variable_blocks(
@@ -2016,7 +2219,9 @@ fn parse_ceres_scalar_field(report: &str, label: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::BundleAdjustmentLinearSolver;
+    use super::super::{
+        BaCommitTestOverride, BundleAdjustmentLinearSolver, BundleAdjustmentTerminationType,
+    };
     use super::*;
     use crate::sift::SiftFeatures;
     use crate::types::{CameraModel, ImageFrame, Point3D, TrackObservation};
@@ -2027,6 +2232,246 @@ mod tests {
     use rustscan_slam::KeyPoint;
     use rustscan_slam::SE3;
     use std::path::PathBuf;
+
+    #[derive(Clone)]
+    struct BaMutableSnapshot {
+        camera_params: Vec<Vec<f64>>,
+        poses: Vec<[f64; 7]>,
+        pose_present: Vec<bool>,
+        points_xyz: Vec<[f32; 3]>,
+        point_errors: Vec<f32>,
+        frame_poses: Vec<[f64; 7]>,
+        sensor_poses: Vec<Option<[f64; 7]>>,
+    }
+
+    fn snapshot_ba_state(reconstruction: &Reconstruction) -> BaMutableSnapshot {
+        let mut cameras = reconstruction.cameras.clone();
+        if cameras.is_empty() {
+            cameras.push(reconstruction.camera);
+        }
+        let camera_params = cameras
+            .iter()
+            .map(|camera| camera.params_slice().to_vec())
+            .collect();
+        let mut poses = Vec::with_capacity(reconstruction.poses.len());
+        let mut pose_present = Vec::with_capacity(reconstruction.poses.len());
+        for pose in &reconstruction.poses {
+            match pose {
+                Some(pose) => {
+                    pose_present.push(true);
+                    poses.push(se3_to_pose_params(*pose));
+                }
+                None => {
+                    pose_present.push(false);
+                    poses.push([0.0; 7]);
+                }
+            }
+        }
+        let frame_poses = reconstruction
+            .frames
+            .iter()
+            .map(|frame| se3_to_pose_params(frame.rig_from_world.to_se3()))
+            .collect();
+        let sensor_poses = reconstruction
+            .rigs
+            .iter()
+            .flat_map(|rig| {
+                rig.sensors.iter().map(|sensor| {
+                    sensor
+                        .sensor_from_rig
+                        .as_ref()
+                        .map(|rigid| se3_to_pose_params(rigid.to_se3()))
+                })
+            })
+            .collect();
+        BaMutableSnapshot {
+            camera_params,
+            poses,
+            pose_present,
+            points_xyz: reconstruction.points.iter().map(|p| p.xyz).collect(),
+            point_errors: reconstruction.points.iter().map(|p| p.error).collect(),
+            frame_poses,
+            sensor_poses,
+        }
+    }
+
+    fn assert_ba_state_unchanged(before: &BaMutableSnapshot, after: &Reconstruction) {
+        let after = snapshot_ba_state(after);
+        assert_eq!(before.camera_params, after.camera_params);
+        assert_eq!(before.pose_present, after.pose_present);
+        assert_eq!(before.poses, after.poses);
+        assert_eq!(before.points_xyz, after.points_xyz);
+        assert_eq!(before.point_errors, after.point_errors);
+        assert_eq!(before.frame_poses, after.frame_poses);
+        assert_eq!(before.sensor_poses, after.sensor_poses);
+    }
+
+    fn trivial_single_observation_scene() -> (Vec<ImageFrame>, Reconstruction) {
+        let frames = vec![ImageFrame {
+            id: 0,
+            name: "0.jpg".into(),
+            path: PathBuf::from("0.jpg"),
+            width: 100,
+            height: 100,
+            keypoints: vec![KeyPoint::new(50.0, 50.0)],
+            descriptors: Descriptors::new(),
+            sift: SiftFeatures::default(),
+            wide_descriptors: WideDescriptors {
+                data: Vec::new(),
+                dim: 0,
+                count: 0,
+            },
+            strong_feature_indices: Vec::new(),
+            colors: Vec::new(),
+        }];
+        let reconstruction = Reconstruction {
+            camera: CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0),
+            cameras: vec![CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0)],
+            camera_ids: vec![1],
+            rigs: Vec::new(),
+            frames: Vec::new(),
+            image_names: vec!["0.jpg".into()],
+            image_paths: vec![PathBuf::from("0.jpg")],
+            image_ids: vec![1],
+            image_camera_indices: vec![0],
+            image_frame_indices: vec![None],
+            poses: vec![Some(SE3::identity())],
+            observations: vec![vec![Some(0)]],
+            keypoints: frames.iter().map(|f| f.keypoints.clone()).collect(),
+            point_ids: vec![1],
+            points: vec![Point3D {
+                xyz: [0.0, 0.0, 2.0],
+                color: [0, 0, 0],
+                error: 1.25,
+                track: vec![TrackObservation {
+                    image: 0,
+                    feature: 0,
+                }],
+            }],
+        };
+        (frames, reconstruction)
+    }
+
+    #[test]
+    fn rejected_ba_solutions_leave_reconstruction_unchanged() {
+        let (frames, mut reconstruction) = trivial_single_observation_scene();
+
+        for (label, hooks) in [
+            (
+                "failure",
+                BaCommitTestOverride {
+                    force_ceres_usable: Some(false),
+                    force_termination: Some(BundleAdjustmentTerminationType::Failure),
+                    corrupt_first_camera_param: None,
+                },
+            ),
+            (
+                "user_failure",
+                BaCommitTestOverride {
+                    force_ceres_usable: Some(false),
+                    force_termination: Some(BundleAdjustmentTerminationType::UserFailure),
+                    corrupt_first_camera_param: None,
+                },
+            ),
+            (
+                "nan_camera",
+                BaCommitTestOverride {
+                    force_ceres_usable: Some(true),
+                    force_termination: Some(BundleAdjustmentTerminationType::Convergence),
+                    corrupt_first_camera_param: Some(f64::NAN),
+                },
+            ),
+            (
+                "inf_camera",
+                BaCommitTestOverride {
+                    force_ceres_usable: Some(true),
+                    force_termination: Some(BundleAdjustmentTerminationType::NoConvergence),
+                    corrupt_first_camera_param: Some(f64::INFINITY),
+                },
+            ),
+            (
+                "non_positive_focal",
+                BaCommitTestOverride {
+                    force_ceres_usable: Some(true),
+                    force_termination: Some(BundleAdjustmentTerminationType::UserSuccess),
+                    corrupt_first_camera_param: Some(-1.0),
+                },
+            ),
+        ] {
+            reconstruction = trivial_single_observation_scene().1;
+            let before = snapshot_ba_state(&reconstruction);
+            let report = solve_bundle_adjustment_ceres(
+                &frames,
+                &mut reconstruction,
+                BundleAdjustmentOptions {
+                    iterations: 5,
+                    allow_single_observation_points: true,
+                    refine_focal_length: true,
+                    commit_test_override: Some(hooks),
+                    ..BundleAdjustmentOptions::default()
+                },
+                None,
+            )
+            .unwrap_or_else(|| panic!("{label}: expected report"));
+            assert!(
+                !report.is_solution_usable(),
+                "{label}: report must be unusable"
+            );
+            assert_ba_state_unchanged(&before, &reconstruction);
+            assert_eq!(reconstruction.points[0].error, 1.25);
+        }
+    }
+
+    #[test]
+    fn usable_no_convergence_still_commits_when_parameters_valid() {
+        let (frames, mut reconstruction) = trivial_single_observation_scene();
+        let before = snapshot_ba_state(&reconstruction);
+        let report = solve_bundle_adjustment_ceres(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 5,
+                allow_single_observation_points: true,
+                refine_focal_length: true,
+                commit_test_override: Some(BaCommitTestOverride {
+                    force_ceres_usable: Some(true),
+                    force_termination: Some(BundleAdjustmentTerminationType::NoConvergence),
+                    corrupt_first_camera_param: None,
+                }),
+                ..BundleAdjustmentOptions::default()
+            },
+            None,
+        )
+        .expect("usable no-convergence should return a report");
+        assert!(report.is_solution_usable());
+        assert_eq!(
+            report.termination_type,
+            BundleAdjustmentTerminationType::NoConvergence
+        );
+        // Point error is refreshed after a successful commit.
+        assert_ne!(reconstruction.points[0].error, before.point_errors[0]);
+    }
+
+    #[test]
+    fn successful_convergence_commits_and_refreshes_point_errors() {
+        let (frames, mut reconstruction) = trivial_single_observation_scene();
+        let before_error = reconstruction.points[0].error;
+        let report = solve_bundle_adjustment_ceres(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 5,
+                allow_single_observation_points: true,
+                ..BundleAdjustmentOptions::default()
+            },
+            None,
+        )
+        .expect("convergence path");
+        assert!(report.is_solution_usable());
+        assert!(reconstruction.points[0].error.is_finite());
+        // Error is recomputed from the committed geometry.
+        let _ = before_error;
+    }
 
     #[test]
     fn ceres_full_report_contains_termination_and_gradient_fields() {

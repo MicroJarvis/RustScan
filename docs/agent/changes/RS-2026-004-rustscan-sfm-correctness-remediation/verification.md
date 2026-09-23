@@ -1039,7 +1039,85 @@ branch to `main`.
 
 ### T5 — Atomic BA
 
-Status: pending.
+Status: review_ready. Not reviewed.
+
+Owner: `cursor-agent`
+
+Base commit: `701d051814a29ab3ee4fbefc01355112f71b5a47` (local `main` with T1–T4
+integrated)
+
+Implementation commit: tip of `agent/RS-2026-004/t5-atomic-ba` (this handoff).
+
+
+Branch: `agent/RS-2026-004/t5-atomic-ba`
+
+Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t5-atomic-ba`
+
+This start supersedes the earlier “do not start T5” handoff freeze.
+
+Changed files:
+
+- `rustscan-sfm/src/ba/mod.rs`
+- `rustscan-sfm/src/ba/ceres_problem.rs`
+- `rustscan-sfm/src/sfm/global_mapper.rs`
+- `rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
+
+Public Ceres BA now gates Reconstruction mutation on
+`should_commit_ba_solution(ceres_summary_usable, termination_type,
+parameters_valid)`. `NoConvergence` remains committable when Ceres marks the
+solution usable; `Failure` / `UserFailure` never commit. Write-back stages
+cameras (via checked `set_param`), poses, and points, then applies once; any
+illegal camera/pose/point value rejects the whole commit and forces an
+unusable report. Point-error refresh and covariance run only after a
+successful commit. Cancel before write-back remains unchanged.
+
+`global_mapper::run_iterative_global_refinement` sets success from
+`report.is_solution_usable()` and stops further refinement rounds on an
+unusable or absent BA result. Mapper camera-plausibility rollback in
+`refine_bundle_adjustment_checked` stays a post-success policy gate.
+
+Deterministic coverage uses `BaCommitTestOverride` on the real solve/write-back
+path (not a standalone boolean stub): Failure, UserFailure, NaN/Inf/negative
+camera params leave cameras, poses, xyz, point errors, frames, and sensors
+unchanged; usable `NoConvergence` still commits; convergence refreshes point
+errors; `unusable_global_ba_is_not_success_and_stops_refinement` checks
+global success + round stop. Existing taskflow cancel tests continue to cover
+cancellation without mutation.
+
+Commands with `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+and `CARGO_TERM_COLOR=never`:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: pass
+  (lib `846 passed; 19 ignored`, plus integration/example targets; exit 0).
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `656 passed; 0 failed; 19 ignored`.
+- `cargo test -p rustscan-sfm --no-default-features --features ceres-ba --lib -- --test-threads=1`:
+  pass. `693 passed; 0 failed; 19 ignored`.
+- `cargo test -p rustscan-sfm --features ceres-ba --lib ba:: -- --test-threads=1`:
+  pass. `37 passed`.
+- `cargo test -p rustscan-sfm --features ceres-ba --lib global_mapper -- --test-threads=1`:
+  pass. `9 passed`.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error: `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`. Final:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`. Slam
+  unmodified. No global allow added.
+- `git diff --check`: pass.
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- GPU numerical host limitations from earlier tasks are unchanged; this run
+  did not treat ignored GPU skips as execution evidence.
+- Database transaction atomicity remains T6.
+
+Next action: do not start T6. Do not merge to `main`. Await independent
+code review.
 
 ### T6 — Database Transactions
 

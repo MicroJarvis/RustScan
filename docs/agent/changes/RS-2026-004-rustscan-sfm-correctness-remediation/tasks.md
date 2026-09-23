@@ -163,20 +163,23 @@ cannot observe different intrinsics for the same `CameraModel`.
 
 ## T5 — Make Bundle Adjustment State Updates Atomic
 
+**Status:** review_ready on `agent/RS-2026-004/t5-atomic-ba` (base
+`701d051814a29ab3ee4fbefc01355112f71b5a47`).
+
 **Dependencies:** T0  
 **Primary scope:** `rustscan-sfm/src/ba/`,
 `rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs`,
 `rustscan-sfm/src/sfm/global_mapper.rs`, and BA/global-mapper tests
 
-- [ ] Inspect the Ceres summary and all solution parameters before write-back.
-- [ ] Commit camera, pose, point, and point-error changes only for a usable,
+- [x] Inspect the Ceres summary and all solution parameters before write-back.
+- [x] Commit camera, pose, point, and point-error changes only for a usable,
       finite solution.
-- [ ] Ensure cancellation and all failure termination types leave the caller's
+- [x] Ensure cancellation and all failure termination types leave the caller's
       state unchanged.
-- [ ] Make `global_mapper` derive success from `is_solution_usable()` and stop
+- [x] Make `global_mapper` derive success from `is_solution_usable()` and stop
       the affected refinement round after an unusable result.
-- [ ] Keep mapper camera-plausibility rollback as a separate post-success gate.
-- [ ] Add deterministic convergence, no-convergence, failure, user-failure,
+- [x] Keep mapper camera-plausibility rollback as a separate post-success gate.
+- [x] Add deterministic convergence, no-convergence, failure, user-failure,
       cancellation, and non-finite-solution tests. Compare the complete mutable
       BA state before and after rejected solutions.
 

@@ -115,6 +115,8 @@ pub struct GlobalReconstructionOptions {
     /// Global BA iteration count per refinement round.
     pub global_ba_iterations: usize,
     pub ba_taskflow: Option<crate::ba::CeresBaTaskflow>,
+    /// Deterministic BA commit overrides used by atomicity tests.
+    pub ba_commit_test_override: Option<crate::ba::BaCommitTestOverride>,
     /// Split the view graph into connected components and reconstruct each
     /// qualifying component as an independent model.
     pub component_splitting: ViewGraphComponentSplittingOptions,
@@ -137,6 +139,7 @@ impl Default for GlobalReconstructionOptions {
             run_global_ba: true,
             global_ba_iterations: 50,
             ba_taskflow: None,
+            ba_commit_test_override: None,
             component_splitting: ViewGraphComponentSplittingOptions::default(),
         }
     }
@@ -660,9 +663,21 @@ fn run_iterative_global_refinement(
             constant_images: vec![registered[0]],
             variable_images: Some(registered.clone()),
             allow_single_observation_points: false,
+            commit_test_override: options.ba_commit_test_override.clone(),
             ..BundleAdjustmentOptions::default()
         };
-        global_ba_success = refine_bundle_adjustment(frames, reconstruction, ba_options).is_some();
+        let ba_report = refine_bundle_adjustment(frames, reconstruction, ba_options);
+        match ba_report {
+            Some(report) if report.is_solution_usable() => {
+                global_ba_success = true;
+            }
+            _ => {
+                // Unusable / absent BA must not be reported as success and must
+                // stop further global refinement rounds on this reconstruction.
+                global_ba_success = false;
+                break;
+            }
+        }
 
         let pass_stats = run_incremental_triangulation_pass(
             frames,
@@ -1207,6 +1222,104 @@ mod tests {
             stats.retriangulated_points
         );
         assert!(!reconstruction.points.is_empty());
+    }
+
+    #[cfg(feature = "ceres-ba")]
+    #[test]
+    fn unusable_global_ba_is_not_success_and_stops_refinement() {
+        let camera = test_camera();
+        let frames = (0..2)
+            .map(|view| synth_frame(view, vec![rustscan_slam::KeyPoint::new(320.0, 240.0)]))
+            .collect::<Vec<_>>();
+        let pairs = vec![PairGeometry {
+            left: 0,
+            right: 1,
+            two_view_config: 2,
+            f_matrix: None,
+            e_matrix: None,
+            h_matrix: None,
+            qvec: None,
+            tvec: None,
+            matches: Vec::new(),
+            inlier_matches: vec![rustscan_slam::Match {
+                query_idx: 0,
+                train_idx: 0,
+                distance: 0.0,
+            }],
+            relative_pose: SE3::from_quat_translation(Quat::identity(), Vec3::new(1.0, 0.0, 0.0)),
+            inliers: 1,
+            triangulated: 1,
+            mean_reprojection_error_px: 0.5,
+            rotation_deg: 0.0,
+            median_triangulation_angle_deg: 5.0,
+            pose_graph_only: false,
+        }];
+        let mut reconstruction = build_reconstruction_scaffold(
+            &frames,
+            camera,
+            &[
+                Some(SE3::identity()),
+                Some(SE3::from_quat_translation(
+                    Quat::identity(),
+                    Vec3::new(1.0, 0.0, 0.0),
+                )),
+            ],
+        );
+        reconstruction.observations = vec![vec![Some(0)], vec![Some(0)]];
+        reconstruction.keypoints = frames.iter().map(|f| f.keypoints.clone()).collect();
+        reconstruction.point_ids = vec![1];
+        reconstruction.points = vec![crate::types::Point3D {
+            xyz: [0.0, 0.0, 2.0],
+            color: [0, 0, 0],
+            error: 0.5,
+            track: vec![
+                crate::types::TrackObservation {
+                    image: 0,
+                    feature: 0,
+                },
+                crate::types::TrackObservation {
+                    image: 1,
+                    feature: 0,
+                },
+            ],
+        }];
+
+        let before_cameras = reconstruction.cameras[0].params_slice().to_vec();
+        let before_xyz = reconstruction.points[0].xyz;
+        let before_error = reconstruction.points[0].error;
+
+        let mut options = GlobalReconstructionOptions::default();
+        options.refinement.max_refinements = 3;
+        options.global_ba_iterations = 5;
+        options.refinement.filter_max_reprojection_error_px = 1.0e6;
+        options.refinement.filter_min_triangulation_angle_deg = 0.0;
+        options.refinement.filter_min_track_length = 1;
+        options.ba_commit_test_override = Some(crate::ba::BaCommitTestOverride {
+            force_ceres_usable: Some(false),
+            force_termination: Some(crate::ba::BundleAdjustmentTerminationType::Failure),
+            corrupt_first_camera_param: None,
+        });
+        options.incremental_triangulation = IncrementalTriangulatorOptions {
+            ignore_two_view_tracks: false,
+            min_angle_deg: 0.0,
+            ..IncrementalTriangulatorOptions::default()
+        };
+
+        let (rounds, _stats, ba_ok) =
+            super::run_iterative_global_refinement(&frames, &pairs, &mut reconstruction, &options);
+
+        assert!(!ba_ok);
+        assert_eq!(rounds, 1, "unusable BA must stop further refinement rounds");
+        assert_eq!(
+            reconstruction.cameras[0].params_slice(),
+            before_cameras.as_slice()
+        );
+        assert!(
+            !reconstruction.points.is_empty(),
+            "unusable BA must not clear structure during the stopped round"
+        );
+        assert_eq!(reconstruction.points[0].xyz, before_xyz);
+        assert_eq!(reconstruction.points[0].error, before_error);
     }
 
     #[test]

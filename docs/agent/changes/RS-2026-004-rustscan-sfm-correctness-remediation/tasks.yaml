@@ -71,6 +71,7 @@ known_limitations:
   - "T1 cargo test -p rustscan-sfm --all-features --lib reported two unrelated GPU numerical failures on this host (five_point_f32_actual_gpu_stages, wgpu_pnp_focal_p3p_reorders_adverse_baseline_before_solving). They are outside T1 mapper identity scope."
   - "T4 cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings still fails on pre-existing unmodified rustscan-slam diagnostics (first error module_inception at rustscan-slam/src/config/mod.rs:5; 84 errors). This is an existing repository issue, not a T4 defect."
   - "T4 full cargo test -p rustscan-sfm --all-targets was not completed for reviewed tip be27ce4 and is not cited as pass evidence."
+  - "T5 cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings still fails on pre-existing unmodified rustscan-slam diagnostics (first error module_inception at rustscan-slam/src/config/mod.rs:5; 84 errors). This is an existing repository issue, not a T5 defect."
 
 later_tasks:
   - id: T1
@@ -106,6 +107,9 @@ later_tasks:
     branch: agent/RS-2026-004/t5-atomic-ba
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t5-atomic-ba
     scope: rustscan-sfm/src/ba, rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs, and rustscan-sfm/src/sfm/global_mapper.rs
+    status: review_ready
+    base_commit: 701d051814a29ab3ee4fbefc01355112f71b5a47
+    tip_commit: tip_of_agent/RS-2026-004/t5-atomic-ba
   - id: T6
     owner: cursor-agent
     branch: agent/RS-2026-004/t6-database-transactions
@@ -122,4 +126,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T4 is reviewed at tip_commit be27ce41843823810c2c4a2f06a0a7e5e2ee6dbf. Do not start T5 or T6 from this handoff. Do not merge T4 to main from this handoff."
+next_action: "T5 is review_ready on agent/RS-2026-004/t5-atomic-ba. Do not start T6. Do not merge to main. Await independent code review."

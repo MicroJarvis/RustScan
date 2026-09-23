@@ -226,6 +226,23 @@ pub struct BundleAdjustmentOptions {
     pub pose_priors: Vec<BundleAdjustmentPosePrior>,
     pub prior_position_fallback_stddev: f64,
     pub compute_covariance: bool,
+    /// Deterministic commit-gate overrides for tests. Must stay `None` in production.
+    pub commit_test_override: Option<BaCommitTestOverride>,
+}
+
+/// Test-only hooks applied after Ceres solve and before Reconstruction commit.
+///
+/// Production callers leave [`BundleAdjustmentOptions::commit_test_override`] as
+/// `None`. These hooks exist so Failure / UserFailure / non-finite write-back
+/// paths can be exercised without relying on Ceres to fail randomly.
+#[derive(Debug, Clone, Default)]
+pub struct BaCommitTestOverride {
+    /// Overrides Ceres `SolverSummary::is_solution_usable()` for the commit gate.
+    pub force_ceres_usable: Option<bool>,
+    /// Overrides the mapped termination type used for commit and the report.
+    pub force_termination: Option<BundleAdjustmentTerminationType>,
+    /// Replaces the first refined camera parameter value before validation.
+    pub corrupt_first_camera_param: Option<f64>,
 }
 
 impl Default for BundleAdjustmentOptions {
@@ -261,8 +278,25 @@ impl Default for BundleAdjustmentOptions {
             pose_priors: Vec::new(),
             prior_position_fallback_stddev: 1.0,
             compute_covariance: false,
+            commit_test_override: None,
         }
     }
+}
+
+/// Decides whether a solved BA parameter vector may mutate the caller's
+/// [`crate::types::Reconstruction`].
+///
+/// A solution is committable only when Ceres reports it usable, the mapped
+/// termination type is usable (`Convergence`, `NoConvergence`, or
+/// `UserSuccess`), and every parameter that would be written is finite and
+/// camera-valid. `NoConvergence` remains eligible when Ceres marks the
+/// solution usable; `Failure` / `UserFailure` never commit.
+pub fn should_commit_ba_solution(
+    ceres_summary_usable: bool,
+    termination_type: BundleAdjustmentTerminationType,
+    parameters_valid: bool,
+) -> bool {
+    ceres_summary_usable && termination_type.is_solution_usable() && parameters_valid
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,9 +473,48 @@ pub fn try_refine_bundle_adjustment(
 #[cfg(test)]
 mod tests {
     use super::{
-        BundleAdjustmentLinearSolverPreference, BundleAdjustmentLoss,
-        BundleAdjustmentSparseLinearAlgebra,
+        should_commit_ba_solution, BundleAdjustmentLinearSolverPreference, BundleAdjustmentLoss,
+        BundleAdjustmentSparseLinearAlgebra, BundleAdjustmentTerminationType,
     };
+
+    #[test]
+    fn commit_gate_accepts_usable_no_convergence_and_rejects_failures() {
+        assert!(should_commit_ba_solution(
+            true,
+            BundleAdjustmentTerminationType::Convergence,
+            true
+        ));
+        assert!(should_commit_ba_solution(
+            true,
+            BundleAdjustmentTerminationType::NoConvergence,
+            true
+        ));
+        assert!(should_commit_ba_solution(
+            true,
+            BundleAdjustmentTerminationType::UserSuccess,
+            true
+        ));
+        assert!(!should_commit_ba_solution(
+            false,
+            BundleAdjustmentTerminationType::Convergence,
+            true
+        ));
+        assert!(!should_commit_ba_solution(
+            true,
+            BundleAdjustmentTerminationType::Failure,
+            true
+        ));
+        assert!(!should_commit_ba_solution(
+            true,
+            BundleAdjustmentTerminationType::UserFailure,
+            true
+        ));
+        assert!(!should_commit_ba_solution(
+            true,
+            BundleAdjustmentTerminationType::Convergence,
+            false
+        ));
+    }
 
     #[test]
     fn bundle_adjustment_preference_parsing_accepts_cli_spellings() {

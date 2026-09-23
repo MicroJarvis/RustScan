@@ -105,6 +105,7 @@ pub(super) fn global_reconstruction_options_from_config(
         run_global_ba: config.global_ba,
         global_ba_iterations: global_ba_iterations(config),
         ba_taskflow: config.ba_taskflow.clone(),
+        ba_commit_test_override: None,
         component_splitting: ViewGraphComponentSplittingOptions {
             enabled: config.multiple_models,
             min_component_size: config.min_model_size.max(2),
