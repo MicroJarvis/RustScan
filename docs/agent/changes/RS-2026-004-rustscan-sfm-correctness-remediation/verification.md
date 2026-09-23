@@ -1050,7 +1050,9 @@ integrated)
 Prior tip reviewed: `3422fff88f10da1ff34c2857b88bf15661e1ae08`
 Review: `review-t5-2026-09-23.md` — Decision CHANGES_REQUESTED (retained).
 
-Remediation commit: tip of `agent/RS-2026-004/t5-atomic-ba` (this handoff).
+Remediation commit: `08889a8df98835665b7e697e93e03ace1c084a97`
+(docs tip: `1ab8e7614c17f303c3f2528224380e2797c71374`; final handoff SHA after
+this note may advance by one docs commit).
 
 Branch: `agent/RS-2026-004/t5-atomic-ba`
 
