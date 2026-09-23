@@ -3,8 +3,8 @@ use super::ceres_support::{
     apply_two_cams_from_world_gauge, camera_by_index, camera_param_jacobian, camera_param_specs,
     count_variable_residuals, frame_sensor_from_rig, frame_sensor_key_for_image,
     projection_jacobians, sensor_pose_specs, set_frame_pose_block,
-    sync_camera_intrinsics_from_params, sync_pose_blocks_for_sensor_changes, variable_pose_blocks,
-    CameraParamSpec, PoseBlockKind, SensorPoseKey,
+    sync_pose_blocks_for_sensor_changes, variable_pose_blocks, CameraParamSpec, PoseBlockKind,
+    SensorPoseKey,
 };
 use super::shared::{
     add_three_point_gauge, bundle_adjustment_point_filter, collect_observations, project_point,
@@ -220,7 +220,7 @@ pub fn solve_bundle_adjustment_ceres(
         }
         let idx = next_param_index;
         next_param_index += 1;
-        block_values.insert(idx, vec![camera.params[spec.param]]);
+        block_values.insert(idx, vec![camera.params_slice()[spec.param]]);
         camera_param_registry.insert(key, idx);
     }
 
@@ -882,7 +882,7 @@ fn assemble_state(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<As
             }
             ParamRole::CameraParam(param) => {
                 if *param < camera.num_params {
-                    camera.params[*param] = slice[0];
+                    camera.set_param(*param, slice[0]).ok()?;
                 }
             }
         }
@@ -912,7 +912,6 @@ fn assemble_state(parameters: &[&[f64]], binding: &ResidualBinding) -> Option<As
             sensor_pose.compose(&rig)
         }
     };
-    sync_camera_intrinsics_from_params(&mut camera);
     let point = [point[0] as f32, point[1] as f32, point[2] as f32];
     let (rig_from_world, sensor_from_rig) = match &binding.pose_eval {
         PoseEval::Frame { sensor, .. } => {
@@ -1556,8 +1555,14 @@ fn write_back_solution(
         let Some(params) = parameter_values(parameters, idx, internal_to_storage) else {
             continue;
         };
-        cameras[spec.camera].params[spec.param] = params[0];
-        sync_camera_intrinsics_from_params(&mut cameras[spec.camera]);
+        if cameras[spec.camera]
+            .set_param(spec.param, params[0])
+            .is_err()
+        {
+            // Reject illegal solver write-back for this camera parameter; leave
+            // the previous committed value unchanged.
+            continue;
+        }
     }
     reconstruction.cameras = cameras.clone();
     if let Some(camera) = cameras.first() {

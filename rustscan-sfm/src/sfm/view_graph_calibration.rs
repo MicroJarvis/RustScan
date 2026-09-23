@@ -918,11 +918,29 @@ mod tests {
             (refined.fx() - seed.fx() * 0.9).abs() > 5.0,
             "must not lock onto the first grid scale 0.9"
         );
-        assert!((refined.params[0] - refined.fx() as f64).abs() < 1.0e-6);
-        assert!((refined.params[1] - refined.fy() as f64).abs() < 1.0e-6);
+        assert!((refined.params_slice()[0] - refined.fx() as f64).abs() < 1.0e-6);
+        assert!((refined.params_slice()[1] - refined.fy() as f64).abs() < 1.0e-6);
         let center = refined
             .img_from_cam(0.0, 0.0, 1.0)
             .expect("projection uses canonical params");
         assert!((center[0] - refined.cx() as f64).abs() < 1.0e-6);
+        // Off-center projection must use the same canonical focals as accessors.
+        let uv = [0.12f64, -0.08];
+        let px = refined
+            .img_from_cam(uv[0], uv[1], 1.0)
+            .expect("off-center projection");
+        assert!((px[0] - (refined.fx() as f64 * uv[0] + refined.cx() as f64)).abs() < 1.0e-4);
+        assert!((px[1] - (refined.fy() as f64 * uv[1] + refined.cy() as f64)).abs() < 1.0e-4);
+        let roundtrip = CameraModel::from_colmap(
+            refined.model_id,
+            refined.width,
+            refined.height,
+            refined.params_slice(),
+        )
+        .expect("COLMAP params round-trip");
+        assert_eq!(roundtrip.fx(), refined.fx());
+        assert_eq!(roundtrip.fy(), refined.fy());
+        assert_eq!(roundtrip.cx(), refined.cx());
+        assert_eq!(roundtrip.cy(), refined.cy());
     }
 }

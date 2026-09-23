@@ -850,32 +850,20 @@ fn run_reconstruction_prepared(
     } else {
         fallback_camera(&paths[0])
     };
-    if let Some(fx) = config.fx {
-        camera.set_fx(fx);
-    }
-    if let Some(fy) = config.fy {
-        camera.set_fy(fy);
-    }
-    if let Some(cx) = config.cx {
-        camera.set_cx(cx);
-    }
-    if let Some(cy) = config.cy {
-        camera.set_cy(cy);
-    }
+    camera
+        .apply_optional_intrinsics(config.fx, config.fy, config.cx, config.cy)
+        .map_err(|error| {
+            anyhow::anyhow!("invalid mapper intrinsics override for default camera: {error}")
+        })?;
     if let Some(setup) = &mut reference_camera_setup {
         for setup_camera in &mut setup.cameras {
-            if let Some(fx) = config.fx {
-                setup_camera.set_fx(fx);
-            }
-            if let Some(fy) = config.fy {
-                setup_camera.set_fy(fy);
-            }
-            if let Some(cx) = config.cx {
-                setup_camera.set_cx(cx);
-            }
-            if let Some(cy) = config.cy {
-                setup_camera.set_cy(cy);
-            }
+            setup_camera
+                .apply_optional_intrinsics(config.fx, config.fy, config.cx, config.cy)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid mapper intrinsics override for reference camera: {error}"
+                    )
+                })?;
         }
         if let Some(first) = setup.cameras.first().copied() {
             camera = first;
@@ -924,18 +912,13 @@ fn run_reconstruction_prepared(
         }
         if let Some(setup) = &mut reference_camera_setup {
             for setup_camera in &mut setup.cameras {
-                if let Some(fx) = config.fx {
-                    setup_camera.set_fx(fx);
-                }
-                if let Some(fy) = config.fy {
-                    setup_camera.set_fy(fy);
-                }
-                if let Some(cx) = config.cx {
-                    setup_camera.set_cx(cx);
-                }
-                if let Some(cy) = config.cy {
-                    setup_camera.set_cy(cy);
-                }
+                setup_camera
+                    .apply_optional_intrinsics(config.fx, config.fy, config.cx, config.cy)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "invalid mapper intrinsics override for retained-image camera: {error}"
+                        )
+                    })?;
             }
             if let Some(first) = setup.cameras.first().copied() {
                 camera = first;
@@ -1368,7 +1351,7 @@ pub(super) fn bogus_registered_camera_audits(
             let extra = colmap_camera_model_extra_idxs(camera.model_id)
                 .unwrap_or(&[])
                 .iter()
-                .filter_map(|&idx| camera.params.get(idx))
+                .filter_map(|&idx| camera.param(idx))
                 .map(|value| format!("{value:.4}"))
                 .collect::<Vec<_>>()
                 .join(",");
@@ -7833,7 +7816,7 @@ fn initial_pair_camera_invalid(reconstruction: &Reconstruction, image: usize) ->
         || camera.height == 0
         || !camera.fx().is_finite()
         || !camera.fy().is_finite()
-        || camera.params.iter().any(|param| !param.is_finite())
+        || camera.params_slice().iter().any(|param| !param.is_finite())
 }
 
 fn same_registration_frame(reconstruction: &Reconstruction, left: usize, right: usize) -> bool {
@@ -10202,13 +10185,9 @@ fn solve_absolute_pose_with_gpu_focal_estimation(
         bail!("gpu pnp-focal returned an invalid inlier mask");
     }
     let mut camera = initial_camera;
-    for &idx in focal_idxs {
-        if idx >= camera.num_params {
-            bail!("gpu pnp-focal focal parameter index {idx} is out of range");
-        }
-        camera.params[idx] = solution.focal as f64;
-    }
-    camera.sync_intrinsics_from_params();
+    camera
+        .set_shared_focal(solution.focal as f64)
+        .map_err(|error| anyhow::anyhow!("gpu pnp-focal returned invalid focal: {error}"))?;
     if camera_has_bogus_params(camera, config) {
         bail!("gpu pnp-focal returned invalid camera parameters");
     }
@@ -10250,13 +10229,7 @@ fn solve_absolute_pose_with_focal_estimation(
     }
     let result = solver.solve_with_estimated_focal(&problem)?;
     let mut camera = initial_camera;
-    for &idx in focal_idxs {
-        if idx >= camera.num_params {
-            return None;
-        }
-        camera.params[idx] = result.focal as f64;
-    }
-    camera.sync_intrinsics_from_params();
+    camera.set_shared_focal(result.focal as f64).ok()?;
     if camera_has_bogus_params(camera, config) {
         return None;
     }
@@ -10328,7 +10301,7 @@ fn average_camera_focal(camera: CameraModel) -> f64 {
         let mut count = 0usize;
         for &idx in focal_idxs {
             if idx < camera.num_params {
-                sum += camera.params[idx];
+                sum += camera.params_slice()[idx];
                 count += 1;
             }
         }
@@ -10559,11 +10532,21 @@ fn refine_absolute_pose_camera_params(
         let mut accepted = false;
         for step in [1.0, 0.5, 0.25, 0.125, 0.0625] {
             let mut candidate = camera;
+            let mut ok = true;
             for (idx, &param) in params.iter().enumerate() {
-                candidate.params[param] += delta[idx] * step;
+                let Some(current) = candidate.param(param) else {
+                    ok = false;
+                    break;
+                };
+                if candidate
+                    .set_param(param, current + delta[idx] * step)
+                    .is_err()
+                {
+                    ok = false;
+                    break;
+                }
             }
-            candidate.sync_intrinsics_from_params();
-            if camera_has_bogus_params(candidate, config) {
+            if !ok || camera_has_bogus_params(candidate, config) {
                 continue;
             }
             let Some(cost) = absolute_pose_camera_cost(pose, observations, candidate) else {
@@ -10647,13 +10630,12 @@ fn numerical_absolute_pose_camera_jacobian(
     if param >= camera.num_params {
         return None;
     }
-    let eps = camera.params[param].abs().max(1.0) * 1.0e-6;
+    let eps = camera.param(param)?.abs().max(1.0) * 1.0e-6;
     let mut plus = camera;
     let mut minus = camera;
-    plus.params[param] += eps;
-    minus.params[param] -= eps;
-    plus.sync_intrinsics_from_params();
-    minus.sync_intrinsics_from_params();
+    let current = camera.param(param)?;
+    plus.set_param(param, current + eps).ok()?;
+    minus.set_param(param, current - eps).ok()?;
     let r_plus = absolute_pose_residual(pose, plus, observation)?;
     let r_minus = absolute_pose_residual(pose, minus, observation)?;
     Some([
@@ -13019,8 +13001,8 @@ mod tests {
         assert_eq!(mask.len(), observations.len());
         assert!(mask.iter().all(|&inlier| inlier));
         assert!((solved_camera.fx() - expected_focal).abs() / expected_focal < 0.05);
-        assert_eq!(solved_camera.params[0], solved_camera.fx() as f64);
-        assert_eq!(solved_camera.params[1], solved_camera.fy() as f64);
+        assert_eq!(solved_camera.params_slice()[0], solved_camera.fx() as f64);
+        assert_eq!(solved_camera.params_slice()[1], solved_camera.fy() as f64);
         assert!(!camera_has_bogus_params(solved_camera, &config));
         Ok(())
     }
@@ -15926,7 +15908,7 @@ mod tests {
             None
         );
 
-        reconstruction.cameras[0].params[0] = 1.0;
+        reconstruction.cameras[0].inject_raw_param_for_test(0, 1.0);
         reconstruction.cameras[0].sync_intrinsics_from_params();
         assert_eq!(
             registration_rollback_reason(&reconstruction, 0, false, false, &config),
@@ -16072,7 +16054,7 @@ mod tests {
             &registration_stats(&reconstruction),
         ));
 
-        reconstruction.cameras[0].params[0] = 1.0;
+        reconstruction.cameras[0].inject_raw_param_for_test(0, 1.0);
         reconstruction.cameras[0].sync_intrinsics_from_params();
         assert!(absolute_pose_refine_camera_params_enabled(
             1,
@@ -17194,8 +17176,8 @@ mod tests {
         let frames = vec![minimal_frame(0, "a.jpg")];
         let mut reconstruction = test_reconstruction(&frames);
         reconstruction.poses[0] = Some(SE3::identity());
-        reconstruction.cameras[0].set_fx(2000.0);
-        reconstruction.cameras[0].set_fy(2000.0);
+        reconstruction.cameras[0].set_fx(2000.0).unwrap();
+        reconstruction.cameras[0].set_fy(2000.0).unwrap();
         reconstruction.camera = reconstruction.cameras[0];
         let audits = bogus_registered_camera_audits(&reconstruction, &MapperConfig::default());
         assert_eq!(audits.len(), 1);
@@ -17237,8 +17219,8 @@ mod tests {
         });
         let healthy = reconstruction.cameras[0];
         let base_cameras = reconstruction.cameras.clone();
-        reconstruction.cameras[0].set_fx(2000.0);
-        reconstruction.cameras[0].set_fy(2000.0);
+        reconstruction.cameras[0].set_fx(2000.0).unwrap();
+        reconstruction.cameras[0].set_fy(2000.0).unwrap();
         reconstruction.camera = reconstruction.cameras[0];
         reconstruction.poses[1] = Some(SE3::from_quat_translation(
             nalgebra::UnitQuaternion::<f32>::identity(),
@@ -26124,7 +26106,7 @@ mod tests {
                 model_id: camera.model_id,
                 width: camera.width,
                 height: camera.height,
-                params: camera.params[..camera.num_params].to_vec(),
+                params: camera.params_slice()[..camera.num_params].to_vec(),
             }],
             rigs: vec![ColmapRig {
                 rig_id: 77,

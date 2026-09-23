@@ -69,7 +69,7 @@ pub(super) fn populate_local_matching_database(
                     model_id: camera.model_id,
                     width: camera.width,
                     height: camera.height,
-                    params: camera.params[..camera.num_params].to_vec(),
+                    params: camera.params_slice()[..camera.num_params].to_vec(),
                 },
                 has_prior_focal_length: setup
                     .camera_has_prior_focal_length

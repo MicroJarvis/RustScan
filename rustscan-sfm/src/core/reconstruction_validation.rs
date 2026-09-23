@@ -670,7 +670,7 @@ fn validate_camera_finite(
             "camera parameter count exceeds the fixed parameter array",
         ));
     }
-    if camera.params[..camera.num_params]
+    if camera.params_slice()[..camera.num_params]
         .iter()
         .any(|value| !value.is_finite())
     {
@@ -1046,7 +1046,7 @@ mod tests {
         cases.push(("point_index", disagreement));
 
         let mut non_finite_params = two_images();
-        non_finite_params.cameras[0].params[0] = f64::INFINITY;
+        non_finite_params.cameras[0].inject_raw_param_for_test(0, f64::INFINITY);
         cases.push(("params", non_finite_params));
 
         let mut non_finite_pose = two_images();

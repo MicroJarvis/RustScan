@@ -4445,10 +4445,10 @@ mod tests {
             CameraModel::from_colmap(COLMAP_PINHOLE, 640, 480, &[500.0, 501.0, 320.0, 240.0])
                 .unwrap();
 
-        camera.set_fx(600.0);
-        camera.set_fy(601.0);
-        camera.set_cx(321.0);
-        camera.set_cy(241.0);
+        camera.set_fx(600.0).unwrap();
+        camera.set_fy(601.0).unwrap();
+        camera.set_cx(321.0).unwrap();
+        camera.set_cy(241.0).unwrap();
 
         assert_eq!(camera.params_slice(), &[600.0, 601.0, 321.0, 241.0]);
     }

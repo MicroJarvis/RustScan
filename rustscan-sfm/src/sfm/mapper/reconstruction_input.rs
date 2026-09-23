@@ -1196,7 +1196,7 @@ pub(super) fn local_image_camera_setup(
             }
 
             return Ok(ReferenceCameraSetup {
-                cameras: vec![local_image_camera(first, config)],
+                cameras: vec![local_image_camera(first, config)?],
                 camera_ids: fresh_local_colmap_ids(1)?,
                 camera_has_prior_focal_length: vec![true],
                 rigs: Vec::new(),
@@ -1214,7 +1214,7 @@ pub(super) fn local_image_camera_setup(
     let mut cameras = Vec::with_capacity(frames.len());
     let mut image_camera_indices = Vec::with_capacity(frames.len());
     for frame in frames {
-        cameras.push(local_image_camera(frame, config));
+        cameras.push(local_image_camera(frame, config)?);
         image_camera_indices.push(cameras.len() - 1);
     }
     Ok(ReferenceCameraSetup {
@@ -1234,7 +1234,7 @@ fn fresh_local_colmap_ids(count: usize) -> Result<Vec<u32>> {
     crate::reconstruction_validation::fresh_colmap_record_ids(count).map_err(anyhow::Error::from)
 }
 
-fn local_image_camera(frame: &ImageFrame, config: &MapperConfig) -> CameraModel {
+fn local_image_camera(frame: &ImageFrame, config: &MapperConfig) -> Result<CameraModel> {
     let focal = frame.width.max(frame.height) as f32 * 1.2;
     let mut camera = CameraModel::new_pinhole(
         frame.width,
@@ -1244,19 +1244,15 @@ fn local_image_camera(frame: &ImageFrame, config: &MapperConfig) -> CameraModel 
         frame.width as f32 * 0.5,
         frame.height as f32 * 0.5,
     );
-    if let Some(fx) = config.fx {
-        camera.set_fx(fx);
-    }
-    if let Some(fy) = config.fy {
-        camera.set_fy(fy);
-    }
-    if let Some(cx) = config.cx {
-        camera.set_cx(cx);
-    }
-    if let Some(cy) = config.cy {
-        camera.set_cy(cy);
-    }
     camera
+        .apply_optional_intrinsics(config.fx, config.fy, config.cx, config.cy)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid mapper intrinsics override for local image {}: {error}",
+                frame.name
+            )
+        })?;
+    Ok(camera)
 }
 
 pub(super) fn rig_from_colmap(rig: &ColmapRig) -> Rig {
