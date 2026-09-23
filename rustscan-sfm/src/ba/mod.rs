@@ -226,23 +226,6 @@ pub struct BundleAdjustmentOptions {
     pub pose_priors: Vec<BundleAdjustmentPosePrior>,
     pub prior_position_fallback_stddev: f64,
     pub compute_covariance: bool,
-    /// Deterministic commit-gate overrides for tests. Must stay `None` in production.
-    pub commit_test_override: Option<BaCommitTestOverride>,
-}
-
-/// Test-only hooks applied after Ceres solve and before Reconstruction commit.
-///
-/// Production callers leave [`BundleAdjustmentOptions::commit_test_override`] as
-/// `None`. These hooks exist so Failure / UserFailure / non-finite write-back
-/// paths can be exercised without relying on Ceres to fail randomly.
-#[derive(Debug, Clone, Default)]
-pub struct BaCommitTestOverride {
-    /// Overrides Ceres `SolverSummary::is_solution_usable()` for the commit gate.
-    pub force_ceres_usable: Option<bool>,
-    /// Overrides the mapped termination type used for commit and the report.
-    pub force_termination: Option<BundleAdjustmentTerminationType>,
-    /// Replaces the first refined camera parameter value before validation.
-    pub corrupt_first_camera_param: Option<f64>,
 }
 
 impl Default for BundleAdjustmentOptions {
@@ -278,7 +261,6 @@ impl Default for BundleAdjustmentOptions {
             pose_priors: Vec::new(),
             prior_position_fallback_stddev: 1.0,
             compute_covariance: false,
-            commit_test_override: None,
         }
     }
 }
@@ -288,15 +270,55 @@ impl Default for BundleAdjustmentOptions {
 ///
 /// A solution is committable only when Ceres reports it usable, the mapped
 /// termination type is usable (`Convergence`, `NoConvergence`, or
-/// `UserSuccess`), and every parameter that would be written is finite and
-/// camera-valid. `NoConvergence` remains eligible when Ceres marks the
+/// `UserSuccess`), and the staged candidate (parameters + derived point
+/// errors) is valid. `NoConvergence` remains eligible when Ceres marks the
 /// solution usable; `Failure` / `UserFailure` never commit.
-pub fn should_commit_ba_solution(
+pub(crate) fn should_commit_ba_solution(
     ceres_summary_usable: bool,
     termination_type: BundleAdjustmentTerminationType,
-    parameters_valid: bool,
+    candidate_valid: bool,
 ) -> bool {
-    ceres_summary_usable && termination_type.is_solution_usable() && parameters_valid
+    ceres_summary_usable && termination_type.is_solution_usable() && candidate_valid
+}
+
+/// Test-only seams for BA commit-gate coverage. Compiled only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod commit_test_hooks {
+    use super::BundleAdjustmentTerminationType;
+    use std::cell::RefCell;
+
+    /// Deterministic overrides applied after Ceres solve and before candidate
+    /// validation / commit. Production options never expose these fields.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct BaCommitTestHooks {
+        pub force_ceres_usable: Option<bool>,
+        pub force_termination: Option<BundleAdjustmentTerminationType>,
+        pub corrupt_first_camera_param: Option<f64>,
+        /// Request cancel after candidate validation and before live install.
+        pub cancel_before_commit: bool,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<BaCommitTestHooks>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn with_hooks<R>(hooks: BaCommitTestHooks, f: impl FnOnce() -> R) -> R {
+        ACTIVE.with(|cell| {
+            *cell.borrow_mut() = Some(hooks);
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        ACTIVE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn current() -> Option<BaCommitTestHooks> {
+        ACTIVE.with(|cell| cell.borrow().clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

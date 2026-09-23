@@ -1039,23 +1039,24 @@ branch to `main`.
 
 ### T5 — Atomic BA
 
-Status: review_ready. Not reviewed.
+Status: review_ready (remediation after independent CHANGES_REQUESTED).
+Awaiting independent re-review.
 
 Owner: `cursor-agent`
 
 Base commit: `701d051814a29ab3ee4fbefc01355112f71b5a47` (local `main` with T1–T4
 integrated)
 
-Implementation commit: tip of `agent/RS-2026-004/t5-atomic-ba` (this handoff).
+Prior tip reviewed: `3422fff88f10da1ff34c2857b88bf15661e1ae08`
+Review: `review-t5-2026-09-23.md` — Decision CHANGES_REQUESTED (retained).
 
+Remediation commit: tip of `agent/RS-2026-004/t5-atomic-ba` (this handoff).
 
 Branch: `agent/RS-2026-004/t5-atomic-ba`
 
 Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t5-atomic-ba`
 
-This start supersedes the earlier “do not start T5” handoff freeze.
-
-Changed files:
+Changed files (remediation):
 
 - `rustscan-sfm/src/ba/mod.rs`
 - `rustscan-sfm/src/ba/ceres_problem.rs`
@@ -1064,44 +1065,57 @@ Changed files:
 - `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
 - `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
 - `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/review-t5-2026-09-23.md`
 
-Public Ceres BA now gates Reconstruction mutation on
-`should_commit_ba_solution(ceres_summary_usable, termination_type,
-parameters_valid)`. `NoConvergence` remains committable when Ceres marks the
-solution usable; `Failure` / `UserFailure` never commit. Write-back stages
-cameras (via checked `set_param`), poses, and points, then applies once; any
-illegal camera/pose/point value rejects the whole commit and forces an
-unusable report. Point-error refresh and covariance run only after a
-successful commit. Cancel before write-back remains unchanged.
+#### Review findings addressed
 
-`global_mapper::run_iterative_global_refinement` sets success from
-`report.is_solution_usable()` and stops further refinement rounds on an
-unusable or absent BA result. Mapper camera-plausibility rollback in
-`refine_bundle_adjustment_checked` stays a post-success policy gate.
+1. **Full candidate validation before commit.** Write-back builds a cloned
+   candidate via `prepare_write_back` → apply → `refresh_point_errors_checked`
+   (rejects non-finite f64 residuals, f64→f32 overflow, and accumulation
+   overflow; does not skip/zero/retain old errors). Only then
+   `install_ba_candidate` mutates the caller. Gate is
+   `should_commit_ba_solution(ceres_usable, termination, candidate_valid)`.
+   Usable `NoConvergence` / `UserSuccess` / `Convergence` still commit when
+   the candidate is valid. Review repro (focal `3e38`, point `[4,0,2]`) is a
+   regression in `rejected_ba_solutions_leave_reconstruction_unchanged`.
 
-Deterministic coverage uses `BaCommitTestOverride` on the real solve/write-back
-path (not a standalone boolean stub): Failure, UserFailure, NaN/Inf/negative
-camera params leave cameras, poses, xyz, point errors, frames, and sensors
-unchanged; usable `NoConvergence` still commits; convergence refreshes point
-errors; `unusable_global_ba_is_not_success_and_stops_refinement` checks
-global success + round stop. Existing taskflow cancel tests continue to cover
-cancellation without mutation.
+2. **Skip post-BA filter on BA abort.** `run_iterative_global_refinement`
+   sets `ba_aborted` on unusable/absent/cancelled BA and skips the trailing
+   track filter. Regression uses `filter_min_track_length = 3` so a two-view
+   point would be deleted if filtering still ran.
+
+3. **Fault injection out of production API.** Removed public
+   `BaCommitTestOverride` and `commit_test_override` /
+   `ba_commit_test_override` options fields. Test-only
+   `ba::commit_test_hooks` (`cfg(test)` thread-local) injects through the
+   real solve path. `should_commit_ba_solution` is `pub(crate)`.
+
+#### Coverage added with the fix
+
+- Non-identity pose, multi-camera, non-empty frame/rig/sensor scene with
+  independent legacy `reconstruction.camera`; bitwise snapshots of all
+  mutable BA state on late rejection.
+- Post-solve / pre-commit cancel (`cancel_before_commit` + real
+  `SfmTaskControl` checkpoint) — distinct from queued-cancel tests.
+- Convergence, NoConvergence, UserSuccess commit paths assert geometry and/or
+  finite refreshed point errors; Failure, UserFailure, NaN/Inf/negative/
+  finite-huge focal reject without mutation.
+
+Independent review probes under `artifacts/runs/t5-independent-review/` were
+kept as evidence and not treated as library tests.
 
 Commands with `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
-and `CARGO_TERM_COLOR=never`:
+and `CARGO_TERM_COLOR=never` (remediation run):
 
 - `cargo fmt --all -- --check`: pass.
-- `cargo check --workspace --all-targets`: pass.
-- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: pass
-  (lib `846 passed; 19 ignored`, plus integration/example targets; exit 0).
+- `cargo check --workspace --all-targets`: pass (existing warnings only).
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: pass.
+  Lib target `849 passed; 0 failed; 19 ignored` (246.33s); remaining
+  integration/example targets also exit 0.
 - `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
-  pass. `656 passed; 0 failed; 19 ignored`.
+  pass. `656 passed; 0 failed; 19 ignored` (55.58s).
 - `cargo test -p rustscan-sfm --no-default-features --features ceres-ba --lib -- --test-threads=1`:
-  pass. `693 passed; 0 failed; 19 ignored`.
-- `cargo test -p rustscan-sfm --features ceres-ba --lib ba:: -- --test-threads=1`:
-  pass. `37 passed`.
-- `cargo test -p rustscan-sfm --features ceres-ba --lib global_mapper -- --test-threads=1`:
-  pass. `9 passed`.
+  pass. `696 passed; 0 failed; 19 ignored` (56.59s).
 - `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
   fail, exit 101. First error: `module_inception` at
   `rustscan-slam/src/config/mod.rs:5`. Final:
@@ -1109,15 +1123,21 @@ and `CARGO_TERM_COLOR=never`:
   unmodified. No global allow added.
 - `git diff --check`: pass.
 
+Focused pre-checks:
+
+- `ba::ceres_problem::tests`: 22 passed (includes review repro + cancel +
+  rig-scene atomicity + Convergence/NoConvergence/UserSuccess).
+- `global_mapper::tests::unusable_global_ba_is_not_success_and_stops_refinement`:
+  pass with `filter_min_track_length=3`.
+
 Known limitations:
 
 - Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
-- GPU numerical host limitations from earlier tasks are unchanged; this run
-  did not treat ignored GPU skips as execution evidence.
+- GPU numerical host limitations from earlier tasks are unchanged.
 - Database transaction atomicity remains T6.
 
 Next action: do not start T6. Do not merge to `main`. Await independent
-code review.
+re-review.
 
 ### T6 — Database Transactions
 

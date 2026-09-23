@@ -164,7 +164,8 @@ cannot observe different intrinsics for the same `CameraModel`.
 ## T5 — Make Bundle Adjustment State Updates Atomic
 
 **Status:** review_ready on `agent/RS-2026-004/t5-atomic-ba` (base
-`701d051814a29ab3ee4fbefc01355112f71b5a47`).
+`701d051814a29ab3ee4fbefc01355112f71b5a47`; prior tip `3422fff` CHANGES_REQUESTED
+by `review-t5-2026-09-23.md`; remediation awaiting independent re-review).
 
 **Dependencies:** T0  
 **Primary scope:** `rustscan-sfm/src/ba/`,
@@ -182,6 +183,15 @@ cannot observe different intrinsics for the same `CameraModel`.
 - [x] Add deterministic convergence, no-convergence, failure, user-failure,
       cancellation, and non-finite-solution tests. Compare the complete mutable
       BA state before and after rejected solutions.
+- [x] Review P1: stage full candidate (cameras, derived poses, points, and
+      checked point errors including f64→f32 / accumulation) before any live
+      commit; reject without mutating on non-finite derived error (focal `3e38`
+      repro). Keep usable `NoConvergence` commit semantics.
+- [x] Review P2: skip trailing track filter after unusable/absent/cancelled BA
+      (`filter_min_track_length=3` two-view repro); preserve prior accepted work.
+- [x] Review P2: move fault injection to `cfg(test)` `commit_test_hooks`; remove
+      production `BaCommitTestOverride` / options fields; shrink
+      `should_commit_ba_solution` to `pub(crate)`.
 
 **Exit condition:** every rejected BA result is observationally atomic and is
 never reported as a successful global BA round.

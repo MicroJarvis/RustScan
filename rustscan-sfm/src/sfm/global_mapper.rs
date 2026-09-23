@@ -115,8 +115,6 @@ pub struct GlobalReconstructionOptions {
     /// Global BA iteration count per refinement round.
     pub global_ba_iterations: usize,
     pub ba_taskflow: Option<crate::ba::CeresBaTaskflow>,
-    /// Deterministic BA commit overrides used by atomicity tests.
-    pub ba_commit_test_override: Option<crate::ba::BaCommitTestOverride>,
     /// Split the view graph into connected components and reconstruct each
     /// qualifying component as an independent model.
     pub component_splitting: ViewGraphComponentSplittingOptions,
@@ -139,7 +137,6 @@ impl Default for GlobalReconstructionOptions {
             run_global_ba: true,
             global_ba_iterations: 50,
             ba_taskflow: None,
-            ba_commit_test_override: None,
             component_splitting: ViewGraphComponentSplittingOptions::default(),
         }
     }
@@ -650,6 +647,7 @@ fn run_iterative_global_refinement(
     }
 
     let mut global_ba_success = false;
+    let mut ba_aborted = false;
     let mut rounds = 0usize;
     for round in 0..options.refinement.max_refinements {
         let observations_before = reconstruction_num_observations(reconstruction);
@@ -663,7 +661,6 @@ fn run_iterative_global_refinement(
             constant_images: vec![registered[0]],
             variable_images: Some(registered.clone()),
             allow_single_observation_points: false,
-            commit_test_override: options.ba_commit_test_override.clone(),
             ..BundleAdjustmentOptions::default()
         };
         let ba_report = refine_bundle_adjustment(frames, reconstruction, ba_options);
@@ -672,9 +669,11 @@ fn run_iterative_global_refinement(
                 global_ba_success = true;
             }
             _ => {
-                // Unusable / absent BA must not be reported as success and must
-                // stop further global refinement rounds on this reconstruction.
+                // Unusable / absent / cancelled BA must not be reported as
+                // success, must stop further refinement rounds, and must not
+                // run the trailing track filter that could destroy structure.
                 global_ba_success = false;
+                ba_aborted = true;
                 break;
             }
         }
@@ -717,7 +716,8 @@ fn run_iterative_global_refinement(
         }
     }
 
-    if !reconstruction.points.is_empty() {
+    // Normal loop completion may still tighten tracks; BA failure must not.
+    if !ba_aborted && !reconstruction.points.is_empty() {
         stats.filtered_observations += filter_reconstruction_tracks_with_state(
             frames,
             pairs,
@@ -1293,20 +1293,31 @@ mod tests {
         options.global_ba_iterations = 5;
         options.refinement.filter_max_reprojection_error_px = 1.0e6;
         options.refinement.filter_min_triangulation_angle_deg = 0.0;
-        options.refinement.filter_min_track_length = 1;
-        options.ba_commit_test_override = Some(crate::ba::BaCommitTestOverride {
-            force_ceres_usable: Some(false),
-            force_termination: Some(crate::ba::BundleAdjustmentTerminationType::Failure),
-            corrupt_first_camera_param: None,
-        });
+        // Require length > 2 so the trailing filter would delete this two-view
+        // point if it still ran after BA failure.
+        options.refinement.filter_min_track_length = 3;
         options.incremental_triangulation = IncrementalTriangulatorOptions {
             ignore_two_view_tracks: false,
             min_angle_deg: 0.0,
             ..IncrementalTriangulatorOptions::default()
         };
 
-        let (rounds, _stats, ba_ok) =
-            super::run_iterative_global_refinement(&frames, &pairs, &mut reconstruction, &options);
+        let (rounds, _stats, ba_ok) = crate::ba::commit_test_hooks::with_hooks(
+            crate::ba::commit_test_hooks::BaCommitTestHooks {
+                force_ceres_usable: Some(false),
+                force_termination: Some(crate::ba::BundleAdjustmentTerminationType::Failure),
+                corrupt_first_camera_param: None,
+                cancel_before_commit: false,
+            },
+            || {
+                super::run_iterative_global_refinement(
+                    &frames,
+                    &pairs,
+                    &mut reconstruction,
+                    &options,
+                )
+            },
+        );
 
         assert!(!ba_ok);
         assert_eq!(rounds, 1, "unusable BA must stop further refinement rounds");
@@ -1318,8 +1329,14 @@ mod tests {
             !reconstruction.points.is_empty(),
             "unusable BA must not clear structure during the stopped round"
         );
+        assert_eq!(reconstruction.points.len(), 1);
         assert_eq!(reconstruction.points[0].xyz, before_xyz);
         assert_eq!(reconstruction.points[0].error, before_error);
+        assert_eq!(
+            reconstruction.points[0].track.len(),
+            2,
+            "trailing filter must not run after BA abort"
+        );
     }
 
     #[test]
