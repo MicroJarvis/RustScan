@@ -383,13 +383,15 @@ impl CameraModel {
             .unwrap_or(0.0)
     }
 
-    /// Applies optional intrinsics overrides in one commit.
+    /// Applies optional intrinsics overrides in one atomic commit.
     ///
     /// For single-focal COLMAP models (`SIMPLE_PINHOLE`, `SIMPLE_RADIAL`, …),
-    /// `set_focal_lengths` stores the mean of the provided `fx`/`fy` pair into
-    /// the shared focal slot. Collect both overrides first so
-    /// `fx=600, fy=601` becomes `600.5` regardless of setter order. A missing
+    /// the shared focal slot stores the mean of the resolved `fx`/`fy` pair so
+    /// `fx=600, fy=601` becomes `600.5` regardless of call order. A missing
     /// override keeps the current derived value.
+    ///
+    /// Focal and principal-point changes are applied to a candidate parameter
+    /// copy and validated together; on any failure the camera is unchanged.
     pub fn apply_optional_intrinsics(
         &mut self,
         fx: Option<f32>,
@@ -397,17 +399,22 @@ impl CameraModel {
         cx: Option<f32>,
         cy: Option<f32>,
     ) -> Result<(), String> {
+        if fx.is_none() && fy.is_none() && cx.is_none() && cy.is_none() {
+            return Ok(());
+        }
+
+        let mut candidate = self.params;
         if fx.is_some() || fy.is_some() {
             let new_fx = fx.unwrap_or_else(|| self.fx());
             let new_fy = fy.unwrap_or_else(|| self.fy());
-            self.set_focal_lengths(new_fx, new_fy)?;
+            write_focal_lengths_into_candidate(self.model_id, &mut candidate, new_fx, new_fy)?;
         }
         if cx.is_some() || cy.is_some() {
             let new_cx = cx.unwrap_or_else(|| self.cx());
             let new_cy = cy.unwrap_or_else(|| self.cy());
-            self.set_principal_point(new_cx, new_cy)?;
+            write_principal_point_into_candidate(self.model_id, &mut candidate, new_cx, new_cy)?;
         }
-        Ok(())
+        self.commit_params(candidate)
     }
 
     /// Updates both focal lengths in canonical parameters.
@@ -417,50 +424,15 @@ impl CameraModel {
     /// independently. The update is built on a candidate copy and committed
     /// only after validation (including finite positive `f32` narrowing).
     pub fn set_focal_lengths(&mut self, fx: f32, fy: f32) -> Result<(), String> {
-        if !fx.is_finite() || !fy.is_finite() || fx <= 0.0 || fy <= 0.0 {
-            return Err(format!(
-                "focal lengths must be finite and strictly positive (fx={fx}, fy={fy})"
-            ));
-        }
-        let Some(focal_idxs) = colmap_camera_model_focal_idxs(self.model_id) else {
-            return Err(format!(
-                "camera model {} has no focal parameters",
-                self.model_id
-            ));
-        };
         let mut candidate = self.params;
-        match focal_idxs {
-            [idx] => {
-                candidate[*idx] = ((fx as f64) + (fy as f64)) * 0.5;
-            }
-            [idx_x, idx_y] => {
-                candidate[*idx_x] = fx as f64;
-                candidate[*idx_y] = fy as f64;
-            }
-            _ => {
-                return Err(format!(
-                    "camera model {} has unsupported focal layout",
-                    self.model_id
-                ));
-            }
-        }
+        write_focal_lengths_into_candidate(self.model_id, &mut candidate, fx, fy)?;
         self.commit_params(candidate)
     }
 
     /// Updates the principal point in canonical parameters.
     pub fn set_principal_point(&mut self, cx: f32, cy: f32) -> Result<(), String> {
-        if !cx.is_finite() || !cy.is_finite() {
-            return Err(format!("principal point must be finite (cx={cx}, cy={cy})"));
-        }
-        let Some([idx_x, idx_y]) = colmap_camera_model_principal_point_idxs(self.model_id) else {
-            return Err(format!(
-                "camera model {} has no principal-point parameters",
-                self.model_id
-            ));
-        };
         let mut candidate = self.params;
-        candidate[idx_x] = cx as f64;
-        candidate[idx_y] = cy as f64;
+        write_principal_point_into_candidate(self.model_id, &mut candidate, cx, cy)?;
         self.commit_params(candidate)
     }
 
@@ -539,24 +511,39 @@ impl CameraModel {
     }
 
     /// Compatibility wrapper: updates `fx` through [`Self::set_focal_lengths`].
+    ///
+    /// Prefer [`Self::set_focal_lengths`] or [`Self::apply_optional_intrinsics`]
+    /// when configuring a camera. On single-focal models, calling `set_fx` then
+    /// `set_fy` averages twice and is order-dependent; collect both values and
+    /// apply them together instead.
     pub fn set_fx(&mut self, fx: f32) -> Result<(), String> {
         let fy = self.fy();
         self.set_focal_lengths(fx, fy)
     }
 
     /// Compatibility wrapper: updates `fy` through [`Self::set_focal_lengths`].
+    ///
+    /// Prefer [`Self::set_focal_lengths`] or [`Self::apply_optional_intrinsics`]
+    /// when configuring a camera. On single-focal models, sequential
+    /// `set_fx`/`set_fy` calls are order-dependent.
     pub fn set_fy(&mut self, fy: f32) -> Result<(), String> {
         let fx = self.fx();
         self.set_focal_lengths(fx, fy)
     }
 
     /// Compatibility wrapper: updates `cx` through [`Self::set_principal_point`].
+    ///
+    /// Prefer [`Self::set_principal_point`] or [`Self::apply_optional_intrinsics`]
+    /// when updating both principal-point coordinates together.
     pub fn set_cx(&mut self, cx: f32) -> Result<(), String> {
         let cy = self.cy();
         self.set_principal_point(cx, cy)
     }
 
     /// Compatibility wrapper: updates `cy` through [`Self::set_principal_point`].
+    ///
+    /// Prefer [`Self::set_principal_point`] or [`Self::apply_optional_intrinsics`]
+    /// when updating both principal-point coordinates together.
     pub fn set_cy(&mut self, cy: f32) -> Result<(), String> {
         let cx = self.cx();
         self.set_principal_point(cx, cy)
@@ -912,6 +899,56 @@ fn principal_point_from_params(
 ) -> Option<(f64, f64)> {
     let [idx_x, idx_y] = colmap_camera_model_principal_point_idxs(model_id)?;
     Some((params[idx_x], params[idx_y]))
+}
+
+fn write_focal_lengths_into_candidate(
+    model_id: i32,
+    candidate: &mut [f64; COLMAP_MAX_CAMERA_PARAMS],
+    fx: f32,
+    fy: f32,
+) -> Result<(), String> {
+    if !fx.is_finite() || !fy.is_finite() || fx <= 0.0 || fy <= 0.0 {
+        return Err(format!(
+            "focal lengths must be finite and strictly positive (fx={fx}, fy={fy})"
+        ));
+    }
+    let Some(focal_idxs) = colmap_camera_model_focal_idxs(model_id) else {
+        return Err(format!("camera model {model_id} has no focal parameters"));
+    };
+    match focal_idxs {
+        [idx] => {
+            candidate[*idx] = ((fx as f64) + (fy as f64)) * 0.5;
+        }
+        [idx_x, idx_y] => {
+            candidate[*idx_x] = fx as f64;
+            candidate[*idx_y] = fy as f64;
+        }
+        _ => {
+            return Err(format!(
+                "camera model {model_id} has unsupported focal layout"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_principal_point_into_candidate(
+    model_id: i32,
+    candidate: &mut [f64; COLMAP_MAX_CAMERA_PARAMS],
+    cx: f32,
+    cy: f32,
+) -> Result<(), String> {
+    if !cx.is_finite() || !cy.is_finite() {
+        return Err(format!("principal point must be finite (cx={cx}, cy={cy})"));
+    }
+    let Some([idx_x, idx_y]) = colmap_camera_model_principal_point_idxs(model_id) else {
+        return Err(format!(
+            "camera model {model_id} has no principal-point parameters"
+        ));
+    };
+    candidate[idx_x] = cx as f64;
+    candidate[idx_y] = cy as f64;
+    Ok(())
 }
 
 fn validate_camera_params(
@@ -2169,16 +2206,68 @@ mod tests {
 
         let mut pinhole = CameraModel::new_pinhole(640, 480, 500.0, 501.0, 320.0, 240.0);
         pinhole
-            .apply_optional_intrinsics(Some(600.0), Some(601.0), None, None)
+            .apply_optional_intrinsics(Some(600.0), Some(601.0), Some(321.0), Some(241.0))
             .unwrap();
         assert!((pinhole.fx() - 600.0).abs() < 1.0e-3);
         assert!((pinhole.fy() - 601.0).abs() < 1.0e-3);
+        assert!((pinhole.cx() - 321.0).abs() < 1.0e-3);
+        assert!((pinhole.cy() - 241.0).abs() < 1.0e-3);
+        assert_eq!(pinhole.params_slice()[0], 600.0);
+        assert_eq!(pinhole.params_slice()[1], 601.0);
+        assert_eq!(pinhole.params_slice()[2], 321.0);
+        assert_eq!(pinhole.params_slice()[3], 241.0);
+        let projected = pinhole.img_from_cam(0.1, -0.05, 1.0).unwrap();
+        assert!((projected[0] - (600.0 * 0.1 + 321.0)).abs() < 1.0e-4);
+        assert!((projected[1] - (601.0 * -0.05 + 241.0)).abs() < 1.0e-4);
 
         let err = pinhole
             .apply_optional_intrinsics(Some(-1.0), Some(601.0), None, None)
             .expect_err("negative focal");
         assert!(err.contains("focal"), "{err}");
         assert!((pinhole.fx() - 600.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn apply_optional_intrinsics_is_atomic_when_principal_point_is_invalid() {
+        let mut dual = CameraModel::new_pinhole(640, 480, 500.0, 501.0, 320.0, 240.0);
+        let before_dual = dual.params_slice().to_vec();
+        let before_dual_proj = dual.img_from_cam(0.1, -0.05, 1.0).unwrap();
+
+        let err = dual
+            .apply_optional_intrinsics(Some(600.0), Some(601.0), Some(f32::NAN), Some(241.0))
+            .expect_err("NaN cx must fail");
+        assert!(err.contains("principal") || err.contains("finite"), "{err}");
+        assert_eq!(dual.params_slice(), before_dual.as_slice());
+        assert_eq!(
+            dual.img_from_cam(0.1, -0.05, 1.0).unwrap(),
+            before_dual_proj
+        );
+
+        let err = dual
+            .apply_optional_intrinsics(Some(600.0), Some(601.0), Some(321.0), Some(f32::INFINITY))
+            .expect_err("Inf cy must fail");
+        assert!(err.contains("principal") || err.contains("finite"), "{err}");
+        assert_eq!(dual.params_slice(), before_dual.as_slice());
+        assert_eq!(
+            dual.img_from_cam(0.1, -0.05, 1.0).unwrap(),
+            before_dual_proj
+        );
+
+        let mut simple =
+            CameraModel::from_colmap(COLMAP_SIMPLE_PINHOLE, 640, 480, &[500.0, 320.0, 240.0])
+                .unwrap();
+        let before_simple = simple.params_slice().to_vec();
+        let before_simple_proj = simple.img_from_cam(0.1, -0.05, 1.0).unwrap();
+        let err = simple
+            .apply_optional_intrinsics(Some(600.0), Some(601.0), Some(f32::NAN), None)
+            .expect_err("single-focal must not commit shared focal when cx is NaN");
+        assert!(err.contains("principal") || err.contains("finite"), "{err}");
+        assert_eq!(simple.params_slice(), before_simple.as_slice());
+        assert!((simple.fx() - 500.0).abs() < 1.0e-6);
+        assert_eq!(
+            simple.img_from_cam(0.1, -0.05, 1.0).unwrap(),
+            before_simple_proj
+        );
     }
 
     #[test]

@@ -942,6 +942,57 @@ Known limitations:
 Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
 handoff. Do not merge to `main`.
 
+#### T4 review P1 remediation (apply_optional_intrinsics atomicity)
+
+Status: review_fix applied. Not reviewed.
+
+Code commit: tip of `agent/RS-2026-004/t4-camera-invariants` (this remediation commit).
+
+`apply_optional_intrinsics` no longer calls `set_focal_lengths` then
+`set_principal_point` sequentially. It copies `params` to a candidate, writes
+optional fx/fy/cx/cy into that candidate only (single-focal mean semantics
+unchanged), validates once via `commit_params`, and leaves `self` untouched on
+any failure. Compat `set_fx`/`set_fy`/`set_cx`/`set_cy` remain public with
+rustdoc directing single-focal configuration to `set_focal_lengths` or
+`apply_optional_intrinsics`. Production mapper / reconstruction-input config
+paths already use `apply_optional_intrinsics`; remaining `set_fx`/`set_fy`
+calls are dual-equal test fixtures only.
+
+Regression: `apply_optional_intrinsics_is_atomic_when_principal_point_is_invalid`
+covers legal fx/fy with NaN cx, Inf cy, and single-focal shared-focal retention.
+Success-path coverage in
+`single_focal_optional_intrinsics_average_once_order_independently` now also
+checks PINHOLE dual focals, off-center principal point, params slice, and
+projection agreement.
+
+Commands with `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+and `CARGO_TERM_COLOR=never`:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error: `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`. Final:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`. Slam
+  unmodified. No global allow added.
+- `cargo test -p rustscan-sfm --all-features --lib types::tests -- --test-threads=1`:
+  pass. `15 passed`.
+- `cargo test -p rustscan-sfm --all-features --lib view_graph_calibration -- --test-threads=1`:
+  pass. `3 passed`.
+- `cargo test -p rustscan-sfm --all-features --lib colmap -- --test-threads=1`:
+  pass. `178 passed; 0 failed; 19 ignored`.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `655 passed; 0 failed; 19 ignored; finished in 56.41s`.
+- `git diff --check`: pass.
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- Full Reconstruction/BA commit atomicity on unusable solutions remains T5.
+
+Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
+handoff. Do not merge to `main`.
+
 ### T5 — Atomic BA
 
 Status: pending.
