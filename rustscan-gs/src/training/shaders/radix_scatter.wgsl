@@ -26,7 +26,12 @@ fn main(
     let block = idx / 256u;
     let block_start = block * 256u;
     let in_range = idx < n;
-    shared_keys[local_id] = select(0u, keys[idx], in_range);
+    // `select` would still evaluate `keys[idx]` on tail lanes past `n`.
+    if (in_range) {
+        shared_keys[local_id] = keys[idx];
+    } else {
+        shared_keys[local_id] = 0u;
+    }
     workgroupBarrier();
 
     if !in_range {

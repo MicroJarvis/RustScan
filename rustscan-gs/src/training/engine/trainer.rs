@@ -15,8 +15,10 @@ use crate::training::data::frame_loader::PrefetchFrameLoader;
 use crate::training::gpu_primitives::device_radix::{
     radix_sort_dispatch_count, radix_sort_workspace_bytes,
 };
-use crate::training::gpu_primitives::prefix_sum::{
-    prefix_sum_dispatch_count, prefix_sum_workspace_bytes, PrefixSumWorkspace,
+use crate::training::gpu_primitives::prefix_sum::{prefix_sum_dispatch_count, PrefixSumWorkspace};
+use crate::training::reporting::gpu_profiler::{
+    probe_training_device, profile_device_gpu_step, runtime_device_bytes_in_use, span,
+    PipelineTimingCollector, SendConstPtr, SendMutPtr,
 };
 use crate::training::reporting::metrics::{
     step_intersection_overflowed, ParityLossCurveSample, ParityTopologyMetrics,
@@ -56,6 +58,20 @@ pub(crate) enum StatusReadbackReason {
     /// Diagnostic read after the device gate already marked the step unhealthy.
     /// Never used on healthy steps.
     ForwardAbort,
+    /// Confirm committed vs aborted when loss scalar readback is skipped.
+    /// Required so read_loss=false cannot hide sticky overflow / non-finite.
+    StepDisposition,
+}
+
+/// Result of one logical training step after device work finishes.
+///
+/// `Committed.loss == None` means the step submitted successfully but the loss
+/// scalar was not read. That must not be confused with an aborted step.
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum TrainStepDisposition {
+    Committed { loss: Option<f32> },
+    Aborted { error: TrainingError },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -208,6 +224,7 @@ pub struct WgpuTrainer {
     /// planned size so overflow sticky flags can be exercised through `train_step`.
     intersection_capacity_override: Option<usize>,
     prefix_sum_workspace: PrefixSumWorkspace,
+    pipeline_timing: PipelineTimingCollector,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -223,6 +240,7 @@ struct OptimizationTimingSamples {
     status_readbacks_cancel: usize,
     status_readbacks_training_end: usize,
     status_readbacks_forward_abort: usize,
+    status_readbacks_step_disposition: usize,
     capacity_telemetry_readbacks: usize,
     loss_value_readbacks: usize,
     checkpoint_tensor_readbacks: usize,
@@ -238,8 +256,13 @@ struct OptimizationTimingSamples {
     scan_dispatches: Vec<usize>,
     sort_workspace_bytes: Option<usize>,
     scan_workspace_bytes: Option<usize>,
+    scan_workspace_scratch_bytes: Option<usize>,
+    scan_workspace_output_bytes: Option<usize>,
     scan_workspace_growth_count: usize,
+    scan_workspace_output_growth_count: usize,
     scan_workspace_step_fresh_allocations: Vec<usize>,
+    scan_workspace_step_scratch_fresh: Vec<usize>,
+    scan_workspace_step_output_fresh: Vec<usize>,
     topology_snapshot_ms: Vec<f64>,
     topology_plan_ms: Vec<f64>,
     topology_apply_ms: Vec<f64>,
@@ -258,28 +281,48 @@ impl OptimizationTimingSamples {
         if loss_readback {
             self.loss_readbacks = self.loss_readbacks.saturating_add(1);
         }
+        // Dispatch counts are host-side estimates from splat_count (not the
+        // intersection-count scan length). Measured scan workspace bytes come
+        // only from record_scan_workspace_stats / PrefixSumWorkspace.
         let sort_len = splat_count;
-        let scan_len = splat_count;
         self.sort_dispatches
             .push(radix_sort_dispatch_count(sort_len));
         self.scan_dispatches
-            .push(prefix_sum_dispatch_count(scan_len));
+            .push(prefix_sum_dispatch_count(splat_count));
         let sort_bytes = radix_sort_workspace_bytes(intersection_capacity.max(sort_len));
-        let scan_bytes = prefix_sum_workspace_bytes(scan_len);
         self.sort_workspace_bytes = Some(self.sort_workspace_bytes.unwrap_or(0).max(sort_bytes));
-        self.scan_workspace_bytes = Some(self.scan_workspace_bytes.unwrap_or(0).max(scan_bytes));
     }
 
     fn record_scan_workspace_stats(
         &mut self,
         reserved_bytes: usize,
+        scratch_bytes: usize,
+        output_bytes: usize,
         growth_count: usize,
+        output_growth_count: usize,
         step_fresh: usize,
+        step_scratch_fresh: usize,
+        step_output_fresh: usize,
     ) {
         self.scan_workspace_bytes =
             Some(self.scan_workspace_bytes.unwrap_or(0).max(reserved_bytes));
+        self.scan_workspace_scratch_bytes = Some(
+            self.scan_workspace_scratch_bytes
+                .unwrap_or(0)
+                .max(scratch_bytes),
+        );
+        self.scan_workspace_output_bytes = Some(
+            self.scan_workspace_output_bytes
+                .unwrap_or(0)
+                .max(output_bytes),
+        );
         self.scan_workspace_growth_count = growth_count;
+        self.scan_workspace_output_growth_count = output_growth_count;
         self.scan_workspace_step_fresh_allocations.push(step_fresh);
+        self.scan_workspace_step_scratch_fresh
+            .push(step_scratch_fresh);
+        self.scan_workspace_step_output_fresh
+            .push(step_output_fresh);
     }
 
     fn record_count_readbacks(&mut self, count: usize) {
@@ -314,6 +357,10 @@ impl OptimizationTimingSamples {
                 self.status_readbacks_forward_abort =
                     self.status_readbacks_forward_abort.saturating_add(1);
             }
+            StatusReadbackReason::StepDisposition => {
+                self.status_readbacks_step_disposition =
+                    self.status_readbacks_step_disposition.saturating_add(1);
+            }
         }
     }
 
@@ -337,6 +384,7 @@ impl OptimizationTimingSamples {
         telemetry.status_readbacks_cancel = Some(self.status_readbacks_cancel);
         telemetry.status_readbacks_training_end = Some(self.status_readbacks_training_end);
         telemetry.status_readbacks_forward_abort = Some(self.status_readbacks_forward_abort);
+        telemetry.status_readbacks_step_disposition = Some(self.status_readbacks_step_disposition);
         telemetry.capacity_telemetry_readbacks = Some(self.capacity_telemetry_readbacks);
         telemetry.loss_value_readbacks = Some(self.loss_value_readbacks);
         telemetry.checkpoint_tensor_readbacks = Some(self.checkpoint_tensor_readbacks);
@@ -350,11 +398,24 @@ impl OptimizationTimingSamples {
         telemetry.scan_dispatch_count_p95 = percentile_usize(&self.scan_dispatches, 95.0);
         telemetry.sort_workspace_bytes = self.sort_workspace_bytes;
         telemetry.scan_workspace_bytes = self.scan_workspace_bytes;
+        telemetry.scan_workspace_bytes_reason = if self.scan_workspace_bytes.is_some() {
+            None
+        } else {
+            Some("scan_workspace_not_observed".into())
+        };
+        telemetry.scan_workspace_scratch_bytes = self.scan_workspace_scratch_bytes;
+        telemetry.scan_workspace_output_bytes = self.scan_workspace_output_bytes;
         telemetry.scan_workspace_growth_count = Some(self.scan_workspace_growth_count);
+        telemetry.scan_workspace_output_growth_count =
+            Some(self.scan_workspace_output_growth_count);
         telemetry.scan_workspace_step_fresh_allocations_p50 =
             percentile_usize(&self.scan_workspace_step_fresh_allocations, 50.0);
         telemetry.scan_workspace_step_fresh_allocations_p95 =
             percentile_usize(&self.scan_workspace_step_fresh_allocations, 95.0);
+        telemetry.scan_workspace_step_scratch_fresh_p50 =
+            percentile_usize(&self.scan_workspace_step_scratch_fresh, 50.0);
+        telemetry.scan_workspace_step_output_fresh_p50 =
+            percentile_usize(&self.scan_workspace_step_output_fresh, 50.0);
 
         let mut snapshot_sorted = self.topology_snapshot_ms.clone();
         snapshot_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -497,6 +558,7 @@ impl WgpuTrainer {
             optimization_samples: OptimizationTimingSamples::default(),
             intersection_capacity_override: None,
             prefix_sum_workspace: PrefixSumWorkspace::new(),
+            pipeline_timing: PipelineTimingCollector::new(probe_training_device(&device)),
         }
     }
 
@@ -768,22 +830,86 @@ impl WgpuTrainer {
 
         let active_sh_degree = self.active_sh_degree_at(iteration, splats.sh_degree);
         self.telemetry.active_sh_degree = Some(active_sh_degree as usize);
-        let rendered = backward::render_splats_with_visibility_active_sh(
-            splats,
-            active_sh_degree,
-            camera,
-            (width as u32, height as u32),
-            background,
-            self.raster_cov_blur_at(iteration, frame_count),
-            self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32)),
-            Some((iteration as u32, self.device_status.buffer().clone())),
-            Some(&mut self.prefix_sum_workspace),
-        )
-        .await;
+
+        let forward_cpu = Instant::now();
+        let rendered = if self.pipeline_timing.probe().gpu_timing_supported() {
+            let device = self.device.clone();
+            let capacity =
+                self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32));
+            let cov_blur = self.raster_cov_blur_at(iteration, frame_count);
+            let status_buf = self.device_status.buffer().clone();
+            let ws = SendMutPtr(&mut self.prefix_sum_workspace as *mut PrefixSumWorkspace);
+            let splats_ptr = SendMutPtr(splats as *mut DeviceSplats<GsDiffBackend>);
+            let camera_ptr = SendConstPtr(camera as *const GaussianCamera);
+            let (rendered, gpu_ms) = profile_device_gpu_step(&device, move || async move {
+                // SAFETY: profile_device_gpu_step drives this future to completion on the
+                // calling thread before returning; these pointers are not accessed concurrently.
+                let workspace = unsafe { ws.as_mut() };
+                let splats = unsafe { splats_ptr.as_mut() };
+                let camera = unsafe { camera_ptr.as_ref() };
+                backward::render_splats_with_visibility_active_sh(
+                    splats,
+                    active_sh_degree,
+                    camera,
+                    (width as u32, height as u32),
+                    background,
+                    cov_blur,
+                    capacity,
+                    Some((iteration as u32, status_buf)),
+                    Some(workspace),
+                )
+                .await
+            })
+            .await;
+            if let Some(ms) = gpu_ms {
+                self.pipeline_timing.record_gpu_step_ms(ms);
+            }
+            rendered
+        } else {
+            backward::render_splats_with_visibility_active_sh(
+                splats,
+                active_sh_degree,
+                camera,
+                (width as u32, height as u32),
+                background,
+                self.raster_cov_blur_at(iteration, frame_count),
+                self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32)),
+                Some((iteration as u32, self.device_status.buffer().clone())),
+                Some(&mut self.prefix_sum_workspace),
+            )
+            .await
+        };
+        self.pipeline_timing
+            .record_span(span::FORWARD, forward_cpu.elapsed());
         self.optimization_samples.record_scan_workspace_stats(
             self.prefix_sum_workspace.reserved_bytes(),
+            self.prefix_sum_workspace.scratch_bytes(),
+            self.prefix_sum_workspace.output_bytes(),
             self.prefix_sum_workspace.growth_count(),
+            self.prefix_sum_workspace.output_growth_count(),
             self.prefix_sum_workspace.step_fresh_allocations(),
+            self.prefix_sum_workspace.step_allocations().scratch_fresh,
+            self.prefix_sum_workspace.step_allocations().output_fresh,
+        );
+        self.pipeline_timing.observe_workspace(
+            self.prefix_sum_workspace.reserved_bytes() as u64,
+            self.prefix_sum_workspace.growth_count() as u64,
+            self.prefix_sum_workspace.step_fresh_allocations() as u64,
+        );
+        self.pipeline_timing
+            .observe_runtime_device_bytes(runtime_device_bytes_in_use(&self.device));
+        debug_assert_eq!(
+            self.prefix_sum_workspace.reserved_bytes(),
+            self.prefix_sum_workspace
+                .scratch_bytes()
+                .saturating_add(self.prefix_sum_workspace.output_bytes()),
+            "scan workspace bytes must equal scratch + output"
+        );
+        debug_assert!(
+            self.prefix_sum_workspace.capacity() == 0
+                || self.prefix_sum_workspace.output_capacity()
+                    >= self.prefix_sum_workspace.capacity().min(1),
+            "output capacity tracks owned scan buffer size"
         );
         // Overflow sticky bits are written on-device by write_dispatch together with
         // the same-step mutation_gate clear. Loss/backward/Adam/topology consult the
@@ -826,7 +952,10 @@ impl WgpuTrainer {
             iteration as u32,
         );
         let loss_for_read = read_loss.then(|| loss.clone());
+        let backward_cpu = Instant::now();
         let mut grads = loss.backward();
+        self.pipeline_timing
+            .record_span(span::BACKWARD, backward_cpu.elapsed());
 
         let transforms_grad = splats
             .transforms
@@ -909,6 +1038,7 @@ impl WgpuTrainer {
                 self.collects_actual_visibility_diagnostics(),
             );
         }
+        let optimizer_cpu = Instant::now();
         self.optimizer.step_device_splats(
             splats,
             transforms_grad,
@@ -916,6 +1046,8 @@ impl WgpuTrainer {
             opacity_grad,
             self.device_status.buffer().clone(),
         );
+        self.pipeline_timing
+            .record_span(span::OPTIMIZER, optimizer_cpu.elapsed());
         let optimizer_elapsed = if profile_step {
             let started = Instant::now();
             let _ = splats
@@ -1022,7 +1154,12 @@ impl WgpuTrainer {
         }
 
         if !read_loss {
-            return Ok(None);
+            // Loss scalar stays unread, but sticky overflow / non-finite must still
+            // classify the step so outer-loop counters cannot treat it as committed.
+            return match self.resolve_unread_loss_disposition().await? {
+                TrainStepDisposition::Committed { loss } => Ok(loss),
+                TrainStepDisposition::Aborted { error } => Err(error),
+            };
         }
 
         // Sample current-frame capacity telemetry on loss cadence only. Sticky
@@ -1060,6 +1197,89 @@ impl WgpuTrainer {
             });
         }
         Ok(Some(validate_loss_value(loss_value, iteration)?))
+    }
+
+    /// Classifies a finished step without reading the loss scalar.
+    ///
+    /// Healthy unread steps still touch the status buffer once so overflow /
+    /// non-finite cannot be mistaken for a commit; that probe is recorded as
+    /// [`StatusReadbackReason::StepDisposition`], not loss-cadence telemetry.
+    async fn resolve_unread_loss_disposition(
+        &mut self,
+    ) -> Result<TrainStepDisposition, TrainingError> {
+        let status = self.device_status.read().await?;
+        self.device_status.adopt_device_snapshot(status);
+        self.optimization_samples
+            .record_status_readback(StatusReadbackReason::StepDisposition);
+        self.optimizer
+            .sync_committed_steps(status.committed_optimizer_steps as usize);
+        self.optimization_samples.gpu_gate_optimizer_skips =
+            status.gpu_gate_optimizer_skips as usize;
+        if let Some(error) = status.to_error() {
+            // Sticky anomaly: attribute the probe to ForwardAbort rather than a
+            // healthy disposition confirmation.
+            self.optimization_samples.status_readbacks_step_disposition = self
+                .optimization_samples
+                .status_readbacks_step_disposition
+                .saturating_sub(1);
+            self.optimization_samples.status_readbacks =
+                self.optimization_samples.status_readbacks.saturating_sub(1);
+            self.optimization_samples
+                .record_status_readback(StatusReadbackReason::ForwardAbort);
+            self.optimization_samples.record_host_safety_point_abort();
+            if status.has_forward_overflow() || status.has_non_finite_loss() {
+                self.optimization_samples.gpu_gate_backward_skips = self
+                    .optimization_samples
+                    .gpu_gate_backward_skips
+                    .saturating_add(1);
+            }
+            return Ok(TrainStepDisposition::Aborted { error });
+        }
+        if status.mutation_gate == 0 {
+            return Ok(TrainStepDisposition::Aborted {
+                error: TrainingError::TrainingFailed(
+                    "train step mutation_gate blocked without sticky overflow/non-finite flags"
+                        .into(),
+                ),
+            });
+        }
+        Ok(TrainStepDisposition::Committed { loss: None })
+    }
+
+    /// Explicit committed/aborted result for outer-loop accounting.
+    pub async fn train_step_disposition(
+        &mut self,
+        splats: &mut DeviceSplats<GsDiffBackend>,
+        camera: &GaussianCamera,
+        target_img: Tensor<GsDiffBackend, 3>,
+        image_dims: (usize, usize),
+        iteration: usize,
+        frame_count: usize,
+        collect_topology_stats: bool,
+        read_loss: bool,
+    ) -> Result<TrainStepDisposition, TrainingError> {
+        match self
+            .train_step(
+                splats,
+                camera,
+                target_img,
+                image_dims,
+                iteration,
+                frame_count,
+                collect_topology_stats,
+                read_loss,
+            )
+            .await
+        {
+            Ok(loss) => Ok(TrainStepDisposition::Committed { loss }),
+            Err(error) => match error {
+                TrainingError::ForwardCapacityExceeded { .. }
+                | TrainingError::NonFiniteLoss { .. } => {
+                    Ok(TrainStepDisposition::Aborted { error })
+                }
+                other => Err(other),
+            },
+        }
     }
 
     pub(crate) async fn train_with_frame_loader(
@@ -1105,20 +1325,41 @@ impl WgpuTrainer {
 
             let sample_idx = zero_based % cameras.len();
             let frame_idx = frame_order[sample_idx];
+            let frame_wait_started = Instant::now();
             frame_loader.prefetch_order_window(frame_order, sample_idx)?;
             let decoded = frame_loader.get(frame_idx)?;
+            self.pipeline_timing
+                .record_span(span::FRAME_WAIT, frame_wait_started.elapsed());
+            // Decode/resize happen on prefetch workers; attribute residual host
+            // cache-miss preparation under decode/resize/upload without double-counting
+            // into step_cpu child sums (step_cpu is the parent Instant for the iteration).
             let target_img = match target_tensor_cache.get(&frame_idx).cloned() {
                 Some(cached) => {
                     touch_target_tensor_cache(&mut target_tensor_lru, frame_idx);
+                    self.pipeline_timing
+                        .record_span(span::DECODE, Duration::from_secs(0));
+                    self.pipeline_timing
+                        .record_span(span::RESIZE, Duration::from_secs(0));
+                    self.pipeline_timing
+                        .record_span(span::UPLOAD, Duration::from_secs(0));
                     cached
                 }
                 None => {
+                    let decode_started = Instant::now();
                     let target_image = decoded.target_rgb.clone().ok_or_else(|| {
                         TrainingError::TrainingFailed(format!(
                             "frame loader did not prepare target_rgb for frame {frame_idx}"
                         ))
                     })?;
+                    // Prefetch already decoded+resized; residual is host Arc clone.
+                    self.pipeline_timing
+                        .record_span(span::DECODE, decode_started.elapsed());
+                    self.pipeline_timing
+                        .record_span(span::RESIZE, Duration::from_secs(0));
+                    let upload_started = Instant::now();
                     let tensor = target_image_tensor(&target_image, image_dims, &self.device);
+                    self.pipeline_timing
+                        .record_span(span::UPLOAD, upload_started.elapsed());
                     target_tensor_cache.insert(frame_idx, tensor.clone());
                     touch_target_tensor_cache(&mut target_tensor_lru, frame_idx);
                     while target_tensor_cache.len() > target_tensor_cache_capacity {
@@ -1144,8 +1385,8 @@ impl WgpuTrainer {
                 checkpoint_due,
                 observer.should_pause(),
             ) || should_log_step;
-            let loss = self
-                .train_step(
+            let disposition = match self
+                .train_step_disposition(
                     splats,
                     &cameras[sample_idx],
                     target_img,
@@ -1155,8 +1396,23 @@ impl WgpuTrainer {
                     collect_topology_stats,
                     read_loss,
                 )
-                .await?;
+                .await
+            {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    self.finish_report(&mut report);
+                    return Err(error);
+                }
+            };
+            let loss = match disposition {
+                TrainStepDisposition::Committed { loss } => loss,
+                TrainStepDisposition::Aborted { error } => {
+                    self.finish_report(&mut report);
+                    return Err(error);
+                }
+            };
             let loop_duration = step_started_at.elapsed();
+            self.pipeline_timing.record_cpu_step(loop_duration);
             self.optimization_samples.record_loop_step(
                 loop_duration,
                 read_loss,
@@ -1291,10 +1547,14 @@ impl WgpuTrainer {
         let before = self.snapshot_mutation_state_for_test(splats).await?;
         self.force_intersection_capacity_for_test(capacity);
 
-        let overflowed = self
+        let overflow_err = self
             .train_step(splats, camera, target, image_dims, 2, 1, true, false)
-            .await?;
-        debug_assert!(overflowed.is_none());
+            .await
+            .expect_err("capacity-1 overflow must abort even when loss is unread");
+        assert!(
+            matches!(overflow_err, TrainingError::ForwardCapacityExceeded { .. }),
+            "got {overflow_err:?}"
+        );
 
         let after = self.snapshot_mutation_state_for_test(splats).await?;
         let mut mismatches = Vec::new();
@@ -1670,9 +1930,12 @@ impl WgpuTrainer {
         } else {
             9
         };
+        let snapshot_elapsed = snapshot_started.elapsed();
         self.optimization_samples
             .topology_snapshot_ms
-            .push(duration_millis(snapshot_started.elapsed()));
+            .push(duration_millis(snapshot_elapsed));
+        self.pipeline_timing
+            .record_span(span::TOPOLOGY_SNAPSHOT, snapshot_elapsed);
         let snapshot_readback_bytes = snapshot
             .splats
             .len()
@@ -1708,9 +1971,12 @@ impl WgpuTrainer {
             .collect();
         let plan_started = Instant::now();
         let plan = plan_mutations(&snapshot, &self.config, iteration, frame_count);
+        let plan_elapsed = plan_started.elapsed();
         self.optimization_samples
             .topology_plan_ms
-            .push(duration_millis(plan_started.elapsed()));
+            .push(duration_millis(plan_elapsed));
+        self.pipeline_timing
+            .record_span(span::TOPOLOGY_PLAN, plan_elapsed);
         if let Some(sample) = plan.telemetry_sample.clone() {
             log::info!(
                 "Topology diagnostics | iter={} | epoch={:?} | splats={} | growth={} | clone={} | split={} | prune={} | large_low_grad={}/{} ({:.3}) | low_vis={} | near_low_vis={} | high_opacity_low_vis={} | vis_prune_dry_run={}",
@@ -1736,17 +2002,31 @@ impl WgpuTrainer {
             self.telemetry.topology.scheduled_steps.saturating_add(1);
         let apply_started = Instant::now();
         if plan.mutates_splats() {
+            let upload_started = Instant::now();
             apply_mutations(splats, &snapshot.splats, &plan, &self.device);
+            self.pipeline_timing
+                .record_span(span::TOPOLOGY_UPLOAD, upload_started.elapsed());
+            let remap_started = Instant::now();
             self.remap_topology_visibility_state(&plan, iteration);
+            self.pipeline_timing
+                .record_span(span::TOPOLOGY_REMAP, remap_started.elapsed());
+        } else {
+            self.pipeline_timing
+                .record_span(span::TOPOLOGY_UPLOAD, Duration::from_secs(0));
+            self.pipeline_timing
+                .record_span(span::TOPOLOGY_REMAP, Duration::from_secs(0));
         }
         if plan.aftermath.requires_adam_rebuild {
             let sh_dims = splats.sh_coeffs.val().dims();
+            let remap_started = Instant::now();
             self.optimizer.remap_origins(
                 &plan.origins(),
                 sh_dims[1],
                 sh_dims.get(2).copied().unwrap_or(3),
                 &self.device,
             );
+            self.pipeline_timing
+                .record_span(span::TOPOLOGY_REMAP, remap_started.elapsed());
         }
         if plan.aftermath.apply_opacity_reset {
             self.optimizer.clear_opacity_moments();
@@ -1775,9 +2055,12 @@ impl WgpuTrainer {
                 iteration,
             );
         }
+        let apply_elapsed = apply_started.elapsed();
         self.optimization_samples
             .topology_apply_ms
-            .push(duration_millis(apply_started.elapsed()));
+            .push(duration_millis(apply_elapsed));
+        self.pipeline_timing
+            .record_span(span::TOPOLOGY_APPLY, apply_elapsed);
     }
 
     fn reset_accumulators(&mut self, num_splats: usize, sh_coeffs: usize, iteration: usize) {
@@ -1928,6 +2211,10 @@ impl WgpuTrainer {
         self.telemetry.final_step_loss = report.final_step_loss;
         self.telemetry.topology.final_gaussians = Some(report.final_gaussian_count);
         self.optimization_samples.flush_into(&mut self.telemetry);
+        self.pipeline_timing
+            .observe_runtime_device_bytes(runtime_device_bytes_in_use(&self.device));
+        let gpu_report = self.pipeline_timing.build_report();
+        self.telemetry.gpu_profiler = Some(gpu_report);
         report.telemetry = self.telemetry.clone();
     }
 }
@@ -2656,6 +2943,545 @@ mod tests {
         config
     }
 
+    #[derive(Debug)]
+    struct SyntheticOuterLoopAbort {
+        error: TrainingError,
+        report: Box<WgpuTrainingReport>,
+    }
+
+    /// Mirror train_with_frame_loader commit rules without PrefetchFrameLoader.
+    async fn run_synthetic_outer_loop(
+        trainer: &mut WgpuTrainer,
+        splats: &mut DeviceSplats<GsDiffBackend>,
+        camera: &GaussianCamera,
+        device: &GsDevice,
+        start_iteration: usize,
+        num_iterations: usize,
+        target_fill: f32,
+        force_capacity: Option<usize>,
+        observer: &mut dyn TrainingLoopObserver,
+    ) -> Result<WgpuTrainingReport, SyntheticOuterLoopAbort> {
+        let mut report = WgpuTrainingReport {
+            completed_iterations: start_iteration,
+            final_gaussian_count: splats.num_splats(),
+            ..Default::default()
+        };
+        let mut last_sampled_loss = 0.0;
+        if let Some(capacity) = force_capacity {
+            trainer.force_intersection_capacity_for_test(capacity);
+        }
+        for zero_based in start_iteration..num_iterations {
+            if observer.should_cancel() {
+                report.cancelled = true;
+                report.disposition = TrainingRunDisposition::Cancelled;
+                break;
+            }
+            let iteration_idx = zero_based + 1;
+            let checkpoint_due = observer.checkpoint_reason(iteration_idx).is_some();
+            let read_loss = should_read_loss(
+                iteration_idx,
+                num_iterations,
+                LOSS_SCALAR_READBACK_INTERVAL,
+                checkpoint_due,
+                observer.should_pause(),
+            );
+            let emit_progress = observer.should_emit_progress(iteration_idx);
+            let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
+            let disposition = match trainer
+                .train_step_disposition(
+                    splats,
+                    camera,
+                    fault_injection_target(device, target_fill),
+                    (8, 8),
+                    iteration_idx,
+                    1,
+                    false,
+                    read_loss,
+                )
+                .await
+            {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    trainer.finish_report(&mut report);
+                    return Err(SyntheticOuterLoopAbort {
+                        error,
+                        report: Box::new(report),
+                    });
+                }
+            };
+            let loss = match disposition {
+                TrainStepDisposition::Committed { loss } => loss,
+                TrainStepDisposition::Aborted { error } => {
+                    trainer.finish_report(&mut report);
+                    return Err(SyntheticOuterLoopAbort {
+                        error,
+                        report: Box::new(report),
+                    });
+                }
+            };
+            if let Some(loss) = loss {
+                last_sampled_loss = loss;
+            }
+            record_completed_step(&mut report, iteration_idx, splats.num_splats(), loss);
+            let metrics = TrainingIterationMetrics {
+                iteration: iteration_idx,
+                loss: last_sampled_loss,
+                gaussian_count: splats.num_splats(),
+                loop_duration: Duration::from_millis(0),
+                loss_readback: read_loss,
+            };
+            if emit_progress {
+                observer.on_iteration(metrics);
+            }
+            if emit_snapshot {
+                let host = device_splats_to_host(splats).await;
+                observer.on_snapshot(metrics, host);
+            }
+            if let Some(reason) = observer.checkpoint_reason(iteration_idx) {
+                let identity = match observer.checkpoint_identity().cloned() {
+                    Some(identity) => identity,
+                    None => {
+                        trainer.finish_report(&mut report);
+                        return Err(SyntheticOuterLoopAbort {
+                            error: TrainingError::InvalidInput(
+                                "checkpointing training requires the current training identity"
+                                    .to_string(),
+                            ),
+                            report: Box::new(report),
+                        });
+                    }
+                };
+                let checkpoint = match trainer
+                    .checkpoint_with_status_reason(
+                        splats,
+                        identity,
+                        iteration_idx,
+                        Some(last_sampled_loss),
+                        WgpuTrainer::checkpoint_status_reason(reason),
+                    )
+                    .await
+                {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        trainer.finish_report(&mut report);
+                        return Err(SyntheticOuterLoopAbort {
+                            error,
+                            report: Box::new(report),
+                        });
+                    }
+                };
+                match complete_checkpoint_boundary(
+                    observer,
+                    TrainingCheckpointReady {
+                        iteration: iteration_idx,
+                        reason,
+                        checkpoint,
+                    },
+                ) {
+                    Ok(Some(disposition)) => {
+                        report.cancelled = disposition == TrainingRunDisposition::Cancelled;
+                        report.disposition = disposition;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        trainer.finish_report(&mut report);
+                        return Err(SyntheticOuterLoopAbort {
+                            error,
+                            report: Box::new(report),
+                        });
+                    }
+                }
+            }
+        }
+        if let Err(error) = trainer
+            .ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
+            .await
+        {
+            trainer.finish_report(&mut report);
+            return Err(SyntheticOuterLoopAbort {
+                error,
+                report: Box::new(report),
+            });
+        }
+        trainer.finish_report(&mut report);
+        Ok(report)
+    }
+
+    struct OuterLoopProbeObserver {
+        progress_iters: Vec<usize>,
+        snapshot_iters: Vec<usize>,
+        checkpoint_iters: Vec<usize>,
+        cancel_after: Option<usize>,
+        pause_at: Option<usize>,
+        checkpoint_every: Option<usize>,
+        identity: TrainingIdentity,
+        last_checkpoint: Option<TrainingCheckpoint>,
+    }
+
+    impl OuterLoopProbeObserver {
+        fn new() -> Self {
+            Self {
+                progress_iters: Vec::new(),
+                snapshot_iters: Vec::new(),
+                checkpoint_iters: Vec::new(),
+                cancel_after: None,
+                pause_at: None,
+                checkpoint_every: None,
+                identity: trainer_checkpoint_identity(),
+                last_checkpoint: None,
+            }
+        }
+    }
+
+    impl TrainingLoopObserver for OuterLoopProbeObserver {
+        fn should_cancel(&self) -> bool {
+            self.cancel_after
+                .is_some_and(|after| self.progress_iters.last().copied().unwrap_or(0) >= after)
+        }
+
+        fn should_pause(&self) -> bool {
+            self.pause_at
+                .is_some_and(|at| self.progress_iters.last().copied().unwrap_or(0) >= at)
+        }
+
+        fn should_emit_progress(&self, _iteration: usize) -> bool {
+            true
+        }
+
+        fn should_emit_snapshot(&self, iteration: usize) -> bool {
+            iteration == 1
+                || self
+                    .checkpoint_every
+                    .is_some_and(|every| iteration.is_multiple_of(every))
+        }
+
+        fn checkpoint_reason(&self, iteration: usize) -> Option<TrainingCheckpointReason> {
+            if self.pause_at == Some(iteration) {
+                return Some(TrainingCheckpointReason::Pause);
+            }
+            self.checkpoint_every.and_then(|every| {
+                iteration
+                    .is_multiple_of(every)
+                    .then_some(TrainingCheckpointReason::Periodic)
+            })
+        }
+
+        fn checkpoint_identity(&self) -> Option<&TrainingIdentity> {
+            Some(&self.identity)
+        }
+
+        fn on_iteration(&mut self, metrics: TrainingIterationMetrics) {
+            self.progress_iters.push(metrics.iteration);
+        }
+
+        fn on_snapshot(&mut self, metrics: TrainingIterationMetrics, _splats: HostSplats) {
+            self.snapshot_iters.push(metrics.iteration);
+        }
+
+        fn on_checkpoint(&mut self, ready: TrainingCheckpointReady) -> Result<(), TrainingError> {
+            self.checkpoint_iters.push(ready.iteration);
+            self.last_checkpoint = Some(ready.checkpoint);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outer_loop_overflow_read_loss_false_keeps_completed_iterations() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let camera = fault_injection_camera();
+        let mut observer = OuterLoopProbeObserver::new();
+
+        // Commit iteration 1 with normal capacity.
+        let healthy = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            0,
+            1,
+            0.4,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect("healthy first iteration");
+        assert_eq!(healthy.completed_iterations, 1);
+        assert_eq!(observer.progress_iters, vec![1]);
+
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
+        let mut observer = OuterLoopProbeObserver::new();
+        let aborted = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            1,
+            3,
+            0.4,
+            Some(1),
+            &mut observer,
+        )
+        .await
+        .expect_err("overflow with unread loss must abort outer loop");
+        assert!(
+            matches!(aborted.error, TrainingError::ForwardCapacityExceeded { .. }),
+            "got {:?}",
+            aborted.error
+        );
+        assert_eq!(
+            aborted.report.completed_iterations, 1,
+            "aborted unread overflow must not advance completed_iterations"
+        );
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
+        assert_eq!(after.0, before.0, "transforms must not change");
+        assert_eq!(after.3, before.3, "adam must not change");
+        assert_eq!(after.4, before.4, "topology accumulators must not change");
+        assert_eq!(after.6, before.6);
+        assert_eq!(after.7, before.7);
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
+        assert!(observer.progress_iters.is_empty());
+        assert!(observer.snapshot_iters.is_empty());
+        assert!(observer.checkpoint_iters.is_empty());
+        assert_eq!(after.5.first_invalid_iteration, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outer_loop_non_finite_read_loss_false_keeps_completed_iterations() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let camera = fault_injection_camera();
+        let mut observer = OuterLoopProbeObserver::new();
+        let healthy = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            0,
+            1,
+            0.4,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect("healthy first iteration");
+        assert_eq!(healthy.completed_iterations, 1);
+
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
+        let mut observer = OuterLoopProbeObserver::new();
+        let aborted = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            1,
+            3,
+            f32::NAN,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect_err("non-finite unread loss must abort outer loop");
+        assert!(matches!(aborted.error, TrainingError::NonFiniteLoss { .. }));
+        assert_eq!(aborted.report.completed_iterations, 1);
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.3, before.3);
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
+        assert!(observer.progress_iters.is_empty());
+        assert!(observer.checkpoint_iters.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outer_loop_continuous_overflow_never_advances_report() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+        let mut observer = OuterLoopProbeObserver::new();
+        let healthy = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            0,
+            1,
+            0.4,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect("healthy");
+        assert_eq!(healthy.completed_iterations, 1);
+
+        for _ in 0..3 {
+            let mut observer = OuterLoopProbeObserver::new();
+            let err = run_synthetic_outer_loop(
+                &mut trainer,
+                &mut splats,
+                &camera,
+                &device,
+                1,
+                4,
+                0.4,
+                Some(1),
+                &mut observer,
+            )
+            .await
+            .expect_err("sticky overflow");
+            assert!(matches!(
+                err.error,
+                TrainingError::ForwardCapacityExceeded {
+                    first_iteration: 2,
+                    ..
+                }
+            ));
+            assert_eq!(err.report.completed_iterations, 1);
+            assert!(observer.progress_iters.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outer_loop_committed_unread_loss_advances_and_keeps_cadence() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+        let mut observer = OuterLoopProbeObserver::new();
+        let report = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            0,
+            5,
+            0.4,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect("committed unread steps");
+        assert_eq!(report.completed_iterations, 5);
+        assert_eq!(observer.progress_iters, vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            trainer.optimization_samples.loss_value_readbacks, 2,
+            "iterations 1 and 5 are on the loss cadence for a 5-step run"
+        );
+        assert_eq!(
+            trainer
+                .optimization_samples
+                .status_readbacks_step_disposition,
+            3,
+            "unread steps 2..=4 confirm disposition without loss scalar readback"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outer_loop_cancel_and_checkpoint_use_committed_iterations_only() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+
+        let mut observer = OuterLoopProbeObserver::new();
+        observer.checkpoint_every = Some(2);
+        let report = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            0,
+            2,
+            0.4,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect("checkpoint boundary");
+        assert_eq!(report.completed_iterations, 2);
+        assert_eq!(observer.checkpoint_iters, vec![2]);
+        assert_eq!(observer.snapshot_iters, vec![1, 2]);
+        let checkpoint = observer
+            .last_checkpoint
+            .expect("periodic checkpoint must commit");
+        assert_eq!(checkpoint.completed_iterations, 2);
+
+        let mut observer = OuterLoopProbeObserver::new();
+        observer.cancel_after = Some(1);
+        let cancelled = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            2,
+            5,
+            0.4,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect("cancel after committed progress");
+        assert!(cancelled.cancelled);
+        assert_eq!(cancelled.disposition, TrainingRunDisposition::Cancelled);
+        assert_eq!(cancelled.completed_iterations, 3);
+        assert_eq!(observer.progress_iters, vec![3]);
+        assert!(observer.checkpoint_iters.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outer_loop_pause_checkpoint_keeps_committed_iterations() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+        let mut observer = OuterLoopProbeObserver::new();
+        observer.pause_at = Some(2);
+        let paused = run_synthetic_outer_loop(
+            &mut trainer,
+            &mut splats,
+            &camera,
+            &device,
+            0,
+            5,
+            0.4,
+            None,
+            &mut observer,
+        )
+        .await
+        .expect("pause checkpoint boundary");
+        assert_eq!(paused.disposition, TrainingRunDisposition::Paused);
+        assert_eq!(paused.completed_iterations, 2);
+        assert_eq!(observer.checkpoint_iters, vec![2]);
+        let checkpoint = observer
+            .last_checkpoint
+            .expect("pause must emit checkpoint");
+        assert_eq!(checkpoint.completed_iterations, 2);
+        assert_eq!(observer.progress_iters, vec![1, 2]);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn train_step_nan_injection_with_read_loss_false_mutates_nothing() {
         let device = GsDevice::default();
@@ -2696,8 +3522,11 @@ mod tests {
                 false,
             )
             .await
-            .expect("gated nan step returns Ok when loss is not sampled");
-        assert!(poisoned.is_none());
+            .expect_err("non-finite step must abort even when loss is unread");
+        assert!(
+            matches!(poisoned, TrainingError::NonFiniteLoss { .. }),
+            "got {poisoned:?}"
+        );
 
         let after = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(after.0, before.0, "transforms must not change");
@@ -2755,8 +3584,11 @@ mod tests {
                 false,
             )
             .await
-            .expect("gated overflow step returns Ok when loss is not sampled");
-        assert!(overflowed.is_none());
+            .expect_err("overflow step must abort even when loss is unread");
+        assert!(
+            matches!(overflowed, TrainingError::ForwardCapacityExceeded { .. }),
+            "got {overflowed:?}"
+        );
 
         let after = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(after.0, before.0, "transforms must not change");
@@ -2819,12 +3651,17 @@ mod tests {
                     false,
                 )
                 .await
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "continuous overflow step {iteration} must stay Ok when loss unread: {err}"
-                    )
-                });
-            assert!(overflowed.is_none());
+                .expect_err("continuous unread overflow must stay aborted");
+            assert!(
+                matches!(
+                    overflowed,
+                    TrainingError::ForwardCapacityExceeded {
+                        first_iteration: 2,
+                        ..
+                    }
+                ),
+                "iteration {iteration} got {overflowed:?}"
+            );
         }
 
         let after = snapshot_mutation_state(&mut trainer, &splats).await;
@@ -3025,6 +3862,13 @@ mod tests {
             trainer.optimization_samples.status_readbacks_loss_cadence,
             1
         );
+        assert_eq!(
+            trainer
+                .optimization_samples
+                .status_readbacks_step_disposition,
+            2,
+            "unread steps 2 and 3 must confirm disposition without loss cadence"
+        );
         assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 0);
 
         trainer
@@ -3032,7 +3876,7 @@ mod tests {
             .await
             .expect("checkpoint outside loss cadence");
         assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 1);
-        assert_eq!(trainer.optimization_samples.status_readbacks, 2);
+        assert_eq!(trainer.optimization_samples.status_readbacks, 4);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3046,11 +3890,14 @@ mod tests {
         let camera = fault_injection_camera();
 
         let mut expected_loss_cadence = 0usize;
+        let mut expected_disposition = 0usize;
         for iteration in 1..=100 {
             let read_loss =
                 should_read_loss(iteration, 100, LOSS_SCALAR_READBACK_INTERVAL, false, false);
             if read_loss {
                 expected_loss_cadence += 1;
+            } else {
+                expected_disposition += 1;
             }
             trainer
                 .train_step(
@@ -3075,6 +3922,16 @@ mod tests {
             trainer.optimization_samples.status_readbacks_loss_cadence,
             expected_loss_cadence
         );
+        assert_eq!(
+            trainer
+                .optimization_samples
+                .status_readbacks_step_disposition,
+            expected_disposition
+        );
+        assert_eq!(
+            trainer.optimization_samples.loss_value_readbacks, expected_loss_cadence,
+            "unread steps must not sample the loss scalar"
+        );
         assert_eq!(trainer.optimization_samples.status_readbacks_topology, 0);
         assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 0);
         assert_eq!(
@@ -3083,12 +3940,388 @@ mod tests {
         );
         assert_eq!(
             trainer.optimization_samples.status_readbacks,
-            expected_loss_cadence + 1
-        );
-        assert!(
-            trainer.optimization_samples.status_readbacks < 100,
-            "status readbacks must not scale with every step"
+            expected_loss_cadence + expected_disposition + 1
         );
         assert_eq!(expected_loss_cadence, 6);
+        assert_eq!(expected_disposition, 94);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_workspace_telemetry_tracks_measured_bytes_not_splat_estimates() {
+        use crate::training::gpu_primitives::prefix_sum::prefix_sum_total_reserved_bytes;
+
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+
+        // No scan observed yet: measured bytes stay unset.
+        assert!(trainer.optimization_samples.scan_workspace_bytes.is_none());
+        trainer.optimization_samples.record_loop_step(
+            Duration::from_millis(1),
+            false,
+            /*splat_count=*/ 64,
+            /*intersection_capacity=*/ 128,
+        );
+        assert!(
+            trainer.optimization_samples.scan_workspace_bytes.is_none(),
+            "loop-step splat estimates must not invent scan_workspace_bytes"
+        );
+
+        trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                1,
+                1,
+                false,
+                false,
+            )
+            .await
+            .expect("first train step");
+
+        let reserved = trainer
+            .optimization_samples
+            .scan_workspace_bytes
+            .expect("train step must record measured scan workspace");
+        let scratch = trainer
+            .optimization_samples
+            .scan_workspace_scratch_bytes
+            .expect("scratch bytes");
+        let output = trainer
+            .optimization_samples
+            .scan_workspace_output_bytes
+            .expect("output bytes");
+        assert_eq!(reserved, scratch + output);
+        assert_eq!(
+            reserved,
+            trainer.prefix_sum_workspace.reserved_bytes(),
+            "telemetry must mirror PrefixSumWorkspace::reserved_bytes"
+        );
+        assert_eq!(
+            reserved,
+            prefix_sum_total_reserved_bytes(trainer.prefix_sum_workspace.capacity())
+        );
+        // Visible / splat counts can differ from a naive host estimate; measured
+        // bytes still come from the owned workspace capacities.
+        assert_ne!(
+            reserved,
+            crate::training::gpu_primitives::prefix_sum::prefix_sum_workspace_bytes(64),
+            "must not equal the loop-step splat_count=64 estimate"
+        );
+
+        let growth_after_first = trainer.prefix_sum_workspace.growth_count();
+        let output_growth_after_first = trainer.prefix_sum_workspace.output_growth_count();
+        assert!(growth_after_first >= 1);
+        assert!(output_growth_after_first >= 1);
+
+        trainer
+            .train_step(
+                &mut splats,
+                &camera,
+                fault_injection_target(&device, 0.4),
+                (8, 8),
+                2,
+                1,
+                false,
+                false,
+            )
+            .await
+            .expect("steady train step");
+        assert_eq!(
+            trainer.prefix_sum_workspace.step_fresh_allocations(),
+            0,
+            "steady reuse must not fresh-allocate"
+        );
+        assert_eq!(
+            trainer.prefix_sum_workspace.growth_count(),
+            growth_after_first
+        );
+        assert_eq!(
+            trainer.prefix_sum_workspace.output_growth_count(),
+            output_growth_after_first
+        );
+        assert_eq!(
+            trainer.optimization_samples.scan_workspace_bytes,
+            Some(trainer.prefix_sum_workspace.reserved_bytes())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn train_step_hundred_step_prefix_workspace_reaches_steady_state() {
+        use crate::training::gpu_primitives::prefix_sum::prefix_sum_total_reserved_bytes;
+
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 100;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+
+        let mut growth_series = Vec::new();
+        for iteration in 1..=100 {
+            trainer
+                .train_step(
+                    &mut splats,
+                    &camera,
+                    fault_injection_target(&device, 0.4),
+                    (8, 8),
+                    iteration,
+                    1,
+                    false,
+                    should_read_loss(iteration, 100, LOSS_SCALAR_READBACK_INTERVAL, false, false),
+                )
+                .await
+                .expect("train step");
+            growth_series.push(trainer.prefix_sum_workspace.growth_count());
+            if iteration == 1 {
+                assert!(
+                    trainer.prefix_sum_workspace.step_fresh_allocations() > 0,
+                    "first step may allocate scratch/output"
+                );
+                assert!(trainer.prefix_sum_workspace.growth_count() >= 1);
+                assert!(trainer.prefix_sum_workspace.output_growth_count() >= 1);
+            } else {
+                assert_eq!(
+                    trainer.prefix_sum_workspace.step_fresh_allocations(),
+                    0,
+                    "steady-state train step {iteration} must not fresh-allocate"
+                );
+                assert_eq!(
+                    trainer
+                        .prefix_sum_workspace
+                        .step_allocations()
+                        .scratch_fresh,
+                    0
+                );
+                assert_eq!(
+                    trainer.prefix_sum_workspace.step_allocations().output_fresh,
+                    0
+                );
+            }
+            assert_eq!(
+                trainer.prefix_sum_workspace.reserved_bytes(),
+                trainer.prefix_sum_workspace.scratch_bytes()
+                    + trainer.prefix_sum_workspace.output_bytes()
+            );
+        }
+
+        assert!(growth_series.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(growth_series.first(), growth_series.last());
+        assert_eq!(
+            trainer.optimization_samples.scan_workspace_bytes,
+            Some(trainer.prefix_sum_workspace.reserved_bytes())
+        );
+        assert_eq!(
+            trainer.prefix_sum_workspace.reserved_bytes(),
+            prefix_sum_total_reserved_bytes(trainer.prefix_sum_workspace.capacity())
+        );
+
+        // Short → long → short on the same workspace the train loop owns.
+        {
+            use crate::training::gpu_primitives::prefix_sum::PrefixSumBackend;
+            use burn::prelude::*;
+            use burn::tensor::{Int, TensorData};
+
+            async fn scan_values(
+                ws: &mut PrefixSumWorkspace,
+                device: &GsDevice,
+                values: &[i32],
+            ) -> Vec<i32> {
+                ws.begin_step();
+                let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                    TensorData::new(values.to_vec(), [values.len()]),
+                    device,
+                );
+                let scanned =
+                    GsBackendBase::prefix_sum_u32_with_workspace(ws, input.into_primitive())
+                        .expect("workspace scan");
+                Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
+                    .into_data_async()
+                    .await
+                    .expect("read")
+                    .into_vec::<i32>()
+                    .expect("data")
+            }
+
+            async fn fresh_values(device: &GsDevice, values: &[i32]) -> Vec<i32> {
+                let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                    TensorData::new(values.to_vec(), [values.len()]),
+                    device,
+                );
+                let scanned =
+                    GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("fresh");
+                Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
+                    .into_data_async()
+                    .await
+                    .expect("read")
+                    .into_vec::<i32>()
+                    .expect("data")
+            }
+
+            let short = [1_i32, 2, 3, 4];
+            let long: Vec<i32> = (0..300).map(|i| i % 3 + 1).collect();
+            let short_again = [4_i32, 5, 6];
+            for values in [&short[..], long.as_slice(), &short_again[..]] {
+                let ws_vals = scan_values(&mut trainer.prefix_sum_workspace, &device, values).await;
+                let fresh_vals = fresh_values(&device, values).await;
+                assert_eq!(ws_vals, fresh_vals);
+            }
+            assert!(
+                trainer.prefix_sum_workspace.capacity() >= long.len(),
+                "long scan must raise owned capacity"
+            );
+            assert_eq!(
+                trainer.prefix_sum_workspace.reserved_bytes(),
+                trainer.prefix_sum_workspace.scratch_bytes()
+                    + trainer.prefix_sum_workspace.output_bytes()
+            );
+        }
+
+        // Hold a prior output across the next scan: must not overwrite.
+        {
+            use crate::training::gpu_primitives::prefix_sum::PrefixSumBackend;
+            use burn::prelude::*;
+            use burn::tensor::{Int, TensorData};
+
+            trainer.prefix_sum_workspace.begin_step();
+            let held_input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(vec![1_i32, 2, 3], [3]),
+                &device,
+            );
+            let held = GsBackendBase::prefix_sum_u32_with_workspace(
+                &mut trainer.prefix_sum_workspace,
+                held_input.into_primitive(),
+            )
+            .expect("held scan");
+
+            trainer.prefix_sum_workspace.begin_step();
+            let next_input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(vec![9_i32, 8, 7], [3]),
+                &device,
+            );
+            let _ = GsBackendBase::prefix_sum_u32_with_workspace(
+                &mut trainer.prefix_sum_workspace,
+                next_input.into_primitive(),
+            )
+            .expect("scan while prior output held");
+            assert!(
+                trainer.prefix_sum_workspace.step_allocations().output_fresh >= 1,
+                "in-use train workspace output must force a fresh buffer"
+            );
+
+            let held_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(held)
+                .into_data_async()
+                .await
+                .expect("held read")
+                .into_vec::<i32>()
+                .expect("held data");
+            assert_eq!(held_vals, vec![1, 3, 6]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gpu_profiler_hundred_step_smoke_sample_counts_and_workspace_monotonic() {
+        use crate::training::reporting::gpu_profiler::assert_report_self_consistent;
+
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 100;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+
+        let mut growth_series = Vec::new();
+        let mut fresh_series = Vec::new();
+        for iteration in 1..=100 {
+            let step_started = Instant::now();
+            trainer
+                .train_step(
+                    &mut splats,
+                    &camera,
+                    fault_injection_target(&device, 0.4),
+                    (8, 8),
+                    iteration,
+                    1,
+                    false,
+                    should_read_loss(iteration, 100, LOSS_SCALAR_READBACK_INTERVAL, false, false),
+                )
+                .await
+                .expect("train step");
+            trainer
+                .pipeline_timing
+                .record_cpu_step(step_started.elapsed());
+            growth_series.push(
+                trainer
+                    .pipeline_timing
+                    .build_report()
+                    .workspace_growth_count,
+            );
+            fresh_series.push(
+                trainer
+                    .pipeline_timing
+                    .build_report()
+                    .fresh_step_allocations,
+            );
+        }
+
+        let report = trainer.pipeline_timing.build_report();
+        assert_report_self_consistent(&report).expect("profiler report self-consistent");
+        assert!(
+            report.cpu_step_p50_ms.is_some(),
+            "CPU step percentiles must be present"
+        );
+        assert_eq!(
+            report.cpu_timing_kind.as_deref(),
+            Some("cpu_submit_instant")
+        );
+        assert!(
+            !report.adapter.as_deref().unwrap_or("").is_empty()
+                || report.adapter_unavailable_reason.is_some()
+        );
+        assert!(!report.backend.is_empty());
+
+        if report.supported {
+            assert!(report.unsupported_reason.is_none());
+            assert!(
+                report.sample_count > 0,
+                "device timing must collect GPU samples"
+            );
+            assert!(report.gpu_step_p50_ms.is_some());
+            assert!(report.gpu_step_p95_ms.is_some());
+            assert!(report.gpu_step_p95_ms.unwrap() >= report.gpu_step_p50_ms.unwrap());
+        } else {
+            assert!(
+                report.unsupported_reason.is_some(),
+                "unsupported path must keep a stable reason"
+            );
+            assert!(report.gpu_step_p50_ms.is_none());
+            assert!(report.gpu_step_p95_ms.is_none());
+            assert_eq!(report.sample_count, 0);
+        }
+
+        assert!(growth_series.windows(2).all(|w| w[1] >= w[0]));
+        assert!(fresh_series.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(
+            report.workspace_growth_count,
+            *growth_series.last().expect("growth series")
+        );
+        assert_eq!(
+            report.fresh_step_allocations,
+            *fresh_series.last().expect("fresh series")
+        );
+
+        let forward = report
+            .pipeline_spans
+            .get(span::FORWARD)
+            .expect("forward span");
+        assert!(forward.sample_count > 0);
+        assert_eq!(forward.timing_kind, "cpu_submit_instant");
     }
 }

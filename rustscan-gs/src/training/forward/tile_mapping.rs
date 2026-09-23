@@ -18,7 +18,9 @@ const OFFSETS_SHADER_SRC: &str = include_str!("../shaders/get_tile_offsets.wgsl"
 pub(crate) struct MGIUniforms {
     tile_bounds: [u32; 2],
     num_visible: u32,
-    pad: u32,
+    /// Allocated length of `tile_id_from_isect` and `compact_gid_from_isect`.
+    /// The map shader must reject `isect_id` at or above this value before storing.
+    intersection_capacity: u32,
 }
 
 #[repr(C)]
@@ -218,7 +220,7 @@ pub(crate) fn tile_mapping<B: TileMappingBackend + PrefixSumBackend>(
         MGIUniforms {
             tile_bounds: [tile_bounds.0, tile_bounds.1],
             num_visible: projected_splats.dims()[0] as u32,
-            pad: 0,
+            intersection_capacity: num_intersections as u32,
         },
         map_dispatch,
     );

@@ -3,7 +3,7 @@
 struct MGIUniforms {
     tile_bounds: vec2<u32>,
     num_visible: u32,
-    pad: u32,
+    intersection_capacity: u32,
 }
 
 @group(0) @binding(0) var<storage, read> projected: array<helpers::ProjectedSplat>;
@@ -32,7 +32,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bbox_max = tile_bbox.zw;
     let bbox_width = bbox_max.x - bbox_min.x;
     let bbox_tiles = (bbox_max.y - bbox_min.y) * bbox_width;
-    let base_isect_id = select(cum_tiles_hit[compact_gid - 1u], 0u, compact_gid == 0u);
+    // `select` evaluates both arms, so the exclusive prefix load stays in a branch.
+    var base_isect_id = 0u;
+    if (compact_gid > 0u) {
+        base_isect_id = cum_tiles_hit[compact_gid - 1u];
+    }
 
     var offset = 0u;
     for (var tile_idx = 0u; tile_idx < bbox_tiles; tile_idx++) {
@@ -41,9 +45,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rect = vec4<u32>(tx, ty, tx + 1u, ty + 1u);
         if helpers::will_primitive_contribute(rect, mean2d, conic, power_threshold) {
             let isect_id = base_isect_id + offset;
-            let tile_id = tx + ty * uniforms.tile_bounds.x;
-            tile_id_from_isect[isect_id] = tile_id;
-            compact_gid_from_isect[isect_id] = compact_gid;
+            // Keep the real prefix id, but never store past the allocated workspace.
+            if (isect_id < uniforms.intersection_capacity) {
+                let tile_id = tx + ty * uniforms.tile_bounds.x;
+                tile_id_from_isect[isect_id] = tile_id;
+                compact_gid_from_isect[isect_id] = compact_gid;
+            }
             offset += 1u;
         }
     }

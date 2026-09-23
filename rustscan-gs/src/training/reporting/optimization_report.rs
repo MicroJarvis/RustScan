@@ -28,6 +28,10 @@ pub struct OptimizationEnvironment {
     pub backend: Option<String>,
     pub driver: Option<String>,
     pub timestamp_query_available: Option<bool>,
+    /// Present when adapter_name could not be probed at runtime.
+    pub adapter_unavailable_reason: Option<String>,
+    /// Present when driver could not be probed at runtime.
+    pub driver_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -60,7 +64,12 @@ pub struct OptimizationTrainMetrics {
     pub loop_duration_p95_ms: Option<f64>,
     /// CPU submit-side loop samples only; not GPU completion time.
     pub loop_timing_kind: Option<String>,
+    /// Aggregate GPU completion seconds from timestamp queries; null when unsupported.
     pub gpu_completion_seconds: Option<f64>,
+    pub gpu_step_p50_ms: Option<f64>,
+    pub gpu_step_p95_ms: Option<f64>,
+    pub gpu_step_sample_count: Option<u64>,
+    pub gpu_profiler_unsupported_reason: Option<String>,
     pub loss_readback_count: Option<usize>,
     pub count_readback_count: Option<usize>,
     pub status_readbacks: Option<usize>,
@@ -105,7 +114,12 @@ pub struct OptimizationTopologyMetrics {
 pub struct OptimizationMemoryMetrics {
     pub peak_rss_bytes: Option<u64>,
     pub peak_device_bytes: Option<u64>,
+    pub peak_device_bytes_reason: Option<String>,
     pub estimated_buffer_bytes: Option<u64>,
+    pub workspace_current_bytes: Option<u64>,
+    pub workspace_peak_bytes: Option<u64>,
+    pub workspace_growth_count: Option<u64>,
+    pub fresh_step_allocations: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -510,6 +524,8 @@ mod tests {
                 backend: Some("Metal".into()),
                 driver: None,
                 timestamp_query_available: Some(false),
+                adapter_unavailable_reason: None,
+                driver_unavailable_reason: Some("driver_info_empty".into()),
             },
             command: OptimizationCommand {
                 argv: vec!["rustgs".into(), "train".into()],
@@ -537,6 +553,10 @@ mod tests {
                 loop_duration_p95_ms: Some(22.0),
                 loop_timing_kind: Some("cpu_submit_instant".into()),
                 gpu_completion_seconds: None,
+                gpu_step_p50_ms: None,
+                gpu_step_p95_ms: None,
+                gpu_step_sample_count: Some(0),
+                gpu_profiler_unsupported_reason: Some("timestamp_query_unavailable".into()),
                 loss_readback_count: Some(26),
                 count_readback_count: Some(0),
                 status_readbacks: Some(27),
@@ -582,7 +602,12 @@ mod tests {
             memory: OptimizationMemoryMetrics {
                 peak_rss_bytes: Some(1_000_000),
                 peak_device_bytes: None,
+                peak_device_bytes_reason: Some("runtime_peak_device_bytes_unavailable".into()),
                 estimated_buffer_bytes: Some(2_000_000),
+                workspace_current_bytes: Some(512),
+                workspace_peak_bytes: Some(512),
+                workspace_growth_count: Some(1),
+                fresh_step_allocations: Some(2),
             },
             evaluation: Some(OptimizationEvaluationMetrics {
                 frame_count: Some(2),
@@ -618,6 +643,8 @@ mod tests {
         assert!(json.contains("\"gpu_completion_seconds\": null"));
         assert!(json.contains("\"peak_device_bytes\": null"));
         assert!(json.contains("\"driver\": null"));
+        assert!(json.contains("\"gpu_step_p50_ms\": null"));
+        assert!(json.contains("timestamp_query_unavailable"));
         let decoded: OptimizationReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, report);
         assert_eq!(decoded.evaluation.as_ref().unwrap().frames.len(), 2);
