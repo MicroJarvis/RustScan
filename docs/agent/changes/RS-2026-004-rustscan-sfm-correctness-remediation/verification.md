@@ -813,7 +813,7 @@ allow. Do not merge this branch to `main` from this handoff.
 
 ### T4 — Camera Invariants
 
-Status: implemented. Not reviewed.
+Status: review_fix. Not reviewed.
 
 Owner: `cursor-agent`
 
@@ -882,6 +882,65 @@ Known limitations:
 Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
 handoff unless their dependencies and the task protocol allow. Do not merge
 to `main`.
+
+#### T4 review P1 remediation
+
+Status: review_fix applied. Not reviewed.
+
+Code commit: `99fe9c8e11130e3a23d248144ee2d96c72e6619d`
+
+1. Checked mutators are atomic. `set_param`, `scale_focal`,
+   `set_focal_lengths`, and `set_principal_point` build a candidate parameter
+   array, validate (including finite positive focals after `f32` narrowing),
+   then commit once. Failures leave params and projection unchanged.
+   Regressions: `checked_mutators_leave_camera_unchanged_on_failure`.
+
+2. Mapper / local-camera config overrides collect optional `fx`/`fy`/`cx`/`cy`
+   and call `apply_optional_intrinsics` once. For single-focal models the
+   shared focal is the mean of the provided pair, so `600` then `601` yields
+   `600.5` independent of order. Illegal overrides return contextual
+   `anyhow` errors; compatibility setters return `Result` and no longer
+   `expect`. Regression:
+   `single_focal_optional_intrinsics_average_once_order_independently`.
+
+3. `CameraModel.params` is private. Production BA assemble/write-back, PnP
+   focal write-back, and finite-difference paths use `set_param` /
+   `set_shared_focal`. Illegal candidates are rejected without mutating the
+   committed camera. Test-only corruption uses
+   `inject_raw_param_for_test`.
+
+Existing focal-search test still passes and now also checks off-center
+projection plus COLMAP params round-trip agreement.
+
+Commands with `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+and `CARGO_TERM_COLOR=never`:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error: `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`. Final:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`. Slam
+  unmodified.
+- `cargo test -p rustscan-sfm --no-default-features --lib -- --test-threads=1`:
+  pass. `654 passed; 0 failed; 19 ignored; finished in 57.03s`.
+- `cargo test -p rustscan-sfm --all-features --lib types::tests -- --test-threads=1`:
+  pass. `14 passed`.
+- `cargo test -p rustscan-sfm --all-features --lib view_graph_calibration -- --test-threads=1`:
+  pass. `3 passed`.
+- `cargo test -p rustscan-sfm --all-features --lib colmap -- --test-threads=1`:
+  pass. `178 passed; 0 failed; 19 ignored`.
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`:
+  pass (lib `840 passed; 19 ignored`, plus integration targets; exit 0).
+- `git diff --check`: pass.
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- Full Reconstruction/BA commit atomicity on unusable solutions remains T5.
+
+Next action: do not mark T4 reviewed. Do not start T5 or T6 from this
+handoff. Do not merge to `main`.
 
 ### T5 — Atomic BA
 

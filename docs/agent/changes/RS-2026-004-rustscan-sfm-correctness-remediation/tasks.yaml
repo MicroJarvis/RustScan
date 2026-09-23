@@ -97,8 +97,8 @@ later_tasks:
     branch: agent/RS-2026-004/t4-camera-invariants
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t4-camera-invariants
     scope: rustscan-sfm/src/core/types.rs, rustscan-sfm/src/sfm/view_graph_calibration.rs, and direct camera callers
-    status: implemented
-    tip_commit: 4de9ff7f832a4858a6cc7164fa1b6d9cba7dc56f
+    status: review_fix
+    tip_commit: 99fe9c8e11130e3a23d248144ee2d96c72e6619d
   - id: T5
     owner: cursor-agent
     branch: agent/RS-2026-004/t5-atomic-ba
@@ -120,4 +120,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T4 is implemented on agent/RS-2026-004/t4-camera-invariants. Do not mark T4 reviewed. Do not start T5 or T6 from this handoff. Do not merge to main."
+next_action: "T4 review P1 fixes are on agent/RS-2026-004/t4-camera-invariants. Do not mark T4 reviewed. Do not start T5 or T6. Do not merge to main."

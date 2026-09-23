@@ -140,6 +140,13 @@ truncating an export file.
       grid element, plus projection/export consistency assertions.
 - [x] Add constructor and deserialization tests for zero, negative, NaN, and
       infinite focal parameters.
+- [x] Review P1: checked mutators commit only after candidate validation so
+      failures leave the camera unchanged.
+- [x] Review P1: mapper/config intrinsics overrides collect fx/fy once via
+      `apply_optional_intrinsics` (single-focal mean is order-independent) and
+      return contextual errors instead of panicking.
+- [x] Review P1: production BA/mapper camera writes go through checked APIs;
+      `params` is private.
 
 **Exit condition:** camera accessors, projection, BA, calibration, and export
 cannot observe different intrinsics for the same `CameraModel`.
