@@ -107,9 +107,9 @@ later_tasks:
     branch: agent/RS-2026-004/t5-atomic-ba
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t5-atomic-ba
     scope: rustscan-sfm/src/ba, rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs, and rustscan-sfm/src/sfm/global_mapper.rs
-    status: reviewed
+    status: integrated
     base_commit: 701d051814a29ab3ee4fbefc01355112f71b5a47
-    tip_commit: 82512b9a3b6a4d455b13e1e8dbdd938bfbc7a4ec
+    tip_commit: 56ce9b24e9f84fac19c82b98178b758d1e2fcf2e
   - id: T6
     owner: cursor-agent
     branch: agent/RS-2026-004/t6-database-transactions
@@ -126,4 +126,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T5 is independently approved and merge-eligible on agent/RS-2026-004/t5-atomic-ba (reviewed HEAD 82512b9). Await repository-owner authorization to integrate. Do not start T6. Do not merge to main. Do not delete the T5 worktree."
+next_action: "T5 is integrated on main. Do not start T6 until explicitly scheduled. Do not push remote from this handoff."

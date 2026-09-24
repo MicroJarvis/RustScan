@@ -1039,9 +1039,9 @@ branch to `main`.
 
 ### T5 — Atomic BA
 
-Status: reviewed and approved (remediation after
-`review-t5-2026-09-24-final.md` CHANGES_REQUESTED). Independent re-review is
-recorded in `review-t5-2026-09-24-distortion-recheck.md`.
+Status: integrated on `main` (remediation after
+`review-t5-2026-09-24-final.md` CHANGES_REQUESTED; independent re-review
+`review-t5-2026-09-24-distortion-recheck.md` APPROVE retained).
 
 Owner: `cursor-agent`
 
@@ -1145,12 +1145,52 @@ Known limitations:
 
 - Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
 - Database transaction atomicity remains T6.
-- T5 is merge-eligible but must not be merged to `main` without repository-
-  owner authorization. Worktree retained. T6 not started.
 
-Next action: T5 handoff complete. Await repository-owner authorization to
-integrate. Do not start T6. Do not merge to `main`. Do not delete the T5
-worktree.
+#### Integration — 2026-09-24
+
+Owner: `cursor-agent`. Integration branch/worktree: `main`, repository root.
+User explicitly authorized merging T5 and removing the T5 worktree.
+
+- Pre-merge `main`: `701d051814a29ab3ee4fbefc01355112f71b5a47` (clean).
+- Pre-merge T5 tip: `56ce9b24e9f84fac19c82b98178b758d1e2fcf2e` (clean;
+  `main` was an ancestor).
+- `git merge --ff-only agent/RS-2026-004/t5-atomic-ba`: PASS.
+  Post-merge `main` = `56ce9b24e9f84fac19c82b98178b758d1e2fcf2e`.
+- `git diff --exit-code agent/RS-2026-004/t5-atomic-ba HEAD` after FF: PASS
+  (identical trees).
+
+Post-merge verification with
+`POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+and `CARGO_TERM_COLOR=never`:
+
+- `cargo fmt --all -- --check`: PASS.
+- `cargo check --workspace --all-targets`: PASS (exit 0; existing warnings).
+- `cargo test -p rustscan-sfm --no-default-features --features ceres-ba --lib ba:: -- --test-threads=1`:
+  PASS, **49 passed**; 0 failed (matches reviewed baseline).
+- `cargo test -p rustscan-sfm --all-features --lib types::tests -- --test-threads=1`:
+  PASS, **16 passed**; 0 failed (matches reviewed baseline).
+- Clippy: not re-run as a pass claim. Known limitation remains: pre-existing
+  `rustscan-slam` diagnostics (84 errors; first `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`). Unrelated slam code was not modified.
+
+Evidence (ignored under `artifacts/runs/`, retained on disk):
+
+- `artifacts/runs/rs-2026-004-t5-integration/fmt.log`
+- `artifacts/runs/rs-2026-004-t5-integration/check.log`
+- `artifacts/runs/rs-2026-004-t5-integration/ba-tests.log`
+- `artifacts/runs/rs-2026-004-t5-integration/types-tests.log`
+- `artifacts/runs/rs-2026-004-t5-integration/MANIFEST.sha256-prefix.txt`
+- `artifacts/runs/rs-2026-004-t5-integration/preserved-from-worktree/`
+  (T5 review probes/logs: independent-review, independent-rereview-20260924,
+  review-2647492; binary `distortion-probe` executable excluded, source+log
+  kept)
+
+Worktree cleanup: after merge verification and evidence copy, remove
+`.worktrees/rs-2026-004-t5-atomic-ba` with `git worktree remove`. Keep branch
+`agent/RS-2026-004/t5-atomic-ba`. Do not delete other worktrees. Do not push
+remote. Do not start T6.
+
+Next action: T5 integrated. Await scheduling for T6.
 
 ### T6 — Database Transactions
 
