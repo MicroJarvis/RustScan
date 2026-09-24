@@ -294,6 +294,13 @@ pub(crate) mod commit_test_hooks {
         pub force_ceres_usable: Option<bool>,
         pub force_termination: Option<BundleAdjustmentTerminationType>,
         pub corrupt_first_camera_param: Option<f64>,
+        /// Overwrites translation-x of the first frame (else first) pose block.
+        pub corrupt_first_pose_translation_x: Option<f64>,
+        /// Overwrites translation-x of every registered pose block (frame/sensor/image).
+        pub corrupt_all_pose_translations_x: Option<f64>,
+        /// After cloning the candidate, set every non-ref sensor translation-x
+        /// before applying solved parameters (for composed-pose overflow tests).
+        pub seed_candidate_sensor_translation_x: Option<f64>,
         /// Request cancel after candidate validation and before live install.
         pub cancel_before_commit: bool,
     }

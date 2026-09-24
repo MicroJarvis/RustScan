@@ -392,7 +392,6 @@ pub fn solve_bundle_adjustment_ceres(
     let postprocess_started = Instant::now();
 
     let summary = &solution.summary;
-    let mut parameters = solution.parameters;
     let (
         mut termination_type,
         termination_reason,
@@ -401,33 +400,85 @@ pub fn solve_bundle_adjustment_ceres(
         step_quality,
         damping,
     ) = map_ceres_summary(summary);
-    let mut ceres_usable = summary.is_solution_usable();
-    #[cfg(test)]
-    let mut cancel_before_commit = false;
-
-    #[cfg(test)]
-    if let Some(hooks) = super::commit_test_hooks::current() {
-        if let Some(force_usable) = hooks.force_ceres_usable {
-            ceres_usable = force_usable;
-        }
-        if let Some(forced_termination) = hooks.force_termination {
-            termination_type = forced_termination;
-        }
-        if let Some(corrupt) = hooks.corrupt_first_camera_param {
-            if let Some(first_spec) = camera_param_specs.first() {
-                let key = (first_spec.camera, first_spec.param);
-                if let Some(&idx) = camera_param_registry.get(&key) {
-                    if let Some(storage_idx) = internal_to_storage.get(&idx) {
-                        if let Some(block) = parameters.get_mut(*storage_idx) {
-                            if let Some(slot) = block.get_mut(0) {
-                                *slot = corrupt;
+    let parameters = {
+        #[cfg(test)]
+        {
+            let mut parameters = solution.parameters;
+            if let Some(hooks) = super::commit_test_hooks::current() {
+                if let Some(corrupt) = hooks.corrupt_first_camera_param {
+                    if let Some(first_spec) = camera_param_specs.first() {
+                        let key = (first_spec.camera, first_spec.param);
+                        if let Some(&idx) = camera_param_registry.get(&key) {
+                            if let Some(storage_idx) = internal_to_storage.get(&idx) {
+                                if let Some(block) = parameters.get_mut(*storage_idx) {
+                                    if let Some(slot) = block.get_mut(0) {
+                                        *slot = corrupt;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(tx) = hooks.corrupt_first_pose_translation_x {
+                    let handle = pose_entity_registry
+                        .iter()
+                        .find(|(key, _)| matches!(key, PoseEntityKey::Frame(_)))
+                        .or_else(|| pose_entity_registry.iter().next())
+                        .map(|(_, handle)| *handle);
+                    if let Some(handle) = handle {
+                        if let Some(&storage_idx) = internal_to_storage.get(&handle) {
+                            if let Some(block) = parameters.get_mut(storage_idx) {
+                                if block.len() >= 5 {
+                                    block[4] = tx;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(tx) = hooks.corrupt_all_pose_translations_x {
+                    for &handle in pose_entity_registry.values() {
+                        if let Some(&storage_idx) = internal_to_storage.get(&handle) {
+                            if let Some(block) = parameters.get_mut(storage_idx) {
+                                if block.len() >= 5 {
+                                    block[4] = tx;
+                                }
                             }
                         }
                     }
                 }
             }
+            parameters
         }
-        cancel_before_commit = hooks.cancel_before_commit;
+        #[cfg(not(test))]
+        {
+            solution.parameters
+        }
+    };
+    let ceres_usable = {
+        #[cfg(test)]
+        {
+            let mut ceres_usable = summary.is_solution_usable();
+            if let Some(hooks) = super::commit_test_hooks::current() {
+                if let Some(force_usable) = hooks.force_ceres_usable {
+                    ceres_usable = force_usable;
+                }
+            }
+            ceres_usable
+        }
+        #[cfg(not(test))]
+        {
+            summary.is_solution_usable()
+        }
+    };
+    #[cfg(test)]
+    let cancel_before_commit = super::commit_test_hooks::current()
+        .map(|hooks| hooks.cancel_before_commit)
+        .unwrap_or(false);
+    #[cfg(test)]
+    if let Some(hooks) = super::commit_test_hooks::current() {
+        if let Some(forced_termination) = hooks.force_termination {
+            termination_type = forced_termination;
+        }
     }
 
     // Build the full candidate (poses, cameras, points, derived point errors)
@@ -1713,7 +1764,8 @@ fn apply_prepared_write_back(
 
 /// Recompute point errors on a candidate reconstruction. Rejects the candidate
 /// when any observation residual, f64→f32 narrowing, or mean accumulation is
-/// non-finite. Does not skip, zero, or retain a prior error to hide overflow.
+/// non-finite. Distinguishes finite behind-camera geometry (skipped under the
+/// existing policy) from non-finite camera coordinates or projection overflow.
 fn refresh_point_errors_checked(
     frames: &[ImageFrame],
     reconstruction: &mut Reconstruction,
@@ -1732,7 +1784,16 @@ fn refresh_point_errors_checked(
                 continue;
             }
             let kp = &frames[obs.image].keypoints[obs.feature];
-            let Some(predicted) = project_point(image_cameras[obs.image], pose, point.xyz) else {
+            let Some(predicted) = project_point_for_candidate_error(
+                image_cameras[obs.image],
+                pose,
+                point.xyz,
+                point_id,
+                obs.image,
+                obs.feature,
+            )?
+            else {
+                // Finite geometric non-projectability (e.g. behind camera).
                 continue;
             };
             let err = ((predicted[0] - kp.x() as f64).powi(2)
@@ -1778,6 +1839,159 @@ fn refresh_point_errors_checked(
     Ok(())
 }
 
+/// Project for candidate error refresh.
+///
+/// - `Ok(Some(xy))`: finite image projection
+/// - `Ok(None)`: finite geometry that the existing policy does not project
+///   (behind/at the camera, or in-model geometric domain rejection)
+/// - `Err`: non-finite camera coordinates or projection overflow/NaN/Inf
+fn project_point_for_candidate_error(
+    camera: CameraModel,
+    pose: SE3,
+    point: [f32; 3],
+    point_id: usize,
+    image: usize,
+    feature: usize,
+) -> Result<Option<[f64; 2]>, String> {
+    let p = pose.transform_point(&point);
+    let u = p[0] as f64;
+    let v = p[1] as f64;
+    let w = p[2] as f64;
+    if !u.is_finite() || !v.is_finite() || !w.is_finite() {
+        return Err(format!(
+            "point {point_id} observation ({image},{feature}) has non-finite camera coordinates ({u}, {v}, {w})"
+        ));
+    }
+    // Cheirality policy matches CameraModel::img_from_cam: skip behind/at camera.
+    if w < f64::EPSILON {
+        return Ok(None);
+    }
+    let uu = u / w;
+    let vv = v / w;
+    if !uu.is_finite() || !vv.is_finite() {
+        return Err(format!(
+            "point {point_id} observation ({image},{feature}) normalized camera coords overflow ({uu}, {vv})"
+        ));
+    }
+    match camera.img_from_cam_unchecked(u, v, w) {
+        Some(xy) => {
+            // Residual refresh narrows to f32; reject overflow here instead of
+            // letting a later cast silently become Inf after a Some(...) path.
+            let xy_f32 = [xy[0] as f32, xy[1] as f32];
+            if xy_f32.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "point {point_id} observation ({image},{feature}) projection overflows f32 ({}, {})",
+                    xy[0], xy[1]
+                ));
+            }
+            Ok(Some(xy))
+        }
+        None => {
+            // finite2 filters Inf/NaN image coords to None; also models may
+            // reject finite points outside their domain. Treat perspective
+            // overflow as numerical failure; otherwise keep geometric skip.
+            let trial_x = camera.fx() as f64 * uu + camera.cx() as f64;
+            let trial_y = camera.fy() as f64 * vv + camera.cy() as f64;
+            if !trial_x.is_finite() || !trial_y.is_finite() {
+                return Err(format!(
+                    "point {point_id} observation ({image},{feature}) projection overflows ({trial_x}, {trial_y})"
+                ));
+            }
+            let trial_f32 = [trial_x as f32, trial_y as f32];
+            if trial_f32.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "point {point_id} observation ({image},{feature}) projection overflows f32 ({trial_x}, {trial_y})"
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn validate_se3_pose(pose: SE3, label: &str) -> Result<(), String> {
+    let translation = pose.translation();
+    let quaternion = pose.quaternion();
+    if translation.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{label}: non-finite translation {translation:?}"));
+    }
+    if quaternion.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{label}: non-finite quaternion {quaternion:?}"));
+    }
+    let norm = (quaternion[0] * quaternion[0]
+        + quaternion[1] * quaternion[1]
+        + quaternion[2] * quaternion[2]
+        + quaternion[3] * quaternion[3])
+        .sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        return Err(format!("{label}: invalid quaternion norm {norm}"));
+    }
+    let normalized = [
+        quaternion[0] / norm,
+        quaternion[1] / norm,
+        quaternion[2] / norm,
+        quaternion[3] / norm,
+    ];
+    if normalized.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "{label}: normalized quaternion is non-finite {normalized:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rigid3_pose(rigid: &Rigid3, label: &str) -> Result<(), String> {
+    if rigid.qvec.iter().any(|value| !value.is_finite())
+        || rigid.tvec.iter().any(|value| !value.is_finite())
+    {
+        return Err(format!(
+            "{label}: non-finite rigid components q={:?} t={:?}",
+            rigid.qvec, rigid.tvec
+        ));
+    }
+    let [w, x, y, z] = rigid.qvec;
+    let norm = (w * w + x * x + y * y + z * z).sqrt();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return Err(format!("{label}: invalid quaternion norm {norm}"));
+    }
+    let normalized = [w / norm, x / norm, y / norm, z / norm];
+    if normalized.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "{label}: normalized quaternion is non-finite {normalized:?}"
+        ));
+    }
+    // Also require the f32 SE3 conversion (layout used after write-back) to be
+    // finite; do not rely on Rigid3::to_se3 silently substituting identity.
+    validate_se3_pose(rigid.to_se3(), label)
+}
+
+fn validate_candidate_poses(reconstruction: &Reconstruction) -> Result<(), String> {
+    for (image, pose) in reconstruction.poses.iter().enumerate() {
+        if let Some(pose) = pose {
+            validate_se3_pose(*pose, &format!("image pose {image}"))?;
+        }
+    }
+    for (frame_idx, frame) in reconstruction.frames.iter().enumerate() {
+        validate_rigid3_pose(
+            &frame.rig_from_world,
+            &format!("frame {frame_idx} rig_from_world"),
+        )?;
+    }
+    for rig in &reconstruction.rigs {
+        for sensor in &rig.sensors {
+            if let Some(rigid) = sensor.sensor_from_rig.as_ref() {
+                validate_rigid3_pose(
+                    rigid,
+                    &format!(
+                        "rig {} sensor {} sensor_from_rig",
+                        rig.rig_id, sensor.sensor_id.sensor_id
+                    ),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_validated_candidate(
     frames: &[ImageFrame],
     reconstruction: &Reconstruction,
@@ -1802,7 +2016,29 @@ fn build_validated_candidate(
         constant_point_filter,
     )?;
     let mut candidate = reconstruction.clone();
+    #[cfg(test)]
+    if let Some(tx) = super::commit_test_hooks::current()
+        .and_then(|hooks| hooks.seed_candidate_sensor_translation_x)
+    {
+        for rig in &mut candidate.rigs {
+            let ref_id = rig.ref_sensor_id.clone();
+            for sensor in &mut rig.sensors {
+                if ref_id.as_ref() == Some(&sensor.sensor_id) {
+                    continue;
+                }
+                let mut rigid = sensor
+                    .sensor_from_rig
+                    .clone()
+                    .unwrap_or_else(Rigid3::identity);
+                rigid.tvec[0] = tx;
+                sensor.sensor_from_rig = Some(rigid);
+            }
+        }
+    }
     apply_prepared_write_back(&mut candidate, prepared, frame_images, pose_blocks);
+    // Composition (frame ∘ sensor → image) can overflow even when each operand
+    // was individually finite; validate the final derived poses before errors.
+    validate_candidate_poses(&candidate)?;
     refresh_point_errors_checked(frames, &mut candidate)?;
     Ok(candidate)
 }
@@ -2624,6 +2860,9 @@ mod tests {
                     force_ceres_usable: Some(false),
                     force_termination: Some(BundleAdjustmentTerminationType::Failure),
                     corrupt_first_camera_param: None,
+                    corrupt_first_pose_translation_x: None,
+                    corrupt_all_pose_translations_x: None,
+                    seed_candidate_sensor_translation_x: None,
                     cancel_before_commit: false,
                 },
             ),
@@ -2633,6 +2872,9 @@ mod tests {
                     force_ceres_usable: Some(false),
                     force_termination: Some(BundleAdjustmentTerminationType::UserFailure),
                     corrupt_first_camera_param: None,
+                    corrupt_first_pose_translation_x: None,
+                    corrupt_all_pose_translations_x: None,
+                    seed_candidate_sensor_translation_x: None,
                     cancel_before_commit: false,
                 },
             ),
@@ -2642,6 +2884,9 @@ mod tests {
                     force_ceres_usable: Some(true),
                     force_termination: Some(BundleAdjustmentTerminationType::Convergence),
                     corrupt_first_camera_param: Some(f64::NAN),
+                    corrupt_first_pose_translation_x: None,
+                    corrupt_all_pose_translations_x: None,
+                    seed_candidate_sensor_translation_x: None,
                     cancel_before_commit: false,
                 },
             ),
@@ -2651,6 +2896,9 @@ mod tests {
                     force_ceres_usable: Some(true),
                     force_termination: Some(BundleAdjustmentTerminationType::NoConvergence),
                     corrupt_first_camera_param: Some(f64::INFINITY),
+                    corrupt_first_pose_translation_x: None,
+                    corrupt_all_pose_translations_x: None,
+                    seed_candidate_sensor_translation_x: None,
                     cancel_before_commit: false,
                 },
             ),
@@ -2660,6 +2908,9 @@ mod tests {
                     force_ceres_usable: Some(true),
                     force_termination: Some(BundleAdjustmentTerminationType::UserSuccess),
                     corrupt_first_camera_param: Some(-1.0),
+                    corrupt_first_pose_translation_x: None,
+                    corrupt_all_pose_translations_x: None,
+                    seed_candidate_sensor_translation_x: None,
                     cancel_before_commit: false,
                 },
             ),
@@ -2669,6 +2920,9 @@ mod tests {
                     force_ceres_usable: Some(true),
                     force_termination: Some(BundleAdjustmentTerminationType::Convergence),
                     corrupt_first_camera_param: Some(3.0e38),
+                    corrupt_first_pose_translation_x: None,
+                    corrupt_all_pose_translations_x: None,
+                    seed_candidate_sensor_translation_x: None,
                     cancel_before_commit: false,
                 },
             ),
@@ -2737,6 +2991,9 @@ mod tests {
                 force_ceres_usable: Some(false),
                 force_termination: Some(BundleAdjustmentTerminationType::Failure),
                 corrupt_first_camera_param: Some(3.0e38),
+                corrupt_first_pose_translation_x: None,
+                corrupt_all_pose_translations_x: None,
+                seed_candidate_sensor_translation_x: None,
                 cancel_before_commit: false,
             },
             None,
@@ -2744,6 +3001,125 @@ mod tests {
         .expect("report");
         assert!(!report.is_solution_usable());
         assert_ba_state_unchanged(&before, &reconstruction);
+    }
+
+    #[test]
+    fn candidate_rejects_nonfinite_composed_frame_sensor_pose() {
+        let (frames, reconstruction) = non_identity_multi_camera_scene();
+        let mut reconstruction = reconstruction;
+        reconstruction.rigs[0].sensors[1].sensor_from_rig = Some(Rigid3::from_se3(
+            SE3::from_quat_translation(Quat::identity(), Vec3::new(3.0e38, 0.0, 0.0)),
+        ));
+        reconstruction.points[0].track.retain(|obs| obs.image == 1);
+        let poses = variable_pose_blocks(&reconstruction, None, &[], &[], false);
+        let parameters = vec![vec![0.0, 0.0, 0.0, 1.0, 3.0e38, 0.0, 0.0]];
+        let storage = HashMap::from([(0usize, 0usize)]);
+        let registry = HashMap::from([(PoseEntityKey::Frame(0), 0usize)]);
+        let frame_images = HashMap::from([(0usize, vec![0usize, 1usize])]);
+        let candidate = build_validated_candidate(
+            &frames,
+            &reconstruction,
+            &parameters,
+            &storage,
+            &registry,
+            &frame_images,
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+            &HashSet::new(),
+            &poses,
+        );
+        assert!(
+            candidate.is_err(),
+            "non-finite composed pose must be rejected before install: {candidate:?}"
+        );
+    }
+
+    #[test]
+    fn usable_solve_rejects_nonfinite_composed_pose_without_partial_write() {
+        let (frames, mut reconstruction) = non_identity_multi_camera_scene();
+        let before = snapshot_ba_state(&reconstruction);
+        let report = solve_with_hooks(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 5,
+                refine_focal_length: true,
+                variable_images: Some(vec![0, 1]),
+                // Both images share one frame; keeping image 0 constant would
+                // drop the entire frame (and sensor) from the pose registry.
+                constant_images: Vec::new(),
+                gauge: BundleAdjustmentGauge::None,
+                ..BundleAdjustmentOptions::default()
+            },
+            BaCommitTestHooks {
+                force_ceres_usable: Some(true),
+                force_termination: Some(BundleAdjustmentTerminationType::Convergence),
+                corrupt_first_camera_param: None,
+                // Finite frame translation 3e38 plus seeded sensor 3e38 compose
+                // to Inf; usable Convergence must still reject install.
+                corrupt_first_pose_translation_x: Some(3.0e38),
+                corrupt_all_pose_translations_x: None,
+                seed_candidate_sensor_translation_x: Some(3.0e38),
+                cancel_before_commit: false,
+            },
+            None,
+        )
+        .expect("report");
+        assert!(
+            !report.is_solution_usable(),
+            "usable solver summary must not install a non-finite composed candidate"
+        );
+        assert_eq!(
+            report.termination_type,
+            BundleAdjustmentTerminationType::Failure
+        );
+        assert_ba_state_unchanged(&before, &reconstruction);
+    }
+
+    #[test]
+    fn candidate_error_refresh_rejects_nonfinite_camera_coordinates() {
+        let pose = SE3::from_quat_translation(Quat::identity(), Vec3::new(f32::INFINITY, 0.0, 0.0));
+        let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let err = project_point_for_candidate_error(camera, pose, [0.0, 0.0, 2.0], 0, 0, 0);
+        assert!(
+            err.is_err(),
+            "non-finite camera coordinates must fail candidate error refresh: {err:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_error_refresh_skips_finite_behind_camera_geometry() {
+        let pose = SE3::identity();
+        let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let projected = project_point_for_candidate_error(camera, pose, [0.0, 0.0, -2.0], 0, 0, 0)
+            .expect("behind-camera must remain a geometric skip, not a numerical failure");
+        assert!(projected.is_none());
+
+        let (frames, mut reconstruction) = trivial_single_observation_scene();
+        reconstruction.points[0].xyz = [0.0, 0.0, -2.0];
+        let before_error = reconstruction.points[0].error;
+        refresh_point_errors_checked(&frames, &mut reconstruction)
+            .expect("finite behind-camera observations must not reject the candidate");
+        assert_eq!(
+            reconstruction.points[0].error.to_bits(),
+            before_error.to_bits(),
+            "skipped geometric observations must retain the prior finite error"
+        );
+    }
+
+    #[test]
+    fn candidate_error_refresh_rejects_projection_overflow_returning_none() {
+        // Finite depth with extreme lateral offset: f64 projection stays finite
+        // but overflows f32. That must fail candidate validation (same as a
+        // finite2-filtered None from Inf image coords).
+        let pose = SE3::identity();
+        let camera = CameraModel::new_pinhole(100, 100, 50.0, 50.0, 50.0, 50.0);
+        let err = project_point_for_candidate_error(camera, pose, [3.0e38, 0.0, 1.0], 0, 0, 0);
+        assert!(
+            err.is_err(),
+            "projection overflow must reject the candidate: {err:?}"
+        );
     }
 
     #[test]
@@ -2763,6 +3139,9 @@ mod tests {
                 force_ceres_usable: Some(true),
                 force_termination: Some(BundleAdjustmentTerminationType::Convergence),
                 corrupt_first_camera_param: None,
+                corrupt_first_pose_translation_x: None,
+                corrupt_all_pose_translations_x: None,
+                seed_candidate_sensor_translation_x: None,
                 cancel_before_commit: true,
             },
             Some(&control),
@@ -2791,6 +3170,9 @@ mod tests {
                 force_ceres_usable: Some(true),
                 force_termination: Some(BundleAdjustmentTerminationType::NoConvergence),
                 corrupt_first_camera_param: None,
+                corrupt_first_pose_translation_x: None,
+                corrupt_all_pose_translations_x: None,
+                seed_candidate_sensor_translation_x: None,
                 cancel_before_commit: false,
             },
             None,
@@ -2824,6 +3206,9 @@ mod tests {
                 force_ceres_usable: Some(true),
                 force_termination: Some(BundleAdjustmentTerminationType::UserSuccess),
                 corrupt_first_camera_param: None,
+                corrupt_first_pose_translation_x: None,
+                corrupt_all_pose_translations_x: None,
+                seed_candidate_sensor_translation_x: None,
                 cancel_before_commit: false,
             },
             None,

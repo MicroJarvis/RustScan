@@ -164,8 +164,9 @@ cannot observe different intrinsics for the same `CameraModel`.
 ## T5 — Make Bundle Adjustment State Updates Atomic
 
 **Status:** review_ready on `agent/RS-2026-004/t5-atomic-ba` (base
-`701d051814a29ab3ee4fbefc01355112f71b5a47`; prior tip `3422fff` CHANGES_REQUESTED
-by `review-t5-2026-09-23.md`; remediation awaiting independent re-review).
+`701d051814a29ab3ee4fbefc01355112f71b5a47`; `review-t5-2026-09-23.md` and
+`review-t5-2026-09-24.md` CHANGES_REQUESTED retained; composed-pose remediation
+awaiting independent re-review).
 
 **Dependencies:** T0  
 **Primary scope:** `rustscan-sfm/src/ba/`,
@@ -192,6 +193,11 @@ by `review-t5-2026-09-23.md`; remediation awaiting independent re-review).
 - [x] Review P2: move fault injection to `cfg(test)` `commit_test_hooks`; remove
       production `BaCommitTestOverride` / options fields; shrink
       `should_commit_ba_solution` to `pub(crate)`.
+- [x] Review 2026-09-24 P1: validate composed image/frame/sensor poses after
+      write-back (finite translation/rotation, valid normalized quaternion);
+      distinguish behind-camera geometric skips from non-finite/overflow
+      projection failures in `refresh_point_errors_checked`; composed-pose and
+      projection regressions on the real candidate/commit path.
 
 **Exit condition:** every rejected BA result is observationally atomic and is
 never reported as a successful global BA round.
