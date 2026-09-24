@@ -12,7 +12,8 @@ This change was migrated from a historical RustGS remediation plan on 2026-09-19
 | Prior reviewed commit | `f5dbf678362bdc7e2e45e16661488b29d97371dd` |
 | R01–R03 commit | `1c11e938eedd8efb66aa37a0d9fbf894a9f9c09f` |
 | R04–R09 commit | `311cd1775a40ae25546f3976f56b8eaaa663b1b0` |
-| Clippy/docs follow-up | see branch tip `git rev-parse HEAD` (docs-only after `3bf9b84644c81f66766d1644658afc4bd9fa02a3`) |
+| Branch tip (handoff) | recorded in commit message / `git rev-parse HEAD` |
+| Code package tip | `3bf9b84644c81f66766d1644658afc4bd9fa02a3` |
 
 C1 capacity guards, WGSL explicit branches, and C3 workspace ownership are preserved. Do not start C5–C8 from this worktree.
 
