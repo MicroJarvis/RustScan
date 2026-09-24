@@ -54,10 +54,12 @@ safety points. Snapshots are captured only when the just-confirmed iteration
 equals the labeled cadence point, so the exported model matches the iteration
 number (no coalesced historical labels on a later model).
 
-**Config continuity fingerprint (R02):** Resume identity hashes training
-continuity fields only. `iterations` is zeroed and nested `profiler` is omitted
-so legacy checkpoints and profiler-only toggles remain restorable; optimizer /
-loss / topology / data / raster / litegs changes still mismatch.
+**Config continuity fingerprint (R02):** Resume identity uses the historical
+`701d051` serialization rule: struct-order JSON of a continuity-shaped view
+(`iterations=0`, no `profiler`). Do not hash via `serde_json::Value` (BTreeMap
+key order). Profiler-only toggles remain restorable; optimizer / loss / topology
+/ data / raster / litegs changes still mismatch.
+
 
 ## Profiler contracts (C4 / R04–R08 remediations)
 
@@ -83,3 +85,13 @@ accepted samples. Fault injection uses the production
 
 **R08 — validator:** Unsupported reports must set `measurement_success=false`.
 Illegal combinations are rejected after JSON round-trip as well as in-memory.
+
+
+**Round-3 R07 — live GPU health:** After resolve panic, health is probed with a
+tiny tensor write/readback on the training device (not cached properties /
+allocator stats). Unhealthy or inconclusive ⇒ `TrainingError::Gpu`. Destroyed
+isolated-device regression runs in a child process without force-bool bypass.
+
+**Round-3 R04 — debug profile gate:** `profile_step` requires
+`profiler.enabled` in addition to Debug log + cadence; debug
+`into_scalar_async` readbacks and `step_started_at` are skipped when disabled.

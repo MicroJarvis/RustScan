@@ -5,21 +5,20 @@ source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
 fix_branch: "fix/rs-2026-002-c1-c4-review"
-head_sha: "6bfab3ae491a2f7de7f5310ac2f0ad4719bce9b7"
+head_sha: "PENDING"
 cards:
   C1:
     status: implemented_pending_maintainer_review
     notes: "capacity guards + WGSL explicit branches preserved"
   C2:
     status: implemented_pending_rereview
-    head_sha: "1c11e93"
-    notes: "R01 late-pause sync; R02 profiler omitted from continuity fingerprint; R03 exact snapshot cadence"
+    notes: "R01/R03 retained; R02 round-3 historical struct-order fingerprint"
   C3:
     status: implemented_pending_maintainer_review
     notes: "prefix-sum workspace ownership preserved"
   C4:
     status: implemented_pending_rereview
-    notes: "R04 Instant skip; R06 split forward series; R07 resolve catch_unwind; R08 validator; prior R01–R09 retained"
+    notes: "R04 debug gate; R07 live GPU health; R06/R08 retained"
   C5:
     status: not_started
   C6:
@@ -31,16 +30,13 @@ cards:
 scope:
   - rustscan-gs/src/training
   - rustscan-gs/tests
-  - rustscan-gs/src/bin/rustgs
   - docs/agent/changes/RS-2026-002-rustgs-training-pipeline-remediation
 out_of_scope:
   - rustsfm
   - rust-viewer
   - C5-C8 implementation
 acceptance:
-  - "All completion gates in tasks.md have code, test, and artifact evidence."
-  - "No unchecked task is described as complete without evidence."
-  - "Independent re-review of round-2 R04/R06/R07/R08 before merge."
+  - "Independent re-review of round-3 R02/R07/R04 before merge."
 verification:
   - "cargo fmt --all -- --check"
   - "cargo check --workspace --all-targets"

@@ -17,8 +17,8 @@ use crate::training::gpu_primitives::device_radix::{
 };
 use crate::training::gpu_primitives::prefix_sum::{prefix_sum_dispatch_count, PrefixSumWorkspace};
 use crate::training::reporting::gpu_profiler::{
-    probe_training_device, profile_device_gpu_step, profiling_instant, runtime_device_bytes_in_use,
-    should_profile_gpu, span, CpuSpanTimer, PipelineTimingCollector,
+    note_debug_profile_readback, probe_training_device, profile_device_gpu_step, profiling_instant,
+    runtime_device_bytes_in_use, should_profile_gpu, span, CpuSpanTimer, PipelineTimingCollector,
 };
 use crate::training::reporting::metrics::{
     step_intersection_overflowed, ParityLossCurveSample, ParityTopologyMetrics,
@@ -874,17 +874,21 @@ impl WgpuTrainer {
 
         self.prefix_sum_workspace.begin_step();
 
-        let profile_step = log::log_enabled!(log::Level::Debug)
+        let profiler_on = self.config.profiler.enabled;
+        // Debug-only sync profiling is gated by the same profiler.enabled switch.
+        let profile_step = profiler_on
+            && log::log_enabled!(log::Level::Debug)
             && (iteration <= 3 || iteration.is_multiple_of(100));
-        let step_started_at = Instant::now();
+        let step_started_at = profile_step.then(Instant::now);
         let (width, height) = image_dims;
         let background = [0.0, 0.0, 0.0];
-        let target_ready_elapsed = step_started_at.elapsed();
+        let target_ready_elapsed = step_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
 
         let active_sh_degree = self.active_sh_degree_at(iteration, splats.sh_degree);
         self.telemetry.active_sh_degree = Some(active_sh_degree as usize);
 
-        let profiler_on = self.config.profiler.enabled;
         let forward_cpu = profiling_instant(profiler_on);
         let profile_gpu = profiler_on
             && self.config.profiler.gpu_timing_enabled
@@ -987,6 +991,7 @@ impl WgpuTrainer {
         // the same-step mutation_gate clear. Loss/backward/Adam/topology consult the
         // device status buffer directly — no mid-step host-mirror branch.
         let forward_elapsed = if profile_step {
+            note_debug_profile_readback();
             let started = Instant::now();
             let _ = rendered
                 .image
@@ -1050,6 +1055,7 @@ impl WgpuTrainer {
                 Tensor::<GsBackendBase, 2>::zeros([splats.num_splats(), 7], &self.device)
             });
         let backward_elapsed = if profile_step {
+            note_debug_profile_readback();
             let started = Instant::now();
             let _ = transforms_grad
                 .clone()
@@ -1125,6 +1131,7 @@ impl WgpuTrainer {
                 .record_span(span::OPTIMIZER, started.elapsed());
         }
         let optimizer_elapsed = if profile_step {
+            note_debug_profile_readback();
             let started = Instant::now();
             let _ = splats
                 .transforms
@@ -1141,6 +1148,9 @@ impl WgpuTrainer {
         };
 
         if profile_step {
+            let total_so_far = step_started_at
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
             log::debug!(
                 "WGPU train profile step {} | target={:.3}ms | forward_sync={:.3}ms | loss_sync={:.3}ms | backward_sync={:.3}ms | optimizer_sync={:.3}ms | total_so_far={:.3}ms",
                 iteration,
@@ -1149,7 +1159,7 @@ impl WgpuTrainer {
                 0.0,
                 backward_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
                 optimizer_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
-                step_started_at.elapsed().as_secs_f64() * 1000.0,
+                total_so_far.as_secs_f64() * 1000.0,
             );
         }
 
@@ -5075,6 +5085,78 @@ mod tests {
             "disabled profiler must not create profiling Instant/CpuSpanTimer"
         );
         assert_report_self_consistent(profiler).expect("disabled self-consistent");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn profiler_disabled_with_debug_log_skips_profile_readbacks() {
+        use crate::training::reporting::gpu_profiler::{
+            take_debug_profile_readbacks, take_profiling_instant_creations,
+        };
+        use std::sync::{Mutex, OnceLock};
+
+        struct CapturingLogger;
+        static LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        fn logs() -> &'static Mutex<Vec<String>> {
+            LOGS.get_or_init(|| Mutex::new(Vec::new()))
+        }
+        impl log::Log for CapturingLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Debug
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    logs()
+                        .lock()
+                        .expect("log lock")
+                        .push(format!("{}", record.args()));
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: CapturingLogger = CapturingLogger;
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Debug);
+        logs().lock().expect("log lock").clear();
+        let _ = take_debug_profile_readbacks();
+        let _ = take_profiling_instant_creations();
+
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 3;
+        config.profiler.enabled = false;
+        config.profiler.gpu_timing_enabled = false;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+        for iteration in 1..=3 {
+            trainer
+                .train_step(
+                    &mut splats,
+                    &camera,
+                    fault_injection_target(&device, 0.4),
+                    (8, 8),
+                    iteration,
+                    1,
+                    false,
+                    false,
+                )
+                .await
+                .expect("train step with debug+disabled profiler");
+        }
+
+        let captured = logs().lock().expect("log lock").clone();
+        assert!(
+            captured
+                .iter()
+                .all(|line| !line.contains("WGPU train profile step")),
+            "debug profile lines must not run when profiler.enabled=false; got {captured:?}"
+        );
+        assert_eq!(
+            take_debug_profile_readbacks(),
+            0,
+            "into_scalar_async profiling readbacks must not run when profiler disabled"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

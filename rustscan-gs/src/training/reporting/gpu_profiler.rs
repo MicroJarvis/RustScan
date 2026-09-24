@@ -664,6 +664,24 @@ pub fn take_profiling_instant_creations() -> u64 {
     PROFILING_INSTANT_CREATIONS.with(|c| c.replace(0))
 }
 
+#[cfg(test)]
+thread_local! {
+    static DEBUG_PROFILE_READBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count a debug-only `into_scalar_async` profiling readback (test observability).
+#[inline]
+pub fn note_debug_profile_readback() {
+    #[cfg(test)]
+    DEBUG_PROFILE_READBACKS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Test helper: return and clear debug profile readback count.
+#[cfg(test)]
+pub fn take_debug_profile_readbacks() -> u64 {
+    DEBUG_PROFILE_READBACKS.with(|c| c.replace(0))
+}
+
 /// Build environment probe from the actual training `GsDevice` / cubecl client.
 ///
 /// Adapter name/driver are resolved against the training client's backend and
@@ -821,19 +839,12 @@ pub enum ProfileFaultStage {
     End,
     /// Pretend resolve panicked while the device remains usable.
     Resolve,
-    /// Pretend resolve failed and the device is no longer usable.
-    ResolveDeviceUnavailable,
 }
 
 impl ProfileFaultStage {
     /// Injectable stages (excludes [`Self::None`]). Referenced so the API surface
     /// stays live for production-shared fault drills without silencing dead_code.
-    pub const INJECTABLE: &[Self] = &[
-        Self::Start,
-        Self::End,
-        Self::Resolve,
-        Self::ResolveDeviceUnavailable,
-    ];
+    pub const INJECTABLE: &[Self] = &[Self::Start, Self::End, Self::Resolve];
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -846,18 +857,49 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Whether the training client still answers basic queries after a measure fault.
+/// Whether the training device can still execute GPU work after a measure fault.
+///
+/// Cached `properties()` / host allocator stats are **not** sufficient. This probe
+/// runs a tiny tensor write/readback round-trip on the training device; panics or
+/// I/O failures mean the device is not usable for continued training. When health
+/// cannot be confirmed, returns `false` so callers surface [`crate::TrainingError::Gpu`].
 pub fn device_measurement_path_healthy(device: &crate::training::engine::GsDevice) -> bool {
-    use burn_cubecl::cubecl::Runtime;
-    use burn_wgpu::WgpuRuntime;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    catch_unwind(AssertUnwindSafe(|| {
-        let client = WgpuRuntime::client(device);
-        let _ = client.properties().timing_method;
-        let _ = client.memory_usage();
-    }))
-    .is_ok()
+    catch_unwind(AssertUnwindSafe(|| probe_device_executes_gpu_work(device))).unwrap_or(false)
+}
+
+fn probe_device_executes_gpu_work(device: &crate::training::engine::GsDevice) -> bool {
+    use burn::prelude::*;
+    use burn::tensor::TensorData;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use crate::training::engine::GsBackendBase;
+
+    // Force a device round-trip: host→GPU write then GPU→host readback.
+    let round_trip = catch_unwind(AssertUnwindSafe(|| {
+        let tensor = Tensor::<GsBackendBase, 1>::from_data(
+            TensorData::new(vec![0.125_f32, 0.25, 0.5], [3]),
+            device,
+        );
+        let data = burn_cubecl::cubecl::future::block_on(tensor.into_data_async())
+            .map_err(|error| format!("readback failed: {error}"))?;
+        let values = data
+            .into_vec::<f32>()
+            .map_err(|error| format!("typed readback failed: {error:?}"))?;
+        if values.len() != 3 {
+            return Err(format!("unexpected readback length {}", values.len()));
+        }
+        Ok::<_, String>(values)
+    }));
+    match round_trip {
+        Ok(Ok(values)) => {
+            (values[0] - 0.125).abs() < 1e-5
+                && (values[1] - 0.25).abs() < 1e-5
+                && (values[2] - 0.5).abs() < 1e-5
+        }
+        Ok(Err(_)) | Err(_) => false,
+    }
 }
 
 /// Resolve a cubecl profile duration into GPU milliseconds only for Device timing.
@@ -893,11 +935,13 @@ pub async fn resolve_device_gpu_ms(
 
 /// Finish a profiled step after work produced `output` and resolve completed
 /// (or failed). Shared by the live GPU path and fault-injection tests.
+///
+/// On resolve panic: if [`device_measurement_path_healthy`] confirms the device,
+/// drop the sample and continue; otherwise return [`crate::TrainingError::Gpu`].
 pub fn finish_profiled_output<T>(
     device: &crate::training::engine::GsDevice,
     output: T,
     resolve: Result<Option<f64>, ProfileMeasureError>,
-    force_device_unavailable: bool,
 ) -> Result<(T, Option<f64>, ProfileAttemptStats), crate::TrainingError> {
     let mut stats = ProfileAttemptStats::default();
     match resolve {
@@ -908,8 +952,7 @@ pub fn finish_profiled_output<T>(
             Ok((output, None, stats))
         }
         Err(ProfileMeasureError::ResolvePanic { message }) => {
-            let healthy = !force_device_unavailable && device_measurement_path_healthy(device);
-            if !healthy {
+            if !device_measurement_path_healthy(device) {
                 return Err(crate::TrainingError::Gpu(format!(
                     "GPU unavailable after profile resolve failure: {message}"
                 )));
@@ -1108,23 +1151,11 @@ where
                 Err(ProfileMeasureError::ResolvePanic {
                     message: "injected resolve failure".into(),
                 }),
-                false,
-            );
-        }
-        ProfileFaultStage::ResolveDeviceUnavailable => {
-            let output = work().await;
-            return finish_profiled_output(
-                device,
-                output,
-                Err(ProfileMeasureError::ResolvePanic {
-                    message: "injected resolve failure with device unavailable".into(),
-                }),
-                true,
             );
         }
         ProfileFaultStage::None => {
             // Keep INJECTABLE referenced in production code so fault stages stay live.
-            debug_assert_eq!(ProfileFaultStage::INJECTABLE.len(), 4);
+            debug_assert_eq!(ProfileFaultStage::INJECTABLE.len(), 3);
         }
     }
 
@@ -1163,7 +1194,7 @@ where
             match output {
                 Some(output) => {
                     let resolve = resolve_device_gpu_ms(profile).await;
-                    finish_profiled_output(device, output, resolve, false)
+                    finish_profiled_output(device, output, resolve)
                 }
                 None => Err(crate::TrainingError::TrainingFailed(
                     "gpu profile Ok without output: work closure did not store a result".into(),
@@ -1933,23 +1964,6 @@ mod tests {
         assert_eq!(stats.resolve_failures, 1);
         assert_eq!(stats.dropped_samples, 1);
         assert_eq!(runs.load(Ordering::SeqCst), 3);
-
-        let err = profile_device_gpu_step_with_fault(
-            &device,
-            || async {
-                runs.fetch_add(1, Ordering::SeqCst);
-                44_i32
-            },
-            ProfileFaultStage::ResolveDeviceUnavailable,
-        )
-        .await
-        .expect_err("device unavailable must be TrainingError::Gpu");
-        assert!(matches!(err, crate::TrainingError::Gpu(_)), "{err:?}");
-        assert_eq!(
-            runs.load(Ordering::SeqCst),
-            4,
-            "work still runs once before device error"
-        );
     }
 
     #[test]
@@ -1965,7 +1979,6 @@ mod tests {
             Err(ProfileMeasureError::ResolvePanic {
                 message: "map failed".into(),
             }),
-            false,
         )
         .expect("healthy device drops sample");
         assert_eq!(out, 7);
@@ -1977,6 +1990,117 @@ mod tests {
         assert_eq!(report.sample_count, 1);
         assert_eq!(report.profile_resolve_failures, 1);
         assert_eq!(report.dropped_profile_samples, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn destroyed_isolated_device_fails_health_without_force_flag() {
+        // Run the destructive probe in an isolated child process so cubecl/wgpu
+        // teardown after `Device::destroy` cannot abort the parent test binary.
+        if std::env::var_os("RUSTGS_DESTROY_DEVICE_WORKER").is_none() {
+            let exe = std::env::current_exe().expect("current test exe");
+            let output = std::process::Command::new(exe)
+                .env("RUSTGS_DESTROY_DEVICE_WORKER", "1")
+                .env("RUST_BACKTRACE", "0")
+                .args([
+                    "--exact",
+                    "training::reporting::gpu_profiler::tests::destroyed_isolated_device_fails_health_without_force_flag",
+                    "--nocapture",
+                ])
+                .output()
+                .expect("spawn destroyed-device worker");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "destroyed-device worker failed status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.contains("DESTROYED_DEVICE_WORKER_OK"),
+                "worker missing success marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+
+        use burn_wgpu::{init_device, RuntimeOptions, WgpuSetup};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Build an isolated wgpu device owned by this worker (not the shared default).
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .expect("adapter for destroyed-device probe");
+        let (raw_device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .expect("wgpu device");
+        let backend = adapter.get_info().backend;
+        let setup = WgpuSetup {
+            instance,
+            adapter,
+            device: raw_device.clone(),
+            queue,
+            backend,
+        };
+        let gs_device = init_device(
+            setup,
+            RuntimeOptions {
+                memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
+                ..RuntimeOptions::default()
+            },
+        );
+
+        assert!(
+            device_measurement_path_healthy(&gs_device),
+            "fresh isolated device must pass the live GPU probe"
+        );
+
+        let runs = AtomicUsize::new(0);
+        let (out, ms, stats) = finish_profiled_output(
+            &gs_device,
+            {
+                runs.fetch_add(1, Ordering::SeqCst);
+                42_i32
+            },
+            Err(ProfileMeasureError::ResolvePanic {
+                message: "injected resolve on healthy device".into(),
+            }),
+        )
+        .expect("healthy device: measurement-only failure continues");
+        assert_eq!(out, 42);
+        assert!(ms.is_none());
+        assert_eq!(stats.resolve_failures, 1);
+        assert_eq!(stats.dropped_samples, 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "work must not re-run");
+
+        raw_device.destroy();
+        let _ = raw_device.poll(wgpu::PollType::Poll);
+
+        assert!(
+            !device_measurement_path_healthy(&gs_device),
+            "destroyed device must fail the live GPU probe"
+        );
+        let err = finish_profiled_output(
+            &gs_device,
+            99_i32,
+            Err(ProfileMeasureError::ResolvePanic {
+                message: "injected resolve after destroy".into(),
+            }),
+        )
+        .expect_err("destroyed device must return TrainingError::Gpu");
+        match &err {
+            crate::TrainingError::Gpu(message) => {
+                assert!(
+                    message.contains("unavailable") || message.contains("resolve"),
+                    "unexpected gpu error text: {message}"
+                );
+            }
+            other => panic!("expected TrainingError::Gpu, got {other:?}"),
+        }
+        println!("DESTROYED_DEVICE_WORKER_OK");
+        // Skip destructors that would touch the destroyed device / TLS.
+        std::process::exit(0);
     }
 
     #[test]
