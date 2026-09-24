@@ -1853,6 +1853,8 @@ fn project_point_for_candidate_error(
     image: usize,
     feature: usize,
 ) -> Result<Option<[f64; 2]>, String> {
+    use crate::types::CameraProjectionOutcome;
+
     let p = pose.transform_point(&point);
     let u = p[0] as f64;
     let v = p[1] as f64;
@@ -1873,8 +1875,8 @@ fn project_point_for_candidate_error(
             "point {point_id} observation ({image},{feature}) normalized camera coords overflow ({uu}, {vv})"
         ));
     }
-    match camera.img_from_cam_unchecked(u, v, w) {
-        Some(xy) => {
+    match camera.classify_img_from_cam_unchecked(u, v, w) {
+        CameraProjectionOutcome::FiniteProjection(xy) => {
             // Residual refresh narrows to f32; reject overflow here instead of
             // letting a later cast silently become Inf after a Some(...) path.
             let xy_f32 = [xy[0] as f32, xy[1] as f32];
@@ -1886,25 +1888,11 @@ fn project_point_for_candidate_error(
             }
             Ok(Some(xy))
         }
-        None => {
-            // finite2 filters Inf/NaN image coords to None; also models may
-            // reject finite points outside their domain. Treat perspective
-            // overflow as numerical failure; otherwise keep geometric skip.
-            let trial_x = camera.fx() as f64 * uu + camera.cx() as f64;
-            let trial_y = camera.fy() as f64 * vv + camera.cy() as f64;
-            if !trial_x.is_finite() || !trial_y.is_finite() {
-                return Err(format!(
-                    "point {point_id} observation ({image},{feature}) projection overflows ({trial_x}, {trial_y})"
-                ));
-            }
-            let trial_f32 = [trial_x as f32, trial_y as f32];
-            if trial_f32.iter().any(|value| !value.is_finite()) {
-                return Err(format!(
-                    "point {point_id} observation ({image},{feature}) projection overflows f32 ({trial_x}, {trial_y})"
-                ));
-            }
-            Ok(None)
-        }
+        CameraProjectionOutcome::FiniteGeometricDomainSkip => Ok(None),
+        CameraProjectionOutcome::NonFiniteProjection => Err(format!(
+            "point {point_id} observation ({image},{feature}) projection is non-finite for camera model {}",
+            camera.model_id
+        )),
     }
 }
 
@@ -3120,6 +3108,127 @@ mod tests {
             err.is_err(),
             "projection overflow must reject the candidate: {err:?}"
         );
+    }
+
+    #[test]
+    fn candidate_error_refresh_rejects_simple_radial_distortion_overflow() {
+        let camera = CameraModel::from_colmap(
+            crate::types::COLMAP_SIMPLE_RADIAL,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 1e308],
+        )
+        .expect("finite extreme radial camera");
+        assert!(
+            camera.img_from_cam_unchecked(2.0, 0.0, 1.0).is_none(),
+            "actual distorted projection must overflow"
+        );
+        assert_eq!(
+            camera.classify_img_from_cam_unchecked(2.0, 0.0, 1.0),
+            crate::types::CameraProjectionOutcome::NonFiniteProjection
+        );
+        let err =
+            project_point_for_candidate_error(camera, SE3::identity(), [2.0, 0.0, 1.0], 0, 0, 0);
+        assert!(
+            err.is_err(),
+            "numeric distortion failure must not be classified as geometric skip: {err:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_error_refresh_skips_finite_division_domain_rejection() {
+        let camera = CameraModel::from_colmap(
+            crate::types::COLMAP_SIMPLE_DIVISION,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 10.0],
+        )
+        .expect("division camera");
+        assert_eq!(
+            camera.classify_img_from_cam_unchecked(10.0, 0.0, 1.0),
+            crate::types::CameraProjectionOutcome::FiniteGeometricDomainSkip
+        );
+        let projected =
+            project_point_for_candidate_error(camera, SE3::identity(), [10.0, 0.0, 1.0], 0, 0, 0)
+                .expect("finite geometric domain rejection must remain a skip");
+        assert!(projected.is_none());
+    }
+
+    #[test]
+    fn candidate_error_refresh_rejects_opencv_distortion_overflow() {
+        let camera = CameraModel::from_colmap(
+            crate::types::COLMAP_OPENCV,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 50.0, 1e308, 0.0, 0.0, 0.0],
+        )
+        .expect("finite extreme opencv camera");
+        assert_eq!(
+            camera.classify_img_from_cam_unchecked(2.0, 0.0, 1.0),
+            crate::types::CameraProjectionOutcome::NonFiniteProjection
+        );
+        let err =
+            project_point_for_candidate_error(camera, SE3::identity(), [2.0, 0.0, 1.0], 0, 0, 0);
+        assert!(
+            err.is_err(),
+            "opencv distortion overflow must reject: {err:?}"
+        );
+    }
+
+    #[test]
+    fn usable_solve_rejects_radial_distortion_overflow_without_partial_write() {
+        let (mut frames, mut reconstruction) = trivial_single_observation_scene();
+        // Start from a finite SIMPLE_RADIAL model; inject extreme k after the
+        // usable solve (same pattern as finite_focal_infinite_point_error).
+        let radial = CameraModel::from_colmap(
+            crate::types::COLMAP_SIMPLE_RADIAL,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 0.0],
+        )
+        .expect("finite radial camera");
+        reconstruction.camera = radial;
+        reconstruction.cameras = vec![radial];
+        // Point [2,0,1] projects to (150,50) with k=0; keep the observation
+        // inside max_observation_error_px so the residual is included.
+        reconstruction.points[0].xyz = [2.0, 0.0, 1.0];
+        frames[0].keypoints[0] = KeyPoint::new(150.0, 50.0);
+        reconstruction.keypoints[0][0] = KeyPoint::new(150.0, 50.0);
+        let before = snapshot_ba_state(&reconstruction);
+        let report = solve_with_hooks(
+            &frames,
+            &mut reconstruction,
+            BundleAdjustmentOptions {
+                iterations: 5,
+                allow_single_observation_points: true,
+                constant_images: vec![0],
+                constant_point_ids: Some(vec![0]),
+                // Only the distortion (extra) block is free, so
+                // corrupt_first_camera_param targets k rather than focal.
+                refine_extra_params: true,
+                ..BundleAdjustmentOptions::default()
+            },
+            BaCommitTestHooks {
+                force_ceres_usable: Some(true),
+                force_termination: Some(BundleAdjustmentTerminationType::Convergence),
+                corrupt_first_camera_param: Some(1e308),
+                corrupt_first_pose_translation_x: None,
+                corrupt_all_pose_translations_x: None,
+                seed_candidate_sensor_translation_x: None,
+                cancel_before_commit: false,
+            },
+            None,
+        )
+        .expect("report");
+        assert!(
+            !report.is_solution_usable(),
+            "usable solver summary must not install a non-finite distortion candidate"
+        );
+        assert_eq!(
+            report.termination_type,
+            BundleAdjustmentTerminationType::Failure
+        );
+        assert_ba_state_unchanged(&before, &reconstruction);
     }
 
     #[test]

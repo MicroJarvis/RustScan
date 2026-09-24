@@ -1039,8 +1039,8 @@ branch to `main`.
 
 ### T5 — Atomic BA
 
-Status: review_ready (remediation after `review-t5-2026-09-24.md` CHANGES_REQUESTED).
-Awaiting independent re-review.
+Status: review_ready (remediation after `review-t5-2026-09-24-final.md`
+CHANGES_REQUESTED). Awaiting independent re-review.
 
 Owner: `cursor-agent`
 
@@ -1052,69 +1052,73 @@ Prior tips / reviews (retained):
 - `3422fff` / `review-t5-2026-09-23.md` — CHANGES_REQUESTED (point-error /
   filter / production hooks); addressed in `08889a8`.
 - `5593e69` / `review-t5-2026-09-24.md` — CHANGES_REQUESTED (composed pose /
-  projection None handling).
+  projection None handling); addressed in `b556e94` / `2647492`.
+- `2647492` / `review-t5-2026-09-24-final.md` — CHANGES_REQUESTED (distorted
+  projection misclassified via pinhole trial).
 
-Remediation code commit for 2026-09-24: this handoff commit (see git log;
-do not churn docs solely to self-reference HEAD).
+Remediation code commit for 2026-09-24-final: this handoff commit (see git
+log; do not churn docs solely to self-reference HEAD).
 
 Branch: `agent/RS-2026-004/t5-atomic-ba`
 
 Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t5-atomic-ba`
 
-Changed files (2026-09-24 remediation):
+Changed files (2026-09-24-final remediation):
 
-- `rustscan-sfm/src/ba/mod.rs`
+- `rustscan-sfm/src/core/types.rs`
 - `rustscan-sfm/src/ba/ceres_problem.rs`
 - `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
 - `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
 - `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
-- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/review-t5-2026-09-24.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/review-t5-2026-09-24-final.md`
 
-#### 2026-09-24 finding addressed
+#### 2026-09-24-final finding addressed
 
-After `apply_prepared_write_back`, `validate_candidate_poses` checks every
-image SE3 and frame/sensor `Rigid3` for finite translation/rotation and a
-finite non-degenerate normalized quaternion before error refresh. Composition
-of finite `3e38` frame + sensor translations that overflows to Inf is rejected.
+`CameraProjectionOutcome` and `CameraModel::classify_img_from_cam_unchecked`
+classify each supported COLMAP model without a pinhole trial:
 
-`project_point_for_candidate_error` distinguishes:
+- `FiniteProjection([f64; 2])` — finite image coords
+- `FiniteGeometricDomainSkip` — finite behind-camera policy at the BA layer,
+  or in-model finite domain rejection (division discriminant, EUCM denom)
+- `NonFiniteProjection` — distortion/covariance/projection intermediate or
+  final NaN/Inf (including SIMPLE_RADIAL / OPENCV / fisheye)
 
-- finite behind-camera / geometric domain → skip (prior finite error retained)
-- non-finite camera coords, normalized-coord overflow, f64/f32 projection
-  overflow, or Inf/NaN image coords → candidate `Err`
-
-Usable NoConvergence/UserSuccess, cancel-before-commit, BA-abort filter skip,
-and cfg(test)-only hooks are unchanged. Cleared non-test `unused_mut` on
-`parameters` / `ceres_usable` via cfg-scoped shadowing (no lint allow).
+`project_point_for_candidate_error` matches on that outcome. Distortion
+overflow is `Err` and invalidates the candidate before `install_ba_candidate`.
+Finite behind-camera and domain skips remain `Ok(None)` and keep the prior
+finite `point.error`. Usable NoConvergence/UserSuccess, cancel-before-commit,
+BA-abort filter skip, and cfg(test)-only hooks are unchanged.
 
 #### New regressions
 
-- `candidate_rejects_nonfinite_composed_frame_sensor_pose` (review probe)
-- `usable_solve_rejects_nonfinite_composed_pose_without_partial_write`
-- `candidate_error_refresh_rejects_nonfinite_camera_coordinates`
-- `candidate_error_refresh_rejects_projection_overflow_returning_none`
-- `candidate_error_refresh_skips_finite_behind_camera_geometry`
+- `classify_img_from_cam_distinguishes_distortion_overflow_from_domain_skip`
+- `candidate_error_refresh_rejects_simple_radial_distortion_overflow`
+  (review repro: SIMPLE_RADIAL `[50,50,50,1e308]`, point `[2,0,1]`)
+- `candidate_error_refresh_rejects_opencv_distortion_overflow`
+- `candidate_error_refresh_skips_finite_division_domain_rejection`
+- `usable_solve_rejects_radial_distortion_overflow_without_partial_write`
+  (usable Convergence + post-solve k inject; live Reconstruction bitwise
+  unchanged)
 
-Probe evidence: `artifacts/runs/t5-independent-rereview-20260924/`.
+Prior composed-pose, behind-camera skip, f32 overflow, and cancel-before-commit
+tests retained. Focused: `ba::ceres_problem::tests` 31 passed.
 
 Commands with `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
 and `CARGO_TERM_COLOR=never` (this remediation):
 
 - `cargo fmt --all -- --check`: pass.
-- `cargo check --workspace --all-targets`: pass; prior `unused_mut` on
-  `parameters` / `ceres_usable` in `ceres_problem.rs` cleared.
+- `cargo check --workspace --all-targets`: pass.
 - `cargo test -p rustscan-sfm --no-default-features --features ceres-ba --lib -- --test-threads=1`:
-  pass. `701 passed; 0 failed; 19 ignored` (56.92s).
+  pass. `706 passed; 0 failed; 19 ignored` (55.84s).
 - `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: pass.
-  Lib `854 passed; 0 failed; 19 ignored` (250.19s); other targets exit 0.
+  Lib `859 passed; 0 failed; 19 ignored` (249.52s); other targets exit 0
+  (wall ~500.80s).
 - `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
   fail, exit 101. First error: `module_inception` at
   `rustscan-slam/src/config/mod.rs:5`. Final:
   `could not compile rustscan-slam (lib) due to 84 previous errors`. Slam
   unmodified. No global allow added.
 - `git diff --check`: pass.
-
-Focused: `ba::ceres_problem::tests` 27 passed.
 
 Known limitations:
 

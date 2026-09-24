@@ -27,6 +27,21 @@ pub struct CameraModel {
     pub height: u32,
 }
 
+/// Outcome of projecting a camera-space point with a COLMAP camera model.
+///
+/// Distinguishes finite geometric domain rejection from non-finite arithmetic
+/// so BA candidate validation can reject numerical failures without changing
+/// the behind-camera / in-domain skip policy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CameraProjectionOutcome {
+    FiniteProjection([f64; 2]),
+    /// Finite inputs outside a model-defined geometric domain (for example
+    /// negative division discriminant or EUCM denominator).
+    FiniteGeometricDomainSkip,
+    /// An intermediate or final projection value was NaN/Inf.
+    NonFiniteProjection,
+}
+
 impl CameraModel {
     pub fn new_pinhole(width: u32, height: u32, fx: f32, fy: f32, cx: f32, cy: f32) -> Self {
         Self::try_new_pinhole(width, height, fx, fy, cx, cy)
@@ -231,6 +246,23 @@ impl CameraModel {
     /// image coordinates instead of aborting the iteration. Only non-finite
     /// results fail.
     pub fn img_from_cam_unchecked(&self, u: f64, v: f64, w: f64) -> Option<[f64; 2]> {
+        match self.classify_img_from_cam_unchecked(u, v, w) {
+            CameraProjectionOutcome::FiniteProjection(xy) => Some(xy),
+            CameraProjectionOutcome::FiniteGeometricDomainSkip
+            | CameraProjectionOutcome::NonFiniteProjection => None,
+        }
+    }
+
+    /// Model-aware classification of [`Self::img_from_cam_unchecked`].
+    ///
+    /// Callers that must not treat distortion overflow as a geometric skip
+    /// should match on [`CameraProjectionOutcome`] instead of `Option`.
+    pub fn classify_img_from_cam_unchecked(
+        &self,
+        u: f64,
+        v: f64,
+        w: f64,
+    ) -> CameraProjectionOutcome {
         let p = &self.params;
         let xy = match self.model_id {
             COLMAP_SIMPLE_PINHOLE => [p[0] * u / w + p[1], p[0] * v / w + p[2]],
@@ -238,99 +270,188 @@ impl CameraModel {
             COLMAP_SIMPLE_RADIAL => {
                 let uu = u / w;
                 let vv = v / w;
-                let [du, dv] = distortion(self.model_id, &p[3..4], uu, vv)?;
+                let Some([du, dv]) = distortion(self.model_id, &p[3..4], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + du) + p[1], p[0] * (vv + dv) + p[2]]
             }
             COLMAP_RADIAL => {
                 let uu = u / w;
                 let vv = v / w;
-                let [du, dv] = distortion(self.model_id, &p[3..5], uu, vv)?;
+                let Some([du, dv]) = distortion(self.model_id, &p[3..5], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + du) + p[1], p[0] * (vv + dv) + p[2]]
             }
             COLMAP_OPENCV => {
                 let uu = u / w;
                 let vv = v / w;
-                let [du, dv] = distortion(self.model_id, &p[4..8], uu, vv)?;
+                let Some([du, dv]) = distortion(self.model_id, &p[4..8], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + du) + p[2], p[1] * (vv + dv) + p[3]]
             }
             COLMAP_OPENCV_FISHEYE => {
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
-                let [duu, dvv] = distortion(self.model_id, &p[4..8], uu, vv)?;
+                if !uu.is_finite() || !vv.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let Some([duu, dvv]) = distortion(self.model_id, &p[4..8], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + duu) + p[2], p[1] * (vv + dvv) + p[3]]
             }
             COLMAP_FULL_OPENCV => {
                 let uu = u / w;
                 let vv = v / w;
-                let [du, dv] = distortion(self.model_id, &p[4..12], uu, vv)?;
+                let Some([du, dv]) = distortion(self.model_id, &p[4..12], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + du) + p[2], p[1] * (vv + dv) + p[3]]
             }
             COLMAP_FOV => {
                 let [xd, yd] = fov_distortion(p[4], u / w, v / w);
+                if !xd.is_finite() || !yd.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 [p[0] * xd + p[2], p[1] * yd + p[3]]
             }
             COLMAP_SIMPLE_RADIAL_FISHEYE => {
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
-                let [duu, dvv] = distortion(self.model_id, &p[3..4], uu, vv)?;
+                if !uu.is_finite() || !vv.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let Some([duu, dvv]) = distortion(self.model_id, &p[3..4], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + duu) + p[1], p[0] * (vv + dvv) + p[2]]
             }
             COLMAP_RADIAL_FISHEYE => {
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
-                let [duu, dvv] = distortion(self.model_id, &p[3..5], uu, vv)?;
+                if !uu.is_finite() || !vv.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let Some([duu, dvv]) = distortion(self.model_id, &p[3..5], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + duu) + p[1], p[0] * (vv + dvv) + p[2]]
             }
             COLMAP_THIN_PRISM_FISHEYE => {
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
-                let [duu, dvv] = distortion(self.model_id, &p[4..12], uu, vv)?;
+                if !uu.is_finite() || !vv.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let Some([duu, dvv]) = distortion(self.model_id, &p[4..12], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + duu) + p[2], p[1] * (vv + dvv) + p[3]]
             }
             COLMAP_RAD_TAN_THIN_PRISM_FISHEYE => {
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
-                let [duu, dvv] = distortion(self.model_id, &p[4..16], uu, vv)?;
+                if !uu.is_finite() || !vv.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let Some([duu, dvv]) = distortion(self.model_id, &p[4..16], uu, vv) else {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                };
                 [p[0] * (uu + duu) + p[2], p[1] * (vv + dvv) + p[3]]
             }
             COLMAP_SIMPLE_DIVISION => {
                 let rho = (u * u + v * v).sqrt();
-                let disc_sq = w * w - 4.0 * rho * rho * p[3];
-                if disc_sq < 0.0 {
-                    return None;
+                if !rho.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
                 }
-                let r = 2.0 / (w + disc_sq.sqrt());
+                let disc_sq = w * w - 4.0 * rho * rho * p[3];
+                if !disc_sq.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                if disc_sq < 0.0 {
+                    return CameraProjectionOutcome::FiniteGeometricDomainSkip;
+                }
+                let disc = disc_sq.sqrt();
+                if !disc.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let denom = w + disc;
+                if !denom.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let r = 2.0 / denom;
+                if !r.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 [p[0] * r * u + p[1], p[0] * r * v + p[2]]
             }
             COLMAP_DIVISION => {
                 let rho = (u * u + v * v).sqrt();
-                let disc_sq = w * w - 4.0 * rho * rho * p[4];
-                if disc_sq < 0.0 {
-                    return None;
+                if !rho.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
                 }
-                let r = 2.0 / (w + disc_sq.sqrt());
+                let disc_sq = w * w - 4.0 * rho * rho * p[4];
+                if !disc_sq.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                if disc_sq < 0.0 {
+                    return CameraProjectionOutcome::FiniteGeometricDomainSkip;
+                }
+                let disc = disc_sq.sqrt();
+                if !disc.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let denom = w + disc;
+                if !denom.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
+                let r = 2.0 / denom;
+                if !r.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 [p[0] * r * u + p[2], p[1] * r * v + p[3]]
             }
             COLMAP_SIMPLE_FISHEYE => {
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
+                if !uu.is_finite() || !vv.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 [p[0] * uu + p[1], p[0] * vv + p[2]]
             }
             COLMAP_FISHEYE => {
                 let [uu, vv] = fisheye_from_normal(u / w, v / w);
+                if !uu.is_finite() || !vv.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 [p[0] * uu + p[2], p[1] * vv + p[3]]
             }
             COLMAP_EUCM => {
                 let alpha = p[4];
                 let beta = p[5];
                 let rho2 = beta * (u * u + v * v) + w * w;
+                if !rho2.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 if rho2 < 0.0 {
-                    return None;
+                    return CameraProjectionOutcome::FiniteGeometricDomainSkip;
                 }
                 let rho = rho2.sqrt();
+                if !rho.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 let den = alpha * rho + (1.0 - alpha) * w;
+                if !den.is_finite() {
+                    return CameraProjectionOutcome::NonFiniteProjection;
+                }
                 if den < f64::EPSILON {
-                    return None;
+                    return CameraProjectionOutcome::FiniteGeometricDomainSkip;
                 }
                 [p[0] * (u / den) + p[2], p[1] * (v / den) + p[3]]
             }
-            _ => return None,
+            _ => return CameraProjectionOutcome::FiniteGeometricDomainSkip,
         };
-        finite2(xy).then_some(xy)
+        if finite2(xy) {
+            CameraProjectionOutcome::FiniteProjection(xy)
+        } else {
+            CameraProjectionOutcome::NonFiniteProjection
+        }
     }
 
     pub fn cam_from_img_threshold(&self, threshold_px: f64) -> f64 {
@@ -1901,6 +2022,48 @@ mod tests {
         // The unchecked variant still rejects non-finite results.
         assert!(camera.img_from_cam_unchecked(f64::NAN, 0.0, 1.0).is_none());
         assert!(camera.img_from_cam_unchecked(0.0, 0.0, 0.0).is_none());
+        assert_eq!(
+            camera.classify_img_from_cam_unchecked(f64::NAN, 0.0, 1.0),
+            CameraProjectionOutcome::NonFiniteProjection
+        );
+        assert_eq!(
+            camera.classify_img_from_cam_unchecked(0.0, 0.0, 0.0),
+            CameraProjectionOutcome::NonFiniteProjection
+        );
+    }
+
+    #[test]
+    fn classify_img_from_cam_distinguishes_distortion_overflow_from_domain_skip() {
+        let radial =
+            CameraModel::from_colmap(COLMAP_SIMPLE_RADIAL, 100, 100, &[50.0, 50.0, 50.0, 1e308])
+                .expect("finite extreme radial");
+        assert_eq!(
+            radial.classify_img_from_cam_unchecked(2.0, 0.0, 1.0),
+            CameraProjectionOutcome::NonFiniteProjection
+        );
+        assert!(radial.img_from_cam_unchecked(2.0, 0.0, 1.0).is_none());
+
+        let opencv = CameraModel::from_colmap(
+            COLMAP_OPENCV,
+            100,
+            100,
+            &[50.0, 50.0, 50.0, 50.0, 1e308, 0.0, 0.0, 0.0],
+        )
+        .expect("finite extreme opencv");
+        assert_eq!(
+            opencv.classify_img_from_cam_unchecked(2.0, 0.0, 1.0),
+            CameraProjectionOutcome::NonFiniteProjection
+        );
+
+        let division =
+            CameraModel::from_colmap(COLMAP_SIMPLE_DIVISION, 100, 100, &[50.0, 50.0, 50.0, 10.0])
+                .expect("division camera");
+        // Large lateral offset with strong k yields a negative discriminant.
+        assert_eq!(
+            division.classify_img_from_cam_unchecked(10.0, 0.0, 1.0),
+            CameraProjectionOutcome::FiniteGeometricDomainSkip
+        );
+        assert!(division.img_from_cam_unchecked(10.0, 0.0, 1.0).is_none());
     }
 
     #[test]

@@ -164,9 +164,9 @@ cannot observe different intrinsics for the same `CameraModel`.
 ## T5 — Make Bundle Adjustment State Updates Atomic
 
 **Status:** review_ready on `agent/RS-2026-004/t5-atomic-ba` (base
-`701d051814a29ab3ee4fbefc01355112f71b5a47`; `review-t5-2026-09-23.md` and
-`review-t5-2026-09-24.md` CHANGES_REQUESTED retained; composed-pose remediation
-awaiting independent re-review).
+`701d051814a29ab3ee4fbefc01355112f71b5a47`; `review-t5-2026-09-23.md`,
+`review-t5-2026-09-24.md`, and `review-t5-2026-09-24-final.md` CHANGES_REQUESTED
+retained; distortion-classification remediation awaiting independent re-review).
 
 **Dependencies:** T0  
 **Primary scope:** `rustscan-sfm/src/ba/`,
@@ -198,6 +198,11 @@ awaiting independent re-review).
       distinguish behind-camera geometric skips from non-finite/overflow
       projection failures in `refresh_point_errors_checked`; composed-pose and
       projection regressions on the real candidate/commit path.
+- [x] Review 2026-09-24-final P1: model-aware `CameraProjectionOutcome` /
+      `classify_img_from_cam_unchecked` so SIMPLE_RADIAL / OPENCV / fisheye
+      distortion Inf/NaN is `NonFiniteProjection` (candidate reject), while
+      finite behind-camera and division/EUCM domain rejection stay
+      `FiniteGeometricDomainSkip`; real commit-path radial overflow regression.
 
 **Exit condition:** every rejected BA result is observationally atomic and is
 never reported as a successful global BA round.
