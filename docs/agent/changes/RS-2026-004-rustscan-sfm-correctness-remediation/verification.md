@@ -1194,7 +1194,85 @@ Next action: T5 integrated. Await scheduling for T6.
 
 ### T6 — Database Transactions
 
-Status: pending.
+Status: review_ready. Awaiting independent review.
+
+Owner: `cursor-agent`
+
+Base commit: `c71f8092778e2abb1feaaf03c9d784ea25434349` (`main` after T5 integration)
+
+Branch: `agent/RS-2026-004/t6-database-transactions`
+
+Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t6-database-transactions`
+
+Changed files:
+
+- `rustscan-sfm/src/io/database.rs`
+- `rustscan-sfm/src/sfm/mapper/database_io.rs`
+- `rustscan-sfm/src/sfm/mapper.rs` (tests)
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
+
+#### Implementation
+
+Reused `ColmapDatabase::with_transaction` (BEGIN IMMEDIATE / COMMIT /
+ROLLBACK; restores `database_entry_deleted` on failure) for:
+
+- `populate_local_matching_database` — one txn for cameras, images,
+  keypoints, descriptors, matches, and two-view geometries
+- `write_pair_geometries_to_database` — one txn per pair-geometry batch
+- `ColmapDatabase::merge` — one txn on the target for the complete merge
+
+No nested transactions. Write/commit/rollback errors propagate. No production
+fault-injection API; failures use SQLite `RAISE(ABORT)` triggers or
+`bail!` inside `with_transaction` (tests only).
+
+#### Pre-fix proof
+
+Against the unwrapped implementation, mid-batch / retry regressions failed
+(partial writes leaked). Logs:
+`artifacts/runs/rs-2026-004-t6/pre-fix-mid-failure.log`,
+`artifacts/runs/rs-2026-004-t6/pre-fix-retry.log`.
+
+#### New regressions
+
+- `database_merge_mid_failure_leaves_preexisting_target_unchanged`
+- `database_merge_retry_after_trigger_failure_commits_once`
+- `transaction_mid_batch_delete_restores_deletion_bookkeeping`
+- `populate_local_matching_database_mid_failure_rolls_back_preexisting_rows`
+- `populate_local_matching_database_retry_after_failure_commits_once`
+- `write_pair_geometries_mid_failure_leaves_preexisting_geometry_unchanged`
+- `write_pair_geometries_retry_after_failure_commits_once`
+
+#### Verification
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`,
+`CARGO_TERM_COLOR=never`.
+
+- `cargo fmt --all -- --check`: pass (after `cargo fmt --all`).
+- `cargo check --workspace --all-targets`: pass.
+- `cargo test -p rustscan-sfm --lib database:: -- --test-threads=1`: pass,
+  42 passed.
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: pass.
+  Lib `866 passed; 0 failed; 19 ignored` (258.58s); other targets exit 0.
+- Directed post-fix: mid_failure 3 passed; retry_after 3 passed;
+  transaction_mid_batch_delete 1 passed.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error: `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`. Final:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`. Slam
+  unmodified. No global allow added.
+- `git diff --check`: pass.
+
+Logs: `artifacts/runs/rs-2026-004-t6/`.
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- T7 (nalgebra ownership) not started.
+
+Next action: do not start T7. Do not merge to `main`. Await independent
+review.
 
 ### T7 — nalgebra Ownership
 

@@ -16,34 +16,36 @@ pub(super) fn write_pair_geometries_to_database(
     pairs: &[PairGeometry],
 ) -> Result<usize> {
     let db = ColmapDatabase::open(database_path)?;
-    let image_by_name = db
-        .read_all_images()?
-        .into_iter()
-        .map(|image| (image.name, image.image_id))
-        .collect::<HashMap<_, _>>();
-    let mut written = 0usize;
-    for pair in pairs {
-        let Some(left_frame) = frames.get(pair.left) else {
-            continue;
-        };
-        let Some(right_frame) = frames.get(pair.right) else {
-            continue;
-        };
-        let Some(&left_image_id) = image_by_name.get(&left_frame.name) else {
-            continue;
-        };
-        let Some(&right_image_id) = image_by_name.get(&right_frame.name) else {
-            continue;
-        };
-        let geometry = pair_geometry_to_colmap_two_view_geometry(pair);
-        if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-            db.update_two_view_geometry(left_image_id, right_image_id, &geometry)?;
-        } else {
-            db.write_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+    db.with_transaction(|| {
+        let image_by_name = db
+            .read_all_images()?
+            .into_iter()
+            .map(|image| (image.name, image.image_id))
+            .collect::<HashMap<_, _>>();
+        let mut written = 0usize;
+        for pair in pairs {
+            let Some(left_frame) = frames.get(pair.left) else {
+                continue;
+            };
+            let Some(right_frame) = frames.get(pair.right) else {
+                continue;
+            };
+            let Some(&left_image_id) = image_by_name.get(&left_frame.name) else {
+                continue;
+            };
+            let Some(&right_image_id) = image_by_name.get(&right_frame.name) else {
+                continue;
+            };
+            let geometry = pair_geometry_to_colmap_two_view_geometry(pair);
+            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                db.update_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+            } else {
+                db.write_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+            }
+            written += 1;
         }
-        written += 1;
-    }
-    Ok(written)
+        Ok(written)
+    })
 }
 
 pub(super) fn populate_local_matching_database(
@@ -59,75 +61,77 @@ pub(super) fn populate_local_matching_database(
         }
     }
     let db = ColmapDatabase::open(database_path)?;
-    let mut written = 0usize;
-    for (camera_idx, camera) in setup.cameras.iter().enumerate() {
-        let camera_id = setup.camera_ids[camera_idx];
-        db.write_camera(
-            &ColmapDatabaseCamera {
-                camera: ColmapCamera {
-                    camera_id,
-                    model_id: camera.model_id,
-                    width: camera.width,
-                    height: camera.height,
-                    params: camera.params_slice()[..camera.num_params].to_vec(),
+    db.with_transaction(|| {
+        let mut written = 0usize;
+        for (camera_idx, camera) in setup.cameras.iter().enumerate() {
+            let camera_id = setup.camera_ids[camera_idx];
+            db.write_camera(
+                &ColmapDatabaseCamera {
+                    camera: ColmapCamera {
+                        camera_id,
+                        model_id: camera.model_id,
+                        width: camera.width,
+                        height: camera.height,
+                        params: camera.params_slice()[..camera.num_params].to_vec(),
+                    },
+                    has_prior_focal_length: setup
+                        .camera_has_prior_focal_length
+                        .get(camera_idx)
+                        .copied()
+                        .unwrap_or(true),
                 },
-                has_prior_focal_length: setup
-                    .camera_has_prior_focal_length
-                    .get(camera_idx)
-                    .copied()
-                    .unwrap_or(true),
-            },
-            true,
-        )?;
-        written += 1;
-    }
-    for (frame_idx, frame) in frames.iter().enumerate() {
-        let image_id = setup.image_ids[frame_idx];
-        let camera_id = setup.camera_ids[setup.image_camera_indices[frame_idx]];
-        db.write_image(
-            &ColmapDatabaseImage {
-                image_id,
-                name: frame.name.clone(),
-                camera_id,
-                frame_id: None,
-            },
-            true,
-        )?;
-        written += 1;
-        let keypoints = frame_keypoints_for_database(frame, feature_type);
-        db.write_keypoints(image_id, &keypoints)?;
-        written += 1;
-        let descriptors = frame_descriptors_for_database(frame, feature_type)?;
-        db.write_descriptors(image_id, &descriptors)?;
-        written += 1;
-    }
-    for pair in pairs {
-        let left_image_id = setup.image_ids[pair.left];
-        let right_image_id = setup.image_ids[pair.right];
-        let matches = pair
-            .matches
-            .iter()
-            .map(|match_| FeatureMatch {
-                point2d_idx1: match_.query_idx,
-                point2d_idx2: match_.train_idx,
-            })
-            .collect::<Vec<_>>();
-        if db.exists_matches(left_image_id, right_image_id)? {
-            db.delete_matches(left_image_id, right_image_id)?;
-        }
-        if !matches.is_empty() {
-            db.write_matches(left_image_id, right_image_id, &matches)?;
+                true,
+            )?;
             written += 1;
         }
-        let geometry = pair_geometry_to_colmap_two_view_geometry(pair);
-        if db.exists_two_view_geometry(left_image_id, right_image_id)? {
-            db.update_two_view_geometry(left_image_id, right_image_id, &geometry)?;
-        } else {
-            db.write_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+        for (frame_idx, frame) in frames.iter().enumerate() {
+            let image_id = setup.image_ids[frame_idx];
+            let camera_id = setup.camera_ids[setup.image_camera_indices[frame_idx]];
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: frame.name.clone(),
+                    camera_id,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            written += 1;
+            let keypoints = frame_keypoints_for_database(frame, feature_type);
+            db.write_keypoints(image_id, &keypoints)?;
+            written += 1;
+            let descriptors = frame_descriptors_for_database(frame, feature_type)?;
+            db.write_descriptors(image_id, &descriptors)?;
+            written += 1;
         }
-        written += 1;
-    }
-    Ok(written)
+        for pair in pairs {
+            let left_image_id = setup.image_ids[pair.left];
+            let right_image_id = setup.image_ids[pair.right];
+            let matches = pair
+                .matches
+                .iter()
+                .map(|match_| FeatureMatch {
+                    point2d_idx1: match_.query_idx,
+                    point2d_idx2: match_.train_idx,
+                })
+                .collect::<Vec<_>>();
+            if db.exists_matches(left_image_id, right_image_id)? {
+                db.delete_matches(left_image_id, right_image_id)?;
+            }
+            if !matches.is_empty() {
+                db.write_matches(left_image_id, right_image_id, &matches)?;
+                written += 1;
+            }
+            let geometry = pair_geometry_to_colmap_two_view_geometry(pair);
+            if db.exists_two_view_geometry(left_image_id, right_image_id)? {
+                db.update_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+            } else {
+                db.write_two_view_geometry(left_image_id, right_image_id, &geometry)?;
+            }
+            written += 1;
+        }
+        Ok(written)
+    })
 }
 
 fn frame_keypoints_for_database(

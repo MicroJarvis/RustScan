@@ -19430,6 +19430,181 @@ mod tests {
     }
 
     #[test]
+    fn populate_local_matching_database_mid_failure_rolls_back_preexisting_rows() -> Result<()> {
+        use rusqlite::Connection;
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+
+        // Pre-seed a distinctive row that must survive a failed populate.
+        {
+            let db = ColmapDatabase::open(&db_path)?;
+            db.write_camera(
+                &ColmapDatabaseCamera {
+                    camera: crate::colmap::ColmapCamera {
+                        camera_id: 77,
+                        model_id: crate::types::COLMAP_PINHOLE,
+                        width: 64,
+                        height: 48,
+                        params: vec![40.0, 40.0, 32.0, 24.0],
+                    },
+                    has_prior_focal_length: true,
+                },
+                true,
+            )?;
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id: 7001,
+                    name: "seed.jpg".to_string(),
+                    camera_id: 77,
+                    frame_id: None,
+                },
+                true,
+            )?;
+            db.write_keypoints(7001, &[ColmapKeypoint::new(9.0, 8.0)])?;
+        }
+
+        let mut frames = vec![
+            minimal_frame(0, "left.jpg"),
+            minimal_frame(1, "right.jpg"),
+            minimal_frame(2, "extra.jpg"),
+        ];
+        for frame in &mut frames {
+            frame.sift.keypoints = frame.keypoints.clone();
+            frame.sift.descriptors = vec![
+                lowe_sift::Descriptor::new([1.0; lowe_sift::DESCRIPTOR_LEN]),
+                lowe_sift::Descriptor::new([0.5; lowe_sift::DESCRIPTOR_LEN]),
+            ];
+        }
+        let setup = local_image_camera_setup(&frames, &MapperConfig::default()).unwrap();
+        let mut pair01 = pair_with_inliers(0, 1, &[(0, 1)]);
+        pair01.matches = pair01.inlier_matches.clone();
+        pair01.two_view_config = crate::database::COLMAP_TWO_VIEW_CALIBRATED;
+        let mut pair12 = pair_with_inliers(1, 2, &[(0, 1)]);
+        pair12.matches = pair12.inlier_matches.clone();
+        pair12.two_view_config = crate::database::COLMAP_TWO_VIEW_CALIBRATED;
+
+        // Fail after cameras + first two images succeed: abort 3rd image descriptors.
+        let fail_image_id = setup.image_ids[2];
+        {
+            let trigger = Connection::open(&db_path)?;
+            trigger.execute_batch(&format!(
+                "CREATE TRIGGER fail_third_image_descriptors
+                 BEFORE INSERT ON descriptors
+                 WHEN NEW.image_id = {fail_image_id}
+                 BEGIN
+                     SELECT RAISE(ABORT, 'third image descriptors failed');
+                 END;"
+            ))?;
+        }
+
+        let before = {
+            let db = ColmapDatabase::open(&db_path)?;
+            (
+                db.num_cameras()?,
+                db.num_images()?,
+                db.num_keypoints()?,
+                db.read_keypoints(7001)?,
+            )
+        };
+
+        let err = populate_local_matching_database(
+            &db_path,
+            &frames,
+            &setup,
+            &[pair01, pair12],
+            FeatureType::Sift,
+        )
+        .expect_err("populate must fail after earlier successful writes");
+        assert!(err.to_string().contains("third image descriptors failed"));
+
+        let db = ColmapDatabase::open(&db_path)?;
+        assert_eq!(db.num_cameras()?, before.0);
+        assert_eq!(db.num_images()?, before.1);
+        assert_eq!(db.num_keypoints()?, before.2);
+        assert_eq!(db.read_keypoints(7001)?, before.3);
+        assert!(db.exists_image_with_name("seed.jpg")?);
+        assert!(!db.exists_image_with_name("left.jpg")?);
+        assert!(!db.exists_image_with_name("right.jpg")?);
+        assert!(!db.exists_image_with_name("extra.jpg")?);
+        assert_eq!(db.num_verified_image_pairs()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn populate_local_matching_database_retry_after_failure_commits_once() -> Result<()> {
+        use rusqlite::Connection;
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let mut frames = vec![minimal_frame(0, "left.jpg"), minimal_frame(1, "right.jpg")];
+        for frame in &mut frames {
+            frame.sift.keypoints = frame.keypoints.clone();
+            frame.sift.descriptors = vec![
+                lowe_sift::Descriptor::new([1.0; lowe_sift::DESCRIPTOR_LEN]),
+                lowe_sift::Descriptor::new([0.5; lowe_sift::DESCRIPTOR_LEN]),
+            ];
+        }
+        let setup = local_image_camera_setup(&frames, &MapperConfig::default()).unwrap();
+        let mut pair = pair_with_inliers(0, 1, &[(0, 1)]);
+        pair.matches = pair.inlier_matches.clone();
+        pair.two_view_config = crate::database::COLMAP_TWO_VIEW_CALIBRATED;
+        pair.qvec = Some([1.0, 0.0, 0.0, 0.0]);
+        pair.tvec = Some([0.0, 0.0, 1.0]);
+
+        let fail_image_id = setup.image_ids[1];
+        {
+            let _schema = ColmapDatabase::open(&db_path)?;
+        }
+        {
+            let trigger = Connection::open(&db_path)?;
+            trigger.execute_batch(&format!(
+                "CREATE TRIGGER fail_second_image_descriptors
+                 BEFORE INSERT ON descriptors
+                 WHEN NEW.image_id = {fail_image_id}
+                 BEGIN
+                     SELECT RAISE(ABORT, 'second image descriptors failed');
+                 END;"
+            ))?;
+        }
+
+        let err = populate_local_matching_database(
+            &db_path,
+            &frames,
+            &setup,
+            std::slice::from_ref(&pair),
+            FeatureType::Sift,
+        )
+        .expect_err("first populate attempt must fail");
+        assert!(err.to_string().contains("second image descriptors failed"));
+        {
+            let db = ColmapDatabase::open(&db_path)?;
+            assert_eq!(db.num_images()?, 0);
+            assert_eq!(db.num_cameras()?, 0);
+        }
+
+        {
+            let trigger = Connection::open(&db_path)?;
+            trigger.execute_batch("DROP TRIGGER fail_second_image_descriptors;")?;
+        }
+
+        let written = populate_local_matching_database(
+            &db_path,
+            &frames,
+            &setup,
+            std::slice::from_ref(&pair),
+            FeatureType::Sift,
+        )?;
+        assert!(written >= 7);
+        let db = ColmapDatabase::open(&db_path)?;
+        assert_eq!(db.num_images()?, 2);
+        assert_eq!(db.num_cameras()?, 2);
+        assert_eq!(db.read_matches(1, 2)?.len(), 1);
+        assert_eq!(db.num_verified_image_pairs()?, 1);
+        Ok(())
+    }
+
+    #[test]
     fn resolve_mapper_database_path_allows_missing_output_for_local_write() -> Result<()> {
         let dir = tempdir()?;
         let missing = dir.path().join("new.db");
@@ -20133,6 +20308,172 @@ mod tests {
         );
         assert_eq!(read_sorted.qvec, Some([1.0, -0.0, -0.0, -0.0]));
         assert_eq!(read_sorted.tvec, Some([-0.0, -0.0, -1.0]));
+        Ok(())
+    }
+
+    #[test]
+    fn write_pair_geometries_mid_failure_leaves_preexisting_geometry_unchanged() -> Result<()> {
+        use crate::correspondence_graph::image_pair_to_pair_id;
+        use rusqlite::Connection;
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        let db = ColmapDatabase::open(&db_path)?;
+        db.write_camera(
+            &ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: 1,
+                    model_id: crate::types::COLMAP_PINHOLE,
+                    width: 100,
+                    height: 100,
+                    params: vec![50.0, 50.0, 50.0, 50.0],
+                },
+                has_prior_focal_length: true,
+            },
+            true,
+        )?;
+        for (image_id, name) in [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg")] {
+            db.write_image(
+                &ColmapDatabaseImage {
+                    image_id,
+                    name: name.to_string(),
+                    camera_id: 1,
+                    frame_id: None,
+                },
+                true,
+            )?;
+        }
+        let preexisting = ColmapTwoViewGeometry {
+            config: crate::database::COLMAP_TWO_VIEW_CALIBRATED,
+            inlier_matches: vec![FeatureMatch::new(7, 8)],
+            ..ColmapTwoViewGeometry::default()
+        };
+        db.write_two_view_geometry(1, 2, &preexisting)?;
+        let before_pairs = db.num_verified_image_pairs()?;
+        let before_geometry = db.read_two_view_geometry(1, 2)?;
+
+        let frames = vec![
+            minimal_frame(0, "a.jpg"),
+            minimal_frame(1, "b.jpg"),
+            minimal_frame(2, "c.jpg"),
+        ];
+        let mut pair_ab = pair_with_inliers(0, 1, &[(0, 1)]);
+        pair_ab.two_view_config = crate::database::COLMAP_TWO_VIEW_PLANAR;
+        pair_ab.qvec = Some([1.0, 0.0, 0.0, 0.0]);
+        pair_ab.tvec = Some([1.0, 0.0, 0.0]);
+        let mut pair_bc = pair_with_inliers(1, 2, &[(0, 1)]);
+        pair_bc.two_view_config = crate::database::COLMAP_TWO_VIEW_PLANAR;
+        pair_bc.qvec = Some([1.0, 0.0, 0.0, 0.0]);
+        pair_bc.tvec = Some([0.0, 1.0, 0.0]);
+
+        // pair_ab updates existing row; pair_bc inserts. Fail the second insert.
+        let fail_pair_id =
+            image_pair_to_pair_id(2, 3).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        {
+            let trigger = Connection::open(&db_path)?;
+            trigger.execute_batch(&format!(
+                "CREATE TRIGGER fail_second_pair_geometry
+                 BEFORE INSERT ON two_view_geometries
+                 WHEN NEW.pair_id = {fail_pair_id}
+                 BEGIN
+                     SELECT RAISE(ABORT, 'second pair geometry failed');
+                 END;"
+            ))?;
+        }
+
+        let err = write_pair_geometries_to_database(&db_path, &frames, &[pair_ab, pair_bc])
+            .expect_err("second pair write must fail after first pair succeeded");
+        assert!(err.to_string().contains("second pair geometry failed"));
+
+        let db = ColmapDatabase::open(&db_path)?;
+        assert_eq!(db.num_verified_image_pairs()?, before_pairs);
+        assert_eq!(db.read_two_view_geometry(1, 2)?, before_geometry);
+        assert!(!db.exists_two_view_geometry(2, 3)?);
+        Ok(())
+    }
+
+    #[test]
+    fn write_pair_geometries_retry_after_failure_commits_once() -> Result<()> {
+        use crate::correspondence_graph::image_pair_to_pair_id;
+        use rusqlite::Connection;
+
+        let dir = tempdir()?;
+        let db_path = dir.path().join("database.db");
+        {
+            let db = ColmapDatabase::open(&db_path)?;
+            db.write_camera(
+                &ColmapDatabaseCamera {
+                    camera: crate::colmap::ColmapCamera {
+                        camera_id: 1,
+                        model_id: crate::types::COLMAP_PINHOLE,
+                        width: 100,
+                        height: 100,
+                        params: vec![50.0, 50.0, 50.0, 50.0],
+                    },
+                    has_prior_focal_length: true,
+                },
+                true,
+            )?;
+            for (image_id, name) in [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg")] {
+                db.write_image(
+                    &ColmapDatabaseImage {
+                        image_id,
+                        name: name.to_string(),
+                        camera_id: 1,
+                        frame_id: None,
+                    },
+                    true,
+                )?;
+            }
+        }
+
+        let frames = vec![
+            minimal_frame(0, "a.jpg"),
+            minimal_frame(1, "b.jpg"),
+            minimal_frame(2, "c.jpg"),
+        ];
+        let mut pair_ab = pair_with_inliers(0, 1, &[(0, 1)]);
+        pair_ab.two_view_config = crate::database::COLMAP_TWO_VIEW_CALIBRATED;
+        let mut pair_bc = pair_with_inliers(1, 2, &[(0, 1)]);
+        pair_bc.two_view_config = crate::database::COLMAP_TWO_VIEW_CALIBRATED;
+
+        let fail_pair_id =
+            image_pair_to_pair_id(2, 3).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        {
+            let trigger = Connection::open(&db_path)?;
+            trigger.execute_batch(&format!(
+                "CREATE TRIGGER fail_second_pair_geometry
+                 BEFORE INSERT ON two_view_geometries
+                 WHEN NEW.pair_id = {fail_pair_id}
+                 BEGIN
+                     SELECT RAISE(ABORT, 'second pair geometry failed');
+                 END;"
+            ))?;
+        }
+
+        let err = write_pair_geometries_to_database(
+            &db_path,
+            &frames,
+            &[pair_ab.clone(), pair_bc.clone()],
+        )
+        .expect_err("first attempt must fail");
+        assert!(err.to_string().contains("second pair geometry failed"));
+        {
+            let db = ColmapDatabase::open(&db_path)?;
+            assert_eq!(db.num_verified_image_pairs()?, 0);
+        }
+
+        {
+            let trigger = Connection::open(&db_path)?;
+            trigger.execute_batch("DROP TRIGGER fail_second_pair_geometry;")?;
+        }
+
+        let written = write_pair_geometries_to_database(&db_path, &frames, &[pair_ab, pair_bc])?;
+        assert_eq!(written, 2);
+        let db = ColmapDatabase::open(&db_path)?;
+        assert_eq!(db.num_verified_image_pairs()?, 2);
+        assert!(db.exists_two_view_geometry(1, 2)?);
+        assert!(db.exists_two_view_geometry(2, 3)?);
         Ok(())
     }
 
