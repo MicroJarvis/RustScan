@@ -7,6 +7,8 @@ use nalgebra::{Isometry3, Matrix3, Matrix4, Translation3, UnitQuaternion, Vector
 use rustscan_types::{Rotation3f, SE3};
 
 pub use rustscan_types::matrix4_to_column_major_array;
+#[cfg(test)]
+pub use rustscan_types::matrix4_from_column_major_array;
 
 /// Build a homogeneous rigid transform from a unit quaternion and translation.
 ///

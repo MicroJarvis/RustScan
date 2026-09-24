@@ -11,6 +11,8 @@ use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use nalgebra::{Matrix3, Matrix4, Vector3};
+#[cfg(test)]
+use nalgebra::Point3;
 use rustscan_types::colmap::{
     colmap_camera_model_by_id, colmap_camera_model_by_name, ColmapCameraModelSpec, COLMAP_PINHOLE,
     COLMAP_SIMPLE_PINHOLE,
