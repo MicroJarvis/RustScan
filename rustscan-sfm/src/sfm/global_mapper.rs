@@ -1307,6 +1307,9 @@ mod tests {
                 force_ceres_usable: Some(false),
                 force_termination: Some(crate::ba::BundleAdjustmentTerminationType::Failure),
                 corrupt_first_camera_param: None,
+                corrupt_first_pose_translation_x: None,
+                corrupt_all_pose_translations_x: None,
+                seed_candidate_sensor_translation_x: None,
                 cancel_before_commit: false,
             },
             || {
