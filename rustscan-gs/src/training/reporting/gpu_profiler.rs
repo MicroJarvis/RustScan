@@ -59,9 +59,12 @@ pub mod timing_kind {
     pub const HOST_WAIT: &str = "host_wait";
     /// Prefetch-worker wall (decode/resize); not on the train-step thread.
     pub const WORKER_WALL: &str = "worker_wall";
-    /// Host Instant around CPU-side submit / orchestration.
+    /// Host Instant around CPU-side submit / orchestration (no GPU resolve wait).
     pub const CPU_SUBMIT: &str = "cpu_submit";
-    /// Host Instant that may include GPU timestamp resolve / sync.
+    /// Host Instant that brackets GPU timestamp queries **and** resolve wait.
+    ///
+    /// Only for iterations that actually sample device timestamps. Do not mix
+    /// with unsampled forward submit walls in the same percentile series.
     pub const SYNCHRONIZED_BOUNDARY: &str = "synchronized_boundary";
     /// Full outer-loop iteration wall (frame wait through step end).
     pub const HOST_WALL: &str = "host_wall";
@@ -75,7 +78,10 @@ pub mod span {
     pub const DECODE: &str = "decode";
     pub const RESIZE: &str = "resize";
     pub const UPLOAD: &str = "upload";
-    pub const FORWARD: &str = "forward";
+    /// Forward host wall on GPU-sampled iterations (includes timestamp resolve wait).
+    pub const FORWARD_GPU_SAMPLED: &str = "forward_gpu_sampled";
+    /// Forward host wall on unsampled iterations (CPU submit / orchestration only).
+    pub const FORWARD_CPU_SUBMIT: &str = "forward_cpu_submit";
     pub const BACKWARD: &str = "backward";
     pub const OPTIMIZER: &str = "optimizer";
     pub const TOPOLOGY_SNAPSHOT: &str = "topology_snapshot";
@@ -97,7 +103,8 @@ pub mod span {
         DECODE,
         RESIZE,
         UPLOAD,
-        FORWARD,
+        FORWARD_GPU_SAMPLED,
+        FORWARD_CPU_SUBMIT,
         BACKWARD,
         OPTIMIZER,
         TOPOLOGY_SNAPSHOT,
@@ -115,7 +122,8 @@ pub fn span_timing_kind(name: &str) -> &'static str {
     match name {
         span::FRAME_WAIT => timing_kind::HOST_WAIT,
         span::DECODE | span::RESIZE => timing_kind::WORKER_WALL,
-        span::FORWARD => timing_kind::SYNCHRONIZED_BOUNDARY,
+        span::FORWARD_GPU_SAMPLED => timing_kind::SYNCHRONIZED_BOUNDARY,
+        span::FORWARD_CPU_SUBMIT => timing_kind::CPU_SUBMIT,
         span::ITERATION_WALL => timing_kind::HOST_WALL,
         span::STEP_CPU => timing_kind::STEP_WALL,
         _ => timing_kind::CPU_SUBMIT,
@@ -440,8 +448,12 @@ impl PipelineTimingCollector {
         self.record_span_ms(span::STEP_CPU, ms);
     }
 
-    /// Record a GPU forward completion sample only when device timestamps are supported.
+    /// Record a GPU forward completion sample only when profiling + GPU timing
+    /// are enabled and device timestamps are supported.
     pub fn record_gpu_step_ms(&mut self, ms: f64) {
+        if !self.profiler_enabled || !self.gpu_timing_enabled {
+            return;
+        }
         if !is_valid_timing_ms(ms) {
             self.rejected_timing_samples = self.rejected_timing_samples.saturating_add(1);
             return;
@@ -607,15 +619,49 @@ pub struct CpuSpanTimer {
 
 impl CpuSpanTimer {
     pub fn start(name: &'static str) -> Self {
+        note_profiling_instant_created();
         Self {
             name,
             started: Instant::now(),
         }
     }
 
+    /// Start only when profiling is enabled — skips Instant creation when off.
+    pub fn start_enabled(enabled: bool, name: &'static str) -> Option<Self> {
+        enabled.then(|| Self::start(name))
+    }
+
     pub fn finish(self, collector: &mut PipelineTimingCollector) {
         collector.record_span(self.name, self.started.elapsed());
     }
+}
+
+/// Optional Instant for profiler-only host walls. When `enabled` is false, no
+/// Instant is created (verified by [`take_profiling_instant_creations`] in tests).
+#[inline]
+pub fn profiling_instant(enabled: bool) -> Option<Instant> {
+    if !enabled {
+        return None;
+    }
+    note_profiling_instant_created();
+    Some(Instant::now())
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROFILING_INSTANT_CREATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn note_profiling_instant_created() {
+    #[cfg(test)]
+    PROFILING_INSTANT_CREATIONS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Test helper: return and clear profiling Instant creation count.
+#[cfg(test)]
+pub fn take_profiling_instant_creations() -> u64 {
+    PROFILING_INSTANT_CREATIONS.with(|c| c.replace(0))
 }
 
 /// Build environment probe from the actual training `GsDevice` / cubecl client.
@@ -757,26 +803,160 @@ pub fn runtime_device_bytes_in_use(device: &crate::training::engine::GsDevice) -
     client.memory_usage().ok().map(|usage| usage.bytes_in_use)
 }
 
+/// Measurement-only failure while resolving device timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileMeasureError {
+    /// CubeCL timestamp map/resolve panicked (or equivalent hard failure).
+    ResolvePanic { message: String },
+}
+
+/// Injected faults for production-shared profile completion paths (tests + drills).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProfileFaultStage {
+    #[default]
+    None,
+    /// Pretend profile never started; run work once unprofiled.
+    Start,
+    /// Pretend profile end failed after work; keep output, drop timing.
+    End,
+    /// Pretend resolve panicked while the device remains usable.
+    Resolve,
+    /// Pretend resolve failed and the device is no longer usable.
+    ResolveDeviceUnavailable,
+}
+
+impl ProfileFaultStage {
+    /// Injectable stages (excludes [`Self::None`]). Referenced so the API surface
+    /// stays live for production-shared fault drills without silencing dead_code.
+    pub const INJECTABLE: &[Self] = &[
+        Self::Start,
+        Self::End,
+        Self::Resolve,
+        Self::ResolveDeviceUnavailable,
+    ];
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "profile resolve panicked".to_string()
+    }
+}
+
+/// Whether the training client still answers basic queries after a measure fault.
+pub fn device_measurement_path_healthy(device: &crate::training::engine::GsDevice) -> bool {
+    use burn_cubecl::cubecl::Runtime;
+    use burn_wgpu::WgpuRuntime;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    catch_unwind(AssertUnwindSafe(|| {
+        let client = WgpuRuntime::client(device);
+        let _ = client.properties().timing_method;
+        let _ = client.memory_usage();
+    }))
+    .is_ok()
+}
+
 /// Resolve a cubecl profile duration into GPU milliseconds only for Device timing.
 ///
-/// # Panic / failure honesty
-///
-/// CubeCL's wgpu timestamp resolve path may `expect`/panic on map-buffer failure
-/// (see cubecl-wgpu timings). This wrapper cannot convert that into a silent
-/// `None` success — a panic aborts the process. When timing_method is not
-/// Device, the future is drained and `None` is returned (not counted as GPU time).
+/// CubeCL's wgpu path may `expect`/panic inside the resolve future on map-buffer
+/// failure. This wrapper catches that panic and returns
+/// [`ProfileMeasureError::ResolvePanic`] instead of aborting the process.
 pub async fn resolve_device_gpu_ms(
     profile: burn_cubecl::cubecl::profile::ProfileDuration,
-) -> Option<f64> {
+) -> Result<Option<f64>, ProfileMeasureError> {
     use burn_cubecl::cubecl::profile::TimingMethod;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    if profile.timing_method() != TimingMethod::Device {
-        // Drain the future so the map buffer is released; discard as GPU time.
-        let _ = profile.resolve().await;
-        return None;
+    let timing_method = profile.timing_method();
+    // Drive resolve via block_on so catch_unwind can wrap the panic-prone path.
+    let resolved = catch_unwind(AssertUnwindSafe(|| {
+        burn_cubecl::cubecl::future::block_on(profile.resolve())
+    }));
+    match resolved {
+        Ok(ticks) => {
+            if timing_method != TimingMethod::Device {
+                // Drained non-device timing; not a GPU sample.
+                Ok(None)
+            } else {
+                Ok(Some(duration_millis(ticks.duration())))
+            }
+        }
+        Err(payload) => Err(ProfileMeasureError::ResolvePanic {
+            message: panic_payload_message(payload),
+        }),
     }
-    let ticks = profile.resolve().await;
-    Some(duration_millis(ticks.duration()))
+}
+
+/// Finish a profiled step after work produced `output` and resolve completed
+/// (or failed). Shared by the live GPU path and fault-injection tests.
+pub fn finish_profiled_output<T>(
+    device: &crate::training::engine::GsDevice,
+    output: T,
+    resolve: Result<Option<f64>, ProfileMeasureError>,
+    force_device_unavailable: bool,
+) -> Result<(T, Option<f64>, ProfileAttemptStats), crate::TrainingError> {
+    let mut stats = ProfileAttemptStats::default();
+    match resolve {
+        Ok(Some(ms)) => Ok((output, Some(ms), stats)),
+        Ok(None) => {
+            stats.resolve_failures = 1;
+            stats.dropped_samples = 1;
+            Ok((output, None, stats))
+        }
+        Err(ProfileMeasureError::ResolvePanic { message }) => {
+            let healthy = !force_device_unavailable && device_measurement_path_healthy(device);
+            if !healthy {
+                return Err(crate::TrainingError::Gpu(format!(
+                    "GPU unavailable after profile resolve failure: {message}"
+                )));
+            }
+            stats.resolve_failures = 1;
+            stats.dropped_samples = 1;
+            Ok((output, None, stats))
+        }
+    }
+}
+
+/// Complete a start/end profile recovery without re-running already-executed work.
+pub async fn complete_profile_recovery<T, F, Fut>(
+    kind: ProfileRecoveryKind,
+    work_slot: &mut Option<F>,
+    output_slot: &mut Option<T>,
+) -> Result<(T, Option<f64>, ProfileAttemptStats), crate::TrainingError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut stats = ProfileAttemptStats::default();
+    match kind {
+        ProfileRecoveryKind::EndFailed => {
+            stats.end_failures = 1;
+            stats.dropped_samples = 1;
+            let output = output_slot.take().ok_or_else(|| {
+                crate::TrainingError::TrainingFailed(
+                    "gpu profile end-fail recovery missing stored output".into(),
+                )
+            })?;
+            Ok((output, None, stats))
+        }
+        ProfileRecoveryKind::StartFailed => {
+            stats.start_failures = 1;
+            stats.dropped_samples = 1;
+            let work = work_slot.take().ok_or_else(|| {
+                crate::TrainingError::TrainingFailed(
+                    "gpu profile start-fail recovery missing work".into(),
+                )
+            })?;
+            Ok((work().await, None, stats))
+        }
+        ProfileRecoveryKind::Impossible => Err(crate::TrainingError::TrainingFailed(
+            "gpu profile recovery: work already consumed and no output stored (impossible)".into(),
+        )),
+    }
 }
 
 /// Whether this iteration should capture a device-timestamp GPU sample.
@@ -865,21 +1045,29 @@ where
 
 /// Run `work` under cubecl device timestamp profiling when supported.
 ///
-/// The future is driven with `cubecl::future::block_on` inside `client.profile`
-/// so timestamp start/end bracket the submitted GPU work. Callers must not
-/// include loss `into_scalar_async` readback inside `work` — that host sync is
-/// CPU time, not GPU completion.
-///
 /// When profiling cannot start or end fails after work ran, `work` still runs
-/// at most once (unprofiled on start failure; timing dropped on end failure).
-/// Failure counters are returned in [`ProfileAttemptStats`].
-///
-/// Resolve path honesty: cubecl may panic inside `ProfileDuration::resolve` on
-/// map failure; that is not mapped to a silent successful unsampled step.
+/// at most once. Resolve panics are caught: if the device remains healthy the
+/// sample is dropped and training continues; if the device is unusable a
+/// [`crate::TrainingError::Gpu`] is returned. Training errors from `work` are
+/// not swallowed (work returns `T` directly; callers wrap fallible work).
 pub async fn profile_device_gpu_step<F, Fut, T>(
     device: &crate::training::engine::GsDevice,
     work: F,
-) -> (T, Option<f64>, ProfileAttemptStats)
+) -> Result<(T, Option<f64>, ProfileAttemptStats), crate::TrainingError>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    profile_device_gpu_step_with_fault(device, work, ProfileFaultStage::None).await
+}
+
+/// Production profile path with optional fault injection at start/end/resolve.
+pub async fn profile_device_gpu_step_with_fault<F, Fut, T>(
+    device: &crate::training::engine::GsDevice,
+    work: F,
+    fault: ProfileFaultStage,
+) -> Result<(T, Option<f64>, ProfileAttemptStats), crate::TrainingError>
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = T>,
@@ -890,10 +1078,59 @@ where
     use burn_wgpu::WgpuRuntime;
     use std::sync::{Arc, Mutex};
 
-    let mut stats = ProfileAttemptStats::default();
+    match fault {
+        ProfileFaultStage::Start => {
+            let mut work_slot = Some(work);
+            let mut output_slot = None;
+            return complete_profile_recovery(
+                ProfileRecoveryKind::StartFailed,
+                &mut work_slot,
+                &mut output_slot,
+            )
+            .await;
+        }
+        ProfileFaultStage::End => {
+            let output = work().await;
+            let mut work_slot = None::<F>;
+            let mut output_slot = Some(output);
+            return complete_profile_recovery(
+                ProfileRecoveryKind::EndFailed,
+                &mut work_slot,
+                &mut output_slot,
+            )
+            .await;
+        }
+        ProfileFaultStage::Resolve => {
+            let output = work().await;
+            return finish_profiled_output(
+                device,
+                output,
+                Err(ProfileMeasureError::ResolvePanic {
+                    message: "injected resolve failure".into(),
+                }),
+                false,
+            );
+        }
+        ProfileFaultStage::ResolveDeviceUnavailable => {
+            let output = work().await;
+            return finish_profiled_output(
+                device,
+                output,
+                Err(ProfileMeasureError::ResolvePanic {
+                    message: "injected resolve failure with device unavailable".into(),
+                }),
+                true,
+            );
+        }
+        ProfileFaultStage::None => {
+            // Keep INJECTABLE referenced in production code so fault stages stay live.
+            debug_assert_eq!(ProfileFaultStage::INJECTABLE.len(), 4);
+        }
+    }
+
     let client = WgpuRuntime::client(device);
     if client.properties().timing_method != TimingMethod::Device {
-        return (work().await, None, stats);
+        return Ok((work().await, None, ProfileAttemptStats::default()));
     }
 
     let work_slot = Arc::new(Mutex::new(Some(work)));
@@ -907,7 +1144,6 @@ where
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
             let Some(work) = work else {
-                // Closure must not re-enter after work was taken.
                 return;
             };
             let output = burn_cubecl::cubecl::future::block_on(work());
@@ -926,18 +1162,12 @@ where
             };
             match output {
                 Some(output) => {
-                    let ms = resolve_device_gpu_ms(profile).await;
-                    if ms.is_none() {
-                        stats.resolve_failures = 1;
-                        stats.dropped_samples = 1;
-                    }
-                    (output, ms, stats)
+                    let resolve = resolve_device_gpu_ms(profile).await;
+                    finish_profiled_output(device, output, resolve, false)
                 }
-                None => {
-                    // Profile Ok without stored output cannot happen with the
-                    // slot protocol above; treat as unrecoverable.
-                    panic!("gpu profile Ok without output: work closure did not store a result");
-                }
+                None => Err(crate::TrainingError::TrainingFailed(
+                    "gpu profile Ok without output: work closure did not store a result".into(),
+                )),
             }
         }
         Err(_) => {
@@ -950,31 +1180,17 @@ where
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 classify_profile_recovery(&*work_guard, &*output_guard)
             };
-            match kind {
-                ProfileRecoveryKind::EndFailed => {
-                    stats.end_failures = 1;
-                    stats.dropped_samples = 1;
-                    let output = output_slot
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                        .expect("EndFailed requires stored output");
-                    (output, None, stats)
-                }
-                ProfileRecoveryKind::StartFailed => {
-                    stats.start_failures = 1;
-                    stats.dropped_samples = 1;
-                    let work = work_slot
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                        .expect("StartFailed requires work");
-                    (work().await, None, stats)
-                }
-                ProfileRecoveryKind::Impossible => panic!(
-                    "gpu profile recovery: work already consumed and no output stored (impossible)"
-                ),
-            }
+            // Take slots before await so MutexGuards are not held across .await.
+            let (mut work_opt, mut output_opt) = {
+                let mut work_guard = work_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut output_guard = output_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (work_guard.take(), output_guard.take())
+            };
+            complete_profile_recovery(kind, &mut work_opt, &mut output_opt).await
         }
     }
 }
@@ -1066,6 +1282,9 @@ pub fn assert_report_self_consistent(report: &GpuProfilerReport) -> Result<(), S
         }
         if report.sample_count != 0 {
             return Err("unsupported report sample_count must be 0".into());
+        }
+        if report.measurement_success {
+            return Err("unsupported report must set measurement_success=false".into());
         }
     }
 
@@ -1221,6 +1440,7 @@ mod tests {
     #[test]
     fn percentile_p95_ge_p50_and_sample_count_matches() {
         let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.set_profiler_mode(true, true, 1);
         // warmup + 4 samples
         for ms in [1.0, 10.0, 20.0, 30.0, 40.0] {
             collector.record_gpu_step_ms(ms);
@@ -1253,6 +1473,7 @@ mod tests {
     #[test]
     fn forward_sum_differs_from_p50_times_sample_count_for_uneven_samples() {
         let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.set_profiler_mode(true, true, 1);
         // warmup + uneven: 1, then 10, 100, 1000
         for ms in [1.0, 10.0, 100.0, 1000.0] {
             collector.record_gpu_step_ms(ms);
@@ -1275,10 +1496,11 @@ mod tests {
     #[test]
     fn rejects_nan_inf_and_negative_timings() {
         let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.set_profiler_mode(true, true, 1);
         collector.record_gpu_step_ms(f64::NAN);
         collector.record_gpu_step_ms(f64::INFINITY);
         collector.record_gpu_step_ms(-1.0);
-        collector.record_span_ms(span::FORWARD, f64::NAN);
+        collector.record_span_ms(span::FORWARD_CPU_SUBMIT, f64::NAN);
         collector.record_span_ms(span::DECODE, -0.5);
         collector.record_cpu_step(Duration::from_millis(5));
         // One valid GPU sample that will be dropped by warmup alone.
@@ -1295,6 +1517,7 @@ mod tests {
     #[test]
     fn empty_after_warmup_only_yields_null_percentiles() {
         let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.set_profiler_mode(true, true, 1);
         collector.record_gpu_step_ms(5.0); // warmup only
         collector.record_cpu_step(Duration::from_millis(3));
         let report = collector.build_report();
@@ -1322,8 +1545,8 @@ mod tests {
         collector.record_gpu_step_ms(12.0);
         collector.record_cpu_step(Duration::from_millis(18));
         collector.record_cpu_step(Duration::from_millis(22));
-        collector.record_span(span::FORWARD, Duration::from_millis(5));
-        collector.record_span(span::FORWARD, Duration::from_millis(7));
+        collector.record_span(span::FORWARD_CPU_SUBMIT, Duration::from_millis(5));
+        collector.record_span(span::FORWARD_CPU_SUBMIT, Duration::from_millis(7));
 
         let report = collector.build_report();
         assert!(!report.supported);
@@ -1342,9 +1565,9 @@ mod tests {
         assert_eq!(
             report
                 .pipeline_spans
-                .get(span::FORWARD)
+                .get(span::FORWARD_CPU_SUBMIT)
                 .map(|s| s.timing_kind.as_str()),
-            Some(timing_kind::SYNCHRONIZED_BOUNDARY)
+            Some(timing_kind::CPU_SUBMIT)
         );
         assert_eq!(
             report
@@ -1401,12 +1624,12 @@ mod tests {
             cpu_timing_kind: Some(timing_kind::STEP_WALL.into()),
             pipeline_spans: BTreeMap::from([
                 (
-                    span::FORWARD.to_string(),
+                    span::FORWARD_CPU_SUBMIT.to_string(),
                     PipelineSpanStats {
                         sample_count: 2,
                         p50_ms: Some(5.0),
                         p95_ms: Some(7.0),
-                        timing_kind: timing_kind::SYNCHRONIZED_BOUNDARY.into(),
+                        timing_kind: timing_kind::CPU_SUBMIT.into(),
                     },
                 ),
                 (
@@ -1425,7 +1648,8 @@ mod tests {
         assert!(json.contains("\"gpu_forward_sum_ms\": null"));
         assert!(json.contains("\"gpu_timing_scope\": \"forward\""));
         assert!(json.contains("timestamp_query_unavailable"));
-        assert!(json.contains(timing_kind::SYNCHRONIZED_BOUNDARY));
+        assert!(json.contains(timing_kind::CPU_SUBMIT));
+        assert!(json.contains(span::FORWARD_CPU_SUBMIT));
         assert!(json.contains("prefix_sum"));
         let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, report);
@@ -1519,12 +1743,12 @@ mod tests {
     fn profiler_disabled_records_no_cpu_span_samples() {
         let mut collector = PipelineTimingCollector::new(supported_probe());
         collector.set_profiler_mode(false, false, 20);
-        collector.record_span(span::FORWARD, Duration::from_millis(5));
+        collector.record_span(span::FORWARD_CPU_SUBMIT, Duration::from_millis(5));
         collector.record_span(span::DECODE, Duration::from_millis(3));
         collector.record_cpu_step(Duration::from_millis(12));
         collector.record_span_ms(span::UPLOAD, 1.5);
         // Invalid samples must not bump rejects when disabled.
-        collector.record_span_ms(span::FORWARD, f64::NAN);
+        collector.record_span_ms(span::FORWARD_CPU_SUBMIT, f64::NAN);
         assert_eq!(collector.rejected_timing_samples(), 0);
         let report = collector.build_report();
         assert!(!report.profiler_enabled);
@@ -1655,6 +1879,177 @@ mod tests {
         );
         // TimingMethod still comes from the live client.
         assert!(!probe.backend.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_fault_path_start_end_resolve_work_at_most_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let device = crate::training::engine::GsDevice::default();
+        let runs = AtomicUsize::new(0);
+
+        let (out, ms, stats) = profile_device_gpu_step_with_fault(
+            &device,
+            || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                11_i32
+            },
+            ProfileFaultStage::Start,
+        )
+        .await
+        .expect("start fault");
+        assert_eq!(out, 11);
+        assert!(ms.is_none());
+        assert_eq!(stats.start_failures, 1);
+        assert_eq!(stats.dropped_samples, 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let (out, ms, stats) = profile_device_gpu_step_with_fault(
+            &device,
+            || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                22_i32
+            },
+            ProfileFaultStage::End,
+        )
+        .await
+        .expect("end fault");
+        assert_eq!(out, 22);
+        assert!(ms.is_none());
+        assert_eq!(stats.end_failures, 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        let (out, ms, stats) = profile_device_gpu_step_with_fault(
+            &device,
+            || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                33_i32
+            },
+            ProfileFaultStage::Resolve,
+        )
+        .await
+        .expect("resolve fault keeps training");
+        assert_eq!(out, 33);
+        assert!(ms.is_none());
+        assert_eq!(stats.resolve_failures, 1);
+        assert_eq!(stats.dropped_samples, 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+
+        let err = profile_device_gpu_step_with_fault(
+            &device,
+            || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                44_i32
+            },
+            ProfileFaultStage::ResolveDeviceUnavailable,
+        )
+        .await
+        .expect_err("device unavailable must be TrainingError::Gpu");
+        assert!(matches!(err, crate::TrainingError::Gpu(_)), "{err:?}");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            4,
+            "work still runs once before device error"
+        );
+    }
+
+    #[test]
+    fn finish_profiled_output_resolve_panic_keeps_prior_success_flag_semantics() {
+        let device = crate::training::engine::GsDevice::default();
+        let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.set_profiler_mode(true, true, 1);
+        collector.record_gpu_step_ms(10.0); // warmup
+        collector.record_gpu_step_ms(12.0); // accepted
+        let (out, ms, stats) = finish_profiled_output(
+            &device,
+            7_u32,
+            Err(ProfileMeasureError::ResolvePanic {
+                message: "map failed".into(),
+            }),
+            false,
+        )
+        .expect("healthy device drops sample");
+        assert_eq!(out, 7);
+        assert!(ms.is_none());
+        assert_eq!(stats.resolve_failures, 1);
+        collector.record_profile_attempt_stats(&stats);
+        let report = collector.build_report();
+        assert!(report.measurement_success, "prior accepted samples remain");
+        assert_eq!(report.sample_count, 1);
+        assert_eq!(report.profile_resolve_failures, 1);
+        assert_eq!(report.dropped_profile_samples, 1);
+    }
+
+    #[test]
+    fn split_forward_series_kinds_and_sparse_sample_counts() {
+        let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.set_profiler_mode(true, true, 5);
+        // iterations 1..12 with sample every 5 (+ final): sampled 1,5,10,12
+        for iter in 1..=12 {
+            if should_profile_gpu(iter, 5, Some(12)) {
+                collector.record_span_ms(span::FORWARD_GPU_SAMPLED, 3.0 + iter as f64);
+                collector.record_gpu_step_ms(2.0 + iter as f64);
+            } else {
+                collector.record_span_ms(span::FORWARD_CPU_SUBMIT, 1.0 + iter as f64 * 0.1);
+            }
+        }
+        let report = collector.build_report();
+        let sampled = report
+            .pipeline_spans
+            .get(span::FORWARD_GPU_SAMPLED)
+            .expect("sampled");
+        let submit = report
+            .pipeline_spans
+            .get(span::FORWARD_CPU_SUBMIT)
+            .expect("submit");
+        assert_eq!(sampled.timing_kind, timing_kind::SYNCHRONIZED_BOUNDARY);
+        assert_eq!(submit.timing_kind, timing_kind::CPU_SUBMIT);
+        // 4 sampled raw → 3 after warmup; 8 submit raw → 7 after warmup
+        assert_eq!(sampled.sample_count, 3);
+        assert_eq!(submit.sample_count, 7);
+        assert_eq!(report.sample_count, 3);
+        assert_report_self_consistent(&report).expect("split series consistent");
+    }
+
+    #[test]
+    fn report_consistency_json_round_trip_rejects_illegal_combinations() {
+        let mut good = PipelineTimingCollector::new(supported_probe());
+        good.set_profiler_mode(true, true, 20);
+        // warmup-only: one GPU sample → success false, still consistent
+        good.record_gpu_step_ms(5.0);
+        let warmup_only = good.build_report();
+        assert!(!warmup_only.measurement_success);
+        let json = serde_json::to_string(&warmup_only).expect("ser");
+        let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("de");
+        assert_report_self_consistent(&decoded).expect("warmup-only ok");
+
+        let mut empty = PipelineTimingCollector::new(supported_probe());
+        empty.set_profiler_mode(true, false, 20);
+        let no_samples = empty.build_report();
+        let json = serde_json::to_string(&no_samples).expect("ser");
+        let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("de");
+        assert_report_self_consistent(&decoded).expect("no-sample ok");
+
+        let mut bad = warmup_only.clone();
+        bad.supported = false;
+        bad.unsupported_reason = Some(UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE.into());
+        bad.measurement_success = true; // illegal with unsupported
+        bad.sample_count = 0;
+        bad.gpu_step_p50_ms = None;
+        bad.gpu_step_p95_ms = None;
+        bad.gpu_forward_sum_ms = None;
+        let json = serde_json::to_string(&bad).expect("ser");
+        let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("de");
+        let err = assert_report_self_consistent(&decoded).expect_err("unsupported+success");
+        assert!(
+            err.contains("measurement_success") || err.contains("unsupported"),
+            "{err}"
+        );
+
+        let mut bad2 = warmup_only.clone();
+        bad2.measurement_success = true; // sample_count 0
+        let json = serde_json::to_string(&bad2).expect("ser");
+        let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("de");
+        assert!(assert_report_self_consistent(&decoded).is_err());
     }
 
     #[test]

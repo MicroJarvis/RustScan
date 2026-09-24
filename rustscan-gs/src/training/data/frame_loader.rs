@@ -31,6 +31,8 @@ pub(crate) struct FrameLoaderOptions {
     pub(crate) cache_capacity: usize,
     pub(crate) prefetch_ahead: usize,
     pub(crate) rgb_target_size: Option<(usize, usize)>,
+    /// When false, skip decode/resize Instant creation (profiler disabled).
+    pub(crate) measure_timing: bool,
 }
 
 impl Default for FrameLoaderOptions {
@@ -39,6 +41,7 @@ impl Default for FrameLoaderOptions {
             cache_capacity: 8,
             prefetch_ahead: 4,
             rgb_target_size: None,
+            measure_timing: true,
         }
     }
 }
@@ -140,6 +143,7 @@ impl PrefetchFrameLoader {
         let min_depth = config.initialization.min_depth;
         let max_depth = config.initialization.max_depth;
         let rgb_target_size = options.rgb_target_size;
+        let measure_timing = options.measure_timing;
         let (request_tx, request_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let request_rx = Arc::new(Mutex::new(request_rx));
@@ -175,6 +179,7 @@ impl PrefetchFrameLoader {
                             use_synthetic_depth,
                             min_depth,
                             max_depth,
+                            measure_timing,
                         )
                     } else {
                         Err(TrainingError::InvalidInput(format!(
@@ -349,12 +354,13 @@ pub(super) fn decode_frame(
     use_synthetic_depth: bool,
     min_depth: f32,
     max_depth: f32,
+    measure_timing: bool,
 ) -> Result<DecodedFrame, TrainingError> {
     let expected_color = width.saturating_mul(height).saturating_mul(3);
     let expected_depth = width.saturating_mul(height);
-    let decode_started = Instant::now();
+    let decode_started = measure_timing.then(Instant::now);
     let color_u8 = load_color_image(image_path, width, height)?;
-    let decode_ms = Some(decode_started.elapsed().as_secs_f64() * 1_000.0);
+    let decode_ms = decode_started.map(|started| started.elapsed().as_secs_f64() * 1_000.0);
     if color_u8.len() != expected_color {
         return Err(TrainingError::InvalidInput(format!(
             "image {} produced {} bytes, expected {}",
@@ -365,7 +371,7 @@ pub(super) fn decode_frame(
     }
     let (target_rgb, resize_ms) = match rgb_target_size {
         Some((target_width, target_height)) => {
-            let resize_started = Instant::now();
+            let resize_started = measure_timing.then(Instant::now);
             let resized = Arc::new(resize_rgb_u8_to_f32(
                 &color_u8,
                 width,
@@ -375,7 +381,7 @@ pub(super) fn decode_frame(
             ));
             (
                 Some(resized),
-                Some(resize_started.elapsed().as_secs_f64() * 1_000.0),
+                resize_started.map(|started| started.elapsed().as_secs_f64() * 1_000.0),
             )
         }
         None => (None, None),

@@ -256,6 +256,7 @@ where
             cache_capacity: config.data.frame_cache_capacity,
             prefetch_ahead: config.data.frame_prefetch_ahead,
             rgb_target_size: Some((target_width, target_height)),
+            measure_timing: config.profiler.enabled,
         },
     )?;
 

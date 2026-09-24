@@ -942,6 +942,31 @@ fn checkpoint_bincode_options() -> impl Options {
         .reject_trailing_bytes()
 }
 
+fn encode_checkpoint_error(error: bincode::ErrorKind) -> TrainingError {
+    match error {
+        bincode::ErrorKind::Io(error) => TrainingError::Io(error),
+        error => TrainingError::TrainingFailed(format!("encode checkpoint: {error}")),
+    }
+}
+
+fn decode_checkpoint_error(error: bincode::ErrorKind) -> TrainingError {
+    match error {
+        bincode::ErrorKind::Io(error) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
+            TrainingError::Io(error)
+        }
+        error => {
+            let message = error.to_string();
+            if message.contains("bytes remaining") || message.contains("trailing") {
+                TrainingError::InvalidInput(
+                    "decode checkpoint: trailing bytes are not allowed".to_string(),
+                )
+            } else {
+                TrainingError::InvalidInput(format!("decode checkpoint: {message}"))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod fingerprint_tests {
     use super::hash_training_config;
@@ -982,30 +1007,5 @@ mod fingerprint_tests {
             hash_training_config(&changed_loss).expect("loss hash"),
             "real training parameter changes must still mismatch"
         );
-    }
-}
-
-fn encode_checkpoint_error(error: bincode::ErrorKind) -> TrainingError {
-    match error {
-        bincode::ErrorKind::Io(error) => TrainingError::Io(error),
-        error => TrainingError::TrainingFailed(format!("encode checkpoint: {error}")),
-    }
-}
-
-fn decode_checkpoint_error(error: bincode::ErrorKind) -> TrainingError {
-    match error {
-        bincode::ErrorKind::Io(error) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
-            TrainingError::Io(error)
-        }
-        error => {
-            let message = error.to_string();
-            if message.contains("bytes remaining") || message.contains("trailing") {
-                TrainingError::InvalidInput(
-                    "decode checkpoint: trailing bytes are not allowed".to_string(),
-                )
-            } else {
-                TrainingError::InvalidInput(format!("decode checkpoint: {message}"))
-            }
-        }
     }
 }
