@@ -163,10 +163,9 @@ cannot observe different intrinsics for the same `CameraModel`.
 
 ## T5 — Make Bundle Adjustment State Updates Atomic
 
-**Status:** review_ready on `agent/RS-2026-004/t5-atomic-ba` (base
-`701d051814a29ab3ee4fbefc01355112f71b5a47`; `review-t5-2026-09-23.md`,
-`review-t5-2026-09-24.md`, and `review-t5-2026-09-24-final.md` CHANGES_REQUESTED
-retained; distortion-classification remediation awaiting independent re-review).
+**Status:** reviewed and approved on `agent/RS-2026-004/t5-atomic-ba` (base
+`701d051814a29ab3ee4fbefc01355112f71b5a47`; prior CHANGES_REQUESTED reviews
+and the accepted distortion-classification re-review are retained).
 
 **Dependencies:** T0  
 **Primary scope:** `rustscan-sfm/src/ba/`,
@@ -275,4 +274,3 @@ are explicit and tested, and the automated repository check enforces the rule.
 **Exit condition:** all acceptance conditions have evidence, the reviewer has
 no unresolved P1/P2 findings, and integration does not include the unrelated
 dirty documentation changes.
-

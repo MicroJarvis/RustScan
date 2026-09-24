@@ -1039,8 +1039,9 @@ branch to `main`.
 
 ### T5 — Atomic BA
 
-Status: review_ready (remediation after `review-t5-2026-09-24-final.md`
-CHANGES_REQUESTED). Awaiting independent re-review.
+Status: reviewed and approved (remediation after
+`review-t5-2026-09-24-final.md` CHANGES_REQUESTED). Independent re-review is
+recorded in `review-t5-2026-09-24-distortion-recheck.md`.
 
 Owner: `cursor-agent`
 
@@ -1120,13 +1121,36 @@ and `CARGO_TERM_COLOR=never` (this remediation):
   unmodified. No global allow added.
 - `git diff --check`: pass.
 
+#### Independent approval — 2026-09-24 distortion recheck
+
+Review: `review-t5-2026-09-24-distortion-recheck.md`. Decision: **APPROVE**.
+
+Reviewed HEAD: `82512b9a3b6a4d455b13e1e8dbdd938bfbc7a4ec` (implementation
+`d6287d8`). Product source tree was clean at review time; only change-package
+docs were updated for this handoff.
+
+Independent verification (recorded for handoff; product code unchanged):
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check --workspace --all-targets`: pass.
+- BA directed: `cargo test -p rustscan-sfm --no-default-features --features
+  ceres-ba --lib ba:: -- --test-threads=1`: **49 passed**.
+- types directed: `cargo test -p rustscan-sfm --all-features --lib
+  types::tests -- --test-threads=1`: **16 passed**.
+- `git diff --check`: pass.
+- Clippy: blocked by pre-existing `rustscan-slam` (84 errors; first
+  `module_inception` at `rustscan-slam/src/config/mod.rs:5`).
+
 Known limitations:
 
 - Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
 - Database transaction atomicity remains T6.
+- T5 is merge-eligible but must not be merged to `main` without repository-
+  owner authorization. Worktree retained. T6 not started.
 
-Next action: do not start T6. Do not merge to `main`. Await independent
-re-review.
+Next action: T5 handoff complete. Await repository-owner authorization to
+integrate. Do not start T6. Do not merge to `main`. Do not delete the T5
+worktree.
 
 ### T6 — Database Transactions
 
