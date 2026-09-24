@@ -896,14 +896,14 @@ impl WgpuTrainer {
             let cov_blur = self.raster_cov_blur_at(iteration, frame_count);
             let status_buf = self.device_status.buffer().clone();
             let sh_degree = splats.sh_degree;
-            let mut owned_splats =
+            let owned_splats =
                 std::mem::replace(splats, empty_device_splats_placeholder(&device, sh_degree));
             let mut owned_ws = std::mem::take(&mut self.prefix_sum_workspace);
             let owned_camera = camera.clone();
             let ((stolen_splats, stolen_ws, rendered), gpu_ms) =
                 profile_device_gpu_step(&device, move || async move {
                     let rendered = backward::render_splats_with_visibility_active_sh(
-                        &mut owned_splats,
+                        &owned_splats,
                         active_sh_degree,
                         &owned_camera,
                         (width as u32, height as u32),
@@ -1623,10 +1623,19 @@ impl WgpuTrainer {
         let before = self.snapshot_mutation_state_for_test(splats).await?;
         self.force_intersection_capacity_for_test(capacity);
 
-        let overflow_err = self
+        // F01: healthy unread steps do not status-read; overflow stays sticky on
+        // device and surfaces at the next safety-point readback.
+        let unread = self
             .train_step(splats, camera, target, image_dims, 2, 1, true, false)
+            .await?;
+        assert!(
+            unread.is_none(),
+            "unread overflow must stay SubmittedUnconfirmed without stepwise status read"
+        );
+        let overflow_err = self
+            .ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
             .await
-            .expect_err("capacity-1 overflow must abort even when loss is unread");
+            .expect_err("capacity-1 overflow must surface at the safety-point status read");
         assert!(
             matches!(overflow_err, TrainingError::ForwardCapacityExceeded { .. }),
             "got {overflow_err:?}"
@@ -3737,10 +3746,12 @@ mod tests {
         assert_eq!(healthy.completed_iterations, 1);
 
         let before = snapshot_mutation_state(&mut trainer, &splats).await;
-        let mut sticky = TrainingStatusSnapshot::default();
-        sticky.flags = STATUS_NON_FINITE_LOSS;
-        sticky.first_invalid_iteration = 2;
-        sticky.committed_optimizer_steps = before.5.committed_optimizer_steps;
+        let sticky = TrainingStatusSnapshot {
+            flags: STATUS_NON_FINITE_LOSS,
+            first_invalid_iteration: 2,
+            committed_optimizer_steps: before.5.committed_optimizer_steps,
+            ..TrainingStatusSnapshot::default()
+        };
         trainer.device_status.set_host_snapshot(sticky);
 
         let mut observer = OuterLoopProbeObserver::new();

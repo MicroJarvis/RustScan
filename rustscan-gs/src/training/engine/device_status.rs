@@ -168,6 +168,7 @@ impl<B: Backend> DeviceTrainingStatus<B> {
         &self.buffer
     }
 
+    #[cfg(test)]
     pub(crate) fn set_host_snapshot(&mut self, snapshot: TrainingStatusSnapshot) {
         self.host = snapshot;
         self.sync_host_to_device();

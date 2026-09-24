@@ -8,8 +8,10 @@ mod topology_accum;
 mod trainer;
 
 pub(crate) use backend::{GsBackendBase, GsDevice, GsDiffBackend};
+pub(crate) use device_status::DeviceTrainingStatus;
+#[cfg(test)]
 pub(crate) use device_status::{
-    DeviceTrainingStatus, TrainingStatusSnapshot, STATUS_FORWARD_OVERFLOW, STATUS_NON_FINITE_LOSS,
+    TrainingStatusSnapshot, STATUS_FORWARD_OVERFLOW, STATUS_NON_FINITE_LOSS,
 };
 pub(crate) use loss::{combined_loss_with_kernel, gaussian_kernel_1d, SsimConfig};
 pub(crate) use runtime::train_splats;
