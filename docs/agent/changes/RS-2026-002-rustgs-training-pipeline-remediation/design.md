@@ -58,3 +58,28 @@ number (no coalesced historical labels on a later model).
 continuity fields only. `iterations` is zeroed and nested `profiler` is omitted
 so legacy checkpoints and profiler-only toggles remain restorable; optimizer /
 loss / topology / data / raster / litegs changes still mismatch.
+
+## Profiler contracts (C4 / R04–R08 remediations)
+
+**R04 — disabled Instant creation:** When `profiler.enabled=false`, the
+train loop, forward/backward/optimizer host walls, upload `CpuSpanTimer`, and
+prefetch decode/resize paths must not create profiling `Instant`s. Recording
+entry points (`record_span*`, `record_cpu_step`, `record_gpu_step_ms`) are
+no-ops. Topology still keeps its own training telemetry vectors; those are not
+pipeline-profiler series.
+
+**R06 — split forward series:** GPU-sampled iterations record
+`forward_gpu_sampled` (`synchronized_boundary`, includes timestamp resolve
+wait). Unsampled iterations record `forward_cpu_submit` (`cpu_submit`). Do not
+mix the two into one percentile series.
+
+**R07 — resolve failures:** `resolve_device_gpu_ms` catches CubeCL resolve
+panics. Measurement-only failure with a healthy device drops the sample,
+increments resolve/drop counters, and continues. Device unusable →
+`TrainingError::Gpu`. Work runs at most once. `measurement_success` reflects
+whether any post-warmup GPU sample exists; later failures do not erase prior
+accepted samples. Fault injection uses the production
+`profile_device_gpu_step_with_fault` / `finish_profiled_output` path.
+
+**R08 — validator:** Unsupported reports must set `measurement_success=false`.
+Illegal combinations are rejected after JSON round-trip as well as in-memory.

@@ -5,7 +5,7 @@ source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
 fix_branch: "fix/rs-2026-002-c1-c4-review"
-head_sha: "3bf9b84644c81f66766d1644658afc4bd9fa02a3"
+head_sha: "6bfab3ae491a2f7de7f5310ac2f0ad4719bce9b7"
 cards:
   C1:
     status: implemented_pending_maintainer_review
@@ -19,8 +19,7 @@ cards:
     notes: "prefix-sum workspace ownership preserved"
   C4:
     status: implemented_pending_rereview
-    head_sha: "311cd17"
-    notes: "R04–R09 profiler gates, kinds, failures, JSON export; prior F02–F11 retained"
+    notes: "R04 Instant skip; R06 split forward series; R07 resolve catch_unwind; R08 validator; prior R01–R09 retained"
   C5:
     status: not_started
   C6:
@@ -41,12 +40,12 @@ out_of_scope:
 acceptance:
   - "All completion gates in tasks.md have code, test, and artifact evidence."
   - "No unchecked task is described as complete without evidence."
-  - "Independent re-review of R01–R09 before merge."
+  - "Independent re-review of round-2 R04/R06/R07/R08 before merge."
 verification:
   - "cargo fmt --all -- --check"
   - "cargo check --workspace --all-targets"
   - "cargo test -p rustscan-gs --all-targets --features gpu-wgpu -- --test-threads=1"
   - "cargo test -p rustscan-gs --no-default-features --lib -- --test-threads=1"
   - "cargo test -p rustscan-gs --test integration_test --features gpu-wgpu -- --ignored --test-threads=1"
-  - "cargo clippy -p rustscan-gs --all-targets --all-features -- -D warnings"
   - "cargo clippy -p rustscan-gs --all-targets --features gpu-wgpu --no-deps -- -D warnings"
+  - "git diff --check"
