@@ -890,6 +890,46 @@ impl TrainingRasterConfig {
     }
 }
 
+fn default_profiler_enabled() -> bool {
+    true
+}
+
+fn default_gpu_sample_every() -> usize {
+    20
+}
+
+/// Host and optional device-timestamp profiling controls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrainingProfilerConfig {
+    /// Enable CPU span collection (host Instant).
+    #[serde(default = "default_profiler_enabled")]
+    pub enabled: bool,
+    /// Enable cubecl device timestamp profiling (off by default).
+    #[serde(default)]
+    pub gpu_timing_enabled: bool,
+    /// Sample GPU timestamps every N iterations when enabled.
+    #[serde(default = "default_gpu_sample_every")]
+    pub gpu_sample_every: usize,
+}
+
+impl Default for TrainingProfilerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_profiler_enabled(),
+            gpu_timing_enabled: false,
+            gpu_sample_every: default_gpu_sample_every(),
+        }
+    }
+}
+
+impl TrainingProfilerConfig {
+    fn validate(&self, invalid: &mut Vec<String>) {
+        if self.gpu_sample_every == 0 {
+            invalid.push("profiler.gpu_sample_every must be >= 1".to_string());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TrainingConfig {
     /// Training backend implementation to use.
@@ -910,6 +950,9 @@ pub struct TrainingConfig {
     pub raster: TrainingRasterConfig,
     /// Nested LiteGS-compatible configuration surface.
     pub litegs: LiteGsConfig,
+    /// CPU / optional GPU device-timestamp profiling controls.
+    #[serde(default)]
+    pub profiler: TrainingProfilerConfig,
 }
 
 impl Default for TrainingConfig {
@@ -923,6 +966,7 @@ impl Default for TrainingConfig {
             data: TrainingDataConfig::default(),
             raster: TrainingRasterConfig::default(),
             litegs: LiteGsConfig::default(),
+            profiler: TrainingProfilerConfig::default(),
         }
     }
 }
@@ -945,6 +989,7 @@ impl TrainingConfig {
         self.optimizer.validate(&mut invalid);
         self.loss.validate(&mut invalid);
         self.litegs.validate(&mut invalid);
+        self.profiler.validate(&mut invalid);
 
         if invalid.is_empty() {
             Ok(())
@@ -990,6 +1035,18 @@ pub struct TrainingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profiler_gpu_sample_every_must_be_at_least_one() {
+        let mut config = TrainingConfig::default();
+        assert!(config.validate().is_ok());
+        config.profiler.gpu_sample_every = 0;
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            TrainingError::InvalidInput(message) if message.contains("gpu_sample_every")
+        ));
+    }
 
     #[test]
     fn sh_degree_is_limited_to_shader_supported_range() {

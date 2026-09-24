@@ -70,6 +70,12 @@ pub struct GpuProfilerReport {
     pub driver: Option<String>,
     pub adapter_unavailable_reason: Option<String>,
     pub driver_unavailable_reason: Option<String>,
+    /// CPU span collection enabled (host Instant).
+    pub profiler_enabled: bool,
+    /// Device timestamp profiling requested by config.
+    pub gpu_timing_enabled: bool,
+    /// Sample every N iterations when GPU timing is enabled.
+    pub gpu_sample_every: usize,
     /// GPU completion p50 from timestamp-query resolve; null when unsupported.
     pub gpu_step_p50_ms: Option<f64>,
     /// GPU completion p95 from timestamp-query resolve; null when unsupported.
@@ -209,6 +215,9 @@ pub struct PipelineTimingCollector {
     runtime_peak_device_bytes: Option<u64>,
     runtime_peak_device_bytes_reason: Option<String>,
     probe: GpuEnvironmentProbe,
+    profiler_enabled: bool,
+    gpu_timing_enabled: bool,
+    gpu_sample_every: usize,
 }
 
 impl PipelineTimingCollector {
@@ -216,6 +225,9 @@ impl PipelineTimingCollector {
         Self {
             probe,
             runtime_peak_device_bytes_reason: Some(UNSUPPORTED_RUNTIME_PEAK_UNAVAILABLE.into()),
+            profiler_enabled: true,
+            gpu_timing_enabled: false,
+            gpu_sample_every: 20,
             ..Self::default()
         }
     }
@@ -226,6 +238,18 @@ impl PipelineTimingCollector {
 
     pub fn set_probe(&mut self, probe: GpuEnvironmentProbe) {
         self.probe = probe;
+    }
+
+    /// Record configured profiling mode for the report.
+    pub fn set_profiler_mode(
+        &mut self,
+        enabled: bool,
+        gpu_timing_enabled: bool,
+        gpu_sample_every: usize,
+    ) {
+        self.profiler_enabled = enabled;
+        self.gpu_timing_enabled = gpu_timing_enabled;
+        self.gpu_sample_every = gpu_sample_every.max(1);
     }
 
     pub fn record_span_ms(&mut self, name: &str, ms: f64) {
@@ -333,6 +357,9 @@ impl PipelineTimingCollector {
             driver: self.probe.driver.clone(),
             adapter_unavailable_reason: self.probe.adapter_unavailable_reason.clone(),
             driver_unavailable_reason: self.probe.driver_unavailable_reason.clone(),
+            profiler_enabled: self.profiler_enabled,
+            gpu_timing_enabled: self.gpu_timing_enabled,
+            gpu_sample_every: self.gpu_sample_every,
             gpu_step_p50_ms,
             gpu_step_p95_ms,
             sample_count,
@@ -412,32 +439,44 @@ pub async fn resolve_device_gpu_ms(
     Some(duration_millis(ticks.duration()))
 }
 
-/// Send-capable raw pointer for exclusive same-thread GPU profile closures.
-pub(crate) struct SendMutPtr<T>(pub(crate) *mut T);
-
-// SAFETY: The pointer is only dereferenced inside `profile_device_gpu_step`, which
-// completes the future on the calling thread before returning to any other access.
-unsafe impl<T> Send for SendMutPtr<T> {}
-
-impl<T> SendMutPtr<T> {
-    /// # Safety
-    /// Caller must ensure exclusive access for the duration of the returned borrow.
-    pub(crate) unsafe fn as_mut<'a>(self) -> &'a mut T {
-        unsafe { &mut *self.0 }
+/// Whether this iteration should capture a device-timestamp GPU sample.
+///
+/// Cadence: iteration 1, then every `sample_every` iterations. When a total
+/// iteration count is known, the final iteration is also sampled.
+pub fn should_profile_gpu(
+    iteration: usize,
+    sample_every: usize,
+    total_iterations: Option<usize>,
+) -> bool {
+    let every = sample_every.max(1);
+    if iteration == 0 {
+        return false;
     }
+    if iteration == 1 || iteration.is_multiple_of(every) {
+        return true;
+    }
+    matches!(total_iterations, Some(total) if total > 0 && iteration == total)
 }
 
-pub(crate) struct SendConstPtr<T>(pub(crate) *const T);
-
-// SAFETY: Same exclusive completion guarantee as `SendMutPtr`.
-unsafe impl<T> Send for SendConstPtr<T> {}
-
-impl<T> SendConstPtr<T> {
-    /// # Safety
-    /// Caller must ensure the pointees remain valid for the returned borrow.
-    pub(crate) unsafe fn as_ref<'a>(self) -> &'a T {
-        unsafe { &*self.0 }
+/// Recover after a profile attempt that returned `Err`.
+///
+/// Work must run at most once: prefer an already-stored output (end-profile
+/// failure after the closure ran), else run remaining work once (start failure).
+#[cfg(test)]
+pub(crate) fn recover_profile_result<T, F>(
+    work_slot: &mut Option<F>,
+    output_slot: &mut Option<T>,
+) -> Result<(T, Option<f64>), String>
+where
+    F: FnOnce() -> T,
+{
+    if let Some(output) = output_slot.take() {
+        return Ok((output, None));
     }
+    if let Some(work) = work_slot.take() {
+        return Ok((work(), None));
+    }
+    Err("gpu profile recovery: work already consumed and no output stored (impossible)".into())
 }
 
 /// Run `work` under cubecl device timestamp profiling when supported.
@@ -447,7 +486,8 @@ impl<T> SendConstPtr<T> {
 /// include loss `into_scalar_async` readback inside `work` — that host sync is
 /// CPU time, not GPU completion.
 ///
-/// When profiling cannot start, `work` still runs once (unprofiled).
+/// When profiling cannot start or end fails after work ran, `work` still runs
+/// at most once (unprofiled on start failure; timing dropped on end failure).
 pub async fn profile_device_gpu_step<F, Fut, T>(
     device: &crate::training::engine::GsDevice,
     work: F,
@@ -468,29 +508,66 @@ where
     }
 
     let work_slot = Arc::new(Mutex::new(Some(work)));
+    let output_slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
     let work_slot_for_profile = Arc::clone(&work_slot);
+    let output_slot_for_profile = Arc::clone(&output_slot);
     match client.profile(
         move || {
             let work = work_slot_for_profile
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-                .expect("gpu profile work slot");
-            burn_cubecl::cubecl::future::block_on(work())
+                .take();
+            let Some(work) = work else {
+                // Closure must not re-enter after work was taken.
+                return;
+            };
+            let output = burn_cubecl::cubecl::future::block_on(work());
+            *output_slot_for_profile
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(output);
         },
         "gpu_step",
     ) {
-        Ok((output, profile)) => {
-            let ms = resolve_device_gpu_ms(profile).await;
-            (output, ms)
-        }
-        Err(_) => {
-            let work = work_slot
+        Ok(((), profile)) => {
+            let output = output_slot
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-                .expect("gpu profile work slot after start failure");
-            (work().await, None)
+                .take();
+            match output {
+                Some(output) => {
+                    let ms = resolve_device_gpu_ms(profile).await;
+                    (output, ms)
+                }
+                None => {
+                    // Profile Ok without stored output cannot happen with the
+                    // slot protocol above; treat as unrecoverable.
+                    panic!("gpu profile Ok without output: work closure did not store a result");
+                }
+            }
+        }
+        Err(_) => {
+            let output = output_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(output) = output {
+                // End-profile failed after work already ran — never re-run.
+                (output, None)
+            } else {
+                let work = work_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                match work {
+                    Some(work) => {
+                        // Start-profile failed before the closure ran — run once unprofiled.
+                        (work().await, None)
+                    }
+                    None => panic!(
+                        "gpu profile recovery: work already consumed and no output stored (impossible)"
+                    ),
+                }
+            }
         }
     }
 }
@@ -643,6 +720,9 @@ mod tests {
             driver: Some("Metal".into()),
             adapter_unavailable_reason: None,
             driver_unavailable_reason: None,
+            profiler_enabled: true,
+            gpu_timing_enabled: false,
+            gpu_sample_every: 20,
             gpu_step_p50_ms: None,
             gpu_step_p95_ms: None,
             sample_count: 0,
@@ -686,5 +766,74 @@ mod tests {
         assert_eq!(collector.fresh_step_allocations, 2);
         // Later smaller current must not shrink peak.
         assert_eq!(collector.workspace_current_bytes, 80);
+    }
+
+    #[test]
+    fn should_profile_gpu_cadence_first_and_multiples() {
+        assert!(!should_profile_gpu(0, 20, None));
+        assert!(should_profile_gpu(1, 20, None));
+        assert!(!should_profile_gpu(2, 20, None));
+        assert!(should_profile_gpu(20, 20, None));
+        assert!(should_profile_gpu(40, 20, None));
+        assert!(!should_profile_gpu(41, 20, None));
+        // Final iteration when total is known.
+        assert!(should_profile_gpu(17, 20, Some(17)));
+        assert!(!should_profile_gpu(16, 20, Some(17)));
+        // sample_every < 1 treated as 1.
+        assert!(should_profile_gpu(3, 0, None));
+    }
+
+    #[test]
+    fn recover_profile_result_runs_work_at_most_once_on_start_fail() {
+        use std::cell::Cell;
+        let runs = Cell::new(0);
+        let mut work_slot = Some(|| {
+            runs.set(runs.get() + 1);
+            42
+        });
+        let mut output_slot = None;
+        // Start-fail: work still in slot, no output yet.
+        let (out, ms) = recover_profile_result(&mut work_slot, &mut output_slot).expect("recover");
+        assert_eq!(out, 42);
+        assert!(ms.is_none());
+        assert_eq!(runs.get(), 1);
+        assert!(work_slot.is_none());
+        assert!(output_slot.is_none());
+        // Second recovery must fail rather than re-run.
+        let err = recover_profile_result(&mut work_slot, &mut output_slot).unwrap_err();
+        assert!(err.contains("impossible"));
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn recover_profile_result_prefers_stored_output_on_end_fail() {
+        use std::cell::Cell;
+        let runs = Cell::new(0);
+        let mut work_slot = Some(|| {
+            runs.set(runs.get() + 1);
+            7
+        });
+        let mut output_slot = None;
+        // Simulate profile closure: take work once, store output.
+        if let Some(work) = work_slot.take() {
+            output_slot = Some(work());
+        }
+        assert_eq!(runs.get(), 1);
+        let (out, ms) = recover_profile_result(&mut work_slot, &mut output_slot).expect("recover");
+        assert_eq!(out, 7);
+        assert!(ms.is_none());
+        assert_eq!(runs.get(), 1, "end-fail must not re-run work");
+        assert!(work_slot.is_none());
+        assert!(output_slot.is_none());
+    }
+
+    #[test]
+    fn build_report_records_profiler_mode() {
+        let mut collector = PipelineTimingCollector::new(GpuEnvironmentProbe::default());
+        collector.set_profiler_mode(true, true, 20);
+        let report = collector.build_report();
+        assert!(report.profiler_enabled);
+        assert!(report.gpu_timing_enabled);
+        assert_eq!(report.gpu_sample_every, 20);
     }
 }

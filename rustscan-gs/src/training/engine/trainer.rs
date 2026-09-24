@@ -17,8 +17,8 @@ use crate::training::gpu_primitives::device_radix::{
 };
 use crate::training::gpu_primitives::prefix_sum::{prefix_sum_dispatch_count, PrefixSumWorkspace};
 use crate::training::reporting::gpu_profiler::{
-    probe_training_device, profile_device_gpu_step, runtime_device_bytes_in_use, span,
-    PipelineTimingCollector, SendConstPtr, SendMutPtr,
+    probe_training_device, profile_device_gpu_step, runtime_device_bytes_in_use,
+    should_profile_gpu, span, PipelineTimingCollector,
 };
 use crate::training::reporting::metrics::{
     step_intersection_overflowed, ParityLossCurveSample, ParityTopologyMetrics,
@@ -43,7 +43,8 @@ use super::device_status::{DeviceTrainingStatus, TrainingStatusSnapshot};
 use super::loss::{combined_loss_with_kernel, gaussian_kernel_1d, LossStatusBackend, SsimConfig};
 use super::optimizer::{AdamScaled, AdamScaledConfig};
 use super::splats::{
-    device_splats_to_host, host_splats_to_device, try_device_splats_to_host, DeviceSplats,
+    device_splats_to_host, empty_device_splats_placeholder, host_splats_to_device,
+    try_device_splats_to_host, DeviceSplats,
 };
 use super::topology_accum::{accumulate_topology_stats, TopologyAccumulatorSet};
 
@@ -68,10 +69,14 @@ pub(crate) enum StatusReadbackReason {
 #[must_use]
 pub(crate) enum TrainStepDisposition {
     /// Safety-point path already synced device status; host may confirm commits.
-    ConfirmedCommitted { loss: Option<f32> },
+    ConfirmedCommitted {
+        loss: Option<f32>,
+    },
     /// Unread-loss step submitted without a status read; not yet a confirmed commit.
     SubmittedUnconfirmed,
-    Aborted { error: TrainingError },
+    Aborted {
+        error: TrainingError,
+    },
 }
 
 /// Tracks submitted vs device-confirmed optimizer commits for the outer loop.
@@ -567,6 +572,13 @@ impl WgpuTrainer {
         let telemetry =
             initial_training_telemetry(&config, initial_splats, position_lr_scene_scale);
 
+        let mut pipeline_timing = PipelineTimingCollector::new(probe_training_device(&device));
+        pipeline_timing.set_profiler_mode(
+            config.profiler.enabled,
+            config.profiler.gpu_timing_enabled,
+            config.profiler.gpu_sample_every,
+        );
+
         Self {
             config,
             optimizer,
@@ -595,7 +607,7 @@ impl WgpuTrainer {
             optimization_samples: OptimizationTimingSamples::default(),
             intersection_capacity_override: None,
             prefix_sum_workspace: PrefixSumWorkspace::new(),
-            pipeline_timing: PipelineTimingCollector::new(probe_training_device(&device)),
+            pipeline_timing,
         }
     }
 
@@ -869,35 +881,44 @@ impl WgpuTrainer {
         self.telemetry.active_sh_degree = Some(active_sh_degree as usize);
 
         let forward_cpu = Instant::now();
-        let rendered = if self.pipeline_timing.probe().gpu_timing_supported() {
+        let profile_gpu = self.config.profiler.enabled
+            && self.config.profiler.gpu_timing_enabled
+            && self.pipeline_timing.probe().gpu_timing_supported()
+            && should_profile_gpu(
+                iteration,
+                self.config.profiler.gpu_sample_every,
+                Some(self.config.iterations),
+            );
+        let rendered = if profile_gpu {
             let device = self.device.clone();
             let capacity =
                 self.intersection_capacity_for(splats.num_splats(), (width as u32, height as u32));
             let cov_blur = self.raster_cov_blur_at(iteration, frame_count);
             let status_buf = self.device_status.buffer().clone();
-            let ws = SendMutPtr(&mut self.prefix_sum_workspace as *mut PrefixSumWorkspace);
-            let splats_ptr = SendMutPtr(splats as *mut DeviceSplats<GsDiffBackend>);
-            let camera_ptr = SendConstPtr(camera as *const GaussianCamera);
-            let (rendered, gpu_ms) = profile_device_gpu_step(&device, move || async move {
-                // SAFETY: profile_device_gpu_step drives this future to completion on the
-                // calling thread before returning; these pointers are not accessed concurrently.
-                let workspace = unsafe { ws.as_mut() };
-                let splats = unsafe { splats_ptr.as_mut() };
-                let camera = unsafe { camera_ptr.as_ref() };
-                backward::render_splats_with_visibility_active_sh(
-                    splats,
-                    active_sh_degree,
-                    camera,
-                    (width as u32, height as u32),
-                    background,
-                    cov_blur,
-                    capacity,
-                    Some((iteration as u32, status_buf)),
-                    Some(workspace),
-                )
-                .await
-            })
-            .await;
+            let sh_degree = splats.sh_degree;
+            let mut owned_splats =
+                std::mem::replace(splats, empty_device_splats_placeholder(&device, sh_degree));
+            let mut owned_ws = std::mem::take(&mut self.prefix_sum_workspace);
+            let owned_camera = camera.clone();
+            let ((stolen_splats, stolen_ws, rendered), gpu_ms) =
+                profile_device_gpu_step(&device, move || async move {
+                    let rendered = backward::render_splats_with_visibility_active_sh(
+                        &mut owned_splats,
+                        active_sh_degree,
+                        &owned_camera,
+                        (width as u32, height as u32),
+                        background,
+                        cov_blur,
+                        capacity,
+                        Some((iteration as u32, status_buf)),
+                        Some(&mut owned_ws),
+                    )
+                    .await;
+                    (owned_splats, owned_ws, rendered)
+                })
+                .await;
+            *splats = stolen_splats;
+            self.prefix_sum_workspace = stolen_ws;
             if let Some(ms) = gpu_ms {
                 self.pipeline_timing.record_gpu_step_ms(ms);
             }
@@ -1242,7 +1263,8 @@ impl WgpuTrainer {
         splat_count: usize,
         last_loss: Option<f32>,
     ) -> Vec<usize> {
-        let device_committed = self.device_status.host_snapshot().committed_optimizer_steps as usize;
+        let device_committed =
+            self.device_status.host_snapshot().committed_optimizer_steps as usize;
         let newly = state.apply_device_committed(device_committed);
         if let Some(&last) = newly.last() {
             record_completed_step(report, last, splat_count, last_loss);
@@ -3027,8 +3049,10 @@ mod tests {
         if let Some(capacity) = force_capacity {
             trainer.force_intersection_capacity_for_test(capacity);
         }
-        let committed_baseline =
-            trainer.device_status.host_snapshot().committed_optimizer_steps as usize;
+        let committed_baseline = trainer
+            .device_status
+            .host_snapshot()
+            .committed_optimizer_steps as usize;
         let mut commit_state = CommitConfirmationState::new(start_iteration, committed_baseline);
         for zero_based in start_iteration..num_iterations {
             if observer.should_cancel() {
@@ -3614,12 +3638,7 @@ mod tests {
             },
         )
         .expect("prefetch loader");
-        (
-            temp,
-            loader,
-            vec![fault_injection_camera()],
-            vec![0usize],
-        )
+        (temp, loader, vec![fault_injection_camera()], vec![0usize])
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3672,7 +3691,10 @@ mod tests {
         // Host report is only available via finish_report path inside Err; re-run
         // status from trainer telemetry / device mirror.
         assert_eq!(
-            trainer.device_status.host_snapshot().committed_optimizer_steps,
+            trainer
+                .device_status
+                .host_snapshot()
+                .committed_optimizer_steps,
             before.5.committed_optimizer_steps
         );
         assert!(observer.progress_iters.is_empty());
@@ -4554,6 +4576,8 @@ mod tests {
         let device = GsDevice::default();
         let mut config = fault_injection_config();
         config.iterations = 100;
+        config.profiler.gpu_timing_enabled = true;
+        config.profiler.gpu_sample_every = 1;
         let host_splats = trainer_checkpoint_host_splats();
         let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
         let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
