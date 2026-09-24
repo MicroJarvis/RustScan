@@ -61,15 +61,15 @@ pub use crate::core::{GaussianCamera, HostSplats, SplatView};
 #[cfg(feature = "gpu")]
 pub use crate::training::{
     assert_report_self_consistent, evaluate_splats, evaluation_device, last_training_telemetry,
-    probe_wgpu_environment, render_evaluation_frame, run_bounded_forward_parity_suite,
-    runtime_from_splats, training_frame_order, GpuEnvironmentProbe, GpuProfilerReport,
-    LiteGsOptimizerLrs, LiteGsTrainingTelemetry, PipelineSpanStats, PipelineTimingCollector,
-    TrainingCheckpointPolicy, TrainingCheckpointReady, TrainingCheckpointReason,
-    TrainingCheckpointSink, TrainingControl, TrainingEvent, TrainingEventCadence,
-    TrainingEventRoute, TrainingIterationProgress, TrainingOptions, TrainingPlanSelected,
-    TrainingRun, TrainingRunCancelled, TrainingRunCompleted, TrainingRunDisposition,
-    TrainingRunPaused, TrainingRunReport, TrainingRunStarted, TrainingSnapshotReady,
-    PIPELINE_TIMING_WARMUP_SAMPLES, UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE,
+    optimization_gpu_fields_from_profiler, probe_wgpu_environment, render_evaluation_frame,
+    run_bounded_forward_parity_suite, runtime_from_splats, training_frame_order,
+    GpuEnvironmentProbe, GpuProfilerReport, LiteGsOptimizerLrs, LiteGsTrainingTelemetry,
+    OptimizationGpuFields, PipelineSpanStats, PipelineTimingCollector, TrainingCheckpointPolicy,
+    TrainingCheckpointReady, TrainingCheckpointReason, TrainingCheckpointSink, TrainingControl,
+    TrainingEvent, TrainingEventCadence, TrainingEventRoute, TrainingIterationProgress,
+    TrainingOptions, TrainingPlanSelected, TrainingRun, TrainingRunCancelled, TrainingRunCompleted,
+    TrainingRunDisposition, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
+    TrainingSnapshotReady, PIPELINE_TIMING_WARMUP_SAMPLES, UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE,
 };
 pub use crate::training::{
     build_optimization_report, canonical_config_fingerprint, compare_loss_curve_samples,

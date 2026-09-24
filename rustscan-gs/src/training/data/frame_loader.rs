@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use image::{DynamicImage, GenericImageView, ImageReader};
 
@@ -19,6 +20,10 @@ pub(crate) struct DecodedFrame {
     pub(crate) target_rgb: Option<Arc<Vec<f32>>>,
     pub(crate) depth: Vec<f32>,
     pub(crate) used_real_depth: bool,
+    /// Host wall ms for `load_color_image` (decode path).
+    pub(crate) decode_ms: Option<f64>,
+    /// Host wall ms for `resize_rgb_u8_to_f32` when a target size is configured.
+    pub(crate) resize_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,7 +352,9 @@ pub(super) fn decode_frame(
 ) -> Result<DecodedFrame, TrainingError> {
     let expected_color = width.saturating_mul(height).saturating_mul(3);
     let expected_depth = width.saturating_mul(height);
+    let decode_started = Instant::now();
     let color_u8 = load_color_image(image_path, width, height)?;
+    let decode_ms = Some(decode_started.elapsed().as_secs_f64() * 1_000.0);
     if color_u8.len() != expected_color {
         return Err(TrainingError::InvalidInput(format!(
             "image {} produced {} bytes, expected {}",
@@ -356,15 +363,23 @@ pub(super) fn decode_frame(
             expected_color,
         )));
     }
-    let target_rgb = rgb_target_size.map(|(target_width, target_height)| {
-        Arc::new(resize_rgb_u8_to_f32(
-            &color_u8,
-            width,
-            height,
-            target_width,
-            target_height,
-        ))
-    });
+    let (target_rgb, resize_ms) = match rgb_target_size {
+        Some((target_width, target_height)) => {
+            let resize_started = Instant::now();
+            let resized = Arc::new(resize_rgb_u8_to_f32(
+                &color_u8,
+                width,
+                height,
+                target_width,
+                target_height,
+            ));
+            (
+                Some(resized),
+                Some(resize_started.elapsed().as_secs_f64() * 1_000.0),
+            )
+        }
+        None => (None, None),
+    };
 
     let (depth, used_real_depth) = match depth_path {
         Some(path) => (load_depth_image(path, width, height, depth_scale)?, true),
@@ -388,6 +403,8 @@ pub(super) fn decode_frame(
         target_rgb,
         depth,
         used_real_depth,
+        decode_ms,
+        resize_ms,
     })
 }
 

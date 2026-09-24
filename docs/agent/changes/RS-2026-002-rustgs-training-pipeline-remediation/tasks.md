@@ -239,8 +239,8 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 
 - [ ] 一次构建 release binary；baseline/candidate 实验期间禁止重建。
 - [ ] 执行 Home 500 → flowers2 500 → TUM 500 → TUM 3k → 10k → 30k；正式 baseline/candidate 各至少 3 次，首轮 warmup 不计入统计，报告 mean/stddev/p50/p95。
-- [ ] 拒绝条件：overflow/non-finite/invalid dispatch/checkpoint failure；resume fingerprint mismatch；普通 step status readback；workspace 持续增长；holdout mean 下降超过 0.10 dB；worst frame 下降超过 0.20 dB；出现新 fog/ghosting/floaters。
-- [ ] 接受条件：先通过 correctness/quality，再在同 GPU/driver 下证明稳定 steps/s 提升且 p95 不恶化，并能从 JSON 归因到同步、workspace 或 kernel 时间。
+- [ ] 拒绝条件：overflow/non-finite/invalid dispatch/checkpoint failure；resume fingerprint mismatch；**超出 C2 安全点契约的逐步 disposition status readback**（loss cadence / topology / checkpoint / pause / cancel / training end / ForwardAbort 属于约定安全点，不算拒绝）；workspace 持续增长；holdout mean 下降超过 0.10 dB；worst frame 下降超过 0.20 dB；出现新 fog/ghosting/floaters。
+- [ ] 接受条件：先通过 correctness/quality，再在同 GPU/driver 下证明稳定 steps/s 提升且 p95 不恶化，并能从 JSON 归因到同步、workspace 或 kernel 时间。baseline 与 candidate 各自绑定自己的 binary hash；其余控制变量按实验契约匹配。
 
 **验收标准：** 每个场景都能由 manifest、report 和 binary hash 完整复现；质量和效率门槛均有数字证据。
 
@@ -279,4 +279,4 @@ workspace 必须由 trainer/forward context 持有，并通过 &mut PrefixSumWor
 2. P0 未通过前停止性能算法；没有 profiling 证据，不实现 GPU-native topology、fused loss 或大规模 cache 重构。
 3. 不得用放宽全局容差、减少测试覆盖、删除 telemetry 或跳过 holdout 来通过门禁。
 4. 每个 Task 单独提交，提交前检查 git status --short；不得带入当前 rustscan-sfm/rustscan-viewer 未提交修改。
-5. 发现接口冲突时，优先保证“异常 step 零持久 mutation”和“正常 step 零 status readback”。
+5. 发现接口冲突时，优先保证“异常 step 零持久 mutation”和“正常 unread step 不增加逐步 disposition status readback”（安全点读回除外，见 `design.md`）。

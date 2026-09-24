@@ -1,9 +1,14 @@
 //! GPU completion profiler and unified pipeline timing.
 //!
-//! CPU spans use host `Instant` and are reported under explicit `cpu_*` field
-//! names. GPU step percentiles are filled only after wgpu timestamp-query
-//! resolve/readback completes with `TimingMethod::Device`. System/host waits
-//! (including `into_scalar_async`) must never be labeled as GPU kernel time.
+//! CPU spans use host `Instant` and are reported under explicit timing_kind
+//! labels. GPU percentiles cover **forward render only** (`gpu_timing_scope =
+//! "forward"`): loss, backward, optimizer, and topology are outside the device
+//! timestamp bracket. System/host waits (including `into_scalar_async`) must
+//! never be labeled as GPU kernel time.
+//!
+//! Warmup drops the first [`PIPELINE_TIMING_WARMUP_SAMPLES`] samples per series
+//! before aggregation. Aborted runs report only samples collected so far.
+//! Resume constructs a new collector (samples do not include prior-run steps).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,11 +25,24 @@ pub const UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE: &str = "timestamp_query_unava
 /// Stable reason when cubecl reports system timing instead of device timestamps.
 pub const UNSUPPORTED_TIMING_METHOD_SYSTEM: &str = "timing_method_system";
 
-/// Stable reason when adapter metadata cannot be probed.
+/// Stable reason when adapter metadata cannot be resolved from the training device.
 pub const UNSUPPORTED_ADAPTER_PROBE_FAILED: &str = "adapter_probe_failed";
 
 /// Stable reason when cubecl memory usage is unavailable.
 pub const UNSUPPORTED_RUNTIME_PEAK_UNAVAILABLE: &str = "runtime_peak_device_bytes_unavailable";
+
+/// Observed high-water of allocator `bytes_in_use` samples — not a true allocator peak.
+pub const SAMPLED_BYTES_IN_USE_HIGH_WATER: &str = "sampled_bytes_in_use_high_water";
+
+/// Existing/shared device without stored adapter metadata.
+pub const EXISTING_DEVICE_ADAPTER_METADATA_UNAVAILABLE: &str =
+    "existing_device_adapter_metadata_unavailable";
+
+/// GPU samples cover render forward only.
+pub const GPU_TIMING_SCOPE_FORWARD: &str = "forward";
+
+/// Prefix-sum workspace ownership scope for workspace_* / fresh_step_allocations.
+pub const WORKSPACE_SCOPE_PREFIX_SUM: &str = "prefix_sum";
 
 /// Unified pipeline span names (CPU submit / wall unless documented otherwise).
 pub mod span {
@@ -39,7 +57,10 @@ pub mod span {
     pub const TOPOLOGY_PLAN: &str = "topology_plan";
     pub const TOPOLOGY_APPLY: &str = "topology_apply";
     pub const TOPOLOGY_UPLOAD: &str = "topology_upload";
-    pub const TOPOLOGY_REMAP: &str = "topology_remap";
+    /// Visibility-state remap after a topology mutation.
+    pub const TOPOLOGY_REMAP_VISIBILITY: &str = "topology_remap_visibility";
+    /// Adam optimizer origin remap after a topology mutation.
+    pub const TOPOLOGY_REMAP_OPTIMIZER: &str = "topology_remap_optimizer";
     /// Parent CPU wall covering one outer-loop iteration (submit-side Instant).
     pub const STEP_CPU: &str = "step_cpu";
 
@@ -55,7 +76,8 @@ pub mod span {
         TOPOLOGY_PLAN,
         TOPOLOGY_APPLY,
         TOPOLOGY_UPLOAD,
-        TOPOLOGY_REMAP,
+        TOPOLOGY_REMAP_VISIBILITY,
+        TOPOLOGY_REMAP_OPTIMIZER,
         STEP_CPU,
     ];
 }
@@ -63,6 +85,7 @@ pub mod span {
 /// Serializable GPU profiler report distinguishing CPU submit from GPU completion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct GpuProfilerReport {
+    /// True when the training device can produce device-timestamp GPU samples.
     pub supported: bool,
     pub unsupported_reason: Option<String>,
     pub backend: String,
@@ -70,21 +93,36 @@ pub struct GpuProfilerReport {
     pub driver: Option<String>,
     pub adapter_unavailable_reason: Option<String>,
     pub driver_unavailable_reason: Option<String>,
+    /// Hardware/capability: training adapter exposes timestamp queries (Device timing).
+    pub timestamp_query_available: bool,
     /// CPU span collection enabled (host Instant).
     pub profiler_enabled: bool,
     /// Device timestamp profiling requested by config.
     pub gpu_timing_enabled: bool,
+    /// True when at least one accepted GPU forward sample survived warmup.
+    pub measurement_success: bool,
     /// Sample every N iterations when GPU timing is enabled.
     pub gpu_sample_every: usize,
-    /// GPU completion p50 from timestamp-query resolve; null when unsupported.
+    /// Scope of GPU timestamp samples (`"forward"` — not full train step).
+    pub gpu_timing_scope: Option<String>,
+    /// Sum of accepted (post-warmup) GPU forward samples in milliseconds.
+    pub gpu_forward_sum_ms: Option<f64>,
+    /// Forward-only GPU completion p50; null when unsupported or no samples.
     pub gpu_step_p50_ms: Option<f64>,
-    /// GPU completion p95 from timestamp-query resolve; null when unsupported.
+    /// Forward-only GPU completion p95; null when unsupported or no samples.
     pub gpu_step_p95_ms: Option<f64>,
+    /// Accepted GPU forward sample count after warmup.
     pub sample_count: u64,
+    /// Illegal (non-finite / negative) timing samples dropped at record sites.
+    pub rejected_timing_samples: u64,
+    /// Scope of workspace_* / fresh_step_allocations (`"prefix_sum"`).
+    pub workspace_scope: String,
     pub workspace_current_bytes: u64,
     pub workspace_peak_bytes: u64,
     pub workspace_growth_count: u64,
+    /// Fresh prefix-sum workspace allocations only — not whole-runtime.
     pub fresh_step_allocations: u64,
+    /// Max observed allocator `bytes_in_use` across sample points.
     pub runtime_peak_device_bytes: Option<u64>,
     pub runtime_peak_device_bytes_reason: Option<String>,
     /// Explicit CPU submit-side loop percentiles (`Instant`); never GPU.
@@ -99,7 +137,8 @@ pub struct PipelineSpanStats {
     pub sample_count: u64,
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
-    /// Always `cpu_submit_instant` for these spans; parent/child are not summed.
+    /// `cpu_submit_instant` for most spans; `synchronized_boundary` for forward
+    /// (Instant may include timestamp-query resolve wait when GPU timing is on).
     pub timing_kind: String,
 }
 
@@ -121,7 +160,54 @@ impl GpuEnvironmentProbe {
     }
 }
 
-/// Probe adapter/backend/driver and timestamp-query capability via wgpu.
+/// Optional adapter metadata captured from a shared wgpu setup (training device).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TrainingAdapterMetadata {
+    pub backend: String,
+    pub adapter: Option<String>,
+    pub driver: Option<String>,
+    pub timestamp_query_available: bool,
+}
+
+impl TrainingAdapterMetadata {
+    pub fn from_wgpu_adapter(adapter: &wgpu::Adapter, backend: wgpu::Backend) -> Self {
+        let info = adapter.get_info();
+        let (adapter_name, driver) = adapter_name_and_driver(&info);
+        Self {
+            backend: format!("{backend:?}"),
+            adapter: adapter_name,
+            driver,
+            timestamp_query_available: adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+        }
+    }
+}
+
+fn adapter_name_and_driver(info: &wgpu::AdapterInfo) -> (Option<String>, Option<String>) {
+    let adapter_name = if info.name.is_empty() {
+        None
+    } else {
+        Some(info.name.clone())
+    };
+    let driver = {
+        let mut parts = Vec::new();
+        if !info.driver.is_empty() {
+            parts.push(info.driver.clone());
+        }
+        if !info.driver_info.is_empty() {
+            parts.push(info.driver_info.clone());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" / "))
+        }
+    };
+    (adapter_name, driver)
+}
+
+/// Probe a fresh HighPerformance adapter — diagnostic only, not for training reports.
+///
+/// Training reports must use [`probe_training_device`] (or SharedWgpuContext metadata).
 pub fn probe_wgpu_environment() -> GpuEnvironmentProbe {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = match burn_cubecl::cubecl::future::block_on(instance.request_adapter(
@@ -148,25 +234,7 @@ pub fn probe_wgpu_environment() -> GpuEnvironmentProbe {
 
     let info = adapter.get_info();
     let backend = format!("{:?}", info.backend);
-    let adapter_name = if info.name.is_empty() {
-        None
-    } else {
-        Some(info.name.clone())
-    };
-    let driver = {
-        let mut parts = Vec::new();
-        if !info.driver.is_empty() {
-            parts.push(info.driver.clone());
-        }
-        if !info.driver_info.is_empty() {
-            parts.push(info.driver_info.clone());
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" / "))
-        }
-    };
+    let (adapter_name, driver) = adapter_name_and_driver(&info);
     let timestamp_query_available = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
 
     let mut unsupported_reason = None;
@@ -186,20 +254,51 @@ pub fn probe_wgpu_environment() -> GpuEnvironmentProbe {
     }
 }
 
-/// Refine probe with live cubecl client timing method and memory.
-pub fn refine_probe_with_client_timing(
-    mut probe: GpuEnvironmentProbe,
+/// Build a probe from SharedWgpuContext / setup metadata, refined with client timing.
+pub fn probe_from_training_adapter_metadata(
+    meta: &TrainingAdapterMetadata,
     timing_method_device: bool,
 ) -> GpuEnvironmentProbe {
-    probe.timing_method_device = timing_method_device;
-    if probe.timestamp_query_available && !timing_method_device {
+    let mut probe = GpuEnvironmentProbe {
+        backend: meta.backend.clone(),
+        adapter: meta.adapter.clone(),
+        driver: meta.driver.clone(),
+        adapter_unavailable_reason: meta.adapter.is_none().then(|| "adapter_name_empty".into()),
+        driver_unavailable_reason: meta.driver.is_none().then(|| "driver_info_empty".into()),
+        timestamp_query_available: meta.timestamp_query_available,
+        timing_method_device,
+        unsupported_reason: None,
+    };
+    refine_probe_unsupported_reason(&mut probe);
+    probe
+}
+
+fn refine_probe_unsupported_reason(probe: &mut GpuEnvironmentProbe) {
+    if probe.timestamp_query_available && !probe.timing_method_device {
         probe.unsupported_reason = Some(UNSUPPORTED_TIMING_METHOD_SYSTEM.into());
     } else if !probe.timestamp_query_available {
         probe.unsupported_reason = Some(UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE.into());
     } else {
         probe.unsupported_reason = None;
     }
+}
+
+/// Refine probe with live cubecl client timing method.
+pub fn refine_probe_with_client_timing(
+    mut probe: GpuEnvironmentProbe,
+    timing_method_device: bool,
+) -> GpuEnvironmentProbe {
+    probe.timing_method_device = timing_method_device;
+    // Capability follows the training client's timing method, not a separate adapter.
+    if timing_method_device {
+        probe.timestamp_query_available = true;
+    }
+    refine_probe_unsupported_reason(&mut probe);
     probe
+}
+
+fn is_valid_timing_ms(ms: f64) -> bool {
+    ms.is_finite() && ms >= 0.0
 }
 
 #[derive(Debug, Default)]
@@ -210,7 +309,7 @@ pub struct PipelineTimingCollector {
     workspace_current_bytes: u64,
     workspace_peak_bytes: u64,
     workspace_growth_count: u64,
-    /// Cumulative fresh allocations across observed steps (monotonic).
+    /// Cumulative fresh prefix-sum allocations across observed steps (monotonic).
     fresh_step_allocations: u64,
     runtime_peak_device_bytes: Option<u64>,
     runtime_peak_device_bytes_reason: Option<String>,
@@ -218,6 +317,7 @@ pub struct PipelineTimingCollector {
     profiler_enabled: bool,
     gpu_timing_enabled: bool,
     gpu_sample_every: usize,
+    rejected_timing_samples: u64,
 }
 
 impl PipelineTimingCollector {
@@ -252,7 +352,15 @@ impl PipelineTimingCollector {
         self.gpu_sample_every = gpu_sample_every.max(1);
     }
 
+    pub fn rejected_timing_samples(&self) -> u64 {
+        self.rejected_timing_samples
+    }
+
     pub fn record_span_ms(&mut self, name: &str, ms: f64) {
+        if !is_valid_timing_ms(ms) {
+            self.rejected_timing_samples = self.rejected_timing_samples.saturating_add(1);
+            return;
+        }
         self.spans.entry(name.to_string()).or_default().push(ms);
     }
 
@@ -262,12 +370,20 @@ impl PipelineTimingCollector {
 
     pub fn record_cpu_step(&mut self, duration: Duration) {
         let ms = duration_millis(duration);
+        if !is_valid_timing_ms(ms) {
+            self.rejected_timing_samples = self.rejected_timing_samples.saturating_add(1);
+            return;
+        }
         self.cpu_step_ms.push(ms);
         self.record_span_ms(span::STEP_CPU, ms);
     }
 
-    /// Record a GPU completion sample only when device timestamps are supported.
+    /// Record a GPU forward completion sample only when device timestamps are supported.
     pub fn record_gpu_step_ms(&mut self, ms: f64) {
+        if !is_valid_timing_ms(ms) {
+            self.rejected_timing_samples = self.rejected_timing_samples.saturating_add(1);
+            return;
+        }
         if self.probe.gpu_timing_supported() {
             self.gpu_step_ms.push(ms);
         }
@@ -293,7 +409,9 @@ impl PipelineTimingCollector {
             Some(bytes) => {
                 self.runtime_peak_device_bytes =
                     Some(self.runtime_peak_device_bytes.unwrap_or(0).max(bytes));
-                self.runtime_peak_device_bytes_reason = None;
+                // Honesty: this is sampled bytes_in_use HWM, not allocator true peak.
+                self.runtime_peak_device_bytes_reason =
+                    Some(SAMPLED_BYTES_IN_USE_HIGH_WATER.into());
             }
             None => {
                 if self.runtime_peak_device_bytes.is_none() {
@@ -309,20 +427,39 @@ impl PipelineTimingCollector {
         let gpu_samples = apply_warmup(&self.gpu_step_ms);
         let cpu_samples = apply_warmup(&self.cpu_step_ms);
 
-        let (gpu_step_p50_ms, gpu_step_p95_ms, sample_count) = if supported {
+        let (gpu_step_p50_ms, gpu_step_p95_ms, sample_count, gpu_forward_sum_ms) = if supported {
             let mut sorted = gpu_samples;
+            let sum = if sorted.is_empty() {
+                None
+            } else {
+                Some(sorted.iter().sum::<f64>())
+            };
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            (
-                percentile_f64(&sorted, 50.0),
-                percentile_f64(&sorted, 95.0),
-                sorted.len() as u64,
-            )
+            let count = sorted.len() as u64;
+            if count == 0 {
+                (None, None, 0, None)
+            } else {
+                (
+                    percentile_f64(&sorted, 50.0),
+                    percentile_f64(&sorted, 95.0),
+                    count,
+                    sum,
+                )
+            }
         } else {
-            (None, None, 0)
+            (None, None, 0, None)
         };
 
         let mut cpu_sorted = cpu_samples;
         cpu_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let (cpu_step_p50_ms, cpu_step_p95_ms) = if cpu_sorted.is_empty() {
+            (None, None)
+        } else {
+            (
+                percentile_f64(&cpu_sorted, 50.0),
+                percentile_f64(&cpu_sorted, 95.0),
+            )
+        };
 
         let mut pipeline_spans = BTreeMap::new();
         for name in span::ALL {
@@ -331,13 +468,25 @@ impl PipelineTimingCollector {
             let sample_count = warmed.len() as u64;
             let mut sorted = warmed;
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let (p50_ms, p95_ms) = if sample_count == 0 {
+                (None, None)
+            } else {
+                (percentile_f64(&sorted, 50.0), percentile_f64(&sorted, 95.0))
+            };
+            let timing_kind = if *name == span::FORWARD {
+                // Forward Instant brackets profile_device_gpu_step, which may await
+                // timestamp resolve — not pure CPU submit.
+                "synchronized_boundary"
+            } else {
+                "cpu_submit_instant"
+            };
             pipeline_spans.insert(
                 (*name).to_string(),
                 PipelineSpanStats {
                     sample_count,
-                    p50_ms: percentile_f64(&sorted, 50.0),
-                    p95_ms: percentile_f64(&sorted, 95.0),
-                    timing_kind: "cpu_submit_instant".into(),
+                    p50_ms,
+                    p95_ms,
+                    timing_kind: timing_kind.into(),
                 },
             );
         }
@@ -357,20 +506,26 @@ impl PipelineTimingCollector {
             driver: self.probe.driver.clone(),
             adapter_unavailable_reason: self.probe.adapter_unavailable_reason.clone(),
             driver_unavailable_reason: self.probe.driver_unavailable_reason.clone(),
+            timestamp_query_available: self.probe.timestamp_query_available,
             profiler_enabled: self.profiler_enabled,
             gpu_timing_enabled: self.gpu_timing_enabled,
+            measurement_success: sample_count > 0,
             gpu_sample_every: self.gpu_sample_every,
+            gpu_timing_scope: Some(GPU_TIMING_SCOPE_FORWARD.into()),
+            gpu_forward_sum_ms,
             gpu_step_p50_ms,
             gpu_step_p95_ms,
             sample_count,
+            rejected_timing_samples: self.rejected_timing_samples,
+            workspace_scope: WORKSPACE_SCOPE_PREFIX_SUM.into(),
             workspace_current_bytes: self.workspace_current_bytes,
             workspace_peak_bytes: self.workspace_peak_bytes,
             workspace_growth_count: self.workspace_growth_count,
             fresh_step_allocations: self.fresh_step_allocations,
             runtime_peak_device_bytes: self.runtime_peak_device_bytes,
             runtime_peak_device_bytes_reason: self.runtime_peak_device_bytes_reason.clone(),
-            cpu_step_p50_ms: percentile_f64(&cpu_sorted, 50.0),
-            cpu_step_p95_ms: percentile_f64(&cpu_sorted, 95.0),
+            cpu_step_p50_ms,
+            cpu_step_p95_ms,
             cpu_timing_kind: Some("cpu_submit_instant".into()),
             pipeline_spans,
         }
@@ -384,7 +539,7 @@ fn apply_warmup(samples: &[f64]) -> Vec<f64> {
     samples[PIPELINE_TIMING_WARMUP_SAMPLES..].to_vec()
 }
 
-/// RAII CPU span timer.
+/// RAII CPU span timer for host Instant spans.
 pub struct CpuSpanTimer {
     name: &'static str,
     started: Instant,
@@ -403,16 +558,139 @@ impl CpuSpanTimer {
     }
 }
 
-/// Build environment probe refined with the live Burn/cubecl client's timing method.
+/// Build environment probe from the actual training `GsDevice` / cubecl client.
+///
+/// Adapter name/driver are resolved against the training client's backend and
+/// device selection when possible. `WgpuDevice::Existing` without registered
+/// SharedWgpuContext metadata yields null + reason (callers should
+/// [`PipelineTimingCollector::set_probe`] from SharedWgpuContext metadata).
 pub fn probe_training_device(device: &crate::training::engine::GsDevice) -> GpuEnvironmentProbe {
     use burn_cubecl::cubecl::profile::TimingMethod;
     use burn_cubecl::cubecl::Runtime;
     use burn_wgpu::WgpuRuntime;
 
-    let probe = probe_wgpu_environment();
     let client = WgpuRuntime::client(device);
+    let backend = *client.info();
     let timing_method_device = client.properties().timing_method == TimingMethod::Device;
-    refine_probe_with_client_timing(probe, timing_method_device)
+    // CubeCL sets Device timing only when the training adapter has TIMESTAMP_QUERY.
+    let timestamp_query_available = timing_method_device;
+
+    let (adapter, driver, adapter_reason, driver_reason) =
+        resolve_training_adapter_metadata(device, backend);
+
+    let mut probe = GpuEnvironmentProbe {
+        backend: format!("{backend:?}"),
+        adapter,
+        driver,
+        adapter_unavailable_reason: adapter_reason,
+        driver_unavailable_reason: driver_reason,
+        timestamp_query_available,
+        timing_method_device,
+        unsupported_reason: None,
+    };
+    refine_probe_unsupported_reason(&mut probe);
+    probe
+}
+
+fn resolve_training_adapter_metadata(
+    device: &crate::training::engine::GsDevice,
+    backend: wgpu::Backend,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    use burn_wgpu::WgpuDevice;
+
+    match device {
+        WgpuDevice::Existing(_) => (
+            None,
+            None,
+            Some(EXISTING_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
+            Some(EXISTING_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
+        ),
+        other => match select_adapter_matching_device(other, backend) {
+            Some(adapter) => {
+                let info = adapter.get_info();
+                let (name, driver) = adapter_name_and_driver(&info);
+                (
+                    name.clone(),
+                    driver.clone(),
+                    name.is_none().then(|| "adapter_name_empty".into()),
+                    driver.is_none().then(|| "driver_info_empty".into()),
+                )
+            }
+            None => (
+                None,
+                None,
+                Some(UNSUPPORTED_ADAPTER_PROBE_FAILED.into()),
+                Some(UNSUPPORTED_ADAPTER_PROBE_FAILED.into()),
+            ),
+        },
+    }
+}
+
+fn select_adapter_matching_device(
+    device: &burn_wgpu::WgpuDevice,
+    backend: wgpu::Backend,
+) -> Option<wgpu::Adapter> {
+    use burn_wgpu::WgpuDevice;
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: backend.into(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters =
+        burn_cubecl::cubecl::future::block_on(instance.enumerate_adapters(backend.into()));
+
+    let filtered: Vec<_> = adapters
+        .into_iter()
+        .filter(|adapter| adapter.get_info().backend == backend)
+        .collect();
+
+    match device {
+        WgpuDevice::DiscreteGpu(index) => filtered
+            .into_iter()
+            .filter(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+            .nth(*index),
+        WgpuDevice::IntegratedGpu(index) => filtered
+            .into_iter()
+            .filter(|a| a.get_info().device_type == wgpu::DeviceType::IntegratedGpu)
+            .nth(*index),
+        WgpuDevice::VirtualGpu(index) => filtered
+            .into_iter()
+            .filter(|a| a.get_info().device_type == wgpu::DeviceType::VirtualGpu)
+            .nth(*index),
+        WgpuDevice::Cpu => filtered
+            .into_iter()
+            .find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu),
+        WgpuDevice::DefaultDevice => {
+            // Match cubecl default: prefer high-performance within the training backend.
+            burn_cubecl::cubecl::future::block_on(instance.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                },
+            ))
+            .ok()
+            .filter(|a| a.get_info().backend == backend)
+            .or_else(|| filtered.into_iter().next())
+        }
+        #[allow(deprecated)]
+        WgpuDevice::BestAvailable => burn_cubecl::cubecl::future::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            }),
+        )
+        .ok()
+        .filter(|a| a.get_info().backend == backend)
+        .or_else(|| filtered.into_iter().next()),
+        WgpuDevice::Existing(_) => None,
+    }
 }
 
 /// Read cubecl allocator bytes-in-use for runtime peak tracking.
@@ -526,7 +804,7 @@ where
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(output);
         },
-        "gpu_step",
+        "gpu_forward",
     ) {
         Ok(((), profile)) => {
             let output = output_slot
@@ -572,22 +850,52 @@ where
     }
 }
 
-/// Validate profiler report self-consistency (p95>=p50, unsupported nulls).
+fn percentile_pair_valid(p50: Option<f64>, p95: Option<f64>) -> Result<(), String> {
+    match (p50, p95) {
+        (None, None) => Ok(()),
+        (Some(p50), Some(p95)) => {
+            if !p50.is_finite() || !p95.is_finite() || p50 < 0.0 || p95 < 0.0 {
+                return Err(format!(
+                    "percentiles must be finite non-negative: p50={p50} p95={p95}"
+                ));
+            }
+            if p95 < p50 {
+                return Err(format!("p95 ({p95}) < p50 ({p50})"));
+            }
+            Ok(())
+        }
+        _ => Err("p50/p95 must both be Some or both None".into()),
+    }
+}
+
+/// Validate profiler report self-consistency (finite non-negative, null semantics).
 pub fn assert_report_self_consistent(report: &GpuProfilerReport) -> Result<(), String> {
     if report.supported {
         if report.unsupported_reason.is_some() {
             return Err("supported report must not set unsupported_reason".into());
         }
         if report.sample_count > 0 {
-            match (report.gpu_step_p50_ms, report.gpu_step_p95_ms) {
-                (Some(p50), Some(p95)) => {
-                    if p95 < p50 {
-                        return Err(format!("gpu p95 ({p95}) < p50 ({p50})"));
-                    }
+            percentile_pair_valid(report.gpu_step_p50_ms, report.gpu_step_p95_ms)?;
+            match report.gpu_forward_sum_ms {
+                Some(sum) if sum.is_finite() && sum >= 0.0 => {}
+                Some(sum) => {
+                    return Err(format!(
+                        "gpu_forward_sum_ms must be finite non-negative: {sum}"
+                    ));
                 }
-                _ => {
-                    return Err("supported report with samples must have gpu p50/p95".into());
+                None => {
+                    return Err("supported report with samples must have gpu_forward_sum_ms".into());
                 }
+            }
+        } else {
+            if report.gpu_step_p50_ms.is_some() || report.gpu_step_p95_ms.is_some() {
+                return Err("zero GPU samples ⇒ null percentiles".into());
+            }
+            if report.gpu_forward_sum_ms.is_some() {
+                return Err("zero GPU samples ⇒ null gpu_forward_sum_ms".into());
+            }
+            if report.measurement_success {
+                return Err("measurement_success must be false when sample_count is 0".into());
             }
         }
     } else {
@@ -602,25 +910,41 @@ pub fn assert_report_self_consistent(report: &GpuProfilerReport) -> Result<(), S
         if report.gpu_step_p50_ms.is_some() || report.gpu_step_p95_ms.is_some() {
             return Err("unsupported report must null gpu_step percentiles".into());
         }
+        if report.gpu_forward_sum_ms.is_some() {
+            return Err("unsupported report must null gpu_forward_sum_ms".into());
+        }
         if report.sample_count != 0 {
             return Err("unsupported report sample_count must be 0".into());
         }
     }
 
-    if let (Some(p50), Some(p95)) = (report.cpu_step_p50_ms, report.cpu_step_p95_ms) {
-        if p95 < p50 {
-            return Err(format!("cpu p95 ({p95}) < p50 ({p50})"));
-        }
+    if report.gpu_timing_scope.as_deref() != Some(GPU_TIMING_SCOPE_FORWARD) {
+        return Err("gpu_timing_scope must be \"forward\"".into());
+    }
+    if report.workspace_scope != WORKSPACE_SCOPE_PREFIX_SUM {
+        return Err("workspace_scope must be \"prefix_sum\"".into());
     }
 
+    percentile_pair_valid(report.cpu_step_p50_ms, report.cpu_step_p95_ms)?;
+
     for (name, stats) in &report.pipeline_spans {
-        if stats.timing_kind != "cpu_submit_instant" {
-            return Err(format!("span {name} must use cpu_submit_instant"));
+        let expected_kind = if name == span::FORWARD {
+            "synchronized_boundary"
+        } else {
+            "cpu_submit_instant"
+        };
+        if stats.timing_kind != expected_kind {
+            return Err(format!(
+                "span {name} must use {expected_kind}, got {}",
+                stats.timing_kind
+            ));
         }
-        if let (Some(p50), Some(p95)) = (stats.p50_ms, stats.p95_ms) {
-            if p95 < p50 {
-                return Err(format!("span {name} p95 ({p95}) < p50 ({p50})"));
+        if stats.sample_count == 0 {
+            if stats.p50_ms.is_some() || stats.p95_ms.is_some() {
+                return Err(format!("span {name}: zero samples ⇒ null percentiles"));
             }
+        } else {
+            percentile_pair_valid(stats.p50_ms, stats.p95_ms)?;
         }
     }
 
@@ -633,24 +957,91 @@ pub fn assert_report_self_consistent(report: &GpuProfilerReport) -> Result<(), S
     {
         return Err("missing runtime_peak_device_bytes requires a reason".into());
     }
+    if report.runtime_peak_device_bytes.is_some()
+        && report.runtime_peak_device_bytes_reason.as_deref()
+            != Some(SAMPLED_BYTES_IN_USE_HIGH_WATER)
+    {
+        return Err(
+            "sampled runtime_peak_device_bytes must reason sampled_bytes_in_use_high_water".into(),
+        );
+    }
 
     Ok(())
+}
+
+/// Map profiler fields into optimization-report GPU/train/memory slices.
+///
+/// `gpu_completion_seconds` is always null: we never invent totals via p50×N.
+/// Use `gpu_forward_sum_seconds` for the real accepted-sample sum (forward scope
+/// only; excludes warmup drops, unsampled steps, and resume-prior work).
+pub fn optimization_gpu_fields_from_profiler(report: &GpuProfilerReport) -> OptimizationGpuFields {
+    OptimizationGpuFields {
+        timestamp_query_available: Some(report.timestamp_query_available),
+        adapter_name: report.adapter.clone(),
+        backend: Some(report.backend.clone()),
+        driver: report.driver.clone(),
+        adapter_unavailable_reason: report.adapter_unavailable_reason.clone(),
+        driver_unavailable_reason: report.driver_unavailable_reason.clone(),
+        gpu_timing_scope: report.gpu_timing_scope.clone(),
+        gpu_completion_seconds: None,
+        gpu_forward_sum_seconds: report.gpu_forward_sum_ms.map(|ms| ms / 1000.0),
+        gpu_step_p50_ms: report.gpu_step_p50_ms,
+        gpu_step_p95_ms: report.gpu_step_p95_ms,
+        gpu_step_sample_count: Some(report.sample_count),
+        gpu_profiler_unsupported_reason: report.unsupported_reason.clone(),
+        peak_device_bytes: report.runtime_peak_device_bytes,
+        peak_device_bytes_reason: report.runtime_peak_device_bytes_reason.clone(),
+        workspace_scope: Some(report.workspace_scope.clone()),
+        workspace_current_bytes: Some(report.workspace_current_bytes),
+        workspace_peak_bytes: Some(report.workspace_peak_bytes),
+        workspace_growth_count: Some(report.workspace_growth_count),
+        fresh_step_allocations: Some(report.fresh_step_allocations),
+    }
+}
+
+/// GPU-related slices for optimization JSON mapping.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OptimizationGpuFields {
+    pub timestamp_query_available: Option<bool>,
+    pub adapter_name: Option<String>,
+    pub backend: Option<String>,
+    pub driver: Option<String>,
+    pub adapter_unavailable_reason: Option<String>,
+    pub driver_unavailable_reason: Option<String>,
+    pub gpu_timing_scope: Option<String>,
+    pub gpu_completion_seconds: Option<f64>,
+    pub gpu_forward_sum_seconds: Option<f64>,
+    pub gpu_step_p50_ms: Option<f64>,
+    pub gpu_step_p95_ms: Option<f64>,
+    pub gpu_step_sample_count: Option<u64>,
+    pub gpu_profiler_unsupported_reason: Option<String>,
+    pub peak_device_bytes: Option<u64>,
+    pub peak_device_bytes_reason: Option<String>,
+    pub workspace_scope: Option<String>,
+    pub workspace_current_bytes: Option<u64>,
+    pub workspace_peak_bytes: Option<u64>,
+    pub workspace_growth_count: Option<u64>,
+    pub fresh_step_allocations: Option<u64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn percentile_p95_ge_p50_and_sample_count_matches() {
-        let mut collector = PipelineTimingCollector::new(GpuEnvironmentProbe {
+    fn supported_probe() -> GpuEnvironmentProbe {
+        GpuEnvironmentProbe {
             backend: "Metal".into(),
             adapter: Some("Test GPU".into()),
             driver: Some("TestDriver".into()),
             timestamp_query_available: true,
             timing_method_device: true,
             ..Default::default()
-        });
+        }
+    }
+
+    #[test]
+    fn percentile_p95_ge_p50_and_sample_count_matches() {
+        let mut collector = PipelineTimingCollector::new(supported_probe());
         // warmup + 4 samples
         for ms in [1.0, 10.0, 20.0, 30.0, 40.0] {
             collector.record_gpu_step_ms(ms);
@@ -663,16 +1054,78 @@ mod tests {
         let report = collector.build_report();
         assert!(report.supported);
         assert_eq!(report.sample_count, 4);
+        assert_eq!(
+            report.gpu_timing_scope.as_deref(),
+            Some(GPU_TIMING_SCOPE_FORWARD)
+        );
+        assert_eq!(report.workspace_scope, WORKSPACE_SCOPE_PREFIX_SUM);
         // Warmup drops 1.0; remaining [10,20,30,40]. Rank for p50 is round(0.5*3)=2 → 30.
         assert_eq!(report.gpu_step_p50_ms, Some(30.0));
         assert_eq!(report.gpu_step_p95_ms, Some(40.0));
-        assert!(report.gpu_step_p95_ms.unwrap() >= report.gpu_step_p50_ms.unwrap());
-        assert_eq!(report.workspace_current_bytes, 120);
-        assert_eq!(report.workspace_peak_bytes, 120);
-        assert_eq!(report.workspace_growth_count, 3);
-        assert_eq!(report.fresh_step_allocations, 1);
-        assert_eq!(report.runtime_peak_device_bytes, Some(4096));
+        assert_eq!(report.gpu_forward_sum_ms, Some(100.0));
+        assert!(report.measurement_success);
+        assert_eq!(
+            report.runtime_peak_device_bytes_reason.as_deref(),
+            Some(SAMPLED_BYTES_IN_USE_HIGH_WATER)
+        );
         assert_report_self_consistent(&report).expect("consistent");
+    }
+
+    #[test]
+    fn forward_sum_differs_from_p50_times_sample_count_for_uneven_samples() {
+        let mut collector = PipelineTimingCollector::new(supported_probe());
+        // warmup + uneven: 1, then 10, 100, 1000
+        for ms in [1.0, 10.0, 100.0, 1000.0] {
+            collector.record_gpu_step_ms(ms);
+        }
+        let report = collector.build_report();
+        assert_eq!(report.sample_count, 3);
+        let sum = report.gpu_forward_sum_ms.expect("sum");
+        let p50 = report.gpu_step_p50_ms.expect("p50");
+        let invented = p50 * report.sample_count as f64;
+        assert!(
+            (sum - invented).abs() > 1.0,
+            "sum={sum} must not equal p50*N={invented}"
+        );
+        let fields = optimization_gpu_fields_from_profiler(&report);
+        assert!(fields.gpu_completion_seconds.is_none());
+        assert_eq!(fields.gpu_forward_sum_seconds, Some(sum / 1000.0));
+        assert_eq!(fields.gpu_timing_scope.as_deref(), Some("forward"));
+    }
+
+    #[test]
+    fn rejects_nan_inf_and_negative_timings() {
+        let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.record_gpu_step_ms(f64::NAN);
+        collector.record_gpu_step_ms(f64::INFINITY);
+        collector.record_gpu_step_ms(-1.0);
+        collector.record_span_ms(span::FORWARD, f64::NAN);
+        collector.record_span_ms(span::DECODE, -0.5);
+        collector.record_cpu_step(Duration::from_millis(5));
+        // One valid GPU sample that will be dropped by warmup alone.
+        collector.record_gpu_step_ms(12.0);
+        assert_eq!(collector.rejected_timing_samples(), 5);
+        let report = collector.build_report();
+        assert_eq!(report.sample_count, 0);
+        assert!(report.gpu_step_p50_ms.is_none());
+        assert!(report.gpu_forward_sum_ms.is_none());
+        assert_eq!(report.rejected_timing_samples, 5);
+        assert_report_self_consistent(&report).expect("empty after rejects/warmup");
+    }
+
+    #[test]
+    fn empty_after_warmup_only_yields_null_percentiles() {
+        let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.record_gpu_step_ms(5.0); // warmup only
+        collector.record_cpu_step(Duration::from_millis(3));
+        let report = collector.build_report();
+        assert_eq!(report.sample_count, 0);
+        assert!(report.gpu_step_p50_ms.is_none());
+        assert!(report.gpu_step_p95_ms.is_none());
+        assert!(report.gpu_forward_sum_ms.is_none());
+        assert!(!report.measurement_success);
+        assert!(report.cpu_step_p50_ms.is_none());
+        assert_report_self_consistent(&report).expect("warmup-empty consistent");
     }
 
     #[test]
@@ -695,6 +1148,7 @@ mod tests {
 
         let report = collector.build_report();
         assert!(!report.supported);
+        assert!(!report.timestamp_query_available);
         assert_eq!(
             report.unsupported_reason.as_deref(),
             Some(UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE)
@@ -705,6 +1159,13 @@ mod tests {
         assert_eq!(
             report.cpu_timing_kind.as_deref(),
             Some("cpu_submit_instant")
+        );
+        assert_eq!(
+            report
+                .pipeline_spans
+                .get(span::FORWARD)
+                .map(|s| s.timing_kind.as_str()),
+            Some("synchronized_boundary")
         );
         assert!(report.cpu_step_p50_ms.is_some());
         assert_report_self_consistent(&report).expect("consistent");
@@ -720,12 +1181,18 @@ mod tests {
             driver: Some("Metal".into()),
             adapter_unavailable_reason: None,
             driver_unavailable_reason: None,
+            timestamp_query_available: false,
             profiler_enabled: true,
             gpu_timing_enabled: false,
+            measurement_success: false,
             gpu_sample_every: 20,
+            gpu_timing_scope: Some(GPU_TIMING_SCOPE_FORWARD.into()),
+            gpu_forward_sum_ms: None,
             gpu_step_p50_ms: None,
             gpu_step_p95_ms: None,
             sample_count: 0,
+            rejected_timing_samples: 0,
+            workspace_scope: WORKSPACE_SCOPE_PREFIX_SUM.into(),
             workspace_current_bytes: 2048,
             workspace_peak_bytes: 4096,
             workspace_growth_count: 2,
@@ -741,15 +1208,17 @@ mod tests {
                     sample_count: 2,
                     p50_ms: Some(5.0),
                     p95_ms: Some(7.0),
-                    timing_kind: "cpu_submit_instant".into(),
+                    timing_kind: "synchronized_boundary".into(),
                 },
             )]),
         };
         let json = serde_json::to_string_pretty(&report).expect("serialize");
         assert!(json.contains("\"gpu_step_p50_ms\": null"));
-        assert!(json.contains("\"gpu_step_p95_ms\": null"));
+        assert!(json.contains("\"gpu_forward_sum_ms\": null"));
+        assert!(json.contains("\"gpu_timing_scope\": \"forward\""));
         assert!(json.contains("timestamp_query_unavailable"));
-        assert!(json.contains("cpu_submit_instant"));
+        assert!(json.contains("synchronized_boundary"));
+        assert!(json.contains("prefix_sum"));
         let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, report);
         assert_report_self_consistent(&decoded).expect("fixture consistent");
@@ -835,5 +1304,48 @@ mod tests {
         assert!(report.profiler_enabled);
         assert!(report.gpu_timing_enabled);
         assert_eq!(report.gpu_sample_every, 20);
+        assert!(!report.measurement_success);
+    }
+
+    #[test]
+    fn timestamp_capability_independent_of_enablement() {
+        let mut probe = supported_probe();
+        probe.timestamp_query_available = true;
+        probe.timing_method_device = true;
+        let mut collector = PipelineTimingCollector::new(probe);
+        collector.set_profiler_mode(true, false, 20);
+        let report = collector.build_report();
+        assert!(report.timestamp_query_available);
+        assert!(report.supported);
+        assert!(!report.gpu_timing_enabled);
+        assert!(!report.measurement_success);
+        let fields = optimization_gpu_fields_from_profiler(&report);
+        assert_eq!(fields.timestamp_query_available, Some(true));
+    }
+
+    #[test]
+    fn cpu_span_timer_records_span() {
+        let mut collector = PipelineTimingCollector::new(supported_probe());
+        let timer = CpuSpanTimer::start(span::UPLOAD);
+        std::thread::sleep(Duration::from_millis(1));
+        timer.finish(&mut collector);
+        let report = collector.build_report();
+        // Warmup drops the single sample.
+        assert_eq!(
+            report
+                .pipeline_spans
+                .get(span::UPLOAD)
+                .map(|s| s.sample_count),
+            Some(0)
+        );
+        collector.record_span(span::UPLOAD, Duration::from_millis(2));
+        let report = collector.build_report();
+        assert_eq!(
+            report
+                .pipeline_spans
+                .get(span::UPLOAD)
+                .map(|s| s.sample_count),
+            Some(1)
+        );
     }
 }

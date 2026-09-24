@@ -3,6 +3,30 @@ status: active
 owner: unassigned
 source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
+base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
+fix_branch: "fix/rs-2026-002-c1-c4-review"
+cards:
+  C1:
+    status: implemented_pending_maintainer_review
+    notes: "capacity guards + WGSL explicit branches preserved"
+  C2:
+    status: implemented_pending_maintainer_review
+    head_sha: "fa970ed"
+    notes: "safety-point commit confirmation; no per-step unread disposition readback"
+  C3:
+    status: implemented_pending_maintainer_review
+    notes: "prefix-sum workspace ownership preserved"
+  C4:
+    status: implemented_pending_maintainer_review
+    notes: "F02/F06/F07/F08/F10/F11 measurement + F03/F04/F05 safety; head is branch tip"
+  C5:
+    status: not_started
+  C6:
+    status: not_started
+  C7:
+    status: not_started
+  C8:
+    status: not_started
 scope:
   - rustscan-gs/src/training
   - rustscan-gs/tests

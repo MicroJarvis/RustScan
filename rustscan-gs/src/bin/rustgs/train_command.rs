@@ -2148,6 +2148,7 @@ fn maybe_write_optimization_report(
         evaluation.map(|result| [result.summary.render_width, result.summary.render_height]);
     let telemetry = training_report.telemetry.as_ref();
     let gpu_profiler = telemetry.and_then(|t| t.gpu_profiler.as_ref());
+    let gpu_fields = gpu_profiler.map(rustscan_gs::optimization_gpu_fields_from_profiler);
     let completed_iterations = training_report.completed_iterations;
     let training_loop_seconds = training_report.training_loop_elapsed.as_secs_f64();
     let steps_per_second = if training_loop_seconds > 0.0 && completed_iterations > 0 {
@@ -2171,16 +2172,21 @@ fn maybe_write_optimization_report(
         rustscan_gs::OptimizationEnvironment {
             binary_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             git_revision: option_env!("VERGEN_GIT_SHA").map(str::to_string),
-            adapter_name: gpu_profiler.and_then(|p| p.adapter.clone()),
-            backend: gpu_profiler
-                .map(|p| p.backend.clone())
+            adapter_name: gpu_fields.as_ref().and_then(|f| f.adapter_name.clone()),
+            backend: gpu_fields
+                .as_ref()
+                .and_then(|f| f.backend.clone())
                 .or_else(|| Some("wgpu".to_string())),
-            driver: gpu_profiler.and_then(|p| p.driver.clone()),
-            timestamp_query_available: gpu_profiler.map(|p| p.supported),
-            adapter_unavailable_reason: gpu_profiler
-                .and_then(|p| p.adapter_unavailable_reason.clone()),
-            driver_unavailable_reason: gpu_profiler
-                .and_then(|p| p.driver_unavailable_reason.clone()),
+            driver: gpu_fields.as_ref().and_then(|f| f.driver.clone()),
+            timestamp_query_available: gpu_fields
+                .as_ref()
+                .and_then(|f| f.timestamp_query_available),
+            adapter_unavailable_reason: gpu_fields
+                .as_ref()
+                .and_then(|f| f.adapter_unavailable_reason.clone()),
+            driver_unavailable_reason: gpu_fields
+                .as_ref()
+                .and_then(|f| f.driver_unavailable_reason.clone()),
         },
         rustscan_gs::OptimizationCommand {
             argv: std::env::args().collect(),
@@ -2222,15 +2228,15 @@ fn maybe_write_optimization_report(
             loop_timing_kind: telemetry
                 .and_then(|t| t.loop_timing_kind.clone())
                 .or_else(|| Some("cpu_submit_instant".into())),
-            gpu_completion_seconds: gpu_profiler.and_then(|p| {
-                p.gpu_step_p50_ms
-                    .map(|ms| ms / 1000.0 * completed_iterations as f64)
-            }),
-            gpu_step_p50_ms: gpu_profiler.and_then(|p| p.gpu_step_p50_ms),
-            gpu_step_p95_ms: gpu_profiler.and_then(|p| p.gpu_step_p95_ms),
-            gpu_step_sample_count: gpu_profiler.map(|p| p.sample_count),
-            gpu_profiler_unsupported_reason: gpu_profiler
-                .and_then(|p| p.unsupported_reason.clone()),
+            gpu_completion_seconds: gpu_fields.as_ref().and_then(|f| f.gpu_completion_seconds),
+            gpu_timing_scope: gpu_fields.as_ref().and_then(|f| f.gpu_timing_scope.clone()),
+            gpu_forward_sum_seconds: gpu_fields.as_ref().and_then(|f| f.gpu_forward_sum_seconds),
+            gpu_step_p50_ms: gpu_fields.as_ref().and_then(|f| f.gpu_step_p50_ms),
+            gpu_step_p95_ms: gpu_fields.as_ref().and_then(|f| f.gpu_step_p95_ms),
+            gpu_step_sample_count: gpu_fields.as_ref().and_then(|f| f.gpu_step_sample_count),
+            gpu_profiler_unsupported_reason: gpu_fields
+                .as_ref()
+                .and_then(|f| f.gpu_profiler_unsupported_reason.clone()),
             loss_readback_count: telemetry.and_then(|t| t.loss_readback_count),
             count_readback_count: telemetry.and_then(|t| t.count_readback_count),
             status_readbacks: telemetry.and_then(|t| t.status_readbacks),
@@ -2278,14 +2284,16 @@ fn maybe_write_optimization_report(
         },
         rustscan_gs::OptimizationMemoryMetrics {
             peak_rss_bytes: rustscan_gs::current_peak_rss_bytes(),
-            peak_device_bytes: gpu_profiler.and_then(|p| p.runtime_peak_device_bytes),
-            peak_device_bytes_reason: gpu_profiler
-                .and_then(|p| p.runtime_peak_device_bytes_reason.clone()),
+            peak_device_bytes: gpu_fields.as_ref().and_then(|f| f.peak_device_bytes),
+            peak_device_bytes_reason: gpu_fields
+                .as_ref()
+                .and_then(|f| f.peak_device_bytes_reason.clone()),
             estimated_buffer_bytes,
-            workspace_current_bytes: gpu_profiler.map(|p| p.workspace_current_bytes),
-            workspace_peak_bytes: gpu_profiler.map(|p| p.workspace_peak_bytes),
-            workspace_growth_count: gpu_profiler.map(|p| p.workspace_growth_count),
-            fresh_step_allocations: gpu_profiler.map(|p| p.fresh_step_allocations),
+            workspace_scope: gpu_fields.as_ref().and_then(|f| f.workspace_scope.clone()),
+            workspace_current_bytes: gpu_fields.as_ref().and_then(|f| f.workspace_current_bytes),
+            workspace_peak_bytes: gpu_fields.as_ref().and_then(|f| f.workspace_peak_bytes),
+            workspace_growth_count: gpu_fields.as_ref().and_then(|f| f.workspace_growth_count),
+            fresh_step_allocations: gpu_fields.as_ref().and_then(|f| f.fresh_step_allocations),
         },
         evaluation.map(optimization_evaluation_metrics),
     );

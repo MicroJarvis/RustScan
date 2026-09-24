@@ -65,9 +65,10 @@ pub use events::{
 };
 #[cfg(feature = "gpu")]
 pub use reporting::gpu_profiler::{
-    assert_report_self_consistent, probe_wgpu_environment, span as gpu_profiler_span,
-    GpuEnvironmentProbe, GpuProfilerReport, PipelineSpanStats, PipelineTimingCollector,
-    PIPELINE_TIMING_WARMUP_SAMPLES, UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE,
+    assert_report_self_consistent, optimization_gpu_fields_from_profiler, probe_wgpu_environment,
+    span as gpu_profiler_span, GpuEnvironmentProbe, GpuProfilerReport, OptimizationGpuFields,
+    PipelineSpanStats, PipelineTimingCollector, PIPELINE_TIMING_WARMUP_SAMPLES,
+    UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE,
 };
 pub use reporting::metrics::{
     accumulate_sticky_forward_overflow, allows_state_mutation, step_intersection_overflowed,

@@ -28,9 +28,9 @@ pub struct OptimizationEnvironment {
     pub backend: Option<String>,
     pub driver: Option<String>,
     pub timestamp_query_available: Option<bool>,
-    /// Present when adapter_name could not be probed at runtime.
+    /// Present when adapter_name could not be probed from the training device.
     pub adapter_unavailable_reason: Option<String>,
-    /// Present when driver could not be probed at runtime.
+    /// Present when driver could not be probed from the training device.
     pub driver_unavailable_reason: Option<String>,
 }
 
@@ -64,8 +64,13 @@ pub struct OptimizationTrainMetrics {
     pub loop_duration_p95_ms: Option<f64>,
     /// CPU submit-side loop samples only; not GPU completion time.
     pub loop_timing_kind: Option<String>,
-    /// Aggregate GPU completion seconds from timestamp queries; null when unsupported.
+    /// Always null — never invent totals via p50 × completed_iterations.
     pub gpu_completion_seconds: Option<f64>,
+    /// Scope of GPU timestamp samples (`"forward"`).
+    pub gpu_timing_scope: Option<String>,
+    /// Sum of accepted post-warmup GPU forward samples in seconds (not full train GPU time).
+    pub gpu_forward_sum_seconds: Option<f64>,
+    /// Forward-only GPU completion p50; null when unsupported or unsampled.
     pub gpu_step_p50_ms: Option<f64>,
     pub gpu_step_p95_ms: Option<f64>,
     pub gpu_step_sample_count: Option<u64>,
@@ -117,9 +122,12 @@ pub struct OptimizationMemoryMetrics {
     pub peak_device_bytes: Option<u64>,
     pub peak_device_bytes_reason: Option<String>,
     pub estimated_buffer_bytes: Option<u64>,
+    /// Scope of workspace_* / fresh_step_allocations (`"prefix_sum"`).
+    pub workspace_scope: Option<String>,
     pub workspace_current_bytes: Option<u64>,
     pub workspace_peak_bytes: Option<u64>,
     pub workspace_growth_count: Option<u64>,
+    /// Prefix-sum workspace fresh allocations only — not whole-runtime zero-alloc proof.
     pub fresh_step_allocations: Option<u64>,
 }
 
@@ -554,6 +562,8 @@ mod tests {
                 loop_duration_p95_ms: Some(22.0),
                 loop_timing_kind: Some("cpu_submit_instant".into()),
                 gpu_completion_seconds: None,
+                gpu_timing_scope: Some("forward".into()),
+                gpu_forward_sum_seconds: None,
                 gpu_step_p50_ms: None,
                 gpu_step_p95_ms: None,
                 gpu_step_sample_count: Some(0),
@@ -606,6 +616,7 @@ mod tests {
                 peak_device_bytes: None,
                 peak_device_bytes_reason: Some("runtime_peak_device_bytes_unavailable".into()),
                 estimated_buffer_bytes: Some(2_000_000),
+                workspace_scope: Some("prefix_sum".into()),
                 workspace_current_bytes: Some(512),
                 workspace_peak_bytes: Some(512),
                 workspace_growth_count: Some(1),

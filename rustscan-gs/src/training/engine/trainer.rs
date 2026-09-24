@@ -18,7 +18,7 @@ use crate::training::gpu_primitives::device_radix::{
 use crate::training::gpu_primitives::prefix_sum::{prefix_sum_dispatch_count, PrefixSumWorkspace};
 use crate::training::reporting::gpu_profiler::{
     probe_training_device, profile_device_gpu_step, runtime_device_bytes_in_use,
-    should_profile_gpu, span, PipelineTimingCollector,
+    should_profile_gpu, span, CpuSpanTimer, PipelineTimingCollector,
 };
 use crate::training::reporting::metrics::{
     step_intersection_overflowed, ParityLossCurveSample, ParityTopologyMetrics,
@@ -1371,30 +1371,27 @@ impl WgpuTrainer {
             let target_img = match target_tensor_cache.get(&frame_idx).cloned() {
                 Some(cached) => {
                     touch_target_tensor_cache(&mut target_tensor_lru, frame_idx);
-                    self.pipeline_timing
-                        .record_span(span::DECODE, Duration::from_secs(0));
-                    self.pipeline_timing
-                        .record_span(span::RESIZE, Duration::from_secs(0));
-                    self.pipeline_timing
-                        .record_span(span::UPLOAD, Duration::from_secs(0));
+                    // Cache hit: decode/resize already ran on the prefetch worker.
+                    // Do not push 0 ms samples that dilute real miss timings.
                     cached
                 }
                 None => {
-                    let decode_started = Instant::now();
+                    // Prefer worker-measured decode/resize; fall back only when
+                    // timings were not attached (should not happen for prefetch path).
+                    if let Some(ms) = decoded.decode_ms {
+                        self.pipeline_timing.record_span_ms(span::DECODE, ms);
+                    }
+                    if let Some(ms) = decoded.resize_ms {
+                        self.pipeline_timing.record_span_ms(span::RESIZE, ms);
+                    }
                     let target_image = decoded.target_rgb.clone().ok_or_else(|| {
                         TrainingError::TrainingFailed(format!(
                             "frame loader did not prepare target_rgb for frame {frame_idx}"
                         ))
                     })?;
-                    // Prefetch already decoded+resized; residual is host Arc clone.
-                    self.pipeline_timing
-                        .record_span(span::DECODE, decode_started.elapsed());
-                    self.pipeline_timing
-                        .record_span(span::RESIZE, Duration::from_secs(0));
-                    let upload_started = Instant::now();
+                    let upload = CpuSpanTimer::start(span::UPLOAD);
                     let tensor = target_image_tensor(&target_image, image_dims, &self.device);
-                    self.pipeline_timing
-                        .record_span(span::UPLOAD, upload_started.elapsed());
+                    upload.finish(&mut self.pipeline_timing);
                     target_tensor_cache.insert(frame_idx, tensor.clone());
                     touch_target_tensor_cache(&mut target_tensor_lru, frame_idx);
                     while target_tensor_cache.len() > target_tensor_cache_capacity {
@@ -2088,12 +2085,7 @@ impl WgpuTrainer {
             let remap_started = Instant::now();
             self.remap_topology_visibility_state(&plan, iteration);
             self.pipeline_timing
-                .record_span(span::TOPOLOGY_REMAP, remap_started.elapsed());
-        } else {
-            self.pipeline_timing
-                .record_span(span::TOPOLOGY_UPLOAD, Duration::from_secs(0));
-            self.pipeline_timing
-                .record_span(span::TOPOLOGY_REMAP, Duration::from_secs(0));
+                .record_span(span::TOPOLOGY_REMAP_VISIBILITY, remap_started.elapsed());
         }
         if plan.aftermath.requires_adam_rebuild {
             let sh_dims = splats.sh_coeffs.val().dims();
@@ -2105,7 +2097,7 @@ impl WgpuTrainer {
                 &self.device,
             );
             self.pipeline_timing
-                .record_span(span::TOPOLOGY_REMAP, remap_started.elapsed());
+                .record_span(span::TOPOLOGY_REMAP_OPTIMIZER, remap_started.elapsed());
         }
         if plan.aftermath.apply_opacity_reset {
             self.optimizer.clear_opacity_moments();
@@ -2295,6 +2287,14 @@ impl WgpuTrainer {
         let gpu_report = self.pipeline_timing.build_report();
         self.telemetry.gpu_profiler = Some(gpu_report);
         report.telemetry = self.telemetry.clone();
+    }
+
+    /// Replace the environment probe (e.g. SharedWgpuContext adapter metadata).
+    pub(crate) fn set_pipeline_probe(
+        &mut self,
+        probe: crate::training::reporting::gpu_profiler::GpuEnvironmentProbe,
+    ) {
+        self.pipeline_timing.set_probe(probe);
     }
 }
 
@@ -3853,7 +3853,9 @@ mod tests {
         let before = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(before.5.committed_optimizer_steps, 1);
 
-        let poisoned = trainer
+        // C2: unread steps return Ok(None) without status readback; device gate
+        // still blocks mutation. Sticky NonFinite surfaces at the next safety point.
+        let unread = trainer
             .train_step(
                 &mut splats,
                 &camera,
@@ -3865,11 +3867,8 @@ mod tests {
                 false,
             )
             .await
-            .expect_err("non-finite step must abort even when loss is unread");
-        assert!(
-            matches!(poisoned, TrainingError::NonFiniteLoss { .. }),
-            "got {poisoned:?}"
-        );
+            .expect("unread non-finite stays SubmittedUnconfirmed");
+        assert!(unread.is_none());
 
         let after = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(after.0, before.0, "transforms must not change");
@@ -3883,6 +3882,7 @@ mod tests {
             after.5.committed_optimizer_steps,
             before.5.committed_optimizer_steps
         );
+        // snapshot_mutation_state syncs status; sticky must be visible after that.
         assert!(after.5.has_non_finite_loss());
         assert_eq!(after.5.first_invalid_iteration, 2);
     }
@@ -3915,7 +3915,7 @@ mod tests {
         let before = snapshot_mutation_state(&mut trainer, &splats).await;
         trainer.intersection_capacity_override = Some(1);
 
-        let overflowed = trainer
+        let unread = trainer
             .train_step(
                 &mut splats,
                 &camera,
@@ -3927,11 +3927,8 @@ mod tests {
                 false,
             )
             .await
-            .expect_err("overflow step must abort even when loss is unread");
-        assert!(
-            matches!(overflowed, TrainingError::ForwardCapacityExceeded { .. }),
-            "got {overflowed:?}"
-        );
+            .expect("unread overflow stays SubmittedUnconfirmed");
+        assert!(unread.is_none());
 
         let after = snapshot_mutation_state(&mut trainer, &splats).await;
         assert_eq!(after.0, before.0, "transforms must not change");
@@ -3982,7 +3979,7 @@ mod tests {
         trainer.intersection_capacity_override = Some(1);
 
         for iteration in 2..=4 {
-            let overflowed = trainer
+            let unread = trainer
                 .train_step(
                     &mut splats,
                     &camera,
@@ -3994,16 +3991,10 @@ mod tests {
                     false,
                 )
                 .await
-                .expect_err("continuous unread overflow must stay aborted");
+                .expect("continuous unread overflow stays SubmittedUnconfirmed");
             assert!(
-                matches!(
-                    overflowed,
-                    TrainingError::ForwardCapacityExceeded {
-                        first_iteration: 2,
-                        ..
-                    }
-                ),
-                "iteration {iteration} got {overflowed:?}"
+                unread.is_none(),
+                "iteration {iteration} must not invent a loss scalar"
             );
         }
 
@@ -4668,6 +4659,138 @@ mod tests {
             .get(span::FORWARD)
             .expect("forward span");
         assert!(forward.sample_count > 0);
-        assert_eq!(forward.timing_kind, "cpu_submit_instant");
+        assert_eq!(forward.timing_kind, "synchronized_boundary");
+        assert_eq!(
+            report.gpu_timing_scope.as_deref(),
+            Some(crate::training::reporting::gpu_profiler::GPU_TIMING_SCOPE_FORWARD)
+        );
+        assert_eq!(
+            report.workspace_scope,
+            crate::training::reporting::gpu_profiler::WORKSPACE_SCOPE_PREFIX_SUM
+        );
+        if report.sample_count > 0 {
+            let sum = report.gpu_forward_sum_ms.expect("forward sum");
+            let p50 = report.gpu_step_p50_ms.expect("p50");
+            assert!(sum.is_finite() && sum >= 0.0);
+            assert!(p50.is_finite());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn c4_production_path_profiler_maps_to_optimization_json() {
+        use crate::training::reporting::gpu_profiler::{
+            assert_report_self_consistent, optimization_gpu_fields_from_profiler,
+            GpuEnvironmentProbe, PipelineTimingCollector, GPU_TIMING_SCOPE_FORWARD,
+            WORKSPACE_SCOPE_PREFIX_SUM,
+        };
+
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 4;
+        config.profiler.enabled = true;
+        config.profiler.gpu_timing_enabled = true;
+        config.profiler.gpu_sample_every = 1;
+        config.data.frame_cache_capacity = 2;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let (_temp, mut loader, cameras, order) = production_outer_loop_fixture(&config);
+        let mut observer = OuterLoopProbeObserver::new();
+
+        let report = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                0,
+                4,
+                &mut observer,
+            )
+            .await
+            .expect("production outer loop");
+        assert_eq!(report.completed_iterations, 4);
+
+        let profiler = report
+            .telemetry
+            .gpu_profiler
+            .as_ref()
+            .expect("finish_report must attach gpu_profiler");
+        assert_report_self_consistent(profiler).expect("profiler self-consistent");
+        assert_eq!(
+            profiler.gpu_timing_scope.as_deref(),
+            Some(GPU_TIMING_SCOPE_FORWARD)
+        );
+        assert_eq!(profiler.workspace_scope, WORKSPACE_SCOPE_PREFIX_SUM);
+        assert!(profiler.timestamp_query_available || profiler.unsupported_reason.is_some());
+
+        // Uneven accepted samples: sum must not equal p50 × N.
+        let mut uneven = PipelineTimingCollector::new(GpuEnvironmentProbe {
+            backend: profiler.backend.clone(),
+            adapter: profiler.adapter.clone(),
+            driver: profiler.driver.clone(),
+            timestamp_query_available: true,
+            timing_method_device: true,
+            ..Default::default()
+        });
+        for ms in [1.0, 10.0, 100.0, 1000.0] {
+            uneven.record_gpu_step_ms(ms);
+        }
+        let uneven_report = uneven.build_report();
+        let sum = uneven_report.gpu_forward_sum_ms.expect("sum");
+        let p50 = uneven_report.gpu_step_p50_ms.expect("p50");
+        assert!((sum - p50 * uneven_report.sample_count as f64).abs() > 1.0);
+
+        let fields = optimization_gpu_fields_from_profiler(profiler);
+        assert!(fields.gpu_completion_seconds.is_none());
+        assert_eq!(fields.gpu_timing_scope.as_deref(), Some("forward"));
+        assert_eq!(
+            fields.timestamp_query_available,
+            Some(profiler.timestamp_query_available)
+        );
+        assert_eq!(fields.workspace_scope.as_deref(), Some("prefix_sum"));
+        if let Some(forward_sum_ms) = profiler.gpu_forward_sum_ms {
+            assert_eq!(
+                fields.gpu_forward_sum_seconds,
+                Some(forward_sum_ms / 1000.0)
+            );
+        }
+
+        // Status readback identity: total equals sum of reason counters.
+        let telemetry = &report.telemetry;
+        let total = telemetry.status_readbacks.unwrap_or(0);
+        let parts = telemetry.status_readbacks_loss_cadence.unwrap_or(0)
+            + telemetry.status_readbacks_topology.unwrap_or(0)
+            + telemetry.status_readbacks_checkpoint.unwrap_or(0)
+            + telemetry.status_readbacks_pause.unwrap_or(0)
+            + telemetry.status_readbacks_cancel.unwrap_or(0)
+            + telemetry.status_readbacks_training_end.unwrap_or(0)
+            + telemetry.status_readbacks_forward_abort.unwrap_or(0)
+            + telemetry.status_readbacks_step_disposition.unwrap_or(0);
+        assert_eq!(total, parts, "status_readbacks total must equal reason sum");
+        // C2 contract: healthy unread steps do not add disposition reads.
+        assert_eq!(telemetry.status_readbacks_step_disposition.unwrap_or(0), 0);
+
+        // Prefetch miss records real decode/resize; cache hits must not push 0ms.
+        let decode = profiler
+            .pipeline_spans
+            .get(span::DECODE)
+            .expect("decode span");
+        let resize = profiler
+            .pipeline_spans
+            .get(span::RESIZE)
+            .expect("resize span");
+        assert!(
+            decode.sample_count <= 1,
+            "cache hits must not push 0ms decode samples, got {}",
+            decode.sample_count
+        );
+        assert!(
+            resize.sample_count <= 1,
+            "cache hits must not push 0ms resize samples, got {}",
+            resize.sample_count
+        );
     }
 }

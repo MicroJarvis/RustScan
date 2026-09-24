@@ -5,7 +5,9 @@ backward, topology, and optimizer. A failed step gates subsequent device work;
 the host reads status only at declared safety points. Workspace ownership is
 explicit and must not use thread-local raw pointers. Reports distinguish GPU
 completion timing from CPU submission timing and carry adapter, split, and
-binary identity when available.
+binary identity when available. GPU timestamp samples are forward-render
+scoped; optimization JSON publishes real sample sums (`gpu_forward_sum_*`)
+and leaves `gpu_completion_seconds` null rather than inventing p50×N totals.
 
 The change is staged as P0 correctness, P1 ownership and measurement, and P2
 quality/reproducibility. Existing P0 and P1.1 evidence in `tasks.md` is the

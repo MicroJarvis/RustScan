@@ -384,7 +384,7 @@ artifacts/runs/rustgs-optimization/2026-09-18-remediation/
 2. 按 Home 500、flowers2 500、TUM 500、TUM 3k、TUM 10k、TUM 30k 执行固定 manifest 的训练和评估。baseline/candidate 正式结果各至少 3 次，首轮 warmup 不计入统计。
 3. 保存 split manifest、optimization JSON、evaluation JSON、stdout/stderr、PLY 和 timing/allocation evidence；汇总 mean/stddev/p50/p95。
 4. comparator 必须拒绝 binary revision、dataset fingerprint、split、seed、分辨率、iteration、loss/topology/SH schedule 或 GPU environment 不一致的报告；不可测字段必须标明原因。
-5. 任一 overflow、non-finite、invalid dispatch、checkpoint failure、resume fingerprint mismatch、普通 step status readback、workspace 持续增长、holdout mean 下降超过 0.10 dB、worst frame 下降超过 0.20 dB 或新增 fog/ghosting/floaters，都判定 candidate 失败。
+5. 任一 overflow、non-finite、invalid dispatch、checkpoint failure、resume fingerprint mismatch、**超出 C2 安全点契约的逐步 disposition status readback**、workspace 持续增长、holdout mean 下降超过 0.10 dB、worst frame 下降超过 0.20 dB 或新增 fog/ghosting/floaters，都判定 candidate 失败。baseline/candidate 各自绑定自己的 binary revision/hash；不可把“binary revision 必须相同”当成跨版本 A/B 的硬门槛。
 6. 先证明 correctness 和 quality，再在同一 GPU/driver 上比较 steps/s 和 p95；不能用不同环境的数字宣称性能提升。
 7. 如果 TUM 数据不可用，保留 blocked reason、数据路径和尝试过的命令，不得伪造结果；完成可运行的 Home/flowers2 和全部代码验证。
 
@@ -425,10 +425,12 @@ Cursor 停止后，维护者按以下顺序审核，不通过时只回发当前�
 
 ## 任务卡完成状态
 
-- [ ] C1 bounded map 边界和 WGSL 显式条件
-- [ ] C2 committed/aborted step 语义
-- [ ] C3 scan output 复用和分配证据
-- [ ] C4 GPU profiler 和 pipeline timing
+Fix branch base: `701d051`. C1–C4 code is on `fix/rs-2026-002-c1-c4-review` pending maintainer review; C5–C8 not started.
+
+- [ ] C1 bounded map 边界和 WGSL 显式条件 *(implemented on fix branch; maintainer review)*
+- [ ] C2 committed/aborted step 语义 *(fa970ed; maintainer review)*
+- [ ] C3 scan output 复用和分配证据 *(implemented on fix branch; maintainer review)*
+- [ ] C4 GPU profiler 和 pipeline timing *(ae55d66 + measurement fix; maintainer review)*
 - [ ] C5 stable frame identity、selection、split manifest
 - [ ] C6 quaternion、sRGB、depth 契约
 - [ ] C7 rasterizer finite difference、SH schedule

@@ -381,13 +381,22 @@ enum SplatEvaluationRendererBackend {
 #[derive(Clone, Debug)]
 pub struct SharedWgpuContext {
     device: <GsBackendBase as Backend>::Device,
+    adapter_metadata: crate::training::reporting::gpu_profiler::TrainingAdapterMetadata,
 }
 
 #[cfg(feature = "gpu")]
 impl SharedWgpuContext {
     pub fn from_wgpu_setup(setup: burn_wgpu::WgpuSetup) -> Self {
+        let adapter_metadata =
+            crate::training::reporting::gpu_profiler::TrainingAdapterMetadata::from_wgpu_adapter(
+                &setup.adapter,
+                setup.backend,
+            );
         let device = burn_wgpu::init_device(setup, shared_wgpu_runtime_options());
-        Self { device }
+        Self {
+            device,
+            adapter_metadata,
+        }
     }
 
     pub fn from_wgpu_parts(
@@ -412,6 +421,24 @@ impl SharedWgpuContext {
 
     pub(crate) fn training_device(&self) -> <GsBackendBase as Backend>::Device {
         self.device.clone()
+    }
+
+    /// Environment probe for training reports — capability refined with the live client.
+    pub(crate) fn environment_probe(
+        &self,
+    ) -> crate::training::reporting::gpu_profiler::GpuEnvironmentProbe {
+        use crate::training::reporting::gpu_profiler::{
+            probe_from_training_adapter_metadata, refine_probe_with_client_timing,
+        };
+        use burn_cubecl::cubecl::profile::TimingMethod;
+        use burn_cubecl::cubecl::Runtime;
+        use burn_wgpu::WgpuRuntime;
+
+        let client = WgpuRuntime::client(&self.device);
+        let timing_method_device = client.properties().timing_method == TimingMethod::Device;
+        let probe =
+            probe_from_training_adapter_metadata(&self.adapter_metadata, timing_method_device);
+        refine_probe_with_client_timing(probe, timing_method_device)
     }
 }
 
