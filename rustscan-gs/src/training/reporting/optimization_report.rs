@@ -55,6 +55,15 @@ pub struct OptimizationCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PipelineSpanStats {
+    pub sample_count: u64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    /// Honest classification (e.g. `host_wait`, `worker_wall`, `cpu_submit`).
+    pub timing_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct OptimizationTrainMetrics {
     pub wall_clock_seconds: Option<f64>,
     pub training_loop_seconds: Option<f64>,
@@ -62,7 +71,7 @@ pub struct OptimizationTrainMetrics {
     pub steps_per_second: Option<f64>,
     pub loop_duration_p50_ms: Option<f64>,
     pub loop_duration_p95_ms: Option<f64>,
-    /// CPU submit-side loop samples only; not GPU completion time.
+    /// Train-step wall samples (`step_wall`); not GPU completion time.
     pub loop_timing_kind: Option<String>,
     /// Always null — never invent totals via p50 × completed_iterations.
     pub gpu_completion_seconds: Option<f64>,
@@ -75,6 +84,23 @@ pub struct OptimizationTrainMetrics {
     pub gpu_step_p95_ms: Option<f64>,
     pub gpu_step_sample_count: Option<u64>,
     pub gpu_profiler_unsupported_reason: Option<String>,
+    /// Host Instant / CPU span collection enabled.
+    pub profiler_enabled: Option<bool>,
+    /// Device timestamp profiling requested.
+    pub gpu_timing_enabled: Option<bool>,
+    /// Sample every N iterations when GPU timing is enabled.
+    pub gpu_sample_every: Option<usize>,
+    /// True when at least one accepted GPU forward sample survived warmup.
+    pub measurement_success: Option<bool>,
+    /// Illegal (non-finite / negative) timing samples dropped at record sites.
+    pub rejected_timing_samples: Option<u64>,
+    pub profile_start_failures: Option<u64>,
+    pub profile_end_failures: Option<u64>,
+    pub profile_resolve_failures: Option<u64>,
+    pub dropped_profile_samples: Option<u64>,
+    /// Unified pipeline span percentiles and timing kinds.
+    #[serde(default)]
+    pub pipeline_spans: std::collections::BTreeMap<String, PipelineSpanStats>,
     pub loss_readback_count: Option<usize>,
     pub count_readback_count: Option<usize>,
     pub status_readbacks: Option<usize>,
@@ -560,7 +586,7 @@ mod tests {
                 steps_per_second: Some(50.0),
                 loop_duration_p50_ms: Some(18.0),
                 loop_duration_p95_ms: Some(22.0),
-                loop_timing_kind: Some("cpu_submit_instant".into()),
+                loop_timing_kind: Some("step_wall".into()),
                 gpu_completion_seconds: None,
                 gpu_timing_scope: Some("forward".into()),
                 gpu_forward_sum_seconds: None,
@@ -568,6 +594,16 @@ mod tests {
                 gpu_step_p95_ms: None,
                 gpu_step_sample_count: Some(0),
                 gpu_profiler_unsupported_reason: Some("timestamp_query_unavailable".into()),
+                profiler_enabled: Some(true),
+                gpu_timing_enabled: Some(false),
+                gpu_sample_every: Some(20),
+                measurement_success: Some(false),
+                rejected_timing_samples: Some(0),
+                profile_start_failures: Some(0),
+                profile_end_failures: Some(0),
+                profile_resolve_failures: Some(0),
+                dropped_profile_samples: Some(0),
+                pipeline_spans: Default::default(),
                 loss_readback_count: Some(26),
                 count_readback_count: Some(0),
                 status_readbacks: Some(27),

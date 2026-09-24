@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+pub use super::optimization_report::PipelineSpanStats;
 use super::optimization_report::{duration_millis, percentile_f64};
 
 /// Drop the first N samples per span before percentile aggregation.
@@ -38,11 +39,35 @@ pub const SAMPLED_BYTES_IN_USE_HIGH_WATER: &str = "sampled_bytes_in_use_high_wat
 pub const EXISTING_DEVICE_ADAPTER_METADATA_UNAVAILABLE: &str =
     "existing_device_adapter_metadata_unavailable";
 
+/// DefaultDevice / BestAvailable cannot re-pick an adapter for name/driver.
+///
+/// The live training client may have been selected via
+/// `CUBECL_WGPU_DEFAULT_DEVICE` or other runtime policy; guessing via
+/// `request_adapter(HighPerformance)` can attribute the wrong GPU.
+pub const DEFAULT_DEVICE_ADAPTER_METADATA_UNAVAILABLE: &str =
+    "default_device_adapter_metadata_unavailable";
+
 /// GPU samples cover render forward only.
 pub const GPU_TIMING_SCOPE_FORWARD: &str = "forward";
 
 /// Prefix-sum workspace ownership scope for workspace_* / fresh_step_allocations.
 pub const WORKSPACE_SCOPE_PREFIX_SUM: &str = "prefix_sum";
+
+/// Timing-kind labels for pipeline spans (honest classification).
+pub mod timing_kind {
+    /// Host thread blocked waiting for prefetch / frame availability.
+    pub const HOST_WAIT: &str = "host_wait";
+    /// Prefetch-worker wall (decode/resize); not on the train-step thread.
+    pub const WORKER_WALL: &str = "worker_wall";
+    /// Host Instant around CPU-side submit / orchestration.
+    pub const CPU_SUBMIT: &str = "cpu_submit";
+    /// Host Instant that may include GPU timestamp resolve / sync.
+    pub const SYNCHRONIZED_BOUNDARY: &str = "synchronized_boundary";
+    /// Full outer-loop iteration wall (frame wait through step end).
+    pub const HOST_WALL: &str = "host_wall";
+    /// Train-step wall after frame wait / upload prep.
+    pub const STEP_WALL: &str = "step_wall";
+}
 
 /// Unified pipeline span names (CPU submit / wall unless documented otherwise).
 pub mod span {
@@ -61,10 +86,13 @@ pub mod span {
     pub const TOPOLOGY_REMAP_VISIBILITY: &str = "topology_remap_visibility";
     /// Adam optimizer origin remap after a topology mutation.
     pub const TOPOLOGY_REMAP_OPTIMIZER: &str = "topology_remap_optimizer";
-    /// Parent CPU wall covering one outer-loop iteration (submit-side Instant).
+    /// Outer-loop iteration wall: starts before frame_wait, ends with step_cpu.
+    pub const ITERATION_WALL: &str = "iteration_wall";
+    /// Train-step wall after frame wait / target upload prep (not full iteration).
     pub const STEP_CPU: &str = "step_cpu";
 
     pub const ALL: &[&str] = &[
+        ITERATION_WALL,
         FRAME_WAIT,
         DECODE,
         RESIZE,
@@ -80,6 +108,18 @@ pub mod span {
         TOPOLOGY_REMAP_OPTIMIZER,
         STEP_CPU,
     ];
+}
+
+/// Stable timing_kind for a named pipeline span.
+pub fn span_timing_kind(name: &str) -> &'static str {
+    match name {
+        span::FRAME_WAIT => timing_kind::HOST_WAIT,
+        span::DECODE | span::RESIZE => timing_kind::WORKER_WALL,
+        span::FORWARD => timing_kind::SYNCHRONIZED_BOUNDARY,
+        span::ITERATION_WALL => timing_kind::HOST_WALL,
+        span::STEP_CPU => timing_kind::STEP_WALL,
+        _ => timing_kind::CPU_SUBMIT,
+    }
 }
 
 /// Serializable GPU profiler report distinguishing CPU submit from GPU completion.
@@ -115,6 +155,14 @@ pub struct GpuProfilerReport {
     pub sample_count: u64,
     /// Illegal (non-finite / negative) timing samples dropped at record sites.
     pub rejected_timing_samples: u64,
+    /// Profile start failed before work ran (work then executed unprofiled).
+    pub profile_start_failures: u64,
+    /// Profile end failed after work already ran (timing dropped).
+    pub profile_end_failures: u64,
+    /// Profile Ok but device-ms resolve yielded no usable sample.
+    pub profile_resolve_failures: u64,
+    /// GPU timing samples dropped due to start/end/resolve failure (not rejects).
+    pub dropped_profile_samples: u64,
     /// Scope of workspace_* / fresh_step_allocations (`"prefix_sum"`).
     pub workspace_scope: String,
     pub workspace_current_bytes: u64,
@@ -130,16 +178,6 @@ pub struct GpuProfilerReport {
     pub cpu_step_p95_ms: Option<f64>,
     pub cpu_timing_kind: Option<String>,
     pub pipeline_spans: BTreeMap<String, PipelineSpanStats>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct PipelineSpanStats {
-    pub sample_count: u64,
-    pub p50_ms: Option<f64>,
-    pub p95_ms: Option<f64>,
-    /// `cpu_submit_instant` for most spans; `synchronized_boundary` for forward
-    /// (Instant may include timestamp-query resolve wait when GPU timing is on).
-    pub timing_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -318,6 +356,10 @@ pub struct PipelineTimingCollector {
     gpu_timing_enabled: bool,
     gpu_sample_every: usize,
     rejected_timing_samples: u64,
+    profile_start_failures: u64,
+    profile_end_failures: u64,
+    profile_resolve_failures: u64,
+    dropped_profile_samples: u64,
 }
 
 impl PipelineTimingCollector {
@@ -356,7 +398,24 @@ impl PipelineTimingCollector {
         self.rejected_timing_samples
     }
 
+    /// Record structured GPU profile attempt failure / drop counters.
+    pub fn record_profile_attempt_stats(&mut self, stats: &ProfileAttemptStats) {
+        self.profile_start_failures = self
+            .profile_start_failures
+            .saturating_add(stats.start_failures);
+        self.profile_end_failures = self.profile_end_failures.saturating_add(stats.end_failures);
+        self.profile_resolve_failures = self
+            .profile_resolve_failures
+            .saturating_add(stats.resolve_failures);
+        self.dropped_profile_samples = self
+            .dropped_profile_samples
+            .saturating_add(stats.dropped_samples);
+    }
+
     pub fn record_span_ms(&mut self, name: &str, ms: f64) {
+        if !self.profiler_enabled {
+            return;
+        }
         if !is_valid_timing_ms(ms) {
             self.rejected_timing_samples = self.rejected_timing_samples.saturating_add(1);
             return;
@@ -369,6 +428,9 @@ impl PipelineTimingCollector {
     }
 
     pub fn record_cpu_step(&mut self, duration: Duration) {
+        if !self.profiler_enabled {
+            return;
+        }
         let ms = duration_millis(duration);
         if !is_valid_timing_ms(ms) {
             self.rejected_timing_samples = self.rejected_timing_samples.saturating_add(1);
@@ -473,13 +535,7 @@ impl PipelineTimingCollector {
             } else {
                 (percentile_f64(&sorted, 50.0), percentile_f64(&sorted, 95.0))
             };
-            let timing_kind = if *name == span::FORWARD {
-                // Forward Instant brackets profile_device_gpu_step, which may await
-                // timestamp resolve — not pure CPU submit.
-                "synchronized_boundary"
-            } else {
-                "cpu_submit_instant"
-            };
+            let timing_kind = span_timing_kind(name);
             pipeline_spans.insert(
                 (*name).to_string(),
                 PipelineSpanStats {
@@ -517,6 +573,10 @@ impl PipelineTimingCollector {
             gpu_step_p95_ms,
             sample_count,
             rejected_timing_samples: self.rejected_timing_samples,
+            profile_start_failures: self.profile_start_failures,
+            profile_end_failures: self.profile_end_failures,
+            profile_resolve_failures: self.profile_resolve_failures,
+            dropped_profile_samples: self.dropped_profile_samples,
             workspace_scope: WORKSPACE_SCOPE_PREFIX_SUM.into(),
             workspace_current_bytes: self.workspace_current_bytes,
             workspace_peak_bytes: self.workspace_peak_bytes,
@@ -526,7 +586,7 @@ impl PipelineTimingCollector {
             runtime_peak_device_bytes_reason: self.runtime_peak_device_bytes_reason.clone(),
             cpu_step_p50_ms,
             cpu_step_p95_ms,
-            cpu_timing_kind: Some("cpu_submit_instant".into()),
+            cpu_timing_kind: Some(timing_kind::STEP_WALL.into()),
             pipeline_spans,
         }
     }
@@ -610,6 +670,22 @@ fn resolve_training_adapter_metadata(
             Some(EXISTING_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
             Some(EXISTING_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
         ),
+        // Do not re-request HighPerformance — may diverge from the live client
+        // (e.g. CUBECL_WGPU_DEFAULT_DEVICE override). TimingMethod still comes
+        // from the training client in probe_training_device.
+        WgpuDevice::DefaultDevice => (
+            None,
+            None,
+            Some(DEFAULT_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
+            Some(DEFAULT_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
+        ),
+        #[allow(deprecated)]
+        WgpuDevice::BestAvailable => (
+            None,
+            None,
+            Some(DEFAULT_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
+            Some(DEFAULT_DEVICE_ADAPTER_METADATA_UNAVAILABLE.into()),
+        ),
         other => match select_adapter_matching_device(other, backend) {
             Some(adapter) => {
                 let info = adapter.get_info();
@@ -665,31 +741,10 @@ fn select_adapter_matching_device(
         WgpuDevice::Cpu => filtered
             .into_iter()
             .find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu),
-        WgpuDevice::DefaultDevice => {
-            // Match cubecl default: prefer high-performance within the training backend.
-            burn_cubecl::cubecl::future::block_on(instance.request_adapter(
-                &wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                },
-            ))
-            .ok()
-            .filter(|a| a.get_info().backend == backend)
-            .or_else(|| filtered.into_iter().next())
-        }
+        // Handled in resolve_training_adapter_metadata — never re-pick.
+        WgpuDevice::DefaultDevice | WgpuDevice::Existing(_) => None,
         #[allow(deprecated)]
-        WgpuDevice::BestAvailable => burn_cubecl::cubecl::future::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            }),
-        )
-        .ok()
-        .filter(|a| a.get_info().backend == backend)
-        .or_else(|| filtered.into_iter().next()),
-        WgpuDevice::Existing(_) => None,
+        WgpuDevice::BestAvailable => None,
     }
 }
 
@@ -703,6 +758,13 @@ pub fn runtime_device_bytes_in_use(device: &crate::training::engine::GsDevice) -
 }
 
 /// Resolve a cubecl profile duration into GPU milliseconds only for Device timing.
+///
+/// # Panic / failure honesty
+///
+/// CubeCL's wgpu timestamp resolve path may `expect`/panic on map-buffer failure
+/// (see cubecl-wgpu timings). This wrapper cannot convert that into a silent
+/// `None` success — a panic aborts the process. When timing_method is not
+/// Device, the future is drained and `None` is returned (not counted as GPU time).
 pub async fn resolve_device_gpu_ms(
     profile: burn_cubecl::cubecl::profile::ProfileDuration,
 ) -> Option<f64> {
@@ -736,25 +798,68 @@ pub fn should_profile_gpu(
     matches!(total_iterations, Some(total) if total > 0 && iteration == total)
 }
 
+/// Counters for a single GPU profile attempt (start / end / resolve).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProfileAttemptStats {
+    pub start_failures: u64,
+    pub end_failures: u64,
+    pub resolve_failures: u64,
+    pub dropped_samples: u64,
+}
+
+/// Classification of profile Err recovery (shared by production and tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileRecoveryKind {
+    /// Work already ran and output is stored — do not re-run; drop timing.
+    EndFailed,
+    /// Profile never started — run work once unprofiled.
+    StartFailed,
+    /// Both slots empty (protocol violation).
+    Impossible,
+}
+
+/// Classify profile Err slots without consuming them.
+pub fn classify_profile_recovery<T, F>(
+    work_slot: &Option<F>,
+    output_slot: &Option<T>,
+) -> ProfileRecoveryKind {
+    if output_slot.is_some() {
+        ProfileRecoveryKind::EndFailed
+    } else if work_slot.is_some() {
+        ProfileRecoveryKind::StartFailed
+    } else {
+        ProfileRecoveryKind::Impossible
+    }
+}
+
 /// Recover after a profile attempt that returned `Err`.
 ///
 /// Work must run at most once: prefer an already-stored output (end-profile
 /// failure after the closure ran), else run remaining work once (start failure).
-#[cfg(test)]
-pub(crate) fn recover_profile_result<T, F>(
+/// Production [`profile_device_gpu_step`] uses the same classification via
+/// [`classify_profile_recovery`].
+pub fn recover_profile_result<T, F>(
     work_slot: &mut Option<F>,
     output_slot: &mut Option<T>,
 ) -> Result<(T, Option<f64>), String>
 where
     F: FnOnce() -> T,
 {
-    if let Some(output) = output_slot.take() {
-        return Ok((output, None));
+    match classify_profile_recovery(work_slot, output_slot) {
+        ProfileRecoveryKind::EndFailed => {
+            let output = output_slot
+                .take()
+                .expect("EndFailed requires stored output");
+            Ok((output, None))
+        }
+        ProfileRecoveryKind::StartFailed => {
+            let work = work_slot.take().expect("StartFailed requires work");
+            Ok((work(), None))
+        }
+        ProfileRecoveryKind::Impossible => Err(
+            "gpu profile recovery: work already consumed and no output stored (impossible)".into(),
+        ),
     }
-    if let Some(work) = work_slot.take() {
-        return Ok((work(), None));
-    }
-    Err("gpu profile recovery: work already consumed and no output stored (impossible)".into())
 }
 
 /// Run `work` under cubecl device timestamp profiling when supported.
@@ -766,10 +871,14 @@ where
 ///
 /// When profiling cannot start or end fails after work ran, `work` still runs
 /// at most once (unprofiled on start failure; timing dropped on end failure).
+/// Failure counters are returned in [`ProfileAttemptStats`].
+///
+/// Resolve path honesty: cubecl may panic inside `ProfileDuration::resolve` on
+/// map failure; that is not mapped to a silent successful unsampled step.
 pub async fn profile_device_gpu_step<F, Fut, T>(
     device: &crate::training::engine::GsDevice,
     work: F,
-) -> (T, Option<f64>)
+) -> (T, Option<f64>, ProfileAttemptStats)
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = T>,
@@ -780,9 +889,10 @@ where
     use burn_wgpu::WgpuRuntime;
     use std::sync::{Arc, Mutex};
 
+    let mut stats = ProfileAttemptStats::default();
     let client = WgpuRuntime::client(device);
     if client.properties().timing_method != TimingMethod::Device {
-        return (work().await, None);
+        return (work().await, None, stats);
     }
 
     let work_slot = Arc::new(Mutex::new(Some(work)));
@@ -814,7 +924,11 @@ where
             match output {
                 Some(output) => {
                     let ms = resolve_device_gpu_ms(profile).await;
-                    (output, ms)
+                    if ms.is_none() {
+                        stats.resolve_failures = 1;
+                        stats.dropped_samples = 1;
+                    }
+                    (output, ms, stats)
                 }
                 None => {
                     // Profile Ok without stored output cannot happen with the
@@ -824,35 +938,56 @@ where
             }
         }
         Err(_) => {
-            let output = output_slot
+            let mut work_guard = work_slot
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(output) = output {
-                // End-profile failed after work already ran — never re-run.
-                (output, None)
-            } else {
-                let work = work_slot
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                match work {
-                    Some(work) => {
-                        // Start-profile failed before the closure ran — run once unprofiled.
-                        (work().await, None)
-                    }
-                    None => panic!(
-                        "gpu profile recovery: work already consumed and no output stored (impossible)"
-                    ),
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut output_guard = output_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match classify_profile_recovery(&*work_guard, &*output_guard) {
+                ProfileRecoveryKind::EndFailed => {
+                    stats.end_failures = 1;
+                    stats.dropped_samples = 1;
+                    let output = output_guard
+                        .take()
+                        .expect("EndFailed requires stored output");
+                    (output, None, stats)
                 }
+                ProfileRecoveryKind::StartFailed => {
+                    stats.start_failures = 1;
+                    stats.dropped_samples = 1;
+                    let work = work_guard.take().expect("StartFailed requires work");
+                    // Drop locks before awaiting work.
+                    drop(work_guard);
+                    drop(output_guard);
+                    (work().await, None, stats)
+                }
+                ProfileRecoveryKind::Impossible => panic!(
+                    "gpu profile recovery: work already consumed and no output stored (impossible)"
+                ),
             }
         }
     }
 }
 
-fn percentile_pair_valid(p50: Option<f64>, p95: Option<f64>) -> Result<(), String> {
+/// Validate percentile pair against sample_count.
+///
+/// - `sample_count == 0` ⇒ both percentiles must be `None`
+/// - `sample_count > 0` ⇒ both `Some`, finite, non-negative, and `p95 >= p50`
+fn percentile_pair_valid(
+    sample_count: u64,
+    p50: Option<f64>,
+    p95: Option<f64>,
+) -> Result<(), String> {
+    if sample_count == 0 {
+        return match (p50, p95) {
+            (None, None) => Ok(()),
+            _ => Err(format!(
+                "sample_count==0 requires null percentiles, got p50={p50:?} p95={p95:?}"
+            )),
+        };
+    }
     match (p50, p95) {
-        (None, None) => Ok(()),
         (Some(p50), Some(p95)) => {
             if !p50.is_finite() || !p95.is_finite() || p50 < 0.0 || p95 < 0.0 {
                 return Err(format!(
@@ -864,7 +999,9 @@ fn percentile_pair_valid(p50: Option<f64>, p95: Option<f64>) -> Result<(), Strin
             }
             Ok(())
         }
-        _ => Err("p50/p95 must both be Some or both None".into()),
+        _ => Err(format!(
+            "sample_count={sample_count}>0 requires both percentiles Some, got p50={p50:?} p95={p95:?}"
+        )),
     }
 }
 
@@ -875,7 +1012,11 @@ pub fn assert_report_self_consistent(report: &GpuProfilerReport) -> Result<(), S
             return Err("supported report must not set unsupported_reason".into());
         }
         if report.sample_count > 0 {
-            percentile_pair_valid(report.gpu_step_p50_ms, report.gpu_step_p95_ms)?;
+            percentile_pair_valid(
+                report.sample_count,
+                report.gpu_step_p50_ms,
+                report.gpu_step_p95_ms,
+            )?;
             match report.gpu_forward_sum_ms {
                 Some(sum) if sum.is_finite() && sum >= 0.0 => {}
                 Some(sum) => {
@@ -887,10 +1028,11 @@ pub fn assert_report_self_consistent(report: &GpuProfilerReport) -> Result<(), S
                     return Err("supported report with samples must have gpu_forward_sum_ms".into());
                 }
             }
-        } else {
-            if report.gpu_step_p50_ms.is_some() || report.gpu_step_p95_ms.is_some() {
-                return Err("zero GPU samples ⇒ null percentiles".into());
+            if !report.measurement_success {
+                return Err("measurement_success must be true when sample_count > 0".into());
             }
+        } else {
+            percentile_pair_valid(0, report.gpu_step_p50_ms, report.gpu_step_p95_ms)?;
             if report.gpu_forward_sum_ms.is_some() {
                 return Err("zero GPU samples ⇒ null gpu_forward_sum_ms".into());
             }
@@ -925,27 +1067,35 @@ pub fn assert_report_self_consistent(report: &GpuProfilerReport) -> Result<(), S
         return Err("workspace_scope must be \"prefix_sum\"".into());
     }
 
-    percentile_pair_valid(report.cpu_step_p50_ms, report.cpu_step_p95_ms)?;
+    let cpu_span_count = report
+        .pipeline_spans
+        .get(span::STEP_CPU)
+        .map(|s| s.sample_count)
+        .unwrap_or(0);
+    // cpu_step_* mirrors step_cpu span after warmup; require matching nullness.
+    percentile_pair_valid(
+        cpu_span_count,
+        report.cpu_step_p50_ms,
+        report.cpu_step_p95_ms,
+    )?;
+    if let Some(kind) = report.cpu_timing_kind.as_deref() {
+        if kind != timing_kind::STEP_WALL {
+            return Err(format!(
+                "cpu_timing_kind must be \"{}\", got {kind}",
+                timing_kind::STEP_WALL
+            ));
+        }
+    }
 
     for (name, stats) in &report.pipeline_spans {
-        let expected_kind = if name == span::FORWARD {
-            "synchronized_boundary"
-        } else {
-            "cpu_submit_instant"
-        };
+        let expected_kind = span_timing_kind(name);
         if stats.timing_kind != expected_kind {
             return Err(format!(
                 "span {name} must use {expected_kind}, got {}",
                 stats.timing_kind
             ));
         }
-        if stats.sample_count == 0 {
-            if stats.p50_ms.is_some() || stats.p95_ms.is_some() {
-                return Err(format!("span {name}: zero samples ⇒ null percentiles"));
-            }
-        } else {
-            percentile_pair_valid(stats.p50_ms, stats.p95_ms)?;
-        }
+        percentile_pair_valid(stats.sample_count, stats.p50_ms, stats.p95_ms)?;
     }
 
     if report.runtime_peak_device_bytes.is_none()
@@ -989,6 +1139,16 @@ pub fn optimization_gpu_fields_from_profiler(report: &GpuProfilerReport) -> Opti
         gpu_step_p95_ms: report.gpu_step_p95_ms,
         gpu_step_sample_count: Some(report.sample_count),
         gpu_profiler_unsupported_reason: report.unsupported_reason.clone(),
+        profiler_enabled: Some(report.profiler_enabled),
+        gpu_timing_enabled: Some(report.gpu_timing_enabled),
+        gpu_sample_every: Some(report.gpu_sample_every),
+        measurement_success: Some(report.measurement_success),
+        rejected_timing_samples: Some(report.rejected_timing_samples),
+        profile_start_failures: Some(report.profile_start_failures),
+        profile_end_failures: Some(report.profile_end_failures),
+        profile_resolve_failures: Some(report.profile_resolve_failures),
+        dropped_profile_samples: Some(report.dropped_profile_samples),
+        pipeline_spans: report.pipeline_spans.clone(),
         peak_device_bytes: report.runtime_peak_device_bytes,
         peak_device_bytes_reason: report.runtime_peak_device_bytes_reason.clone(),
         workspace_scope: Some(report.workspace_scope.clone()),
@@ -1015,6 +1175,16 @@ pub struct OptimizationGpuFields {
     pub gpu_step_p95_ms: Option<f64>,
     pub gpu_step_sample_count: Option<u64>,
     pub gpu_profiler_unsupported_reason: Option<String>,
+    pub profiler_enabled: Option<bool>,
+    pub gpu_timing_enabled: Option<bool>,
+    pub gpu_sample_every: Option<usize>,
+    pub measurement_success: Option<bool>,
+    pub rejected_timing_samples: Option<u64>,
+    pub profile_start_failures: Option<u64>,
+    pub profile_end_failures: Option<u64>,
+    pub profile_resolve_failures: Option<u64>,
+    pub dropped_profile_samples: Option<u64>,
+    pub pipeline_spans: BTreeMap<String, PipelineSpanStats>,
     pub peak_device_bytes: Option<u64>,
     pub peak_device_bytes_reason: Option<String>,
     pub workspace_scope: Option<String>,
@@ -1158,14 +1328,28 @@ mod tests {
         assert_eq!(report.sample_count, 0);
         assert_eq!(
             report.cpu_timing_kind.as_deref(),
-            Some("cpu_submit_instant")
+            Some(timing_kind::STEP_WALL)
         );
         assert_eq!(
             report
                 .pipeline_spans
                 .get(span::FORWARD)
                 .map(|s| s.timing_kind.as_str()),
-            Some("synchronized_boundary")
+            Some(timing_kind::SYNCHRONIZED_BOUNDARY)
+        );
+        assert_eq!(
+            report
+                .pipeline_spans
+                .get(span::DECODE)
+                .map(|s| s.timing_kind.as_str()),
+            Some(timing_kind::WORKER_WALL)
+        );
+        assert_eq!(
+            report
+                .pipeline_spans
+                .get(span::FRAME_WAIT)
+                .map(|s| s.timing_kind.as_str()),
+            Some(timing_kind::HOST_WAIT)
         );
         assert!(report.cpu_step_p50_ms.is_some());
         assert_report_self_consistent(&report).expect("consistent");
@@ -1192,6 +1376,10 @@ mod tests {
             gpu_step_p95_ms: None,
             sample_count: 0,
             rejected_timing_samples: 0,
+            profile_start_failures: 0,
+            profile_end_failures: 0,
+            profile_resolve_failures: 0,
+            dropped_profile_samples: 0,
             workspace_scope: WORKSPACE_SCOPE_PREFIX_SUM.into(),
             workspace_current_bytes: 2048,
             workspace_peak_bytes: 4096,
@@ -1201,23 +1389,34 @@ mod tests {
             runtime_peak_device_bytes_reason: Some(UNSUPPORTED_RUNTIME_PEAK_UNAVAILABLE.into()),
             cpu_step_p50_ms: Some(18.0),
             cpu_step_p95_ms: Some(22.0),
-            cpu_timing_kind: Some("cpu_submit_instant".into()),
-            pipeline_spans: BTreeMap::from([(
-                span::FORWARD.to_string(),
-                PipelineSpanStats {
-                    sample_count: 2,
-                    p50_ms: Some(5.0),
-                    p95_ms: Some(7.0),
-                    timing_kind: "synchronized_boundary".into(),
-                },
-            )]),
+            cpu_timing_kind: Some(timing_kind::STEP_WALL.into()),
+            pipeline_spans: BTreeMap::from([
+                (
+                    span::FORWARD.to_string(),
+                    PipelineSpanStats {
+                        sample_count: 2,
+                        p50_ms: Some(5.0),
+                        p95_ms: Some(7.0),
+                        timing_kind: timing_kind::SYNCHRONIZED_BOUNDARY.into(),
+                    },
+                ),
+                (
+                    span::STEP_CPU.to_string(),
+                    PipelineSpanStats {
+                        sample_count: 2,
+                        p50_ms: Some(18.0),
+                        p95_ms: Some(22.0),
+                        timing_kind: timing_kind::STEP_WALL.into(),
+                    },
+                ),
+            ]),
         };
         let json = serde_json::to_string_pretty(&report).expect("serialize");
         assert!(json.contains("\"gpu_step_p50_ms\": null"));
         assert!(json.contains("\"gpu_forward_sum_ms\": null"));
         assert!(json.contains("\"gpu_timing_scope\": \"forward\""));
         assert!(json.contains("timestamp_query_unavailable"));
-        assert!(json.contains("synchronized_boundary"));
+        assert!(json.contains(timing_kind::SYNCHRONIZED_BOUNDARY));
         assert!(json.contains("prefix_sum"));
         let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, report);
@@ -1308,6 +1507,111 @@ mod tests {
     }
 
     #[test]
+    fn profiler_disabled_records_no_cpu_span_samples() {
+        let mut collector = PipelineTimingCollector::new(supported_probe());
+        collector.set_profiler_mode(false, false, 20);
+        collector.record_span(span::FORWARD, Duration::from_millis(5));
+        collector.record_span(span::DECODE, Duration::from_millis(3));
+        collector.record_cpu_step(Duration::from_millis(12));
+        collector.record_span_ms(span::UPLOAD, 1.5);
+        // Invalid samples must not bump rejects when disabled.
+        collector.record_span_ms(span::FORWARD, f64::NAN);
+        assert_eq!(collector.rejected_timing_samples(), 0);
+        let report = collector.build_report();
+        assert!(!report.profiler_enabled);
+        assert!(report.cpu_step_p50_ms.is_none());
+        assert!(report.cpu_step_p95_ms.is_none());
+        for name in span::ALL {
+            let stats = report.pipeline_spans.get(*name).expect("span");
+            assert_eq!(
+                stats.sample_count, 0,
+                "{name} must stay empty when profiler disabled"
+            );
+            assert!(stats.p50_ms.is_none());
+            assert!(stats.p95_ms.is_none());
+        }
+        assert_report_self_consistent(&report).expect("disabled consistent");
+    }
+
+    #[test]
+    fn hand_built_nonzero_samples_without_percentiles_fail_validator() {
+        let mut report = GpuProfilerReport {
+            supported: true,
+            unsupported_reason: None,
+            backend: "Metal".into(),
+            adapter: Some("Test".into()),
+            driver: Some("Test".into()),
+            timestamp_query_available: true,
+            profiler_enabled: true,
+            gpu_timing_enabled: true,
+            measurement_success: true,
+            gpu_sample_every: 1,
+            gpu_timing_scope: Some(GPU_TIMING_SCOPE_FORWARD.into()),
+            gpu_forward_sum_ms: Some(10.0),
+            gpu_step_p50_ms: None,
+            gpu_step_p95_ms: None,
+            sample_count: 1,
+            workspace_scope: WORKSPACE_SCOPE_PREFIX_SUM.into(),
+            runtime_peak_device_bytes_reason: Some(UNSUPPORTED_RUNTIME_PEAK_UNAVAILABLE.into()),
+            cpu_timing_kind: Some(timing_kind::STEP_WALL.into()),
+            pipeline_spans: BTreeMap::from([(
+                span::UPLOAD.to_string(),
+                PipelineSpanStats {
+                    sample_count: 1,
+                    p50_ms: None,
+                    p95_ms: None,
+                    timing_kind: timing_kind::CPU_SUBMIT.into(),
+                },
+            )]),
+            ..Default::default()
+        };
+        let err = assert_report_self_consistent(&report).expect_err("must reject");
+        assert!(
+            err.contains("sample_count") || err.contains("percentiles"),
+            "unexpected err: {err}"
+        );
+
+        // JSON round-trip of the bad report must still fail validation.
+        let json = serde_json::to_string(&report).expect("serialize");
+        let decoded: GpuProfilerReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.sample_count, 1);
+        assert!(decoded.gpu_step_p50_ms.is_none());
+        assert!(assert_report_self_consistent(&decoded).is_err());
+
+        // Repair GPU percentiles but leave upload span broken.
+        report.gpu_step_p50_ms = Some(10.0);
+        report.gpu_step_p95_ms = Some(10.0);
+        let err = assert_report_self_consistent(&report).expect_err("upload still bad");
+        assert!(err.contains("upload") || err.contains("sample_count"));
+    }
+
+    #[test]
+    fn classify_profile_recovery_matches_recover_core() {
+        let mut work_slot = Some(|| 1);
+        let mut output_slot = None::<i32>;
+        assert_eq!(
+            classify_profile_recovery(&work_slot, &output_slot),
+            ProfileRecoveryKind::StartFailed
+        );
+        let (out, _) = recover_profile_result(&mut work_slot, &mut output_slot).expect("start");
+        assert_eq!(out, 1);
+        assert_eq!(
+            classify_profile_recovery(&work_slot, &output_slot),
+            ProfileRecoveryKind::Impossible
+        );
+
+        let mut work_slot = Some(|| 2);
+        let mut output_slot = Some(9);
+        assert_eq!(
+            classify_profile_recovery(&work_slot, &output_slot),
+            ProfileRecoveryKind::EndFailed
+        );
+        let (out, _) = recover_profile_result(&mut work_slot, &mut output_slot).expect("end");
+        assert_eq!(out, 9);
+        assert!(work_slot.is_some(), "end-fail must not consume work");
+    }
+
+    #[test]
     fn timestamp_capability_independent_of_enablement() {
         let mut probe = supported_probe();
         probe.timestamp_query_available = true;
@@ -1321,6 +1625,27 @@ mod tests {
         assert!(!report.measurement_success);
         let fields = optimization_gpu_fields_from_profiler(&report);
         assert_eq!(fields.timestamp_query_available, Some(true));
+        assert_eq!(fields.profiler_enabled, Some(true));
+        assert_eq!(fields.gpu_timing_enabled, Some(false));
+        assert!(!fields.pipeline_spans.is_empty());
+    }
+
+    #[test]
+    fn default_device_probe_does_not_fabricate_adapter_metadata() {
+        use crate::training::engine::GsDevice;
+        let probe = probe_training_device(&GsDevice::default());
+        assert!(probe.adapter.is_none());
+        assert!(probe.driver.is_none());
+        assert_eq!(
+            probe.adapter_unavailable_reason.as_deref(),
+            Some(DEFAULT_DEVICE_ADAPTER_METADATA_UNAVAILABLE)
+        );
+        assert_eq!(
+            probe.driver_unavailable_reason.as_deref(),
+            Some(DEFAULT_DEVICE_ADAPTER_METADATA_UNAVAILABLE)
+        );
+        // TimingMethod still comes from the live client.
+        assert!(!probe.backend.is_empty());
     }
 
     #[test]

@@ -2227,7 +2227,7 @@ fn maybe_write_optimization_report(
             loop_duration_p95_ms: telemetry.and_then(|t| t.loop_duration_p95_ms),
             loop_timing_kind: telemetry
                 .and_then(|t| t.loop_timing_kind.clone())
-                .or_else(|| Some("cpu_submit_instant".into())),
+                .or_else(|| Some(rustscan_gs::timing_kind::STEP_WALL.to_string())),
             gpu_completion_seconds: gpu_fields.as_ref().and_then(|f| f.gpu_completion_seconds),
             gpu_timing_scope: gpu_fields.as_ref().and_then(|f| f.gpu_timing_scope.clone()),
             gpu_forward_sum_seconds: gpu_fields.as_ref().and_then(|f| f.gpu_forward_sum_seconds),
@@ -2237,6 +2237,28 @@ fn maybe_write_optimization_report(
             gpu_profiler_unsupported_reason: gpu_fields
                 .as_ref()
                 .and_then(|f| f.gpu_profiler_unsupported_reason.clone()),
+            profiler_enabled: gpu_fields
+                .as_ref()
+                .and_then(|f| f.profiler_enabled)
+                .or(Some(config.profiler.enabled)),
+            gpu_timing_enabled: gpu_fields
+                .as_ref()
+                .and_then(|f| f.gpu_timing_enabled)
+                .or(Some(config.profiler.gpu_timing_enabled)),
+            gpu_sample_every: gpu_fields
+                .as_ref()
+                .and_then(|f| f.gpu_sample_every)
+                .or(Some(config.profiler.gpu_sample_every)),
+            measurement_success: gpu_fields.as_ref().and_then(|f| f.measurement_success),
+            rejected_timing_samples: gpu_fields.as_ref().and_then(|f| f.rejected_timing_samples),
+            profile_start_failures: gpu_fields.as_ref().and_then(|f| f.profile_start_failures),
+            profile_end_failures: gpu_fields.as_ref().and_then(|f| f.profile_end_failures),
+            profile_resolve_failures: gpu_fields.as_ref().and_then(|f| f.profile_resolve_failures),
+            dropped_profile_samples: gpu_fields.as_ref().and_then(|f| f.dropped_profile_samples),
+            pipeline_spans: gpu_fields
+                .as_ref()
+                .map(|f| f.pipeline_spans.clone())
+                .unwrap_or_default(),
             loss_readback_count: telemetry.and_then(|t| t.loss_readback_count),
             count_readback_count: telemetry.and_then(|t| t.count_readback_count),
             status_readbacks: telemetry.and_then(|t| t.status_readbacks),

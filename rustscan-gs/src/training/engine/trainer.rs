@@ -322,8 +322,11 @@ impl OptimizationTimingSamples {
         loss_readback: bool,
         splat_count: usize,
         intersection_capacity: usize,
+        record_timing: bool,
     ) {
-        self.loop_ms.push(duration_millis(loop_duration));
+        if record_timing {
+            self.loop_ms.push(duration_millis(loop_duration));
+        }
         if loss_readback {
             self.loss_readbacks = self.loss_readbacks.saturating_add(1);
         }
@@ -415,7 +418,8 @@ impl OptimizationTimingSamples {
         loop_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         telemetry.loop_duration_p50_ms = percentile_f64(&loop_sorted, 50.0);
         telemetry.loop_duration_p95_ms = percentile_f64(&loop_sorted, 95.0);
-        telemetry.loop_timing_kind = Some("cpu_submit_instant".into());
+        telemetry.loop_timing_kind =
+            Some(crate::training::reporting::gpu_profiler::timing_kind::STEP_WALL.into());
         telemetry.loss_readback_count = Some(self.loss_readbacks);
         telemetry.count_readback_count = Some(self.count_readbacks);
         telemetry.status_readbacks = Some(self.status_readbacks);
@@ -900,7 +904,7 @@ impl WgpuTrainer {
                 std::mem::replace(splats, empty_device_splats_placeholder(&device, sh_degree));
             let mut owned_ws = std::mem::take(&mut self.prefix_sum_workspace);
             let owned_camera = camera.clone();
-            let ((stolen_splats, stolen_ws, rendered), gpu_ms) =
+            let ((stolen_splats, stolen_ws, rendered), gpu_ms, profile_stats) =
                 profile_device_gpu_step(&device, move || async move {
                     let rendered = backward::render_splats_with_visibility_active_sh(
                         &owned_splats,
@@ -919,6 +923,8 @@ impl WgpuTrainer {
                 .await;
             *splats = stolen_splats;
             self.prefix_sum_workspace = stolen_ws;
+            self.pipeline_timing
+                .record_profile_attempt_stats(&profile_stats);
             if let Some(ms) = gpu_ms {
                 self.pipeline_timing.record_gpu_step_ms(ms);
             }
@@ -1360,14 +1366,15 @@ impl WgpuTrainer {
 
             let sample_idx = zero_based % cameras.len();
             let frame_idx = frame_order[sample_idx];
+            let iteration_wall_started = Instant::now();
             let frame_wait_started = Instant::now();
             frame_loader.prefetch_order_window(frame_order, sample_idx)?;
             let decoded = frame_loader.get(frame_idx)?;
             self.pipeline_timing
                 .record_span(span::FRAME_WAIT, frame_wait_started.elapsed());
             // Decode/resize happen on prefetch workers; attribute residual host
-            // cache-miss preparation under decode/resize/upload without double-counting
-            // into step_cpu child sums (step_cpu is the parent Instant for the iteration).
+            // cache-miss preparation under decode/resize/upload. Parallel worker
+            // spans are not additive children of iteration_wall / step_cpu.
             let target_img = match target_tensor_cache.get(&frame_idx).cloned() {
                 Some(cached) => {
                     touch_target_tensor_cache(&mut target_tensor_lru, frame_idx);
@@ -1458,11 +1465,14 @@ impl WgpuTrainer {
             };
             let loop_duration = step_started_at.elapsed();
             self.pipeline_timing.record_cpu_step(loop_duration);
+            self.pipeline_timing
+                .record_span(span::ITERATION_WALL, iteration_wall_started.elapsed());
             self.optimization_samples.record_loop_step(
                 loop_duration,
                 read_loss,
                 splats.num_splats(),
                 self.intersection_capacity,
+                self.config.profiler.enabled,
             );
             if let Some(loss) = loss {
                 last_sampled_loss = loss;
@@ -4454,6 +4464,7 @@ mod tests {
             false,
             /*splat_count=*/ 64,
             /*intersection_capacity=*/ 128,
+            /*record_timing=*/ true,
         );
         assert!(
             trainer.optimization_samples.scan_workspace_bytes.is_none(),
@@ -4771,7 +4782,7 @@ mod tests {
         );
         assert_eq!(
             report.cpu_timing_kind.as_deref(),
-            Some("cpu_submit_instant")
+            Some(crate::training::reporting::gpu_profiler::timing_kind::STEP_WALL)
         );
         assert!(
             !report.adapter.as_deref().unwrap_or("").is_empty()
@@ -4947,5 +4958,265 @@ mod tests {
             "cache hits must not push 0ms resize samples, got {}",
             resize.sample_count
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn profiler_disabled_production_loop_records_zero_span_samples() {
+        use crate::training::reporting::gpu_profiler::assert_report_self_consistent;
+
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 8;
+        config.profiler.enabled = false;
+        config.profiler.gpu_timing_enabled = false;
+        config.data.frame_cache_capacity = 2;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let (_temp, mut loader, cameras, order) = production_outer_loop_fixture(&config);
+        let mut observer = OuterLoopProbeObserver::new();
+
+        let report = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                0,
+                8,
+                &mut observer,
+            )
+            .await
+            .expect("disabled profiler loop");
+        assert_eq!(report.completed_iterations, 8);
+
+        let profiler = report
+            .telemetry
+            .gpu_profiler
+            .as_ref()
+            .expect("gpu_profiler attached");
+        assert!(!profiler.profiler_enabled);
+        assert!(profiler.cpu_step_p50_ms.is_none());
+        assert_eq!(profiler.sample_count, 0);
+        for (name, stats) in &profiler.pipeline_spans {
+            assert_eq!(
+                stats.sample_count, 0,
+                "{name} must have zero samples when profiler disabled"
+            );
+        }
+        assert!(
+            report.telemetry.loop_duration_p50_ms.is_none(),
+            "loop_ms must not accumulate when profiler disabled"
+        );
+        assert_report_self_consistent(profiler).expect("disabled self-consistent");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn optimization_report_write_path_exports_profiler_mode_and_spans() {
+        use crate::training::reporting::gpu_profiler::{
+            assert_report_self_consistent, optimization_gpu_fields_from_profiler, timing_kind,
+        };
+        use crate::training::reporting::optimization_report::{
+            build_optimization_report, load_optimization_report, write_optimization_report,
+            OptimizationCommand, OptimizationEnvironment, OptimizationMemoryMetrics,
+            OptimizationTopologyMetrics, OptimizationTrainMetrics,
+        };
+
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 6;
+        config.profiler.enabled = true;
+        config.profiler.gpu_timing_enabled = true;
+        config.profiler.gpu_sample_every = 5;
+        config.data.frame_cache_capacity = 2;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let (_temp, mut loader, cameras, order) = production_outer_loop_fixture(&config);
+        let mut observer = OuterLoopProbeObserver::new();
+
+        let training_report = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                0,
+                6,
+                &mut observer,
+            )
+            .await
+            .expect("sparse sampling loop");
+        let profiler = training_report
+            .telemetry
+            .gpu_profiler
+            .as_ref()
+            .expect("gpu_profiler");
+        assert_report_self_consistent(profiler).expect("consistent");
+        assert!(profiler.profiler_enabled);
+        assert_eq!(profiler.gpu_sample_every, 5);
+        assert_eq!(
+            profiler
+                .pipeline_spans
+                .get(span::FRAME_WAIT)
+                .map(|s| s.timing_kind.as_str()),
+            Some(timing_kind::HOST_WAIT)
+        );
+        assert_eq!(
+            profiler
+                .pipeline_spans
+                .get(span::ITERATION_WALL)
+                .map(|s| s.timing_kind.as_str()),
+            Some(timing_kind::HOST_WALL)
+        );
+
+        let gpu_fields = optimization_gpu_fields_from_profiler(profiler);
+        let opt = build_optimization_report(
+            OptimizationEnvironment {
+                binary_version: Some("test".into()),
+                git_revision: None,
+                adapter_name: gpu_fields.adapter_name.clone(),
+                backend: gpu_fields.backend.clone(),
+                driver: gpu_fields.driver.clone(),
+                timestamp_query_available: gpu_fields.timestamp_query_available,
+                adapter_unavailable_reason: gpu_fields.adapter_unavailable_reason.clone(),
+                driver_unavailable_reason: gpu_fields.driver_unavailable_reason.clone(),
+            },
+            OptimizationCommand {
+                argv: vec!["rustgs".into(), "train".into()],
+                iterations: Some(6),
+                ..Default::default()
+            },
+            OptimizationTrainMetrics {
+                completed_iterations: Some(training_report.completed_iterations),
+                loop_timing_kind: training_report.telemetry.loop_timing_kind.clone(),
+                gpu_completion_seconds: gpu_fields.gpu_completion_seconds,
+                gpu_timing_scope: gpu_fields.gpu_timing_scope.clone(),
+                gpu_forward_sum_seconds: gpu_fields.gpu_forward_sum_seconds,
+                gpu_step_p50_ms: gpu_fields.gpu_step_p50_ms,
+                gpu_step_p95_ms: gpu_fields.gpu_step_p95_ms,
+                gpu_step_sample_count: gpu_fields.gpu_step_sample_count,
+                gpu_profiler_unsupported_reason: gpu_fields.gpu_profiler_unsupported_reason.clone(),
+                profiler_enabled: gpu_fields.profiler_enabled,
+                gpu_timing_enabled: gpu_fields.gpu_timing_enabled,
+                gpu_sample_every: gpu_fields.gpu_sample_every,
+                measurement_success: gpu_fields.measurement_success,
+                rejected_timing_samples: gpu_fields.rejected_timing_samples,
+                profile_start_failures: gpu_fields.profile_start_failures,
+                profile_end_failures: gpu_fields.profile_end_failures,
+                profile_resolve_failures: gpu_fields.profile_resolve_failures,
+                dropped_profile_samples: gpu_fields.dropped_profile_samples,
+                pipeline_spans: gpu_fields.pipeline_spans.clone(),
+                ..Default::default()
+            },
+            OptimizationTopologyMetrics::default(),
+            OptimizationMemoryMetrics {
+                peak_device_bytes: gpu_fields.peak_device_bytes,
+                peak_device_bytes_reason: gpu_fields.peak_device_bytes_reason.clone(),
+                workspace_scope: gpu_fields.workspace_scope.clone(),
+                workspace_current_bytes: gpu_fields.workspace_current_bytes,
+                workspace_peak_bytes: gpu_fields.workspace_peak_bytes,
+                workspace_growth_count: gpu_fields.workspace_growth_count,
+                fresh_step_allocations: gpu_fields.fresh_step_allocations,
+                ..Default::default()
+            },
+            None,
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scene.optimization.json");
+        write_optimization_report(&path, &opt).expect("write");
+        let loaded = load_optimization_report(&path).expect("load");
+        assert_eq!(loaded.train.profiler_enabled, Some(true));
+        assert_eq!(loaded.train.gpu_timing_enabled, Some(true));
+        assert_eq!(loaded.train.gpu_sample_every, Some(5));
+        assert_eq!(
+            loaded.train.measurement_success,
+            Some(profiler.measurement_success)
+        );
+        assert_eq!(
+            loaded.train.rejected_timing_samples,
+            Some(profiler.rejected_timing_samples)
+        );
+        assert_eq!(
+            loaded.train.profile_start_failures,
+            Some(profiler.profile_start_failures)
+        );
+        assert_eq!(
+            loaded.train.dropped_profile_samples,
+            Some(profiler.dropped_profile_samples)
+        );
+        assert!(
+            !loaded.train.pipeline_spans.is_empty(),
+            "pipeline_spans must be exported"
+        );
+        assert_eq!(
+            loaded
+                .train
+                .pipeline_spans
+                .get(span::FORWARD)
+                .map(|s| s.timing_kind.as_str()),
+            Some(timing_kind::SYNCHRONIZED_BOUNDARY)
+        );
+
+        // Disabled export path: mode flags present, spans empty.
+        let mut config_off = config.clone();
+        config_off.profiler.enabled = false;
+        config_off.profiler.gpu_timing_enabled = false;
+        let mut splats_off = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer_off = WgpuTrainer::new(config_off.clone(), device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer_off);
+        let (_temp2, mut loader2, cameras2, order2) = production_outer_loop_fixture(&config_off);
+        let mut observer2 = OuterLoopProbeObserver::new();
+        let off_report = trainer_off
+            .train_with_frame_loader(
+                &mut splats_off,
+                &cameras2,
+                &order2,
+                &mut loader2,
+                (8, 8),
+                0,
+                4,
+                &mut observer2,
+            )
+            .await
+            .expect("disabled loop");
+        let off_profiler = off_report.telemetry.gpu_profiler.as_ref().expect("prof");
+        let off_fields = optimization_gpu_fields_from_profiler(off_profiler);
+        let off_opt = build_optimization_report(
+            OptimizationEnvironment::default(),
+            OptimizationCommand::default(),
+            OptimizationTrainMetrics {
+                profiler_enabled: off_fields.profiler_enabled,
+                gpu_timing_enabled: off_fields.gpu_timing_enabled,
+                gpu_sample_every: off_fields.gpu_sample_every,
+                measurement_success: off_fields.measurement_success,
+                rejected_timing_samples: off_fields.rejected_timing_samples,
+                profile_start_failures: off_fields.profile_start_failures,
+                profile_end_failures: off_fields.profile_end_failures,
+                profile_resolve_failures: off_fields.profile_resolve_failures,
+                dropped_profile_samples: off_fields.dropped_profile_samples,
+                pipeline_spans: off_fields.pipeline_spans.clone(),
+                gpu_step_sample_count: off_fields.gpu_step_sample_count,
+                ..Default::default()
+            },
+            OptimizationTopologyMetrics::default(),
+            OptimizationMemoryMetrics::default(),
+            None,
+        );
+        let path_off = dir.path().join("disabled.optimization.json");
+        write_optimization_report(&path_off, &off_opt).expect("write disabled");
+        let loaded_off = load_optimization_report(&path_off).expect("load disabled");
+        assert_eq!(loaded_off.train.profiler_enabled, Some(false));
+        assert_eq!(loaded_off.train.measurement_success, Some(false));
+        assert!(loaded_off
+            .train
+            .pipeline_spans
+            .values()
+            .all(|s| s.sample_count == 0));
     }
 }

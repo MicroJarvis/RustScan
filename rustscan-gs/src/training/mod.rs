@@ -66,8 +66,8 @@ pub use events::{
 #[cfg(feature = "gpu")]
 pub use reporting::gpu_profiler::{
     assert_report_self_consistent, optimization_gpu_fields_from_profiler, probe_wgpu_environment,
-    span as gpu_profiler_span, GpuEnvironmentProbe, GpuProfilerReport, OptimizationGpuFields,
-    PipelineSpanStats, PipelineTimingCollector, PIPELINE_TIMING_WARMUP_SAMPLES,
+    span as gpu_profiler_span, timing_kind, GpuEnvironmentProbe, GpuProfilerReport,
+    OptimizationGpuFields, PipelineTimingCollector, PIPELINE_TIMING_WARMUP_SAMPLES,
     UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE,
 };
 pub use reporting::metrics::{
@@ -82,7 +82,7 @@ pub use reporting::optimization_report::{
     write_optimization_report, OptimizationCommand, OptimizationCompareDecision,
     OptimizationCompareResult, OptimizationEnvironment, OptimizationEvalFrame,
     OptimizationEvaluationMetrics, OptimizationMemoryMetrics, OptimizationMetricDelta,
-    OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics,
+    OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics, PipelineSpanStats,
 };
 
 pub use config::{
