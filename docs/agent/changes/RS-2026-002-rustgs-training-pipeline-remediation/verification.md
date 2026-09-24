@@ -8,7 +8,7 @@
 | Branch | `fix/rs-2026-002-c1-c4-review` |
 | Worktree | `.worktrees/rs-2026-002-c1-c4-review` |
 | Prior tip (CHANGES_REQUESTED) | `1786e6b83ecebb767edf53fcd59df0256730c2e9` |
-| Round-3 code package | filled at commit |
+| Round-3 code package | `4f539d8af475936022c2a930d856a6c2765a4136` |
 
 R06 / R08 / `items_after_test_module` remain closed. C5–C8 not started.
 
