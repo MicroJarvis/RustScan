@@ -210,7 +210,8 @@ never reported as a successful global BA round.
 ## T6 — Add Transactions Around Logical Database Batches
 
 **Status:** review_ready on `agent/RS-2026-004/t6-database-transactions` (base
-`c71f8092778e2abb1feaaf03c9d784ea25434349`).
+`c71f8092778e2abb1feaaf03c9d784ea25434349`) after P2 remediation for
+`review-t6-2026-09-24.md` (CHANGES_REQUESTED). Independent re-review pending.
 
 **Dependencies:** T0  
 **Primary scope:** `rustscan-sfm/src/io/database.rs`,
@@ -223,6 +224,12 @@ never reported as a successful global BA round.
 - [x] Add deterministic mid-batch failure tests for population and merge.
 - [x] Assert pre-existing target rows and counts are unchanged after rollback,
       and successful retry commits exactly once.
+- [x] Preserve original operation/COMMIT errors when SQLite auto-ends a
+      transaction; chain real cleanup failures; restore deletion bookkeeping
+      only when the transaction is known to have ended.
+- [x] Full logical snapshots (row payloads/IDs/refs) with late populate/merge
+      pair-phase failures, retry payload checks, and deletion bookkeeping for
+      initial false/true via reachable business paths.
 
 **Exit condition:** each public logical operation either commits all related
 rows or leaves the target database unchanged.

@@ -1274,6 +1274,87 @@ Known limitations:
 Next action: do not start T7. Do not merge to `main`. Await independent
 review.
 
+### T6 P2 Remediation — 2026-09-24
+
+Status: review_ready. Awaiting independent re-review after
+`review-t6-2026-09-24.md` (CHANGES_REQUESTED).
+
+Owner: `cursor-agent`
+
+Reviewed HEAD before fix: `1f39c4962416b9d506612ab1646a80ddb61a0e1c`
+
+Branch/worktree: unchanged
+(`agent/RS-2026-004/t6-database-transactions`,
+`/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t6-database-transactions`).
+
+Changed files:
+
+- `rustscan-sfm/src/io/database.rs` — preserve original txn errors; full
+  `LogicalDbSnapshot`; late merge failure/retry; auto-rollback / commit /
+  cleanup-failure regressions
+- `rustscan-sfm/src/sfm/mapper.rs` — late populate/pair full-snapshot
+  mid-failure and retry payload checks
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/review-t6-2026-09-24.md`
+  (preserved independent review; not rewritten)
+- this verification record, `tasks.md`, `tasks.yaml`
+
+#### P2#1 — original error preservation
+
+`with_transaction` now finishes failures through `finish_failed_transaction` /
+`try_rollback_transaction`. Inactive-transaction rollback errors
+("cannot rollback - no transaction is active") are treated as successful
+cleanup so the original operation/COMMIT error is kept. Real cleanup failures
+are chained with `context` and do not restore deletion bookkeeping.
+`cfg(test)`-only hooks can force COMMIT/ROLLBACK failure without production
+API changes.
+
+Pre-fix proof (temporary old Err path):
+`with_transaction_preserves_original_error_after_sqlite_auto_rollback` failed
+with only `cannot rollback - no transaction is active` (original
+`t6-original-second-camera-failure` missing). Log:
+`artifacts/runs/rs-2026-004-t6-p2-remediation/pre-fix-auto-rollback-error.log`.
+
+#### P2#2 — full logical rollback / retry evidence
+
+`LogicalDbSnapshot` / `MapperLogicalDbSnapshot` capture cameras, images, rigs,
+frames, priors, keypoints, descriptors, matches, and geometries (IDs, refs,
+payloads). Populate, merge, and pair-geometry mid-failures now trigger after
+pair/relationship writes via SQLite `RAISE(ABORT)` / `RAISE(ROLLBACK)`.
+Retry asserts exact payloads and no duplicate rows. Deletion bookkeeping
+covered for initial false and true on the merge connection via the business
+`delete_matches` path; pair update-then-insert regression retained with retry
+payload checks.
+
+#### Verification
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`,
+`CARGO_TERM_COLOR=never`.
+
+- Pre-fix auto-rollback error regression: FAIL (exit 101) as required.
+- Directed post-fix (9 tests: error preservation, merge mid/retry,
+  populate mid/retry, pair mid/retry, mid-batch delete): PASS.
+- `cargo fmt --all -- --check`: PASS.
+- `cargo check --workspace --all-targets`: PASS.
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: PASS.
+  Lib `867 passed; 0 failed; 19 ignored` (253.05s); remaining targets exit 0.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  FAIL, exit 101. Unmodified `rustscan-slam` blocker:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`. Not a
+  rustscan-sfm lint regression; not recorded as pass.
+- `git diff --check`: PASS.
+
+Logs: `artifacts/runs/rs-2026-004-t6-p2-remediation/` (gitignored local
+evidence; also retain `artifacts/runs/t6-independent-review/`).
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- Ignored tests are not proof of their behavior.
+- T7 not started.
+
+Next action: do not start T7. Do not merge to `main`. Await independent
+re-review of the two P2 fixes.
+
 ### T7 — nalgebra Ownership
 
 Status: pending.

@@ -1027,19 +1027,66 @@ impl ColmapDatabase {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
         match operation() {
             Ok(value) => {
+                #[cfg(test)]
+                if transaction_test_hooks::take_force_commit_failure() {
+                    return Err(self.finish_failed_transaction(
+                        deleted_before,
+                        anyhow::anyhow!("forced COMMIT failure"),
+                    ));
+                }
                 if let Err(commit_error) = self.conn.execute_batch("COMMIT;") {
-                    let _ = self.conn.execute_batch("ROLLBACK;");
-                    self.database_entry_deleted.set(deleted_before);
-                    return Err(commit_error.into());
+                    return Err(self.finish_failed_transaction(
+                        deleted_before,
+                        anyhow::Error::from(commit_error)
+                            .context("commit COLMAP database transaction"),
+                    ));
                 }
                 Ok(value)
             }
-            Err(error) => {
-                let rollback = self.conn.execute_batch("ROLLBACK;");
+            Err(error) => Err(self.finish_failed_transaction(deleted_before, error)),
+        }
+    }
+
+    /// Roll back after a failed operation/COMMIT, preserving the primary error.
+    ///
+    /// SQLite may already have ended the transaction (for example
+    /// `RAISE(ROLLBACK)`). In that case a follow-up `ROLLBACK` reports
+    /// "cannot rollback - no transaction is active"; cleanup is treated as
+    /// successful and the original error is kept. Only a real cleanup failure
+    /// is chained, and deletion bookkeeping is restored only when the
+    /// transaction is known to have ended.
+    fn finish_failed_transaction(
+        &self,
+        deleted_before: bool,
+        primary: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.try_rollback_transaction() {
+            Ok(()) => {
                 self.database_entry_deleted.set(deleted_before);
-                rollback.context("roll back COLMAP database transaction")?;
-                Err(error)
+                primary
             }
+            Err(rollback_error) => {
+                // Transaction may still be open; do not pretend bookkeeping
+                // matches the pre-operation snapshot.
+                primary.context(format!(
+                    "additionally failed to roll back COLMAP database transaction: {rollback_error}"
+                ))
+            }
+        }
+    }
+
+    fn try_rollback_transaction(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(message) = transaction_test_hooks::take_force_rollback_failure() {
+            // Keep the connection usable: perform the real ROLLBACK, then
+            // surface a synthetic cleanup failure for error-chaining tests.
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            bail!("{message}");
+        }
+        match self.conn.execute_batch("ROLLBACK;") {
+            Ok(()) => Ok(()),
+            Err(error) if is_inactive_transaction_error(&error) => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -3482,7 +3529,37 @@ fn invert_matrix3(matrix: [f64; 9]) -> Option<[f64; 9]> {
     ])
 }
 
+fn is_inactive_transaction_error(error: &rusqlite::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("no transaction is active") || message.contains("cannot rollback")
+}
+
 #[cfg(test)]
+mod transaction_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_COMMIT_FAILURE: Cell<bool> = const { Cell::new(false) };
+        static FORCE_ROLLBACK_FAILURE: Cell<Option<String>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn force_commit_failure() {
+        FORCE_COMMIT_FAILURE.with(|cell| cell.set(true));
+    }
+
+    pub(super) fn take_force_commit_failure() -> bool {
+        FORCE_COMMIT_FAILURE.with(|cell| cell.replace(false))
+    }
+
+    pub(super) fn force_rollback_failure(message: impl Into<String>) {
+        FORCE_ROLLBACK_FAILURE.with(|cell| cell.set(Some(message.into())));
+    }
+
+    pub(super) fn take_force_rollback_failure() -> Option<String> {
+        FORCE_ROLLBACK_FAILURE.with(|cell| cell.take())
+    }
+}
+
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -5748,71 +5825,207 @@ mod tests {
             .contains("must not contain images with the same name"));
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Debug, PartialEq)]
     struct LogicalDbSnapshot {
-        num_cameras: usize,
-        num_images: usize,
-        num_rigs: usize,
-        num_frames: usize,
-        num_pose_priors: usize,
-        num_keypoints: usize,
-        num_descriptors: usize,
-        num_matches: usize,
-        num_matched_pairs: usize,
-        num_verified_pairs: usize,
-        camera_ids: Vec<u32>,
-        image_names: Vec<String>,
         deleted: bool,
+        cameras: Vec<ColmapDatabaseCamera>,
+        images: Vec<ColmapDatabaseImage>,
+        rigs: Vec<crate::colmap::ColmapRig>,
+        frames: Vec<ColmapDatabaseFrame>,
+        pose_priors: Vec<ColmapPosePrior>,
+        keypoints: Vec<(ImageId, Vec<ColmapKeypoint>)>,
+        descriptors: Vec<(ImageId, ColmapDescriptors)>,
+        matches: Vec<(crate::correspondence_graph::ImagePairId, Vec<FeatureMatch>)>,
+        geometries: Vec<(
+            crate::correspondence_graph::ImagePairId,
+            ColmapTwoViewGeometry,
+        )>,
     }
 
     impl LogicalDbSnapshot {
         fn capture(db: &ColmapDatabase) -> Self {
-            let mut camera_ids = db
-                .read_all_cameras()
-                .unwrap()
-                .into_iter()
-                .map(|camera| camera.camera.camera_id)
-                .collect::<Vec<_>>();
-            camera_ids.sort_unstable();
-            let mut image_names = db
-                .read_all_images()
-                .unwrap()
-                .into_iter()
-                .map(|image| image.name)
-                .collect::<Vec<_>>();
-            image_names.sort();
+            let mut cameras = db.read_all_cameras().unwrap();
+            cameras.sort_by_key(|camera| camera.camera.camera_id);
+            let mut images = db.read_all_images().unwrap();
+            images.sort_by_key(|image| image.image_id);
+            let mut rigs = db.read_all_rigs().unwrap();
+            rigs.sort_by_key(|rig| rig.rig_id);
+            let mut frames = db.read_all_frames().unwrap();
+            frames.sort_by_key(|frame| frame.frame_id);
+            let mut pose_priors = db.read_all_pose_priors().unwrap();
+            pose_priors.sort_by_key(|prior| prior.pose_prior_id);
+
+            let mut keypoints = Vec::new();
+            let mut descriptors = Vec::new();
+            for image in &images {
+                keypoints.push((image.image_id, db.read_keypoints(image.image_id).unwrap()));
+                descriptors.push((image.image_id, db.read_descriptors(image.image_id).unwrap()));
+            }
+            keypoints.sort_by_key(|(image_id, _)| *image_id);
+            descriptors.sort_by_key(|(image_id, _)| *image_id);
+
+            let mut matches = db.read_all_matches().unwrap();
+            matches.sort_by_key(|(pair_id, _)| *pair_id);
+            let mut geometries = db.read_two_view_geometries().unwrap();
+            geometries.sort_by_key(|(pair_id, _)| *pair_id);
+
             Self {
-                num_cameras: db.num_cameras().unwrap(),
-                num_images: db.num_images().unwrap(),
-                num_rigs: db.num_rigs().unwrap(),
-                num_frames: db.num_frames().unwrap(),
-                num_pose_priors: db.num_pose_priors().unwrap(),
-                num_keypoints: db.num_keypoints().unwrap(),
-                num_descriptors: db.num_descriptors().unwrap(),
-                num_matches: db.num_matches().unwrap(),
-                num_matched_pairs: db.num_matched_image_pairs().unwrap(),
-                num_verified_pairs: db.num_verified_image_pairs().unwrap(),
-                camera_ids,
-                image_names,
                 deleted: db.database_entry_deleted.get(),
+                cameras,
+                images,
+                rigs,
+                frames,
+                pose_priors,
+                keypoints,
+                descriptors,
+                matches,
+                geometries,
             }
         }
     }
 
+    fn error_chain_string(error: &anyhow::Error) -> String {
+        format!("{error:#}")
+    }
+
     #[test]
-    fn database_merge_mid_failure_leaves_preexisting_target_unchanged() {
+    fn with_transaction_preserves_original_error_after_sqlite_auto_rollback() {
+        use rusqlite::Connection;
+
         let dir = tempdir().unwrap();
         let db1 = ColmapDatabase::open(dir.path().join("database1.db")).unwrap();
         let db2 = ColmapDatabase::open(dir.path().join("database2.db")).unwrap();
-        let merged = ColmapDatabase::open(dir.path().join("merged.db")).unwrap();
+        let merged_path = dir.path().join("merged.db");
+        let merged = ColmapDatabase::open(&merged_path).unwrap();
 
-        // Distinctive pre-existing target payload that must survive rollback.
+        write_test_camera(&db1, 1);
+        write_test_camera(&db1, 2);
+        // empty db2 is fine; merge still processes db1 under one target txn
+
+        {
+            let trigger = Connection::open(&merged_path).unwrap();
+            trigger
+                .execute_batch(
+                    "CREATE TRIGGER fail_second_camera_auto_rollback
+                     BEFORE INSERT ON cameras
+                     WHEN (SELECT COUNT(*) FROM cameras) >= 1
+                     BEGIN
+                         SELECT RAISE(ROLLBACK, 't6-original-second-camera-failure');
+                     END;",
+                )
+                .unwrap();
+        }
+
+        let before = LogicalDbSnapshot::capture(&merged);
+        let err = ColmapDatabase::merge(&db1, &db2, &merged).unwrap_err();
+        let chain = error_chain_string(&err);
+        assert!(
+            chain.contains("t6-original-second-camera-failure"),
+            "original write error must survive auto-rollback cleanup: {chain}"
+        );
+        assert!(
+            !chain.to_lowercase().contains("no transaction is active")
+                || chain.contains("t6-original-second-camera-failure"),
+            "cleanup must not replace the original error: {chain}"
+        );
+        assert_eq!(LogicalDbSnapshot::capture(&merged), before);
+
+        // Connection remains usable after successful cleanup.
+        write_test_camera(&merged, 50);
+        assert!(merged.exists_camera(50).unwrap());
+        assert_eq!(merged.num_cameras().unwrap(), 1);
+    }
+
+    #[test]
+    fn with_transaction_preserves_commit_failure_and_allows_reuse() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        write_test_camera(&db, 1);
+        write_test_images(&db, 1, &[1, 2]);
+        let original = vec![m(0, 1)];
+        db.write_matches(1, 2, &original).unwrap();
+        let before = LogicalDbSnapshot::capture(&db);
+
+        transaction_test_hooks::force_commit_failure();
+        let err = db
+            .with_transaction(|| {
+                db.clear_matches()?;
+                db.write_matches(1, 2, &[m(9, 9)])?;
+                Ok(())
+            })
+            .unwrap_err();
+        let chain = error_chain_string(&err);
+        assert!(
+            chain.contains("forced COMMIT failure"),
+            "commit failure must be preserved: {chain}"
+        );
+        assert_eq!(LogicalDbSnapshot::capture(&db), before);
+        assert!(!db.database_entry_deleted.get());
+
+        // Connection remains usable after successful cleanup of a failed COMMIT.
+        db.delete_matches(1, 2).unwrap();
+        db.write_matches(1, 2, &[m(3, 4)]).unwrap();
+        assert_eq!(db.read_matches(1, 2).unwrap(), vec![m(3, 4)]);
+    }
+
+    #[test]
+    fn with_transaction_chains_cleanup_failure_without_restoring_bookkeeping() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        write_test_camera(&db, 1);
+        write_test_images(&db, 1, &[1, 2]);
+        db.write_matches(1, 2, &[m(0, 1)]).unwrap();
+        db.delete_matches(1, 2).unwrap();
+        assert!(db.database_entry_deleted.get());
+
+        transaction_test_hooks::force_rollback_failure("forced ROLLBACK failure");
+        let err = db
+            .with_transaction(|| -> Result<()> {
+                db.write_matches(1, 2, &[m(5, 6)])?;
+                bail!("t6-original-operation-failure")
+            })
+            .unwrap_err();
+        let chain = error_chain_string(&err);
+        assert!(
+            chain.contains("t6-original-operation-failure"),
+            "original error must remain: {chain}"
+        );
+        assert!(
+            chain.contains("forced ROLLBACK failure"),
+            "cleanup failure must be chained: {chain}"
+        );
+        // Cleanup reported failure: do not pretend pre-op bookkeeping was restored.
+        assert!(db.database_entry_deleted.get());
+    }
+
+    #[test]
+    fn database_merge_mid_failure_leaves_preexisting_target_unchanged() {
+        use rusqlite::Connection;
+
+        let dir = tempdir().unwrap();
+        let db1 = ColmapDatabase::open(dir.path().join("database1.db")).unwrap();
+        let db2 = ColmapDatabase::open(dir.path().join("database2.db")).unwrap();
+        let merged_path = dir.path().join("merged.db");
+        let merged = ColmapDatabase::open(&merged_path).unwrap();
+
+        // Distinctive pre-existing target payload across relationship tables.
         write_test_camera(&merged, 99);
         merged
             .write_image(
                 &ColmapDatabaseImage {
                     image_id: 9001,
-                    name: "preexisting-target.jpg".to_string(),
+                    name: "preexisting-left.jpg".to_string(),
+                    camera_id: 99,
+                    frame_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        merged
+            .write_image(
+                &ColmapDatabaseImage {
+                    image_id: 9002,
+                    name: "preexisting-right.jpg".to_string(),
                     camera_id: 99,
                     frame_id: None,
                 },
@@ -5822,16 +6035,72 @@ mod tests {
         merged
             .write_keypoints(9001, &[ColmapKeypoint::new(42.0, 24.0)])
             .unwrap();
+        merged
+            .write_keypoints(9002, &[ColmapKeypoint::new(11.0, 12.0)])
+            .unwrap();
+        merged
+            .write_descriptors(
+                9001,
+                &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![9, 8]).unwrap(),
+            )
+            .unwrap();
+        merged.write_matches(9001, 9002, &[m(0, 0)]).unwrap();
+        merged
+            .write_two_view_geometry(
+                9001,
+                9002,
+                &ColmapTwoViewGeometry {
+                    config: 2,
+                    inlier_matches: vec![m(0, 0)],
+                    qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                    tvec: Some([0.0, 0.0, 1.0]),
+                    ..ColmapTwoViewGeometry::default()
+                },
+            )
+            .unwrap();
+        // Business deletion path: mark bookkeeping true before the merge txn.
+        merged.delete_matches(9001, 9002).unwrap();
+        merged.write_matches(9001, 9002, &[m(0, 0)]).unwrap();
+        assert!(merged.database_entry_deleted.get());
         let before = LogicalDbSnapshot::capture(&merged);
-        let preexisting_keypoints = merged.read_keypoints(9001).unwrap();
 
         write_test_camera(&db1, 1);
-        write_test_camera(&db2, 1);
+        write_test_camera(&db2, 2);
         db1.write_image(
             &ColmapDatabaseImage {
                 image_id: 1,
-                name: "shared.jpg".to_string(),
+                name: "a-left.jpg".to_string(),
                 camera_id: 1,
+                frame_id: None,
+            },
+            true,
+        )
+        .unwrap();
+        db1.write_image(
+            &ColmapDatabaseImage {
+                image_id: 2,
+                name: "a-right.jpg".to_string(),
+                camera_id: 1,
+                frame_id: None,
+            },
+            true,
+        )
+        .unwrap();
+        db2.write_image(
+            &ColmapDatabaseImage {
+                image_id: 3,
+                name: "b-left.jpg".to_string(),
+                camera_id: 2,
+                frame_id: None,
+            },
+            true,
+        )
+        .unwrap();
+        db2.write_image(
+            &ColmapDatabaseImage {
+                image_id: 4,
+                name: "b-right.jpg".to_string(),
+                camera_id: 2,
                 frame_id: None,
             },
             true,
@@ -5839,26 +6108,57 @@ mod tests {
         .unwrap();
         db1.write_keypoints(1, &[ColmapKeypoint::new(1.0, 2.0)])
             .unwrap();
-        db2.write_image(
-            &ColmapDatabaseImage {
-                image_id: 2,
-                name: "shared.jpg".to_string(),
-                camera_id: 1,
-                frame_id: None,
+        db1.write_keypoints(2, &[ColmapKeypoint::new(3.0, 4.0)])
+            .unwrap();
+        db2.write_keypoints(3, &[ColmapKeypoint::new(5.0, 6.0)])
+            .unwrap();
+        db2.write_keypoints(4, &[ColmapKeypoint::new(7.0, 8.0)])
+            .unwrap();
+        db1.write_matches(1, 2, &[m(0, 0)]).unwrap();
+        db2.write_matches(3, 4, &[m(0, 0)]).unwrap();
+        db1.write_two_view_geometry(
+            1,
+            2,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(0, 0)],
+                ..ColmapTwoViewGeometry::default()
             },
-            true,
+        )
+        .unwrap();
+        db2.write_two_view_geometry(
+            3,
+            4,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(0, 0)],
+                ..ColmapTwoViewGeometry::default()
+            },
         )
         .unwrap();
 
-        // Duplicate name fails after db1 side has already been written without a txn.
-        let err = ColmapDatabase::merge(&db1, &db2, &merged).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("must not contain images with the same name"));
+        // Fail after db1 geometries (and earlier relationship rows) are written.
+        {
+            let trigger = Connection::open(&merged_path).unwrap();
+            trigger
+                .execute_batch(
+                    "CREATE TRIGGER fail_late_merge_geometry
+                     BEFORE INSERT ON two_view_geometries
+                     WHEN (SELECT COUNT(*) FROM two_view_geometries) >= 2
+                     BEGIN
+                         SELECT RAISE(ABORT, 'late merge geometry write failed');
+                     END;",
+                )
+                .unwrap();
+        }
 
+        let err = ColmapDatabase::merge(&db1, &db2, &merged).unwrap_err();
+        assert!(
+            error_chain_string(&err).contains("late merge geometry write failed"),
+            "{err:#}"
+        );
         assert_eq!(LogicalDbSnapshot::capture(&merged), before);
-        assert_eq!(merged.read_keypoints(9001).unwrap(), preexisting_keypoints);
-        assert!(!merged.exists_image_with_name("shared.jpg").unwrap());
+        assert!(merged.database_entry_deleted.get());
     }
 
     #[test]
@@ -5883,7 +6183,39 @@ mod tests {
                 true,
             )
             .unwrap();
+        merged
+            .write_keypoints(9001, &[ColmapKeypoint::new(42.0, 24.0)])
+            .unwrap();
+        merged
+            .write_image(
+                &ColmapDatabaseImage {
+                    image_id: 9002,
+                    name: "preexisting-right.jpg".to_string(),
+                    camera_id: 99,
+                    frame_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        merged
+            .write_keypoints(9002, &[ColmapKeypoint::new(1.0, 1.0)])
+            .unwrap();
+        merged.write_matches(9001, 9002, &[m(0, 0)]).unwrap();
+        merged
+            .write_two_view_geometry(
+                9001,
+                9002,
+                &ColmapTwoViewGeometry {
+                    config: 2,
+                    inlier_matches: vec![m(0, 0)],
+                    qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                    tvec: Some([0.0, 0.0, 2.0]),
+                    ..ColmapTwoViewGeometry::default()
+                },
+            )
+            .unwrap();
         let before = LogicalDbSnapshot::capture(&merged);
+        assert!(!merged.database_entry_deleted.get());
 
         write_test_camera(&db1, 11);
         write_test_camera(&db2, 22);
@@ -5891,6 +6223,16 @@ mod tests {
             &ColmapDatabaseImage {
                 image_id: 101,
                 name: "a.jpg".to_string(),
+                camera_id: 11,
+                frame_id: None,
+            },
+            true,
+        )
+        .unwrap();
+        db1.write_image(
+            &ColmapDatabaseImage {
+                image_id: 102,
+                name: "a2.jpg".to_string(),
                 camera_id: 11,
                 frame_id: None,
             },
@@ -5907,60 +6249,129 @@ mod tests {
             true,
         )
         .unwrap();
+        db2.write_image(
+            &ColmapDatabaseImage {
+                image_id: 202,
+                name: "b2.jpg".to_string(),
+                camera_id: 22,
+                frame_id: None,
+            },
+            true,
+        )
+        .unwrap();
         db1.write_keypoints(101, &[ColmapKeypoint::new(1.0, 2.0)])
             .unwrap();
-        db2.write_keypoints(201, &[ColmapKeypoint::new(3.0, 4.0)])
+        db1.write_keypoints(102, &[ColmapKeypoint::new(3.0, 4.0)])
             .unwrap();
+        db2.write_keypoints(201, &[ColmapKeypoint::new(5.0, 6.0)])
+            .unwrap();
+        db2.write_keypoints(202, &[ColmapKeypoint::new(7.0, 8.0)])
+            .unwrap();
+        db1.write_matches(101, 102, &[m(0, 0)]).unwrap();
+        db2.write_matches(201, 202, &[m(0, 0)]).unwrap();
+        db1.write_two_view_geometry(
+            101,
+            102,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(0, 0)],
+                qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                tvec: Some([1.0, 0.0, 0.0]),
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
+        db2.write_two_view_geometry(
+            201,
+            202,
+            &ColmapTwoViewGeometry {
+                config: 2,
+                inlier_matches: vec![m(0, 0)],
+                qvec: Some([1.0, 0.0, 0.0, 0.0]),
+                tvec: Some([0.0, 1.0, 0.0]),
+                ..ColmapTwoViewGeometry::default()
+            },
+        )
+        .unwrap();
 
-        // Fail after db1 cameras/images are written: abort when inserting db2's camera.
         {
             let trigger = Connection::open(&merged_path).unwrap();
             trigger
                 .execute_batch(
-                    "CREATE TRIGGER fail_second_source_camera
-                     BEFORE INSERT ON cameras
-                     WHEN (SELECT COUNT(*) FROM cameras) >= 2
+                    "CREATE TRIGGER fail_late_merge_geometry
+                     BEFORE INSERT ON two_view_geometries
+                     WHEN (SELECT COUNT(*) FROM two_view_geometries) >= 2
                      BEGIN
-                         SELECT RAISE(ABORT, 'second source camera write failed');
+                         SELECT RAISE(ABORT, 'late merge geometry write failed');
                      END;",
                 )
                 .unwrap();
         }
 
         let err = ColmapDatabase::merge(&db1, &db2, &merged).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("second source camera write failed"));
+        assert!(error_chain_string(&err).contains("late merge geometry write failed"));
         assert_eq!(LogicalDbSnapshot::capture(&merged), before);
 
         {
             let trigger = Connection::open(&merged_path).unwrap();
             trigger
-                .execute_batch("DROP TRIGGER fail_second_source_camera;")
+                .execute_batch("DROP TRIGGER fail_late_merge_geometry;")
                 .unwrap();
         }
 
         ColmapDatabase::merge(&db1, &db2, &merged).unwrap();
-        assert_eq!(merged.num_cameras().unwrap(), 3);
-        assert_eq!(merged.num_images().unwrap(), 3);
-        assert!(merged
-            .exists_image_with_name("preexisting-target.jpg")
-            .unwrap());
-        assert!(merged.exists_image_with_name("a.jpg").unwrap());
-        assert!(merged.exists_image_with_name("b.jpg").unwrap());
-        // Exactly one successful merge: no duplicate names or extra rows.
+        let after = LogicalDbSnapshot::capture(&merged);
+        assert_eq!(after.cameras.len(), 3);
+        assert_eq!(after.images.len(), 6);
+        assert_eq!(after.matches.len(), 3);
+        assert_eq!(after.geometries.len(), 3);
+        let names = after
+            .images
+            .iter()
+            .map(|image| image.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            merged
-                .read_all_images()
-                .unwrap()
-                .into_iter()
-                .map(|image| image.name)
-                .collect::<std::collections::BTreeSet<_>>(),
-            ["a.jpg", "b.jpg", "preexisting-target.jpg"]
-                .into_iter()
-                .map(str::to_string)
-                .collect()
+            names,
+            [
+                "a.jpg",
+                "a2.jpg",
+                "b.jpg",
+                "b2.jpg",
+                "preexisting-right.jpg",
+                "preexisting-target.jpg",
+            ]
+            .into_iter()
+            .collect()
         );
+        // Preexisting relationship payloads retained exactly once.
+        assert!(after.keypoints.iter().any(|(id, points)| {
+            *id == 9001 && points == &vec![ColmapKeypoint::new(42.0, 24.0)]
+        }));
+        assert!(after
+            .matches
+            .iter()
+            .any(|(_, matches)| matches == &vec![m(0, 0)]));
+        assert!(after.geometries.iter().any(|(_, geometry)| {
+            geometry.tvec == Some([0.0, 0.0, 2.0]) && geometry.inlier_matches == vec![m(0, 0)]
+        }));
+        assert!(after
+            .geometries
+            .iter()
+            .any(|(_, geometry)| { geometry.tvec == Some([1.0, 0.0, 0.0]) }));
+        assert!(after
+            .geometries
+            .iter()
+            .any(|(_, geometry)| { geometry.tvec == Some([0.0, 1.0, 0.0]) }));
+        assert!(!after.deleted);
+        // Second merge of the same sources must fail or no-op cleanly without duplicates.
+        // Sources keep original IDs; merge remaps — calling again would duplicate names.
+        // Assert no residual duplicate camera model IDs beyond the three expected.
+        let camera_ids = after
+            .cameras
+            .iter()
+            .map(|camera| camera.camera.camera_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(camera_ids.len(), 3);
     }
 
     #[test]

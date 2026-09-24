@@ -129,4 +129,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T6 database transaction atomicity is review_ready on agent/RS-2026-004/t6-database-transactions. Do not start T7. Do not merge to main. Await independent review."
+next_action: "T6 P2 remediation is review_ready on agent/RS-2026-004/t6-database-transactions. Do not start T7. Do not merge to main. Await independent re-review."
