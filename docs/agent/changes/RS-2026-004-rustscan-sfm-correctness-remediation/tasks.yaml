@@ -109,7 +109,7 @@ later_tasks:
     scope: rustscan-sfm/src/ba, rustscan-sfm/src/sfm/mapper/bundle_adjustment.rs, and rustscan-sfm/src/sfm/global_mapper.rs
     status: review_ready
     base_commit: 701d051814a29ab3ee4fbefc01355112f71b5a47
-    tip_commit: f8ca3f9e84459286666dd4233141a3363b4296d5
+    tip_commit: d6287d8bafa6045de9d187a07a41f7e75ba66f9b
   - id: T6
     owner: cursor-agent
     branch: agent/RS-2026-004/t6-database-transactions
