@@ -229,9 +229,16 @@ fn hash_training_dataset(dataset: &TrainingDataset) -> Result<String, TrainingEr
 }
 
 fn hash_training_config(config: &TrainingConfig) -> Result<String, TrainingError> {
-    let mut resume_compatible_config = config.clone();
-    resume_compatible_config.iterations = 0;
-    let bytes = serde_json::to_vec(&resume_compatible_config)
+    // Continuity fingerprint excludes iterations (resume may raise the target)
+    // and measurement-only profiler settings so old checkpoints and profiler
+    // toggles remain compatible. Real optimizer/loss/topology changes still hash.
+    let mut resume_compatible = serde_json::to_value(config)
+        .map_err(|error| TrainingError::InvalidInput(error.to_string()))?;
+    if let Some(object) = resume_compatible.as_object_mut() {
+        object.insert("iterations".to_string(), serde_json::json!(0));
+        object.remove("profiler");
+    }
+    let bytes = serde_json::to_vec(&resume_compatible)
         .map_err(|error| TrainingError::InvalidInput(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
@@ -933,6 +940,49 @@ fn checkpoint_bincode_options() -> impl Options {
         .with_fixint_encoding()
         .with_limit(MAX_TRAINING_CHECKPOINT_BYTES - TRAINING_CHECKPOINT_ENVELOPE_BYTES)
         .reject_trailing_bytes()
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::hash_training_config;
+    use crate::TrainingConfig;
+
+    #[test]
+    fn continuity_fingerprint_ignores_profiler_and_matches_legacy_bytes() {
+        let baseline = TrainingConfig::default();
+        let mut toggled = baseline.clone();
+        toggled.profiler.enabled = false;
+        toggled.profiler.gpu_timing_enabled = true;
+        toggled.profiler.gpu_sample_every = 99;
+        assert_eq!(
+            hash_training_config(&baseline).expect("baseline hash"),
+            hash_training_config(&toggled).expect("profiler toggle hash"),
+            "profiler-only changes must not break resume identity"
+        );
+
+        let mut legacy_value =
+            serde_json::to_value(&baseline).expect("serialize baseline for legacy hash");
+        let object = legacy_value
+            .as_object_mut()
+            .expect("training config JSON object");
+        object.insert("iterations".to_string(), serde_json::json!(0));
+        object.remove("profiler");
+        let legacy_bytes = serde_json::to_vec(&legacy_value).expect("legacy bytes");
+        let legacy_hash = blake3::hash(&legacy_bytes).to_hex().to_string();
+        assert_eq!(
+            hash_training_config(&baseline).expect("baseline hash"),
+            legacy_hash,
+            "new hash must match pre-profiler canonical bytes"
+        );
+
+        let mut changed_loss = baseline.clone();
+        changed_loss.loss.loss_l1_weight *= 2.0;
+        assert_ne!(
+            hash_training_config(&baseline).expect("baseline hash"),
+            hash_training_config(&changed_loss).expect("loss hash"),
+            "real training parameter changes must still mismatch"
+        );
+    }
 }
 
 fn encode_checkpoint_error(error: bincode::ErrorKind) -> TrainingError {

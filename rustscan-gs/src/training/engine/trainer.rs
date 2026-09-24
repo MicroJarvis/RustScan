@@ -1407,6 +1407,9 @@ impl WgpuTrainer {
             let step_started_at = Instant::now();
             let should_log_step = iteration_idx.is_multiple_of(100)
                 || (start_iteration > 0 && zero_based == start_iteration);
+            // Snapshot cadence is a confirmation safety point so the exported
+            // model matches the labeled iteration (exact cadence, no coalescing).
+            let snapshot_due = observer.should_emit_snapshot(iteration_idx);
             let checkpoint_due = observer.checkpoint_reason(iteration_idx).is_some();
             let read_loss = should_read_loss(
                 iteration_idx,
@@ -1414,7 +1417,8 @@ impl WgpuTrainer {
                 LOSS_SCALAR_READBACK_INTERVAL,
                 checkpoint_due,
                 observer.should_pause(),
-            ) || should_log_step;
+            ) || should_log_step
+                || snapshot_due;
             let disposition = match self
                 .train_step_disposition(
                     splats,
@@ -1491,17 +1495,15 @@ impl WgpuTrainer {
             if report.cancelled {
                 break;
             }
-            if newly_confirmed
-                .iter()
-                .any(|c| observer.should_emit_snapshot(*c))
+            // Exact snapshot cadence: only emit when this step's model matches the
+            // labeled iteration (forced confirm above when snapshot_due).
+            if snapshot_due
+                && newly_confirmed
+                    .iter()
+                    .any(|c| *c == iteration_idx && observer.should_emit_snapshot(*c))
             {
                 let host = device_splats_to_host(splats).await;
-                let snap_iter = *newly_confirmed
-                    .iter()
-                    .rev()
-                    .find(|c| observer.should_emit_snapshot(**c))
-                    .unwrap_or(&iteration_idx);
-                observer.on_snapshot(metrics_for(snap_iter), host);
+                observer.on_snapshot(metrics_for(iteration_idx), host);
             }
             if should_log_step && commit_state.last_confirmed >= iteration_idx {
                 log::info!(
@@ -1513,13 +1515,40 @@ impl WgpuTrainer {
             }
 
             if let Some(reason) = observer.checkpoint_reason(iteration_idx) {
-                // Checkpoint is a safety point; only write after confirmation.
+                // Pause/cancel/periodic may arrive after an unread submit. This is a
+                // new safety point: sync device status, confirm commits, then write.
                 if commit_state.last_confirmed < iteration_idx {
-                    self.finish_report(&mut report);
-                    return Err(TrainingError::TrainingFailed(format!(
-                        "checkpoint at iteration {iteration_idx} requested before commit confirmation (confirmed={})",
-                        commit_state.last_confirmed
-                    )));
+                    match self
+                        .ensure_device_status_healthy(Self::checkpoint_status_reason(reason))
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = self.confirm_commits_from_host_mirror(
+                                &mut commit_state,
+                                &mut report,
+                                splats.num_splats(),
+                                Some(last_sampled_loss),
+                            );
+                        }
+                        Err(error) => {
+                            self.finish_report(&mut report);
+                            return Err(error);
+                        }
+                    }
+                }
+                if commit_state.last_confirmed < iteration_idx {
+                    // Device did not commit this submit; pause/cancel still checkpoint
+                    // the last confirmed state rather than failing the run.
+                    if !matches!(
+                        reason,
+                        TrainingCheckpointReason::Pause | TrainingCheckpointReason::Shutdown
+                    ) {
+                        self.finish_report(&mut report);
+                        return Err(TrainingError::TrainingFailed(format!(
+                            "checkpoint at iteration {iteration_idx} requested before commit confirmation (confirmed={})",
+                            commit_state.last_confirmed
+                        )));
+                    }
                 }
                 let identity = observer.checkpoint_identity().cloned().ok_or_else(|| {
                     TrainingError::InvalidInput(
@@ -3070,6 +3099,7 @@ mod tests {
                 break;
             }
             let iteration_idx = zero_based + 1;
+            let snapshot_due = observer.should_emit_snapshot(iteration_idx);
             let checkpoint_due = observer.checkpoint_reason(iteration_idx).is_some();
             let read_loss = should_read_loss(
                 iteration_idx,
@@ -3077,7 +3107,7 @@ mod tests {
                 LOSS_SCALAR_READBACK_INTERVAL,
                 checkpoint_due,
                 observer.should_pause(),
-            );
+            ) || snapshot_due;
             let disposition = match trainer
                 .train_step_disposition(
                     splats,
@@ -3143,20 +3173,43 @@ mod tests {
             if report.cancelled {
                 break;
             }
-            if newly_confirmed
-                .iter()
-                .any(|c| observer.should_emit_snapshot(*c))
+            if snapshot_due
+                && newly_confirmed
+                    .iter()
+                    .any(|c| *c == iteration_idx && observer.should_emit_snapshot(*c))
             {
                 let host = device_splats_to_host(splats).await;
-                let snap_iter = *newly_confirmed
-                    .iter()
-                    .rev()
-                    .find(|c| observer.should_emit_snapshot(**c))
-                    .unwrap_or(&iteration_idx);
-                observer.on_snapshot(metrics_for(snap_iter), host);
+                observer.on_snapshot(metrics_for(iteration_idx), host);
             }
             if let Some(reason) = observer.checkpoint_reason(iteration_idx) {
                 if commit_state.last_confirmed < iteration_idx {
+                    match trainer
+                        .ensure_device_status_healthy(WgpuTrainer::checkpoint_status_reason(reason))
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = trainer.confirm_commits_from_host_mirror(
+                                &mut commit_state,
+                                &mut report,
+                                splats.num_splats(),
+                                Some(last_sampled_loss),
+                            );
+                        }
+                        Err(error) => {
+                            trainer.finish_report(&mut report);
+                            return Err(SyntheticOuterLoopAbort {
+                                error,
+                                report: Box::new(report),
+                            });
+                        }
+                    }
+                }
+                if commit_state.last_confirmed < iteration_idx
+                    && !matches!(
+                        reason,
+                        TrainingCheckpointReason::Pause | TrainingCheckpointReason::Shutdown
+                    )
+                {
                     trainer.finish_report(&mut report);
                     return Err(SyntheticOuterLoopAbort {
                         error: TrainingError::TrainingFailed(format!(
@@ -3252,9 +3305,13 @@ mod tests {
         checkpoint_iters: Vec<usize>,
         cancel_after: Option<usize>,
         pause_at: Option<usize>,
+        /// Pause checkpoint after an unread submit without forcing pre-step read_loss.
+        late_pause_checkpoint: Option<usize>,
         checkpoint_every: Option<usize>,
+        snapshot_every: Option<usize>,
         identity: TrainingIdentity,
         last_checkpoint: Option<TrainingCheckpoint>,
+        last_snapshot_splats: Option<HostSplats>,
     }
 
     impl OuterLoopProbeObserver {
@@ -3265,9 +3322,12 @@ mod tests {
                 checkpoint_iters: Vec::new(),
                 cancel_after: None,
                 pause_at: None,
+                late_pause_checkpoint: None,
                 checkpoint_every: None,
+                snapshot_every: None,
                 identity: trainer_checkpoint_identity(),
                 last_checkpoint: None,
+                last_snapshot_splats: None,
             }
         }
     }
@@ -3288,13 +3348,19 @@ mod tests {
         }
 
         fn should_emit_snapshot(&self, iteration: usize) -> bool {
-            iteration == 1
-                || self
-                    .checkpoint_every
-                    .is_some_and(|every| iteration.is_multiple_of(every))
+            self.snapshot_every
+                .is_some_and(|every| every > 0 && iteration.is_multiple_of(every))
+                || (self.snapshot_every.is_none()
+                    && (iteration == 1
+                        || self
+                            .checkpoint_every
+                            .is_some_and(|every| iteration.is_multiple_of(every))))
         }
 
         fn checkpoint_reason(&self, iteration: usize) -> Option<TrainingCheckpointReason> {
+            if self.late_pause_checkpoint == Some(iteration) {
+                return Some(TrainingCheckpointReason::Pause);
+            }
             if self.pause_at == Some(iteration) {
                 return Some(TrainingCheckpointReason::Pause);
             }
@@ -3313,8 +3379,9 @@ mod tests {
             self.progress_iters.push(metrics.iteration);
         }
 
-        fn on_snapshot(&mut self, metrics: TrainingIterationMetrics, _splats: HostSplats) {
+        fn on_snapshot(&mut self, metrics: TrainingIterationMetrics, splats: HostSplats) {
             self.snapshot_iters.push(metrics.iteration);
+            self.last_snapshot_splats = Some(splats);
         }
 
         fn on_checkpoint(&mut self, ready: TrainingCheckpointReady) -> Result<(), TrainingError> {
@@ -3619,6 +3686,83 @@ mod tests {
             .expect("pause must emit checkpoint");
         assert_eq!(checkpoint.completed_iterations, 2);
         assert_eq!(observer.progress_iters, vec![1, 2]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_late_pause_syncs_unread_submit_before_checkpoint() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        let (_temp, mut loader, cameras, order) = production_outer_loop_fixture(&config);
+        let mut observer = OuterLoopProbeObserver::new();
+        // Deterministic R01: pause checkpoint appears after an unread submit without
+        // forcing pre-step read_loss (should_pause stays false).
+        observer.late_pause_checkpoint = Some(2);
+        let paused = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                0,
+                5,
+                &mut observer,
+            )
+            .await
+            .expect("late pause must sync then checkpoint, not fail");
+        assert_eq!(paused.disposition, TrainingRunDisposition::Paused);
+        assert_eq!(paused.completed_iterations, 2);
+        assert_eq!(observer.checkpoint_iters, vec![2]);
+        let checkpoint = observer.last_checkpoint.expect("pause checkpoint");
+        assert_eq!(checkpoint.completed_iterations, 2);
+        assert_eq!(
+            trainer
+                .device_status
+                .host_snapshot()
+                .committed_optimizer_steps,
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_exact_snapshot_cadence_matches_model_iteration() {
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 20;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        let (_temp, mut loader, cameras, order) = production_outer_loop_fixture(&config);
+        let mut observer = OuterLoopProbeObserver::new();
+        // Not a divisor of loss cadence (20): forces snapshot safety-point reads.
+        observer.snapshot_every = Some(7);
+        let report = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                0,
+                20,
+                &mut observer,
+            )
+            .await
+            .expect("exact snapshot cadence");
+        assert_eq!(report.completed_iterations, 20);
+        assert_eq!(observer.snapshot_iters, vec![7, 14]);
+        let snap14 = observer
+            .last_snapshot_splats
+            .expect("snapshot at 14 captured");
+        let final_host = device_splats_to_host(&splats).await;
+        assert_ne!(
+            snap14.as_view().positions,
+            final_host.as_view().positions,
+            "iteration-14 snapshot must not equal the final iteration-20 model"
+        );
     }
 
     fn production_outer_loop_fixture(

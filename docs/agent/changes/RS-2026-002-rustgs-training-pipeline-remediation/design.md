@@ -41,3 +41,20 @@ per-step unread-loss status readback.
 Telemetry still exports `status_readbacks_step_disposition` so totals remain
 recomputable from reason fields. Under this contract the counter stays at zero:
 healthy unread steps never perform a disposition status read.
+
+**Late pause/cancel (R01):** If pause or shutdown is requested after an unread
+submit, the boundary is a new safety point: sync device status, confirm word4,
+then write the checkpoint at the confirmed iteration. Do not fail with
+“before commit confirmation” when the device has (or has not) committed — for
+pause/shutdown, checkpoint the last confirmed state; device sticky errors still
+block the checkpoint write.
+
+**Exact snapshot cadence (R03):** `snapshot_every` iterations are confirmation
+safety points. Snapshots are captured only when the just-confirmed iteration
+equals the labeled cadence point, so the exported model matches the iteration
+number (no coalesced historical labels on a later model).
+
+**Config continuity fingerprint (R02):** Resume identity hashes training
+continuity fields only. `iterations` is zeroed and nested `profiler` is omitted
+so legacy checkpoints and profiler-only toggles remain restorable; optimizer /
+loss / topology / data / raster / litegs changes still mismatch.
