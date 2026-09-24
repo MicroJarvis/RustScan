@@ -2242,6 +2242,8 @@ fn maybe_write_optimization_report(
             status_readbacks_training_end: telemetry.and_then(|t| t.status_readbacks_training_end),
             status_readbacks_forward_abort: telemetry
                 .and_then(|t| t.status_readbacks_forward_abort),
+            status_readbacks_step_disposition: telemetry
+                .and_then(|t| t.status_readbacks_step_disposition),
             gpu_gate_optimizer_skips: telemetry.and_then(|t| t.gpu_gate_optimizer_skips),
             gpu_gate_backward_skips: telemetry.and_then(|t| t.gpu_gate_backward_skips),
             gpu_gate_topology_skips: telemetry.and_then(|t| t.gpu_gate_topology_skips),

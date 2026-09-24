@@ -58,9 +58,6 @@ pub(crate) enum StatusReadbackReason {
     /// Diagnostic read after the device gate already marked the step unhealthy.
     /// Never used on healthy steps.
     ForwardAbort,
-    /// Confirm committed vs aborted when loss scalar readback is skipped.
-    /// Required so read_loss=false cannot hide sticky overflow / non-finite.
-    StepDisposition,
 }
 
 /// Result of one logical training step after device work finishes.
@@ -70,8 +67,52 @@ pub(crate) enum StatusReadbackReason {
 #[derive(Debug)]
 #[must_use]
 pub(crate) enum TrainStepDisposition {
-    Committed { loss: Option<f32> },
+    /// Safety-point path already synced device status; host may confirm commits.
+    ConfirmedCommitted { loss: Option<f32> },
+    /// Unread-loss step submitted without a status read; not yet a confirmed commit.
+    SubmittedUnconfirmed,
     Aborted { error: TrainingError },
+}
+
+/// Tracks submitted vs device-confirmed optimizer commits for the outer loop.
+#[derive(Debug, Clone, Copy)]
+struct CommitConfirmationState {
+    start_iteration: usize,
+    /// Device `committed_optimizer_steps` at loop entry (absolute).
+    committed_baseline: usize,
+    /// Highest logical iteration index that was submitted (pending or confirmed).
+    highest_submitted: usize,
+    /// Last confirmed `completed_iterations`.
+    last_confirmed: usize,
+}
+
+impl CommitConfirmationState {
+    fn new(start_iteration: usize, committed_baseline: usize) -> Self {
+        Self {
+            start_iteration,
+            committed_baseline,
+            highest_submitted: start_iteration,
+            last_confirmed: start_iteration,
+        }
+    }
+
+    fn note_submitted(&mut self, iteration: usize) {
+        self.highest_submitted = self.highest_submitted.max(iteration);
+    }
+
+    /// Apply device word-4 commits. Returns newly confirmed iteration indices.
+    fn apply_device_committed(&mut self, device_committed: usize) -> Vec<usize> {
+        let confirmed = self
+            .start_iteration
+            .saturating_add(device_committed.saturating_sub(self.committed_baseline))
+            .min(self.highest_submitted);
+        if confirmed <= self.last_confirmed {
+            return Vec::new();
+        }
+        let newly: Vec<usize> = ((self.last_confirmed + 1)..=confirmed).collect();
+        self.last_confirmed = confirmed;
+        newly
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -356,10 +397,6 @@ impl OptimizationTimingSamples {
             StatusReadbackReason::ForwardAbort => {
                 self.status_readbacks_forward_abort =
                     self.status_readbacks_forward_abort.saturating_add(1);
-            }
-            StatusReadbackReason::StepDisposition => {
-                self.status_readbacks_step_disposition =
-                    self.status_readbacks_step_disposition.saturating_add(1);
             }
         }
     }
@@ -1154,12 +1191,10 @@ impl WgpuTrainer {
         }
 
         if !read_loss {
-            // Loss scalar stays unread, but sticky overflow / non-finite must still
-            // classify the step so outer-loop counters cannot treat it as committed.
-            return match self.resolve_unread_loss_disposition().await? {
-                TrainStepDisposition::Committed { loss } => Ok(loss),
-                TrainStepDisposition::Aborted { error } => Err(error),
-            };
+            // Zero stepwise readback: do not probe status on healthy unread steps.
+            // Device sticky flags + mutation_gate still block optimizer commits;
+            // the outer loop confirms via word 4 at the next safety point.
+            return Ok(None);
         }
 
         // Sample current-frame capacity telemetry on loss cadence only. Sticky
@@ -1199,54 +1234,23 @@ impl WgpuTrainer {
         Ok(Some(validate_loss_value(loss_value, iteration)?))
     }
 
-    /// Classifies a finished step without reading the loss scalar.
-    ///
-    /// Healthy unread steps still touch the status buffer once so overflow /
-    /// non-finite cannot be mistaken for a commit; that probe is recorded as
-    /// [`StatusReadbackReason::StepDisposition`], not loss-cadence telemetry.
-    async fn resolve_unread_loss_disposition(
-        &mut self,
-    ) -> Result<TrainStepDisposition, TrainingError> {
-        let status = self.device_status.read().await?;
-        self.device_status.adopt_device_snapshot(status);
-        self.optimization_samples
-            .record_status_readback(StatusReadbackReason::StepDisposition);
-        self.optimizer
-            .sync_committed_steps(status.committed_optimizer_steps as usize);
-        self.optimization_samples.gpu_gate_optimizer_skips =
-            status.gpu_gate_optimizer_skips as usize;
-        if let Some(error) = status.to_error() {
-            // Sticky anomaly: attribute the probe to ForwardAbort rather than a
-            // healthy disposition confirmation.
-            self.optimization_samples.status_readbacks_step_disposition = self
-                .optimization_samples
-                .status_readbacks_step_disposition
-                .saturating_sub(1);
-            self.optimization_samples.status_readbacks =
-                self.optimization_samples.status_readbacks.saturating_sub(1);
-            self.optimization_samples
-                .record_status_readback(StatusReadbackReason::ForwardAbort);
-            self.optimization_samples.record_host_safety_point_abort();
-            if status.has_forward_overflow() || status.has_non_finite_loss() {
-                self.optimization_samples.gpu_gate_backward_skips = self
-                    .optimization_samples
-                    .gpu_gate_backward_skips
-                    .saturating_add(1);
-            }
-            return Ok(TrainStepDisposition::Aborted { error });
+    /// Confirm pending commits from device word 4 after a safety-point status sync.
+    fn confirm_commits_from_host_mirror(
+        &self,
+        state: &mut CommitConfirmationState,
+        report: &mut WgpuTrainingReport,
+        splat_count: usize,
+        last_loss: Option<f32>,
+    ) -> Vec<usize> {
+        let device_committed = self.device_status.host_snapshot().committed_optimizer_steps as usize;
+        let newly = state.apply_device_committed(device_committed);
+        if let Some(&last) = newly.last() {
+            record_completed_step(report, last, splat_count, last_loss);
         }
-        if status.mutation_gate == 0 {
-            return Ok(TrainStepDisposition::Aborted {
-                error: TrainingError::TrainingFailed(
-                    "train step mutation_gate blocked without sticky overflow/non-finite flags"
-                        .into(),
-                ),
-            });
-        }
-        Ok(TrainStepDisposition::Committed { loss: None })
+        newly
     }
 
-    /// Explicit committed/aborted result for outer-loop accounting.
+    /// Explicit committed/aborted/pending result for outer-loop accounting.
     pub async fn train_step_disposition(
         &mut self,
         splats: &mut DeviceSplats<GsDiffBackend>,
@@ -1271,7 +1275,13 @@ impl WgpuTrainer {
             )
             .await
         {
-            Ok(loss) => Ok(TrainStepDisposition::Committed { loss }),
+            Ok(loss) => {
+                if read_loss {
+                    Ok(TrainStepDisposition::ConfirmedCommitted { loss })
+                } else {
+                    Ok(TrainStepDisposition::SubmittedUnconfirmed)
+                }
+            }
             Err(error) => match error {
                 TrainingError::ForwardCapacityExceeded { .. }
                 | TrainingError::NonFiniteLoss { .. } => {
@@ -1315,6 +1325,9 @@ impl WgpuTrainer {
         let target_tensor_cache_capacity = self.config.data.frame_cache_capacity.max(1);
         let training_loop_started_at = Instant::now();
         let mut last_sampled_loss = 0.0;
+        let committed_baseline =
+            self.device_status.host_snapshot().committed_optimizer_steps as usize;
+        let mut commit_state = CommitConfirmationState::new(start_iteration, committed_baseline);
 
         for zero_based in start_iteration..num_iterations {
             if observer.should_cancel() {
@@ -1373,8 +1386,6 @@ impl WgpuTrainer {
 
             let iteration_idx = zero_based + 1;
             let step_started_at = Instant::now();
-            let emit_progress = observer.should_emit_progress(iteration_idx);
-            let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
             let should_log_step = iteration_idx.is_multiple_of(100)
                 || (start_iteration > 0 && zero_based == start_iteration);
             let checkpoint_due = observer.checkpoint_reason(iteration_idx).is_some();
@@ -1404,8 +1415,19 @@ impl WgpuTrainer {
                     return Err(error);
                 }
             };
-            let loss = match disposition {
-                TrainStepDisposition::Committed { loss } => loss,
+            commit_state.note_submitted(iteration_idx);
+            let (loss, newly_confirmed) = match disposition {
+                TrainStepDisposition::ConfirmedCommitted { loss } => {
+                    // Loss-cadence / checkpoint path already synced device status.
+                    let newly = self.confirm_commits_from_host_mirror(
+                        &mut commit_state,
+                        &mut report,
+                        splats.num_splats(),
+                        loss,
+                    );
+                    (loss, newly)
+                }
+                TrainStepDisposition::SubmittedUnconfirmed => (None, Vec::new()),
                 TrainStepDisposition::Aborted { error } => {
                     self.finish_report(&mut report);
                     return Err(error);
@@ -1422,7 +1444,6 @@ impl WgpuTrainer {
             if let Some(loss) = loss {
                 last_sampled_loss = loss;
             }
-            record_completed_step(&mut report, iteration_idx, splats.num_splats(), loss);
             if let Some(loss) = loss {
                 self.record_loss_sample(
                     iteration_idx,
@@ -1431,21 +1452,39 @@ impl WgpuTrainer {
                     should_log_step || iteration_idx == num_iterations,
                 );
             }
-            let metrics = TrainingIterationMetrics {
-                iteration: iteration_idx,
+            let metrics_for = |iteration: usize| TrainingIterationMetrics {
+                iteration,
                 loss: last_sampled_loss,
                 gaussian_count: splats.num_splats(),
                 loop_duration,
-                loss_readback: read_loss,
+                loss_readback: read_loss && iteration == iteration_idx,
             };
-            if emit_progress {
-                observer.on_iteration(metrics);
+            for confirmed in &newly_confirmed {
+                if observer.should_emit_progress(*confirmed) {
+                    observer.on_iteration(metrics_for(*confirmed));
+                }
+                if observer.should_cancel() {
+                    report.cancelled = true;
+                    report.disposition = TrainingRunDisposition::Cancelled;
+                    break;
+                }
             }
-            if emit_snapshot {
+            if report.cancelled {
+                break;
+            }
+            if newly_confirmed
+                .iter()
+                .any(|c| observer.should_emit_snapshot(*c))
+            {
                 let host = device_splats_to_host(splats).await;
-                observer.on_snapshot(metrics, host);
+                let snap_iter = *newly_confirmed
+                    .iter()
+                    .rev()
+                    .find(|c| observer.should_emit_snapshot(**c))
+                    .unwrap_or(&iteration_idx);
+                observer.on_snapshot(metrics_for(snap_iter), host);
             }
-            if should_log_step {
+            if should_log_step && commit_state.last_confirmed >= iteration_idx {
                 log::info!(
                     "WGPU training step {} | loss={:.6} | splats={}",
                     iteration_idx,
@@ -1454,13 +1493,15 @@ impl WgpuTrainer {
                 );
             }
 
-            if observer.should_cancel() {
-                report.cancelled = true;
-                report.disposition = TrainingRunDisposition::Cancelled;
-                break;
-            }
-
             if let Some(reason) = observer.checkpoint_reason(iteration_idx) {
+                // Checkpoint is a safety point; only write after confirmation.
+                if commit_state.last_confirmed < iteration_idx {
+                    self.finish_report(&mut report);
+                    return Err(TrainingError::TrainingFailed(format!(
+                        "checkpoint at iteration {iteration_idx} requested before commit confirmation (confirmed={})",
+                        commit_state.last_confirmed
+                    )));
+                }
                 let identity = observer.checkpoint_identity().cloned().ok_or_else(|| {
                     TrainingError::InvalidInput(
                         "checkpointing training requires the current training identity".to_string(),
@@ -1470,7 +1511,7 @@ impl WgpuTrainer {
                     .checkpoint_with_status_reason(
                         splats,
                         identity,
-                        iteration_idx,
+                        commit_state.last_confirmed,
                         Some(last_sampled_loss),
                         Self::checkpoint_status_reason(reason),
                     )
@@ -1478,7 +1519,7 @@ impl WgpuTrainer {
                 if let Some(disposition) = complete_checkpoint_boundary(
                     observer,
                     TrainingCheckpointReady {
-                        iteration: iteration_idx,
+                        iteration: commit_state.last_confirmed,
                         reason,
                         checkpoint,
                     },
@@ -1491,8 +1532,24 @@ impl WgpuTrainer {
         }
 
         report.training_loop_elapsed = training_loop_started_at.elapsed();
-        self.ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
-            .await?;
+        match self
+            .ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
+            .await
+        {
+            Ok(_) => {
+                let end_loss = report.final_loss.or(Some(last_sampled_loss));
+                let _ = self.confirm_commits_from_host_mirror(
+                    &mut commit_state,
+                    &mut report,
+                    splats.num_splats(),
+                    end_loss,
+                );
+            }
+            Err(error) => {
+                self.finish_report(&mut report);
+                return Err(error);
+            }
+        }
         self.finish_report(&mut report);
         Ok(report)
     }
@@ -2970,6 +3027,9 @@ mod tests {
         if let Some(capacity) = force_capacity {
             trainer.force_intersection_capacity_for_test(capacity);
         }
+        let committed_baseline =
+            trainer.device_status.host_snapshot().committed_optimizer_steps as usize;
+        let mut commit_state = CommitConfirmationState::new(start_iteration, committed_baseline);
         for zero_based in start_iteration..num_iterations {
             if observer.should_cancel() {
                 report.cancelled = true;
@@ -2985,8 +3045,6 @@ mod tests {
                 checkpoint_due,
                 observer.should_pause(),
             );
-            let emit_progress = observer.should_emit_progress(iteration_idx);
-            let emit_snapshot = observer.should_emit_snapshot(iteration_idx);
             let disposition = match trainer
                 .train_step_disposition(
                     splats,
@@ -3009,8 +3067,18 @@ mod tests {
                     });
                 }
             };
-            let loss = match disposition {
-                TrainStepDisposition::Committed { loss } => loss,
+            commit_state.note_submitted(iteration_idx);
+            let (loss, newly_confirmed) = match disposition {
+                TrainStepDisposition::ConfirmedCommitted { loss } => {
+                    let newly = trainer.confirm_commits_from_host_mirror(
+                        &mut commit_state,
+                        &mut report,
+                        splats.num_splats(),
+                        loss,
+                    );
+                    (loss, newly)
+                }
+                TrainStepDisposition::SubmittedUnconfirmed => (None, Vec::new()),
                 TrainStepDisposition::Aborted { error } => {
                     trainer.finish_report(&mut report);
                     return Err(SyntheticOuterLoopAbort {
@@ -3022,22 +3090,48 @@ mod tests {
             if let Some(loss) = loss {
                 last_sampled_loss = loss;
             }
-            record_completed_step(&mut report, iteration_idx, splats.num_splats(), loss);
-            let metrics = TrainingIterationMetrics {
-                iteration: iteration_idx,
+            let metrics_for = |iteration: usize| TrainingIterationMetrics {
+                iteration,
                 loss: last_sampled_loss,
                 gaussian_count: splats.num_splats(),
                 loop_duration: Duration::from_millis(0),
-                loss_readback: read_loss,
+                loss_readback: read_loss && iteration == iteration_idx,
             };
-            if emit_progress {
-                observer.on_iteration(metrics);
+            for confirmed in &newly_confirmed {
+                if observer.should_emit_progress(*confirmed) {
+                    observer.on_iteration(metrics_for(*confirmed));
+                }
+                if observer.should_cancel() {
+                    report.cancelled = true;
+                    report.disposition = TrainingRunDisposition::Cancelled;
+                    break;
+                }
             }
-            if emit_snapshot {
+            if report.cancelled {
+                break;
+            }
+            if newly_confirmed
+                .iter()
+                .any(|c| observer.should_emit_snapshot(*c))
+            {
                 let host = device_splats_to_host(splats).await;
-                observer.on_snapshot(metrics, host);
+                let snap_iter = *newly_confirmed
+                    .iter()
+                    .rev()
+                    .find(|c| observer.should_emit_snapshot(**c))
+                    .unwrap_or(&iteration_idx);
+                observer.on_snapshot(metrics_for(snap_iter), host);
             }
             if let Some(reason) = observer.checkpoint_reason(iteration_idx) {
+                if commit_state.last_confirmed < iteration_idx {
+                    trainer.finish_report(&mut report);
+                    return Err(SyntheticOuterLoopAbort {
+                        error: TrainingError::TrainingFailed(format!(
+                            "checkpoint at iteration {iteration_idx} before confirmation"
+                        )),
+                        report: Box::new(report),
+                    });
+                }
                 let identity = match observer.checkpoint_identity().cloned() {
                     Some(identity) => identity,
                     None => {
@@ -3055,7 +3149,7 @@ mod tests {
                     .checkpoint_with_status_reason(
                         splats,
                         identity,
-                        iteration_idx,
+                        commit_state.last_confirmed,
                         Some(last_sampled_loss),
                         WgpuTrainer::checkpoint_status_reason(reason),
                     )
@@ -3073,7 +3167,7 @@ mod tests {
                 match complete_checkpoint_boundary(
                     observer,
                     TrainingCheckpointReady {
-                        iteration: iteration_idx,
+                        iteration: commit_state.last_confirmed,
                         reason,
                         checkpoint,
                     },
@@ -3094,15 +3188,26 @@ mod tests {
                 }
             }
         }
-        if let Err(error) = trainer
+        match trainer
             .ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
             .await
         {
-            trainer.finish_report(&mut report);
-            return Err(SyntheticOuterLoopAbort {
-                error,
-                report: Box::new(report),
-            });
+            Ok(_) => {
+                let end_loss = report.final_loss.or(Some(last_sampled_loss));
+                let _ = trainer.confirm_commits_from_host_mirror(
+                    &mut commit_state,
+                    &mut report,
+                    splats.num_splats(),
+                    end_loss,
+                );
+            }
+            Err(error) => {
+                trainer.finish_report(&mut report);
+                return Err(SyntheticOuterLoopAbort {
+                    error,
+                    report: Box::new(report),
+                });
+            }
         }
         trainer.finish_report(&mut report);
         Ok(report)
@@ -3390,8 +3495,8 @@ mod tests {
             trainer
                 .optimization_samples
                 .status_readbacks_step_disposition,
-            3,
-            "unread steps 2..=4 confirm disposition without loss scalar readback"
+            0,
+            "healthy unread steps must not perform StepDisposition status readbacks"
         );
     }
 
@@ -3428,14 +3533,15 @@ mod tests {
         assert_eq!(checkpoint.completed_iterations, 2);
 
         let mut observer = OuterLoopProbeObserver::new();
-        observer.cancel_after = Some(1);
+        // Cancel once progress reaches iteration 3 (confirmed via loss/end cadence).
+        observer.cancel_after = Some(3);
         let cancelled = run_synthetic_outer_loop(
             &mut trainer,
             &mut splats,
             &camera,
             &device,
             2,
-            5,
+            3,
             0.4,
             None,
             &mut observer,
@@ -3480,6 +3586,221 @@ mod tests {
             .expect("pause must emit checkpoint");
         assert_eq!(checkpoint.completed_iterations, 2);
         assert_eq!(observer.progress_iters, vec![1, 2]);
+    }
+
+    fn production_outer_loop_fixture(
+        config: &TrainingConfig,
+    ) -> (
+        tempfile::TempDir,
+        PrefetchFrameLoader,
+        Vec<GaussianCamera>,
+        Vec<usize>,
+    ) {
+        use crate::training::data::frame_loader::FrameLoaderOptions;
+        use crate::{Intrinsics, ScenePose, TrainingDataset, SE3};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image_path = temp.path().join("frame.rgb");
+        std::fs::write(&image_path, vec![40u8; 8 * 8 * 3]).expect("write rgb");
+        let mut dataset = TrainingDataset::new(Intrinsics::new(8.0, 8.0, 4.0, 4.0, 8, 8));
+        dataset.add_pose(ScenePose::new(0, image_path, SE3::identity(), 0.0));
+        let loader = PrefetchFrameLoader::new(
+            &dataset,
+            config,
+            FrameLoaderOptions {
+                cache_capacity: 2,
+                prefetch_ahead: 1,
+                rgb_target_size: Some((8, 8)),
+            },
+        )
+        .expect("prefetch loader");
+        (
+            temp,
+            loader,
+            vec![fault_injection_camera()],
+            vec![0usize],
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_outer_loop_overflow_keeps_completed_iterations() {
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let (_temp, mut loader, cameras, order) = production_outer_loop_fixture(&config);
+        let mut observer = OuterLoopProbeObserver::new();
+
+        let healthy = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                0,
+                1,
+                &mut observer,
+            )
+            .await
+            .expect("healthy production iteration");
+        assert_eq!(healthy.completed_iterations, 1);
+        assert_eq!(observer.progress_iters, vec![1]);
+
+        trainer.force_intersection_capacity_for_test(1);
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
+        let mut observer = OuterLoopProbeObserver::new();
+        let err = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                1,
+                3,
+                &mut observer,
+            )
+            .await
+            .expect_err("production overflow must abort");
+        assert!(
+            matches!(err, TrainingError::ForwardCapacityExceeded { .. }),
+            "got {err:?}"
+        );
+        // Host report is only available via finish_report path inside Err; re-run
+        // status from trainer telemetry / device mirror.
+        assert_eq!(
+            trainer.device_status.host_snapshot().committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
+        assert!(observer.progress_iters.is_empty());
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.3, before.3);
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_outer_loop_non_finite_keeps_completed_iterations() {
+        use crate::training::engine::device_status::{
+            TrainingStatusSnapshot, STATUS_NON_FINITE_LOSS,
+        };
+
+        let device = GsDevice::default();
+        let config = fault_injection_config();
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config.clone(), device.clone(), 3, 4, 2.5);
+        install_trainer_checkpoint_state(&mut trainer);
+        let (_temp, mut loader, cameras, order) = production_outer_loop_fixture(&config);
+        let mut observer = OuterLoopProbeObserver::new();
+        let healthy = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                0,
+                1,
+                &mut observer,
+            )
+            .await
+            .expect("healthy production iteration");
+        assert_eq!(healthy.completed_iterations, 1);
+
+        let before = snapshot_mutation_state(&mut trainer, &splats).await;
+        let mut sticky = TrainingStatusSnapshot::default();
+        sticky.flags = STATUS_NON_FINITE_LOSS;
+        sticky.first_invalid_iteration = 2;
+        sticky.committed_optimizer_steps = before.5.committed_optimizer_steps;
+        trainer.device_status.set_host_snapshot(sticky);
+
+        let mut observer = OuterLoopProbeObserver::new();
+        let err = trainer
+            .train_with_frame_loader(
+                &mut splats,
+                &cameras,
+                &order,
+                &mut loader,
+                (8, 8),
+                1,
+                3,
+                &mut observer,
+            )
+            .await
+            .expect_err("sticky non-finite must abort production loop");
+        assert!(
+            matches!(err, TrainingError::NonFiniteLoss { .. }),
+            "got {err:?}"
+        );
+        assert!(observer.progress_iters.is_empty());
+        let after = snapshot_mutation_state(&mut trainer, &splats).await;
+        assert_eq!(
+            after.5.committed_optimizer_steps,
+            before.5.committed_optimizer_steps
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_readback_reason_totals_are_recomputable() {
+        let device = GsDevice::default();
+        let mut config = fault_injection_config();
+        config.iterations = 20;
+        let host_splats = trainer_checkpoint_host_splats();
+        let mut splats = host_splats_to_device::<GsDiffBackend>(&host_splats, &device);
+        let mut trainer = WgpuTrainer::new(config, device.clone(), 3, 4, 2.5);
+        let camera = fault_injection_camera();
+        for iteration in 1..=20 {
+            let read_loss =
+                should_read_loss(iteration, 20, LOSS_SCALAR_READBACK_INTERVAL, false, false);
+            trainer
+                .train_step(
+                    &mut splats,
+                    &camera,
+                    fault_injection_target(&device, 0.4),
+                    (8, 8),
+                    iteration,
+                    1,
+                    false,
+                    read_loss,
+                )
+                .await
+                .expect("step");
+        }
+        trainer
+            .ensure_device_status_healthy(StatusReadbackReason::TrainingEnd)
+            .await
+            .expect("end");
+        let samples = &trainer.optimization_samples;
+        let parts = samples.status_readbacks_loss_cadence
+            + samples.status_readbacks_topology
+            + samples.status_readbacks_checkpoint
+            + samples.status_readbacks_pause
+            + samples.status_readbacks_cancel
+            + samples.status_readbacks_training_end
+            + samples.status_readbacks_forward_abort
+            + samples.status_readbacks_step_disposition;
+        assert_eq!(samples.status_readbacks, parts);
+        assert_eq!(samples.status_readbacks_step_disposition, 0);
+        let mut report = WgpuTrainingReport::default();
+        trainer.finish_report(&mut report);
+        let telemetry = report.telemetry;
+        let telem_parts = telemetry.status_readbacks_loss_cadence.unwrap_or(0)
+            + telemetry.status_readbacks_topology.unwrap_or(0)
+            + telemetry.status_readbacks_checkpoint.unwrap_or(0)
+            + telemetry.status_readbacks_pause.unwrap_or(0)
+            + telemetry.status_readbacks_cancel.unwrap_or(0)
+            + telemetry.status_readbacks_training_end.unwrap_or(0)
+            + telemetry.status_readbacks_forward_abort.unwrap_or(0)
+            + telemetry.status_readbacks_step_disposition.unwrap_or(0);
+        assert_eq!(telemetry.status_readbacks, Some(telem_parts));
+        assert_eq!(telemetry.status_readbacks_step_disposition, Some(0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3866,8 +4187,8 @@ mod tests {
             trainer
                 .optimization_samples
                 .status_readbacks_step_disposition,
-            2,
-            "unread steps 2 and 3 must confirm disposition without loss cadence"
+            0,
+            "unread steps must not perform StepDisposition status readbacks"
         );
         assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 0);
 
@@ -3876,7 +4197,10 @@ mod tests {
             .await
             .expect("checkpoint outside loss cadence");
         assert_eq!(trainer.optimization_samples.status_readbacks_checkpoint, 1);
-        assert_eq!(trainer.optimization_samples.status_readbacks, 4);
+        assert_eq!(
+            trainer.optimization_samples.status_readbacks, 2,
+            "loss cadence + checkpoint only"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3890,14 +4214,11 @@ mod tests {
         let camera = fault_injection_camera();
 
         let mut expected_loss_cadence = 0usize;
-        let mut expected_disposition = 0usize;
         for iteration in 1..=100 {
             let read_loss =
                 should_read_loss(iteration, 100, LOSS_SCALAR_READBACK_INTERVAL, false, false);
             if read_loss {
                 expected_loss_cadence += 1;
-            } else {
-                expected_disposition += 1;
             }
             trainer
                 .train_step(
@@ -3926,7 +4247,8 @@ mod tests {
             trainer
                 .optimization_samples
                 .status_readbacks_step_disposition,
-            expected_disposition
+            0,
+            "healthy unread steps must not use StepDisposition status readbacks"
         );
         assert_eq!(
             trainer.optimization_samples.loss_value_readbacks, expected_loss_cadence,
@@ -3940,10 +4262,10 @@ mod tests {
         );
         assert_eq!(
             trainer.optimization_samples.status_readbacks,
-            expected_loss_cadence + expected_disposition + 1
+            expected_loss_cadence + 1,
+            "status readbacks are safety points only (loss cadence + training end)"
         );
         assert_eq!(expected_loss_cadence, 6);
-        assert_eq!(expected_disposition, 94);
     }
 
     #[tokio::test(flavor = "current_thread")]
