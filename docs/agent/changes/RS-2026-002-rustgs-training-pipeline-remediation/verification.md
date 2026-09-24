@@ -10,7 +10,8 @@ This change was migrated from a historical RustGS remediation plan on 2026-09-19
 | Branch | `fix/rs-2026-002-c1-c4-review` |
 | Worktree | `.worktrees/rs-2026-002-c1-c4-review` |
 | Prior tip (CHANGES_REQUESTED) | `a0d5c7ec1f93eacae12e6e9602a7098d8972377e` |
-| Round-2 code package tip | see `git rev-parse HEAD` after commit |
+| Round-2 code package | `6bfab3ae491a2f7de7f5310ac2f0ad4719bce9b7` |
+| Branch tip (docs) | `aa7dd1fa156ae19ad28ca4ab1f6ef6e7989e219a` |
 
 C1 capacity guards, WGSL explicit branches, and C3 workspace ownership are preserved. Do not start C5–C8 from this worktree.
 
