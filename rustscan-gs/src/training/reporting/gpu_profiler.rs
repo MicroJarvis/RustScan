@@ -838,6 +838,7 @@ pub fn classify_profile_recovery<T, F>(
 /// failure after the closure ran), else run remaining work once (start failure).
 /// Production [`profile_device_gpu_step`] uses the same classification via
 /// [`classify_profile_recovery`].
+#[cfg(test)]
 pub fn recover_profile_result<T, F>(
     work_slot: &mut Option<F>,
     output_slot: &mut Option<T>,
@@ -917,10 +918,12 @@ where
         "gpu_forward",
     ) {
         Ok(((), profile)) => {
-            let output = output_slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            let output = {
+                output_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            };
             match output {
                 Some(output) => {
                     let ms = resolve_device_gpu_ms(profile).await;
@@ -938,17 +941,22 @@ where
             }
         }
         Err(_) => {
-            let mut work_guard = work_slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut output_guard = output_slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match classify_profile_recovery(&*work_guard, &*output_guard) {
+            let kind = {
+                let work_guard = work_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let output_guard = output_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                classify_profile_recovery(&*work_guard, &*output_guard)
+            };
+            match kind {
                 ProfileRecoveryKind::EndFailed => {
                     stats.end_failures = 1;
                     stats.dropped_samples = 1;
-                    let output = output_guard
+                    let output = output_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .take()
                         .expect("EndFailed requires stored output");
                     (output, None, stats)
@@ -956,10 +964,11 @@ where
                 ProfileRecoveryKind::StartFailed => {
                     stats.start_failures = 1;
                     stats.dropped_samples = 1;
-                    let work = work_guard.take().expect("StartFailed requires work");
-                    // Drop locks before awaiting work.
-                    drop(work_guard);
-                    drop(output_guard);
+                    let work = work_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                        .expect("StartFailed requires work");
                     (work().await, None, stats)
                 }
                 ProfileRecoveryKind::Impossible => panic!(

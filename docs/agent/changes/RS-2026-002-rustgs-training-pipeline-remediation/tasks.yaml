@@ -1,24 +1,26 @@
 id: RS-2026-002
 status: active
-owner: unassigned
+owner: cursor-agent
 source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
 fix_branch: "fix/rs-2026-002-c1-c4-review"
+head_sha: "311cd1775a40ae25546f3976f56b8eaaa663b1b0"
 cards:
   C1:
     status: implemented_pending_maintainer_review
     notes: "capacity guards + WGSL explicit branches preserved"
   C2:
-    status: implemented_pending_maintainer_review
-    head_sha: "fa970ed"
-    notes: "safety-point commit confirmation; no per-step unread disposition readback"
+    status: implemented_pending_rereview
+    head_sha: "1c11e93"
+    notes: "R01 late-pause sync; R02 profiler omitted from continuity fingerprint; R03 exact snapshot cadence"
   C3:
     status: implemented_pending_maintainer_review
     notes: "prefix-sum workspace ownership preserved"
   C4:
-    status: implemented_pending_maintainer_review
-    notes: "F02/F06/F07/F08/F10/F11 measurement + F03/F04/F05 safety; head is branch tip"
+    status: implemented_pending_rereview
+    head_sha: "311cd17"
+    notes: "R04–R09 profiler gates, kinds, failures, JSON export; prior F02–F11 retained"
   C5:
     status: not_started
   C6:
@@ -35,11 +37,16 @@ scope:
 out_of_scope:
   - rustsfm
   - rust-viewer
+  - C5-C8 implementation
 acceptance:
   - "All completion gates in tasks.md have code, test, and artifact evidence."
   - "No unchecked task is described as complete without evidence."
+  - "Independent re-review of R01–R09 before merge."
 verification:
-  - "cargo fmt --package rustscan-gs --check"
-  - "cargo test -p rustscan-gs --lib --no-default-features --no-fail-fast"
-  - "cargo test -p rustscan-gs --lib --features gpu-wgpu --no-fail-fast -- --test-threads=1"
-  - "git diff --check"
+  - "cargo fmt --all -- --check"
+  - "cargo check --workspace --all-targets"
+  - "cargo test -p rustscan-gs --all-targets --features gpu-wgpu -- --test-threads=1"
+  - "cargo test -p rustscan-gs --no-default-features --lib -- --test-threads=1"
+  - "cargo test -p rustscan-gs --test integration_test --features gpu-wgpu -- --ignored --test-threads=1"
+  - "cargo clippy -p rustscan-gs --all-targets --all-features -- -D warnings"
+  - "cargo clippy -p rustscan-gs --all-targets --features gpu-wgpu --no-deps -- -D warnings"
