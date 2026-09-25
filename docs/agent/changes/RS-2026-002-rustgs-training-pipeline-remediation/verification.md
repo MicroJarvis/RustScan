@@ -1,5 +1,19 @@
 # RS-2026-002 Verification
 
+## C1–C4 merged to main (2026-09-25)
+
+| Field | Value |
+| --- | --- |
+| Merge | `--no-ff` `fix/rs-2026-002-c1-c4-review` |
+| Merge commit | `4fdf506e6819fd30c74ad8245e85c9f1df625220` |
+| Main before | `c71f8092778e2abb1feaaf03c9d784ea25434349` |
+| Included tip | `993ac093344d68096e1bb92cd3c6d620d8c03a58` |
+| Logs | `artifacts/runs/rs-2026-002-c1-c4-main-merge/` |
+
+C1–C4: `merged`. C5–C8: `not_started`. Not pushed.
+
+Post-merge gates (`POSELIB_ROOT` = main-tree PoseLib): workspace `cargo check` PASS; `rustscan-gs` gpu-wgpu lib tests PASS **192**; `cargo fmt --all -- --check` PASS; `git diff --check` PASS.
+
 ## C1–C4 final handoff (R04 review passed)
 
 | Field | Value |

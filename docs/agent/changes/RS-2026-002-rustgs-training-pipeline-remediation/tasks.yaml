@@ -5,20 +5,20 @@ source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
 fix_branch: "fix/rs-2026-002-c1-c4-review"
-head_sha: "783eb2bac8ab0e6878e8d0c42a5b9dfb78a31b6e"
+head_sha: "4fdf506e6819fd30c74ad8245e85c9f1df625220"
 cards:
   C1:
-    status: implemented_pending_merge
+    status: merged
     notes: "capacity guards + WGSL explicit branches preserved"
   C2:
-    status: implemented_pending_merge
+    status: merged
     notes: "R01/R03 retained; R02 historical struct-order fingerprint closed"
   C3:
-    status: implemented_pending_merge
+    status: merged
     notes: "prefix-sum workspace ownership preserved"
   C4:
-    status: implemented_pending_merge
-    notes: "R02/R04/R06/R07/R08 closed; R04 disabled+Debug total Debug GPU readbacks=0"
+    status: merged
+    notes: "R02/R04/R06/R07/R08 closed; merged via --no-ff 4fdf506"
   C5:
     status: not_started
   C6:
@@ -36,7 +36,7 @@ out_of_scope:
   - rust-viewer
   - C5-C8 implementation
 acceptance:
-  - "C1-C4 ready for maintainer merge; C5-C8 not started."
+  - "C1-C4 merged to main at 4fdf506; C5-C8 not started."
 verification:
   - "cargo fmt --all -- --check"
   - "POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib cargo check --workspace --all-targets"
