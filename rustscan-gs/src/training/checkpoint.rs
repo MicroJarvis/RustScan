@@ -13,6 +13,7 @@ use tempfile::{NamedTempFile, TempPath};
 use crate::{HostSplats, TrainingConfig, TrainingDataset, TrainingError};
 
 use super::config::MAX_TRAINING_ITERATIONS;
+use super::evaluation::{fingerprint_frame_selection, FrameIdRange, FrameSelectionRequest};
 
 pub const TRAINING_CHECKPOINT_VERSION: u32 = 3;
 pub const TRAINING_CHECKPOINT_VERSION_V2: u32 = 2;
@@ -521,6 +522,10 @@ pub enum CheckpointMigration {
 ///
 /// Distinguishes canonical selection IDs from the oversampled/shuffled loader
 /// order. Missing on v1/v2 files — never invent values when loading legacy bytes.
+///
+/// Request fields (`max_frames`, ranges, `allowed_ids`, …) are stored so
+/// `selection_fingerprint` / `eval_selection_fingerprint` can be recomputed and
+/// verified independently of the live dataset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CheckpointFrameSelectionMeta {
     /// `in-view` / `holdout` when evaluation split is known; `None` if unset.
@@ -534,6 +539,28 @@ pub struct CheckpointFrameSelectionMeta {
     pub manifest_fingerprint: Option<String>,
     pub selection_fingerprint: Option<String>,
     pub eval_selection_fingerprint: Option<String>,
+    /// Train FrameSelectionRequest.max_frames used to produce the fingerprint.
+    #[serde(default)]
+    pub max_frames: usize,
+    /// Train FrameSelectionRequest.frame_stride (resolved, typically >= 1).
+    #[serde(default)]
+    pub frame_stride: usize,
+    #[serde(default)]
+    pub include_ranges: Vec<FrameIdRange>,
+    #[serde(default)]
+    pub exclude_ranges: Vec<FrameIdRange>,
+    #[serde(default)]
+    pub allowed_ids: Option<Vec<u64>>,
+    #[serde(default)]
+    pub eval_max_frames: usize,
+    #[serde(default)]
+    pub eval_frame_stride: usize,
+    #[serde(default)]
+    pub eval_include_ranges: Vec<FrameIdRange>,
+    #[serde(default)]
+    pub eval_exclude_ranges: Vec<FrameIdRange>,
+    #[serde(default)]
+    pub eval_allowed_ids: Option<Vec<u64>>,
 }
 
 impl CheckpointFrameSelectionMeta {
@@ -547,6 +574,26 @@ impl CheckpointFrameSelectionMeta {
             || self.manifest_fingerprint.is_some()
             || self.selection_fingerprint.is_some()
             || self.eval_selection_fingerprint.is_some()
+    }
+
+    fn train_request(&self) -> FrameSelectionRequest {
+        FrameSelectionRequest {
+            include_ranges: self.include_ranges.clone(),
+            exclude_ranges: self.exclude_ranges.clone(),
+            allowed_ids: self.allowed_ids.clone(),
+            max_frames: self.max_frames,
+            frame_stride: self.frame_stride.max(1),
+        }
+    }
+
+    fn eval_request(&self) -> FrameSelectionRequest {
+        FrameSelectionRequest {
+            include_ranges: self.eval_include_ranges.clone(),
+            exclude_ranges: self.eval_exclude_ranges.clone(),
+            allowed_ids: self.eval_allowed_ids.clone(),
+            max_frames: self.eval_max_frames,
+            frame_stride: self.eval_frame_stride.max(1),
+        }
     }
 }
 
@@ -598,10 +645,58 @@ pub fn validate_checkpoint_selection_consistency(
     }
 }
 
+fn reject_duplicate_stable_ids(label: &str, ids: &[u64]) -> Result<(), TrainingError> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for &id in ids {
+        if !seen.insert(id) {
+            return Err(TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata invalid: {label} contains duplicate stable id {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_selection_meta_against_dataset(
     meta: &CheckpointFrameSelectionMeta,
     dataset: &TrainingDataset,
 ) -> Result<(), TrainingError> {
+    reject_duplicate_stable_ids("train_stable_ids", &meta.train_stable_ids)?;
+    reject_duplicate_stable_ids("eval_stable_ids", &meta.eval_stable_ids)?;
+
+    if meta.eval_split_kind.as_deref() == Some("holdout") {
+        let train: std::collections::HashSet<u64> = meta.train_stable_ids.iter().copied().collect();
+        let overlap: Vec<u64> = meta
+            .eval_stable_ids
+            .iter()
+            .copied()
+            .filter(|id| train.contains(id))
+            .collect();
+        if !overlap.is_empty() {
+            return Err(TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata invalid: holdout mode forbids train/eval \
+                 stable id overlap: {overlap:?}"
+            )));
+        }
+    }
+
+    let train_set: std::collections::HashSet<u64> = meta.train_stable_ids.iter().copied().collect();
+    if meta.train_stable_ids.is_empty() && !meta.train_loader_frame_ids.is_empty() {
+        return Err(TrainingError::InvalidInput(
+            "checkpoint frame-selection metadata invalid: train_loader_frame_ids present but \
+             train_stable_ids is empty"
+                .into(),
+        ));
+    }
+    for &id in &meta.train_loader_frame_ids {
+        if !train_set.contains(&id) {
+            return Err(TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata invalid: train_loader_frame_ids contains \
+                 stable id {id} outside the train selection"
+            )));
+        }
+    }
+
     let available: std::collections::HashSet<u64> =
         dataset.poses.iter().map(|pose| pose.frame_id).collect();
     for (label, ids) in [
@@ -621,6 +716,29 @@ fn validate_selection_meta_against_dataset(
             }
         }
     }
+
+    if let Some(stored) = meta.selection_fingerprint.as_ref() {
+        let expected = fingerprint_frame_selection(&meta.train_stable_ids, &meta.train_request());
+        if stored != &expected {
+            return Err(TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata invalid: selection_fingerprint does not match \
+                 recomputed fingerprint from train selection metadata \
+                 (stored={stored}, expected={expected})"
+            )));
+        }
+    }
+
+    if let Some(stored) = meta.eval_selection_fingerprint.as_ref() {
+        let expected = fingerprint_frame_selection(&meta.eval_stable_ids, &meta.eval_request());
+        if stored != &expected {
+            return Err(TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata invalid: eval_selection_fingerprint does not \
+                 match recomputed fingerprint from eval selection metadata \
+                 (stored={stored}, expected={expected})"
+            )));
+        }
+    }
+
     Ok(())
 }
 

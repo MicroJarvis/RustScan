@@ -270,6 +270,80 @@ pub struct FrameSelection {
     pub selection_fingerprint: String,
     pub max_frames: usize,
     pub frame_stride: usize,
+    pub include_ranges: Vec<FrameIdRange>,
+    pub exclude_ranges: Vec<FrameIdRange>,
+    pub allowed_ids: Option<Vec<u64>>,
+}
+
+/// Serializable selection provenance for eval / suite reports.
+///
+/// Captures the *actual* request parameters and resulting stable IDs so reports
+/// remain reproducible even when `SplatEvaluationSummary` records post-preselect
+/// `max_frames=0` / `frame_stride=1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameSelectionReport {
+    pub stable_frame_ids: Vec<u64>,
+    pub selection_fingerprint: String,
+    pub max_frames: usize,
+    pub frame_stride: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_frame_ranges: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_frame_ranges: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_split_kind: Option<String>,
+}
+
+impl FrameSelectionReport {
+    #[must_use]
+    pub fn from_selection(
+        selection: &FrameSelection,
+        manifest_fingerprint: Option<String>,
+        eval_split_kind: Option<String>,
+    ) -> Self {
+        Self {
+            stable_frame_ids: selection.stable_ids.clone(),
+            selection_fingerprint: selection.selection_fingerprint.clone(),
+            max_frames: selection.max_frames,
+            frame_stride: selection.frame_stride,
+            include_frame_ranges: format_frame_id_ranges(&selection.include_ranges),
+            exclude_frame_ranges: format_frame_id_ranges(&selection.exclude_ranges),
+            manifest_fingerprint,
+            eval_split_kind,
+        }
+    }
+}
+
+/// Aggregate quality-gate check statuses: Failed > Inapplicable > Passed.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationGateStatus {
+    Passed,
+    Failed,
+    /// Threshold must not be applied (e.g. historical static_162 unrestorable).
+    Inapplicable,
+}
+
+/// Collapse per-check statuses with Failed beating Inapplicable beating Passed.
+#[must_use]
+pub fn aggregate_evaluation_gate_status(
+    statuses: impl IntoIterator<Item = EvaluationGateStatus>,
+) -> EvaluationGateStatus {
+    let mut saw_inapplicable = false;
+    for status in statuses {
+        match status {
+            EvaluationGateStatus::Failed => return EvaluationGateStatus::Failed,
+            EvaluationGateStatus::Inapplicable => saw_inapplicable = true,
+            EvaluationGateStatus::Passed => {}
+        }
+    }
+    if saw_inapplicable {
+        EvaluationGateStatus::Inapplicable
+    } else {
+        EvaluationGateStatus::Passed
+    }
 }
 
 impl FrameSelection {
@@ -330,8 +404,14 @@ impl FrameSelection {
 
         let selected_poses: Vec<_> = candidates.into_iter().step_by(stride).cloned().collect();
         let stable_ids: Vec<u64> = selected_poses.iter().map(|pose| pose.frame_id).collect();
-        let selection_fingerprint =
-            fingerprint_selection(&stable_ids, request.max_frames, stride, request);
+        let resolved_request = FrameSelectionRequest {
+            include_ranges: request.include_ranges.clone(),
+            exclude_ranges: request.exclude_ranges.clone(),
+            allowed_ids: request.allowed_ids.clone(),
+            max_frames: request.max_frames,
+            frame_stride: stride,
+        };
+        let selection_fingerprint = fingerprint_frame_selection(&stable_ids, &resolved_request);
 
         let mut dataset =
             TrainingDataset::new(source.intrinsics).with_depth_scale(source.depth_scale);
@@ -344,21 +424,36 @@ impl FrameSelection {
             stable_ids,
             dataset,
             selection_fingerprint,
-            max_frames: request.max_frames,
+            max_frames: resolved_request.max_frames,
             frame_stride: stride,
+            include_ranges: resolved_request.include_ranges,
+            exclude_ranges: resolved_request.exclude_ranges,
+            allowed_ids: resolved_request.allowed_ids,
         })
+    }
+
+    /// Rebuild the request that produced this selection (for fingerprint checks).
+    #[must_use]
+    pub fn request(&self) -> FrameSelectionRequest {
+        FrameSelectionRequest {
+            include_ranges: self.include_ranges.clone(),
+            exclude_ranges: self.exclude_ranges.clone(),
+            allowed_ids: self.allowed_ids.clone(),
+            max_frames: self.max_frames,
+            frame_stride: self.frame_stride,
+        }
     }
 }
 
-fn fingerprint_selection(
-    stable_ids: &[u64],
-    max_frames: usize,
-    frame_stride: usize,
-    request: &FrameSelectionRequest,
-) -> String {
+/// Canonical blake3 fingerprint of a selection (request params + ordered stable IDs).
+///
+/// Independently recomputable from stored checkpoint / report metadata.
+#[must_use]
+pub fn fingerprint_frame_selection(stable_ids: &[u64], request: &FrameSelectionRequest) -> String {
+    let frame_stride = request.frame_stride.max(1);
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rustgs-frame-selection-v1\0");
-    hasher.update(&max_frames.to_le_bytes());
+    hasher.update(&request.max_frames.to_le_bytes());
     hasher.update(&frame_stride.to_le_bytes());
     update_ranges(&mut hasher, b"include", &request.include_ranges);
     update_ranges(&mut hasher, b"exclude", &request.exclude_ranges);
@@ -377,6 +472,27 @@ fn fingerprint_selection(
         hasher.update(&id.to_le_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// Format inclusive ranges as comma-separated `<id>` / `<start>-<end>` tokens.
+#[must_use]
+pub fn format_frame_id_ranges(ranges: &[FrameIdRange]) -> Option<String> {
+    if ranges.is_empty() {
+        return None;
+    }
+    Some(
+        ranges
+            .iter()
+            .map(|range| {
+                if range.start == range.end {
+                    range.start.to_string()
+                } else {
+                    format!("{}-{}", range.start, range.end)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 fn update_ranges(hasher: &mut blake3::Hasher, label: &[u8], ranges: &[FrameIdRange]) {
@@ -722,5 +838,100 @@ mod tests {
             EvaluationSplitKind::Holdout
         );
         assert!("bogus".parse::<EvaluationSplitKind>().is_err());
+    }
+
+    #[test]
+    fn gate_status_aggregates_failed_over_inapplicable_over_passed() {
+        assert_eq!(
+            aggregate_evaluation_gate_status([
+                EvaluationGateStatus::Passed,
+                EvaluationGateStatus::Passed,
+            ]),
+            EvaluationGateStatus::Passed
+        );
+        assert_eq!(
+            aggregate_evaluation_gate_status([
+                EvaluationGateStatus::Passed,
+                EvaluationGateStatus::Inapplicable,
+            ]),
+            EvaluationGateStatus::Inapplicable
+        );
+        assert_eq!(
+            aggregate_evaluation_gate_status([
+                EvaluationGateStatus::Inapplicable,
+                EvaluationGateStatus::Failed,
+            ]),
+            EvaluationGateStatus::Failed
+        );
+    }
+
+    #[test]
+    fn unrestorable_static_162_gate_is_not_passed() {
+        // Mirrors eval-suite behavior: static_162 check marked Inapplicable while
+        // other checks may still Pass — overall must not report Passed.
+        let status = aggregate_evaluation_gate_status([
+            EvaluationGateStatus::Passed,       // full_180
+            EvaluationGateStatus::Inapplicable, // static_162 unrestorable
+        ]);
+        assert_ne!(status, EvaluationGateStatus::Passed);
+        assert_eq!(status, EvaluationGateStatus::Inapplicable);
+    }
+
+    #[test]
+    fn selection_report_serializes_full_stable_ids_and_fingerprint() {
+        let source = dataset_with_ids(&[10, 20, 30, 40, 50]);
+        let selection = FrameSelection::select(
+            &source,
+            &FrameSelectionRequest {
+                include_ranges: vec![FrameIdRange { start: 20, end: 40 }],
+                max_frames: 2,
+                frame_stride: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = FrameSelectionReport::from_selection(
+            &selection,
+            Some("manifest-fp".into()),
+            Some("holdout".into()),
+        );
+        assert_eq!(report.stable_frame_ids, vec![20, 30]);
+        assert_eq!(
+            report.selection_fingerprint,
+            selection.selection_fingerprint
+        );
+        assert_eq!(report.max_frames, 2);
+        assert_eq!(report.frame_stride, 1);
+        assert_eq!(report.include_frame_ranges.as_deref(), Some("20-40"));
+        assert_eq!(report.manifest_fingerprint.as_deref(), Some("manifest-fp"));
+        assert_eq!(report.eval_split_kind.as_deref(), Some("holdout"));
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["stable_frame_ids"],
+            serde_json::json!([20, 30]),
+            "report must retain full stable IDs"
+        );
+        assert_eq!(
+            json["selection_fingerprint"],
+            serde_json::json!(selection.selection_fingerprint)
+        );
+        assert_eq!(json["max_frames"], serde_json::json!(2));
+        assert_eq!(json["frame_stride"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn fingerprint_is_independently_recomputable_from_request_fields() {
+        let source = dataset_with_ids(&[1, 2, 3, 4]);
+        let request = FrameSelectionRequest {
+            exclude_ranges: vec![FrameIdRange { start: 2, end: 2 }],
+            max_frames: 3,
+            frame_stride: 1,
+            allowed_ids: Some(vec![1, 2, 3, 4]),
+            ..Default::default()
+        };
+        let selection = FrameSelection::select(&source, &request).unwrap();
+        let recomputed = fingerprint_frame_selection(&selection.stable_ids, &selection.request());
+        assert_eq!(recomputed, selection.selection_fingerprint);
     }
 }

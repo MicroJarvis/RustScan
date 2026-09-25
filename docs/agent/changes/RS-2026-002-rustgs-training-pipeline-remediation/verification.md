@@ -1,5 +1,45 @@
 # RS-2026-002 Verification
 
+## C5 frame selection — review-fix (gate / report / checkpoint meta)
+
+| Field | Value |
+| --- | --- |
+| Review baseline | `a85d7a5` (prior P2 tip pin) |
+| Branch | `agent/RS-2026-002/c5-frame-selection` |
+| Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
+| Tip after this package | *(see commit after docs pin)* |
+
+C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+
+### Review findings closed this package
+
+| ID | Fix |
+| --- | --- |
+| Gate Inapplicable → Passed | `aggregate_evaluation_gate_status`: Failed > Inapplicable > Passed; suite `--fail-on-gate` exits non-zero on Failed **or** Inapplicable; lib test covers unrestorable static_162 ≠ Passed |
+| Eval report reproducibility | `FrameSelectionReport` with full `stable_frame_ids`, `selection_fingerprint`, max/stride/include/exclude, optional manifest/eval_split; suite JSON/MD + `evaluate_psnr --json` emit selection beside summary (not masked by post-preselect summary max=0/stride=1) |
+| Checkpoint selection validation | Reject duplicate train/eval stable IDs; holdout forbids train∩eval; loader IDs ⊆ train (oversample dups OK); fingerprint recomputed from stored request fields + IDs; v1/v2 still absent; v3 inherit unchanged |
+
+### Gate results
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo check --workspace --all-targets` | PASS with `POSELIB_ROOT` |
+| `cargo test -p rustscan-gs --lib --features gpu-wgpu -- --test-threads=1` | PASS: **216** |
+| `cargo test -p rustscan-gs --test checkpoint_resume --features gpu-wgpu -- --test-threads=1` | PASS: **63** |
+| `git diff --check` | PASS |
+
+### Known limitations
+
+- Clippy `-D warnings` remains red on the **pre-existing** rustscan-gs baseline (gradient_check / radix / prefix_sum / loss / optimizer / autodiff / forward / topology, etc.). Not part of this package’s touched surfaces.
+- C6–C8 not started.
+
+### Next action
+
+Independent re-review of this C5 package. Do **not** start C6, merge, push, or delete the worktree until review accepts.
+
 ## C5 frame selection — P2 review-fix (pending independent review)
 
 | Field | Value |

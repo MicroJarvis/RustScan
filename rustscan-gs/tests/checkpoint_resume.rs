@@ -7,9 +7,10 @@ use std::sync::{Arc, Barrier};
 
 use bincode::Options;
 use rustscan_gs::{
-    load_training_checkpoint, load_training_checkpoint_with_migration, save_training_checkpoint,
-    train_splats, AdamCheckpoint, AdamParameterCheckpoint, CheckpointFrameSelectionMeta,
-    CheckpointMigration, HostSplats, Intrinsics, ScenePose, TensorCheckpoint, TopologyCheckpoint,
+    fingerprint_frame_selection, load_training_checkpoint, load_training_checkpoint_with_migration,
+    resolve_checkpoint_selection, save_training_checkpoint, train_splats, AdamCheckpoint,
+    AdamParameterCheckpoint, CheckpointFrameSelectionMeta, CheckpointMigration,
+    FrameSelectionRequest, HostSplats, Intrinsics, ScenePose, TensorCheckpoint, TopologyCheckpoint,
     TrainingCheckpoint, TrainingCheckpointPolicy, TrainingCheckpointReason, TrainingConfig,
     TrainingControl, TrainingDataset, TrainingError, TrainingEvent, TrainingEventCadence,
     TrainingIdentity, TrainingOptions, TrainingRunDisposition, MAX_TRAINING_CHECKPOINT_BYTES,
@@ -1029,6 +1030,47 @@ fn tiny_training_dataset(
     dataset.add_point([0.0, 0.0, 2.0], Some([0.25, 0.5, 0.75]));
     dataset.add_point([0.25, -0.2, 2.5], Some([0.75, 0.25, 0.5]));
     dataset
+}
+
+fn verified_selection_meta(
+    train_ids: &[u64],
+    eval_ids: &[u64],
+    loader_ids: &[u64],
+    eval_split_kind: Option<&str>,
+) -> CheckpointFrameSelectionMeta {
+    let train_request = FrameSelectionRequest {
+        max_frames: 0,
+        frame_stride: 1,
+        ..Default::default()
+    };
+    let eval_request = FrameSelectionRequest {
+        max_frames: 0,
+        frame_stride: 1,
+        ..Default::default()
+    };
+    CheckpointFrameSelectionMeta {
+        eval_split_kind: eval_split_kind.map(str::to_string),
+        train_stable_ids: train_ids.to_vec(),
+        eval_stable_ids: eval_ids.to_vec(),
+        train_loader_frame_ids: loader_ids.to_vec(),
+        manifest_fingerprint: None,
+        selection_fingerprint: Some(fingerprint_frame_selection(train_ids, &train_request)),
+        eval_selection_fingerprint: if eval_ids.is_empty() {
+            None
+        } else {
+            Some(fingerprint_frame_selection(eval_ids, &eval_request))
+        },
+        max_frames: 0,
+        frame_stride: 1,
+        include_ranges: Vec::new(),
+        exclude_ranges: Vec::new(),
+        allowed_ids: None,
+        eval_max_frames: 0,
+        eval_frame_stride: 1,
+        eval_include_ranges: Vec::new(),
+        eval_exclude_ranges: Vec::new(),
+        eval_allowed_ids: None,
+    }
 }
 
 fn tiny_training_config(iterations: usize) -> TrainingConfig {
@@ -2199,6 +2241,7 @@ fn selection_metadata_roundtrips_and_v2_loads_as_absent() {
         manifest_fingerprint: Some("manifest-fp".into()),
         selection_fingerprint: Some("sel-fp".into()),
         eval_selection_fingerprint: Some("eval-sel-fp".into()),
+        ..Default::default()
     });
 
     let temp = tempfile::tempdir().unwrap();
@@ -2277,14 +2320,10 @@ fn resume_without_with_selection_inherits_v3_selection_through_save_reload() {
     let mut config = tiny_training_config(1);
     let identity =
         TrainingIdentity::from_canonical_content(&dataset, b"sel-inherit-recon", &config).unwrap();
-    let selection = CheckpointFrameSelectionMeta {
-        eval_split_kind: Some("in-view".into()),
-        train_stable_ids: vec![0, 1],
-        eval_stable_ids: vec![1],
-        train_loader_frame_ids: vec![0, 1],
-        manifest_fingerprint: Some("manifest-fp".into()),
-        selection_fingerprint: Some("sel-fp".into()),
-        eval_selection_fingerprint: Some("eval-sel-fp".into()),
+    let selection = {
+        let mut meta = verified_selection_meta(&[0, 1], &[1], &[0, 1], Some("in-view"));
+        meta.manifest_fingerprint = Some("manifest-fp".into());
+        meta
     };
 
     let captured = Rc::new(RefCell::new(None));
@@ -2338,6 +2377,81 @@ fn resume_without_with_selection_inherits_v3_selection_through_save_reload() {
     save_training_checkpoint(&second_path, &second).unwrap();
     let reloaded = load_training_checkpoint(&second_path).unwrap();
     assert_eq!(reloaded.selection.as_ref(), Some(&selection));
+}
+
+#[test]
+fn selection_meta_rejects_duplicate_train_stable_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-dup-train", 3);
+    let mut meta = verified_selection_meta(&[0, 1], &[], &[0, 1], None);
+    meta.train_stable_ids = vec![0, 0, 1];
+    // Fingerprint no longer matches after mutating IDs; either duplicate or fingerprint
+    // rejection is acceptable — prefer the duplicate check by clearing fingerprint.
+    meta.selection_fingerprint = None;
+    let err = resolve_checkpoint_selection(None, Some(&meta), &dataset).unwrap_err();
+    assert_invalid_input_contains(err, "duplicate stable id");
+}
+
+#[test]
+fn selection_meta_rejects_holdout_train_eval_overlap() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-holdout-overlap", 3);
+    let mut meta = verified_selection_meta(&[0, 1], &[1, 2], &[0, 1], Some("holdout"));
+    // Rebuild fingerprints after the intentional overlap.
+    meta.selection_fingerprint = Some(fingerprint_frame_selection(
+        &meta.train_stable_ids,
+        &FrameSelectionRequest {
+            max_frames: meta.max_frames,
+            frame_stride: meta.frame_stride.max(1),
+            ..Default::default()
+        },
+    ));
+    meta.eval_selection_fingerprint = Some(fingerprint_frame_selection(
+        &meta.eval_stable_ids,
+        &FrameSelectionRequest {
+            max_frames: meta.eval_max_frames,
+            frame_stride: meta.eval_frame_stride.max(1),
+            ..Default::default()
+        },
+    ));
+    let err = resolve_checkpoint_selection(None, Some(&meta), &dataset).unwrap_err();
+    assert_invalid_input_contains(err, "train/eval");
+}
+
+#[test]
+fn selection_meta_rejects_loader_id_outside_train_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-loader-oob", 3);
+    let mut meta = verified_selection_meta(&[0, 1], &[], &[0, 1, 2], None);
+    meta.selection_fingerprint = Some(fingerprint_frame_selection(
+        &meta.train_stable_ids,
+        &FrameSelectionRequest {
+            max_frames: 0,
+            frame_stride: 1,
+            ..Default::default()
+        },
+    ));
+    let err = resolve_checkpoint_selection(None, Some(&meta), &dataset).unwrap_err();
+    assert_invalid_input_contains(err, "outside the train selection");
+}
+
+#[test]
+fn selection_meta_allows_loader_oversample_duplicates_within_train() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-loader-dup-ok", 3);
+    let meta = verified_selection_meta(&[0, 1], &[], &[0, 1, 0, 1, 0], None);
+    let resolved = resolve_checkpoint_selection(None, Some(&meta), &dataset).unwrap();
+    assert_eq!(resolved.as_ref(), Some(&meta));
+}
+
+#[test]
+fn selection_meta_rejects_fingerprint_inconsistent_with_selection_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-fp-mismatch", 3);
+    let mut meta = verified_selection_meta(&[0, 1], &[], &[0, 1], None);
+    meta.selection_fingerprint = Some("not-the-recomputed-fingerprint".into());
+    let err = resolve_checkpoint_selection(None, Some(&meta), &dataset).unwrap_err();
+    assert_invalid_input_contains(err, "selection_fingerprint does not match");
 }
 
 #[test]

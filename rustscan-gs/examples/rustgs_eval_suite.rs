@@ -5,9 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use image::{ImageBuffer, RgbImage};
 use rustscan_gs::{
-    evaluate_splats, evaluation_device, load_colmap_training_dataset, load_splats_ply,
-    parse_frame_id_ranges, render_evaluation_frame, runtime_from_splats, ColmapConfig,
-    EvaluationDevice, EvaluationFrameMetric, FrameSelectionRequest, HostSplats,
+    aggregate_evaluation_gate_status, evaluate_splats, evaluation_device,
+    load_colmap_training_dataset, load_splats_ply, parse_frame_id_ranges, render_evaluation_frame,
+    runtime_from_splats, ColmapConfig, EvaluationDevice, EvaluationFrameMetric,
+    EvaluationGateStatus, FrameSelectionReport, FrameSelectionRequest, HostSplats,
     SplatEvaluationConfig, SplatEvaluationRenderer, SplatEvaluationSummary, TrainingDataset,
 };
 use serde::Serialize;
@@ -119,6 +120,8 @@ struct EvaluationCaseReport {
     frame_stride: usize,
     include_frame_ranges: Option<String>,
     exclude_frame_ranges: Option<String>,
+    /// Actual post-selection stable IDs and fingerprints (not summary max/stride).
+    selection: FrameSelectionReport,
     export_dir: Option<PathBuf>,
     summary: SplatEvaluationSummary,
 }
@@ -143,6 +146,26 @@ enum GateStatus {
     Failed,
     /// Old threshold must not be applied (e.g. historical static_162 cannot be restored).
     Inapplicable,
+}
+
+impl From<EvaluationGateStatus> for GateStatus {
+    fn from(status: EvaluationGateStatus) -> Self {
+        match status {
+            EvaluationGateStatus::Passed => Self::Passed,
+            EvaluationGateStatus::Failed => Self::Failed,
+            EvaluationGateStatus::Inapplicable => Self::Inapplicable,
+        }
+    }
+}
+
+impl From<GateStatus> for EvaluationGateStatus {
+    fn from(status: GateStatus) -> Self {
+        match status {
+            GateStatus::Passed => Self::Passed,
+            GateStatus::Failed => Self::Failed,
+            GateStatus::Inapplicable => Self::Inapplicable,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -271,13 +294,24 @@ fn main() -> anyhow::Result<()> {
         if let Some(export_dir) = export_dir.as_ref() {
             summary.crop_outputs.push(export_dir.join("summary.tsv"));
         }
+        let include_frame_ranges = case.include_frame_ranges.map(str::to_string);
+        let exclude_frame_ranges = case.exclude_frame_ranges.map(str::to_string);
+        let mut selection_report = FrameSelectionReport::from_selection(&selection, None, None);
+        // Prefer the human-readable CLI/case strings when present.
+        if include_frame_ranges.is_some() {
+            selection_report.include_frame_ranges = include_frame_ranges.clone();
+        }
+        if exclude_frame_ranges.is_some() {
+            selection_report.exclude_frame_ranges = exclude_frame_ranges.clone();
+        }
         reports.push(EvaluationCaseReport {
             name: case.name.to_string(),
             title: case.title.to_string(),
-            max_frames: case.max_frames,
-            frame_stride: case.frame_stride,
-            include_frame_ranges: case.include_frame_ranges.map(str::to_string),
-            exclude_frame_ranges: case.exclude_frame_ranges.map(str::to_string),
+            max_frames: selection.max_frames,
+            frame_stride: selection.frame_stride,
+            include_frame_ranges,
+            exclude_frame_ranges,
+            selection: selection_report,
             export_dir,
             summary,
         });
@@ -305,13 +339,13 @@ fn main() -> anyhow::Result<()> {
     println!("summary_json={}", summary_json.display());
     println!("summary_md={}", summary_md.display());
 
-    if args.fail_on_gate
-        && matches!(
-            report.gate.as_ref().map(|gate| gate.status),
-            Some(GateStatus::Failed)
-        )
-    {
-        std::process::exit(2);
+    if args.fail_on_gate {
+        match report.gate.as_ref().map(|gate| gate.status) {
+            Some(GateStatus::Failed) | Some(GateStatus::Inapplicable) => {
+                std::process::exit(2);
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -429,14 +463,12 @@ fn evaluate_gate(
         );
     }
 
-    let status = if checks
-        .iter()
-        .any(|check| check.status == GateStatus::Failed)
-    {
-        GateStatus::Failed
-    } else {
-        GateStatus::Passed
-    };
+    let status = aggregate_evaluation_gate_status(
+        checks
+            .iter()
+            .map(|check| EvaluationGateStatus::from(check.status)),
+    )
+    .into();
     GateReport {
         profile: profile.to_string(),
         status,
@@ -520,8 +552,8 @@ fn render_markdown(report: &SuiteReport) -> String {
     if let Some(profile_hint) = report.profile_hint.as_ref() {
         out.push_str(&format!("profile: `{profile_hint}`\n\n"));
     }
-    out.push_str("| Case | Frames | PSNR mean | PSNR min | Grad ratio | Lap ratio | Splats | Worst frame |\n");
-    out.push_str("|---|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Case | Frames | Selection FP | PSNR mean | PSNR min | Grad ratio | Lap ratio | Splats | Worst frame |\n");
+    out.push_str("|---|---:|---|---:|---:|---:|---:|---:|---|\n");
     for case in &report.cases {
         let summary = &case.summary;
         let worst = summary
@@ -529,16 +561,43 @@ fn render_markdown(report: &SuiteReport) -> String {
             .first()
             .map(|frame| format!("{} ({:.4} dB)", frame.frame_id, frame.psnr_db))
             .unwrap_or_else(|| "-".to_string());
+        let fp_short = case
+            .selection
+            .selection_fingerprint
+            .chars()
+            .take(12)
+            .collect::<String>();
         out.push_str(&format!(
-            "| {} | {} | {:.4} | {:.4} | {:.4} | {:.4} | {} | {} |\n",
+            "| {} | {} | `{}…` | {:.4} | {:.4} | {:.4} | {:.4} | {} | {} |\n",
             case.name,
-            summary.frame_count,
+            case.selection.stable_frame_ids.len(),
+            fp_short,
             summary.psnr_mean_db,
             summary.psnr_min_db,
             summary.sharpness_grad_ratio_mean,
             summary.sharpness_lap_ratio_mean,
             summary.splat_count,
             worst
+        ));
+    }
+    out.push_str("\n## Frame selection\n\n");
+    for case in &report.cases {
+        out.push_str(&format!("### {}\n\n", case.name));
+        out.push_str(&format!(
+            "- max_frames: {}\n- frame_stride: {}\n- include: {}\n- exclude: {}\n- selection_fingerprint: `{}`\n- stable_frame_ids ({}): `{:?}`\n\n",
+            case.selection.max_frames,
+            case.selection.frame_stride,
+            case.selection
+                .include_frame_ranges
+                .as_deref()
+                .unwrap_or("-"),
+            case.selection
+                .exclude_frame_ranges
+                .as_deref()
+                .unwrap_or("-"),
+            case.selection.selection_fingerprint,
+            case.selection.stable_frame_ids.len(),
+            case.selection.stable_frame_ids,
         ));
     }
     if let Some(gate) = report.gate.as_ref() {

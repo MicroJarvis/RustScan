@@ -1307,21 +1307,32 @@ fn checkpoint_selection_meta_from_frame_plan(
             .into_iter()
             .filter_map(|idx| loader_dataset.poses.get(idx).map(|pose| pose.frame_id))
             .collect();
+    let train = &frame_plan.train;
+    let eval = frame_plan.eval.as_ref();
     rustscan_gs::CheckpointFrameSelectionMeta {
         eval_split_kind: frame_plan.eval_split_kind.map(|kind| kind.to_string()),
-        train_stable_ids: frame_plan.train.stable_ids.clone(),
-        eval_stable_ids: frame_plan
-            .eval
-            .as_ref()
+        train_stable_ids: train.stable_ids.clone(),
+        eval_stable_ids: eval
             .map(|selection| selection.stable_ids.clone())
             .unwrap_or_default(),
         train_loader_frame_ids,
         manifest_fingerprint: frame_plan.manifest_fingerprint.clone(),
-        selection_fingerprint: Some(frame_plan.train.selection_fingerprint.clone()),
-        eval_selection_fingerprint: frame_plan
-            .eval
-            .as_ref()
-            .map(|selection| selection.selection_fingerprint.clone()),
+        selection_fingerprint: Some(train.selection_fingerprint.clone()),
+        eval_selection_fingerprint: eval.map(|selection| selection.selection_fingerprint.clone()),
+        max_frames: train.max_frames,
+        frame_stride: train.frame_stride,
+        include_ranges: train.include_ranges.clone(),
+        exclude_ranges: train.exclude_ranges.clone(),
+        allowed_ids: train.allowed_ids.clone(),
+        eval_max_frames: eval.map(|selection| selection.max_frames).unwrap_or(0),
+        eval_frame_stride: eval.map(|selection| selection.frame_stride).unwrap_or(0),
+        eval_include_ranges: eval
+            .map(|selection| selection.include_ranges.clone())
+            .unwrap_or_default(),
+        eval_exclude_ranges: eval
+            .map(|selection| selection.exclude_ranges.clone())
+            .unwrap_or_default(),
+        eval_allowed_ids: eval.and_then(|selection| selection.allowed_ids.clone()),
     }
 }
 

@@ -4,8 +4,9 @@ use image::{ImageBuffer, RgbImage};
 use rustscan_gs::{
     evaluate_splats, evaluation_device, load_colmap_training_dataset, load_splats_ply,
     parse_frame_id_ranges, render_evaluation_frame, runtime_from_splats, ColmapConfig,
-    EvaluationDevice, EvaluationFrameMetric, FrameSelection, FrameSelectionRequest, HostSplats,
-    SplatEvaluationConfig, SplatEvaluationRenderer, SplatEvaluationSummary,
+    EvaluationDevice, EvaluationFrameMetric, FrameSelection, FrameSelectionReport,
+    FrameSelectionRequest, HostSplats, SplatEvaluationConfig, SplatEvaluationRenderer,
+    SplatEvaluationSummary,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -63,7 +64,23 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&result.summary)?);
+        #[derive(serde::Serialize)]
+        struct EvaluatePsnrJsonReport<'a> {
+            summary: &'a SplatEvaluationSummary,
+            selection: FrameSelectionReport,
+        }
+        let mut selection_report = FrameSelectionReport::from_selection(&selection, None, None);
+        if args.include_frame_ranges.is_some() {
+            selection_report.include_frame_ranges = args.include_frame_ranges.clone();
+        }
+        if args.exclude_frame_ranges.is_some() {
+            selection_report.exclude_frame_ranges = args.exclude_frame_ranges.clone();
+        }
+        let report = EvaluatePsnrJsonReport {
+            summary: &result.summary,
+            selection: selection_report,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_human_summary(&args, &result.summary, &selection);
     }
@@ -231,11 +248,12 @@ fn print_human_summary(args: &Args, summary: &SplatEvaluationSummary, selection:
         summary.raster_cov_blur,
         summary.render_width,
         summary.render_height,
-        summary.frame_count,
+        selection.stable_ids.len(),
         selection.frame_stride,
         selection.max_frames,
         selection.selection_fingerprint,
     );
+    println!("stable_frame_ids={:?}", selection.stable_ids);
     println!(
         "splat_metadata iterations={} splat_count={} final_loss={} final_step_loss={}",
         summary.splat_iterations,

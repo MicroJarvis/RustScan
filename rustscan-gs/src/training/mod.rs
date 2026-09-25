@@ -37,21 +37,23 @@ pub use checkpoint::{
     TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2,
 };
 pub use evaluation::{
+    aggregate_evaluation_gate_status, compute_psnr_f32, fingerprint_frame_selection,
+    format_frame_id_ranges, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,
+    select_evaluation_frames, static_162_allowed_stable_ids,
+    static_162_allowed_stable_ids_from_candidates, summarize_psnr_samples,
+    summarize_training_metrics, worst_frame_metrics, EvaluationDevice, EvaluationFrameMetric,
+    EvaluationGateStatus, EvaluationSplitKind, FinalTrainingMetrics, FrameIdRange, FrameSelection,
+    FrameSelectionReport, FrameSelectionRequest, FrameSplitManifest, PsnrSummary,
+    SplatEvaluationConfig, SplatEvaluationError, SplatEvaluationResult, SplatEvaluationSummary,
+    MIN_RENDER_SCALE,
+};
+pub use evaluation::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
     parity_fixture_id_for_input_path, resolve_litegs_parity_fixture_input_path,
     resolve_litegs_parity_reference_report_path, ColmapFrameCandidate, ParityCheckOutcome,
     ParityCheckStatus, ParityFixtureKind, ParityFixtureSpec, ParityGateEvaluation,
     ParityGateStatus, ParityHarnessReport, ParityMetricSnapshot, ParityReferenceComparison,
     ParityThresholds, ParityTimingMetrics, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_TINY_FIXTURE_ID,
-};
-pub use evaluation::{
-    compute_psnr_f32, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,
-    select_evaluation_frames, static_162_allowed_stable_ids,
-    static_162_allowed_stable_ids_from_candidates, summarize_psnr_samples,
-    summarize_training_metrics, worst_frame_metrics, EvaluationDevice, EvaluationFrameMetric,
-    EvaluationSplitKind, FinalTrainingMetrics, FrameIdRange, FrameSelection, FrameSelectionRequest,
-    FrameSplitManifest, PsnrSummary, SplatEvaluationConfig, SplatEvaluationError,
-    SplatEvaluationResult, SplatEvaluationSummary, MIN_RENDER_SCALE,
 };
 #[cfg(feature = "gpu")]
 pub use evaluation::{
