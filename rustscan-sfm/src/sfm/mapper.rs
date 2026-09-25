@@ -19699,46 +19699,144 @@ mod tests {
             &db_path,
             &frames,
             &setup,
-            &[pair01, pair12],
+            &[pair01.clone(), pair12.clone()],
             FeatureType::Sift,
         )?;
         assert!(written >= 10);
         let db = ColmapDatabase::open(&db_path)?;
-        let after = MapperLogicalDbSnapshot::capture(&db)?;
-        assert_eq!(after.images.len(), 4);
-        assert!(after.images.iter().any(|image| image.name == "seed.jpg"));
-        assert!(after.images.iter().any(|image| image.name == "left.jpg"));
-        assert!(after.images.iter().any(|image| image.name == "right.jpg"));
-        assert!(after.images.iter().any(|image| image.name == "extra.jpg"));
-        assert_eq!(after.matches.len(), 2);
-        assert_eq!(after.geometries.len(), 2);
-        assert!(after.geometries.iter().any(|(_, geometry)| {
-            geometry.tvec == Some([2.0, 0.0, 0.0])
-                && geometry.inlier_matches == vec![FeatureMatch::new(0, 1)]
-        }));
-        assert!(after.geometries.iter().any(|(_, geometry)| {
-            geometry.tvec == Some([0.0, 2.0, 0.0])
-                && geometry.inlier_matches == vec![FeatureMatch::new(0, 1)]
-        }));
-        assert!(after
-            .keypoints
-            .iter()
-            .any(|(id, points)| { *id == 7001 && points == &vec![ColmapKeypoint::new(9.0, 8.0)] }));
-        // Exactly one successful populate: no duplicate image names.
-        let names = after
-            .images
-            .iter()
-            .map(|image| image.name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
+
+        let seed = db.read_image_with_name("seed.jpg")?.expect("seed");
+        let left = db.read_image_with_name("left.jpg")?.expect("left");
+        let right = db.read_image_with_name("right.jpg")?.expect("right");
+        let extra = db.read_image_with_name("extra.jpg")?.expect("extra");
+        assert_eq!(seed.image_id, 7001);
+        assert_eq!(seed.camera_id, 77);
+        assert_eq!(left.image_id, setup.image_ids[0]);
+        assert_eq!(right.image_id, setup.image_ids[1]);
+        assert_eq!(extra.image_id, setup.image_ids[2]);
         assert_eq!(
-            names,
-            ["extra.jpg", "left.jpg", "right.jpg", "seed.jpg"]
-                .into_iter()
-                .collect()
+            left.camera_id,
+            setup.camera_ids[setup.image_camera_indices[0]]
         );
+        assert_eq!(
+            right.camera_id,
+            setup.camera_ids[setup.image_camera_indices[1]]
+        );
+        assert_eq!(
+            extra.camera_id,
+            setup.camera_ids[setup.image_camera_indices[2]]
+        );
+
+        let expected_frame_keypoints = |frame: &crate::types::ImageFrame| {
+            frame
+                .sift
+                .keypoints
+                .iter()
+                .map(ColmapKeypoint::from)
+                .collect::<Vec<_>>()
+        };
+        let expected_frame_descriptors =
+            |frame: &crate::types::ImageFrame| -> Result<ColmapDescriptors> {
+                let rows = frame.sift.descriptors.len();
+                const DESCRIPTOR_LEN: usize = 128;
+                let mut data = Vec::with_capacity(rows.saturating_mul(DESCRIPTOR_LEN));
+                for descriptor in &frame.sift.descriptors {
+                    for value in descriptor.as_slice() {
+                        data.push((value.clamp(0.0, 1.0) * 512.0).round() as u8);
+                    }
+                }
+                ColmapDescriptors::new(
+                    crate::database::COLMAP_FEATURE_SIFT,
+                    rows,
+                    DESCRIPTOR_LEN,
+                    data,
+                )
+            };
+
+        let pair01_id =
+            crate::correspondence_graph::image_pair_to_pair_id(left.image_id, right.image_id)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let pair12_id =
+            crate::correspondence_graph::image_pair_to_pair_id(right.image_id, extra.image_id)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+
+        let mut expected_cameras = vec![ColmapDatabaseCamera {
+            camera: crate::colmap::ColmapCamera {
+                camera_id: 77,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 64,
+                height: 48,
+                params: vec![40.0, 40.0, 32.0, 24.0],
+            },
+            has_prior_focal_length: true,
+        }];
+        for (camera_idx, camera) in setup.cameras.iter().enumerate() {
+            expected_cameras.push(ColmapDatabaseCamera {
+                camera: crate::colmap::ColmapCamera {
+                    camera_id: setup.camera_ids[camera_idx],
+                    model_id: camera.model_id,
+                    width: camera.width,
+                    height: camera.height,
+                    params: camera.params_slice()[..camera.num_params].to_vec(),
+                },
+                has_prior_focal_length: setup
+                    .camera_has_prior_focal_length
+                    .get(camera_idx)
+                    .copied()
+                    .unwrap_or(true),
+            });
+        }
+        expected_cameras.sort_by_key(|camera| camera.camera.camera_id);
+
+        let mut expected_images = vec![seed, left.clone(), right.clone(), extra.clone()];
+        expected_images.sort_by_key(|image| image.image_id);
+
+        let mut expected_keypoints = vec![
+            (7001, vec![ColmapKeypoint::new(9.0, 8.0)]),
+            (left.image_id, expected_frame_keypoints(&frames[0])),
+            (right.image_id, expected_frame_keypoints(&frames[1])),
+            (extra.image_id, expected_frame_keypoints(&frames[2])),
+        ];
+        expected_keypoints.sort_by_key(|(image_id, _)| *image_id);
+
+        let mut expected_descriptors = vec![
+            (7001, ColmapDescriptors::new(-1, 0, 0, Vec::new())?),
+            (left.image_id, expected_frame_descriptors(&frames[0])?),
+            (right.image_id, expected_frame_descriptors(&frames[1])?),
+            (extra.image_id, expected_frame_descriptors(&frames[2])?),
+        ];
+        expected_descriptors.sort_by_key(|(image_id, _)| *image_id);
+
+        let mut expected_matches = vec![
+            (pair01_id, vec![FeatureMatch::new(0, 1)]),
+            (pair12_id, vec![FeatureMatch::new(0, 1)]),
+        ];
+        expected_matches.sort_by_key(|(pair_id, _)| *pair_id);
+        let mut expected_geometries = vec![
+            (
+                pair01_id,
+                pair_geometry_to_colmap_two_view_geometry(&pair01),
+            ),
+            (
+                pair12_id,
+                pair_geometry_to_colmap_two_view_geometry(&pair12),
+            ),
+        ];
+        expected_geometries.sort_by_key(|(pair_id, _)| *pair_id);
+
+        let expected = MapperLogicalDbSnapshot {
+            cameras: expected_cameras,
+            images: expected_images,
+            keypoints: expected_keypoints,
+            descriptors: expected_descriptors,
+            matches: expected_matches,
+            geometries: expected_geometries,
+        };
+        assert_eq!(MapperLogicalDbSnapshot::capture(&db)?, expected);
         Ok(())
     }
 
+    #[test]
     fn resolve_mapper_database_path_allows_missing_output_for_local_write() -> Result<()> {
         let dir = tempdir()?;
         let missing = dir.path().join("new.db");
@@ -20671,6 +20769,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     fn run_incremental_pipeline_reports_success_status() {
         let camera = CameraModel::new_pinhole(200, 160, 80.0, 80.0, 100.0, 80.0);
         let poses = [

@@ -1078,9 +1078,8 @@ impl ColmapDatabase {
     fn try_rollback_transaction(&self) -> Result<()> {
         #[cfg(test)]
         if let Some(message) = transaction_test_hooks::take_force_rollback_failure() {
-            // Keep the connection usable: perform the real ROLLBACK, then
-            // surface a synthetic cleanup failure for error-chaining tests.
-            let _ = self.conn.execute_batch("ROLLBACK;");
+            // Model a cleanup failure while the transaction is still active:
+            // do not ROLLBACK here.
             bail!("{message}");
         }
         match self.conn.execute_batch("ROLLBACK;") {
@@ -1088,6 +1087,25 @@ impl ColmapDatabase {
             Err(error) if is_inactive_transaction_error(&error) => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    #[cfg(test)]
+    fn has_open_transaction_for_test(&self) -> bool {
+        !self.conn.is_autocommit()
+    }
+
+    #[cfg(test)]
+    fn rollback_open_transaction_for_test(&self) -> Result<()> {
+        match self.conn.execute_batch("ROLLBACK;") {
+            Ok(()) => Ok(()),
+            Err(error) if is_inactive_transaction_error(&error) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_database_entry_deleted_for_test(&self, deleted: bool) {
+        self.database_entry_deleted.set(deleted);
     }
 
     pub fn exists_rig(&self, rig_id: u32) -> Result<bool> {
@@ -3560,6 +3578,7 @@ mod transaction_test_hooks {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -5969,18 +5988,80 @@ mod tests {
     }
 
     #[test]
-    fn with_transaction_chains_cleanup_failure_without_restoring_bookkeeping() {
+    fn with_transaction_successful_rollback_restores_deleted_false() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        write_test_camera(&db, 1);
+        write_test_images(&db, 1, &[1, 2]);
+        let original = vec![m(0, 1)];
+        db.write_matches(1, 2, &original).unwrap();
+        assert!(!db.database_entry_deleted.get());
+        let before = LogicalDbSnapshot::capture(&db);
+
+        let err = db
+            .with_transaction(|| -> Result<()> {
+                db.delete_matches(1, 2)?;
+                assert!(db.database_entry_deleted.get());
+                db.write_matches(1, 2, &[m(9, 9)])?;
+                bail!("t6-injected-failure-deleted-false")
+            })
+            .unwrap_err();
+        assert!(error_chain_string(&err).contains("t6-injected-failure-deleted-false"));
+        assert!(!db.has_open_transaction_for_test());
+        assert!(!db.database_entry_deleted.get());
+        assert_eq!(LogicalDbSnapshot::capture(&db), before);
+
+        db.delete_matches(1, 2).unwrap();
+        db.write_matches(1, 2, &[m(3, 4)]).unwrap();
+        assert_eq!(db.read_matches(1, 2).unwrap(), vec![m(3, 4)]);
+    }
+
+    #[test]
+    fn with_transaction_successful_rollback_restores_deleted_true() {
         let dir = tempdir().unwrap();
         let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
         write_test_camera(&db, 1);
         write_test_images(&db, 1, &[1, 2]);
         db.write_matches(1, 2, &[m(0, 1)]).unwrap();
         db.delete_matches(1, 2).unwrap();
+        db.write_matches(1, 2, &[m(0, 1)]).unwrap();
         assert!(db.database_entry_deleted.get());
+        let before = LogicalDbSnapshot::capture(&db);
+
+        let err = db
+            .with_transaction(|| -> Result<()> {
+                // Differ from deleted_before so restore-to-true is observable.
+                db.set_database_entry_deleted_for_test(false);
+                assert!(!db.database_entry_deleted.get());
+                db.clear_matches()?;
+                db.write_matches(1, 2, &[m(9, 9)])?;
+                bail!("t6-injected-failure-deleted-true")
+            })
+            .unwrap_err();
+        assert!(error_chain_string(&err).contains("t6-injected-failure-deleted-true"));
+        assert!(!db.has_open_transaction_for_test());
+        assert!(
+            db.database_entry_deleted.get(),
+            "successful cleanup must restore deleted_before=true"
+        );
+        assert_eq!(LogicalDbSnapshot::capture(&db), before);
+    }
+
+    #[test]
+    fn with_transaction_cleanup_failure_preserves_errors_and_current_bookkeeping() {
+        let dir = tempdir().unwrap();
+        let db = ColmapDatabase::open(dir.path().join("database.db")).unwrap();
+        write_test_camera(&db, 1);
+        write_test_images(&db, 1, &[1, 2]);
+        let original = vec![m(0, 1)];
+        db.write_matches(1, 2, &original).unwrap();
+        assert!(!db.database_entry_deleted.get());
 
         transaction_test_hooks::force_rollback_failure("forced ROLLBACK failure");
         let err = db
             .with_transaction(|| -> Result<()> {
+                db.delete_matches(1, 2)?;
+                assert!(db.database_entry_deleted.get());
                 db.write_matches(1, 2, &[m(5, 6)])?;
                 bail!("t6-original-operation-failure")
             })
@@ -5994,8 +6075,144 @@ mod tests {
             chain.contains("forced ROLLBACK failure"),
             "cleanup failure must be chained: {chain}"
         );
-        // Cleanup reported failure: do not pretend pre-op bookkeeping was restored.
-        assert!(db.database_entry_deleted.get());
+        assert!(
+            db.has_open_transaction_for_test(),
+            "failed cleanup must leave the transaction active"
+        );
+        assert!(
+            db.database_entry_deleted.get(),
+            "must not restore deleted_before=false while cleanup failed"
+        );
+
+        // Explicitly finish the open transaction and leave the connection usable.
+        db.rollback_open_transaction_for_test().unwrap();
+        assert!(!db.has_open_transaction_for_test());
+        assert_eq!(db.read_matches(1, 2).unwrap(), original);
+        db.set_database_entry_deleted_for_test(false);
+        db.delete_matches(1, 2).unwrap();
+        db.write_matches(1, 2, &[m(3, 4)]).unwrap();
+        assert_eq!(db.read_matches(1, 2).unwrap(), vec![m(3, 4)]);
+    }
+
+    fn camera_sensor(camera_id: u32) -> ColmapSensorId {
+        ColmapSensorId {
+            sensor_type: ColmapSensorType::Camera,
+            sensor_id: camera_id,
+        }
+    }
+
+    fn write_merge_side_with_relationships(
+        db: &ColmapDatabase,
+        camera: &ColmapDatabaseCamera,
+        left_id: ImageId,
+        right_id: ImageId,
+        left_name: &str,
+        right_name: &str,
+        left_kp: ColmapKeypoint,
+        right_kp: ColmapKeypoint,
+        left_desc: &[u8],
+        match_payload: FeatureMatch,
+        geometry: &ColmapTwoViewGeometry,
+        rig_id: u32,
+        frame_id: u32,
+        pose_prior_id: u32,
+        pose_position: [f64; 3],
+    ) {
+        db.write_camera(camera, true).unwrap();
+        let camera_id = camera.camera.camera_id;
+        db.write_image(
+            &ColmapDatabaseImage {
+                image_id: left_id,
+                name: left_name.to_string(),
+                camera_id,
+                frame_id: None,
+            },
+            true,
+        )
+        .unwrap();
+        db.write_image(
+            &ColmapDatabaseImage {
+                image_id: right_id,
+                name: right_name.to_string(),
+                camera_id,
+                frame_id: None,
+            },
+            true,
+        )
+        .unwrap();
+        db.write_keypoints(left_id, &[left_kp]).unwrap();
+        db.write_keypoints(right_id, &[right_kp]).unwrap();
+        db.write_descriptors(
+            left_id,
+            &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, left_desc.len(), left_desc.to_vec())
+                .unwrap(),
+        )
+        .unwrap();
+        db.write_descriptors(
+            right_id,
+            &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![1, 2]).unwrap(),
+        )
+        .unwrap();
+        let sensor = camera_sensor(camera_id);
+        db.write_rig(
+            &ColmapRig {
+                rig_id,
+                ref_sensor_id: Some(sensor.clone()),
+                sensors: vec![ColmapRigSensor {
+                    sensor_id: sensor.clone(),
+                    sensor_from_rig: None,
+                }],
+            },
+            true,
+        )
+        .unwrap();
+        db.write_frame(
+            &ColmapDatabaseFrame {
+                frame_id,
+                rig_id,
+                data_ids: vec![
+                    ColmapDataId {
+                        sensor_id: sensor.clone(),
+                        data_id: left_id as u64,
+                    },
+                    ColmapDataId {
+                        sensor_id: sensor.clone(),
+                        data_id: right_id as u64,
+                    },
+                ],
+            },
+            true,
+        )
+        .unwrap();
+        db.write_pose_prior(
+            &ColmapPosePrior {
+                pose_prior_id,
+                corr_data_id: ColmapDataId {
+                    sensor_id: sensor,
+                    data_id: left_id as u64,
+                },
+                position: pose_position,
+                position_covariance: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                coordinate_system: ColmapPosePriorCoordinateSystem::Cartesian,
+                gravity: [0.0, 0.0, 1.0],
+            },
+            true,
+        )
+        .unwrap();
+        db.write_matches(left_id, right_id, &[match_payload])
+            .unwrap();
+        db.write_two_view_geometry(left_id, right_id, geometry)
+            .unwrap();
+    }
+
+    fn require_image(db: &ColmapDatabase, name: &str) -> ColmapDatabaseImage {
+        db.read_image_with_name(name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing image {name}"))
+    }
+
+    fn pair_id(image_id1: ImageId, image_id2: ImageId) -> crate::correspondence_graph::ImagePairId {
+        crate::correspondence_graph::image_pair_to_pair_id(image_id1, image_id2).unwrap()
     }
 
     #[test]
@@ -6008,136 +6225,118 @@ mod tests {
         let merged_path = dir.path().join("merged.db");
         let merged = ColmapDatabase::open(&merged_path).unwrap();
 
-        // Distinctive pre-existing target payload across relationship tables.
-        write_test_camera(&merged, 99);
-        merged
-            .write_image(
-                &ColmapDatabaseImage {
-                    image_id: 9001,
-                    name: "preexisting-left.jpg".to_string(),
-                    camera_id: 99,
-                    frame_id: None,
-                },
-                true,
-            )
-            .unwrap();
-        merged
-            .write_image(
-                &ColmapDatabaseImage {
-                    image_id: 9002,
-                    name: "preexisting-right.jpg".to_string(),
-                    camera_id: 99,
-                    frame_id: None,
-                },
-                true,
-            )
-            .unwrap();
-        merged
-            .write_keypoints(9001, &[ColmapKeypoint::new(42.0, 24.0)])
-            .unwrap();
-        merged
-            .write_keypoints(9002, &[ColmapKeypoint::new(11.0, 12.0)])
-            .unwrap();
-        merged
-            .write_descriptors(
-                9001,
-                &ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![9, 8]).unwrap(),
-            )
-            .unwrap();
-        merged.write_matches(9001, 9002, &[m(0, 0)]).unwrap();
-        merged
-            .write_two_view_geometry(
-                9001,
-                9002,
-                &ColmapTwoViewGeometry {
-                    config: 2,
-                    inlier_matches: vec![m(0, 0)],
-                    qvec: Some([1.0, 0.0, 0.0, 0.0]),
-                    tvec: Some([0.0, 0.0, 1.0]),
-                    ..ColmapTwoViewGeometry::default()
-                },
-            )
-            .unwrap();
-        // Business deletion path: mark bookkeeping true before the merge txn.
+        let preexisting_camera = ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 99,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 64,
+                height: 48,
+                params: vec![40.0, 40.0, 32.0, 24.0],
+            },
+            has_prior_focal_length: true,
+        };
+        let preexisting_geometry = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: vec![m(0, 0)],
+            qvec: Some([1.0, 0.0, 0.0, 0.0]),
+            tvec: Some([0.0, 0.0, 1.0]),
+            ..ColmapTwoViewGeometry::default()
+        };
+        write_merge_side_with_relationships(
+            &merged,
+            &preexisting_camera,
+            9001,
+            9002,
+            "preexisting-left.jpg",
+            "preexisting-right.jpg",
+            ColmapKeypoint::new(42.0, 24.0),
+            ColmapKeypoint::new(11.0, 12.0),
+            &[9, 8],
+            m(0, 0),
+            &preexisting_geometry,
+            7,
+            8,
+            9,
+            [9.0, 8.0, 7.0],
+        );
+        // Business deletion path: deleted_before=true for the merge txn.
         merged.delete_matches(9001, 9002).unwrap();
         merged.write_matches(9001, 9002, &[m(0, 0)]).unwrap();
         assert!(merged.database_entry_deleted.get());
         let before = LogicalDbSnapshot::capture(&merged);
+        assert!(!before.rigs.is_empty());
+        assert!(!before.frames.is_empty());
+        assert!(!before.pose_priors.is_empty());
 
-        write_test_camera(&db1, 1);
-        write_test_camera(&db2, 2);
-        db1.write_image(
-            &ColmapDatabaseImage {
-                image_id: 1,
-                name: "a-left.jpg".to_string(),
-                camera_id: 1,
-                frame_id: None,
+        let camera1 = ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 11,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 100,
+                height: 100,
+                params: vec![50.0, 50.0, 50.0, 50.0],
             },
-            true,
-        )
-        .unwrap();
-        db1.write_image(
-            &ColmapDatabaseImage {
-                image_id: 2,
-                name: "a-right.jpg".to_string(),
-                camera_id: 1,
-                frame_id: None,
+            has_prior_focal_length: true,
+        };
+        let camera2 = ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 22,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 120,
+                height: 80,
+                params: vec![60.0, 60.0, 60.0, 40.0],
             },
-            true,
-        )
-        .unwrap();
-        db2.write_image(
-            &ColmapDatabaseImage {
-                image_id: 3,
-                name: "b-left.jpg".to_string(),
-                camera_id: 2,
-                frame_id: None,
-            },
-            true,
-        )
-        .unwrap();
-        db2.write_image(
-            &ColmapDatabaseImage {
-                image_id: 4,
-                name: "b-right.jpg".to_string(),
-                camera_id: 2,
-                frame_id: None,
-            },
-            true,
-        )
-        .unwrap();
-        db1.write_keypoints(1, &[ColmapKeypoint::new(1.0, 2.0)])
-            .unwrap();
-        db1.write_keypoints(2, &[ColmapKeypoint::new(3.0, 4.0)])
-            .unwrap();
-        db2.write_keypoints(3, &[ColmapKeypoint::new(5.0, 6.0)])
-            .unwrap();
-        db2.write_keypoints(4, &[ColmapKeypoint::new(7.0, 8.0)])
-            .unwrap();
-        db1.write_matches(1, 2, &[m(0, 0)]).unwrap();
-        db2.write_matches(3, 4, &[m(0, 0)]).unwrap();
-        db1.write_two_view_geometry(
+            has_prior_focal_length: false,
+        };
+        let geom1 = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: vec![m(0, 0)],
+            qvec: Some([1.0, 0.0, 0.0, 0.0]),
+            tvec: Some([1.0, 0.0, 0.0]),
+            ..ColmapTwoViewGeometry::default()
+        };
+        let geom2 = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: vec![m(0, 0)],
+            qvec: Some([1.0, 0.0, 0.0, 0.0]),
+            tvec: Some([0.0, 1.0, 0.0]),
+            ..ColmapTwoViewGeometry::default()
+        };
+        write_merge_side_with_relationships(
+            &db1,
+            &camera1,
             1,
             2,
-            &ColmapTwoViewGeometry {
-                config: 2,
-                inlier_matches: vec![m(0, 0)],
-                ..ColmapTwoViewGeometry::default()
-            },
-        )
-        .unwrap();
-        db2.write_two_view_geometry(
+            "a-left.jpg",
+            "a-right.jpg",
+            ColmapKeypoint::new(1.0, 2.0),
+            ColmapKeypoint::new(3.0, 4.0),
+            &[3, 4],
+            m(0, 0),
+            &geom1,
+            31,
+            51,
+            71,
+            [1.0, 2.0, 3.0],
+        );
+        write_merge_side_with_relationships(
+            &db2,
+            &camera2,
             3,
             4,
-            &ColmapTwoViewGeometry {
-                config: 2,
-                inlier_matches: vec![m(0, 0)],
-                ..ColmapTwoViewGeometry::default()
-            },
-        )
-        .unwrap();
+            "b-left.jpg",
+            "b-right.jpg",
+            ColmapKeypoint::new(5.0, 6.0),
+            ColmapKeypoint::new(7.0, 8.0),
+            &[5, 6],
+            m(0, 0),
+            &geom2,
+            41,
+            61,
+            81,
+            [4.0, 5.0, 6.0],
+        );
 
-        // Fail after db1 geometries (and earlier relationship rows) are written.
         {
             let trigger = Connection::open(&merged_path).unwrap();
             trigger
@@ -6171,128 +6370,114 @@ mod tests {
         let merged_path = dir.path().join("merged.db");
         let merged = ColmapDatabase::open(&merged_path).unwrap();
 
-        write_test_camera(&merged, 99);
-        merged
-            .write_image(
-                &ColmapDatabaseImage {
-                    image_id: 9001,
-                    name: "preexisting-target.jpg".to_string(),
-                    camera_id: 99,
-                    frame_id: None,
-                },
-                true,
-            )
-            .unwrap();
-        merged
-            .write_keypoints(9001, &[ColmapKeypoint::new(42.0, 24.0)])
-            .unwrap();
-        merged
-            .write_image(
-                &ColmapDatabaseImage {
-                    image_id: 9002,
-                    name: "preexisting-right.jpg".to_string(),
-                    camera_id: 99,
-                    frame_id: None,
-                },
-                true,
-            )
-            .unwrap();
-        merged
-            .write_keypoints(9002, &[ColmapKeypoint::new(1.0, 1.0)])
-            .unwrap();
-        merged.write_matches(9001, 9002, &[m(0, 0)]).unwrap();
-        merged
-            .write_two_view_geometry(
-                9001,
-                9002,
-                &ColmapTwoViewGeometry {
-                    config: 2,
-                    inlier_matches: vec![m(0, 0)],
-                    qvec: Some([1.0, 0.0, 0.0, 0.0]),
-                    tvec: Some([0.0, 0.0, 2.0]),
-                    ..ColmapTwoViewGeometry::default()
-                },
-            )
-            .unwrap();
-        let before = LogicalDbSnapshot::capture(&merged);
+        let preexisting_camera = ColmapDatabaseCamera {
+            camera: ColmapCamera {
+                camera_id: 99,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 64,
+                height: 48,
+                params: vec![40.0, 40.0, 32.0, 24.0],
+            },
+            has_prior_focal_length: true,
+        };
+        let preexisting_geometry = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: vec![m(0, 0)],
+            qvec: Some([1.0, 0.0, 0.0, 0.0]),
+            tvec: Some([0.0, 0.0, 2.0]),
+            ..ColmapTwoViewGeometry::default()
+        };
+        write_merge_side_with_relationships(
+            &merged,
+            &preexisting_camera,
+            9001,
+            9002,
+            "preexisting-target.jpg",
+            "preexisting-right.jpg",
+            ColmapKeypoint::new(42.0, 24.0),
+            ColmapKeypoint::new(1.0, 1.0),
+            &[9, 8],
+            m(0, 0),
+            &preexisting_geometry,
+            7,
+            8,
+            9,
+            [9.0, 8.0, 7.0],
+        );
         assert!(!merged.database_entry_deleted.get());
+        let before = LogicalDbSnapshot::capture(&merged);
+        assert!(!before.rigs.is_empty());
+        assert!(!before.frames.is_empty());
+        assert!(!before.pose_priors.is_empty());
 
-        write_test_camera(&db1, 11);
-        write_test_camera(&db2, 22);
-        db1.write_image(
-            &ColmapDatabaseImage {
-                image_id: 101,
-                name: "a.jpg".to_string(),
+        let camera1 = ColmapDatabaseCamera {
+            camera: ColmapCamera {
                 camera_id: 11,
-                frame_id: None,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 100,
+                height: 100,
+                params: vec![50.0, 51.0, 52.0, 53.0],
             },
-            true,
-        )
-        .unwrap();
-        db1.write_image(
-            &ColmapDatabaseImage {
-                image_id: 102,
-                name: "a2.jpg".to_string(),
-                camera_id: 11,
-                frame_id: None,
-            },
-            true,
-        )
-        .unwrap();
-        db2.write_image(
-            &ColmapDatabaseImage {
-                image_id: 201,
-                name: "b.jpg".to_string(),
+            has_prior_focal_length: true,
+        };
+        let camera2 = ColmapDatabaseCamera {
+            camera: ColmapCamera {
                 camera_id: 22,
-                frame_id: None,
+                model_id: crate::types::COLMAP_PINHOLE,
+                width: 120,
+                height: 80,
+                params: vec![60.0, 61.0, 62.0, 63.0],
             },
-            true,
-        )
-        .unwrap();
-        db2.write_image(
-            &ColmapDatabaseImage {
-                image_id: 202,
-                name: "b2.jpg".to_string(),
-                camera_id: 22,
-                frame_id: None,
-            },
-            true,
-        )
-        .unwrap();
-        db1.write_keypoints(101, &[ColmapKeypoint::new(1.0, 2.0)])
-            .unwrap();
-        db1.write_keypoints(102, &[ColmapKeypoint::new(3.0, 4.0)])
-            .unwrap();
-        db2.write_keypoints(201, &[ColmapKeypoint::new(5.0, 6.0)])
-            .unwrap();
-        db2.write_keypoints(202, &[ColmapKeypoint::new(7.0, 8.0)])
-            .unwrap();
-        db1.write_matches(101, 102, &[m(0, 0)]).unwrap();
-        db2.write_matches(201, 202, &[m(0, 0)]).unwrap();
-        db1.write_two_view_geometry(
+            has_prior_focal_length: false,
+        };
+        let geom1 = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: vec![m(0, 0)],
+            qvec: Some([1.0, 0.0, 0.0, 0.0]),
+            tvec: Some([1.0, 0.0, 0.0]),
+            ..ColmapTwoViewGeometry::default()
+        };
+        let geom2 = ColmapTwoViewGeometry {
+            config: 2,
+            inlier_matches: vec![m(0, 0)],
+            qvec: Some([1.0, 0.0, 0.0, 0.0]),
+            tvec: Some([0.0, 1.0, 0.0]),
+            ..ColmapTwoViewGeometry::default()
+        };
+        write_merge_side_with_relationships(
+            &db1,
+            &camera1,
             101,
             102,
-            &ColmapTwoViewGeometry {
-                config: 2,
-                inlier_matches: vec![m(0, 0)],
-                qvec: Some([1.0, 0.0, 0.0, 0.0]),
-                tvec: Some([1.0, 0.0, 0.0]),
-                ..ColmapTwoViewGeometry::default()
-            },
-        )
-        .unwrap();
-        db2.write_two_view_geometry(
+            "a.jpg",
+            "a2.jpg",
+            ColmapKeypoint::new(1.0, 2.0),
+            ColmapKeypoint::new(3.0, 4.0),
+            &[11, 12],
+            m(0, 0),
+            &geom1,
+            31,
+            51,
+            71,
+            [1.0, 2.0, 3.0],
+        );
+        write_merge_side_with_relationships(
+            &db2,
+            &camera2,
             201,
             202,
-            &ColmapTwoViewGeometry {
-                config: 2,
-                inlier_matches: vec![m(0, 0)],
-                qvec: Some([1.0, 0.0, 0.0, 0.0]),
-                tvec: Some([0.0, 1.0, 0.0]),
-                ..ColmapTwoViewGeometry::default()
-            },
-        )
-        .unwrap();
+            "b.jpg",
+            "b2.jpg",
+            ColmapKeypoint::new(5.0, 6.0),
+            ColmapKeypoint::new(7.0, 8.0),
+            &[21, 22],
+            m(0, 0),
+            &geom2,
+            41,
+            61,
+            81,
+            [4.0, 5.0, 6.0],
+        );
 
         {
             let trigger = Connection::open(&merged_path).unwrap();
@@ -6320,58 +6505,223 @@ mod tests {
         }
 
         ColmapDatabase::merge(&db1, &db2, &merged).unwrap();
-        let after = LogicalDbSnapshot::capture(&merged);
-        assert_eq!(after.cameras.len(), 3);
-        assert_eq!(after.images.len(), 6);
-        assert_eq!(after.matches.len(), 3);
-        assert_eq!(after.geometries.len(), 3);
-        let names = after
-            .images
-            .iter()
-            .map(|image| image.name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
+
+        let preexisting_left = require_image(&merged, "preexisting-target.jpg");
+        let preexisting_right = require_image(&merged, "preexisting-right.jpg");
+        let a = require_image(&merged, "a.jpg");
+        let a2 = require_image(&merged, "a2.jpg");
+        let b = require_image(&merged, "b.jpg");
+        let b2 = require_image(&merged, "b2.jpg");
+
+        assert_eq!(preexisting_left.image_id, 9001);
+        assert_eq!(preexisting_right.image_id, 9002);
+        assert_eq!(preexisting_left.camera_id, 99);
+        assert_eq!(preexisting_right.camera_id, 99);
+        assert_eq!(a.camera_id, a2.camera_id);
+        assert_eq!(b.camera_id, b2.camera_id);
+        assert_ne!(a.camera_id, 99);
+        assert_ne!(b.camera_id, 99);
+        assert_ne!(a.camera_id, b.camera_id);
+
+        let mut expected_cameras = vec![
+            preexisting_camera.clone(),
+            ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: a.camera_id,
+                    ..camera1.camera.clone()
+                },
+                has_prior_focal_length: camera1.has_prior_focal_length,
+            },
+            ColmapDatabaseCamera {
+                camera: ColmapCamera {
+                    camera_id: b.camera_id,
+                    ..camera2.camera.clone()
+                },
+                has_prior_focal_length: camera2.has_prior_focal_length,
+            },
+        ];
+        expected_cameras.sort_by_key(|camera| camera.camera.camera_id);
+
+        let mut expected_images = vec![
+            preexisting_left.clone(),
+            preexisting_right.clone(),
+            a.clone(),
+            a2.clone(),
+            b.clone(),
+            b2.clone(),
+        ];
+        expected_images.sort_by_key(|image| image.image_id);
+
+        let sensor_pre = camera_sensor(99);
+        let sensor_a = camera_sensor(a.camera_id);
+        let sensor_b = camera_sensor(b.camera_id);
+
+        let frame_pre = merged
+            .read_frame(preexisting_left.frame_id.expect("preexisting frame"))
+            .unwrap()
+            .expect("preexisting frame row");
+        let frame_a = merged
+            .read_frame(a.frame_id.expect("a frame"))
+            .unwrap()
+            .expect("a frame row");
+        let frame_b = merged
+            .read_frame(b.frame_id.expect("b frame"))
+            .unwrap()
+            .expect("b frame row");
         assert_eq!(
-            names,
-            [
-                "a.jpg",
-                "a2.jpg",
-                "b.jpg",
-                "b2.jpg",
-                "preexisting-right.jpg",
-                "preexisting-target.jpg",
+            frame_pre.data_ids,
+            vec![
+                ColmapDataId {
+                    sensor_id: sensor_pre.clone(),
+                    data_id: 9001,
+                },
+                ColmapDataId {
+                    sensor_id: sensor_pre.clone(),
+                    data_id: 9002,
+                },
             ]
-            .into_iter()
-            .collect()
         );
-        // Preexisting relationship payloads retained exactly once.
-        assert!(after.keypoints.iter().any(|(id, points)| {
-            *id == 9001 && points == &vec![ColmapKeypoint::new(42.0, 24.0)]
-        }));
-        assert!(after
-            .matches
+        assert_eq!(
+            frame_a.data_ids,
+            vec![
+                ColmapDataId {
+                    sensor_id: sensor_a.clone(),
+                    data_id: a.image_id as u64,
+                },
+                ColmapDataId {
+                    sensor_id: sensor_a.clone(),
+                    data_id: a2.image_id as u64,
+                },
+            ]
+        );
+        assert_eq!(
+            frame_b.data_ids,
+            vec![
+                ColmapDataId {
+                    sensor_id: sensor_b.clone(),
+                    data_id: b.image_id as u64,
+                },
+                ColmapDataId {
+                    sensor_id: sensor_b.clone(),
+                    data_id: b2.image_id as u64,
+                },
+            ]
+        );
+        let mut expected_frames = vec![frame_pre.clone(), frame_a.clone(), frame_b.clone()];
+        expected_frames.sort_by_key(|frame| frame.frame_id);
+
+        // read_all_rigs omits the reference sensor from the sensors vector.
+        let mut expected_rigs = vec![
+            ColmapRig {
+                rig_id: frame_pre.rig_id,
+                ref_sensor_id: Some(sensor_pre.clone()),
+                sensors: Vec::new(),
+            },
+            ColmapRig {
+                rig_id: frame_a.rig_id,
+                ref_sensor_id: Some(sensor_a.clone()),
+                sensors: Vec::new(),
+            },
+            ColmapRig {
+                rig_id: frame_b.rig_id,
+                ref_sensor_id: Some(sensor_b.clone()),
+                sensors: Vec::new(),
+            },
+        ];
+        expected_rigs.sort_by_key(|rig| rig.rig_id);
+
+        let priors = merged.read_all_pose_priors().unwrap();
+        let prior_pre = priors
             .iter()
-            .any(|(_, matches)| matches == &vec![m(0, 0)]));
-        assert!(after.geometries.iter().any(|(_, geometry)| {
-            geometry.tvec == Some([0.0, 0.0, 2.0]) && geometry.inlier_matches == vec![m(0, 0)]
-        }));
-        assert!(after
-            .geometries
+            .find(|prior| prior.corr_data_id.data_id == 9001)
+            .cloned()
+            .expect("preexisting pose prior");
+        assert_eq!(prior_pre.corr_data_id.sensor_id, sensor_pre);
+        assert_eq!(prior_pre.position, [9.0, 8.0, 7.0]);
+        let prior_a = priors
             .iter()
-            .any(|(_, geometry)| { geometry.tvec == Some([1.0, 0.0, 0.0]) }));
-        assert!(after
-            .geometries
+            .find(|prior| prior.corr_data_id.data_id == a.image_id as u64)
+            .cloned()
+            .expect("db1 pose prior");
+        assert_eq!(prior_a.corr_data_id.sensor_id, sensor_a);
+        assert_eq!(prior_a.position, [1.0, 2.0, 3.0]);
+        let prior_b = priors
             .iter()
-            .any(|(_, geometry)| { geometry.tvec == Some([0.0, 1.0, 0.0]) }));
-        assert!(!after.deleted);
-        // Second merge of the same sources must fail or no-op cleanly without duplicates.
-        // Sources keep original IDs; merge remaps — calling again would duplicate names.
-        // Assert no residual duplicate camera model IDs beyond the three expected.
-        let camera_ids = after
-            .cameras
-            .iter()
-            .map(|camera| camera.camera.camera_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(camera_ids.len(), 3);
+            .find(|prior| prior.corr_data_id.data_id == b.image_id as u64)
+            .cloned()
+            .expect("db2 pose prior");
+        assert_eq!(prior_b.corr_data_id.sensor_id, sensor_b);
+        assert_eq!(prior_b.position, [4.0, 5.0, 6.0]);
+
+        let mut expected_keypoints = vec![
+            (9001, vec![ColmapKeypoint::new(42.0, 24.0)]),
+            (9002, vec![ColmapKeypoint::new(1.0, 1.0)]),
+            (a.image_id, vec![ColmapKeypoint::new(1.0, 2.0)]),
+            (a2.image_id, vec![ColmapKeypoint::new(3.0, 4.0)]),
+            (b.image_id, vec![ColmapKeypoint::new(5.0, 6.0)]),
+            (b2.image_id, vec![ColmapKeypoint::new(7.0, 8.0)]),
+        ];
+        expected_keypoints.sort_by_key(|(image_id, _)| *image_id);
+
+        let mut expected_descriptors = vec![
+            (
+                9001,
+                ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![9, 8]).unwrap(),
+            ),
+            (
+                9002,
+                ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![1, 2]).unwrap(),
+            ),
+            (
+                a.image_id,
+                ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![11, 12]).unwrap(),
+            ),
+            (
+                a2.image_id,
+                ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![1, 2]).unwrap(),
+            ),
+            (
+                b.image_id,
+                ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![21, 22]).unwrap(),
+            ),
+            (
+                b2.image_id,
+                ColmapDescriptors::new(COLMAP_FEATURE_SIFT, 1, 2, vec![1, 2]).unwrap(),
+            ),
+        ];
+        expected_descriptors.sort_by_key(|(image_id, _)| *image_id);
+
+        let mut expected_matches = vec![
+            (pair_id(9001, 9002), vec![m(0, 0)]),
+            (pair_id(a.image_id, a2.image_id), vec![m(0, 0)]),
+            (pair_id(b.image_id, b2.image_id), vec![m(0, 0)]),
+        ];
+        expected_matches.sort_by_key(|(pair, _)| *pair);
+
+        let mut expected_geometries = vec![
+            (pair_id(9001, 9002), preexisting_geometry.clone()),
+            (pair_id(a.image_id, a2.image_id), geom1.clone()),
+            (pair_id(b.image_id, b2.image_id), geom2.clone()),
+        ];
+        expected_geometries.sort_by_key(|(pair, _)| *pair);
+
+        let expected = LogicalDbSnapshot {
+            deleted: false,
+            cameras: expected_cameras,
+            images: expected_images,
+            rigs: expected_rigs,
+            frames: expected_frames,
+            pose_priors: {
+                let mut priors = vec![prior_pre, prior_a, prior_b];
+                priors.sort_by_key(|prior| prior.pose_prior_id);
+                priors
+            },
+            keypoints: expected_keypoints,
+            descriptors: expected_descriptors,
+            matches: expected_matches,
+            geometries: expected_geometries,
+        };
+        assert_eq!(LogicalDbSnapshot::capture(&merged), expected);
     }
 
     #[test]

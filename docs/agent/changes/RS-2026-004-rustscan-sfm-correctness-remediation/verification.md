@@ -1355,6 +1355,82 @@ Known limitations:
 Next action: do not start T7. Do not merge to `main`. Await independent
 re-review of the two P2 fixes.
 
+### T6 P2 Re-review Remediation — 2026-09-25
+
+Status: review_ready. Awaiting independent re-review after
+`review-t6-2026-09-25.md` (CHANGES_REQUESTED).
+
+Owner: `cursor-agent`
+
+Reviewed HEAD before this fix: `a5d250af4b58266254363207fdce777cbf6a4666`
+
+Branch/worktree: unchanged.
+
+Changed files:
+
+- `rustscan-sfm/src/io/database.rs` — `#[cfg(test)]` on `database::tests`;
+  cleanup-failure hook leaves txn active; bookkeeping success/failure
+  regressions; merge fixtures with nonempty rigs/frames/pose priors; exact
+  expected-state retry compare by stable IDs
+- `rustscan-sfm/src/sfm/mapper.rs` — restore missing `#[test]` attributes;
+  populate retry exact ID/payload expected state
+- `docs/agent/changes/.../review-t6-2026-09-25.md` (preserved)
+- this verification record, `tasks.md`, `tasks.yaml`
+
+#### Fixes
+
+1. Restored `#[test]` on
+   `resolve_mapper_database_path_allows_missing_output_for_local_write` and
+   `run_incremental_pipeline_reports_success_status`. Both listed and executed.
+   `database::tests` is `#[cfg(test)]` again; check no longer reports the
+   prior dead_code/helper warnings from that module.
+
+2. Cleanup-failure hook no longer performs a real ROLLBACK before reporting
+   failure. New regressions:
+   - successful rollback restores `deleted_before=false` after in-txn true
+   - successful rollback restores `deleted_before=true` after in-txn false
+   - cleanup failure chains original+cleanup errors, leaves txn active,
+     keeps current bookkeeping (would fail if `deleted_before` were restored
+     unconditionally), then explicitly rolls back and reuses the connection
+
+3. Merge/populate retry builds an independently specified expected logical
+   snapshot and `assert_eq!`s it after name/ID resolution. Pair IDs are
+   asserted with full match/geometry payloads; image→camera, frame→rig/sensor,
+   and pose-prior→image/camera references are checked. Merge fixtures include
+   nonempty rigs, frames, and pose priors for late-failure rollback and retry.
+
+#### Verification
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`,
+`CARGO_TERM_COLOR=never`.
+
+- `cargo test -p rustscan-sfm --lib -- --list`: includes both restored tests.
+- Directed:
+  `cargo test -p rustscan-sfm --lib -- --test-threads=1 with_transaction mid_failure retry_after transaction_mid_batch_delete`:
+  PASS, 12 passed.
+- Restored tests individually: PASS.
+- `cargo fmt --all -- --check`: PASS.
+- `cargo check --workspace --all-targets`: PASS (no new isolation/dead_code
+  warnings from `database::tests`).
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: PASS.
+  Lib `871 passed; 0 failed; 19 ignored` (247.80s); remaining targets exit 0.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  FAIL, exit 101. Unmodified `rustscan-slam` blocker (84 errors). Not recorded
+  as pass.
+- `git diff --check`: PASS.
+
+Logs: `artifacts/runs/rs-2026-004-t6-p2-rereview/` (gitignored local evidence).
+Preserve `review-t6-2026-09-24.md` and `review-t6-2026-09-25.md`.
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- Ignored tests are not proof of their behavior.
+- T7 not started.
+
+Next action: do not start T7. Do not merge to `main`. Await independent
+re-review.
+
 ### T7 — nalgebra Ownership
 
 Status: pending.

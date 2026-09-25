@@ -210,8 +210,9 @@ never reported as a successful global BA round.
 ## T6 — Add Transactions Around Logical Database Batches
 
 **Status:** review_ready on `agent/RS-2026-004/t6-database-transactions` (base
-`c71f8092778e2abb1feaaf03c9d784ea25434349`) after P2 remediation for
-`review-t6-2026-09-24.md` (CHANGES_REQUESTED). Independent re-review pending.
+`c71f8092778e2abb1feaaf03c9d784ea25434349`) after remediation for
+`review-t6-2026-09-24.md` and `review-t6-2026-09-25.md` (CHANGES_REQUESTED).
+Independent re-review pending.
 
 **Dependencies:** T0  
 **Primary scope:** `rustscan-sfm/src/io/database.rs`,
@@ -230,6 +231,11 @@ never reported as a successful global BA round.
 - [x] Full logical snapshots (row payloads/IDs/refs) with late populate/merge
       pair-phase failures, retry payload checks, and deletion bookkeeping for
       initial false/true via reachable business paths.
+- [x] Restore accidentally removed `#[test]` attributes and `#[cfg(test)]` on
+      `database::tests`; prove cleanup-failure bookkeeping without synthetic
+      successful rollback; compare retry results to independently specified
+      expected state with stable pair/image/camera IDs and nonempty
+      rig/frame/prior merge fixtures.
 
 **Exit condition:** each public logical operation either commits all related
 rows or leaves the target database unchanged.
