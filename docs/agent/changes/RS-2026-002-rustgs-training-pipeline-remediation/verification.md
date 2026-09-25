@@ -8,7 +8,7 @@
 | Branch | `fix/rs-2026-002-c1-c4-review` |
 | Worktree | `.worktrees/rs-2026-002-c1-c4-review` |
 | Prior tip | `eb8f3f3bf866f13a92c0c6e4505c3607dec9f841` |
-| Round-4 code package | filled at commit |
+| Round-4 code package | `cc4323b57f8aa23bd268583a93c804c58572cf38` |
 
 R02 / R06 / R07 / R08 remain closed. C5–C8 not started.
 
