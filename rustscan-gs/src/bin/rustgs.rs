@@ -120,6 +120,14 @@ struct TrainArgs {
     #[arg(long, default_value = "0")]
     frame_shuffle_seed: u64,
 
+    /// JSON split manifest with dataset fingerprint plus train / in-view / holdout stable IDs
+    #[arg(long)]
+    frame_split_manifest: Option<PathBuf>,
+
+    /// Post-training evaluation split: in-view (default) or holdout (requires --frame-split-manifest)
+    #[arg(long, default_value = "in-view")]
+    eval_split: String,
+
     /// Relative render scale used by training
     #[arg(long, default_value = "0.5")]
     render_scale: f32,

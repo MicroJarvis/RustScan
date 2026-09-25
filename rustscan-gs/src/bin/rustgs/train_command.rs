@@ -277,27 +277,27 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
         log::info!("Applied RustGS train preset: {}", preset);
     }
 
-    let (dataset, source) = load_training_dataset_for_training(
-        &args.input,
-        args.image_root.as_deref(),
-        args.max_frames,
-        args.frame_stride,
-    )?;
-    let included_training_ranges = parse_frame_ranges(args.include_frame_ranges.as_deref())?;
-    let dataset = filter_dataset_to_frame_ranges(dataset, &included_training_ranges, "training")?;
-    let excluded_training_ranges = parse_frame_ranges(args.exclude_frame_ranges.as_deref())?;
-    let dataset = filter_dataset_by_frame_ranges(dataset, &excluded_training_ranges, "training")?;
+    let (full_dataset, source) =
+        load_training_dataset_for_training(&args.input, args.image_root.as_deref(), 0, 1)?;
+    let dataset_fingerprint = dataset_fingerprint_hex(&args.input)?;
+    let frame_plan =
+        build_canonical_frame_plan(&args, &full_dataset, dataset_fingerprint.as_deref())?;
     let oversample_training_ranges = parse_frame_ranges(args.oversample_frame_ranges.as_deref())?;
     let dataset = oversample_dataset_frame_ranges(
-        dataset,
+        frame_plan.train.dataset.clone(),
         &oversample_training_ranges,
         args.oversample_frame_repeat,
         "training",
     )?;
     log::info!(
-        "Loaded {} poses, {} initialization points",
+        "Loaded {} poses, {} initialization points | selection_fp={} | eval_split={}",
         dataset.poses.len(),
-        dataset.initial_points.len()
+        dataset.initial_points.len(),
+        frame_plan.train.selection_fingerprint,
+        frame_plan
+            .eval_split_kind
+            .map(|kind| kind.to_string())
+            .unwrap_or_else(|| "none".to_string()),
     );
     ensure_sparse_initialization_points(&dataset, source, &args.input)?;
 
@@ -336,7 +336,8 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
     rustscan_gs::save_splats(&args.output, &splats, &metadata)?;
     log::info!("Saved scene to {:?}", args.output);
 
-    let evaluation = maybe_evaluate_trained_splats(&args, &splats, &metadata, training_telemetry)?;
+    let evaluation =
+        maybe_evaluate_trained_splats(&args, &splats, &metadata, training_telemetry, &frame_plan)?;
     let evaluation_summary = evaluation.as_ref().map(|result| &result.summary);
 
     if let Err(err) = maybe_write_litegs_parity_report(
@@ -360,6 +361,8 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
         &config,
         &training_report,
         evaluation.as_ref(),
+        &frame_plan,
+        dataset_fingerprint,
     ) {
         log::warn!("failed to persist optimization report: {err}");
     }
@@ -483,6 +486,9 @@ pub(super) struct TrainConfigOverrides {
     oversample_frame_ranges: Option<Option<String>>,
     oversample_frame_repeat: Option<usize>,
     frame_shuffle_seed: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_nullable_override")]
+    frame_split_manifest: Option<Option<PathBuf>>,
+    eval_split: Option<String>,
     render_scale: Option<f32>,
     raster_cov_blur: Option<f32>,
     #[serde(default, deserialize_with = "deserialize_nullable_override")]
@@ -665,6 +671,18 @@ impl TrainConfigOverrides {
             "frame_shuffle_seed",
             &mut args.frame_shuffle_seed,
             self.frame_shuffle_seed,
+        );
+        apply_override(
+            sources,
+            "frame_split_manifest",
+            &mut args.frame_split_manifest,
+            self.frame_split_manifest.clone(),
+        );
+        apply_override(
+            sources,
+            "eval_split",
+            &mut args.eval_split,
+            self.eval_split.clone(),
         );
         apply_override(
             sources,
@@ -1256,152 +1274,149 @@ pub(super) fn load_training_dataset_for_training(
     Ok((dataset, source))
 }
 
-#[cfg(feature = "gpu")]
-fn load_evaluation_dataset(
-    input: &Path,
-    image_root: Option<&Path>,
-    max_frames: usize,
-    frame_stride: usize,
-) -> anyhow::Result<rustscan_types::TrainingDataset> {
-    let (dataset, source) = rustscan_gs::load_colmap_training_dataset_with_source(
-        input,
-        &rustscan_gs::ColmapConfig {
-            max_frames,
-            frame_stride,
-            image_root: image_root.map(Path::to_path_buf),
-            ..Default::default()
-        },
-    )?;
-
-    log::info!(
-        "Resolved evaluation dataset {:?} as {} with {} poses",
-        input,
-        source,
-        dataset.poses.len(),
-    );
-
-    Ok(dataset)
+#[derive(Debug, Clone)]
+struct CanonicalFramePlan {
+    train: rustscan_gs::FrameSelection,
+    eval: Option<rustscan_gs::FrameSelection>,
+    eval_split_kind: Option<rustscan_gs::EvaluationSplitKind>,
+    manifest_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FrameIdRange {
-    start: u64,
-    end: u64,
+fn dataset_fingerprint_hex(input: &Path) -> anyhow::Result<Option<String>> {
+    Ok(rustscan_gs::fingerprint_colmap_sparse_model(input)
+        .ok()
+        .map(|digest| {
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        }))
 }
 
-impl FrameIdRange {
-    fn contains(&self, frame_id: u64) -> bool {
-        self.start <= frame_id && frame_id <= self.end
-    }
-}
+fn build_canonical_frame_plan(
+    args: &TrainArgs,
+    full_dataset: &rustscan_types::TrainingDataset,
+    dataset_fingerprint: Option<&str>,
+) -> anyhow::Result<CanonicalFramePlan> {
+    let eval_split = args
+        .eval_split
+        .parse::<rustscan_gs::EvaluationSplitKind>()
+        .map_err(anyhow::Error::msg)?;
 
-fn parse_frame_ranges(value: Option<&str>) -> anyhow::Result<Vec<FrameIdRange>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let mut ranges = Vec::new();
-    for raw_token in value.split(',') {
-        let token = raw_token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let (start, end) = if let Some((start, end)) = token.split_once("..") {
-            (start.trim(), end.trim())
-        } else if let Some((start, end)) = token.split_once('-') {
-            (start.trim(), end.trim())
-        } else {
-            (token, token)
+    let manifest = if let Some(path) = &args.frame_split_manifest {
+        let Some(fingerprint) = dataset_fingerprint else {
+            bail!(
+                "--frame-split-manifest requires a COLMAP sparse model fingerprint for {}",
+                args.input.display()
+            );
         };
-        if start.is_empty() || end.is_empty() {
-            bail!("frame range '{token}' must be <frame_id> or <start>-<end>");
-        }
-        let start = start
-            .parse::<u64>()
-            .with_context(|| format!("invalid frame range start in '{token}'"))?;
-        let end = end
-            .parse::<u64>()
-            .with_context(|| format!("invalid frame range end in '{token}'"))?;
-        if start > end {
-            bail!("frame range '{token}' has start greater than end");
-        }
-        ranges.push(FrameIdRange { start, end });
+        let manifest =
+            rustscan_gs::FrameSplitManifest::load_path(path).map_err(anyhow::Error::msg)?;
+        manifest
+            .validate(full_dataset, fingerprint)
+            .map_err(anyhow::Error::msg)?;
+        Some(manifest)
+    } else {
+        None
+    };
+
+    if matches!(eval_split, rustscan_gs::EvaluationSplitKind::Holdout) && manifest.is_none() {
+        bail!("--eval-split holdout requires --frame-split-manifest");
     }
-    Ok(ranges)
+
+    let include_ranges = parse_frame_ranges(args.include_frame_ranges.as_deref())?;
+    let exclude_ranges = parse_frame_ranges(args.exclude_frame_ranges.as_deref())?;
+    let train_allowed = manifest.as_ref().map(|manifest| manifest.train_ids.clone());
+    let train = rustscan_gs::FrameSelection::select(
+        full_dataset,
+        &rustscan_gs::FrameSelectionRequest {
+            include_ranges,
+            exclude_ranges,
+            allowed_ids: train_allowed,
+            max_frames: args.max_frames,
+            frame_stride: args.frame_stride,
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    if train.dataset.poses.is_empty() {
+        bail!("canonical training frame selection resolved to zero frames");
+    }
+
+    let eval = if args.eval_after_train {
+        Some(build_eval_frame_selection(
+            args,
+            full_dataset,
+            manifest.as_ref(),
+            eval_split,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(CanonicalFramePlan {
+        train,
+        eval,
+        eval_split_kind: args.eval_after_train.then_some(eval_split),
+        manifest_fingerprint: manifest.as_ref().map(|manifest| manifest.fingerprint()),
+    })
 }
 
-fn filter_dataset_by_frame_ranges(
-    dataset: rustscan_types::TrainingDataset,
-    excluded_ranges: &[FrameIdRange],
-    label: &str,
-) -> anyhow::Result<rustscan_types::TrainingDataset> {
-    if excluded_ranges.is_empty() {
-        return Ok(dataset);
+fn build_eval_frame_selection(
+    args: &TrainArgs,
+    full_dataset: &rustscan_types::TrainingDataset,
+    manifest: Option<&rustscan_gs::FrameSplitManifest>,
+    eval_split: rustscan_gs::EvaluationSplitKind,
+) -> anyhow::Result<rustscan_gs::FrameSelection> {
+    if args.eval_frame_stride == 0 {
+        bail!("--eval-frame-stride must be >= 1");
     }
-
-    let original_pose_count = dataset.poses.len();
-    let mut filtered = rustscan_types::TrainingDataset::new(dataset.intrinsics)
-        .with_depth_scale(dataset.depth_scale);
-    filtered.initial_points = dataset.initial_points.clone();
-    for pose in dataset.poses {
-        if excluded_ranges
-            .iter()
-            .any(|range| range.contains(pose.frame_id))
-        {
-            continue;
+    let include_ranges = parse_frame_ranges(args.eval_include_frame_ranges.as_deref())?;
+    let exclude_ranges = parse_frame_ranges(args.eval_exclude_frame_ranges.as_deref())?;
+    let allowed_ids = match (eval_split, manifest) {
+        (rustscan_gs::EvaluationSplitKind::Holdout, Some(manifest)) => {
+            if manifest.holdout_ids.is_empty() {
+                bail!("--eval-split holdout requires a non-empty holdout_ids list in the manifest");
+            }
+            Some(manifest.holdout_ids.clone())
         }
-        filtered.add_pose(pose);
+        (rustscan_gs::EvaluationSplitKind::Holdout, None) => {
+            bail!("--eval-split holdout requires --frame-split-manifest");
+        }
+        (rustscan_gs::EvaluationSplitKind::InView, Some(manifest)) => {
+            if !manifest.in_view_ids.is_empty() {
+                Some(manifest.in_view_ids.clone())
+            } else if !manifest.train_ids.is_empty() {
+                Some(manifest.train_ids.clone())
+            } else {
+                None
+            }
+        }
+        (rustscan_gs::EvaluationSplitKind::InView, None) => None,
+    };
+    let selection = rustscan_gs::FrameSelection::select(
+        full_dataset,
+        &rustscan_gs::FrameSelectionRequest {
+            include_ranges,
+            exclude_ranges,
+            allowed_ids,
+            max_frames: args.eval_max_frames,
+            frame_stride: args.eval_frame_stride,
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    if selection.dataset.poses.is_empty() {
+        bail!("canonical evaluation frame selection resolved to zero frames");
     }
-
-    let removed = original_pose_count.saturating_sub(filtered.poses.len());
-    log::info!(
-        "Applied {label} frame exclusion | removed={} | remaining={}",
-        removed,
-        filtered.poses.len()
-    );
-    if filtered.poses.is_empty() {
-        bail!("{label} frame exclusion removed all frames");
-    }
-
-    Ok(filtered)
+    Ok(selection)
 }
 
-fn filter_dataset_to_frame_ranges(
-    dataset: rustscan_types::TrainingDataset,
-    included_ranges: &[FrameIdRange],
-    label: &str,
-) -> anyhow::Result<rustscan_types::TrainingDataset> {
-    if included_ranges.is_empty() {
-        return Ok(dataset);
-    }
-
-    let original_pose_count = dataset.poses.len();
-    let mut filtered = rustscan_types::TrainingDataset::new(dataset.intrinsics)
-        .with_depth_scale(dataset.depth_scale);
-    filtered.initial_points = dataset.initial_points.clone();
-    for pose in dataset.poses {
-        if included_ranges
-            .iter()
-            .any(|range| range.contains(pose.frame_id))
-        {
-            filtered.add_pose(pose);
-        }
-    }
-
-    log::info!(
-        "Applied {label} frame include | kept={} | removed={}",
-        filtered.poses.len(),
-        original_pose_count.saturating_sub(filtered.poses.len())
-    );
-    if filtered.poses.is_empty() {
-        bail!("{label} frame include selected no frames");
-    }
-
-    Ok(filtered)
+fn parse_frame_ranges(value: Option<&str>) -> anyhow::Result<Vec<rustscan_gs::FrameIdRange>> {
+    rustscan_gs::parse_frame_id_ranges(value).map_err(anyhow::Error::msg)
 }
 
 fn oversample_dataset_frame_ranges(
     dataset: rustscan_types::TrainingDataset,
-    oversample_ranges: &[FrameIdRange],
+    oversample_ranges: &[rustscan_gs::FrameIdRange],
     repeat: usize,
     label: &str,
 ) -> anyhow::Result<rustscan_types::TrainingDataset> {
@@ -1448,13 +1463,6 @@ fn oversample_dataset_frame_ranges(
     );
 
     Ok(augmented)
-}
-
-#[cfg(feature = "gpu")]
-pub(super) fn evaluation_dataset_load_params(args: &TrainArgs) -> (usize, usize) {
-    // Keep the evaluation prefix trimming, but do not apply frame_stride here.
-    // The actual evaluation subset selection should happen once inside evaluate_splats().
-    (args.eval_max_frames, 1)
 }
 
 #[cfg(feature = "gpu")]
@@ -1666,11 +1674,8 @@ fn export_evaluation_crops(
     };
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create crop output dir {}", output_dir.display()))?;
-    let selected = rustscan_gs::select_evaluation_frames(
-        dataset,
-        args.eval_max_frames,
-        args.eval_frame_stride,
-    );
+    // Reuse the already-selected evaluation dataset; do not re-apply max/stride.
+    let selected = dataset.clone();
     let requested_frame_ids = parse_eval_crop_frame_ids(args.eval_crop_frames.as_deref())?;
     let frame_indices = crop_frame_indices(&selected, summary, requested_frame_ids.as_ref())?;
     let rect = parse_eval_crop_rect(
@@ -1736,12 +1741,10 @@ fn maybe_evaluate_trained_splats(
     splats: &rustscan_gs::HostSplats,
     metadata: &rustscan_gs::SplatMetadata,
     training_telemetry: Option<&rustscan_gs::LiteGsTrainingTelemetry>,
+    frame_plan: &CanonicalFramePlan,
 ) -> anyhow::Result<Option<rustscan_gs::SplatEvaluationResult>> {
     if !args.eval_after_train {
         return Ok(None);
-    }
-    if args.eval_frame_stride == 0 {
-        bail!("--eval-frame-stride must be >= 1");
     }
     if !(0.0625..=1.0).contains(&args.eval_render_scale) {
         bail!("--eval-render-scale must be in [0.0625, 1.0]");
@@ -1756,26 +1759,29 @@ fn maybe_evaluate_trained_splats(
         .parse::<rustscan_gs::EvaluationDevice>()
         .map_err(anyhow::Error::msg)?;
     let device = rustscan_gs::evaluation_device(eval_device).map_err(anyhow::Error::from)?;
-    let (dataset_max_frames, dataset_frame_stride) = evaluation_dataset_load_params(args);
-    let dataset = load_evaluation_dataset(
-        &args.input,
-        args.image_root.as_deref(),
-        dataset_max_frames,
-        dataset_frame_stride,
-    )?;
-    let included_eval_ranges = parse_frame_ranges(args.eval_include_frame_ranges.as_deref())?;
-    let dataset = filter_dataset_to_frame_ranges(dataset, &included_eval_ranges, "evaluation")?;
-    let excluded_eval_ranges = parse_frame_ranges(args.eval_exclude_frame_ranges.as_deref())?;
-    let dataset = filter_dataset_by_frame_ranges(dataset, &excluded_eval_ranges, "evaluation")?;
+    let Some(eval_selection) = frame_plan.eval.as_ref() else {
+        bail!("evaluation was requested but no canonical eval FrameSelection was built");
+    };
+    let dataset = &eval_selection.dataset;
+    log::info!(
+        "Evaluating with split={} | frames={} | selection_fp={}",
+        frame_plan
+            .eval_split_kind
+            .map(|kind| kind.to_string())
+            .unwrap_or_else(|| "in-view".to_string()),
+        eval_selection.stable_ids.len(),
+        eval_selection.selection_fingerprint,
+    );
     let mut evaluation = rustscan_gs::evaluate_splats(
-        &dataset,
+        dataset,
         splats,
         metadata,
         &rustscan_gs::SplatEvaluationConfig {
             render_scale: args.eval_render_scale,
             raster_cov_blur: eval_raster_cov_blur,
-            frame_stride: args.eval_frame_stride,
-            max_frames: args.eval_max_frames,
+            // Dataset is already canonically selected; do not re-filter.
+            frame_stride: 1,
+            max_frames: 0,
             worst_frame_count: args.eval_worst_frames,
         },
         &device,
@@ -1784,7 +1790,7 @@ fn maybe_evaluate_trained_splats(
     .map_err(anyhow::Error::from)?;
 
     evaluation.summary.crop_outputs =
-        export_evaluation_crops(args, &dataset, splats, &device, &evaluation.summary)?;
+        export_evaluation_crops(args, dataset, splats, &device, &evaluation.summary)?;
     log_splat_evaluation_summary(&evaluation.summary, args.eval_json)?;
     Ok(Some(evaluation))
 }
@@ -2100,13 +2106,13 @@ fn optimization_evaluation_metrics(
         worst_frame_ids: summary
             .worst_frames
             .iter()
-            .map(|frame| frame.frame_id as u32)
+            .map(|frame| frame.frame_id)
             .collect(),
         frames: evaluation
             .frame_metrics
             .iter()
             .map(|frame| rustscan_gs::OptimizationEvalFrame {
-                frame_id: frame.frame_id as u32,
+                frame_id: frame.frame_id,
                 psnr_db: frame.psnr_db,
                 sharpness_grad_ratio: Some(frame.sharpness_grad_ratio),
                 sharpness_lap_ratio: Some(frame.sharpness_lap_ratio),
@@ -2122,26 +2128,25 @@ fn maybe_write_optimization_report(
     config: &rustscan_gs::TrainingConfig,
     training_report: &rustscan_gs::TrainingRunReport,
     evaluation: Option<&rustscan_gs::SplatEvaluationResult>,
+    frame_plan: &CanonicalFramePlan,
+    dataset_fingerprint: Option<String>,
 ) -> anyhow::Result<()> {
     let Some(report_path) = resolve_optimization_report_path(args) else {
         return Ok(());
     };
 
-    let dataset_fingerprint = rustscan_gs::fingerprint_colmap_sparse_model(&args.input)
-        .ok()
-        .map(|digest| {
-            digest
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        });
-    let eval_frame_ids = evaluation
-        .map(|result| {
-            result
-                .frame_metrics
-                .iter()
-                .map(|frame| frame.frame_id as u32)
-                .collect::<Vec<_>>()
+    let eval_frame_ids = frame_plan
+        .eval
+        .as_ref()
+        .map(|selection| selection.stable_ids.clone())
+        .or_else(|| {
+            evaluation.map(|result| {
+                result
+                    .frame_metrics
+                    .iter()
+                    .map(|frame| frame.frame_id)
+                    .collect::<Vec<_>>()
+            })
         })
         .unwrap_or_default();
     let eval_resolution =
@@ -2200,7 +2205,7 @@ fn maybe_write_optimization_report(
                 config.data.frame_shuffle_seed,
             )
             .into_iter()
-            .filter_map(|idx| dataset.poses.get(idx).map(|pose| pose.frame_id as u32))
+            .filter_map(|idx| dataset.poses.get(idx).map(|pose| pose.frame_id))
             .collect(),
             effective_max_frames: Some(dataset.poses.len()),
             eval_resolution,
@@ -2217,6 +2222,13 @@ fn maybe_write_optimization_report(
             )
             .ok(),
             training_config_fingerprint: rustscan_gs::canonical_config_fingerprint(&config).ok(),
+            eval_split_kind: frame_plan.eval_split_kind.map(|kind| kind.to_string()),
+            manifest_fingerprint: frame_plan.manifest_fingerprint.clone(),
+            selection_fingerprint: Some(frame_plan.train.selection_fingerprint.clone()),
+            eval_selection_fingerprint: frame_plan
+                .eval
+                .as_ref()
+                .map(|selection| selection.selection_fingerprint.clone()),
         },
         rustscan_gs::OptimizationTrainMetrics {
             wall_clock_seconds: Some(training_report.elapsed.as_secs_f64()),

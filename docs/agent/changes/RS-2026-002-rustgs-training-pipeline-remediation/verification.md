@@ -1,5 +1,45 @@
 # RS-2026-002 Verification
 
+## C5 frame selection (pending independent review)
+
+| Field | Value |
+| --- | --- |
+| Base SHA | `e6db819e43764d536fc51a83e72395e8aa76632d` (main at worktree creation) |
+| Branch | `agent/RS-2026-002/c5-frame-selection` |
+| Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
+| Code tip | filled at commit |
+
+C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+
+### C5 remediations
+
+| Item | Summary |
+| --- | --- |
+| Stable ID | `ScenePose.frame_id = image.image_id as u64`; missing images do not renumber survivors |
+| FrameSelection | include/exclude → max_frames → stride → selection fingerprint (one implementation) |
+| Split manifest | `--frame-split-manifest` + `--eval-split in-view\|holdout`; startup rejects dup/unknown/overlap/fingerprint mismatch; holdout requires manifest |
+| Report | `eval_frame_ids` / `train_frame_ids` / worst frames are `u64`; split kind + manifest/selection fingerprints persisted |
+
+### Gate results
+
+Logs: `artifacts/runs/rs-2026-002-c5-frame-selection/`
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo test -p rustscan-gs --lib --features gpu-wgpu -- --test-threads=1` | PASS: **205** (includes split + missing-image fixtures) |
+| `cargo test -p rustscan-gs --test checkpoint_resume --features gpu-wgpu -- --test-threads=1` | PASS: **53** |
+| `cargo check -p rustscan-gs --all-targets --features gpu-wgpu` | PASS |
+| `git diff --check` | PASS |
+
+### Known limitations
+
+- Examples (`evaluate_psnr`, `rustgs_eval_suite`, residual heatmap) still have local include/exclude helpers; production train/eval/crop/report path uses `FrameSelection`.
+- `ColmapConfig::{max_frames,frame_stride}` still apply a max/stride-only `FrameSelection` at load end for API compatibility when callers do not use include/exclude; the CLI loads full then selects once.
+- Clippy `-D warnings` not part of this C5 gate matrix.
+
 ## C1–C4 merged to main (2026-09-25)
 
 | Field | Value |

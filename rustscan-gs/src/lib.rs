@@ -80,7 +80,8 @@ pub use crate::training::{
     resolve_litegs_parity_fixture_input_path, resolve_litegs_parity_reference_report_path,
     save_training_checkpoint, sh_schedule_fingerprint, write_optimization_report, AdamCheckpoint,
     AdamParameterCheckpoint, CheckpointMigration, DynamicMaskGradient, EvaluationDevice,
-    EvaluationFrameMetric, FinalTrainingMetrics, LiteGsCameraConfig, LiteGsConfig,
+    EvaluationFrameMetric, EvaluationSplitKind, FinalTrainingMetrics, FrameIdRange, FrameSelection,
+    FrameSelectionRequest, FrameSplitManifest, LiteGsCameraConfig, LiteGsConfig,
     LiteGsFeatureConfig, LiteGsGrowthConfig, LiteGsOpacityResetMode, LiteGsPruneMode,
     LiteGsPruningConfig, LiteGsRefineConfig, LiteGsRenderingConfig, LiteGsSplitScoreMode,
     LiteGsTileSize, LiteGsTopologyConfig, LiteGsTrainingProfile, OptimizationCommand,
@@ -102,8 +103,9 @@ pub use crate::training::{
     TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION, TRAINING_CHECKPOINT_VERSION_V1,
 };
 pub use crate::training::{
-    compute_psnr_f32, scaled_dimensions, select_evaluation_frames, summarize_psnr_samples,
-    summarize_training_metrics, worst_frame_metrics,
+    compute_psnr_f32, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,
+    select_evaluation_frames, summarize_psnr_samples, summarize_training_metrics,
+    worst_frame_metrics,
 };
 #[cfg(feature = "gpu")]
 pub use crate::training::{

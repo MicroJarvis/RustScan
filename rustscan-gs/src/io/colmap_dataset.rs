@@ -183,24 +183,13 @@ pub fn load_colmap_dataset(
         );
     }
 
-    // Apply frame selection
-    let considered = if config.max_frames > 0 {
-        config.max_frames.min(images.len())
-    } else {
-        images.len()
-    };
-    let stride = config.frame_stride.max(1);
+    // Load every existing image with a stable COLMAP image_id as frame_id.
+    // max_frames / frame_stride are applied later by FrameSelection (include /
+    // exclude must resolve against stable IDs before max/stride).
     let mut missing_image_count = 0usize;
     let mut missing_image_examples = Vec::new();
 
-    // Add poses
-    for (frame_idx, (image, pose)) in images
-        .iter()
-        .zip(poses.iter())
-        .take(considered)
-        .step_by(stride)
-        .enumerate()
-    {
+    for (image, pose) in images.iter().zip(poses.iter()) {
         validate_image_name(&image.name)?;
         let image_path = image_dir.join(&image.name);
         if !image_path.exists() {
@@ -211,7 +200,7 @@ pub fn load_colmap_dataset(
             continue;
         }
 
-        let scene_pose = ScenePose::new(frame_idx as u64, image_path, *pose, image.image_id as f64);
+        let scene_pose = ScenePose::new(u64::from(image.image_id), image_path, *pose, 0.0);
         dataset.add_pose(scene_pose);
     }
 
@@ -230,11 +219,24 @@ pub fn load_colmap_dataset(
         );
     }
 
+    if config.max_frames > 0 || config.frame_stride > 1 {
+        let selection = crate::training::FrameSelection::select(
+            &dataset,
+            &crate::training::FrameSelectionRequest {
+                max_frames: config.max_frames,
+                frame_stride: config.frame_stride.max(1),
+                ..Default::default()
+            },
+        )
+        .map_err(TrainingError::InvalidInput)?;
+        dataset = selection.dataset;
+    }
+
     log::info!(
         "Loaded COLMAP dataset {} | cameras={} | images_total={} | frames={} | missing_images={} | points={} | resolution={}x{}",
         sparse_dir.display(),
         cameras.len(),
-        considered,
+        images.len(),
         dataset.poses.len(),
         missing_image_count,
         dataset.initial_points.len(),
@@ -1496,7 +1498,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(dataset.poses[0].frame_id, 0);
+        assert_eq!(dataset.poses[0].frame_id, 11);
         assert_eq!(
             dataset.poses[0].image_path,
             image_root.join("frame one.png")
@@ -1506,6 +1508,41 @@ mod tests {
             Intrinsics::new(500.0, 500.0, 320.0, 240.0, 640, 480)
         );
         assert_eq!(dataset.initial_points[0].0, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn missing_images_do_not_renumber_surviving_stable_ids() {
+        let dir = tempdir().unwrap();
+        let sparse = dir.path().join("sparse/0");
+        let image_root = dir.path().join("images");
+        fs::create_dir_all(&image_root).unwrap();
+        // Only image_id 5 and 9 exist on disk; id 7 is listed but missing.
+        fs::write(image_root.join("a.png"), [0u8; 16]).unwrap();
+        fs::write(image_root.join("c.png"), [0u8; 16]).unwrap();
+        write_minimal_fixture(
+            &sparse,
+            "1 SIMPLE_PINHOLE 64 48 50 32 24\n",
+            "\
+5 1 0 0 0 0 0 0 1 a.png
+
+7 1 0 0 0 0 0 0 1 b.png
+
+9 1 0 0 0 0 0 0 1 c.png
+
+",
+        )
+        .unwrap();
+
+        let dataset = load_colmap_dataset(
+            &sparse,
+            &ColmapConfig {
+                image_root: Some(image_root),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ids: Vec<_> = dataset.poses.iter().map(|pose| pose.frame_id).collect();
+        assert_eq!(ids, vec![5, 9]);
     }
 
     #[test]

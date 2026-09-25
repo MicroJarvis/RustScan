@@ -43,10 +43,12 @@ pub use evaluation::{
     ParityTimingMetrics, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_TINY_FIXTURE_ID,
 };
 pub use evaluation::{
-    compute_psnr_f32, scaled_dimensions, select_evaluation_frames, summarize_psnr_samples,
-    summarize_training_metrics, worst_frame_metrics, EvaluationDevice, EvaluationFrameMetric,
-    FinalTrainingMetrics, PsnrSummary, SplatEvaluationConfig, SplatEvaluationError,
-    SplatEvaluationResult, SplatEvaluationSummary,
+    compute_psnr_f32, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,
+    select_evaluation_frames, summarize_psnr_samples, summarize_training_metrics,
+    worst_frame_metrics, EvaluationDevice, EvaluationFrameMetric, EvaluationSplitKind,
+    FinalTrainingMetrics, FrameIdRange, FrameSelection, FrameSelectionRequest, FrameSplitManifest,
+    PsnrSummary, SplatEvaluationConfig, SplatEvaluationError, SplatEvaluationResult,
+    SplatEvaluationSummary,
 };
 #[cfg(feature = "gpu")]
 pub use evaluation::{

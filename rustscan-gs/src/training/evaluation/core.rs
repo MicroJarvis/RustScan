@@ -20,6 +20,8 @@ use crate::training::forward;
 #[cfg(feature = "gpu")]
 use burn::prelude::Backend;
 
+use super::{FrameSelection, FrameSelectionRequest};
+
 pub const MIN_RENDER_SCALE: f32 = 0.0625;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -172,22 +174,16 @@ pub fn select_evaluation_frames(
     max_frames: usize,
     frame_stride: usize,
 ) -> TrainingDataset {
-    let mut selected =
-        TrainingDataset::new(dataset.intrinsics).with_depth_scale(dataset.depth_scale);
-    selected.initial_points = dataset.initial_points.clone();
-    for pose in dataset
-        .poses
-        .iter()
-        .take(if max_frames == 0 {
-            dataset.poses.len()
-        } else {
-            max_frames
-        })
-        .step_by(frame_stride.max(1))
-    {
-        selected.add_pose(pose.clone());
-    }
-    selected
+    FrameSelection::select(
+        dataset,
+        &FrameSelectionRequest {
+            max_frames,
+            frame_stride: frame_stride.max(1),
+            ..Default::default()
+        },
+    )
+    .expect("max/stride-only frame selection cannot fail without allowed_ids")
+    .dataset
 }
 
 pub fn summarize_psnr_samples(values: &[f32]) -> PsnrSummary {
