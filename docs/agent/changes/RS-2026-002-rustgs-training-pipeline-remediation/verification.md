@@ -9,7 +9,7 @@
 | Worktree | `.worktrees/rs-2026-002-c1-c4-review` |
 | R04 code package | `cc4323b57f8aa23bd268583a93c804c58572cf38` |
 | Prior verification docs | `d878109f42dd67f38bcf88a1894ad70609f1811a` |
-| Handoff tip | filled at commit |
+| Handoff tip | `783eb2bac8ab0e6878e8d0c42a5b9dfb78a31b6e` |
 
 C1–C4: `implemented_pending_merge`. C5–C8 not started. No merge, push, or worktree deletion.
 
