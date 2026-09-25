@@ -1,6 +1,24 @@
 # RS-2026-002 Verification
 
-## C5 frame selection — review-fix (v4 compat / in-view / reselect)
+## C5 frame selection — merged to main (2026-09-25)
+
+| Field | Value |
+| --- | --- |
+| Merge | `--no-ff` `agent/RS-2026-002/c5-frame-selection` |
+| Merge commit | `96ac2235df88e5d731c4082657bf00eb0346e5d2` |
+| Main before | `a5d48ed1510683f79425d48267666cf0ca7d4a22` (`backup/main-before-c5`) |
+| Included tip | `21184120c953997f10bc55ae67d11ea50fc1d941` |
+| Conflicts | none |
+
+C5: `merged`. C6–C8: `not_started`.
+
+Post-merge gates on main (`POSELIB_ROOT` = main-tree PoseLib): `cargo fmt --all -- --check` PASS; workspace `cargo check --all-targets` PASS; `rustscan-gs` gpu-wgpu lib tests PASS **217**; `checkpoint_resume` PASS **65**; `git diff --check` PASS.
+
+### Next action
+
+C6–C8 remain `not_started`. Do not start C6 until explicitly requested.
+
+## C5 frame selection — review-fix (v4 compat / in-view / reselect; historical)
 
 | Field | Value |
 | --- | --- |
@@ -9,7 +27,7 @@
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
 | Tip after this package | `7437ef6c0956a88713fe1fbf52d6a607e0a91ff8` |
 
-C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+C5: later `merged` at `96ac223`. Historical package status at time of writing was `implemented_pending_review`. C6–C8: `not_started`.
 
 ### Compatibility scheme (old v3)
 
@@ -62,9 +80,9 @@ Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/P
 
 ### Next action
 
-Independent re-review of this C5 package. Do **not** start C6, merge, push, or delete the worktree until review accepts.
+Superseded: C5 merged to main at `96ac223`. C6–C8 remain `not_started`.
 
-## C5 frame selection — review-fix (gate / report / checkpoint meta)
+## C5 frame selection — review-fix (gate / report / checkpoint meta; historical)
 
 | Field | Value |
 | --- | --- |
@@ -73,7 +91,7 @@ Independent re-review of this C5 package. Do **not** start C6, merge, push, or d
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
 | Tip after this package | `2d552313e85dbd1b426955eed6a455f7acf4df15` |
 
-C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+C5: later `merged` at `96ac223`. Historical package status at time of writing was `implemented_pending_review`. C6–C8: `not_started`.
 
 ### Review findings closed this package
 
@@ -102,9 +120,9 @@ Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/P
 
 ### Next action
 
-Independent re-review of this C5 package. Do **not** start C6, merge, push, or delete the worktree until review accepts.
+Superseded: C5 merged to main at `96ac223`. C6–C8 remain `not_started`.
 
-## C5 frame selection — P2 review-fix (pending independent review)
+## C5 frame selection — P2 review-fix (historical)
 
 | Field | Value |
 | --- | --- |
@@ -113,7 +131,7 @@ Independent re-review of this C5 package. Do **not** start C6, merge, push, or d
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
 | Tip after this package | `0e984f458f34d8f193adeb37e3ea5922f1586416` |
 
-C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+C5: later `merged` at `96ac223`. Historical package status at time of writing was `implemented_pending_review`. C6–C8: `not_started`.
 
 ### P2 findings closed
 
@@ -156,7 +174,7 @@ Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/P
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
 | Tip after this package | `a327802ed9dad759d58fd922e6ea9409f513a494` |
 
-C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+C5: later `merged` at `96ac223`. Historical package status at time of writing was `implemented_pending_review`. C6–C8: `not_started`.
 
 ### Review findings closed this package
 
@@ -190,7 +208,7 @@ Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/P
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
 | Tip after this package | `0e984f458f34d8f193adeb37e3ea5922f1586416` |
 
-C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+C5: later `merged` at `96ac223`. Historical package status at time of writing was `implemented_pending_review`. C6–C8: `not_started`.
 
 ### P2 findings closed
 
@@ -233,7 +251,7 @@ Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/P
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
 | Tip after this package | `a327802ed9dad759d58fd922e6ea9409f513a494` |
 
-C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
+C5: later `merged` at `96ac223`. Historical package status at time of writing was `implemented_pending_review`. C6–C8: `not_started`.
 
 ### Review findings closed this package
 

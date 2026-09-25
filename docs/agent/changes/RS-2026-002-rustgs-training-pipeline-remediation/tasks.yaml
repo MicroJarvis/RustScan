@@ -20,8 +20,8 @@ cards:
     status: merged
     notes: "R02/R04/R06/R07/R08 closed; merged via --no-ff 4fdf506"
   C5:
-    status: implemented_pending_review
-    notes: "v4+legacy v3 unverified; in-view reports; canonical reselect; tip in verification.md"
+    status: merged
+    notes: "merged via --no-ff 96ac223; v4+legacy v3; in-view reports; canonical reselect"
   C6:
     status: not_started
   C7:
@@ -35,9 +35,9 @@ scope:
 out_of_scope:
   - rustsfm
   - rust-viewer
-  - C5-C8 implementation
+  - C6-C8 implementation
 acceptance:
-  - "C1-C4 merged to main at 4fdf506; C5-C8 not started."
+  - "C1-C4 merged to main at 4fdf506; C5 merged to main at 96ac223; C6-C8 not started."
 verification:
   - "cargo fmt --all -- --check"
   - "POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib cargo check --workspace --all-targets"
