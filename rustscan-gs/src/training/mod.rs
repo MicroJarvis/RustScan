@@ -63,6 +63,13 @@ pub use events::{
     TrainingRunFailed, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
     TrainingSnapshotReady,
 };
+#[cfg(feature = "gpu")]
+pub use reporting::gpu_profiler::{
+    assert_report_self_consistent, optimization_gpu_fields_from_profiler, probe_wgpu_environment,
+    span as gpu_profiler_span, timing_kind, GpuEnvironmentProbe, GpuProfilerReport,
+    OptimizationGpuFields, PipelineTimingCollector, PIPELINE_TIMING_WARMUP_SAMPLES,
+    UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE,
+};
 pub use reporting::metrics::{
     accumulate_sticky_forward_overflow, allows_state_mutation, step_intersection_overflowed,
     ForwardCapacityTelemetry, ParityFloatDistribution, ParityLossCurveSample, ParityLossTerms,
@@ -75,7 +82,7 @@ pub use reporting::optimization_report::{
     write_optimization_report, OptimizationCommand, OptimizationCompareDecision,
     OptimizationCompareResult, OptimizationEnvironment, OptimizationEvalFrame,
     OptimizationEvaluationMetrics, OptimizationMemoryMetrics, OptimizationMetricDelta,
-    OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics,
+    OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics, PipelineSpanStats,
 };
 
 pub use config::{
@@ -84,7 +91,8 @@ pub use config::{
     LiteGsRenderingConfig, LiteGsSplitScoreMode, LiteGsTileSize, LiteGsTopologyConfig,
     LiteGsTrainingProfile, TrainingBackend, TrainingConfig, TrainingDataConfig,
     TrainingInitializationConfig, TrainingLossConfig, TrainingOptimizerConfig,
-    TrainingRasterConfig, TrainingResult, DEFAULT_RASTER_COV_BLUR, MAX_TRAINING_ITERATIONS,
+    TrainingProfilerConfig, TrainingRasterConfig, TrainingResult, DEFAULT_RASTER_COV_BLUR,
+    MAX_TRAINING_ITERATIONS,
 };
 #[cfg(feature = "gpu")]
 pub use reporting::telemetry::{

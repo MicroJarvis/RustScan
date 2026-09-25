@@ -284,7 +284,6 @@ pub mod dynamic_mask_host {
     }
 }
 
-use burn::tensor::Int;
 use burn_cubecl::cubecl::{prelude::KernelId, server::KernelArguments, CubeCount};
 use burn_cubecl::{kernel::into_contiguous, BoolElement, CubeBackend, FloatElement, IntElement};
 use burn_wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime};

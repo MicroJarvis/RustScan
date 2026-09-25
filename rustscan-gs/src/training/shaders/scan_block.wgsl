@@ -29,7 +29,12 @@ fn main(
     @builtin(workgroup_id) group_id: vec3<u32>,
 ) {
     let idx = gid.x;
-    values[local_id] = select(0u, input_values[idx], idx < params.len);
+    // `select` would still evaluate `input_values[idx]` on tail lanes past `len`.
+    if (idx < params.len) {
+        values[local_id] = input_values[idx];
+    } else {
+        values[local_id] = 0u;
+    }
     workgroupBarrier();
 
     // 256 lanes, inclusive Hillis-Steele. Offset is uniform so barriers stay uniform.

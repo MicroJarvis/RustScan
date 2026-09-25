@@ -256,6 +256,7 @@ where
             cache_capacity: config.data.frame_cache_capacity,
             prefetch_ahead: config.data.frame_prefetch_ahead,
             rgb_target_size: Some((target_width, target_height)),
+            measure_timing: config.profiler.enabled,
         },
     )?;
 
@@ -298,25 +299,32 @@ where
             .await?;
             let (mut trainer, mut device_splats) = match resume_checkpoint {
                 Some(checkpoint) => {
-                    WgpuTrainer::from_checkpoint(
+                    let (mut trainer, device_splats) = WgpuTrainer::from_checkpoint(
                         config.clone(),
                         device.clone(),
                         scene_scale,
                         checkpoint,
                     )
-                    .await?
+                    .await?;
+                    if let Some(context) = shared_wgpu_context {
+                        trainer.set_pipeline_probe(context.environment_probe());
+                    }
+                    (trainer, device_splats)
                 }
                 None => {
                     let device_splats =
                         host_splats_to_device::<GsDiffBackend>(training_splats, &device);
                     let sh_coeffs = device_splats.sh_coeffs.val().dims()[1];
-                    let trainer = WgpuTrainer::new(
+                    let mut trainer = WgpuTrainer::new(
                         config.clone(),
                         device.clone(),
                         device_splats.num_splats(),
                         sh_coeffs,
                         scene_scale,
                     );
+                    if let Some(context) = shared_wgpu_context {
+                        trainer.set_pipeline_probe(context.environment_probe());
+                    }
                     (trainer, device_splats)
                 }
             };

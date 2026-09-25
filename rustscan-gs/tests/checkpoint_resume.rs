@@ -1229,9 +1229,12 @@ fn cancel_requested_by_checkpoint_event_finishes_cancelled_after_commit() {
 }
 
 #[test]
-fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
+fn resume_past_loss_cadence_pause_runs_one_more_iteration() {
     let temp = tempfile::tempdir().unwrap();
     let dataset = tiny_training_dataset(&temp, "resume-frame", 3);
+    // Pause can only take effect at a declared safety point. With loss-cadence
+    // confirmation (interval 20), progress for mid-run iterations arrives in the
+    // catch-up batch at iteration 20, so the pause checkpoint commits 20.
     let pause_config = tiny_training_config(20);
     let identity =
         TrainingIdentity::from_canonical_content(&dataset, b"resume-reconstruction", &pause_config)
@@ -1257,7 +1260,7 @@ fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
             .with_event_sink(move |event| {
                 if matches!(
                     event,
-                    TrainingEvent::IterationProgress(progress) if progress.iteration == 7
+                    TrainingEvent::IterationProgress(progress) if progress.iteration == 20
                 ) {
                     event_control.request_pause();
                 }
@@ -1265,12 +1268,14 @@ fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
     )
     .unwrap();
     assert_eq!(paused.report.disposition, TrainingRunDisposition::Paused);
+    assert_eq!(paused.report.completed_iterations, 20);
     let checkpoint = captured_checkpoint
         .borrow()
         .clone()
         .expect("pause checkpoint");
+    assert_eq!(checkpoint.completed_iterations, 20);
 
-    let resume_config = tiny_training_config(8);
+    let resume_config = tiny_training_config(21);
     let resume_identity = TrainingIdentity::from_canonical_content(
         &dataset,
         b"resume-reconstruction",
@@ -1293,8 +1298,8 @@ fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
     )
     .unwrap();
 
-    assert_eq!(resumed_iterations.borrow().as_slice(), [8]);
-    assert_eq!(resumed.report.completed_iterations, 8);
+    assert_eq!(resumed_iterations.borrow().as_slice(), [21]);
+    assert_eq!(resumed.report.completed_iterations, 21);
     assert!(!resumed.report.cancelled);
     assert_eq!(
         resumed.report.disposition,
@@ -1308,8 +1313,9 @@ fn resume_to_larger_target_starts_at_iteration_eight_and_next_frame() {
         .loss_curve_samples
         .last()
         .expect("target iteration is retained in telemetry");
-    assert_eq!(last_sample.iteration, 8);
-    assert_eq!(last_sample.frame_idx, 1);
+    assert_eq!(last_sample.iteration, 21);
+    // zero-based sample index 20 with 3 frames → frame 2
+    assert_eq!(last_sample.frame_idx, 2);
 }
 
 #[test]

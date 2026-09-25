@@ -1,3 +1,4 @@
+use super::gpu_profiler::GpuProfilerReport;
 use super::metrics::{
     ForwardCapacityTelemetry, ParityLossCurveSample, ParityLossTerms, ParityTopologyMetrics,
 };
@@ -32,13 +33,22 @@ pub struct LiteGsTrainingTelemetry {
     pub scan_dispatch_count_p95: Option<usize>,
     pub sort_workspace_bytes: Option<usize>,
     pub scan_workspace_bytes: Option<usize>,
+    /// Present when `scan_workspace_bytes` is measured from owned capacities.
+    pub scan_workspace_bytes_reason: Option<String>,
+    pub scan_workspace_scratch_bytes: Option<usize>,
+    pub scan_workspace_output_bytes: Option<usize>,
     pub scan_workspace_growth_count: Option<usize>,
+    pub scan_workspace_output_growth_count: Option<usize>,
     pub scan_workspace_step_fresh_allocations_p50: Option<usize>,
     pub scan_workspace_step_fresh_allocations_p95: Option<usize>,
+    pub scan_workspace_step_scratch_fresh_p50: Option<usize>,
+    pub scan_workspace_step_output_fresh_p50: Option<usize>,
     /// CPU submit-side loop duration percentiles (`Instant`); not GPU completion.
     pub loop_duration_p50_ms: Option<f64>,
     pub loop_duration_p95_ms: Option<f64>,
     pub loop_timing_kind: Option<String>,
+    /// GPU completion profiler report (timestamp-query aware).
+    pub gpu_profiler: Option<GpuProfilerReport>,
     pub loss_readback_count: Option<usize>,
     pub count_readback_count: Option<usize>,
     pub status_readbacks: Option<usize>,
@@ -49,6 +59,7 @@ pub struct LiteGsTrainingTelemetry {
     pub status_readbacks_cancel: Option<usize>,
     pub status_readbacks_training_end: Option<usize>,
     pub status_readbacks_forward_abort: Option<usize>,
+    pub status_readbacks_step_disposition: Option<usize>,
     pub capacity_telemetry_readbacks: Option<usize>,
     pub loss_value_readbacks: Option<usize>,
     pub checkpoint_tensor_readbacks: Option<usize>,

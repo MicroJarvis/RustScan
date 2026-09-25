@@ -24,6 +24,25 @@ impl<B: Backend> DeviceSplats<B> {
     }
 }
 
+/// Empty device splat set used as a temporary stand-in while owned splats run
+/// under GPU profiling (avoids unsafe Send raw pointers into cubecl closures).
+pub(crate) fn empty_device_splats_placeholder<B: Backend>(
+    device: &B::Device,
+    sh_degree: u32,
+) -> DeviceSplats<B> {
+    // Empty component arrays validate for any SH degree (zero rows).
+    let host = HostSplats::from_components(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        sh_degree as usize,
+    )
+    .expect("empty HostSplats validate for any SH degree");
+    host_splats_to_device(&host, device)
+}
+
 pub fn host_splats_to_device<B: Backend>(hs: &HostSplats, device: &B::Device) -> DeviceSplats<B> {
     let num_splats = hs.len();
     let sh_degree = hs.sh_degree() as u32;

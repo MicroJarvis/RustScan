@@ -58,6 +58,19 @@ pub use rustscan_types::{Intrinsics, MapPointData, ScenePose, TrainingDataset, S
 pub use crate::core::{GaussianCamera, HostSplats, SplatView};
 
 // Re-export training types
+#[cfg(feature = "gpu")]
+pub use crate::training::{
+    assert_report_self_consistent, evaluate_splats, evaluation_device, last_training_telemetry,
+    optimization_gpu_fields_from_profiler, probe_wgpu_environment, render_evaluation_frame,
+    run_bounded_forward_parity_suite, runtime_from_splats, timing_kind, training_frame_order,
+    GpuEnvironmentProbe, GpuProfilerReport, LiteGsOptimizerLrs, LiteGsTrainingTelemetry,
+    OptimizationGpuFields, PipelineTimingCollector, TrainingCheckpointPolicy,
+    TrainingCheckpointReady, TrainingCheckpointReason, TrainingCheckpointSink, TrainingControl,
+    TrainingEvent, TrainingEventCadence, TrainingEventRoute, TrainingIterationProgress,
+    TrainingOptions, TrainingPlanSelected, TrainingRun, TrainingRunCancelled, TrainingRunCompleted,
+    TrainingRunDisposition, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
+    TrainingSnapshotReady, PIPELINE_TIMING_WARMUP_SAMPLES, UNSUPPORTED_TIMESTAMP_QUERY_UNAVAILABLE,
+};
 pub use crate::training::{
     build_optimization_report, canonical_config_fingerprint, compare_loss_curve_samples,
     compare_optimization_reports, current_peak_rss_bytes, default_litegs_parity_fixtures,
@@ -78,12 +91,12 @@ pub use crate::training::{
     ParityFixtureSpec, ParityFloatDistribution, ParityGateEvaluation, ParityGateStatus,
     ParityHarnessReport, ParityLossCurveSample, ParityLossTerms, ParityMetricSnapshot,
     ParityReferenceComparison, ParityThresholds, ParityTimingMetrics, ParityTopologyMetrics,
-    ParityTopologyStepSample, PsnrSummary, SplatEvaluationConfig, SplatEvaluationError,
-    SplatEvaluationResult, SplatEvaluationSummary, TensorCheckpoint, TopologyCheckpoint,
-    TrainingCheckpoint, TrainingDataConfig, TrainingIdentity, TrainingInitializationConfig,
-    TrainingLossConfig, TrainingOptimizerConfig, TrainingRasterConfig,
-    DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_RASTER_COV_BLUR, DEFAULT_TINY_FIXTURE_ID,
-    MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
+    ParityTopologyStepSample, PipelineSpanStats, PsnrSummary, SplatEvaluationConfig,
+    SplatEvaluationError, SplatEvaluationResult, SplatEvaluationSummary, TensorCheckpoint,
+    TopologyCheckpoint, TrainingCheckpoint, TrainingDataConfig, TrainingIdentity,
+    TrainingInitializationConfig, TrainingLossConfig, TrainingOptimizerConfig,
+    TrainingRasterConfig, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_RASTER_COV_BLUR,
+    DEFAULT_TINY_FIXTURE_ID, MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
     MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
     MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, TRAINING_CHECKPOINT_FORMAT_VERSION,
     TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION, TRAINING_CHECKPOINT_VERSION_V1,
@@ -91,17 +104,6 @@ pub use crate::training::{
 pub use crate::training::{
     compute_psnr_f32, scaled_dimensions, select_evaluation_frames, summarize_psnr_samples,
     summarize_training_metrics, worst_frame_metrics,
-};
-#[cfg(feature = "gpu")]
-pub use crate::training::{
-    evaluate_splats, evaluation_device, last_training_telemetry, render_evaluation_frame,
-    run_bounded_forward_parity_suite, runtime_from_splats, training_frame_order,
-    LiteGsOptimizerLrs, LiteGsTrainingTelemetry, TrainingCheckpointPolicy, TrainingCheckpointReady,
-    TrainingCheckpointReason, TrainingCheckpointSink, TrainingControl, TrainingEvent,
-    TrainingEventCadence, TrainingEventRoute, TrainingIterationProgress, TrainingOptions,
-    TrainingPlanSelected, TrainingRun, TrainingRunCancelled, TrainingRunCompleted,
-    TrainingRunDisposition, TrainingRunPaused, TrainingRunReport, TrainingRunStarted,
-    TrainingSnapshotReady,
 };
 #[cfg(feature = "gpu")]
 pub use crate::training::{

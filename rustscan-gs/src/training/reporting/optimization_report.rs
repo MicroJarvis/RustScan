@@ -28,6 +28,10 @@ pub struct OptimizationEnvironment {
     pub backend: Option<String>,
     pub driver: Option<String>,
     pub timestamp_query_available: Option<bool>,
+    /// Present when adapter_name could not be probed from the training device.
+    pub adapter_unavailable_reason: Option<String>,
+    /// Present when driver could not be probed from the training device.
+    pub driver_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -51,6 +55,15 @@ pub struct OptimizationCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PipelineSpanStats {
+    pub sample_count: u64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    /// Honest classification (e.g. `host_wait`, `worker_wall`, `cpu_submit`).
+    pub timing_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct OptimizationTrainMetrics {
     pub wall_clock_seconds: Option<f64>,
     pub training_loop_seconds: Option<f64>,
@@ -58,9 +71,36 @@ pub struct OptimizationTrainMetrics {
     pub steps_per_second: Option<f64>,
     pub loop_duration_p50_ms: Option<f64>,
     pub loop_duration_p95_ms: Option<f64>,
-    /// CPU submit-side loop samples only; not GPU completion time.
+    /// Train-step wall samples (`step_wall`); not GPU completion time.
     pub loop_timing_kind: Option<String>,
+    /// Always null — never invent totals via p50 × completed_iterations.
     pub gpu_completion_seconds: Option<f64>,
+    /// Scope of GPU timestamp samples (`"forward"`).
+    pub gpu_timing_scope: Option<String>,
+    /// Sum of accepted post-warmup GPU forward samples in seconds (not full train GPU time).
+    pub gpu_forward_sum_seconds: Option<f64>,
+    /// Forward-only GPU completion p50; null when unsupported or unsampled.
+    pub gpu_step_p50_ms: Option<f64>,
+    pub gpu_step_p95_ms: Option<f64>,
+    pub gpu_step_sample_count: Option<u64>,
+    pub gpu_profiler_unsupported_reason: Option<String>,
+    /// Host Instant / CPU span collection enabled.
+    pub profiler_enabled: Option<bool>,
+    /// Device timestamp profiling requested.
+    pub gpu_timing_enabled: Option<bool>,
+    /// Sample every N iterations when GPU timing is enabled.
+    pub gpu_sample_every: Option<usize>,
+    /// True when at least one accepted GPU forward sample survived warmup.
+    pub measurement_success: Option<bool>,
+    /// Illegal (non-finite / negative) timing samples dropped at record sites.
+    pub rejected_timing_samples: Option<u64>,
+    pub profile_start_failures: Option<u64>,
+    pub profile_end_failures: Option<u64>,
+    pub profile_resolve_failures: Option<u64>,
+    pub dropped_profile_samples: Option<u64>,
+    /// Unified pipeline span percentiles and timing kinds.
+    #[serde(default)]
+    pub pipeline_spans: std::collections::BTreeMap<String, PipelineSpanStats>,
     pub loss_readback_count: Option<usize>,
     pub count_readback_count: Option<usize>,
     pub status_readbacks: Option<usize>,
@@ -71,6 +111,7 @@ pub struct OptimizationTrainMetrics {
     pub status_readbacks_cancel: Option<usize>,
     pub status_readbacks_training_end: Option<usize>,
     pub status_readbacks_forward_abort: Option<usize>,
+    pub status_readbacks_step_disposition: Option<usize>,
     pub gpu_gate_optimizer_skips: Option<usize>,
     pub gpu_gate_backward_skips: Option<usize>,
     pub gpu_gate_topology_skips: Option<usize>,
@@ -105,7 +146,15 @@ pub struct OptimizationTopologyMetrics {
 pub struct OptimizationMemoryMetrics {
     pub peak_rss_bytes: Option<u64>,
     pub peak_device_bytes: Option<u64>,
+    pub peak_device_bytes_reason: Option<String>,
     pub estimated_buffer_bytes: Option<u64>,
+    /// Scope of workspace_* / fresh_step_allocations (`"prefix_sum"`).
+    pub workspace_scope: Option<String>,
+    pub workspace_current_bytes: Option<u64>,
+    pub workspace_peak_bytes: Option<u64>,
+    pub workspace_growth_count: Option<u64>,
+    /// Prefix-sum workspace fresh allocations only — not whole-runtime zero-alloc proof.
+    pub fresh_step_allocations: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -510,6 +559,8 @@ mod tests {
                 backend: Some("Metal".into()),
                 driver: None,
                 timestamp_query_available: Some(false),
+                adapter_unavailable_reason: None,
+                driver_unavailable_reason: Some("driver_info_empty".into()),
             },
             command: OptimizationCommand {
                 argv: vec!["rustgs".into(), "train".into()],
@@ -535,8 +586,24 @@ mod tests {
                 steps_per_second: Some(50.0),
                 loop_duration_p50_ms: Some(18.0),
                 loop_duration_p95_ms: Some(22.0),
-                loop_timing_kind: Some("cpu_submit_instant".into()),
+                loop_timing_kind: Some("step_wall".into()),
                 gpu_completion_seconds: None,
+                gpu_timing_scope: Some("forward".into()),
+                gpu_forward_sum_seconds: None,
+                gpu_step_p50_ms: None,
+                gpu_step_p95_ms: None,
+                gpu_step_sample_count: Some(0),
+                gpu_profiler_unsupported_reason: Some("timestamp_query_unavailable".into()),
+                profiler_enabled: Some(true),
+                gpu_timing_enabled: Some(false),
+                gpu_sample_every: Some(20),
+                measurement_success: Some(false),
+                rejected_timing_samples: Some(0),
+                profile_start_failures: Some(0),
+                profile_end_failures: Some(0),
+                profile_resolve_failures: Some(0),
+                dropped_profile_samples: Some(0),
+                pipeline_spans: Default::default(),
                 loss_readback_count: Some(26),
                 count_readback_count: Some(0),
                 status_readbacks: Some(27),
@@ -547,6 +614,7 @@ mod tests {
                 status_readbacks_cancel: Some(0),
                 status_readbacks_training_end: Some(1),
                 status_readbacks_forward_abort: Some(0),
+                status_readbacks_step_disposition: Some(0),
                 gpu_gate_optimizer_skips: Some(0),
                 gpu_gate_backward_skips: Some(0),
                 gpu_gate_topology_skips: Some(0),
@@ -582,7 +650,13 @@ mod tests {
             memory: OptimizationMemoryMetrics {
                 peak_rss_bytes: Some(1_000_000),
                 peak_device_bytes: None,
+                peak_device_bytes_reason: Some("runtime_peak_device_bytes_unavailable".into()),
                 estimated_buffer_bytes: Some(2_000_000),
+                workspace_scope: Some("prefix_sum".into()),
+                workspace_current_bytes: Some(512),
+                workspace_peak_bytes: Some(512),
+                workspace_growth_count: Some(1),
+                fresh_step_allocations: Some(2),
             },
             evaluation: Some(OptimizationEvaluationMetrics {
                 frame_count: Some(2),
@@ -618,6 +692,8 @@ mod tests {
         assert!(json.contains("\"gpu_completion_seconds\": null"));
         assert!(json.contains("\"peak_device_bytes\": null"));
         assert!(json.contains("\"driver\": null"));
+        assert!(json.contains("\"gpu_step_p50_ms\": null"));
+        assert!(json.contains("timestamp_query_unavailable"));
         let decoded: OptimizationReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, report);
         assert_eq!(decoded.evaluation.as_ref().unwrap().frames.len(), 2);

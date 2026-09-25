@@ -96,6 +96,15 @@ pub(crate) fn prefix_sum_workspace_bytes(len: usize) -> usize {
     total.saturating_mul(std::mem::size_of::<u32>())
 }
 
+/// Scratch plus final output bytes for a reusable scan of `len` elements.
+pub(crate) fn prefix_sum_total_reserved_bytes(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    prefix_sum_workspace_bytes(len)
+        .saturating_add(len.saturating_mul(std::mem::size_of::<u32>()))
+}
+
 pub(crate) fn hillis_steele_dispatch_count(len: usize) -> usize {
     if len <= 1 {
         return 0;
@@ -115,6 +124,27 @@ fn empty_tensor(like: &CubeTensor<WgpuRuntime>, len: usize) -> CubeTensor<WgpuRu
     )
 }
 
+fn tensor_byte_len(tensor: &CubeTensor<WgpuRuntime>) -> usize {
+    tensor
+        .shape()
+        .num_elements()
+        .saturating_mul(core::mem::size_of::<u32>())
+}
+
+/// Logical view of the first `len` elements of a reusable output buffer.
+fn shaped_output_view(
+    buffer: &CubeTensor<WgpuRuntime>,
+    len: usize,
+) -> CubeTensor<WgpuRuntime> {
+    CubeTensor::new_contiguous(
+        buffer.client.clone(),
+        buffer.device.clone(),
+        Shape::new([len.max(1)]),
+        buffer.handle.clone(),
+        buffer.dtype(),
+    )
+}
+
 /// Per-recursion-level scratch: raw block totals plus their inclusive prefix.
 pub(crate) struct PrefixSumLevel {
     block_sums: CubeTensor<WgpuRuntime>,
@@ -122,13 +152,41 @@ pub(crate) struct PrefixSumLevel {
     blocks: usize,
 }
 
+/// Per-step allocation counters for workspace telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrefixSumStepAllocations {
+    /// New recursive scratch tensors allocated this step.
+    pub scratch_fresh: usize,
+    /// New final-output tensors allocated this step.
+    pub output_fresh: usize,
+}
+
+impl PrefixSumStepAllocations {
+    pub(crate) fn total(self) -> usize {
+        self.scratch_fresh.saturating_add(self.output_fresh)
+    }
+}
+
 /// Caller-owned hierarchical scan workspace reused across training steps.
+///
+/// Owns recursive scratch levels and the final scan output. `inclusive_scan_into`
+/// returns a cloned handle to the workspace output; the next scan reuses that
+/// buffer only when it is exclusively owned (`can_mut`), so a still-live prior
+/// result is never overwritten. Growth replaces storage without invalidating
+/// outstanding clones of the previous buffers.
 pub(crate) struct PrefixSumWorkspace {
     capacity: usize,
     levels: Vec<PrefixSumLevel>,
+    output: Option<CubeTensor<WgpuRuntime>>,
+    output_capacity: usize,
     reserved_bytes: usize,
+    scratch_bytes: usize,
+    output_bytes: usize,
+    /// Times scratch level capacity grew (`len > capacity`).
     growth_count: usize,
-    step_fresh_allocations: usize,
+    /// Times output capacity grew (`len > output_capacity`).
+    output_growth_count: usize,
+    step_allocations: PrefixSumStepAllocations,
 }
 
 impl Default for PrefixSumWorkspace {
@@ -142,9 +200,14 @@ impl PrefixSumWorkspace {
         Self {
             capacity: 0,
             levels: Vec::new(),
+            output: None,
+            output_capacity: 0,
             reserved_bytes: 0,
+            scratch_bytes: 0,
+            output_bytes: 0,
             growth_count: 0,
-            step_fresh_allocations: 0,
+            output_growth_count: 0,
+            step_allocations: PrefixSumStepAllocations::default(),
         }
     }
 
@@ -152,45 +215,102 @@ impl PrefixSumWorkspace {
         self.capacity
     }
 
+    pub(crate) fn output_capacity(&self) -> usize {
+        self.output_capacity
+    }
+
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reserved_bytes
+    }
+
+    pub(crate) fn scratch_bytes(&self) -> usize {
+        self.scratch_bytes
+    }
+
+    pub(crate) fn output_bytes(&self) -> usize {
+        self.output_bytes
     }
 
     pub(crate) fn growth_count(&self) -> usize {
         self.growth_count
     }
 
+    pub(crate) fn output_growth_count(&self) -> usize {
+        self.output_growth_count
+    }
+
     pub(crate) fn step_fresh_allocations(&self) -> usize {
-        self.step_fresh_allocations
+        self.step_allocations.total()
     }
 
-    /// Reset per-step fresh allocation counter (call at the start of a train step).
+    pub(crate) fn step_allocations(&self) -> PrefixSumStepAllocations {
+        self.step_allocations
+    }
+
+    /// Reset per-step fresh allocation counters (call at the start of a train step).
     pub(crate) fn begin_step(&mut self) {
-        self.step_fresh_allocations = 0;
+        self.step_allocations = PrefixSumStepAllocations::default();
     }
 
-    /// Inclusive scan into a caller-owned `output` using reserved level scratch.
+    fn recompute_reserved_bytes(&mut self) {
+        self.scratch_bytes = prefix_sum_workspace_bytes(self.capacity);
+        self.output_bytes = self
+            .output_capacity
+            .saturating_mul(std::mem::size_of::<u32>());
+        self.reserved_bytes = self.scratch_bytes.saturating_add(self.output_bytes);
+        if self.capacity > 1 && self.capacity == self.output_capacity {
+            debug_assert_eq!(
+                self.reserved_bytes,
+                prefix_sum_total_reserved_bytes(self.capacity),
+                "reserved bytes must match scratch+output capacity formula"
+            );
+        }
+    }
+
+    /// Inclusive scan using reserved scratch and a workspace-owned output buffer.
+    ///
+    /// Returns a handle to the workspace output. Callers must finish consuming a
+    /// prior result (or accept a fresh output allocation) before the next scan
+    /// that would otherwise reuse the same storage.
     pub(crate) fn inclusive_scan_into(
         &mut self,
         input: CubeTensor<WgpuRuntime>,
         len: usize,
-        output: CubeTensor<WgpuRuntime>,
     ) -> Result<CubeTensor<WgpuRuntime>, String> {
+        let input_len = input.shape()[0];
+        if len > input_len {
+            return Err(format!(
+                "prefix scan requested len {len} exceeds input length {input_len}"
+            ));
+        }
+        // Preserve existing empty / singleton semantics: no scratch, no launch.
         if len <= 1 {
             return Ok(input);
         }
-        if output.shape()[0] < len {
-            return Err(format!(
-                "prefix scan output len {} < requested {len}",
-                output.shape()[0]
-            ));
+        self.reserve_scratch(len, &input);
+        let buffer = self.take_output_buffer(len, &input)?;
+        // Shared storage would mean neither handle is exclusively owned.
+        if !input.can_mut()
+            && !buffer.can_mut()
+            && format!("{:?}", input.handle.memory) == format!("{:?}", buffer.handle.memory)
+        {
+            self.output = Some(buffer);
+            return Err("prefix scan input and output must not share storage".into());
         }
-        self.reserve(len, &input);
-        self.scan_into_level(input, len, output, 0)
+        let scanned = self.scan_into_level(input, len, buffer, 0)?;
+        // Keep the full-capacity buffer in the workspace; hand callers a
+        // length-shaped view so short→long reuse does not leak stale tails.
+        self.output = Some(scanned.clone());
+        Ok(shaped_output_view(&scanned, len))
     }
 
-    /// Grow scratch levels so an inclusive scan of `capacity` elements can run.
+    /// Grow recursive scratch levels so an inclusive scan of `capacity` can run.
+    #[allow(dead_code)] // Public pre-warm API; training grows via inclusive_scan_into.
     pub(crate) fn reserve(&mut self, capacity: usize, like: &CubeTensor<WgpuRuntime>) {
+        self.reserve_scratch(capacity, like);
+    }
+
+    fn reserve_scratch(&mut self, capacity: usize, like: &CubeTensor<WgpuRuntime>) {
         let capacity = capacity.max(1);
         let device_ok = self
             .levels
@@ -219,9 +339,62 @@ impl PrefixSumWorkspace {
 
         self.capacity = capacity;
         self.levels = levels;
-        self.reserved_bytes = prefix_sum_workspace_bytes(capacity);
         self.growth_count = self.growth_count.saturating_add(1);
-        self.step_fresh_allocations = self.step_fresh_allocations.saturating_add(fresh);
+        self.step_allocations.scratch_fresh =
+            self.step_allocations.scratch_fresh.saturating_add(fresh);
+        self.recompute_reserved_bytes();
+    }
+
+    /// Take an exclusively owned output buffer of at least `len` elements.
+    ///
+    /// Reuses the prior buffer only when it is large enough and `can_mut`.
+    /// Otherwise allocates a fresh buffer so still-live scan results stay valid.
+    fn take_output_buffer(
+        &mut self,
+        len: usize,
+        like: &CubeTensor<WgpuRuntime>,
+    ) -> Result<CubeTensor<WgpuRuntime>, String> {
+        let len = len.max(1);
+        let previous = self.output.take();
+        let device_ok = previous
+            .as_ref()
+            .is_none_or(|out| out.device == like.device);
+        if device_ok {
+            if let Some(out) = previous {
+                let large_enough = self.output_capacity >= len && out.shape()[0] >= len;
+                if large_enough && out.can_mut() {
+                    return Ok(out);
+                }
+                // Still referenced by a prior consumer, or wrong size: keep the
+                // outstanding clone alive and allocate a replacement.
+                if !out.can_mut() && large_enough {
+                    // Capacity unchanged; forced fresh alloc to avoid alias overwrite.
+                    let fresh = empty_tensor(like, self.output_capacity.max(len));
+                    self.step_allocations.output_fresh =
+                        self.step_allocations.output_fresh.saturating_add(1);
+                    return Ok(fresh);
+                }
+                // Drop `out` (or leave it to GC if still shared) and grow below.
+            }
+        }
+
+        let alloc_len = len.max(self.output_capacity.max(1));
+        let grew = alloc_len > self.output_capacity;
+        let fresh = empty_tensor(like, alloc_len);
+        self.output_capacity = alloc_len;
+        if grew {
+            self.output_growth_count = self.output_growth_count.saturating_add(1);
+        }
+        self.step_allocations.output_fresh =
+            self.step_allocations.output_fresh.saturating_add(1);
+        self.recompute_reserved_bytes();
+        debug_assert_eq!(
+            self.reserved_bytes,
+            self.scratch_bytes
+                .saturating_add(self.output_capacity.saturating_mul(std::mem::size_of::<u32>()))
+        );
+        debug_assert_eq!(tensor_byte_len(&fresh), self.output_bytes);
+        Ok(fresh)
     }
 
     fn scan_into_level(
@@ -245,6 +418,12 @@ impl PrefixSumWorkspace {
             return Err(format!(
                 "prefix scan level {level} blocks {} < required {blocks}",
                 self.levels[level].blocks
+            ));
+        }
+        if output.shape()[0] < len {
+            return Err(format!(
+                "prefix scan output len {} < requested {len}",
+                output.shape()[0]
             ));
         }
 
@@ -292,8 +471,7 @@ impl PrefixSumWorkspace {
     }
 }
 
-/// Training-path scan that reuses reserved scratch in `workspace`.
-/// Output storage is still allocated per call (P1.2 reuses it); levels are reused.
+/// Training-path scan that reuses reserved scratch and output in `workspace`.
 pub(crate) fn inclusive_scan_with_workspace(
     workspace: &mut PrefixSumWorkspace,
     input: CubeTensor<WgpuRuntime>,
@@ -309,8 +487,7 @@ pub(crate) fn inclusive_scan_with_workspace(
     if len <= 1 {
         return Ok(input);
     }
-    let output = empty_tensor(&input, len);
-    workspace.inclusive_scan_into(input, len, output)
+    workspace.inclusive_scan_into(input, len)
 }
 
 impl<F, I, BT> PrefixSumBackend for CubeBackend<WgpuRuntime, F, I, BT>
@@ -399,8 +576,8 @@ fn inclusive_scan_fresh(input: CubeTensor<WgpuRuntime>) -> Result<CubeTensor<Wgp
 #[cfg(test)]
 mod tests {
     use super::{
-        hillis_steele_dispatch_count, prefix_sum_dispatch_count, prefix_sum_workspace_bytes,
-        PrefixSumBackend, PrefixSumWorkspace,
+        hillis_steele_dispatch_count, prefix_sum_dispatch_count, prefix_sum_total_reserved_bytes,
+        prefix_sum_workspace_bytes, PrefixSumBackend, PrefixSumWorkspace,
     };
 
     #[test]
@@ -492,7 +669,7 @@ mod tests {
 
         let device = <GsBackendBase as Backend>::Device::default();
         let short = vec![1_i32, 2, 3];
-        let long: Vec<i32> = (0..257).map(|index| (index % 5) as i32 + 1).collect();
+        let long: Vec<i32> = (0..257).map(|index| index % 5 + 1).collect();
         let short_again = vec![4_i32, 5, 6];
 
         let held_short = {
@@ -554,11 +731,11 @@ mod tests {
             vec![0, 0, 0, 0],
             vec![1, 2, 3, 4, 5],
             vec![i32::MAX, 1, 2, 3],
-            (0..17).map(|index| (index * 3) as i32).collect(),
-            (0..255).map(|index| (index * 5) as i32).collect(),
-            (0..256).map(|index| (index * 7) as i32).collect(),
-            (0..257).map(|index| (index * 11) as i32).collect(),
-            (0..4093).map(|index| (index * 13) as i32).collect(),
+            (0..17).map(|index| index * 3).collect(),
+            (0..255).map(|index| index * 5).collect(),
+            (0..256).map(|index| index * 7).collect(),
+            (0..257).map(|index| index * 11).collect(),
+            (0..4093).map(|index| index * 13).collect(),
             (0..1000)
                 .map(|index| if index % 7 == 0 { 0 } else { 3 })
                 .collect(),
@@ -603,6 +780,7 @@ mod tests {
         let device = <GsBackendBase as Backend>::Device::default();
         let mut ws = PrefixSumWorkspace::new();
         assert_eq!(ws.growth_count(), 0);
+        assert_eq!(ws.output_growth_count(), 0);
 
         let scan = |ws: &mut PrefixSumWorkspace, values: Vec<i32>| {
             let len = values.len();
@@ -612,29 +790,55 @@ mod tests {
         };
 
         ws.begin_step();
-        let _ = scan(&mut ws, vec![1, 2, 3, 4]);
+        let _first = scan(&mut ws, vec![1, 2, 3, 4]);
+        // Drop the returned handle so the next step can reuse output storage.
+        drop(_first);
         assert_eq!(ws.growth_count(), 1);
+        assert_eq!(ws.output_growth_count(), 1);
         assert!(ws.capacity() >= 4);
+        assert_eq!(ws.output_capacity(), 4);
         let reserved_after_first = ws.reserved_bytes();
-        assert_eq!(reserved_after_first, prefix_sum_workspace_bytes(4));
-        let fresh_first = ws.step_fresh_allocations();
-        assert!(fresh_first >= 2);
+        assert_eq!(reserved_after_first, prefix_sum_total_reserved_bytes(4));
+        assert_eq!(ws.scratch_bytes(), prefix_sum_workspace_bytes(4));
+        assert_eq!(ws.output_bytes(), 4 * std::mem::size_of::<u32>());
+        let fresh_first = ws.step_allocations();
+        assert!(fresh_first.scratch_fresh >= 2);
+        assert_eq!(fresh_first.output_fresh, 1);
 
         ws.begin_step();
         let _ = scan(&mut ws, vec![5, 6, 7, 8]);
         assert_eq!(ws.growth_count(), 1, "same capacity must not grow");
+        assert_eq!(ws.output_growth_count(), 1, "same output capacity must not grow");
         assert_eq!(ws.reserved_bytes(), reserved_after_first);
-        assert_eq!(ws.step_fresh_allocations(), 0, "reuse must not fresh-allocate");
+        assert_eq!(
+            ws.step_fresh_allocations(),
+            0,
+            "reuse must not fresh-allocate scratch or output"
+        );
 
         ws.begin_step();
-        let long: Vec<i32> = (0..300).map(|i| (i % 3) as i32 + 1).collect();
+        let long: Vec<i32> = (0..300).map(|i| i % 3 + 1).collect();
         let held = scan(&mut ws, long);
         assert_eq!(ws.growth_count(), 2, "larger capacity must grow once");
+        assert_eq!(ws.output_growth_count(), 2);
         assert!(ws.reserved_bytes() > reserved_after_first);
-        assert!(ws.step_fresh_allocations() >= 2);
+        assert_eq!(
+            ws.reserved_bytes(),
+            prefix_sum_total_reserved_bytes(ws.capacity())
+        );
+        let grow_step = ws.step_allocations();
+        assert!(grow_step.scratch_fresh >= 2);
+        assert_eq!(grow_step.output_fresh, 1);
 
         ws.begin_step();
-        let _ = scan(&mut ws, vec![1, 1, 1]);
+        // Prior long result is still held: next scan must allocate a fresh output
+        // instead of overwriting the live buffer.
+        let short_again = scan(&mut ws, vec![1, 1, 1]);
+        assert_eq!(ws.growth_count(), 2, "shorter scan must not grow scratch");
+        assert!(
+            ws.step_allocations().output_fresh >= 1,
+            "in-use prior output forces a fresh output buffer"
+        );
         let held_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(held)
             .into_data_async()
             .await
@@ -643,6 +847,224 @@ mod tests {
             .expect("held data");
         assert_eq!(held_vals.len(), 300);
         assert_eq!(held_vals[0], 1);
+        let short_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(short_again)
+            .into_data_async()
+            .await
+            .expect("short readback")
+            .into_vec::<i32>()
+            .expect("short data");
+        assert_eq!(short_vals, vec![1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_hundred_step_fixed_shape_reaches_zero_fresh() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+
+        fn cpu_scan(values: &[i32]) -> Vec<i32> {
+            let mut acc = 0u32;
+            values
+                .iter()
+                .map(|value| {
+                    acc = acc.wrapping_add(*value as u32);
+                    acc as i32
+                })
+                .collect()
+        }
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut ws = PrefixSumWorkspace::new();
+        let values: Vec<i32> = (0..257).map(|i| i % 5 + 1).collect();
+        let expected = cpu_scan(&values);
+        let mut growth_series = Vec::new();
+
+        for step in 0..100 {
+            ws.begin_step();
+            let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(values.clone(), [values.len()]),
+                &device,
+            );
+            let scanned =
+                GsBackendBase::prefix_sum_u32_with_workspace(&mut ws, input.into_primitive())
+                    .expect("workspace scan");
+            let actual = Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
+                .into_data_async()
+                .await
+                .expect("readback")
+                .into_vec::<i32>()
+                .expect("data");
+            assert_eq!(actual, expected, "step {step} result mismatch");
+
+            growth_series.push(ws.growth_count());
+            assert_eq!(
+                ws.reserved_bytes(),
+                prefix_sum_total_reserved_bytes(ws.capacity()),
+                "reserved bytes must recompute from capacity"
+            );
+            assert_eq!(
+                ws.reserved_bytes(),
+                ws.scratch_bytes().saturating_add(ws.output_bytes())
+            );
+
+            if step == 0 {
+                assert!(ws.step_fresh_allocations() > 0, "first step may allocate");
+                assert!(ws.growth_count() >= 1);
+                assert!(ws.output_growth_count() >= 1);
+            } else {
+                assert_eq!(
+                    ws.step_fresh_allocations(),
+                    0,
+                    "steady-state step {step} must not fresh-allocate"
+                );
+                assert_eq!(ws.step_allocations().scratch_fresh, 0);
+                assert_eq!(ws.step_allocations().output_fresh, 0);
+            }
+        }
+
+        assert!(growth_series.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(
+            growth_series.last().copied(),
+            growth_series.first().copied()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_short_long_short_matches_fresh_path() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+
+        async fn fresh_scan(device: &<GsBackendBase as Backend>::Device, values: &[i32]) -> Vec<i32> {
+            let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(values.to_vec(), [values.len()]),
+                device,
+            );
+            let scanned =
+                GsBackendBase::prefix_sum_u32_primitive(input.into_primitive()).expect("fresh");
+            Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
+                .into_data_async()
+                .await
+                .expect("read")
+                .into_vec::<i32>()
+                .expect("data")
+        }
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let short = [1_i32, 2, 3, 4];
+        let long: Vec<i32> = (0..300).map(|i| i % 3 + 1).collect();
+        let short_again = [4_i32, 5, 6];
+
+        let mut ws = PrefixSumWorkspace::new();
+        let mut growth = 0usize;
+        for values in [&short[..], long.as_slice(), &short_again[..]] {
+            ws.begin_step();
+            let before_growth = ws.growth_count();
+            let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+                TensorData::new(values.to_vec(), [values.len()]),
+                &device,
+            );
+            let scanned =
+                GsBackendBase::prefix_sum_u32_with_workspace(&mut ws, input.into_primitive())
+                    .expect("ws scan");
+            // Drop before next length change so growth is capacity-driven, not alias-driven.
+            let ws_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(scanned)
+                .into_data_async()
+                .await
+                .expect("ws read")
+                .into_vec::<i32>()
+                .expect("ws data");
+            let fresh_vals = fresh_scan(&device, values).await;
+            assert_eq!(ws_vals, fresh_vals);
+            assert!(ws.growth_count() >= before_growth);
+            growth = ws.growth_count();
+            assert_eq!(
+                ws.reserved_bytes(),
+                ws.scratch_bytes() + ws.output_bytes()
+            );
+        }
+        assert!(growth >= 2, "short→long should grow at least once");
+        // Final short reuses the larger capacity: no extra scratch growth required.
+        assert!(ws.capacity() >= long.len());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inclusive_scan_into_rejects_len_past_input_before_gpu_launch() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData};
+        use burn_cubecl::kernel::into_contiguous;
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut ws = PrefixSumWorkspace::new();
+        let input = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(vec![1_i32, 2, 3, 4], [4]),
+            &device,
+        );
+        let primitive = into_contiguous(input.into_primitive());
+        let err = ws
+            .inclusive_scan_into(primitive, 257)
+            .expect_err("len past input must fail before reserve/launch");
+        assert!(
+            err.contains("exceeds input length 4"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(ws.growth_count(), 0, "reject must not grow scratch");
+        assert_eq!(ws.output_growth_count(), 0, "reject must not grow output");
+        assert_eq!(ws.step_fresh_allocations(), 0);
+        assert_eq!(ws.capacity(), 0);
+        assert_eq!(ws.reserved_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inclusive_scan_into_preserves_empty_and_singleton_semantics() {
+        use crate::training::engine::GsBackendBase;
+        use burn::prelude::*;
+        use burn::tensor::{Int, TensorData, TensorMetadata};
+        use burn_cubecl::kernel::into_contiguous;
+
+        let device = <GsBackendBase as Backend>::Device::default();
+        let mut ws = PrefixSumWorkspace::new();
+
+        let empty = Tensor::<GsBackendBase, 1, Int>::zeros([0], &device);
+        let empty_out = ws
+            .inclusive_scan_into(into_contiguous(empty.into_primitive()), 0)
+            .expect("len=0");
+        assert_eq!(empty_out.shape()[0], 0);
+        assert_eq!(ws.growth_count(), 0);
+
+        let singleton = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(vec![7_i32], [1]),
+            &device,
+        );
+        let single_out = ws
+            .inclusive_scan_into(into_contiguous(singleton.into_primitive()), 1)
+            .expect("len=1");
+        let single_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(single_out)
+            .into_data_async()
+            .await
+            .expect("read")
+            .into_vec::<i32>()
+            .expect("data");
+        assert_eq!(single_vals, vec![7]);
+        assert_eq!(ws.growth_count(), 0);
+
+        let normal = Tensor::<GsBackendBase, 1, Int>::from_data(
+            TensorData::new(vec![1_i32, 2, 3, 4], [4]),
+            &device,
+        );
+        let normal_out = ws
+            .inclusive_scan_into(into_contiguous(normal.into_primitive()), 4)
+            .expect("len=4");
+        let normal_vals = Tensor::<GsBackendBase, 1, Int>::from_primitive(normal_out)
+            .into_data_async()
+            .await
+            .expect("read")
+            .into_vec::<i32>()
+            .expect("data");
+        assert_eq!(normal_vals, vec![1, 3, 6, 10]);
+        assert!(ws.growth_count() >= 1);
+        assert!(ws.output_growth_count() >= 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -652,7 +1074,7 @@ mod tests {
         use burn::tensor::{Int, TensorData};
 
         let device = <GsBackendBase as Backend>::Device::default();
-        let values: Vec<i32> = (0..257).map(|i| (i % 7) as i32 + 1).collect();
+        let values: Vec<i32> = (0..257).map(|i| i % 7 + 1).collect();
         let input_fresh = Tensor::<GsBackendBase, 1, Int>::from_data(
             TensorData::new(values.clone(), [values.len()]),
             &device,
@@ -691,8 +1113,8 @@ mod tests {
         use burn::tensor::{Int, TensorData};
 
         let device = <GsBackendBase as Backend>::Device::default();
-        let left_values: Vec<i32> = (0..128).map(|i| (i % 5) as i32 + 1).collect();
-        let right_values: Vec<i32> = (0..128).map(|i| (i % 7) as i32 + 2).collect();
+        let left_values: Vec<i32> = (0..128).map(|i| i % 5 + 1).collect();
+        let right_values: Vec<i32> = (0..128).map(|i| i % 7 + 2).collect();
         let expected_left = {
             let mut acc = 0i32;
             left_values
