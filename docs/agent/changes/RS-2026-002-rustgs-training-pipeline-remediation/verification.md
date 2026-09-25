@@ -7,7 +7,7 @@
 | Review baseline | `62739c37d301b95f76c727e921fc96f58b074137` |
 | Branch | `agent/RS-2026-002/c5-frame-selection` |
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
-| Tip after this package | *(pinned at commit time below)* |
+| Tip after this package | `a327802ed9dad759d58fd922e6ea9409f513a494` |
 
 C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
 
