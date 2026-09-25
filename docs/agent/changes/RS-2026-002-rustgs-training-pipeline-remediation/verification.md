@@ -1,47 +1,57 @@
 # RS-2026-002 Verification
 
-## C5 frame selection (pending independent review)
+## C5 frame selection — review-fix package (pending independent review)
 
 | Field | Value |
 | --- | --- |
-| Base SHA | `e6db819e43764d536fc51a83e72395e8aa76632d` (main at worktree creation) |
+| Review baseline | `62739c37d301b95f76c727e921fc96f58b074137` |
 | Branch | `agent/RS-2026-002/c5-frame-selection` |
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
-| Code tip | `841c9d28af3b66354836a6d7cbebcc4bbe8fbeed` |
+| Tip after this package | *(pinned at commit time below)* |
 
 C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
 
-### C5 remediations
+### Review findings closed this package
 
-| Item | Summary |
+| ID | Fix |
 | --- | --- |
-| Stable ID | `ScenePose.frame_id = image.image_id as u64`; missing images do not renumber survivors |
-| FrameSelection | include/exclude → max_frames → stride → selection fingerprint (one implementation) |
-| Split manifest | `--frame-split-manifest` + `--eval-split in-view\|holdout`; startup rejects dup/unknown/overlap/fingerprint mismatch; holdout requires manifest |
-| Report | `eval_frame_ids` / `train_frame_ids` / worst frames are `u64`; split kind + manifest/selection fingerprints persisted |
-| Examples | `evaluate_psnr` / `rustgs_eval_suite` / `rustgs_residual_heatmap` use one `FrameSelection`; evaluate/crop reuse selected dataset with max=0 stride=1 |
-| Checkpoint | Pre-C5 enumerated identity accepted with warn; otherwise reject with explicit C5 frame-identity message |
-| Report IDs | `train_frame_ids` = canonical selection; `train_loader_frame_ids` = oversampled/shuffled loader order |
+| Resume wiring | `prepare_resume_runtime` uses `match_checkpoint_dataset_identity` (same path as `validate_dataset_and_config`); reconstruction/config remain strict |
+| Legacy ID mapping | Frozen `assign_pre_c5_enumerated_ids`; gap-free-only auto-accept; missing-image / exclude / oversample cases rejected with explicit reason |
+| static_162 | `static_162_allowed_stable_ids` pins first-180 load order minus enumerated 76..=93; eval suite uses `allowed_ids` (no exclude-then-max drift) |
+| Checkpoint selection meta | `TRAINING_CHECKPOINT_VERSION=3` + `CheckpointFrameSelectionMeta`; v2 loads as `V2SelectionMetaAbsent` with `selection=None` (never invented) |
 
-### Gate results (review fixes)
+### Gate results
 
-Logs: `artifacts/runs/rs-2026-002-c5-review-fixes/`
+Logs: `artifacts/runs/rs-2026-002-c5-review-fix/`
 
 Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
 
 | Command | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | PASS |
-| `cargo test -p rustscan-gs --lib --features gpu-wgpu -- --test-threads=1` | PASS: **207** |
-| `cargo test -p rustscan-gs --test checkpoint_resume --features gpu-wgpu -- --test-threads=1` | PASS: **53** |
-| `cargo check -p rustscan-gs --all-targets --features gpu-wgpu` | PASS |
+| `cargo check --workspace --all-targets` | PASS with `POSELIB_ROOT` |
+| `cargo test -p rustscan-gs --all-targets --features gpu-wgpu -- --test-threads=1` | PASS: lib **211**; checkpoint_resume **56**; other targets green |
+| `cargo clippy -p rustscan-gs --all-targets --features gpu-wgpu --no-deps -- -D warnings` | FAIL: **pre-existing rustscan-gs baseline only** (see below). No diagnostics in C5-touched `checkpoint.rs` / `runtime.rs` / `split.rs` / `events.rs` / `train_command.rs` / eval suite after fixing one new `clone_on_copy` in the resume unit test |
 | `git diff --check` | PASS |
+
+### Clippy baseline vs this package
+
+Pre-existing (unchanged class): duplicated attribute; unused `Int` import; dead_code in gradient_check / radix / prefix_sum / device_status / loss / optimizer; `chunks_exact` const size; `too_many_arguments` in autodiff/forward/project; `clone_on_copy` in topology; field_reassign_with_default; useless_conversion; type_complexity in optimization_report tests; identical if blocks; useless `vec!`.
+
+**New in this package (fixed before handoff):** `clone_on_copy` on `Intrinsics` in `prepare_resume_runtime_accepts_pre_c5_gap_free_dataset_hash` — removed.
+
+### Compatibility boundaries
+
+- Pre-C5 gap-free enumerated identity (unique stable IDs, old IDs exactly `0..n-1`) accepted at resume with warn; re-save persists stable-image_id hash.
+- Gapped IDs (missing images), exclude-filtered non-compact IDs, and oversampled duplicates **cannot** be reconstructed from the final pose list alone → hard reject with reason.
+- Checkpoint v1/v2 selection fields are **absent** (`None`); resume consistency check only runs when both sides present selection meta.
+- Canonical `train_stable_ids` ≠ `train_loader_frame_ids` (oversample/shuffle order).
 
 ### Known limitations
 
-- `ColmapConfig::{max_frames,frame_stride}` still apply a max/stride-only `FrameSelection` at load end for API compatibility when callers do not use include/exclude; the CLI and migrated examples load full then select once.
-- Clippy `-D warnings` not part of this C5 gate matrix.
-- Pre-C5 identity acceptance does not rewrite the checkpoint on disk; re-save to persist stable-image_id hashes.
+- `ColmapConfig::{max_frames,frame_stride}` still apply a max/stride-only `FrameSelection` at load end for API compatibility.
+- Clippy `-D warnings` remains red on the pre-existing baseline above.
+- C6–C8 not started.
 
 ## C1–C4 merged to main (2026-09-25)
 

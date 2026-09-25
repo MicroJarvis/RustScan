@@ -21,7 +21,7 @@ cards:
     notes: "R02/R04/R06/R07/R08 closed; merged via --no-ff 4fdf506"
   C5:
     status: implemented_pending_review
-    notes: "stable frame_id=image_id; FrameSelection + FrameSplitManifest; CLI --frame-split-manifest/--eval-split; report u64 IDs + fingerprints"
+    notes: "review-fix: resume identity wiring; gap-aware pre-C5 reject; static_162 allowed_ids; checkpoint v3 selection meta; tip pinned in verification.md"
   C6:
     status: not_started
   C7:

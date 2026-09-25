@@ -200,6 +200,29 @@ impl FrameSplitManifest {
     }
 }
 
+/// Reconstruct the historical `static_162` evaluation set as stable IDs.
+///
+/// Pre-C5 semantics: take the first 180 poses in load order (old `max_frames=180`),
+/// then drop enumerated indices `76..=93` (old `--exclude-frame-ranges 76-93` matched
+/// post-filter frame_idx, not COLMAP `image_id`). Pinning via `allowed_ids` keeps
+/// FrameSelection's include/exclude→max→stride order without pulling post-prefix frames.
+pub fn static_162_allowed_stable_ids(source: &TrainingDataset) -> Result<Vec<u64>, String> {
+    if source.poses.len() < 180 {
+        return Err(format!(
+            "static_162 requires at least 180 source frames, got {}",
+            source.poses.len()
+        ));
+    }
+    Ok(source
+        .poses
+        .iter()
+        .take(180)
+        .enumerate()
+        .filter(|(idx, _)| !(76..=93).contains(idx))
+        .map(|(_, pose)| pose.frame_id)
+        .collect())
+}
+
 /// Parameters for one canonical selection pass.
 #[derive(Debug, Clone, Default)]
 pub struct FrameSelectionRequest {
@@ -493,6 +516,57 @@ mod tests {
         .unwrap();
         // include → [2,3,4,5,6], max 4 → [2,3,4,5], stride 2 → [2,4]
         assert_eq!(selection.stable_ids, vec![2, 4]);
+    }
+
+    #[test]
+    fn static_162_allowed_ids_pin_prefix_without_backfill() {
+        // Fixture: COLMAP image_id == 1..=300 in load order (matches common Home layouts).
+        // Old mapping: enumerated idx i → image_id i+1; exclude idx 76..=93 → drop IDs 77..=94.
+        let source = dataset_with_ids(&(1..=300).collect::<Vec<_>>());
+        let allowed = static_162_allowed_stable_ids(&source).unwrap();
+        let expected: Vec<u64> = (1..=76).chain(95..=180).collect();
+        assert_eq!(allowed.len(), 162);
+        assert_eq!(allowed, expected);
+        assert_eq!(*allowed.last().unwrap(), 180);
+
+        let selection = FrameSelection::select(
+            &source,
+            &FrameSelectionRequest {
+                allowed_ids: Some(allowed.clone()),
+                max_frames: 180,
+                frame_stride: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.stable_ids.len(), 162);
+        assert_eq!(selection.stable_ids, expected);
+        assert!(
+            selection.stable_ids.iter().all(|&id| id <= 180),
+            "must not backfill frames beyond the original 180-prefix"
+        );
+        assert!(
+            !selection
+                .stable_ids
+                .iter()
+                .any(|&id| (77..=94).contains(&id)),
+            "must not include the historically excluded band"
+        );
+
+        // Drift regression: exclude-then-max without allowed_ids pulls id 198.
+        let drifted = FrameSelection::select(
+            &source,
+            &FrameSelectionRequest {
+                exclude_ranges: vec![FrameIdRange { start: 76, end: 93 }],
+                max_frames: 180,
+                frame_stride: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(drifted.stable_ids.len(), 180);
+        assert_eq!(*drifted.stable_ids.last().unwrap(), 198);
+        assert_ne!(drifted.stable_ids, selection.stable_ids);
     }
 
     #[test]

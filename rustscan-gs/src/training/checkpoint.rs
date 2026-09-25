@@ -14,7 +14,8 @@ use crate::{HostSplats, TrainingConfig, TrainingDataset, TrainingError};
 
 use super::config::MAX_TRAINING_ITERATIONS;
 
-pub const TRAINING_CHECKPOINT_VERSION: u32 = 2;
+pub const TRAINING_CHECKPOINT_VERSION: u32 = 3;
+pub const TRAINING_CHECKPOINT_VERSION_V2: u32 = 2;
 pub const TRAINING_CHECKPOINT_VERSION_V1: u32 = 1;
 pub const TRAINING_CHECKPOINT_MAGIC: [u8; 8] = *b"RGSCPBIN";
 pub const TRAINING_CHECKPOINT_FORMAT_VERSION: u32 = 1;
@@ -167,34 +168,7 @@ impl TrainingIdentity {
         dataset: &TrainingDataset,
         config: &TrainingConfig,
     ) -> Result<(), TrainingError> {
-        let current = hash_training_dataset(dataset)?;
-        if self.dataset != current {
-            // Pre-C5 checkpoints hashed enumerated frame_id with COLMAP image_id in
-            // timestamp. Accept that legacy digest explicitly so resume does not fail
-            // silently from the identity remapping alone.
-            let legacy = hash_training_dataset_pre_c5_enumerated(dataset)?;
-            if self.dataset == legacy {
-                log::warn!(
-                    "accepted pre-C5 training-dataset identity (enumerated frame_id + image_id timestamp); \
-                     re-save the checkpoint to persist the stable-image_id identity"
-                );
-            } else if current == legacy {
-                // Dataset shape makes the two encodings identical; keep the historical
-                // short rejection text for unchanged callers/tests.
-                return Err(TrainingError::InvalidInput(
-                    "training identity dataset does not match the current training dataset"
-                        .to_string(),
-                ));
-            } else {
-                return Err(TrainingError::InvalidInput(format!(
-                    "training identity dataset does not match the current training dataset \
-                     (stable-image_id hash={current}, pre-C5 enumerated hash={legacy}, \
-                     checkpoint hash={}). Re-train or migrate the checkpoint after the C5 \
-                     frame-identity change.",
-                    self.dataset
-                )));
-            }
-        }
+        match_checkpoint_dataset_identity(&self.dataset, dataset)?;
         if self.config != hash_training_config(config)? {
             return Err(TrainingError::InvalidInput(
                 "training identity configuration does not match the current training configuration"
@@ -203,6 +177,145 @@ impl TrainingIdentity {
         }
         Ok(())
     }
+}
+
+/// How a checkpoint dataset hash relates to the live training dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetIdentityMatch {
+    /// Digest matches the C5 stable-`image_id` encoding.
+    Current,
+    /// Digest matches the pre-C5 gap-free enumerated encoding (`0..n-1` with
+    /// COLMAP `image_id` in `timestamp`). Only accepted when the live dataset
+    /// has unique stable IDs (no oversample duplicates); gapped or filtered
+    /// pre-C5 IDs cannot be reconstructed from the final pose list alone.
+    PreC5GapFreeLegacy,
+}
+
+/// Compare a checkpoint dataset hash against the live dataset.
+///
+/// Used by both [`TrainingIdentity::validate_dataset_and_config`] and the real
+/// resume entry [`crate::training::engine::runtime`] so compatibility cannot
+/// diverge between helper validation and `prepare_resume_runtime`.
+pub fn match_checkpoint_dataset_identity(
+    checkpoint_dataset_hash: &str,
+    dataset: &TrainingDataset,
+) -> Result<DatasetIdentityMatch, TrainingError> {
+    let current = hash_training_dataset(dataset)?;
+    if checkpoint_dataset_hash == current {
+        return Ok(DatasetIdentityMatch::Current);
+    }
+
+    if dataset_has_duplicate_stable_ids(dataset) {
+        return Err(TrainingError::InvalidInput(format!(
+            "checkpoint dataset does not match the current training dataset: \
+             pre-C5 identity migration refuses oversampled/duplicate stable IDs \
+             (stable-image_id hash={current}, checkpoint hash={checkpoint_dataset_hash}). \
+             Re-train after the C5 frame-identity change."
+        )));
+    }
+
+    let Some(legacy) = try_hash_training_dataset_pre_c5_gap_free(dataset)? else {
+        return Err(TrainingError::InvalidInput(format!(
+            "checkpoint dataset does not match the current training dataset \
+             (stable-image_id hash={current}, checkpoint hash={checkpoint_dataset_hash}). \
+             Pre-C5 gapped/filtered frame IDs cannot be reconstructed from the final \
+             dataset alone; re-train or supply a checkpoint saved with stable image IDs."
+        )));
+    };
+
+    if checkpoint_dataset_hash == legacy {
+        log::warn!(
+            "accepted pre-C5 training-dataset identity (gap-free enumerated frame_id + image_id timestamp); \
+             re-save the checkpoint to persist the stable-image_id identity"
+        );
+        return Ok(DatasetIdentityMatch::PreC5GapFreeLegacy);
+    }
+
+    if current == legacy {
+        // Dataset shape makes the two encodings identical; keep the historical
+        // short rejection text for unchanged callers/tests.
+        return Err(TrainingError::InvalidInput(
+            "checkpoint dataset does not match the current training dataset".to_string(),
+        ));
+    }
+
+    Err(TrainingError::InvalidInput(format!(
+        "checkpoint dataset does not match the current training dataset \
+         (stable-image_id hash={current}, pre-C5 gap-free enumerated hash={legacy}, \
+         checkpoint hash={checkpoint_dataset_hash}). Gapped pre-C5 IDs (missing images, \
+         exclude filters) cannot be reconstructed by re-enumerating the final dataset; \
+         re-train or migrate with a stable-image_id checkpoint."
+    )))
+}
+
+/// Frozen pre-C5 COLMAP loader ID assignment.
+///
+/// Candidates are the post-`take(max_frames)` / `step_by(stride)` COLMAP image
+/// list in loader order. Enumeration includes missing files; skips leave gaps
+/// (e.g. exists=[true,false,true] → old frame IDs `[0, 2]`).
+#[must_use]
+pub fn assign_pre_c5_enumerated_ids(candidates: &[(u64, bool)]) -> Vec<(u64, u64)> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(frame_idx, &(stable_id, exists))| {
+            exists.then_some((frame_idx as u64, stable_id))
+        })
+        .collect()
+}
+
+/// Hash a dataset using explicit pre-C5 `(enumerated frame_id, image_id timestamp)` rows.
+///
+/// `old_frame_ids` must align 1:1 with `dataset.poses`. Intended for frozen-fixture
+/// tests and for callers that still have the original COLMAP candidate list.
+pub fn hash_training_dataset_with_pre_c5_frame_ids(
+    dataset: &TrainingDataset,
+    old_frame_ids: &[u64],
+) -> Result<String, TrainingError> {
+    if old_frame_ids.len() != dataset.poses.len() {
+        return Err(TrainingError::InvalidInput(format!(
+            "pre-C5 frame_id mapping length {} does not match dataset pose count {}",
+            old_frame_ids.len(),
+            dataset.poses.len()
+        )));
+    }
+    let poses = dataset
+        .poses
+        .iter()
+        .zip(old_frame_ids.iter())
+        .map(|(pose, &old_frame_id)| {
+            Ok(CanonicalTrainingPose {
+                frame_id: old_frame_id,
+                image_content: hash_file_content(&pose.image_path)?,
+                depth_content: pose
+                    .depth_path
+                    .as_deref()
+                    .map(hash_file_content)
+                    .transpose()?,
+                pose: &pose.pose,
+                timestamp: pose.frame_id as f64,
+            })
+        })
+        .collect::<Result<Vec<_>, TrainingError>>()?;
+    hash_canonical_dataset(dataset, poses)
+}
+
+fn dataset_has_duplicate_stable_ids(dataset: &TrainingDataset) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    dataset.poses.iter().any(|pose| !seen.insert(pose.frame_id))
+}
+
+/// Gap-free pre-C5 digest: only valid when old IDs were exactly `0..n-1` in pose order.
+fn try_hash_training_dataset_pre_c5_gap_free(
+    dataset: &TrainingDataset,
+) -> Result<Option<String>, TrainingError> {
+    if dataset_has_duplicate_stable_ids(dataset) {
+        return Ok(None);
+    }
+    let old_ids: Vec<u64> = (0..dataset.poses.len() as u64).collect();
+    Ok(Some(hash_training_dataset_with_pre_c5_frame_ids(
+        dataset, &old_ids,
+    )?))
 }
 
 #[derive(Serialize)]
@@ -237,33 +350,6 @@ fn hash_training_dataset(dataset: &TrainingDataset) -> Result<String, TrainingEr
                     .transpose()?,
                 pose: &pose.pose,
                 timestamp: pose.timestamp,
-            })
-        })
-        .collect::<Result<Vec<_>, TrainingError>>()?;
-    hash_canonical_dataset(dataset, poses)
-}
-
-/// Pre-C5 dataset identity: `frame_id` was the post-filter enumerate index and
-/// COLMAP `image_id` was stored in `timestamp`.
-fn hash_training_dataset_pre_c5_enumerated(
-    dataset: &TrainingDataset,
-) -> Result<String, TrainingError> {
-    let poses = dataset
-        .poses
-        .iter()
-        .enumerate()
-        .map(|(frame_idx, pose)| {
-            Ok(CanonicalTrainingPose {
-                frame_id: frame_idx as u64,
-                image_content: hash_file_content(&pose.image_path)?,
-                depth_content: pose
-                    .depth_path
-                    .as_deref()
-                    .map(hash_file_content)
-                    .transpose()?,
-                pose: &pose.pose,
-                // Stable COLMAP image_id now lives in frame_id; legacy path put it in timestamp.
-                timestamp: pose.frame_id as f64,
             })
         })
         .collect::<Result<Vec<_>, TrainingError>>()?;
@@ -427,6 +513,57 @@ pub struct AdamParameterCheckpoint {
 pub enum CheckpointMigration {
     None,
     V1BaselineReset,
+    /// Loaded a v2 checkpoint that predates selection metadata; fields are absent.
+    V2SelectionMetaAbsent,
+}
+
+/// Frame-selection metadata persisted beside training state.
+///
+/// Distinguishes canonical selection IDs from the oversampled/shuffled loader
+/// order. Missing on v1/v2 files — never invent values when loading legacy bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CheckpointFrameSelectionMeta {
+    /// `in-view` / `holdout` when evaluation split is known; `None` if unset.
+    pub eval_split_kind: Option<String>,
+    /// Canonical train FrameSelection stable IDs (full u64).
+    pub train_stable_ids: Vec<u64>,
+    /// Canonical eval FrameSelection stable IDs (full u64); empty when unused.
+    pub eval_stable_ids: Vec<u64>,
+    /// Pose order that entered the training loader after oversample/shuffle.
+    pub train_loader_frame_ids: Vec<u64>,
+    pub manifest_fingerprint: Option<String>,
+    pub selection_fingerprint: Option<String>,
+    pub eval_selection_fingerprint: Option<String>,
+}
+
+impl CheckpointFrameSelectionMeta {
+    /// True when this record carries any selection fingerprint or non-empty ID list.
+    #[must_use]
+    pub fn is_populated(&self) -> bool {
+        self.eval_split_kind.is_some()
+            || !self.train_stable_ids.is_empty()
+            || !self.eval_stable_ids.is_empty()
+            || !self.train_loader_frame_ids.is_empty()
+            || self.manifest_fingerprint.is_some()
+            || self.selection_fingerprint.is_some()
+            || self.eval_selection_fingerprint.is_some()
+    }
+}
+
+/// Reject resume when both sides recorded selection metadata and they disagree.
+pub fn validate_checkpoint_selection_consistency(
+    checkpoint: Option<&CheckpointFrameSelectionMeta>,
+    expected: Option<&CheckpointFrameSelectionMeta>,
+) -> Result<(), TrainingError> {
+    match (checkpoint, expected) {
+        (None, _) | (_, None) => Ok(()),
+        (Some(left), Some(right)) if left == right => Ok(()),
+        (Some(left), Some(right)) => Err(TrainingError::InvalidInput(format!(
+            "checkpoint frame-selection metadata does not match the current training selection \
+             (checkpoint selection_fingerprint={:?}, current selection_fingerprint={:?})",
+            left.selection_fingerprint, right.selection_fingerprint
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -484,6 +621,19 @@ struct TrainingCheckpointV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TrainingCheckpointV2 {
+    version: u32,
+    identity: TrainingIdentity,
+    completed_iterations: usize,
+    latest_loss: Option<f32>,
+    splats: HostSplats,
+    optimizer: AdamCheckpoint,
+    topology: TopologyCheckpoint,
+    frame_shuffle_seed: u64,
+    active_sh_degree: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainingCheckpoint {
     pub version: u32,
     pub identity: TrainingIdentity,
@@ -494,6 +644,9 @@ pub struct TrainingCheckpoint {
     pub topology: TopologyCheckpoint,
     pub frame_shuffle_seed: u64,
     pub active_sh_degree: usize,
+    /// Present on v3+ saves that recorded selection; `None` means absent (v1/v2
+    /// migration or intentionally omitted) — never fabricate IDs/fingerprints.
+    pub selection: Option<CheckpointFrameSelectionMeta>,
 }
 
 impl TrainingCheckpoint {
@@ -722,21 +875,38 @@ fn visibility_window_baseline_from_cumulative_values(cumulative: &[f32]) -> Vec<
         .collect()
 }
 
-fn migrate_checkpoint_v1(v1: TrainingCheckpointV1) -> (TrainingCheckpoint, CheckpointMigration) {
+fn migrate_checkpoint_v2(v2: TrainingCheckpointV2) -> (TrainingCheckpoint, CheckpointMigration) {
     (
         TrainingCheckpoint {
             version: TRAINING_CHECKPOINT_VERSION,
-            identity: v1.identity,
-            completed_iterations: v1.completed_iterations,
-            latest_loss: v1.latest_loss,
-            splats: v1.splats,
-            optimizer: v1.optimizer,
-            topology: migrate_topology_v1(v1.topology),
-            frame_shuffle_seed: v1.frame_shuffle_seed,
-            active_sh_degree: v1.active_sh_degree,
+            identity: v2.identity,
+            completed_iterations: v2.completed_iterations,
+            latest_loss: v2.latest_loss,
+            splats: v2.splats,
+            optimizer: v2.optimizer,
+            topology: v2.topology,
+            frame_shuffle_seed: v2.frame_shuffle_seed,
+            active_sh_degree: v2.active_sh_degree,
+            selection: None,
         },
-        CheckpointMigration::V1BaselineReset,
+        CheckpointMigration::V2SelectionMetaAbsent,
     )
+}
+
+fn migrate_checkpoint_v1(v1: TrainingCheckpointV1) -> (TrainingCheckpoint, CheckpointMigration) {
+    let (mut checkpoint, _) = migrate_checkpoint_v2(TrainingCheckpointV2 {
+        version: TRAINING_CHECKPOINT_VERSION_V2,
+        identity: v1.identity,
+        completed_iterations: v1.completed_iterations,
+        latest_loss: v1.latest_loss,
+        splats: v1.splats,
+        optimizer: v1.optimizer,
+        topology: migrate_topology_v1(v1.topology),
+        frame_shuffle_seed: v1.frame_shuffle_seed,
+        active_sh_degree: v1.active_sh_degree,
+    });
+    checkpoint.version = TRAINING_CHECKPOINT_VERSION;
+    (checkpoint, CheckpointMigration::V1BaselineReset)
 }
 
 pub fn save_training_checkpoint(
@@ -803,14 +973,24 @@ fn decode_training_checkpoint_payload(
         if checkpoint.version == TRAINING_CHECKPOINT_VERSION {
             return Ok((checkpoint, CheckpointMigration::None));
         }
-        if checkpoint.version == TRAINING_CHECKPOINT_VERSION_V1 {
+        return Err(invalid_checkpoint(format!(
+            "checkpoint version {} is unsupported for v3 layout; expected {TRAINING_CHECKPOINT_VERSION}",
+            checkpoint.version
+        )));
+    }
+
+    if let Ok(v2) = checkpoint_bincode_options().deserialize::<TrainingCheckpointV2>(payload) {
+        if v2.version == TRAINING_CHECKPOINT_VERSION_V2 {
+            return Ok(migrate_checkpoint_v2(v2));
+        }
+        if v2.version == TRAINING_CHECKPOINT_VERSION_V1 {
             return Err(invalid_checkpoint(
                 "checkpoint version 1 payload was decoded as v2 layout; file is corrupt",
             ));
         }
         return Err(invalid_checkpoint(format!(
-            "checkpoint version {} is unsupported; expected {TRAINING_CHECKPOINT_VERSION} (or migrate from {TRAINING_CHECKPOINT_VERSION_V1})",
-            checkpoint.version
+            "checkpoint version {} is unsupported for v2 layout; expected {TRAINING_CHECKPOINT_VERSION_V2}",
+            v2.version
         )));
     }
 
@@ -1125,8 +1305,9 @@ mod fingerprint_tests {
 #[cfg(test)]
 mod identity_migration_tests {
     use super::{
-        hash_training_config, hash_training_dataset, hash_training_dataset_pre_c5_enumerated,
-        TrainingIdentity,
+        assign_pre_c5_enumerated_ids, hash_training_config, hash_training_dataset,
+        hash_training_dataset_with_pre_c5_frame_ids, match_checkpoint_dataset_identity,
+        try_hash_training_dataset_pre_c5_gap_free, DatasetIdentityMatch, TrainingIdentity,
     };
     use crate::TrainingConfig;
     use rustscan_types::{Intrinsics, ScenePose, TrainingDataset, SE3};
@@ -1146,24 +1327,30 @@ mod identity_migration_tests {
     }
 
     #[test]
-    fn pre_c5_enumerated_identity_is_accepted_with_explicit_path() {
+    fn pre_c5_gap_free_identity_is_accepted() {
         let (_dir, dataset) = dataset_with_stable_ids(&[11, 22, 33]);
         let config = TrainingConfig::default();
         let current = hash_training_dataset(&dataset).unwrap();
-        let legacy = hash_training_dataset_pre_c5_enumerated(&dataset).unwrap();
+        let legacy = try_hash_training_dataset_pre_c5_gap_free(&dataset)
+            .unwrap()
+            .expect("gap-free legacy hash");
         assert_ne!(
             current, legacy,
             "stable-id and pre-C5 enumerated hashes must differ"
         );
 
         let identity = TrainingIdentity {
-            dataset: legacy,
+            dataset: legacy.clone(),
             reconstruction: "recon".into(),
             config: hash_training_config(&config).unwrap(),
         };
         identity
             .validate_dataset_and_config(&dataset, &config)
-            .expect("pre-C5 enumerated identity must be accepted");
+            .expect("pre-C5 gap-free identity must be accepted");
+        assert_eq!(
+            match_checkpoint_dataset_identity(&legacy, &dataset).unwrap(),
+            DatasetIdentityMatch::PreC5GapFreeLegacy
+        );
 
         let wrong = TrainingIdentity {
             dataset: "deadbeef".into(),
@@ -1175,8 +1362,62 @@ mod identity_migration_tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("C5") || err.contains("stable-image_id") || err.contains("pre-C5"),
+            err.contains("C5")
+                || err.contains("stable-image_id")
+                || err.contains("pre-C5")
+                || err.contains("Gapped"),
             "rejection must explain the frame-identity change: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_image_gaps_are_not_reconstructed_by_reenumerate() {
+        // Frozen old loader: candidates [(11,true),(22,false),(33,true)] → IDs [0,2].
+        let assigned = assign_pre_c5_enumerated_ids(&[(11, true), (22, false), (33, true)]);
+        assert_eq!(assigned, vec![(0, 11), (2, 33)]);
+
+        let (_dir, dataset) = dataset_with_stable_ids(&[11, 33]);
+        let old_frame_ids: Vec<u64> = assigned.iter().map(|(id, _)| *id).collect();
+        let expected_legacy =
+            hash_training_dataset_with_pre_c5_frame_ids(&dataset, &old_frame_ids).unwrap();
+        let gap_free = try_hash_training_dataset_pre_c5_gap_free(&dataset)
+            .unwrap()
+            .expect("gap-free helper still produces a digest");
+        assert_ne!(
+            expected_legacy, gap_free,
+            "re-enumerate [0,1] must not equal frozen gapped [0,2]"
+        );
+
+        let err = match_checkpoint_dataset_identity(&expected_legacy, &dataset)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Gapped") || err.contains("reconstructed") || err.contains("re-enumerat"),
+            "resume must refuse unreliable gapped migration: {err}"
+        );
+    }
+
+    #[test]
+    fn oversampled_duplicates_refuse_pre_c5_migration() {
+        let dir = tempdir().unwrap();
+        let mut dataset = TrainingDataset::new(Intrinsics::new(1.0, 1.0, 0.0, 0.0, 8, 8));
+        for &id in &[7u64, 7u64] {
+            let path = dir
+                .path()
+                .join(format!("frame_{id}_{}.png", dataset.poses.len()));
+            let mut file = std::fs::File::create(&path).unwrap();
+            write!(file, "image-{id}").unwrap();
+            dataset.add_pose(ScenePose::new(id, path, SE3::identity(), 0.0));
+        }
+        // Old oversample kept the same enumerated frame_id on duplicates; gap-free
+        // re-enumerate cannot prove that layout from the final list alone.
+        let forged = hash_training_dataset_with_pre_c5_frame_ids(&dataset, &[0, 0]).unwrap();
+        let err = match_checkpoint_dataset_identity(&forged, &dataset)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("oversampled") || err.contains("duplicate"),
+            "oversample must refuse silent migration: {err}"
         );
     }
 }

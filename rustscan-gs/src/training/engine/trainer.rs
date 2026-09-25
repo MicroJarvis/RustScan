@@ -207,6 +207,10 @@ pub(crate) trait TrainingLoopObserver {
         None
     }
 
+    fn checkpoint_selection(&self) -> Option<&crate::CheckpointFrameSelectionMeta> {
+        None
+    }
+
     fn on_iteration(&mut self, _metrics: TrainingIterationMetrics) {}
 
     fn on_snapshot(&mut self, _metrics: TrainingIterationMetrics, _splats: HostSplats) {}
@@ -678,6 +682,7 @@ impl WgpuTrainer {
             optimizer: self.optimizer.checkpoint().await?,
             topology,
             frame_shuffle_seed: self.config.data.frame_shuffle_seed,
+            selection: None,
         };
         checkpoint.validate()?;
         Ok(checkpoint)
@@ -1607,7 +1612,7 @@ impl WgpuTrainer {
                         "checkpointing training requires the current training identity".to_string(),
                     )
                 })?;
-                let checkpoint = self
+                let mut checkpoint = self
                     .checkpoint_with_status_reason(
                         splats,
                         identity,
@@ -1616,6 +1621,7 @@ impl WgpuTrainer {
                         Self::checkpoint_status_reason(reason),
                     )
                     .await?;
+                checkpoint.selection = observer.checkpoint_selection().cloned();
                 if let Some(disposition) = complete_checkpoint_boundary(
                     observer,
                     TrainingCheckpointReady {
@@ -3295,7 +3301,7 @@ mod tests {
                         });
                     }
                 };
-                let checkpoint = match trainer
+                let mut checkpoint = match trainer
                     .checkpoint_with_status_reason(
                         splats,
                         identity,
@@ -3314,6 +3320,7 @@ mod tests {
                         });
                     }
                 };
+                checkpoint.selection = observer.checkpoint_selection().cloned();
                 match complete_checkpoint_boundary(
                     observer,
                     TrainingCheckpointReady {

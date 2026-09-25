@@ -194,9 +194,10 @@ pub(super) fn training_options(
     args: &TrainArgs,
     dataset: &rustscan_types::TrainingDataset,
     config: &rustscan_gs::TrainingConfig,
+    selection: Option<rustscan_gs::CheckpointFrameSelectionMeta>,
 ) -> anyhow::Result<rustscan_gs::TrainingOptions<'static>> {
     let checkpoint_every = effective_checkpoint_every(args);
-    if checkpoint_every.is_none() && args.resume.is_none() {
+    if checkpoint_every.is_none() && args.resume.is_none() && selection.is_none() {
         return Ok(rustscan_gs::TrainingOptions::default());
     }
 
@@ -204,6 +205,9 @@ pub(super) fn training_options(
     let identity =
         rustscan_gs::TrainingIdentity::from_canonical_content(dataset, &reconstruction, config)?;
     let mut options = rustscan_gs::TrainingOptions::default().with_identity(identity);
+    if let Some(selection) = selection {
+        options = options.with_selection(selection);
+    }
 
     if let Some(resume_path) = &args.resume {
         let (checkpoint, migration) = rustscan_gs::load_training_checkpoint_with_migration(
@@ -213,6 +217,12 @@ pub(super) fn training_options(
         if migration == rustscan_gs::CheckpointMigration::V1BaselineReset {
             log::warn!(
                 "Migrated v1 training checkpoint {}: visibility window baselines were reconstructed from cumulative observations (V1BaselineReset)",
+                resume_path.display()
+            );
+        }
+        if migration == rustscan_gs::CheckpointMigration::V2SelectionMetaAbsent {
+            log::warn!(
+                "Migrated v2 training checkpoint {}: frame-selection metadata was absent and remains unset",
                 resume_path.display()
             );
         }
@@ -305,7 +315,12 @@ pub(super) fn run_train_command(args: TrainArgs, sources: TrainArgSources) -> an
     log::info!("Frame shuffle seed: {}", config.data.frame_shuffle_seed);
     log_litegs_training_config(&config);
 
-    let options = training_options(&args, &dataset, &config)?;
+    let selection_meta = checkpoint_selection_meta_from_frame_plan(
+        &frame_plan,
+        &dataset,
+        config.data.frame_shuffle_seed,
+    );
+    let options = training_options(&args, &dataset, &config, Some(selection_meta))?;
     let training_run = rustscan_gs::train_splats(&dataset, &config, options)?;
     let rustscan_gs::TrainingRun {
         splats,
@@ -1280,6 +1295,34 @@ struct CanonicalFramePlan {
     eval: Option<rustscan_gs::FrameSelection>,
     eval_split_kind: Option<rustscan_gs::EvaluationSplitKind>,
     manifest_fingerprint: Option<String>,
+}
+
+fn checkpoint_selection_meta_from_frame_plan(
+    frame_plan: &CanonicalFramePlan,
+    loader_dataset: &rustscan_types::TrainingDataset,
+    frame_shuffle_seed: u64,
+) -> rustscan_gs::CheckpointFrameSelectionMeta {
+    let train_loader_frame_ids =
+        rustscan_gs::training_frame_order(loader_dataset.poses.len(), frame_shuffle_seed)
+            .into_iter()
+            .filter_map(|idx| loader_dataset.poses.get(idx).map(|pose| pose.frame_id))
+            .collect();
+    rustscan_gs::CheckpointFrameSelectionMeta {
+        eval_split_kind: frame_plan.eval_split_kind.map(|kind| kind.to_string()),
+        train_stable_ids: frame_plan.train.stable_ids.clone(),
+        eval_stable_ids: frame_plan
+            .eval
+            .as_ref()
+            .map(|selection| selection.stable_ids.clone())
+            .unwrap_or_default(),
+        train_loader_frame_ids,
+        manifest_fingerprint: frame_plan.manifest_fingerprint.clone(),
+        selection_fingerprint: Some(frame_plan.train.selection_fingerprint.clone()),
+        eval_selection_fingerprint: frame_plan
+            .eval
+            .as_ref()
+            .map(|selection| selection.selection_fingerprint.clone()),
+    }
 }
 
 fn dataset_fingerprint_hex(input: &Path) -> anyhow::Result<Option<String>> {

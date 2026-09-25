@@ -226,6 +226,8 @@ pub struct TrainingOptions<'a> {
     pub identity: Option<TrainingIdentity>,
     pub resume_checkpoint: Option<TrainingCheckpoint>,
     pub checkpoint_policy: TrainingCheckpointPolicy,
+    /// Canonical selection metadata mirrored into saved checkpoints / resume checks.
+    pub selection: Option<crate::CheckpointFrameSelectionMeta>,
     pub shared_wgpu_context: Option<SharedWgpuContext>,
     pub on_event: Option<Box<TrainingEventSink<'a>>>,
     pub on_checkpoint: Option<Box<TrainingCheckpointSink<'a>>>,
@@ -248,6 +250,11 @@ impl<'a> TrainingOptions<'a> {
 
     pub fn with_resume_checkpoint(mut self, checkpoint: TrainingCheckpoint) -> Self {
         self.resume_checkpoint = Some(checkpoint);
+        self
+    }
+
+    pub fn with_selection(mut self, selection: crate::CheckpointFrameSelectionMeta) -> Self {
+        self.selection = Some(selection);
         self
     }
 

@@ -8,15 +8,15 @@ use std::sync::{Arc, Barrier};
 use bincode::Options;
 use rustscan_gs::{
     load_training_checkpoint, load_training_checkpoint_with_migration, save_training_checkpoint,
-    train_splats, AdamCheckpoint, AdamParameterCheckpoint, CheckpointMigration, HostSplats,
-    Intrinsics, ScenePose, TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint,
-    TrainingCheckpointPolicy, TrainingCheckpointReason, TrainingConfig, TrainingControl,
-    TrainingDataset, TrainingError, TrainingEvent, TrainingEventCadence, TrainingIdentity,
-    TrainingOptions, TrainingRunDisposition, MAX_TRAINING_CHECKPOINT_BYTES,
+    train_splats, AdamCheckpoint, AdamParameterCheckpoint, CheckpointFrameSelectionMeta,
+    CheckpointMigration, HostSplats, Intrinsics, ScenePose, TensorCheckpoint, TopologyCheckpoint,
+    TrainingCheckpoint, TrainingCheckpointPolicy, TrainingCheckpointReason, TrainingConfig,
+    TrainingControl, TrainingDataset, TrainingError, TrainingEvent, TrainingEventCadence,
+    TrainingIdentity, TrainingOptions, TrainingRunDisposition, MAX_TRAINING_CHECKPOINT_BYTES,
     MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
     MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, SE3,
     TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
-    TRAINING_CHECKPOINT_VERSION_V1,
+    TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2,
 };
 use serde::Serialize;
 
@@ -32,6 +32,21 @@ struct SerializedHostSplats {
 
 #[derive(Serialize)]
 struct SerializedTrainingCheckpoint {
+    version: u32,
+    identity: TrainingIdentity,
+    completed_iterations: usize,
+    latest_loss: Option<f32>,
+    splats: SerializedHostSplats,
+    optimizer: AdamCheckpoint,
+    topology: TopologyCheckpoint,
+    frame_shuffle_seed: u64,
+    active_sh_degree: usize,
+    selection: Option<rustscan_gs::CheckpointFrameSelectionMeta>,
+}
+
+/// Pre-v3 on-disk layout used to prove migration leaves selection absent.
+#[derive(Serialize)]
+struct SerializedTrainingCheckpointV2 {
     version: u32,
     identity: TrainingIdentity,
     completed_iterations: usize,
@@ -115,6 +130,7 @@ fn checkpoint_fixture(completed_iterations: usize) -> TrainingCheckpoint {
         },
         frame_shuffle_seed: 7,
         active_sh_degree: 0,
+        selection: None,
     }
 }
 
@@ -159,6 +175,7 @@ fn serialize_with_splat_mutation(
         topology: checkpoint.topology,
         frame_shuffle_seed: checkpoint.frame_shuffle_seed,
         active_sh_degree: checkpoint.active_sh_degree,
+        selection: checkpoint.selection,
     })
 }
 
@@ -2169,4 +2186,194 @@ fn mid_window_topology_resume_matches_uninterrupted_at_iteration_eight() {
             .topology
             .prune_removed
     );
+}
+
+#[test]
+fn selection_metadata_roundtrips_and_v2_loads_as_absent() {
+    let mut checkpoint = checkpoint_fixture(3);
+    checkpoint.selection = Some(CheckpointFrameSelectionMeta {
+        eval_split_kind: Some("in-view".into()),
+        train_stable_ids: vec![10, 20, 30],
+        eval_stable_ids: vec![40],
+        train_loader_frame_ids: vec![20, 10, 30],
+        manifest_fingerprint: Some("manifest-fp".into()),
+        selection_fingerprint: Some("sel-fp".into()),
+        eval_selection_fingerprint: Some("eval-sel-fp".into()),
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("selection-v3.rgscp");
+    save_training_checkpoint(&path, &checkpoint).unwrap();
+    let loaded = load_training_checkpoint(&path).unwrap();
+    assert_eq!(loaded.version, TRAINING_CHECKPOINT_VERSION);
+    assert_eq!(loaded.selection, checkpoint.selection);
+
+    // Write a raw v2 payload (no selection field) and migrate.
+    let view = checkpoint.splats.as_view();
+    let v2_bytes = encode_unchecked(&SerializedTrainingCheckpointV2 {
+        version: TRAINING_CHECKPOINT_VERSION_V2,
+        identity: checkpoint.identity.clone(),
+        completed_iterations: checkpoint.completed_iterations,
+        latest_loss: checkpoint.latest_loss,
+        splats: SerializedHostSplats {
+            positions: view.positions.to_vec(),
+            log_scales: view.log_scales.to_vec(),
+            rotations: view.rotations.to_vec(),
+            opacity_logits: view.opacity_logits.to_vec(),
+            sh_coeffs: view.sh_coeffs.to_vec(),
+            sh_degree: view.sh_degree,
+        },
+        optimizer: checkpoint.optimizer.clone(),
+        topology: checkpoint.topology.clone(),
+        frame_shuffle_seed: checkpoint.frame_shuffle_seed,
+        active_sh_degree: checkpoint.active_sh_degree,
+    });
+    let v2_path = temp.path().join("selection-v2.rgscp");
+    fs::write(&v2_path, v2_bytes).unwrap();
+    let (migrated, migration) = load_training_checkpoint_with_migration(&v2_path).unwrap();
+    assert_eq!(migration, CheckpointMigration::V2SelectionMetaAbsent);
+    assert_eq!(migrated.version, TRAINING_CHECKPOINT_VERSION);
+    assert!(
+        migrated.selection.is_none(),
+        "v2 migration must mark selection absent, not invent IDs"
+    );
+}
+
+#[test]
+fn resume_rejects_mismatched_selection_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-meta", 2);
+    let config = tiny_training_config(2);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"sel-recon", &config).unwrap();
+    let mut checkpoint = checkpoint_fixture(1);
+    checkpoint.identity = identity.clone();
+    checkpoint.selection = Some(CheckpointFrameSelectionMeta {
+        selection_fingerprint: Some("old".into()),
+        train_stable_ids: vec![0, 1],
+        ..Default::default()
+    });
+    let expected = CheckpointFrameSelectionMeta {
+        selection_fingerprint: Some("new".into()),
+        train_stable_ids: vec![0, 1],
+        ..Default::default()
+    };
+    let error = train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity)
+            .with_selection(expected)
+            .with_resume_checkpoint(checkpoint),
+    )
+    .unwrap_err();
+    assert_invalid_input_contains(error, "frame-selection metadata");
+}
+
+#[test]
+fn public_train_splats_accepts_pre_c5_gap_free_identity_then_resaves_current() {
+    let temp = tempfile::tempdir().unwrap();
+    // Stable IDs are non-enumerated so current != pre-C5 gap-free digests.
+    let image_path = temp.path().join("legacy-frame.rgb");
+    let mut pixels = Vec::with_capacity(16 * 16 * 3);
+    for y in 0..16_u8 {
+        for x in 0..16_u8 {
+            pixels.extend_from_slice(&[x, y, x.saturating_add(y)]);
+        }
+    }
+    fs::write(&image_path, pixels).unwrap();
+    let mut dataset = TrainingDataset::new(Intrinsics::new(12.0, 12.0, 8.0, 8.0, 16, 16));
+    for &stable_id in &[11u64, 22, 33] {
+        dataset.add_pose(ScenePose::new(
+            stable_id,
+            image_path.clone(),
+            SE3::identity(),
+            0.0,
+        ));
+    }
+    dataset.add_point([0.0, 0.0, 2.0], Some([0.25, 0.5, 0.75]));
+
+    let first_config = tiny_training_config(4);
+    let current_hash = rustscan_gs::TrainingIdentity::from_canonical_content(
+        &dataset,
+        b"legacy-recon",
+        &first_config,
+    )
+    .unwrap()
+    .dataset;
+    let legacy_hash =
+        rustscan_gs::hash_training_dataset_with_pre_c5_frame_ids(&dataset, &[0, 1, 2]).unwrap();
+    assert_ne!(current_hash, legacy_hash);
+
+    let legacy_identity = TrainingIdentity {
+        dataset: legacy_hash,
+        reconstruction: blake3::hash(b"legacy-recon").to_hex().to_string(),
+        config: TrainingIdentity::from_canonical_content(&dataset, b"legacy-recon", &first_config)
+            .unwrap()
+            .config,
+    };
+
+    let captured = Rc::new(RefCell::new(None));
+    let sink = Rc::clone(&captured);
+    let first = train_splats(
+        &dataset,
+        &first_config,
+        TrainingOptions::new()
+            .with_identity(legacy_identity)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(4) })
+            .with_checkpoint_sink(move |ready| {
+                *sink.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .expect("train with pre-C5 identity must succeed");
+    assert_eq!(first.report.completed_iterations, 4);
+    let legacy_checkpoint = captured
+        .borrow()
+        .clone()
+        .expect("periodic checkpoint from first run");
+    assert_eq!(legacy_checkpoint.completed_iterations, 4);
+
+    let resume_config = tiny_training_config(6);
+    let current_identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"legacy-recon", &resume_config)
+            .unwrap();
+    let captured2 = Rc::new(RefCell::new(None));
+    let sink2 = Rc::clone(&captured2);
+    let second = train_splats(
+        &dataset,
+        &resume_config,
+        TrainingOptions::new()
+            .with_identity(current_identity.clone())
+            .with_resume_checkpoint(legacy_checkpoint)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(6) })
+            .with_checkpoint_sink(move |ready| {
+                *sink2.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .expect("resume of pre-C5 gap-free checkpoint must succeed via public train_splats");
+    assert_eq!(second.report.completed_iterations, 6);
+    let upgraded = captured2
+        .borrow()
+        .clone()
+        .expect("checkpoint after re-save");
+    assert_eq!(upgraded.identity.dataset, current_identity.dataset);
+    assert_ne!(
+        upgraded.identity.dataset,
+        rustscan_gs::hash_training_dataset_with_pre_c5_frame_ids(&dataset, &[0, 1, 2]).unwrap()
+    );
+
+    let third_config = tiny_training_config(7);
+    let third_identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"legacy-recon", &third_config).unwrap();
+    let third = train_splats(
+        &dataset,
+        &third_config,
+        TrainingOptions::new()
+            .with_identity(third_identity)
+            .with_resume_checkpoint(upgraded),
+    )
+    .expect("second resume with new identity must succeed");
+    assert_eq!(third.report.completed_iterations, 7);
 }

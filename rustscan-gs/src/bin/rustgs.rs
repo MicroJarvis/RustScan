@@ -685,6 +685,7 @@ mod tests {
             &args,
             &dataset,
             &rustscan_gs::TrainingConfig::default(),
+            None,
         )
         .unwrap();
 
@@ -724,6 +725,7 @@ mod tests {
             &args,
             &dataset,
             &rustscan_gs::TrainingConfig::default(),
+            None,
         )
         .unwrap();
 
@@ -764,6 +766,7 @@ mod tests {
             &args,
             &dataset,
             &rustscan_gs::TrainingConfig::default(),
+            None,
         )
         .err()
         .expect("corrupt resume checkpoint must fail");
@@ -815,7 +818,7 @@ mod tests {
             1.0, 1.0, 0.5, 0.5, 1, 1,
         ));
 
-        train_command::training_options(&args, &dataset, config)
+        train_command::training_options(&args, &dataset, config, None)
             .unwrap()
             .identity
             .unwrap()

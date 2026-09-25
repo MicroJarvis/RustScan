@@ -106,6 +106,9 @@ struct EvalCase {
     frame_stride: usize,
     include_frame_ranges: Option<&'static str>,
     exclude_frame_ranges: Option<&'static str>,
+    /// When true, pin the historical static_162 set via allowed_ids (first 180
+    /// load-order frames minus enumerated indices 76..=93).
+    pin_static_162: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,10 +185,20 @@ fn main() -> anyhow::Result<()> {
             },
         )?;
         // One canonical selection: include/exclude → max → stride.
+        // static_162 pins the historical prefix via allowed_ids so exclude+max
+        // cannot backfill frames past the original 180-frame window.
         let max_frames = if case.max_frames > 0 {
             case.max_frames
         } else {
             case.dataset_max_frames
+        };
+        let allowed_ids = if case.pin_static_162 {
+            Some(
+                rustscan_gs::static_162_allowed_stable_ids(&full_dataset)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
         };
         let selection = rustscan_gs::FrameSelection::select(
             &full_dataset,
@@ -194,9 +207,9 @@ fn main() -> anyhow::Result<()> {
                     .map_err(anyhow::Error::msg)?,
                 exclude_ranges: parse_frame_id_ranges(case.exclude_frame_ranges)
                     .map_err(anyhow::Error::msg)?,
+                allowed_ids,
                 max_frames,
                 frame_stride: case.frame_stride,
-                ..Default::default()
             },
         )
         .map_err(anyhow::Error::msg)?;
@@ -310,6 +323,7 @@ fn eval_cases() -> [EvalCase; 4] {
             frame_stride: 30,
             include_frame_ranges: None,
             exclude_frame_ranges: None,
+            pin_static_162: false,
         },
         EvalCase {
             name: "full_180",
@@ -319,15 +333,20 @@ fn eval_cases() -> [EvalCase; 4] {
             frame_stride: 1,
             include_frame_ranges: None,
             exclude_frame_ranges: None,
+            pin_static_162: false,
         },
         EvalCase {
             name: "static_162",
             title: "static 162-frame prefix",
             dataset_max_frames: 180,
+            // Selection is pinned by allowed_ids; max/stride remain for fingerprint.
             max_frames: 180,
             frame_stride: 1,
             include_frame_ranges: None,
-            exclude_frame_ranges: Some("76-93"),
+            // Exclude is encoded in allowed_ids (old enumerated 76-93), not reapplied
+            // as stable-ID exclude which would drift past the 180 prefix.
+            exclude_frame_ranges: None,
+            pin_static_162: true,
         },
         EvalCase {
             name: "full_trajectory_stride_4",
@@ -337,6 +356,7 @@ fn eval_cases() -> [EvalCase; 4] {
             frame_stride: 4,
             include_frame_ranges: None,
             exclude_frame_ranges: None,
+            pin_static_162: false,
         },
     ]
 }
