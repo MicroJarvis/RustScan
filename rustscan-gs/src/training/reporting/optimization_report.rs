@@ -43,8 +43,11 @@ pub struct OptimizationCommand {
     pub eval_render_scale: Option<f32>,
     /// Stable COLMAP image IDs used for evaluation (full u64, never truncated).
     pub eval_frame_ids: Vec<u64>,
-    /// Stable COLMAP image IDs that entered training after canonical selection.
+    /// Stable COLMAP image IDs from the canonical train FrameSelection (before oversample).
     pub train_frame_ids: Vec<u64>,
+    /// Pose order that entered the training loader after oversample (and shuffle seed order).
+    #[serde(default)]
+    pub train_loader_frame_ids: Vec<u64>,
     /// Pose count that actually entered the training loader after filtering.
     pub effective_max_frames: Option<usize>,
     pub eval_resolution: Option<[usize; 2]>,
@@ -314,6 +317,12 @@ pub fn compare_optimization_reports(
         reasons.push(format!(
             "train_frame_ids mismatch: {:?} vs {:?}",
             baseline.command.train_frame_ids, candidate.command.train_frame_ids
+        ));
+    }
+    if baseline.command.train_loader_frame_ids != candidate.command.train_loader_frame_ids {
+        reasons.push(format!(
+            "train_loader_frame_ids mismatch: {:?} vs {:?}",
+            baseline.command.train_loader_frame_ids, candidate.command.train_loader_frame_ids
         ));
     }
     compare_opt_eq(
@@ -608,6 +617,7 @@ mod tests {
                 eval_render_scale: Some(0.25),
                 eval_frame_ids: vec![0, 1],
                 train_frame_ids: vec![10, 11, 12],
+                train_loader_frame_ids: vec![10, 11, 12, 10],
                 effective_max_frames: Some(12),
                 eval_resolution: Some([160, 90]),
                 iterations: Some(500),
@@ -778,6 +788,10 @@ mod tests {
             (
                 "train_frame_ids",
                 Box::new(|cmd| cmd.train_frame_ids = vec![99]),
+            ),
+            (
+                "train_loader_frame_ids",
+                Box::new(|cmd| cmd.train_loader_frame_ids = vec![99]),
             ),
             (
                 "effective_max_frames",

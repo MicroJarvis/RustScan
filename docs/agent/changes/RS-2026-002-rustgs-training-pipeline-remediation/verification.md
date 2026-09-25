@@ -19,26 +19,29 @@ C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked
 | FrameSelection | include/exclude → max_frames → stride → selection fingerprint (one implementation) |
 | Split manifest | `--frame-split-manifest` + `--eval-split in-view\|holdout`; startup rejects dup/unknown/overlap/fingerprint mismatch; holdout requires manifest |
 | Report | `eval_frame_ids` / `train_frame_ids` / worst frames are `u64`; split kind + manifest/selection fingerprints persisted |
+| Examples | `evaluate_psnr` / `rustgs_eval_suite` / `rustgs_residual_heatmap` use one `FrameSelection`; evaluate/crop reuse selected dataset with max=0 stride=1 |
+| Checkpoint | Pre-C5 enumerated identity accepted with warn; otherwise reject with explicit C5 frame-identity message |
+| Report IDs | `train_frame_ids` = canonical selection; `train_loader_frame_ids` = oversampled/shuffled loader order |
 
-### Gate results
+### Gate results (review fixes)
 
-Logs: `artifacts/runs/rs-2026-002-c5-frame-selection/`
+Logs: `artifacts/runs/rs-2026-002-c5-review-fixes/`
 
 Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`
 
 | Command | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | PASS |
-| `cargo test -p rustscan-gs --lib --features gpu-wgpu -- --test-threads=1` | PASS: **205** (includes split + missing-image fixtures) |
+| `cargo test -p rustscan-gs --lib --features gpu-wgpu -- --test-threads=1` | PASS: **207** |
 | `cargo test -p rustscan-gs --test checkpoint_resume --features gpu-wgpu -- --test-threads=1` | PASS: **53** |
 | `cargo check -p rustscan-gs --all-targets --features gpu-wgpu` | PASS |
 | `git diff --check` | PASS |
 
 ### Known limitations
 
-- Examples (`evaluate_psnr`, `rustgs_eval_suite`, residual heatmap) still have local include/exclude helpers; production train/eval/crop/report path uses `FrameSelection`.
-- `ColmapConfig::{max_frames,frame_stride}` still apply a max/stride-only `FrameSelection` at load end for API compatibility when callers do not use include/exclude; the CLI loads full then selects once.
+- `ColmapConfig::{max_frames,frame_stride}` still apply a max/stride-only `FrameSelection` at load end for API compatibility when callers do not use include/exclude; the CLI and migrated examples load full then select once.
 - Clippy `-D warnings` not part of this C5 gate matrix.
+- Pre-C5 identity acceptance does not rewrite the checkpoint on disk; re-save to persist stable-image_id hashes.
 
 ## C1–C4 merged to main (2026-09-25)
 

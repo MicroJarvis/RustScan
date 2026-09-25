@@ -2200,7 +2200,8 @@ fn maybe_write_optimization_report(
             render_scale: Some(config.raster.render_scale),
             eval_render_scale: args.eval_after_train.then_some(args.eval_render_scale),
             eval_frame_ids,
-            train_frame_ids: rustscan_gs::training_frame_order(
+            train_frame_ids: frame_plan.train.stable_ids.clone(),
+            train_loader_frame_ids: rustscan_gs::training_frame_order(
                 dataset.poses.len(),
                 config.data.frame_shuffle_seed,
             )

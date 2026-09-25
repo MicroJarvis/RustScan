@@ -167,10 +167,33 @@ impl TrainingIdentity {
         dataset: &TrainingDataset,
         config: &TrainingConfig,
     ) -> Result<(), TrainingError> {
-        if self.dataset != hash_training_dataset(dataset)? {
-            return Err(TrainingError::InvalidInput(
-                "training identity dataset does not match the current training dataset".to_string(),
-            ));
+        let current = hash_training_dataset(dataset)?;
+        if self.dataset != current {
+            // Pre-C5 checkpoints hashed enumerated frame_id with COLMAP image_id in
+            // timestamp. Accept that legacy digest explicitly so resume does not fail
+            // silently from the identity remapping alone.
+            let legacy = hash_training_dataset_pre_c5_enumerated(dataset)?;
+            if self.dataset == legacy {
+                log::warn!(
+                    "accepted pre-C5 training-dataset identity (enumerated frame_id + image_id timestamp); \
+                     re-save the checkpoint to persist the stable-image_id identity"
+                );
+            } else if current == legacy {
+                // Dataset shape makes the two encodings identical; keep the historical
+                // short rejection text for unchanged callers/tests.
+                return Err(TrainingError::InvalidInput(
+                    "training identity dataset does not match the current training dataset"
+                        .to_string(),
+                ));
+            } else {
+                return Err(TrainingError::InvalidInput(format!(
+                    "training identity dataset does not match the current training dataset \
+                     (stable-image_id hash={current}, pre-C5 enumerated hash={legacy}, \
+                     checkpoint hash={}). Re-train or migrate the checkpoint after the C5 \
+                     frame-identity change.",
+                    self.dataset
+                )));
+            }
         }
         if self.config != hash_training_config(config)? {
             return Err(TrainingError::InvalidInput(
@@ -217,6 +240,40 @@ fn hash_training_dataset(dataset: &TrainingDataset) -> Result<String, TrainingEr
             })
         })
         .collect::<Result<Vec<_>, TrainingError>>()?;
+    hash_canonical_dataset(dataset, poses)
+}
+
+/// Pre-C5 dataset identity: `frame_id` was the post-filter enumerate index and
+/// COLMAP `image_id` was stored in `timestamp`.
+fn hash_training_dataset_pre_c5_enumerated(
+    dataset: &TrainingDataset,
+) -> Result<String, TrainingError> {
+    let poses = dataset
+        .poses
+        .iter()
+        .enumerate()
+        .map(|(frame_idx, pose)| {
+            Ok(CanonicalTrainingPose {
+                frame_id: frame_idx as u64,
+                image_content: hash_file_content(&pose.image_path)?,
+                depth_content: pose
+                    .depth_path
+                    .as_deref()
+                    .map(hash_file_content)
+                    .transpose()?,
+                pose: &pose.pose,
+                // Stable COLMAP image_id now lives in frame_id; legacy path put it in timestamp.
+                timestamp: pose.frame_id as f64,
+            })
+        })
+        .collect::<Result<Vec<_>, TrainingError>>()?;
+    hash_canonical_dataset(dataset, poses)
+}
+
+fn hash_canonical_dataset(
+    dataset: &TrainingDataset,
+    poses: Vec<CanonicalTrainingPose<'_>>,
+) -> Result<String, TrainingError> {
     let canonical = CanonicalTrainingDataset {
         intrinsics: &dataset.intrinsics,
         depth_scale: dataset.depth_scale,
@@ -1061,6 +1118,65 @@ mod fingerprint_tests {
             hash_training_config(&changed_opt).expect("optimizer hash"),
             HISTORICAL_DEFAULT_CONTINUITY_HASH,
             "optimizer changes must still mismatch"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_migration_tests {
+    use super::{
+        hash_training_config, hash_training_dataset, hash_training_dataset_pre_c5_enumerated,
+        TrainingIdentity,
+    };
+    use crate::TrainingConfig;
+    use rustscan_types::{Intrinsics, ScenePose, TrainingDataset, SE3};
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    fn dataset_with_stable_ids(ids: &[u64]) -> (tempfile::TempDir, TrainingDataset) {
+        let dir = tempdir().unwrap();
+        let mut dataset = TrainingDataset::new(Intrinsics::new(1.0, 1.0, 0.0, 0.0, 8, 8));
+        for &id in ids {
+            let path = dir.path().join(format!("frame_{id}.png"));
+            let mut file = std::fs::File::create(&path).unwrap();
+            write!(file, "image-{id}").unwrap();
+            dataset.add_pose(ScenePose::new(id, path, SE3::identity(), 0.0));
+        }
+        (dir, dataset)
+    }
+
+    #[test]
+    fn pre_c5_enumerated_identity_is_accepted_with_explicit_path() {
+        let (_dir, dataset) = dataset_with_stable_ids(&[11, 22, 33]);
+        let config = TrainingConfig::default();
+        let current = hash_training_dataset(&dataset).unwrap();
+        let legacy = hash_training_dataset_pre_c5_enumerated(&dataset).unwrap();
+        assert_ne!(
+            current, legacy,
+            "stable-id and pre-C5 enumerated hashes must differ"
+        );
+
+        let identity = TrainingIdentity {
+            dataset: legacy,
+            reconstruction: "recon".into(),
+            config: hash_training_config(&config).unwrap(),
+        };
+        identity
+            .validate_dataset_and_config(&dataset, &config)
+            .expect("pre-C5 enumerated identity must be accepted");
+
+        let wrong = TrainingIdentity {
+            dataset: "deadbeef".into(),
+            reconstruction: "recon".into(),
+            config: identity.config.clone(),
+        };
+        let err = wrong
+            .validate_dataset_and_config(&dataset, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("C5") || err.contains("stable-image_id") || err.contains("pre-C5"),
+            "rejection must explain the frame-identity change: {err}"
         );
     }
 }

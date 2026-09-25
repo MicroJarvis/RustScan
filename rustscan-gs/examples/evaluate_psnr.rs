@@ -3,42 +3,59 @@ use std::path::PathBuf;
 use image::{ImageBuffer, RgbImage};
 use rustscan_gs::{
     evaluate_splats, evaluation_device, load_colmap_training_dataset, load_splats_ply,
-    render_evaluation_frame, runtime_from_splats, select_evaluation_frames, ColmapConfig,
-    EvaluationDevice, EvaluationFrameMetric, HostSplats, SplatEvaluationConfig,
-    SplatEvaluationRenderer, SplatEvaluationSummary, TrainingDataset,
+    parse_frame_id_ranges, render_evaluation_frame, runtime_from_splats, ColmapConfig,
+    EvaluationDevice, EvaluationFrameMetric, FrameSelection, FrameSelectionRequest, HostSplats,
+    SplatEvaluationConfig, SplatEvaluationRenderer, SplatEvaluationSummary,
 };
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
+    if args.frame_stride == 0 {
+        anyhow::bail!("--frame-stride must be >= 1");
+    }
 
-    let dataset = load_colmap_training_dataset(
+    // Full load, then one canonical FrameSelection (include/exclude → max → stride).
+    let full_dataset = load_colmap_training_dataset(
         &args.dataset,
         &ColmapConfig {
-            max_frames: args.max_frames,
+            max_frames: 0,
             frame_stride: 1,
             ..ColmapConfig::default()
         },
     )?;
-    let included_ranges = parse_frame_ranges(args.include_frame_ranges.as_deref())?;
-    let dataset = filter_dataset_to_frame_ranges(dataset, &included_ranges)?;
-    let excluded_ranges = parse_frame_ranges(args.exclude_frame_ranges.as_deref())?;
-    let dataset = filter_dataset_by_frame_ranges(dataset, &excluded_ranges)?;
+    let selection = FrameSelection::select(
+        &full_dataset,
+        &FrameSelectionRequest {
+            include_ranges: parse_frame_id_ranges(args.include_frame_ranges.as_deref())
+                .map_err(anyhow::Error::msg)?,
+            exclude_ranges: parse_frame_id_ranges(args.exclude_frame_ranges.as_deref())
+                .map_err(anyhow::Error::msg)?,
+            max_frames: args.max_frames,
+            frame_stride: args.frame_stride,
+            ..Default::default()
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    if selection.dataset.poses.is_empty() {
+        anyhow::bail!("frame selection resolved to zero frames");
+    }
+    let dataset = &selection.dataset;
     let (splats, metadata) = load_splats_ply(&args.scene)?;
     let eval_device = args
         .device
         .parse::<EvaluationDevice>()
         .map_err(anyhow::Error::msg)?;
     let device = evaluation_device(eval_device)?;
-    let selected_dataset = select_evaluation_frames(&dataset, args.max_frames, args.frame_stride);
     let result = evaluate_splats(
-        &dataset,
+        dataset,
         &splats,
         &metadata,
         &SplatEvaluationConfig {
             render_scale: args.render_scale,
             raster_cov_blur: args.raster_cov_blur,
-            frame_stride: args.frame_stride,
-            max_frames: args.max_frames,
+            // Already selected once; do not re-filter.
+            frame_stride: 1,
+            max_frames: 0,
             worst_frame_count: summary_worst_count(args.export_worst_k),
         },
         &device,
@@ -48,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result.summary)?);
     } else {
-        print_human_summary(&args, &result.summary);
+        print_human_summary(&args, &result.summary, &selection);
     }
 
     if args.export_worst_k > 0 {
@@ -57,7 +74,7 @@ fn main() -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| default_export_dir(&args.scene));
         export_worst_frames(
-            &selected_dataset,
+            dataset,
             &splats,
             &result.frame_metrics,
             args.export_worst_k,
@@ -196,103 +213,6 @@ fn print_help() {
     );
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FrameIdRange {
-    start: u64,
-    end: u64,
-}
-
-impl FrameIdRange {
-    fn contains(&self, frame_id: u64) -> bool {
-        self.start <= frame_id && frame_id <= self.end
-    }
-}
-
-fn parse_frame_ranges(value: Option<&str>) -> anyhow::Result<Vec<FrameIdRange>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let mut ranges = Vec::new();
-    for raw_token in value.split(',') {
-        let token = raw_token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let (start, end) = if let Some((start, end)) = token.split_once("..") {
-            (start.trim(), end.trim())
-        } else if let Some((start, end)) = token.split_once('-') {
-            (start.trim(), end.trim())
-        } else {
-            (token, token)
-        };
-        if start.is_empty() || end.is_empty() {
-            anyhow::bail!("frame range '{token}' must be <frame_id> or <start>-<end>");
-        }
-        let start = start
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid frame range start in '{token}'"))?;
-        let end = end
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid frame range end in '{token}'"))?;
-        if start > end {
-            anyhow::bail!("frame range '{token}' has start greater than end");
-        }
-        ranges.push(FrameIdRange { start, end });
-    }
-    Ok(ranges)
-}
-
-fn filter_dataset_by_frame_ranges(
-    dataset: TrainingDataset,
-    excluded_ranges: &[FrameIdRange],
-) -> anyhow::Result<TrainingDataset> {
-    if excluded_ranges.is_empty() {
-        return Ok(dataset);
-    }
-
-    let mut filtered =
-        TrainingDataset::new(dataset.intrinsics).with_depth_scale(dataset.depth_scale);
-    filtered.initial_points = dataset.initial_points.clone();
-    for pose in dataset.poses {
-        if excluded_ranges
-            .iter()
-            .any(|range| range.contains(pose.frame_id))
-        {
-            continue;
-        }
-        filtered.add_pose(pose);
-    }
-    if filtered.poses.is_empty() {
-        anyhow::bail!("--exclude-frame-ranges removed all frames");
-    }
-    Ok(filtered)
-}
-
-fn filter_dataset_to_frame_ranges(
-    dataset: TrainingDataset,
-    included_ranges: &[FrameIdRange],
-) -> anyhow::Result<TrainingDataset> {
-    if included_ranges.is_empty() {
-        return Ok(dataset);
-    }
-
-    let mut filtered =
-        TrainingDataset::new(dataset.intrinsics).with_depth_scale(dataset.depth_scale);
-    filtered.initial_points = dataset.initial_points.clone();
-    for pose in dataset.poses {
-        if included_ranges
-            .iter()
-            .any(|range| range.contains(pose.frame_id))
-        {
-            filtered.add_pose(pose);
-        }
-    }
-    if filtered.poses.is_empty() {
-        anyhow::bail!("--include-frame-ranges selected no frames");
-    }
-    Ok(filtered)
-}
-
 fn summary_worst_count(export_worst_k: usize) -> usize {
     if export_worst_k == 0 {
         5
@@ -301,19 +221,20 @@ fn summary_worst_count(export_worst_k: usize) -> usize {
     }
 }
 
-fn print_human_summary(args: &Args, summary: &SplatEvaluationSummary) {
+fn print_human_summary(args: &Args, summary: &SplatEvaluationSummary, selection: &FrameSelection) {
     println!("scene={}", args.scene.display());
     println!("dataset={}", args.dataset.display());
     println!("device={}", summary.device);
     println!(
-        "render_scale={:.3} raster_cov_blur={:.3} resolution={}x{} frames={} stride={} max_frames={}",
+        "render_scale={:.3} raster_cov_blur={:.3} resolution={}x{} frames={} stride={} max_frames={} selection_fp={}",
         summary.render_scale,
         summary.raster_cov_blur,
         summary.render_width,
         summary.render_height,
         summary.frame_count,
-        summary.frame_stride,
-        summary.max_frames,
+        selection.frame_stride,
+        selection.max_frames,
+        selection.selection_fingerprint,
     );
     println!(
         "splat_metadata iterations={} splat_count={} final_loss={} final_step_loss={}",

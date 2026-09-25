@@ -448,6 +448,37 @@ mod tests {
     }
 
     #[test]
+    fn include_before_max_keeps_late_id_that_prefix_max_would_drop() {
+        // Regression: applying max_frames before include would truncate to [1,2,3]
+        // and drop stable id 9. Canonical order must include first.
+        let source = dataset_with_ids(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let wrong_order_prefix: Vec<u64> = source
+            .poses
+            .iter()
+            .take(3)
+            .map(|pose| pose.frame_id)
+            .collect();
+        assert_eq!(wrong_order_prefix, vec![1, 2, 3]);
+        assert!(!wrong_order_prefix.contains(&9));
+
+        let selection = FrameSelection::select(
+            &source,
+            &FrameSelectionRequest {
+                include_ranges: vec![FrameIdRange { start: 9, end: 9 }],
+                max_frames: 3,
+                frame_stride: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selection.stable_ids,
+            vec![9],
+            "include of late stable id must run before max_frames"
+        );
+    }
+
+    #[test]
     fn max_then_stride_apply_after_include() {
         let source = dataset_with_ids(&[1, 2, 3, 4, 5, 6]);
         let selection = FrameSelection::select(

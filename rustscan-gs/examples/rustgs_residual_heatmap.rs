@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use image::{ImageBuffer, RgbImage};
 use rustscan_gs::{
-    evaluation_device, load_colmap_training_dataset, load_splats_ply, render_evaluation_frame,
-    runtime_from_splats, ColmapConfig, EvaluationDevice, SplatEvaluationRenderer, TrainingDataset,
+    evaluation_device, load_colmap_training_dataset, load_splats_ply, parse_frame_id_ranges,
+    render_evaluation_frame, runtime_from_splats, ColmapConfig, EvaluationDevice,
+    FrameSelectionRequest, SplatEvaluationRenderer,
 };
 use serde::Serialize;
 
@@ -77,30 +77,22 @@ struct FrameResidualReport {
     strip_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FrameIdRange {
-    start: u64,
-    end: u64,
-}
-
-impl FrameIdRange {
-    fn contains(&self, frame_id: u64) -> bool {
-        self.start <= frame_id && frame_id <= self.end
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
     std::fs::create_dir_all(&args.out)?;
 
-    let frame_ranges = parse_frame_ranges(&args.frames)?;
+    let frame_ranges =
+        parse_frame_id_ranges(Some(args.frames.as_str())).map_err(anyhow::Error::msg)?;
+    if frame_ranges.is_empty() {
+        anyhow::bail!("--frames must select at least one frame");
+    }
     let eval_device = args
         .device
         .parse::<EvaluationDevice>()
         .map_err(anyhow::Error::msg)?;
     let device = evaluation_device(eval_device)?;
-    let mut dataset = load_colmap_training_dataset(
+    let full_dataset = load_colmap_training_dataset(
         &args.dataset,
         &ColmapConfig {
             max_frames: 0,
@@ -108,7 +100,18 @@ fn main() -> anyhow::Result<()> {
             ..ColmapConfig::default()
         },
     )?;
-    dataset = filter_dataset_to_frame_ranges(dataset, &frame_ranges)?;
+    let selection = rustscan_gs::FrameSelection::select(
+        &full_dataset,
+        &FrameSelectionRequest {
+            include_ranges: frame_ranges,
+            ..Default::default()
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    if selection.dataset.poses.is_empty() {
+        anyhow::bail!("--frames selected no dataset frames");
+    }
+    let dataset = &selection.dataset;
     let (splats, _) = load_splats_ply(&args.scene)?;
 
     let (render_width, render_height) = rustscan_gs::scaled_dimensions(
@@ -206,69 +209,6 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         .parse::<EvaluationDevice>()
         .map_err(anyhow::Error::msg)?;
     Ok(())
-}
-
-fn parse_frame_ranges(value: &str) -> anyhow::Result<Vec<FrameIdRange>> {
-    let mut ranges = Vec::new();
-    for raw_token in value.split(',') {
-        let token = raw_token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let (start, end) = if let Some((start, end)) = token.split_once("..") {
-            (start.trim(), end.trim())
-        } else if let Some((start, end)) = token.split_once('-') {
-            (start.trim(), end.trim())
-        } else {
-            (token, token)
-        };
-        if start.is_empty() || end.is_empty() {
-            anyhow::bail!("frame range '{token}' must be <frame_id> or <start>-<end>");
-        }
-        let start = start
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid frame range start in '{token}'"))?;
-        let end = end
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid frame range end in '{token}'"))?;
-        if start > end {
-            anyhow::bail!("frame range '{token}' has start greater than end");
-        }
-        ranges.push(FrameIdRange { start, end });
-    }
-    if ranges.is_empty() {
-        anyhow::bail!("--frames must select at least one frame");
-    }
-    Ok(ranges)
-}
-
-fn filter_dataset_to_frame_ranges(
-    dataset: TrainingDataset,
-    included_ranges: &[FrameIdRange],
-) -> anyhow::Result<TrainingDataset> {
-    let selected_ids = dataset
-        .poses
-        .iter()
-        .filter(|pose| {
-            included_ranges
-                .iter()
-                .any(|range| range.contains(pose.frame_id))
-        })
-        .map(|pose| pose.frame_id)
-        .collect::<BTreeSet<_>>();
-    if selected_ids.is_empty() {
-        anyhow::bail!("--frames selected no dataset frames");
-    }
-
-    let mut filtered =
-        TrainingDataset::new(dataset.intrinsics).with_depth_scale(dataset.depth_scale);
-    filtered.initial_points = dataset.initial_points.clone();
-    for pose in dataset.poses {
-        if selected_ids.contains(&pose.frame_id) {
-            filtered.add_pose(pose);
-        }
-    }
-    Ok(filtered)
 }
 
 fn mean_abs_residual(target: &[f32], rendered: &[f32]) -> Vec<f32> {
