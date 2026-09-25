@@ -7,7 +7,7 @@
 | Base SHA | `e6db819e43764d536fc51a83e72395e8aa76632d` (main at worktree creation) |
 | Branch | `agent/RS-2026-002/c5-frame-selection` |
 | Worktree | `.worktrees/rs-2026-002-c5-frame-selection` |
-| Code tip | filled at commit |
+| Code tip | `841c9d28af3b66354836a6d7cbebcc4bbe8fbeed` |
 
 C5: `implemented_pending_review`. C6–C8: `not_started`. Not merged; not marked complete by implementer.
 

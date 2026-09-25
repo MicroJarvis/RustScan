@@ -5,7 +5,7 @@ source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
 fix_branch: "fix/rs-2026-002-c1-c4-review"
-head_sha: "4fdf506e6819fd30c74ad8245e85c9f1df625220"
+head_sha: "841c9d28af3b66354836a6d7cbebcc4bbe8fbeed"
 cards:
   C1:
     status: merged
