@@ -58,6 +58,7 @@ pub use rustscan_types::{Intrinsics, MapPointData, ScenePose, TrainingDataset, S
 pub use crate::core::{GaussianCamera, HostSplats, SplatView};
 
 // Re-export training types
+pub use crate::training::SelectionMetaProvenance;
 pub use crate::training::{
     aggregate_evaluation_gate_status, fingerprint_frame_selection, format_frame_id_ranges,
 };
@@ -110,7 +111,7 @@ pub use crate::training::{
     MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
     MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS,
     TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
-    TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2,
+    TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2, TRAINING_CHECKPOINT_VERSION_V3,
 };
 pub use crate::training::{
     compute_psnr_f32, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,

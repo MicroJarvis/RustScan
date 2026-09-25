@@ -24,6 +24,7 @@ pub(crate) mod forward;
 #[cfg(feature = "gpu")]
 use crate::{TrainingDataset, TrainingError};
 
+pub use checkpoint::SelectionMetaProvenance;
 pub use checkpoint::{
     assign_pre_c5_enumerated_ids, hash_training_dataset_with_pre_c5_frame_ids,
     load_training_checkpoint, load_training_checkpoint_with_migration,
@@ -34,7 +35,7 @@ pub use checkpoint::{
     MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
     MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES,
     TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
-    TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2,
+    TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2, TRAINING_CHECKPOINT_VERSION_V3,
 };
 pub use evaluation::{
     aggregate_evaluation_gate_status, compute_psnr_f32, fingerprint_frame_selection,

@@ -314,6 +314,15 @@ impl FrameSelectionReport {
             eval_split_kind,
         }
     }
+
+    /// Build a report for in-view evaluation paths (evaluate_psnr / eval suite).
+    #[must_use]
+    pub fn from_in_view_selection(
+        selection: &FrameSelection,
+        manifest_fingerprint: Option<String>,
+    ) -> Self {
+        Self::from_selection(selection, manifest_fingerprint, Some("in-view".to_string()))
+    }
 }
 
 /// Aggregate quality-gate check statuses: Failed > Inapplicable > Passed.
@@ -918,6 +927,33 @@ mod tests {
         );
         assert_eq!(json["max_frames"], serde_json::json!(2));
         assert_eq!(json["frame_stride"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn evaluate_psnr_and_suite_selection_reports_record_in_view_split() {
+        // evaluate_psnr / rustgs_eval_suite both use from_in_view_selection.
+        let source = dataset_with_ids(&[1, 2, 3]);
+        let selection = FrameSelection::select(
+            &source,
+            &FrameSelectionRequest {
+                max_frames: 2,
+                frame_stride: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let report = FrameSelectionReport::from_in_view_selection(&selection, None);
+        assert_eq!(report.eval_split_kind.as_deref(), Some("in-view"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["eval_split_kind"], serde_json::json!("in-view"));
+        let markdown_line = format!(
+            "eval_split_kind: {}",
+            report.eval_split_kind.as_deref().unwrap_or("-")
+        );
+        assert!(
+            markdown_line.contains("in-view"),
+            "suite markdown must surface in-view split: {markdown_line}"
+        );
     }
 
     #[test]

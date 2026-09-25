@@ -296,7 +296,7 @@ fn main() -> anyhow::Result<()> {
         }
         let include_frame_ranges = case.include_frame_ranges.map(str::to_string);
         let exclude_frame_ranges = case.exclude_frame_ranges.map(str::to_string);
-        let mut selection_report = FrameSelectionReport::from_selection(&selection, None, None);
+        let mut selection_report = FrameSelectionReport::from_in_view_selection(&selection, None);
         // Prefer the human-readable CLI/case strings when present.
         if include_frame_ranges.is_some() {
             selection_report.include_frame_ranges = include_frame_ranges.clone();
@@ -584,7 +584,7 @@ fn render_markdown(report: &SuiteReport) -> String {
     for case in &report.cases {
         out.push_str(&format!("### {}\n\n", case.name));
         out.push_str(&format!(
-            "- max_frames: {}\n- frame_stride: {}\n- include: {}\n- exclude: {}\n- selection_fingerprint: `{}`\n- stable_frame_ids ({}): `{:?}`\n\n",
+            "- max_frames: {}\n- frame_stride: {}\n- include: {}\n- exclude: {}\n- eval_split_kind: {}\n- selection_fingerprint: `{}`\n- stable_frame_ids ({}): `{:?}`\n\n",
             case.selection.max_frames,
             case.selection.frame_stride,
             case.selection
@@ -593,6 +593,10 @@ fn render_markdown(report: &SuiteReport) -> String {
                 .unwrap_or("-"),
             case.selection
                 .exclude_frame_ranges
+                .as_deref()
+                .unwrap_or("-"),
+            case.selection
+                .eval_split_kind
                 .as_deref()
                 .unwrap_or("-"),
             case.selection.selection_fingerprint,

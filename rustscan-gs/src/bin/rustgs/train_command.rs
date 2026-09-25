@@ -226,6 +226,13 @@ pub(super) fn training_options(
                 resume_path.display()
             );
         }
+        if migration == rustscan_gs::CheckpointMigration::V3SelectionMetaLegacyUnverified {
+            log::warn!(
+                "Migrated v3 training checkpoint {}: frame-selection metadata lacked request fields \
+                 and is marked legacy/unverified (IDs/fingerprints preserved; request not invented)",
+                resume_path.display()
+            );
+        }
         options = options.with_resume_checkpoint(checkpoint);
     }
 
@@ -1333,6 +1340,7 @@ fn checkpoint_selection_meta_from_frame_plan(
             .map(|selection| selection.exclude_ranges.clone())
             .unwrap_or_default(),
         eval_allowed_ids: eval.and_then(|selection| selection.allowed_ids.clone()),
+        provenance: rustscan_gs::SelectionMetaProvenance::Verified,
     }
 }
 

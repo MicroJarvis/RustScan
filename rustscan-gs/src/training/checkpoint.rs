@@ -13,9 +13,12 @@ use tempfile::{NamedTempFile, TempPath};
 use crate::{HostSplats, TrainingConfig, TrainingDataset, TrainingError};
 
 use super::config::MAX_TRAINING_ITERATIONS;
-use super::evaluation::{fingerprint_frame_selection, FrameIdRange, FrameSelectionRequest};
+use super::evaluation::{
+    fingerprint_frame_selection, FrameIdRange, FrameSelection, FrameSelectionRequest,
+};
 
-pub const TRAINING_CHECKPOINT_VERSION: u32 = 3;
+pub const TRAINING_CHECKPOINT_VERSION: u32 = 4;
+pub const TRAINING_CHECKPOINT_VERSION_V3: u32 = 3;
 pub const TRAINING_CHECKPOINT_VERSION_V2: u32 = 2;
 pub const TRAINING_CHECKPOINT_VERSION_V1: u32 = 1;
 pub const TRAINING_CHECKPOINT_MAGIC: [u8; 8] = *b"RGSCPBIN";
@@ -516,6 +519,20 @@ pub enum CheckpointMigration {
     V1BaselineReset,
     /// Loaded a v2 checkpoint that predates selection metadata; fields are absent.
     V2SelectionMetaAbsent,
+    /// Loaded a v3 checkpoint whose selection lacked request fields; marked legacy/unverified.
+    V3SelectionMetaLegacyUnverified,
+}
+
+/// Whether selection request fields can be treated as authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionMetaProvenance {
+    /// Full request fields + IDs + fingerprints; independently verifiable.
+    #[default]
+    Verified,
+    /// Migrated from pre-request v3 layout. Request fields are absent — do not
+    /// invent them and do not treat fingerprints as verified against an empty request.
+    LegacyUnverified,
 }
 
 /// Frame-selection metadata persisted beside training state.
@@ -523,9 +540,10 @@ pub enum CheckpointMigration {
 /// Distinguishes canonical selection IDs from the oversampled/shuffled loader
 /// order. Missing on v1/v2 files — never invent values when loading legacy bytes.
 ///
-/// Request fields (`max_frames`, ranges, `allowed_ids`, …) are stored so
+/// Request fields (`max_frames`, ranges, `allowed_ids`, …) are stored on v4+ so
 /// `selection_fingerprint` / `eval_selection_fingerprint` can be recomputed and
-/// verified independently of the live dataset.
+/// the selection re-executed against the dataset. Legacy v3 migrations keep
+/// [`SelectionMetaProvenance::LegacyUnverified`] with empty request fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CheckpointFrameSelectionMeta {
     /// `in-view` / `holdout` when evaluation split is known; `None` if unset.
@@ -561,6 +579,47 @@ pub struct CheckpointFrameSelectionMeta {
     pub eval_exclude_ranges: Vec<FrameIdRange>,
     #[serde(default)]
     pub eval_allowed_ids: Option<Vec<u64>>,
+    /// v4 field: whether request fields are authoritative. Legacy v3 → `LegacyUnverified`.
+    #[serde(default)]
+    pub provenance: SelectionMetaProvenance,
+}
+
+/// On-disk v3 selection layout (no request fields). Used only for decode/migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct CheckpointFrameSelectionMetaV3 {
+    eval_split_kind: Option<String>,
+    train_stable_ids: Vec<u64>,
+    eval_stable_ids: Vec<u64>,
+    train_loader_frame_ids: Vec<u64>,
+    manifest_fingerprint: Option<String>,
+    selection_fingerprint: Option<String>,
+    eval_selection_fingerprint: Option<String>,
+}
+
+impl CheckpointFrameSelectionMetaV3 {
+    fn into_legacy_unverified(self) -> CheckpointFrameSelectionMeta {
+        CheckpointFrameSelectionMeta {
+            eval_split_kind: self.eval_split_kind,
+            train_stable_ids: self.train_stable_ids,
+            eval_stable_ids: self.eval_stable_ids,
+            train_loader_frame_ids: self.train_loader_frame_ids,
+            manifest_fingerprint: self.manifest_fingerprint,
+            selection_fingerprint: self.selection_fingerprint,
+            eval_selection_fingerprint: self.eval_selection_fingerprint,
+            // Intentionally leave request fields empty — do not invent.
+            max_frames: 0,
+            frame_stride: 0,
+            include_ranges: Vec::new(),
+            exclude_ranges: Vec::new(),
+            allowed_ids: None,
+            eval_max_frames: 0,
+            eval_frame_stride: 0,
+            eval_include_ranges: Vec::new(),
+            eval_exclude_ranges: Vec::new(),
+            eval_allowed_ids: None,
+            provenance: SelectionMetaProvenance::LegacyUnverified,
+        }
+    }
 }
 
 impl CheckpointFrameSelectionMeta {
@@ -574,6 +633,12 @@ impl CheckpointFrameSelectionMeta {
             || self.manifest_fingerprint.is_some()
             || self.selection_fingerprint.is_some()
             || self.eval_selection_fingerprint.is_some()
+    }
+
+    /// True when request fields are authoritative and fingerprints can be verified.
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.provenance == SelectionMetaProvenance::Verified
     }
 
     fn train_request(&self) -> FrameSelectionRequest {
@@ -595,6 +660,17 @@ impl CheckpointFrameSelectionMeta {
             frame_stride: self.eval_frame_stride.max(1),
         }
     }
+
+    /// Identity-bearing fields shared by legacy v3 and verified v4 records.
+    fn selection_identity_matches(&self, other: &Self) -> bool {
+        self.eval_split_kind == other.eval_split_kind
+            && self.train_stable_ids == other.train_stable_ids
+            && self.eval_stable_ids == other.eval_stable_ids
+            && self.train_loader_frame_ids == other.train_loader_frame_ids
+            && self.manifest_fingerprint == other.manifest_fingerprint
+            && self.selection_fingerprint == other.selection_fingerprint
+            && self.eval_selection_fingerprint == other.eval_selection_fingerprint
+    }
 }
 
 /// Resolve selection metadata for a training run / resume.
@@ -603,7 +679,10 @@ impl CheckpointFrameSelectionMeta {
 /// - both absent (v1/v2 or never recorded) → remain absent (do not invent)
 /// - checkpoint absent, caller provides → use caller
 /// - checkpoint present, caller absent → validate against dataset then inherit
-/// - both present → must match; otherwise reject
+/// - both present and equal → keep
+/// - legacy unverified checkpoint + verified provided with matching identity fields
+///   → prefer provided (upgrades to verified request fields)
+/// - otherwise reject
 pub fn resolve_checkpoint_selection(
     checkpoint_selection: Option<&CheckpointFrameSelectionMeta>,
     provided_selection: Option<&CheckpointFrameSelectionMeta>,
@@ -614,6 +693,14 @@ pub fn resolve_checkpoint_selection(
         (None, Some(provided)) => Some(provided.clone()),
         (Some(checkpoint), None) => Some(checkpoint.clone()),
         (Some(checkpoint), Some(provided)) if checkpoint == provided => Some(checkpoint.clone()),
+        (Some(checkpoint), Some(provided))
+            if checkpoint.provenance == SelectionMetaProvenance::LegacyUnverified
+                && provided.provenance == SelectionMetaProvenance::Verified
+                && checkpoint.selection_identity_matches(provided) =>
+        {
+            // Upgrade legacy IDs/fingerprints with caller-supplied request fields.
+            Some(provided.clone())
+        }
         (Some(checkpoint), Some(provided)) => {
             return Err(TrainingError::InvalidInput(format!(
                 "checkpoint frame-selection metadata does not match the current training selection \
@@ -637,6 +724,13 @@ pub fn validate_checkpoint_selection_consistency(
     match (checkpoint, expected) {
         (None, _) | (_, None) => Ok(()),
         (Some(left), Some(right)) if left == right => Ok(()),
+        (Some(left), Some(right))
+            if left.provenance == SelectionMetaProvenance::LegacyUnverified
+                && right.provenance == SelectionMetaProvenance::Verified
+                && left.selection_identity_matches(right) =>
+        {
+            Ok(())
+        }
         (Some(left), Some(right)) => Err(TrainingError::InvalidInput(format!(
             "checkpoint frame-selection metadata does not match the current training selection \
              (checkpoint selection_fingerprint={:?}, current selection_fingerprint={:?})",
@@ -655,6 +749,19 @@ fn reject_duplicate_stable_ids(label: &str, ids: &[u64]) -> Result<(), TrainingE
         }
     }
     Ok(())
+}
+
+/// Collapse oversampled duplicate poses to first-occurrence order for canonical re-select.
+fn canonical_pose_dataset(dataset: &TrainingDataset) -> TrainingDataset {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = TrainingDataset::new(dataset.intrinsics).with_depth_scale(dataset.depth_scale);
+    out.initial_points = dataset.initial_points.clone();
+    for pose in &dataset.poses {
+        if seen.insert(pose.frame_id) {
+            out.add_pose(pose.clone());
+        }
+    }
+    out
 }
 
 fn validate_selection_meta_against_dataset(
@@ -717,6 +824,12 @@ fn validate_selection_meta_against_dataset(
         }
     }
 
+    // Legacy v3 migrations lack request fields — do not invent a request or pretend
+    // fingerprints were verified against empty defaults.
+    if meta.provenance == SelectionMetaProvenance::LegacyUnverified {
+        return Ok(());
+    }
+
     if let Some(stored) = meta.selection_fingerprint.as_ref() {
         let expected = fingerprint_frame_selection(&meta.train_stable_ids, &meta.train_request());
         if stored != &expected {
@@ -735,6 +848,44 @@ fn validate_selection_meta_against_dataset(
                 "checkpoint frame-selection metadata invalid: eval_selection_fingerprint does not \
                  match recomputed fingerprint from eval selection metadata \
                  (stored={stored}, expected={expected})"
+            )));
+        }
+    }
+
+    let canonical = canonical_pose_dataset(dataset);
+    let train_reselected =
+        FrameSelection::select(&canonical, &meta.train_request()).map_err(|err| {
+            TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata invalid: cannot re-run train FrameSelection \
+                 from stored request: {err}"
+            ))
+        })?;
+    if train_reselected.stable_ids != meta.train_stable_ids {
+        return Err(TrainingError::InvalidInput(format!(
+            "checkpoint frame-selection metadata invalid: re-running train FrameSelection with \
+             stored request does not reproduce train_stable_ids \
+             (recomputed={:?}, stored={:?})",
+            train_reselected.stable_ids, meta.train_stable_ids
+        )));
+    }
+
+    if !meta.eval_stable_ids.is_empty()
+        && meta.eval_stable_ids.iter().all(|id| available.contains(id))
+    {
+        let eval_reselected = FrameSelection::select(&canonical, &meta.eval_request()).map_err(
+            |err| {
+                TrainingError::InvalidInput(format!(
+                    "checkpoint frame-selection metadata invalid: cannot re-run eval FrameSelection \
+                     from stored request: {err}"
+                ))
+            },
+        )?;
+        if eval_reselected.stable_ids != meta.eval_stable_ids {
+            return Err(TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata invalid: re-running eval FrameSelection with \
+                 stored request does not reproduce eval_stable_ids \
+                 (recomputed={:?}, stored={:?})",
+                eval_reselected.stable_ids, meta.eval_stable_ids
             )));
         }
     }
@@ -807,6 +958,21 @@ struct TrainingCheckpointV2 {
     topology: TopologyCheckpoint,
     frame_shuffle_seed: u64,
     active_sh_degree: usize,
+}
+
+/// On-disk v3 layout: selection uses the pre-request metadata shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TrainingCheckpointV3 {
+    version: u32,
+    identity: TrainingIdentity,
+    completed_iterations: usize,
+    latest_loss: Option<f32>,
+    splats: HostSplats,
+    optimizer: AdamCheckpoint,
+    topology: TopologyCheckpoint,
+    frame_shuffle_seed: u64,
+    active_sh_degree: usize,
+    selection: Option<CheckpointFrameSelectionMetaV3>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1051,6 +1217,40 @@ fn visibility_window_baseline_from_cumulative_values(cumulative: &[f32]) -> Vec<
         .collect()
 }
 
+fn migrate_checkpoint_v3(v3: TrainingCheckpointV3) -> (TrainingCheckpoint, CheckpointMigration) {
+    let had_selection = v3.selection.as_ref().is_some_and(|meta| {
+        meta.eval_split_kind.is_some()
+            || !meta.train_stable_ids.is_empty()
+            || !meta.eval_stable_ids.is_empty()
+            || !meta.train_loader_frame_ids.is_empty()
+            || meta.manifest_fingerprint.is_some()
+            || meta.selection_fingerprint.is_some()
+            || meta.eval_selection_fingerprint.is_some()
+    });
+    (
+        TrainingCheckpoint {
+            version: TRAINING_CHECKPOINT_VERSION,
+            identity: v3.identity,
+            completed_iterations: v3.completed_iterations,
+            latest_loss: v3.latest_loss,
+            splats: v3.splats,
+            optimizer: v3.optimizer,
+            topology: v3.topology,
+            frame_shuffle_seed: v3.frame_shuffle_seed,
+            active_sh_degree: v3.active_sh_degree,
+            selection: v3
+                .selection
+                .map(CheckpointFrameSelectionMetaV3::into_legacy_unverified),
+        },
+        if had_selection {
+            CheckpointMigration::V3SelectionMetaLegacyUnverified
+        } else {
+            // Empty/None selection on a v3 file — still a layout bump, but nothing to verify.
+            CheckpointMigration::V3SelectionMetaLegacyUnverified
+        },
+    )
+}
+
 fn migrate_checkpoint_v2(v2: TrainingCheckpointV2) -> (TrainingCheckpoint, CheckpointMigration) {
     (
         TrainingCheckpoint {
@@ -1141,45 +1341,76 @@ pub fn load_training_checkpoint_with_migration(
     Ok((checkpoint, migration))
 }
 
+fn peek_checkpoint_payload_version(payload: &[u8]) -> Result<u32, TrainingError> {
+    // With fixint encoding the leading `version: u32` occupies the first 4 bytes.
+    if payload.len() < size_of::<u32>() {
+        return Err(invalid_checkpoint(
+            "decode checkpoint: payload is truncated before version",
+        ));
+    }
+    Ok(u32::from_le_bytes(
+        payload[..size_of::<u32>()]
+            .try_into()
+            .expect("version prefix length checked"),
+    ))
+}
+
 fn decode_training_checkpoint_payload(
     payload: &[u8],
 ) -> Result<(TrainingCheckpoint, CheckpointMigration), TrainingError> {
-    if let Ok(checkpoint) = checkpoint_bincode_options().deserialize::<TrainingCheckpoint>(payload)
-    {
-        if checkpoint.version == TRAINING_CHECKPOINT_VERSION {
-            return Ok((checkpoint, CheckpointMigration::None));
+    match peek_checkpoint_payload_version(payload)? {
+        TRAINING_CHECKPOINT_VERSION => {
+            let checkpoint: TrainingCheckpoint = checkpoint_bincode_options()
+                .deserialize(payload)
+                .map_err(|error| decode_checkpoint_error(*error))?;
+            if checkpoint.version != TRAINING_CHECKPOINT_VERSION {
+                return Err(invalid_checkpoint(format!(
+                    "checkpoint version {} is unsupported for v4 layout; expected {TRAINING_CHECKPOINT_VERSION}",
+                    checkpoint.version
+                )));
+            }
+            Ok((checkpoint, CheckpointMigration::None))
         }
-        return Err(invalid_checkpoint(format!(
-            "checkpoint version {} is unsupported for v3 layout; expected {TRAINING_CHECKPOINT_VERSION}",
-            checkpoint.version
-        )));
-    }
-
-    if let Ok(v2) = checkpoint_bincode_options().deserialize::<TrainingCheckpointV2>(payload) {
-        if v2.version == TRAINING_CHECKPOINT_VERSION_V2 {
-            return Ok(migrate_checkpoint_v2(v2));
+        TRAINING_CHECKPOINT_VERSION_V3 => {
+            let v3: TrainingCheckpointV3 = checkpoint_bincode_options()
+                .deserialize(payload)
+                .map_err(|error| decode_checkpoint_error(*error))?;
+            if v3.version != TRAINING_CHECKPOINT_VERSION_V3 {
+                return Err(invalid_checkpoint(format!(
+                    "checkpoint version {} is unsupported for v3 layout; expected {TRAINING_CHECKPOINT_VERSION_V3}",
+                    v3.version
+                )));
+            }
+            Ok(migrate_checkpoint_v3(v3))
         }
-        if v2.version == TRAINING_CHECKPOINT_VERSION_V1 {
-            return Err(invalid_checkpoint(
-                "checkpoint version 1 payload was decoded as v2 layout; file is corrupt",
-            ));
+        TRAINING_CHECKPOINT_VERSION_V2 => {
+            let v2: TrainingCheckpointV2 = checkpoint_bincode_options()
+                .deserialize(payload)
+                .map_err(|error| decode_checkpoint_error(*error))?;
+            if v2.version != TRAINING_CHECKPOINT_VERSION_V2 {
+                return Err(invalid_checkpoint(format!(
+                    "checkpoint version {} is unsupported for v2 layout; expected {TRAINING_CHECKPOINT_VERSION_V2}",
+                    v2.version
+                )));
+            }
+            Ok(migrate_checkpoint_v2(v2))
         }
-        return Err(invalid_checkpoint(format!(
-            "checkpoint version {} is unsupported for v2 layout; expected {TRAINING_CHECKPOINT_VERSION_V2}",
-            v2.version
-        )));
+        TRAINING_CHECKPOINT_VERSION_V1 => {
+            let v1: TrainingCheckpointV1 = checkpoint_bincode_options()
+                .deserialize(payload)
+                .map_err(|error| decode_checkpoint_error(*error))?;
+            if v1.version != TRAINING_CHECKPOINT_VERSION_V1 {
+                return Err(invalid_checkpoint(format!(
+                    "checkpoint version {} is unsupported; expected {TRAINING_CHECKPOINT_VERSION_V1} for v1 layout",
+                    v1.version
+                )));
+            }
+            Ok(migrate_checkpoint_v1(v1))
+        }
+        other => Err(invalid_checkpoint(format!(
+            "checkpoint version {other} is unsupported"
+        ))),
     }
-
-    let v1: TrainingCheckpointV1 = checkpoint_bincode_options()
-        .deserialize(payload)
-        .map_err(|error| decode_checkpoint_error(*error))?;
-    if v1.version != TRAINING_CHECKPOINT_VERSION_V1 {
-        return Err(invalid_checkpoint(format!(
-            "checkpoint version {} is unsupported; expected {TRAINING_CHECKPOINT_VERSION_V1} for v1 layout",
-            v1.version
-        )));
-    }
-    Ok(migrate_checkpoint_v1(v1))
 }
 
 fn validate_identity_field(name: &str, value: &str) -> Result<(), TrainingError> {

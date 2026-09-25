@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
             summary: &'a SplatEvaluationSummary,
             selection: FrameSelectionReport,
         }
-        let mut selection_report = FrameSelectionReport::from_selection(&selection, None, None);
+        let mut selection_report = FrameSelectionReport::from_in_view_selection(&selection, None);
         if args.include_frame_ranges.is_some() {
             selection_report.include_frame_ranges = args.include_frame_ranges.clone();
         }
