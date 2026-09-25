@@ -306,7 +306,7 @@ Pre-existing (unchanged class): duplicated attribute; unused `Int` import; dead_
 | Included tip | `993ac093344d68096e1bb92cd3c6d620d8c03a58` |
 | Logs | `artifacts/runs/rs-2026-002-c1-c4-main-merge/` |
 
-C1–C4: `merged`. C5–C8: `not_started`. Not pushed.
+C1–C4: `merged`. C5: later `merged` at `96ac223`. C6–C8: `not_started`. Not pushed at the time of this C1–C4 merge note.
 
 Post-merge gates (`POSELIB_ROOT` = main-tree PoseLib): workspace `cargo check` PASS; `rustscan-gs` gpu-wgpu lib tests PASS **192**; `cargo fmt --all -- --check` PASS; `git diff --check` PASS.
 
