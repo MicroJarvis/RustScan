@@ -117,7 +117,7 @@ later_tasks:
     scope: rustscan-sfm/src/io/database.rs and rustscan-sfm/src/sfm/mapper/database_io.rs
     status: review_ready
     base_commit: c71f8092778e2abb1feaaf03c9d784ea25434349
-    tip_commit: d976dfedb122fab642d51c49a8c69cf3ee486b8e
+    tip_commit: aa052d34dc728edbdef7f57d90800422dc3242e2
   - id: T7
     owner: cursor-agent
     branch: agent/RS-2026-004/t7-nalgebra-ownership
