@@ -73,8 +73,8 @@ pub use crate::training::{
 };
 pub use crate::training::{
     assign_pre_c5_enumerated_ids, hash_training_dataset_with_pre_c5_frame_ids,
-    match_checkpoint_dataset_identity, static_162_allowed_stable_ids,
-    validate_checkpoint_selection_consistency,
+    match_checkpoint_dataset_identity, resolve_checkpoint_selection, static_162_allowed_stable_ids,
+    static_162_allowed_stable_ids_from_candidates, validate_checkpoint_selection_consistency,
 };
 pub use crate::training::{
     build_optimization_report, canonical_config_fingerprint, compare_loss_curve_samples,
@@ -85,28 +85,29 @@ pub use crate::training::{
     resolve_litegs_parity_fixture_input_path, resolve_litegs_parity_reference_report_path,
     save_training_checkpoint, sh_schedule_fingerprint, write_optimization_report, AdamCheckpoint,
     AdamParameterCheckpoint, CheckpointFrameSelectionMeta, CheckpointMigration,
-    DatasetIdentityMatch, DynamicMaskGradient, EvaluationDevice, EvaluationFrameMetric,
-    EvaluationSplitKind, FinalTrainingMetrics, FrameIdRange, FrameSelection, FrameSelectionRequest,
-    FrameSplitManifest, LiteGsCameraConfig, LiteGsConfig, LiteGsFeatureConfig, LiteGsGrowthConfig,
-    LiteGsOpacityResetMode, LiteGsPruneMode, LiteGsPruningConfig, LiteGsRefineConfig,
-    LiteGsRenderingConfig, LiteGsSplitScoreMode, LiteGsTileSize, LiteGsTopologyConfig,
-    LiteGsTrainingProfile, OptimizationCommand, OptimizationCompareDecision,
-    OptimizationCompareResult, OptimizationEnvironment, OptimizationEvalFrame,
-    OptimizationEvaluationMetrics, OptimizationMemoryMetrics, OptimizationMetricDelta,
-    OptimizationReport, OptimizationTopologyMetrics, OptimizationTrainMetrics, ParityCheckOutcome,
-    ParityCheckStatus, ParityFixtureKind, ParityFixtureSpec, ParityFloatDistribution,
-    ParityGateEvaluation, ParityGateStatus, ParityHarnessReport, ParityLossCurveSample,
-    ParityLossTerms, ParityMetricSnapshot, ParityReferenceComparison, ParityThresholds,
-    ParityTimingMetrics, ParityTopologyMetrics, ParityTopologyStepSample, PipelineSpanStats,
-    PsnrSummary, SplatEvaluationConfig, SplatEvaluationError, SplatEvaluationResult,
-    SplatEvaluationSummary, TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint,
-    TrainingDataConfig, TrainingIdentity, TrainingInitializationConfig, TrainingLossConfig,
-    TrainingOptimizerConfig, TrainingRasterConfig, DEFAULT_CONVERGENCE_FIXTURE_ID,
-    DEFAULT_RASTER_COV_BLUR, DEFAULT_TINY_FIXTURE_ID, MAX_TRAINING_CHECKPOINT_BYTES,
-    MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
-    MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS,
-    TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
-    TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2,
+    ColmapFrameCandidate, DatasetIdentityMatch, DynamicMaskGradient, EvaluationDevice,
+    EvaluationFrameMetric, EvaluationSplitKind, FinalTrainingMetrics, FrameIdRange, FrameSelection,
+    FrameSelectionRequest, FrameSplitManifest, LiteGsCameraConfig, LiteGsConfig,
+    LiteGsFeatureConfig, LiteGsGrowthConfig, LiteGsOpacityResetMode, LiteGsPruneMode,
+    LiteGsPruningConfig, LiteGsRefineConfig, LiteGsRenderingConfig, LiteGsSplitScoreMode,
+    LiteGsTileSize, LiteGsTopologyConfig, LiteGsTrainingProfile, OptimizationCommand,
+    OptimizationCompareDecision, OptimizationCompareResult, OptimizationEnvironment,
+    OptimizationEvalFrame, OptimizationEvaluationMetrics, OptimizationMemoryMetrics,
+    OptimizationMetricDelta, OptimizationReport, OptimizationTopologyMetrics,
+    OptimizationTrainMetrics, ParityCheckOutcome, ParityCheckStatus, ParityFixtureKind,
+    ParityFixtureSpec, ParityFloatDistribution, ParityGateEvaluation, ParityGateStatus,
+    ParityHarnessReport, ParityLossCurveSample, ParityLossTerms, ParityMetricSnapshot,
+    ParityReferenceComparison, ParityThresholds, ParityTimingMetrics, ParityTopologyMetrics,
+    ParityTopologyStepSample, PipelineSpanStats, PsnrSummary, SplatEvaluationConfig,
+    SplatEvaluationError, SplatEvaluationResult, SplatEvaluationSummary, TensorCheckpoint,
+    TopologyCheckpoint, TrainingCheckpoint, TrainingDataConfig, TrainingIdentity,
+    TrainingInitializationConfig, TrainingLossConfig, TrainingOptimizerConfig,
+    TrainingRasterConfig, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_RASTER_COV_BLUR,
+    DEFAULT_TINY_FIXTURE_ID, MAX_TRAINING_CHECKPOINT_BYTES, MAX_TRAINING_CHECKPOINT_SPLATS,
+    MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS, MAX_TRAINING_CHECKPOINT_TENSOR_RANK,
+    MAX_TRAINING_IDENTITY_BYTES, MAX_TRAINING_ITERATIONS, TRAINING_CHECKPOINT_FORMAT_VERSION,
+    TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION, TRAINING_CHECKPOINT_VERSION_V1,
+    TRAINING_CHECKPOINT_VERSION_V2,
 };
 pub use crate::training::{
     compute_psnr_f32, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,
@@ -123,7 +124,8 @@ pub use crate::viewport::{BurnViewportDepth, BurnViewportRenderer, BurnViewportR
 
 // Re-export IO types
 pub use crate::io::colmap_dataset::{
-    fingerprint_colmap_sparse_model, load_colmap_dataset, resolve_colmap_sparse_dir, ColmapConfig,
+    fingerprint_colmap_sparse_model, list_colmap_frame_candidates, load_colmap_dataset,
+    resolve_colmap_sparse_dir, ColmapConfig,
 };
 #[cfg(feature = "gpu")]
 pub use crate::io::scene_io::{

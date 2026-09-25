@@ -17,6 +17,8 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
+pub use crate::io::colmap_dataset::ColmapFrameCandidate;
+
 /// How post-training evaluation frames were chosen relative to the train split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -200,27 +202,52 @@ impl FrameSplitManifest {
     }
 }
 
-/// Reconstruct the historical `static_162` evaluation set as stable IDs.
+/// Historical `static_162` exclude band on pre-C5 enumerated indices (not COLMAP IDs).
+const STATIC_162_EXCLUDE_ENUMERATED: std::ops::RangeInclusive<usize> = 76..=93;
+const STATIC_162_PREFIX_LEN: usize = 180;
+
+/// Reconstruct the historical `static_162` allowed set from the original COLMAP
+/// candidate list (model order, including missing files).
 ///
-/// Pre-C5 semantics: take the first 180 poses in load order (old `max_frames=180`),
-/// then drop enumerated indices `76..=93` (old `--exclude-frame-ranges 76-93` matched
-/// post-filter frame_idx, not COLMAP `image_id`). Pinning via `allowed_ids` keeps
-/// FrameSelection's include/exclude→max→stride order without pulling post-prefix frames.
-pub fn static_162_allowed_stable_ids(source: &TrainingDataset) -> Result<Vec<u64>, String> {
-    if source.poses.len() < 180 {
+/// Pre-C5 semantics: `take(180)` on the COLMAP list, enumerate indices `0..179`,
+/// keep entries that exist and whose enumerated index is outside `76..=93`.
+/// A filtered [`TrainingDataset`] alone cannot supply those indices when images
+/// were skipped — callers must pass candidates or an explicit stable-ID manifest.
+pub fn static_162_allowed_stable_ids_from_candidates(
+    candidates: &[ColmapFrameCandidate],
+) -> Result<Vec<u64>, String> {
+    if candidates.len() < STATIC_162_PREFIX_LEN {
         return Err(format!(
-            "static_162 requires at least 180 source frames, got {}",
-            source.poses.len()
+            "static_162 requires at least {STATIC_162_PREFIX_LEN} COLMAP candidates, got {}; \
+             old quality gate is inapplicable without the original candidate list",
+            candidates.len()
         ));
     }
-    Ok(source
-        .poses
+    Ok(candidates
         .iter()
-        .take(180)
+        .take(STATIC_162_PREFIX_LEN)
         .enumerate()
-        .filter(|(idx, _)| !(76..=93).contains(idx))
-        .map(|(_, pose)| pose.frame_id)
+        .filter(|(idx, candidate)| {
+            candidate.file_exists && !STATIC_162_EXCLUDE_ENUMERATED.contains(idx)
+        })
+        .map(|(_, candidate)| candidate.image_id)
         .collect())
+}
+
+/// Reject reconstructing `static_162` from a filtered dataset alone.
+///
+/// Missing images change enumerated indices; use
+/// [`static_162_allowed_stable_ids_from_candidates`] with the original COLMAP
+/// list, or pin an explicit stable-ID manifest.
+pub fn static_162_allowed_stable_ids(_source: &TrainingDataset) -> Result<Vec<u64>, String> {
+    Err(
+        "static_162 cannot be reconstructed from a filtered TrainingDataset alone \
+         (missing images invalidate re-enumeration of poses); pass the original \
+         COLMAP candidate list to static_162_allowed_stable_ids_from_candidates \
+         or an explicit stable-ID manifest — old quality gate must not run on a \
+         guessed frame set"
+            .into(),
+    )
 }
 
 /// Parameters for one canonical selection pass.
@@ -519,16 +546,34 @@ mod tests {
     }
 
     #[test]
-    fn static_162_allowed_ids_pin_prefix_without_backfill() {
-        // Fixture: COLMAP image_id == 1..=300 in load order (matches common Home layouts).
-        // Old mapping: enumerated idx i → image_id i+1; exclude idx 76..=93 → drop IDs 77..=94.
-        let source = dataset_with_ids(&(1..=300).collect::<Vec<_>>());
-        let allowed = static_162_allowed_stable_ids(&source).unwrap();
-        let expected: Vec<u64> = (1..=76).chain(95..=180).collect();
+    fn static_162_from_candidates_covers_gap_free_and_missing_cases() {
+        // Frozen old-loader expectation helper (independent of the migration API):
+        // take(180) COLMAP slots → keep exist && enumerated idx ∉ 76..=93.
+        fn expected_from_old_semantics(candidates: &[ColmapFrameCandidate]) -> Vec<u64> {
+            candidates
+                .iter()
+                .take(180)
+                .enumerate()
+                .filter(|(idx, c)| c.file_exists && !(76..=93).contains(idx))
+                .map(|(_, c)| c.image_id)
+                .collect()
+        }
+
+        // 1) Complete 300-frame consecutive IDs, all present.
+        let complete: Vec<ColmapFrameCandidate> = (1..=300)
+            .map(|image_id| ColmapFrameCandidate {
+                image_id,
+                file_exists: true,
+            })
+            .collect();
+        let expected_complete: Vec<u64> = (1..=76).chain(95..=180).collect();
+        assert_eq!(expected_from_old_semantics(&complete), expected_complete);
+        let allowed = static_162_allowed_stable_ids_from_candidates(&complete).unwrap();
+        assert_eq!(allowed, expected_complete);
         assert_eq!(allowed.len(), 162);
-        assert_eq!(allowed, expected);
         assert_eq!(*allowed.last().unwrap(), 180);
 
+        let source = dataset_with_ids(&(1..=300).collect::<Vec<_>>());
         let selection = FrameSelection::select(
             &source,
             &FrameSelectionRequest {
@@ -539,34 +584,72 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(selection.stable_ids.len(), 162);
-        assert_eq!(selection.stable_ids, expected);
+        assert_eq!(selection.stable_ids, expected_complete);
+        assert!(selection.stable_ids.iter().all(|&id| id <= 180));
+
+        // Filtered-dataset helper must refuse (cannot see COLMAP gaps).
+        let err = static_162_allowed_stable_ids(&source).unwrap_err();
         assert!(
-            selection.stable_ids.iter().all(|&id| id <= 180),
-            "must not backfill frames beyond the original 180-prefix"
-        );
-        assert!(
-            !selection
-                .stable_ids
-                .iter()
-                .any(|&id| (77..=94).contains(&id)),
-            "must not include the historically excluded band"
+            err.contains("cannot be reconstructed") || err.contains("candidate"),
+            "{err}"
         );
 
-        // Drift regression: exclude-then-max without allowed_ids pulls id 198.
-        let drifted = FrameSelection::select(
-            &source,
-            &FrameSelectionRequest {
-                exclude_ranges: vec![FrameIdRange { start: 76, end: 93 }],
-                max_frames: 180,
-                frame_stride: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(drifted.stable_ids.len(), 180);
-        assert_eq!(*drifted.stable_ids.last().unwrap(), 198);
-        assert_ne!(drifted.stable_ids, selection.stable_ids);
+        // 2) Missing image inside prefix, outside exclude band (id 50 at slot 49).
+        let mut missing_outside = complete.clone();
+        missing_outside[49].file_exists = false; // image_id 50
+        let expected_missing_outside = expected_from_old_semantics(&missing_outside);
+        assert_eq!(expected_missing_outside.len(), 161);
+        assert_eq!(*expected_missing_outside.last().unwrap(), 180);
+        assert!(!expected_missing_outside.contains(&50));
+        assert!(!expected_missing_outside.contains(&77));
+        assert!(!expected_missing_outside.contains(&181));
+        assert!(expected_missing_outside.contains(&95));
+        assert_eq!(
+            static_162_allowed_stable_ids_from_candidates(&missing_outside).unwrap(),
+            expected_missing_outside
+        );
+
+        // 3) Missing image inside exclude band (id 80 at slot 79) — kept set unchanged.
+        let mut missing_inside = complete.clone();
+        missing_inside[79].file_exists = false; // image_id 80, enumerated idx 79 ∈ 76..=93
+        let expected_missing_inside = expected_from_old_semantics(&missing_inside);
+        assert_eq!(expected_missing_inside, expected_complete);
+        assert_eq!(
+            static_162_allowed_stable_ids_from_candidates(&missing_inside).unwrap(),
+            expected_complete
+        );
+
+        // 4) Non-contiguous COLMAP image_ids (still 300 ordered candidates).
+        let sparse_ids: Vec<u64> = (0..300).map(|i| 1_000 + i * 7).collect();
+        let sparse: Vec<ColmapFrameCandidate> = sparse_ids
+            .iter()
+            .map(|&image_id| ColmapFrameCandidate {
+                image_id,
+                file_exists: true,
+            })
+            .collect();
+        let expected_sparse = expected_from_old_semantics(&sparse);
+        assert_eq!(expected_sparse.len(), 162);
+        assert_eq!(
+            expected_sparse,
+            sparse_ids
+                .iter()
+                .take(180)
+                .enumerate()
+                .filter(|(idx, _)| !(76..=93).contains(idx))
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            static_162_allowed_stable_ids_from_candidates(&sparse).unwrap(),
+            expected_sparse
+        );
+        assert!(
+            !expected_sparse
+                .iter()
+                .any(|&id| id == sparse_ids[180] || id == sparse_ids[198]),
+            "must not backfill past the COLMAP take(180) prefix"
+        );
     }
 
     #[test]

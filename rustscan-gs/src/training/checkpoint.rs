@@ -550,6 +550,38 @@ impl CheckpointFrameSelectionMeta {
     }
 }
 
+/// Resolve selection metadata for a training run / resume.
+///
+/// Rules:
+/// - both absent (v1/v2 or never recorded) → remain absent (do not invent)
+/// - checkpoint absent, caller provides → use caller
+/// - checkpoint present, caller absent → validate against dataset then inherit
+/// - both present → must match; otherwise reject
+pub fn resolve_checkpoint_selection(
+    checkpoint_selection: Option<&CheckpointFrameSelectionMeta>,
+    provided_selection: Option<&CheckpointFrameSelectionMeta>,
+    dataset: &TrainingDataset,
+) -> Result<Option<CheckpointFrameSelectionMeta>, TrainingError> {
+    let resolved = match (checkpoint_selection, provided_selection) {
+        (None, None) => None,
+        (None, Some(provided)) => Some(provided.clone()),
+        (Some(checkpoint), None) => Some(checkpoint.clone()),
+        (Some(checkpoint), Some(provided)) if checkpoint == provided => Some(checkpoint.clone()),
+        (Some(checkpoint), Some(provided)) => {
+            return Err(TrainingError::InvalidInput(format!(
+                "checkpoint frame-selection metadata does not match the current training selection \
+                 (checkpoint selection_fingerprint={:?}, current selection_fingerprint={:?})",
+                checkpoint.selection_fingerprint, provided.selection_fingerprint
+            )));
+        }
+    };
+
+    if let Some(meta) = resolved.as_ref() {
+        validate_selection_meta_against_dataset(meta, dataset)?;
+    }
+    Ok(resolved)
+}
+
 /// Reject resume when both sides recorded selection metadata and they disagree.
 pub fn validate_checkpoint_selection_consistency(
     checkpoint: Option<&CheckpointFrameSelectionMeta>,
@@ -564,6 +596,32 @@ pub fn validate_checkpoint_selection_consistency(
             left.selection_fingerprint, right.selection_fingerprint
         ))),
     }
+}
+
+fn validate_selection_meta_against_dataset(
+    meta: &CheckpointFrameSelectionMeta,
+    dataset: &TrainingDataset,
+) -> Result<(), TrainingError> {
+    let available: std::collections::HashSet<u64> =
+        dataset.poses.iter().map(|pose| pose.frame_id).collect();
+    for (label, ids) in [
+        ("train_stable_ids", meta.train_stable_ids.as_slice()),
+        ("eval_stable_ids", meta.eval_stable_ids.as_slice()),
+        (
+            "train_loader_frame_ids",
+            meta.train_loader_frame_ids.as_slice(),
+        ),
+    ] {
+        for &id in ids {
+            if !available.contains(&id) {
+                return Err(TrainingError::InvalidInput(format!(
+                    "checkpoint frame-selection metadata cannot be verified against the current \
+                     training dataset: {label} contains unknown stable id {id}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

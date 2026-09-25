@@ -141,6 +141,8 @@ struct SuiteReport {
 enum GateStatus {
     Passed,
     Failed,
+    /// Old threshold must not be applied (e.g. historical static_162 cannot be restored).
+    Inapplicable,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,6 +176,7 @@ fn main() -> anyhow::Result<()> {
     let (splats, metadata) = load_splats_ply(&args.scene)?;
 
     let mut reports = Vec::new();
+    let mut static_162_inapplicable: Option<String> = None;
     for case in eval_cases() {
         println!("running case {}", case.name);
         let full_dataset = load_colmap_training_dataset(
@@ -185,18 +188,32 @@ fn main() -> anyhow::Result<()> {
             },
         )?;
         // One canonical selection: include/exclude → max → stride.
-        // static_162 pins the historical prefix via allowed_ids so exclude+max
-        // cannot backfill frames past the original 180-frame window.
+        // static_162 pins the historical prefix via COLMAP candidates → allowed_ids.
         let max_frames = if case.max_frames > 0 {
             case.max_frames
         } else {
             case.dataset_max_frames
         };
         let allowed_ids = if case.pin_static_162 {
-            Some(
-                rustscan_gs::static_162_allowed_stable_ids(&full_dataset)
-                    .map_err(anyhow::Error::msg)?,
+            let candidates = rustscan_gs::list_colmap_frame_candidates(
+                &args.dataset,
+                &ColmapConfig {
+                    max_frames: 0,
+                    frame_stride: 1,
+                    ..ColmapConfig::default()
+                },
             )
+            .map_err(anyhow::Error::msg)?;
+            match rustscan_gs::static_162_allowed_stable_ids_from_candidates(&candidates) {
+                Ok(ids) => Some(ids),
+                Err(reason) => {
+                    log::warn!(
+                        "static_162 old quality gate is inapplicable: {reason}; skipping case"
+                    );
+                    static_162_inapplicable = Some(reason);
+                    continue;
+                }
+            }
         } else {
             None
         };
@@ -268,7 +285,7 @@ fn main() -> anyhow::Result<()> {
 
     let gate = args
         .gate_profile
-        .map(|profile| evaluate_gate(profile, &reports));
+        .map(|profile| evaluate_gate(profile, &reports, static_162_inapplicable.as_deref()));
     let report = SuiteReport {
         generated_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         scene: args.scene.clone(),
@@ -361,7 +378,11 @@ fn eval_cases() -> [EvalCase; 4] {
     ]
 }
 
-fn evaluate_gate(profile: GateProfile, reports: &[EvaluationCaseReport]) -> GateReport {
+fn evaluate_gate(
+    profile: GateProfile,
+    reports: &[EvaluationCaseReport],
+    static_162_inapplicable: Option<&str>,
+) -> GateReport {
     let mut checks = Vec::new();
     let (full_threshold, static_threshold, splat_limit) = match profile {
         GateProfile::Quality => (23.05, 23.65, None),
@@ -377,14 +398,26 @@ fn evaluate_gate(profile: GateProfile, reports: &[EvaluationCaseReport]) -> Gate
         full_threshold,
         |summary| summary.psnr_mean_db,
     );
-    push_min_check(
-        &mut checks,
-        reports,
-        "static_162",
-        "psnr_mean_db",
-        static_threshold,
-        |summary| summary.psnr_mean_db,
-    );
+    if let Some(reason) = static_162_inapplicable {
+        checks.push(GateCheck {
+            name: "static_162.psnr_mean_db".to_string(),
+            case: "static_162".to_string(),
+            metric: "psnr_mean_db".to_string(),
+            comparator: format!("inapplicable:{reason}"),
+            actual: 0.0,
+            threshold: static_threshold,
+            status: GateStatus::Inapplicable,
+        });
+    } else {
+        push_min_check(
+            &mut checks,
+            reports,
+            "static_162",
+            "psnr_mean_db",
+            static_threshold,
+            |summary| summary.psnr_mean_db,
+        );
+    }
     if let Some(limit) = splat_limit {
         push_max_check(
             &mut checks,

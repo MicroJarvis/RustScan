@@ -21,7 +21,7 @@ cards:
     notes: "R02/R04/R06/R07/R08 closed; merged via --no-ff 4fdf506"
   C5:
     status: implemented_pending_review
-    notes: "review-fix: resume identity wiring; gap-aware pre-C5 reject; static_162 allowed_ids; checkpoint v3 selection meta; tip pinned in verification.md"
+    notes: "P2: COLMAP-candidate static_162; resume inherits v3 selection; tip in verification.md"
   C6:
     status: not_started
   C7:

@@ -2271,6 +2271,153 @@ fn resume_rejects_mismatched_selection_metadata() {
 }
 
 #[test]
+fn resume_without_with_selection_inherits_v3_selection_through_save_reload() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-inherit", 2);
+    let mut config = tiny_training_config(1);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"sel-inherit-recon", &config).unwrap();
+    let selection = CheckpointFrameSelectionMeta {
+        eval_split_kind: Some("in-view".into()),
+        train_stable_ids: vec![0, 1],
+        eval_stable_ids: vec![1],
+        train_loader_frame_ids: vec![0, 1],
+        manifest_fingerprint: Some("manifest-fp".into()),
+        selection_fingerprint: Some("sel-fp".into()),
+        eval_selection_fingerprint: Some("eval-sel-fp".into()),
+    };
+
+    let captured = Rc::new(RefCell::new(None));
+    let sink = Rc::clone(&captured);
+    train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity.clone())
+            .with_selection(selection.clone())
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(1) })
+            .with_checkpoint_sink(move |ready| {
+                *sink.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .unwrap();
+    let first = captured.borrow().clone().expect("first checkpoint");
+    assert_eq!(first.selection.as_ref(), Some(&selection));
+    let first_path = temp.path().join("first.rgscp");
+    save_training_checkpoint(&first_path, &first).unwrap();
+    let loaded = load_training_checkpoint(&first_path).unwrap();
+    assert_eq!(loaded.selection.as_ref(), Some(&selection));
+
+    config.iterations = 2;
+    let identity2 =
+        TrainingIdentity::from_canonical_content(&dataset, b"sel-inherit-recon", &config).unwrap();
+    let captured2 = Rc::new(RefCell::new(None));
+    let sink2 = Rc::clone(&captured2);
+    train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity2)
+            .with_resume_checkpoint(loaded)
+            // Intentionally omit with_selection — must inherit from checkpoint.
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(2) })
+            .with_checkpoint_sink(move |ready| {
+                *sink2.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .unwrap();
+    let second = captured2.borrow().clone().expect("second checkpoint");
+    assert_eq!(
+        second.selection.as_ref(),
+        Some(&selection),
+        "resume without with_selection must not drop v3 selection metadata"
+    );
+    let second_path = temp.path().join("second.rgscp");
+    save_training_checkpoint(&second_path, &second).unwrap();
+    let reloaded = load_training_checkpoint(&second_path).unwrap();
+    assert_eq!(reloaded.selection.as_ref(), Some(&selection));
+}
+
+#[test]
+fn resume_v2_without_selection_keeps_selection_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = tiny_training_dataset(&temp, "sel-v2-absent", 2);
+    let mut config = tiny_training_config(1);
+    let identity =
+        TrainingIdentity::from_canonical_content(&dataset, b"sel-v2-recon", &config).unwrap();
+
+    let captured = Rc::new(RefCell::new(None));
+    let sink = Rc::clone(&captured);
+    train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity.clone())
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(1) })
+            .with_checkpoint_sink(move |ready| {
+                *sink.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .unwrap();
+    let first = captured.borrow().clone().expect("checkpoint");
+    // Downgrade on-disk bytes to v2 layout (no selection field).
+    let view = first.splats.as_view();
+    let v2_path = temp.path().join("v2.rgscp");
+    fs::write(
+        &v2_path,
+        encode_unchecked(&SerializedTrainingCheckpointV2 {
+            version: TRAINING_CHECKPOINT_VERSION_V2,
+            identity: first.identity.clone(),
+            completed_iterations: first.completed_iterations,
+            latest_loss: first.latest_loss,
+            splats: SerializedHostSplats {
+                positions: view.positions.to_vec(),
+                log_scales: view.log_scales.to_vec(),
+                rotations: view.rotations.to_vec(),
+                opacity_logits: view.opacity_logits.to_vec(),
+                sh_coeffs: view.sh_coeffs.to_vec(),
+                sh_degree: view.sh_degree,
+            },
+            optimizer: first.optimizer.clone(),
+            topology: first.topology.clone(),
+            frame_shuffle_seed: first.frame_shuffle_seed,
+            active_sh_degree: first.active_sh_degree,
+        }),
+    )
+    .unwrap();
+    let (loaded, migration) = load_training_checkpoint_with_migration(&v2_path).unwrap();
+    assert_eq!(migration, CheckpointMigration::V2SelectionMetaAbsent);
+    assert!(loaded.selection.is_none());
+
+    config.iterations = 2;
+    let identity2 =
+        TrainingIdentity::from_canonical_content(&dataset, b"sel-v2-recon", &config).unwrap();
+    let captured2 = Rc::new(RefCell::new(None));
+    let sink2 = Rc::clone(&captured2);
+    train_splats(
+        &dataset,
+        &config,
+        TrainingOptions::new()
+            .with_identity(identity2)
+            .with_resume_checkpoint(loaded)
+            .with_checkpoint_policy(TrainingCheckpointPolicy { every: Some(2) })
+            .with_checkpoint_sink(move |ready| {
+                *sink2.borrow_mut() = Some(ready.checkpoint.clone());
+                Ok(())
+            }),
+    )
+    .unwrap();
+    let second = captured2.borrow().clone().expect("resumed checkpoint");
+    assert!(
+        second.selection.is_none(),
+        "v2 resume must keep selection absent rather than inventing metadata"
+    );
+}
+
+#[test]
 fn public_train_splats_accepts_pre_c5_gap_free_identity_then_resaves_current() {
     let temp = tempfile::tempdir().unwrap();
     // Stable IDs are non-enumerated so current != pre-C5 gap-free digests.

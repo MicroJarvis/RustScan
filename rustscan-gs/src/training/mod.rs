@@ -27,7 +27,7 @@ use crate::{TrainingDataset, TrainingError};
 pub use checkpoint::{
     assign_pre_c5_enumerated_ids, hash_training_dataset_with_pre_c5_frame_ids,
     load_training_checkpoint, load_training_checkpoint_with_migration,
-    match_checkpoint_dataset_identity, save_training_checkpoint,
+    match_checkpoint_dataset_identity, resolve_checkpoint_selection, save_training_checkpoint,
     validate_checkpoint_selection_consistency, AdamCheckpoint, AdamParameterCheckpoint,
     CheckpointFrameSelectionMeta, CheckpointMigration, DatasetIdentityMatch, TensorCheckpoint,
     TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity, MAX_TRAINING_CHECKPOINT_BYTES,
@@ -39,14 +39,15 @@ pub use checkpoint::{
 pub use evaluation::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
     parity_fixture_id_for_input_path, resolve_litegs_parity_fixture_input_path,
-    resolve_litegs_parity_reference_report_path, ParityCheckOutcome, ParityCheckStatus,
-    ParityFixtureKind, ParityFixtureSpec, ParityGateEvaluation, ParityGateStatus,
-    ParityHarnessReport, ParityMetricSnapshot, ParityReferenceComparison, ParityThresholds,
-    ParityTimingMetrics, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_TINY_FIXTURE_ID,
+    resolve_litegs_parity_reference_report_path, ColmapFrameCandidate, ParityCheckOutcome,
+    ParityCheckStatus, ParityFixtureKind, ParityFixtureSpec, ParityGateEvaluation,
+    ParityGateStatus, ParityHarnessReport, ParityMetricSnapshot, ParityReferenceComparison,
+    ParityThresholds, ParityTimingMetrics, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_TINY_FIXTURE_ID,
 };
 pub use evaluation::{
     compute_psnr_f32, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,
-    select_evaluation_frames, static_162_allowed_stable_ids, summarize_psnr_samples,
+    select_evaluation_frames, static_162_allowed_stable_ids,
+    static_162_allowed_stable_ids_from_candidates, summarize_psnr_samples,
     summarize_training_metrics, worst_frame_metrics, EvaluationDevice, EvaluationFrameMetric,
     EvaluationSplitKind, FinalTrainingMetrics, FrameIdRange, FrameSelection, FrameSelectionRequest,
     FrameSplitManifest, PsnrSummary, SplatEvaluationConfig, SplatEvaluationError,

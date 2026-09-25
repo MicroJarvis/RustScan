@@ -35,10 +35,10 @@ fn prepare_resume_runtime<T, SharedFactory, DefaultFactory>(
     config: &TrainingConfig,
     current_identity: Option<&crate::TrainingIdentity>,
     resume_checkpoint: Option<&crate::TrainingCheckpoint>,
-    expected_selection: Option<&crate::CheckpointFrameSelectionMeta>,
+    provided_selection: Option<&crate::CheckpointFrameSelectionMeta>,
     shared_device: Option<SharedFactory>,
     default_device: DefaultFactory,
-) -> Result<(usize, T), TrainingError>
+) -> Result<(usize, T, Option<crate::CheckpointFrameSelectionMeta>), TrainingError>
 where
     SharedFactory: FnOnce() -> T,
     DefaultFactory: FnOnce() -> T,
@@ -46,7 +46,7 @@ where
     if let Some(current_identity) = current_identity {
         current_identity.validate_dataset_and_config(dataset, config)?;
     }
-    let start_iteration = if let Some(checkpoint) = resume_checkpoint {
+    let (start_iteration, resolved_selection) = if let Some(checkpoint) = resume_checkpoint {
         checkpoint.validate()?;
         let current_identity = current_identity.ok_or_else(|| {
             TrainingError::InvalidInput(
@@ -69,9 +69,10 @@ where
                     .to_string(),
             ));
         }
-        crate::training::checkpoint::validate_checkpoint_selection_consistency(
+        let resolved_selection = crate::training::checkpoint::resolve_checkpoint_selection(
             checkpoint.selection.as_ref(),
-            expected_selection,
+            provided_selection,
+            dataset,
         )?;
         if config.iterations < checkpoint.completed_iterations {
             return Err(TrainingError::InvalidInput(format!(
@@ -79,16 +80,21 @@ where
                 config.iterations, checkpoint.completed_iterations
             )));
         }
-        checkpoint.completed_iterations
+        (checkpoint.completed_iterations, resolved_selection)
     } else {
-        0
+        let resolved_selection = crate::training::checkpoint::resolve_checkpoint_selection(
+            None,
+            provided_selection,
+            dataset,
+        )?;
+        (0, resolved_selection)
     };
 
     let device = match shared_device {
         Some(shared_device) => shared_device(),
         None => default_device(),
     };
-    Ok((start_iteration, device))
+    Ok((start_iteration, device, resolved_selection))
 }
 
 pub fn train_splats(
@@ -237,7 +243,7 @@ where
         .transpose()?;
 
     let shared_device = shared_wgpu_context.map(|context| || context.training_device());
-    let (start_iteration, device) = prepare_resume_runtime(
+    let (start_iteration, device, resolved_selection) = prepare_resume_runtime(
         dataset,
         config,
         identity,
@@ -341,7 +347,7 @@ where
                 cadence: control.cadence(),
                 checkpoint_policy,
                 identity,
-                selection,
+                selection: resolved_selection.as_ref(),
                 emit_iteration_events,
                 started_at,
                 on_event,
@@ -752,7 +758,7 @@ mod tests {
             },
             3,
         );
-        let (start_iteration, _) = prepare_resume_runtime(
+        let (start_iteration, _, _) = prepare_resume_runtime(
             &remapped,
             &config,
             Some(&current),
@@ -803,7 +809,7 @@ mod tests {
 
     #[test]
     fn shared_training_device_selection_precedes_the_default_factory() {
-        let (start_iteration, device) = prepare_resume_runtime(
+        let (start_iteration, device, selection) = prepare_resume_runtime(
             &TrainingDataset::new(Intrinsics::default()),
             &TrainingConfig::default(),
             None,
@@ -813,6 +819,7 @@ mod tests {
             || panic!("default factory must not run when shared device exists"),
         )
         .unwrap();
+        assert!(selection.is_none());
 
         assert_eq!(start_iteration, 0);
         assert_eq!(device, "shared");

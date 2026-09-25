@@ -24,6 +24,16 @@ use crate::core::matrix::{
 };
 use crate::{Intrinsics, ScenePose, TrainingDataset, TrainingError, SE3};
 
+/// One COLMAP image entry before existence filtering, in model order.
+///
+/// Pre-C5 loaders enumerated `frame_idx` over this list (after max/stride), then
+/// skipped missing files without compacting indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColmapFrameCandidate {
+    pub image_id: u64,
+    pub file_exists: bool,
+}
+
 /// Configuration for loading a COLMAP dataset.
 #[derive(Debug, Clone)]
 pub struct ColmapConfig {
@@ -245,6 +255,29 @@ pub fn load_colmap_dataset(
     );
 
     Ok(dataset)
+}
+
+/// List COLMAP images in model order with per-file existence, before max/stride.
+///
+/// Used to reconstruct pre-C5 enumerated indices (e.g. historical `static_162`)
+/// that cannot be recovered from a filtered [`TrainingDataset`] alone.
+pub fn list_colmap_frame_candidates(
+    input: &Path,
+    config: &ColmapConfig,
+) -> Result<Vec<ColmapFrameCandidate>, TrainingError> {
+    let sparse_dir = resolve_colmap_sparse_dir(input)?;
+    let image_dir = resolve_image_dir(&sparse_dir, config.image_root.as_deref())?;
+    let images = parse_colmap_images(&sparse_dir)?;
+    let mut candidates = Vec::with_capacity(images.len());
+    for image in images {
+        validate_image_name(&image.name)?;
+        let image_path = image_dir.join(&image.name);
+        candidates.push(ColmapFrameCandidate {
+            image_id: u64::from(image.image_id),
+            file_exists: image_path.exists(),
+        });
+    }
+    Ok(candidates)
 }
 
 /// Resolve the COLMAP sparse model directory used when loading `input`.
@@ -1627,5 +1660,53 @@ mod tests {
         ];
         assert!((ratio_before[0] - ratio_after[0]).abs() < 1e-4);
         assert!((ratio_before[1] - ratio_after[1]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn list_colmap_candidates_restore_static_162_with_missing_image() {
+        let dir = tempdir().unwrap();
+        let sparse = dir.path().join("sparse");
+        let images = dir.path().join("images");
+        fs::create_dir_all(&sparse).unwrap();
+        fs::create_dir_all(&images).unwrap();
+        fs::write(
+            sparse.join("cameras.txt"),
+            "1 SIMPLE_PINHOLE 16 16 12 8 8\n",
+        )
+        .unwrap();
+        fs::write(sparse.join("points3D.txt"), "1 0 0 2 128 128 128 0\n").unwrap();
+        let mut records = String::new();
+        for id in 1..=300 {
+            let name = format!("{id:04}.rgb");
+            records.push_str(&format!("{id} 1 0 0 0 0 0 0 1 {name}\n\n"));
+            if id != 50 {
+                fs::write(images.join(&name), vec![100u8; 16 * 16 * 3]).unwrap();
+            }
+        }
+        fs::write(sparse.join("images.txt"), records).unwrap();
+
+        let candidates = list_colmap_frame_candidates(
+            &sparse,
+            &ColmapConfig {
+                image_root: Some(images),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 300);
+        assert!(!candidates[49].file_exists);
+
+        // Independent old-loader expectation (take 180, exclude enumerated 76..=93).
+        let expected: Vec<u64> = (1..=180)
+            .filter(|&id| id != 50 && !(77..=94).contains(&id))
+            .collect();
+        let allowed =
+            crate::training::static_162_allowed_stable_ids_from_candidates(&candidates).unwrap();
+        assert_eq!(allowed, expected);
+        assert_eq!(allowed.len(), 161);
+        assert_eq!(*allowed.last().unwrap(), 180);
+        assert!(!allowed.contains(&77));
+        assert!(!allowed.contains(&181));
+        assert!(allowed.contains(&95));
     }
 }
