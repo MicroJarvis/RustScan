@@ -1194,7 +1194,242 @@ Next action: T5 integrated. Await scheduling for T6.
 
 ### T6 — Database Transactions
 
-Status: pending.
+Status: review_ready. Awaiting independent review.
+
+Owner: `cursor-agent`
+
+Base commit: `c71f8092778e2abb1feaaf03c9d784ea25434349` (`main` after T5 integration)
+
+Branch: `agent/RS-2026-004/t6-database-transactions`
+
+Worktree: `/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t6-database-transactions`
+
+Changed files:
+
+- `rustscan-sfm/src/io/database.rs`
+- `rustscan-sfm/src/sfm/mapper/database_io.rs`
+- `rustscan-sfm/src/sfm/mapper.rs` (tests)
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.md`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/tasks.yaml`
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/verification.md`
+
+#### Implementation
+
+Reused `ColmapDatabase::with_transaction` (BEGIN IMMEDIATE / COMMIT /
+ROLLBACK; restores `database_entry_deleted` on failure) for:
+
+- `populate_local_matching_database` — one txn for cameras, images,
+  keypoints, descriptors, matches, and two-view geometries
+- `write_pair_geometries_to_database` — one txn per pair-geometry batch
+- `ColmapDatabase::merge` — one txn on the target for the complete merge
+
+No nested transactions. Write/commit/rollback errors propagate. No production
+fault-injection API; failures use SQLite `RAISE(ABORT)` triggers or
+`bail!` inside `with_transaction` (tests only).
+
+#### Pre-fix proof
+
+Against the unwrapped implementation, mid-batch / retry regressions failed
+(partial writes leaked). Logs:
+`artifacts/runs/rs-2026-004-t6/pre-fix-mid-failure.log`,
+`artifacts/runs/rs-2026-004-t6/pre-fix-retry.log`.
+
+#### New regressions
+
+- `database_merge_mid_failure_leaves_preexisting_target_unchanged`
+- `database_merge_retry_after_trigger_failure_commits_once`
+- `transaction_mid_batch_delete_restores_deletion_bookkeeping`
+- `populate_local_matching_database_mid_failure_rolls_back_preexisting_rows`
+- `populate_local_matching_database_retry_after_failure_commits_once`
+- `write_pair_geometries_mid_failure_leaves_preexisting_geometry_unchanged`
+- `write_pair_geometries_retry_after_failure_commits_once`
+
+#### Verification
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`,
+`CARGO_TERM_COLOR=never`.
+
+- `cargo fmt --all -- --check`: pass (after `cargo fmt --all`).
+- `cargo check --workspace --all-targets`: pass.
+- `cargo test -p rustscan-sfm --lib database:: -- --test-threads=1`: pass,
+  42 passed.
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: pass.
+  Lib `866 passed; 0 failed; 19 ignored` (258.58s); other targets exit 0.
+- Directed post-fix: mid_failure 3 passed; retry_after 3 passed;
+  transaction_mid_batch_delete 1 passed.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  fail, exit 101. First error: `module_inception` at
+  `rustscan-slam/src/config/mod.rs:5`. Final:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`. Slam
+  unmodified. No global allow added.
+- `git diff --check`: pass.
+
+Logs: `artifacts/runs/rs-2026-004-t6/`.
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- T7 (nalgebra ownership) not started.
+
+Next action: do not start T7. Do not merge to `main`. Await independent
+review.
+
+### T6 P2 Remediation — 2026-09-24
+
+Status: review_ready. Awaiting independent re-review after
+`review-t6-2026-09-24.md` (CHANGES_REQUESTED).
+
+Owner: `cursor-agent`
+
+Reviewed HEAD before fix: `1f39c4962416b9d506612ab1646a80ddb61a0e1c`
+
+Branch/worktree: unchanged
+(`agent/RS-2026-004/t6-database-transactions`,
+`/Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t6-database-transactions`).
+
+Changed files:
+
+- `rustscan-sfm/src/io/database.rs` — preserve original txn errors; full
+  `LogicalDbSnapshot`; late merge failure/retry; auto-rollback / commit /
+  cleanup-failure regressions
+- `rustscan-sfm/src/sfm/mapper.rs` — late populate/pair full-snapshot
+  mid-failure and retry payload checks
+- `docs/agent/changes/RS-2026-004-rustscan-sfm-correctness-remediation/review-t6-2026-09-24.md`
+  (preserved independent review; not rewritten)
+- this verification record, `tasks.md`, `tasks.yaml`
+
+#### P2#1 — original error preservation
+
+`with_transaction` now finishes failures through `finish_failed_transaction` /
+`try_rollback_transaction`. Inactive-transaction rollback errors
+("cannot rollback - no transaction is active") are treated as successful
+cleanup so the original operation/COMMIT error is kept. Real cleanup failures
+are chained with `context` and do not restore deletion bookkeeping.
+`cfg(test)`-only hooks can force COMMIT/ROLLBACK failure without production
+API changes.
+
+Pre-fix proof (temporary old Err path):
+`with_transaction_preserves_original_error_after_sqlite_auto_rollback` failed
+with only `cannot rollback - no transaction is active` (original
+`t6-original-second-camera-failure` missing). Log:
+`artifacts/runs/rs-2026-004-t6-p2-remediation/pre-fix-auto-rollback-error.log`.
+
+#### P2#2 — full logical rollback / retry evidence
+
+`LogicalDbSnapshot` / `MapperLogicalDbSnapshot` capture cameras, images, rigs,
+frames, priors, keypoints, descriptors, matches, and geometries (IDs, refs,
+payloads). Populate, merge, and pair-geometry mid-failures now trigger after
+pair/relationship writes via SQLite `RAISE(ABORT)` / `RAISE(ROLLBACK)`.
+Retry asserts exact payloads and no duplicate rows. Deletion bookkeeping
+covered for initial false and true on the merge connection via the business
+`delete_matches` path; pair update-then-insert regression retained with retry
+payload checks.
+
+#### Verification
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`,
+`CARGO_TERM_COLOR=never`.
+
+- Pre-fix auto-rollback error regression: FAIL (exit 101) as required.
+- Directed post-fix (9 tests: error preservation, merge mid/retry,
+  populate mid/retry, pair mid/retry, mid-batch delete): PASS.
+- `cargo fmt --all -- --check`: PASS.
+- `cargo check --workspace --all-targets`: PASS.
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: PASS.
+  Lib `867 passed; 0 failed; 19 ignored` (253.05s); remaining targets exit 0.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  FAIL, exit 101. Unmodified `rustscan-slam` blocker:
+  `could not compile rustscan-slam (lib) due to 84 previous errors`. Not a
+  rustscan-sfm lint regression; not recorded as pass.
+- `git diff --check`: PASS.
+
+Logs: `artifacts/runs/rs-2026-004-t6-p2-remediation/` (gitignored local
+evidence; also retain `artifacts/runs/t6-independent-review/`).
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- Ignored tests are not proof of their behavior.
+- T7 not started.
+
+Next action: do not start T7. Do not merge to `main`. Await independent
+re-review of the two P2 fixes.
+
+### T6 P2 Re-review Remediation — 2026-09-25
+
+Status: review_ready. Awaiting independent re-review after
+`review-t6-2026-09-25.md` (CHANGES_REQUESTED).
+
+Owner: `cursor-agent`
+
+Reviewed HEAD before this fix: `a5d250af4b58266254363207fdce777cbf6a4666`
+
+Branch/worktree: unchanged.
+
+Changed files:
+
+- `rustscan-sfm/src/io/database.rs` — `#[cfg(test)]` on `database::tests`;
+  cleanup-failure hook leaves txn active; bookkeeping success/failure
+  regressions; merge fixtures with nonempty rigs/frames/pose priors; exact
+  expected-state retry compare by stable IDs
+- `rustscan-sfm/src/sfm/mapper.rs` — restore missing `#[test]` attributes;
+  populate retry exact ID/payload expected state
+- `docs/agent/changes/.../review-t6-2026-09-25.md` (preserved)
+- this verification record, `tasks.md`, `tasks.yaml`
+
+#### Fixes
+
+1. Restored `#[test]` on
+   `resolve_mapper_database_path_allows_missing_output_for_local_write` and
+   `run_incremental_pipeline_reports_success_status`. Both listed and executed.
+   `database::tests` is `#[cfg(test)]` again; check no longer reports the
+   prior dead_code/helper warnings from that module.
+
+2. Cleanup-failure hook no longer performs a real ROLLBACK before reporting
+   failure. New regressions:
+   - successful rollback restores `deleted_before=false` after in-txn true
+   - successful rollback restores `deleted_before=true` after in-txn false
+   - cleanup failure chains original+cleanup errors, leaves txn active,
+     keeps current bookkeeping (would fail if `deleted_before` were restored
+     unconditionally), then explicitly rolls back and reuses the connection
+
+3. Merge/populate retry builds an independently specified expected logical
+   snapshot and `assert_eq!`s it after name/ID resolution. Pair IDs are
+   asserted with full match/geometry payloads; image→camera, frame→rig/sensor,
+   and pose-prior→image/camera references are checked. Merge fixtures include
+   nonempty rigs, frames, and pose priors for late-failure rollback and retry.
+
+#### Verification
+
+Environment: `POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib`,
+`CARGO_TERM_COLOR=never`.
+
+- `cargo test -p rustscan-sfm --lib -- --list`: includes both restored tests.
+- Directed:
+  `cargo test -p rustscan-sfm --lib -- --test-threads=1 with_transaction mid_failure retry_after transaction_mid_batch_delete`:
+  PASS, 12 passed.
+- Restored tests individually: PASS.
+- `cargo fmt --all -- --check`: PASS.
+- `cargo check --workspace --all-targets`: PASS (no new isolation/dead_code
+  warnings from `database::tests`).
+- `cargo test -p rustscan-sfm --all-targets -- --test-threads=1`: PASS.
+  Lib `871 passed; 0 failed; 19 ignored` (247.80s); remaining targets exit 0.
+- `cargo clippy -p rustscan-sfm --all-targets --all-features -- -D warnings`:
+  FAIL, exit 101. Unmodified `rustscan-slam` blocker (84 errors). Not recorded
+  as pass.
+- `git diff --check`: PASS.
+
+Logs: `artifacts/runs/rs-2026-004-t6-p2-rereview/` (gitignored local evidence).
+Preserve `review-t6-2026-09-24.md` and `review-t6-2026-09-25.md`.
+
+Known limitations:
+
+- Targeted Clippy remains blocked by pre-existing `rustscan-slam` lints.
+- Ignored tests are not proof of their behavior.
+- T7 not started.
+
+Next action: do not start T7. Do not merge to `main`. Await independent
+re-review.
 
 ### T7 — nalgebra Ownership
 

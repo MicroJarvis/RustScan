@@ -115,6 +115,9 @@ later_tasks:
     branch: agent/RS-2026-004/t6-database-transactions
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-t6-database-transactions
     scope: rustscan-sfm/src/io/database.rs and rustscan-sfm/src/sfm/mapper/database_io.rs
+    status: reviewed
+    base_commit: c71f8092778e2abb1feaaf03c9d784ea25434349
+    tip_commit: aa052d34dc728edbdef7f57d90800422dc3242e2
   - id: T7
     owner: cursor-agent
     branch: agent/RS-2026-004/t7-nalgebra-ownership
@@ -126,4 +129,4 @@ later_tasks:
     worktree: /Users/tfjiang/Projects/RustScan/.worktrees/rs-2026-004-rustscan-sfm-correctness
     scope: integration fixes and this change package
 
-next_action: "T5 is integrated on main. Do not start T6 until explicitly scheduled. Do not push remote from this handoff."
+next_action: "T6 is independently reviewed and approved on agent/RS-2026-004/t6-database-transactions. Proceed with the normal integration decision; do not start T7 until T6 is integrated."
