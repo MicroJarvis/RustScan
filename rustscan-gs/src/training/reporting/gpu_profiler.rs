@@ -669,14 +669,17 @@ thread_local! {
     static DEBUG_PROFILE_READBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Count a debug-only `into_scalar_async` profiling readback (test observability).
+/// Count a debug-only diagnostic/`profile_step` `into_scalar_async` readback.
+///
+/// Covers both the three `profile_step` syncs and the six gradient/delta
+/// diagnostic readbacks so tests can assert a zero total when profiler is off.
 #[inline]
 pub fn note_debug_profile_readback() {
     #[cfg(test)]
     DEBUG_PROFILE_READBACKS.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-/// Test helper: return and clear debug profile readback count.
+/// Test helper: return and clear debug profile + diagnostic readback count.
 #[cfg(test)]
 pub fn take_debug_profile_readbacks() -> u64 {
     DEBUG_PROFILE_READBACKS.with(|c| c.replace(0))

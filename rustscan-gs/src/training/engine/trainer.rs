@@ -1070,8 +1070,11 @@ impl WgpuTrainer {
         };
 
         // Brush keeps a strong gradient-validation path; mirror that observability here
-        // so we can quickly spot silent no-op training regressions.
-        let should_log_diagnostics = log::log_enabled!(log::Level::Debug)
+        // so we can quickly spot silent no-op training regressions. Gate on the same
+        // profiler.enabled switch as profile_step so Debug alone cannot force GPU
+        // diagnostic readbacks.
+        let should_log_diagnostics = profiler_on
+            && log::log_enabled!(log::Level::Debug)
             && (iteration <= 3 || iteration.is_multiple_of(100));
         let grad_transforms_for_diag = if should_log_diagnostics {
             Some(transforms_grad.clone())
@@ -1164,6 +1167,7 @@ impl WgpuTrainer {
         }
 
         if should_log_diagnostics {
+            note_debug_profile_readback();
             let grad_transforms_mean_abs = grad_transforms_for_diag
                 .expect("transforms grad for diagnostics")
                 .abs()
@@ -1171,6 +1175,7 @@ impl WgpuTrainer {
                 .into_scalar_async()
                 .await
                 .expect("transforms grad mean");
+            note_debug_profile_readback();
             let grad_sh_mean_abs = grad_sh_for_diag
                 .expect("sh grad for diagnostics")
                 .abs()
@@ -1178,6 +1183,7 @@ impl WgpuTrainer {
                 .into_scalar_async()
                 .await
                 .expect("sh grad mean");
+            note_debug_profile_readback();
             let grad_opacity_mean_abs = grad_opacity_for_diag
                 .expect("opacity grad for diagnostics")
                 .abs()
@@ -1186,6 +1192,7 @@ impl WgpuTrainer {
                 .await
                 .expect("opacity grad mean");
 
+            note_debug_profile_readback();
             let delta_transforms_mean_abs = (splats.transforms.val().inner()
                 - prev_transforms.expect("prev transforms for diagnostics"))
             .abs()
@@ -1193,6 +1200,7 @@ impl WgpuTrainer {
             .into_scalar_async()
             .await
             .expect("transforms delta mean");
+            note_debug_profile_readback();
             let delta_sh_mean_abs = (splats.sh_coeffs.val().inner()
                 - prev_sh.expect("prev sh for diagnostics"))
             .abs()
@@ -1200,6 +1208,7 @@ impl WgpuTrainer {
             .into_scalar_async()
             .await
             .expect("sh delta mean");
+            note_debug_profile_readback();
             let delta_opacity_mean_abs = (splats.raw_opacities.val().inner()
                 - prev_opacity.expect("prev opacity for diagnostics"))
             .abs()
@@ -5152,10 +5161,19 @@ mod tests {
                 .all(|line| !line.contains("WGPU train profile step")),
             "debug profile lines must not run when profiler.enabled=false; got {captured:?}"
         );
+        assert!(
+            captured
+                .iter()
+                .all(|line| !line.contains("WGPU train diagnostics step")),
+            "diagnostic info lines imply diagnostic GPU readbacks; none expected when profiler.enabled=false; got {captured:?}"
+        );
+        // Counter includes profile_step (3/step) and diagnostic (6/step) readbacks.
+        // With Debug on and profiler off across 3 early iterations, a missing gate
+        // would yield 3*6=18 diagnostic notes alone (plus any profile_step notes).
         assert_eq!(
             take_debug_profile_readbacks(),
             0,
-            "into_scalar_async profiling readbacks must not run when profiler disabled"
+            "no Debug GPU into_scalar_async readbacks (profile_step or diagnostics) when profiler.enabled=false"
         );
     }
 

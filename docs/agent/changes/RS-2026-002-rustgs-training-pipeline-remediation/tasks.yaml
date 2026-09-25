@@ -18,7 +18,7 @@ cards:
     notes: "prefix-sum workspace ownership preserved"
   C4:
     status: implemented_pending_rereview
-    notes: "R04 debug gate; R07 live GPU health; R06/R08 retained"
+    notes: "R04 gates profile_step + should_log_diagnostics on profiler.enabled; diagnostic readbacks counted; R07/R06/R08 retained"
   C5:
     status: not_started
   C6:
@@ -36,7 +36,7 @@ out_of_scope:
   - rust-viewer
   - C5-C8 implementation
 acceptance:
-  - "Independent re-review of round-3 R02/R07/R04 before merge."
+  - "Independent re-review of round-4 R04 diagnostic gate before merge."
 verification:
   - "cargo fmt --all -- --check"
   - "cargo check --workspace --all-targets"

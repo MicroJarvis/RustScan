@@ -95,3 +95,10 @@ isolated-device regression runs in a child process without force-bool bypass.
 **Round-3 R04 — debug profile gate:** `profile_step` requires
 `profiler.enabled` in addition to Debug log + cadence; debug
 `into_scalar_async` readbacks and `step_started_at` are skipped when disabled.
+
+**Round-4 R04 — diagnostic readback gate:** `should_log_diagnostics` also
+requires `profiler.enabled` (same `profiler_on` as `profile_step`). The six
+gradient/delta Debug diagnostic `into_scalar_async` readbacks are counted by
+`note_debug_profile_readback` so
+`profiler_disabled_with_debug_log_skips_profile_readbacks` asserts a zero
+total (profile + diagnostic), not only the three `profile_step` syncs.
