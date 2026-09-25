@@ -35,9 +35,10 @@ fn prepare_resume_runtime<T, SharedFactory, DefaultFactory>(
     config: &TrainingConfig,
     current_identity: Option<&crate::TrainingIdentity>,
     resume_checkpoint: Option<&crate::TrainingCheckpoint>,
+    provided_selection: Option<&crate::CheckpointFrameSelectionMeta>,
     shared_device: Option<SharedFactory>,
     default_device: DefaultFactory,
-) -> Result<(usize, T), TrainingError>
+) -> Result<(usize, T, Option<crate::CheckpointFrameSelectionMeta>), TrainingError>
 where
     SharedFactory: FnOnce() -> T,
     DefaultFactory: FnOnce() -> T,
@@ -45,18 +46,17 @@ where
     if let Some(current_identity) = current_identity {
         current_identity.validate_dataset_and_config(dataset, config)?;
     }
-    let start_iteration = if let Some(checkpoint) = resume_checkpoint {
+    let (start_iteration, resolved_selection) = if let Some(checkpoint) = resume_checkpoint {
         checkpoint.validate()?;
         let current_identity = current_identity.ok_or_else(|| {
             TrainingError::InvalidInput(
                 "resuming training requires the current training identity".to_string(),
             )
         })?;
-        if checkpoint.identity.dataset != current_identity.dataset {
-            return Err(TrainingError::InvalidInput(
-                "checkpoint dataset does not match the current training dataset".to_string(),
-            ));
-        }
+        crate::training::checkpoint::match_checkpoint_dataset_identity(
+            &checkpoint.identity.dataset,
+            dataset,
+        )?;
         if checkpoint.identity.reconstruction != current_identity.reconstruction {
             return Err(TrainingError::InvalidInput(
                 "checkpoint reconstruction does not match the current sparse reconstruction"
@@ -69,22 +69,32 @@ where
                     .to_string(),
             ));
         }
+        let resolved_selection = crate::training::checkpoint::resolve_checkpoint_selection(
+            checkpoint.selection.as_ref(),
+            provided_selection,
+            dataset,
+        )?;
         if config.iterations < checkpoint.completed_iterations {
             return Err(TrainingError::InvalidInput(format!(
                 "training iteration target {} is lower than checkpoint completed iterations {}",
                 config.iterations, checkpoint.completed_iterations
             )));
         }
-        checkpoint.completed_iterations
+        (checkpoint.completed_iterations, resolved_selection)
     } else {
-        0
+        let resolved_selection = crate::training::checkpoint::resolve_checkpoint_selection(
+            None,
+            provided_selection,
+            dataset,
+        )?;
+        (0, resolved_selection)
     };
 
     let device = match shared_device {
         Some(shared_device) => shared_device(),
         None => default_device(),
     };
-    Ok((start_iteration, device))
+    Ok((start_iteration, device, resolved_selection))
 }
 
 pub fn train_splats(
@@ -110,6 +120,7 @@ where
         identity,
         resume_checkpoint,
         checkpoint_policy,
+        selection,
         shared_wgpu_context,
         mut on_event,
         mut on_checkpoint,
@@ -143,6 +154,7 @@ where
         &control,
         identity.as_ref(),
         resume_checkpoint.as_ref(),
+        selection.as_ref(),
         checkpoint_policy,
         shared_wgpu_context.as_ref(),
         emit_iteration_events,
@@ -201,6 +213,7 @@ fn run_training<F, C, DefaultFactory>(
     control: &TrainingControl,
     identity: Option<&crate::TrainingIdentity>,
     resume_checkpoint: Option<&crate::TrainingCheckpoint>,
+    selection: Option<&crate::CheckpointFrameSelectionMeta>,
     checkpoint_policy: TrainingCheckpointPolicy,
     shared_wgpu_context: Option<&SharedWgpuContext>,
     emit_iteration_events: bool,
@@ -230,11 +243,12 @@ where
         .transpose()?;
 
     let shared_device = shared_wgpu_context.map(|context| || context.training_device());
-    let (start_iteration, device) = prepare_resume_runtime(
+    let (start_iteration, device, resolved_selection) = prepare_resume_runtime(
         dataset,
         config,
         identity,
         resume_checkpoint,
+        selection,
         shared_device,
         default_device,
     )?;
@@ -333,6 +347,7 @@ where
                 cadence: control.cadence(),
                 checkpoint_policy,
                 identity,
+                selection: resolved_selection.as_ref(),
                 emit_iteration_events,
                 started_at,
                 on_event,
@@ -426,6 +441,7 @@ where
     cadence: TrainingEventCadence,
     checkpoint_policy: TrainingCheckpointPolicy,
     identity: Option<&'a crate::TrainingIdentity>,
+    selection: Option<&'a crate::CheckpointFrameSelectionMeta>,
     emit_iteration_events: bool,
     started_at: Instant,
     on_event: &'a mut F,
@@ -467,6 +483,10 @@ where
 
     fn checkpoint_identity(&self) -> Option<&crate::TrainingIdentity> {
         self.identity
+    }
+
+    fn checkpoint_selection(&self) -> Option<&crate::CheckpointFrameSelectionMeta> {
+        self.selection
     }
 
     fn on_iteration(&mut self, metrics: TrainingIterationMetrics) {
@@ -588,8 +608,9 @@ fn build_training_run(
 mod tests {
     use super::*;
     use crate::{
-        AdamCheckpoint, AdamParameterCheckpoint, ScenePose, TensorCheckpoint, TopologyCheckpoint,
-        TrainingCheckpoint, TrainingIdentity, SE3, TRAINING_CHECKPOINT_VERSION,
+        hash_training_dataset_with_pre_c5_frame_ids, AdamCheckpoint, AdamParameterCheckpoint,
+        ScenePose, TensorCheckpoint, TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity, SE3,
+        TRAINING_CHECKPOINT_VERSION,
     };
 
     fn identity_dataset(temp: &tempfile::TempDir) -> TrainingDataset {
@@ -644,6 +665,7 @@ mod tests {
             },
             frame_shuffle_seed: 17,
             active_sh_degree: 0,
+            selection: None,
         }
     }
 
@@ -693,12 +715,60 @@ mod tests {
                 &config,
                 Some(&current),
                 Some(&checkpoint),
+                None,
                 None::<fn()>,
                 || panic!("default device must not be requested"),
             )
             .unwrap_err();
-            assert_eq!(invalid_input_message(error), expected);
+            let message = invalid_input_message(error);
+            assert!(
+                message.contains(expected),
+                "expected message containing {expected:?}, got {message:?}"
+            );
         }
+    }
+
+    #[test]
+    fn prepare_resume_runtime_accepts_pre_c5_gap_free_dataset_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = identity_dataset(&temp);
+        let mut remapped = TrainingDataset::new(base.intrinsics);
+        remapped.depth_scale = base.depth_scale;
+        remapped.initial_points = base.initial_points.clone();
+        for (idx, pose) in base.poses.iter().enumerate() {
+            remapped.add_pose(ScenePose::new(
+                10 + idx as u64 * 10,
+                pose.image_path.clone(),
+                pose.pose,
+                0.0,
+            ));
+        }
+        let config = TrainingConfig::default();
+        let current = identity(&remapped, &config);
+        let legacy_dataset = hash_training_dataset_with_pre_c5_frame_ids(
+            &remapped,
+            &(0..remapped.poses.len() as u64).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_ne!(current.dataset, legacy_dataset);
+        let checkpoint = resume_checkpoint(
+            TrainingIdentity {
+                dataset: legacy_dataset,
+                ..current.clone()
+            },
+            3,
+        );
+        let (start_iteration, _, _) = prepare_resume_runtime(
+            &remapped,
+            &config,
+            Some(&current),
+            Some(&checkpoint),
+            None,
+            None::<fn() -> &'static str>,
+            || "device",
+        )
+        .expect("gap-free pre-C5 identity must be accepted at the real resume entry");
+        assert_eq!(start_iteration, 3);
     }
 
     #[test]
@@ -713,6 +783,7 @@ mod tests {
             &config,
             None,
             Some(&checkpoint),
+            None,
             None::<fn()>,
             || panic!("device must not be requested"),
         )
@@ -728,6 +799,7 @@ mod tests {
             &lower_target,
             Some(&current),
             Some(&checkpoint),
+            None,
             None::<fn()>,
             || panic!("device must not be requested"),
         )
@@ -737,15 +809,17 @@ mod tests {
 
     #[test]
     fn shared_training_device_selection_precedes_the_default_factory() {
-        let (start_iteration, device) = prepare_resume_runtime(
+        let (start_iteration, device, selection) = prepare_resume_runtime(
             &TrainingDataset::new(Intrinsics::default()),
             &TrainingConfig::default(),
+            None,
             None,
             None,
             Some(|| "shared"),
             || panic!("default factory must not run when shared device exists"),
         )
         .unwrap();
+        assert!(selection.is_none());
 
         assert_eq!(start_iteration, 0);
         assert_eq!(device, "shared");
@@ -801,7 +875,11 @@ mod tests {
                 panic!("device factory must not run before resume validation")
             })
             .unwrap_err();
-            assert_eq!(invalid_input_message(error), expected);
+            let message = invalid_input_message(error);
+            assert!(
+                message.contains(expected),
+                "expected message containing {expected:?}, got {message:?}"
+            );
         }
     }
 
@@ -825,9 +903,9 @@ mod tests {
             || panic!("device factory must not run for a stale new-run dataset identity"),
         )
         .unwrap_err();
-        assert_eq!(
-            invalid_input_message(error),
-            "training identity dataset does not match the current training dataset"
+        assert!(
+            invalid_input_message(error).contains("does not match the current training dataset"),
+            "stale new-run dataset identity must be rejected before device creation"
         );
 
         let error = train_splats_with_device_factory(
@@ -839,9 +917,9 @@ mod tests {
             || panic!("device factory must not run for a stale dataset identity"),
         )
         .unwrap_err();
-        assert_eq!(
-            invalid_input_message(error),
-            "training identity dataset does not match the current training dataset"
+        assert!(
+            invalid_input_message(error).contains("does not match the current training dataset"),
+            "stale resume dataset identity must be rejected before device creation"
         );
 
         let mut changed_config = config.clone();

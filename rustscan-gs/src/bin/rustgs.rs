@@ -120,6 +120,14 @@ struct TrainArgs {
     #[arg(long, default_value = "0")]
     frame_shuffle_seed: u64,
 
+    /// JSON split manifest with dataset fingerprint plus train / in-view / holdout stable IDs
+    #[arg(long)]
+    frame_split_manifest: Option<PathBuf>,
+
+    /// Post-training evaluation split: in-view (default) or holdout (requires --frame-split-manifest)
+    #[arg(long, default_value = "in-view")]
+    eval_split: String,
+
     /// Relative render scale used by training
     #[arg(long, default_value = "0.5")]
     render_scale: f32,
@@ -677,6 +685,7 @@ mod tests {
             &args,
             &dataset,
             &rustscan_gs::TrainingConfig::default(),
+            None,
         )
         .unwrap();
 
@@ -716,6 +725,7 @@ mod tests {
             &args,
             &dataset,
             &rustscan_gs::TrainingConfig::default(),
+            None,
         )
         .unwrap();
 
@@ -756,6 +766,7 @@ mod tests {
             &args,
             &dataset,
             &rustscan_gs::TrainingConfig::default(),
+            None,
         )
         .err()
         .expect("corrupt resume checkpoint must fail");
@@ -807,7 +818,7 @@ mod tests {
             1.0, 1.0, 0.5, 0.5, 1, 1,
         ));
 
-        train_command::training_options(&args, &dataset, config)
+        train_command::training_options(&args, &dataset, config, None)
             .unwrap()
             .identity
             .unwrap()

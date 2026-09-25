@@ -41,8 +41,13 @@ pub struct OptimizationCommand {
     pub frame_shuffle_seed: Option<u64>,
     pub render_scale: Option<f32>,
     pub eval_render_scale: Option<f32>,
-    pub eval_frame_ids: Vec<u32>,
-    pub train_frame_ids: Vec<u32>,
+    /// Stable COLMAP image IDs used for evaluation (full u64, never truncated).
+    pub eval_frame_ids: Vec<u64>,
+    /// Stable COLMAP image IDs from the canonical train FrameSelection (before oversample).
+    pub train_frame_ids: Vec<u64>,
+    /// Pose order that entered the training loader after oversample (and shuffle seed order).
+    #[serde(default)]
+    pub train_loader_frame_ids: Vec<u64>,
     /// Pose count that actually entered the training loader after filtering.
     pub effective_max_frames: Option<usize>,
     pub eval_resolution: Option<[usize; 2]>,
@@ -52,6 +57,18 @@ pub struct OptimizationCommand {
     pub topology_config_fingerprint: Option<String>,
     pub sh_schedule_fingerprint: Option<String>,
     pub training_config_fingerprint: Option<String>,
+    /// `in-view` or `holdout`; in-view must not be reported as holdout.
+    #[serde(default)]
+    pub eval_split_kind: Option<String>,
+    /// Fingerprint of the frame-split manifest when one was supplied.
+    #[serde(default)]
+    pub manifest_fingerprint: Option<String>,
+    /// Fingerprint of the canonical train FrameSelection.
+    #[serde(default)]
+    pub selection_fingerprint: Option<String>,
+    /// Fingerprint of the canonical eval FrameSelection.
+    #[serde(default)]
+    pub eval_selection_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -166,13 +183,13 @@ pub struct OptimizationEvaluationMetrics {
     pub psnr_median_db: Option<f32>,
     pub psnr_min_db: Option<f32>,
     pub psnr_max_db: Option<f32>,
-    pub worst_frame_ids: Vec<u32>,
+    pub worst_frame_ids: Vec<u64>,
     pub frames: Vec<OptimizationEvalFrame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct OptimizationEvalFrame {
-    pub frame_id: u32,
+    pub frame_id: u64,
     pub psnr_db: f32,
     pub sharpness_grad_ratio: Option<f32>,
     pub sharpness_lap_ratio: Option<f32>,
@@ -302,6 +319,36 @@ pub fn compare_optimization_reports(
             baseline.command.train_frame_ids, candidate.command.train_frame_ids
         ));
     }
+    if baseline.command.train_loader_frame_ids != candidate.command.train_loader_frame_ids {
+        reasons.push(format!(
+            "train_loader_frame_ids mismatch: {:?} vs {:?}",
+            baseline.command.train_loader_frame_ids, candidate.command.train_loader_frame_ids
+        ));
+    }
+    compare_opt_eq(
+        &mut reasons,
+        "eval_split_kind",
+        baseline.command.eval_split_kind.as_deref(),
+        candidate.command.eval_split_kind.as_deref(),
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "manifest_fingerprint",
+        baseline.command.manifest_fingerprint.as_deref(),
+        candidate.command.manifest_fingerprint.as_deref(),
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "selection_fingerprint",
+        baseline.command.selection_fingerprint.as_deref(),
+        candidate.command.selection_fingerprint.as_deref(),
+    );
+    compare_opt_eq(
+        &mut reasons,
+        "eval_selection_fingerprint",
+        baseline.command.eval_selection_fingerprint.as_deref(),
+        candidate.command.eval_selection_fingerprint.as_deref(),
+    );
     compare_opt_eq(
         &mut reasons,
         "effective_max_frames",
@@ -570,6 +617,7 @@ mod tests {
                 eval_render_scale: Some(0.25),
                 eval_frame_ids: vec![0, 1],
                 train_frame_ids: vec![10, 11, 12],
+                train_loader_frame_ids: vec![10, 11, 12, 10],
                 effective_max_frames: Some(12),
                 eval_resolution: Some([160, 90]),
                 iterations: Some(500),
@@ -578,6 +626,10 @@ mod tests {
                 topology_config_fingerprint: Some("topo-fp".into()),
                 sh_schedule_fingerprint: Some("sh-fp".into()),
                 training_config_fingerprint: Some("train-fp".into()),
+                eval_split_kind: Some("in-view".into()),
+                manifest_fingerprint: None,
+                selection_fingerprint: Some("sel-fp".into()),
+                eval_selection_fingerprint: Some("eval-sel-fp".into()),
             },
             train: OptimizationTrainMetrics {
                 wall_clock_seconds: Some(12.0),
@@ -736,6 +788,10 @@ mod tests {
             (
                 "train_frame_ids",
                 Box::new(|cmd| cmd.train_frame_ids = vec![99]),
+            ),
+            (
+                "train_loader_frame_ids",
+                Box::new(|cmd| cmd.train_loader_frame_ids = vec![99]),
             ),
             (
                 "effective_max_frames",

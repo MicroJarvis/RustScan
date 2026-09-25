@@ -24,29 +24,37 @@ pub(crate) mod forward;
 #[cfg(feature = "gpu")]
 use crate::{TrainingDataset, TrainingError};
 
+pub use checkpoint::SelectionMetaProvenance;
 pub use checkpoint::{
-    load_training_checkpoint, load_training_checkpoint_with_migration, save_training_checkpoint,
-    AdamCheckpoint, AdamParameterCheckpoint, CheckpointMigration, TensorCheckpoint,
+    assign_pre_c5_enumerated_ids, hash_training_dataset_with_pre_c5_frame_ids,
+    load_training_checkpoint, load_training_checkpoint_with_migration,
+    match_checkpoint_dataset_identity, resolve_checkpoint_selection, save_training_checkpoint,
+    validate_checkpoint_selection_consistency, AdamCheckpoint, AdamParameterCheckpoint,
+    CheckpointFrameSelectionMeta, CheckpointMigration, DatasetIdentityMatch, TensorCheckpoint,
     TopologyCheckpoint, TrainingCheckpoint, TrainingIdentity, MAX_TRAINING_CHECKPOINT_BYTES,
     MAX_TRAINING_CHECKPOINT_SPLATS, MAX_TRAINING_CHECKPOINT_TENSOR_ELEMENTS,
     MAX_TRAINING_CHECKPOINT_TENSOR_RANK, MAX_TRAINING_IDENTITY_BYTES,
     TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_CHECKPOINT_MAGIC, TRAINING_CHECKPOINT_VERSION,
-    TRAINING_CHECKPOINT_VERSION_V1,
+    TRAINING_CHECKPOINT_VERSION_V1, TRAINING_CHECKPOINT_VERSION_V2, TRAINING_CHECKPOINT_VERSION_V3,
 };
-pub use evaluation::MIN_RENDER_SCALE;
+pub use evaluation::{
+    aggregate_evaluation_gate_status, compute_psnr_f32, fingerprint_frame_selection,
+    format_frame_id_ranges, parse_frame_id_ranges, require_frame_id_u32, scaled_dimensions,
+    select_evaluation_frames, static_162_allowed_stable_ids,
+    static_162_allowed_stable_ids_from_candidates, summarize_psnr_samples,
+    summarize_training_metrics, worst_frame_metrics, EvaluationDevice, EvaluationFrameMetric,
+    EvaluationGateStatus, EvaluationSplitKind, FinalTrainingMetrics, FrameIdRange, FrameSelection,
+    FrameSelectionReport, FrameSelectionRequest, FrameSplitManifest, PsnrSummary,
+    SplatEvaluationConfig, SplatEvaluationError, SplatEvaluationResult, SplatEvaluationSummary,
+    MIN_RENDER_SCALE,
+};
 pub use evaluation::{
     compare_loss_curve_samples, default_litegs_parity_fixtures, default_parity_report_path,
     parity_fixture_id_for_input_path, resolve_litegs_parity_fixture_input_path,
-    resolve_litegs_parity_reference_report_path, ParityCheckOutcome, ParityCheckStatus,
-    ParityFixtureKind, ParityFixtureSpec, ParityGateEvaluation, ParityGateStatus,
-    ParityHarnessReport, ParityMetricSnapshot, ParityReferenceComparison, ParityThresholds,
-    ParityTimingMetrics, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_TINY_FIXTURE_ID,
-};
-pub use evaluation::{
-    compute_psnr_f32, scaled_dimensions, select_evaluation_frames, summarize_psnr_samples,
-    summarize_training_metrics, worst_frame_metrics, EvaluationDevice, EvaluationFrameMetric,
-    FinalTrainingMetrics, PsnrSummary, SplatEvaluationConfig, SplatEvaluationError,
-    SplatEvaluationResult, SplatEvaluationSummary,
+    resolve_litegs_parity_reference_report_path, ColmapFrameCandidate, ParityCheckOutcome,
+    ParityCheckStatus, ParityFixtureKind, ParityFixtureSpec, ParityGateEvaluation,
+    ParityGateStatus, ParityHarnessReport, ParityMetricSnapshot, ParityReferenceComparison,
+    ParityThresholds, ParityTimingMetrics, DEFAULT_CONVERGENCE_FIXTURE_ID, DEFAULT_TINY_FIXTURE_ID,
 };
 #[cfg(feature = "gpu")]
 pub use evaluation::{

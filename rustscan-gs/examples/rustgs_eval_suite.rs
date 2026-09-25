@@ -5,10 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use image::{ImageBuffer, RgbImage};
 use rustscan_gs::{
-    evaluate_splats, evaluation_device, load_colmap_training_dataset, load_splats_ply,
-    render_evaluation_frame, runtime_from_splats, select_evaluation_frames, ColmapConfig,
-    EvaluationDevice, EvaluationFrameMetric, HostSplats, SplatEvaluationConfig,
-    SplatEvaluationRenderer, SplatEvaluationSummary, TrainingDataset,
+    aggregate_evaluation_gate_status, evaluate_splats, evaluation_device,
+    load_colmap_training_dataset, load_splats_ply, parse_frame_id_ranges, render_evaluation_frame,
+    runtime_from_splats, ColmapConfig, EvaluationDevice, EvaluationFrameMetric,
+    EvaluationGateStatus, FrameSelectionReport, FrameSelectionRequest, HostSplats,
+    SplatEvaluationConfig, SplatEvaluationRenderer, SplatEvaluationSummary, TrainingDataset,
 };
 use serde::Serialize;
 
@@ -106,6 +107,9 @@ struct EvalCase {
     frame_stride: usize,
     include_frame_ranges: Option<&'static str>,
     exclude_frame_ranges: Option<&'static str>,
+    /// When true, pin the historical static_162 set via allowed_ids (first 180
+    /// load-order frames minus enumerated indices 76..=93).
+    pin_static_162: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +120,8 @@ struct EvaluationCaseReport {
     frame_stride: usize,
     include_frame_ranges: Option<String>,
     exclude_frame_ranges: Option<String>,
+    /// Actual post-selection stable IDs and fingerprints (not summary max/stride).
+    selection: FrameSelectionReport,
     export_dir: Option<PathBuf>,
     summary: SplatEvaluationSummary,
 }
@@ -138,6 +144,28 @@ struct SuiteReport {
 enum GateStatus {
     Passed,
     Failed,
+    /// Old threshold must not be applied (e.g. historical static_162 cannot be restored).
+    Inapplicable,
+}
+
+impl From<EvaluationGateStatus> for GateStatus {
+    fn from(status: EvaluationGateStatus) -> Self {
+        match status {
+            EvaluationGateStatus::Passed => Self::Passed,
+            EvaluationGateStatus::Failed => Self::Failed,
+            EvaluationGateStatus::Inapplicable => Self::Inapplicable,
+        }
+    }
+}
+
+impl From<GateStatus> for EvaluationGateStatus {
+    fn from(status: GateStatus) -> Self {
+        match status {
+            GateStatus::Passed => Self::Passed,
+            GateStatus::Failed => Self::Failed,
+            GateStatus::Inapplicable => Self::Inapplicable,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -158,18 +186,6 @@ struct GateReport {
     checks: Vec<GateCheck>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FrameIdRange {
-    start: u64,
-    end: u64,
-}
-
-impl FrameIdRange {
-    fn contains(&self, frame_id: u64) -> bool {
-        self.start <= frame_id && frame_id <= self.end
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
@@ -183,41 +199,84 @@ fn main() -> anyhow::Result<()> {
     let (splats, metadata) = load_splats_ply(&args.scene)?;
 
     let mut reports = Vec::new();
+    let mut static_162_inapplicable: Option<String> = None;
     for case in eval_cases() {
         println!("running case {}", case.name);
-        let mut dataset = load_colmap_training_dataset(
+        let full_dataset = load_colmap_training_dataset(
             &args.dataset,
             &ColmapConfig {
-                max_frames: case.dataset_max_frames,
+                max_frames: 0,
                 frame_stride: 1,
                 ..ColmapConfig::default()
             },
         )?;
-        let include_ranges = parse_frame_ranges(case.include_frame_ranges)?;
-        dataset = filter_dataset_to_frame_ranges(dataset, &include_ranges, case.name)?;
-        let exclude_ranges = parse_frame_ranges(case.exclude_frame_ranges)?;
-        dataset = filter_dataset_by_frame_ranges(dataset, &exclude_ranges, case.name)?;
+        // One canonical selection: include/exclude → max → stride.
+        // static_162 pins the historical prefix via COLMAP candidates → allowed_ids.
+        let max_frames = if case.max_frames > 0 {
+            case.max_frames
+        } else {
+            case.dataset_max_frames
+        };
+        let allowed_ids = if case.pin_static_162 {
+            let candidates = rustscan_gs::list_colmap_frame_candidates(
+                &args.dataset,
+                &ColmapConfig {
+                    max_frames: 0,
+                    frame_stride: 1,
+                    ..ColmapConfig::default()
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+            match rustscan_gs::static_162_allowed_stable_ids_from_candidates(&candidates) {
+                Ok(ids) => Some(ids),
+                Err(reason) => {
+                    log::warn!(
+                        "static_162 old quality gate is inapplicable: {reason}; skipping case"
+                    );
+                    static_162_inapplicable = Some(reason);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let selection = rustscan_gs::FrameSelection::select(
+            &full_dataset,
+            &FrameSelectionRequest {
+                include_ranges: parse_frame_id_ranges(case.include_frame_ranges)
+                    .map_err(anyhow::Error::msg)?,
+                exclude_ranges: parse_frame_id_ranges(case.exclude_frame_ranges)
+                    .map_err(anyhow::Error::msg)?,
+                allowed_ids,
+                max_frames,
+                frame_stride: case.frame_stride,
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        if selection.dataset.poses.is_empty() {
+            anyhow::bail!("{} resolved to zero frames", case.name);
+        }
+        let dataset = &selection.dataset;
 
         let result = evaluate_splats(
-            &dataset,
+            dataset,
             &splats,
             &metadata,
             &SplatEvaluationConfig {
                 render_scale: args.render_scale,
                 raster_cov_blur: args.raster_cov_blur,
-                max_frames: case.max_frames,
-                frame_stride: case.frame_stride,
+                // Already selected once; do not re-filter.
+                max_frames: 0,
+                frame_stride: 1,
                 worst_frame_count: args.export_worst_k.max(5),
             },
             &device,
             None,
         )?;
-        let selected_dataset =
-            select_evaluation_frames(&dataset, case.max_frames, case.frame_stride);
         let export_dir = if args.export_worst_k > 0 {
             let export_dir = args.out.join("crops").join(case.name);
             export_worst_frames(
-                &selected_dataset,
+                dataset,
                 &splats,
                 &result.frame_metrics,
                 args.export_worst_k,
@@ -235,13 +294,24 @@ fn main() -> anyhow::Result<()> {
         if let Some(export_dir) = export_dir.as_ref() {
             summary.crop_outputs.push(export_dir.join("summary.tsv"));
         }
+        let include_frame_ranges = case.include_frame_ranges.map(str::to_string);
+        let exclude_frame_ranges = case.exclude_frame_ranges.map(str::to_string);
+        let mut selection_report = FrameSelectionReport::from_in_view_selection(&selection, None);
+        // Prefer the human-readable CLI/case strings when present.
+        if include_frame_ranges.is_some() {
+            selection_report.include_frame_ranges = include_frame_ranges.clone();
+        }
+        if exclude_frame_ranges.is_some() {
+            selection_report.exclude_frame_ranges = exclude_frame_ranges.clone();
+        }
         reports.push(EvaluationCaseReport {
             name: case.name.to_string(),
             title: case.title.to_string(),
-            max_frames: case.max_frames,
-            frame_stride: case.frame_stride,
-            include_frame_ranges: case.include_frame_ranges.map(str::to_string),
-            exclude_frame_ranges: case.exclude_frame_ranges.map(str::to_string),
+            max_frames: selection.max_frames,
+            frame_stride: selection.frame_stride,
+            include_frame_ranges,
+            exclude_frame_ranges,
+            selection: selection_report,
             export_dir,
             summary,
         });
@@ -249,7 +319,7 @@ fn main() -> anyhow::Result<()> {
 
     let gate = args
         .gate_profile
-        .map(|profile| evaluate_gate(profile, &reports));
+        .map(|profile| evaluate_gate(profile, &reports, static_162_inapplicable.as_deref()));
     let report = SuiteReport {
         generated_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         scene: args.scene.clone(),
@@ -269,13 +339,13 @@ fn main() -> anyhow::Result<()> {
     println!("summary_json={}", summary_json.display());
     println!("summary_md={}", summary_md.display());
 
-    if args.fail_on_gate
-        && matches!(
-            report.gate.as_ref().map(|gate| gate.status),
-            Some(GateStatus::Failed)
-        )
-    {
-        std::process::exit(2);
+    if args.fail_on_gate {
+        match report.gate.as_ref().map(|gate| gate.status) {
+            Some(GateStatus::Failed) | Some(GateStatus::Inapplicable) => {
+                std::process::exit(2);
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -304,6 +374,7 @@ fn eval_cases() -> [EvalCase; 4] {
             frame_stride: 30,
             include_frame_ranges: None,
             exclude_frame_ranges: None,
+            pin_static_162: false,
         },
         EvalCase {
             name: "full_180",
@@ -313,15 +384,20 @@ fn eval_cases() -> [EvalCase; 4] {
             frame_stride: 1,
             include_frame_ranges: None,
             exclude_frame_ranges: None,
+            pin_static_162: false,
         },
         EvalCase {
             name: "static_162",
             title: "static 162-frame prefix",
             dataset_max_frames: 180,
+            // Selection is pinned by allowed_ids; max/stride remain for fingerprint.
             max_frames: 180,
             frame_stride: 1,
             include_frame_ranges: None,
-            exclude_frame_ranges: Some("76-93"),
+            // Exclude is encoded in allowed_ids (old enumerated 76-93), not reapplied
+            // as stable-ID exclude which would drift past the 180 prefix.
+            exclude_frame_ranges: None,
+            pin_static_162: true,
         },
         EvalCase {
             name: "full_trajectory_stride_4",
@@ -331,98 +407,16 @@ fn eval_cases() -> [EvalCase; 4] {
             frame_stride: 4,
             include_frame_ranges: None,
             exclude_frame_ranges: None,
+            pin_static_162: false,
         },
     ]
 }
 
-fn parse_frame_ranges(value: Option<&str>) -> anyhow::Result<Vec<FrameIdRange>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let mut ranges = Vec::new();
-    for raw_token in value.split(',') {
-        let token = raw_token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let (start, end) = if let Some((start, end)) = token.split_once("..") {
-            (start.trim(), end.trim())
-        } else if let Some((start, end)) = token.split_once('-') {
-            (start.trim(), end.trim())
-        } else {
-            (token, token)
-        };
-        if start.is_empty() || end.is_empty() {
-            anyhow::bail!("frame range '{token}' must be <frame_id> or <start>-<end>");
-        }
-        let start = start
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid frame range start in '{token}'"))?;
-        let end = end
-            .parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid frame range end in '{token}'"))?;
-        if start > end {
-            anyhow::bail!("frame range '{token}' has start greater than end");
-        }
-        ranges.push(FrameIdRange { start, end });
-    }
-    Ok(ranges)
-}
-
-fn filter_dataset_by_frame_ranges(
-    dataset: TrainingDataset,
-    excluded_ranges: &[FrameIdRange],
-    label: &str,
-) -> anyhow::Result<TrainingDataset> {
-    if excluded_ranges.is_empty() {
-        return Ok(dataset);
-    }
-
-    let mut filtered =
-        TrainingDataset::new(dataset.intrinsics).with_depth_scale(dataset.depth_scale);
-    filtered.initial_points = dataset.initial_points.clone();
-    for pose in dataset.poses {
-        if excluded_ranges
-            .iter()
-            .any(|range| range.contains(pose.frame_id))
-        {
-            continue;
-        }
-        filtered.add_pose(pose);
-    }
-    if filtered.poses.is_empty() {
-        anyhow::bail!("{label} excluded all frames");
-    }
-    Ok(filtered)
-}
-
-fn filter_dataset_to_frame_ranges(
-    dataset: TrainingDataset,
-    included_ranges: &[FrameIdRange],
-    label: &str,
-) -> anyhow::Result<TrainingDataset> {
-    if included_ranges.is_empty() {
-        return Ok(dataset);
-    }
-
-    let mut filtered =
-        TrainingDataset::new(dataset.intrinsics).with_depth_scale(dataset.depth_scale);
-    filtered.initial_points = dataset.initial_points.clone();
-    for pose in dataset.poses {
-        if included_ranges
-            .iter()
-            .any(|range| range.contains(pose.frame_id))
-        {
-            filtered.add_pose(pose);
-        }
-    }
-    if filtered.poses.is_empty() {
-        anyhow::bail!("{label} selected no frames");
-    }
-    Ok(filtered)
-}
-
-fn evaluate_gate(profile: GateProfile, reports: &[EvaluationCaseReport]) -> GateReport {
+fn evaluate_gate(
+    profile: GateProfile,
+    reports: &[EvaluationCaseReport],
+    static_162_inapplicable: Option<&str>,
+) -> GateReport {
     let mut checks = Vec::new();
     let (full_threshold, static_threshold, splat_limit) = match profile {
         GateProfile::Quality => (23.05, 23.65, None),
@@ -438,14 +432,26 @@ fn evaluate_gate(profile: GateProfile, reports: &[EvaluationCaseReport]) -> Gate
         full_threshold,
         |summary| summary.psnr_mean_db,
     );
-    push_min_check(
-        &mut checks,
-        reports,
-        "static_162",
-        "psnr_mean_db",
-        static_threshold,
-        |summary| summary.psnr_mean_db,
-    );
+    if let Some(reason) = static_162_inapplicable {
+        checks.push(GateCheck {
+            name: "static_162.psnr_mean_db".to_string(),
+            case: "static_162".to_string(),
+            metric: "psnr_mean_db".to_string(),
+            comparator: format!("inapplicable:{reason}"),
+            actual: 0.0,
+            threshold: static_threshold,
+            status: GateStatus::Inapplicable,
+        });
+    } else {
+        push_min_check(
+            &mut checks,
+            reports,
+            "static_162",
+            "psnr_mean_db",
+            static_threshold,
+            |summary| summary.psnr_mean_db,
+        );
+    }
     if let Some(limit) = splat_limit {
         push_max_check(
             &mut checks,
@@ -457,14 +463,12 @@ fn evaluate_gate(profile: GateProfile, reports: &[EvaluationCaseReport]) -> Gate
         );
     }
 
-    let status = if checks
-        .iter()
-        .any(|check| check.status == GateStatus::Failed)
-    {
-        GateStatus::Failed
-    } else {
-        GateStatus::Passed
-    };
+    let status = aggregate_evaluation_gate_status(
+        checks
+            .iter()
+            .map(|check| EvaluationGateStatus::from(check.status)),
+    )
+    .into();
     GateReport {
         profile: profile.to_string(),
         status,
@@ -548,8 +552,8 @@ fn render_markdown(report: &SuiteReport) -> String {
     if let Some(profile_hint) = report.profile_hint.as_ref() {
         out.push_str(&format!("profile: `{profile_hint}`\n\n"));
     }
-    out.push_str("| Case | Frames | PSNR mean | PSNR min | Grad ratio | Lap ratio | Splats | Worst frame |\n");
-    out.push_str("|---|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Case | Frames | Selection FP | PSNR mean | PSNR min | Grad ratio | Lap ratio | Splats | Worst frame |\n");
+    out.push_str("|---|---:|---|---:|---:|---:|---:|---:|---|\n");
     for case in &report.cases {
         let summary = &case.summary;
         let worst = summary
@@ -557,16 +561,47 @@ fn render_markdown(report: &SuiteReport) -> String {
             .first()
             .map(|frame| format!("{} ({:.4} dB)", frame.frame_id, frame.psnr_db))
             .unwrap_or_else(|| "-".to_string());
+        let fp_short = case
+            .selection
+            .selection_fingerprint
+            .chars()
+            .take(12)
+            .collect::<String>();
         out.push_str(&format!(
-            "| {} | {} | {:.4} | {:.4} | {:.4} | {:.4} | {} | {} |\n",
+            "| {} | {} | `{}…` | {:.4} | {:.4} | {:.4} | {:.4} | {} | {} |\n",
             case.name,
-            summary.frame_count,
+            case.selection.stable_frame_ids.len(),
+            fp_short,
             summary.psnr_mean_db,
             summary.psnr_min_db,
             summary.sharpness_grad_ratio_mean,
             summary.sharpness_lap_ratio_mean,
             summary.splat_count,
             worst
+        ));
+    }
+    out.push_str("\n## Frame selection\n\n");
+    for case in &report.cases {
+        out.push_str(&format!("### {}\n\n", case.name));
+        out.push_str(&format!(
+            "- max_frames: {}\n- frame_stride: {}\n- include: {}\n- exclude: {}\n- eval_split_kind: {}\n- selection_fingerprint: `{}`\n- stable_frame_ids ({}): `{:?}`\n\n",
+            case.selection.max_frames,
+            case.selection.frame_stride,
+            case.selection
+                .include_frame_ranges
+                .as_deref()
+                .unwrap_or("-"),
+            case.selection
+                .exclude_frame_ranges
+                .as_deref()
+                .unwrap_or("-"),
+            case.selection
+                .eval_split_kind
+                .as_deref()
+                .unwrap_or("-"),
+            case.selection.selection_fingerprint,
+            case.selection.stable_frame_ids.len(),
+            case.selection.stable_frame_ids,
         ));
     }
     if let Some(gate) = report.gate.as_ref() {

@@ -5,7 +5,7 @@ source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
 fix_branch: "fix/rs-2026-002-c1-c4-review"
-head_sha: "4fdf506e6819fd30c74ad8245e85c9f1df625220"
+head_sha: "8738f71273a343e16f63fa3848268088e81b473f"
 cards:
   C1:
     status: merged
@@ -20,7 +20,8 @@ cards:
     status: merged
     notes: "R02/R04/R06/R07/R08 closed; merged via --no-ff 4fdf506"
   C5:
-    status: not_started
+    status: implemented_pending_review
+    notes: "v4+legacy v3 unverified; in-view reports; canonical reselect; tip in verification.md"
   C6:
     status: not_started
   C7:
