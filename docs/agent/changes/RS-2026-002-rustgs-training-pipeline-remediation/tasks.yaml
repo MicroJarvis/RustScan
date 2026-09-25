@@ -5,20 +5,20 @@ source_history: "historical RustGS remediation plan (migrated and removed)"
 task_list: tasks.md
 base_sha: "701d051814a29ab3ee4fbefc01355112f71b5a47"
 fix_branch: "fix/rs-2026-002-c1-c4-review"
-head_sha: "cc4323b57f8aa23bd268583a93c804c58572cf38"
+head_sha: "PENDING"
 cards:
   C1:
-    status: implemented_pending_maintainer_review
+    status: implemented_pending_merge
     notes: "capacity guards + WGSL explicit branches preserved"
   C2:
-    status: implemented_pending_rereview
-    notes: "R01/R03 retained; R02 round-3 historical struct-order fingerprint"
+    status: implemented_pending_merge
+    notes: "R01/R03 retained; R02 historical struct-order fingerprint closed"
   C3:
-    status: implemented_pending_maintainer_review
+    status: implemented_pending_merge
     notes: "prefix-sum workspace ownership preserved"
   C4:
-    status: implemented_pending_rereview
-    notes: "R04 gates profile_step + should_log_diagnostics on profiler.enabled; diagnostic readbacks counted; R07/R06/R08 retained"
+    status: implemented_pending_merge
+    notes: "R02/R04/R06/R07/R08 closed; R04 disabled+Debug total Debug GPU readbacks=0"
   C5:
     status: not_started
   C6:
@@ -36,11 +36,11 @@ out_of_scope:
   - rust-viewer
   - C5-C8 implementation
 acceptance:
-  - "Independent re-review of round-4 R04 diagnostic gate before merge."
+  - "C1-C4 ready for maintainer merge; C5-C8 not started."
 verification:
   - "cargo fmt --all -- --check"
-  - "cargo check --workspace --all-targets"
-  - "cargo test -p rustscan-gs --all-targets --features gpu-wgpu -- --test-threads=1"
+  - "POSELIB_ROOT=/Users/tfjiang/Projects/RustScan/third_party/native/PoseLib cargo check --workspace --all-targets"
+  - "cargo test -p rustscan-gs --lib --features gpu-wgpu -- --test-threads=1"
   - "cargo test -p rustscan-gs --no-default-features --lib -- --test-threads=1"
   - "cargo test -p rustscan-gs --test integration_test --features gpu-wgpu -- --ignored --test-threads=1"
   - "cargo clippy -p rustscan-gs --all-targets --features gpu-wgpu --no-deps -- -D warnings"
